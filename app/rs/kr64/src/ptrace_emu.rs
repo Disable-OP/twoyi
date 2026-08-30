@@ -7923,6 +7923,170 @@ fn z231_fresh_create_needed(is_open_family: bool, flags: i32, translated_path: &
     is_open_family && (flags & 0x80) != 0 && is_property_metadata_file(translated_path)
 }
 
+/// 6-Z238: names of the Twoyi-staged hook/shared libraries whose guest-side
+/// parse is a known blocker class (merlin: the guest linker rejected the
+/// arm32 fb_hook with ".dynamic section header was not found" on a file
+/// that is byte-valid on the host — evidence run 33306470979). Opens of
+/// these names get the UN-gated ELF-structure dump.
+fn is_hook_chain_so_path(path: &str) -> bool {
+    const NAMES: [&str; 6] = [
+        "libtwrp_fb_hook.so",
+        "libbionic_compat.so",
+        "libgetpid_hook.so",
+        "libtwoyi_loader_shlib.so",
+        "libdl.so",
+        "libc.so",
+    ];
+    let base = match path.rsplit('/').next() {
+        Some(b) => b,
+        None => return false,
+    };
+    NAMES.contains(&base)
+}
+
+/// 6-Z238: read the ELF structure of an OPEN FILE through
+/// `/proc/<pid>/fd/<fd>` and summarize exactly what the guest linker's
+/// own parser will see: EI_CLASS/e_machine, section-header table
+/// location+size, the SHT_DYNAMIC section (modern bionic locates .dynamic
+/// THROUGH SECTION HEADERS and validates it against PT_DYNAMIC — merlin's
+/// /sbin/linker error strings prove it), and PT_DYNAMIC itself.
+///
+/// Returns `None` when the fd cannot be reopened (procfs denied — e.g.
+/// some sandboxes) or the file is not an ELF; the caller just skips the
+/// log. Bounded reads only (header + program + section tables), never the
+/// whole file.
+fn elf_layout_summary_via_fd(pid: libc::pid_t, fd: i32) -> Option<String> {
+    use std::io::Read;
+    use std::io::Seek;
+    let path = format!("/proc/{}/fd/{}", pid, fd);
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hdr = [0u8; 64];
+    f.read_exact(&mut hdr).ok()?;
+    if hdr[0..4] != *b"\x7fELF" {
+        return None;
+    }
+    let is64 = hdr[4] == 2;
+    let machine = u16::from_le_bytes([hdr[18], hdr[19]]);
+    let (e_phoff, e_shoff, e_phentsize, e_phnum, e_shentsize, e_shnum) = if is64 {
+        let phoff = u64::from_le_bytes(hdr[32..40].try_into().ok()?);
+        let shoff = u64::from_le_bytes(hdr[40..48].try_into().ok()?);
+        (
+            phoff,
+            shoff,
+            u16::from_le_bytes(hdr[54..56].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[56..58].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[58..60].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[60..62].try_into().ok()?) as u64,
+        )
+    } else {
+        (
+            u32::from_le_bytes(hdr[28..32].try_into().ok()?) as u64,
+            u32::from_le_bytes(hdr[32..36].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[42..44].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[44..46].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[46..48].try_into().ok()?) as u64,
+            u16::from_le_bytes(hdr[48..50].try_into().ok()?) as u64,
+        )
+    };
+    // PT_DYNAMIC from the program headers (cap 24 entries).
+    let mut pt_dynamic: Option<(u64, u64)> = None;
+    if e_phoff > 0 && e_phentsize >= 32 && e_phnum > 0 && e_phnum <= 24 {
+        let mut ph = vec![0u8; (e_phentsize * e_phnum) as usize];
+        f.seek(std::io::SeekFrom::Start(e_phoff)).ok()?;
+        f.read_exact(&mut ph).ok()?;
+        for i in 0..e_phnum as usize {
+            let o = i * e_phentsize as usize;
+            let p_type = u32::from_le_bytes(ph[o..o + 4].try_into().ok()?);
+            if p_type == 2 {
+                // PT_DYNAMIC
+                let (off, filesz) = if is64 {
+                    (
+                        u64::from_le_bytes(ph[o + 8..o + 16].try_into().ok()?),
+                        u64::from_le_bytes(ph[o + 32..o + 40].try_into().ok()?),
+                    )
+                } else {
+                    (
+                        u32::from_le_bytes(ph[o + 4..o + 8].try_into().ok()?) as u64,
+                        u32::from_le_bytes(ph[o + 16..o + 20].try_into().ok()?) as u64,
+                    )
+                };
+                pt_dynamic = Some((off, filesz));
+                break;
+            }
+        }
+    }
+    // SHT_DYNAMIC from the section headers (cap 64 entries).
+    let mut sht_dynamic: Option<(usize, u64, u64, u32)> = None;
+    let mut shdr_note = String::new();
+    if e_shoff == 0 {
+        shdr_note = "e_shoff=0 (stripped shdr table!)".to_string();
+    } else if e_shentsize < 40 || e_shnum == 0 || e_shnum > 64 {
+        shdr_note = format!(
+            "invalid shdr geometry e_shoff={} e_shentsize={} e_shnum={}",
+            e_shoff, e_shentsize, e_shnum
+        );
+    } else if e_shoff + e_shentsize * e_shnum > (1 << 30) {
+        shdr_note = "shdr table offset beyond 1 GiB".to_string();
+    } else {
+        let mut sh = vec![0u8; (e_shentsize * e_shnum) as usize];
+        f.seek(std::io::SeekFrom::Start(e_shoff)).ok()?;
+        match f.read_exact(&mut sh) {
+            Ok(()) => {
+                for i in 0..e_shnum as usize {
+                    let o = i * e_shentsize as usize;
+                    let sh_type = u32::from_le_bytes(sh[o + 4..o + 8].try_into().ok()?);
+                    if sh_type != 6 {
+                        continue; // SHT_DYNAMIC
+                    }
+                    let (sh_offset, sh_size, sh_link) = if is64 {
+                        (
+                            u64::from_le_bytes(sh[o + 24..o + 32].try_into().ok()?),
+                            u64::from_le_bytes(sh[o + 32..o + 40].try_into().ok()?),
+                            u32::from_le_bytes(sh[o + 40..o + 44].try_into().ok()?),
+                        )
+                    } else {
+                        (
+                            u32::from_le_bytes(sh[o + 16..o + 20].try_into().ok()?) as u64,
+                            u32::from_le_bytes(sh[o + 20..o + 24].try_into().ok()?) as u64,
+                            u32::from_le_bytes(sh[o + 24..o + 28].try_into().ok()?),
+                        )
+                    };
+                    sht_dynamic = Some((i, sh_offset, sh_size, sh_link));
+                    break;
+                }
+            }
+            Err(e) => {
+                shdr_note = format!("shdr read failed: {}", e);
+            }
+        }
+    }
+    let file_len = f.seek(std::io::SeekFrom::End(0)).unwrap_or(0);
+    Some(format!(
+        "ELF{} machine={} size={} e_shoff={} e_shnum={} e_shentsize={} SHT_DYNAMIC={} PT_DYNAMIC={}",
+        if is64 { "64" } else { "32" },
+        machine,
+        file_len,
+        e_shoff,
+        e_shnum,
+        e_shentsize,
+        match sht_dynamic {
+            Some((i, off, sz, link)) => format!(
+                "shdr[{}] off={:#x} size={:#x} link={}",
+                i, off, sz, link
+            ),
+            None => if shdr_note.is_empty() {
+                "NOT FOUND".to_string()
+            } else {
+                shdr_note.clone()
+            },
+        },
+        match pt_dynamic {
+            Some((off, sz)) => format!("off={:#x} filesz={:#x}", off, sz),
+            None => "NONE".to_string(),
+        },
+    ))
+}
+
 /// 6-Z121: the (st_mode, st_uid, st_gid) byte offsets inside the
 /// child's `struct stat` for the plain-fstat syscalls we virtualize.
 /// Dispatched by the syscall NUMBER (the only per-ABI discriminator
@@ -10294,6 +10458,17 @@ pub fn run_ptrace_loop(
     // 6-Z234: passthrough (untranslated) open DIAG counter, second-stage
     // property window (loop_count 500-700) only.
     let mut passthrough_open_diag_count: u64 = 0;
+    // 6-Z237: failed-open DIAG counter for guest-/dev paths in the
+    // second-stage boot window (loop 400-1000, first 20).
+    let mut dev_fail_diag_count: u64 = 0;
+    // 6-Z238: .so open ELF-structure dump counter (hook-chain names
+    // un-gated, others loop-gated; first 40 total).
+    let mut so_elf_diag_count: u64 = 0;
+    // 6-Z238: execve envp LD_* scan counter (first 24 execs with LD vars).
+    let mut exec_env_diag_count: u64 = 0;
+    // 6-Z237: bounded boot-window "intercepted open" extension counter
+    // (loops 400-1000, first 80 non-property translated opens).
+    let mut boot_window_open_count: u64 = 0;
     let mut pending_mount_enodev: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     // 6-Z168: log cap for the block-storage mount -ENODEV overrides (the
@@ -12707,6 +12882,62 @@ pub fn run_ptrace_loop(
                             syscall_num, pid
                         ));
 
+                        // ── 6-Z238: execve envp LD_* scan (ALL ABIs) ──
+                        // Merlin (run 33306470979): which LD_PRELOAD chain
+                        // the recovery service's linker actually saw was not
+                        // on the record (the CHILD env log covers only the
+                        // INIT exec). Read the envp array at EVERY execve
+                        // ENTRY (bounded: 96 entries) and log the LD_PRELOAD
+                        // / LD_LIBRARY_PATH values — settles the
+                        // legacy-vs-AOSP chain question decisively. Pointer
+                        // stride is ABI-aware: 4 bytes on execve==11 ABIs
+                        // (i386/arm32), 8 bytes on x86_64/aarch64.
+                        {
+                            let path_addr_env = get_syscall_arg(&regs, abi.reg_arg1);
+                            let exec_path = read_child_string(pid, path_addr_env)
+                                .unwrap_or_else(|| "<unreadable>".to_string());
+                            let envp_addr = get_syscall_arg(&regs, abi.reg_arg3);
+                            if envp_addr != 0 && exec_env_diag_count <= 24 {
+                                let stride: u64 = if abi.execve == 11 { 4 } else { 8 };
+                                let mut ld_hits: Vec<String> = Vec::new();
+                                let mut slot = 0usize;
+                                let mut cursor = envp_addr;
+                                while slot < 96 {
+                                    let entry_ptr = match read_child_u64(pid, cursor) {
+                                        Some(w) => {
+                                            if stride == 4 {
+                                                (w & 0xFFFF_FFFF) as u64
+                                            } else {
+                                                w
+                                            }
+                                        }
+                                        None => break,
+                                    };
+                                    if entry_ptr == 0 {
+                                        break;
+                                    }
+                                    if let Some(env) = read_child_string(pid, entry_ptr) {
+                                        if env.starts_with("LD_PRELOAD=")
+                                            || env.starts_with("LD_LIBRARY_PATH=")
+                                        {
+                                            ld_hits.push(env);
+                                        }
+                                    }
+                                    cursor += stride;
+                                    slot += 1;
+                                }
+                                if !ld_hits.is_empty() {
+                                    exec_env_diag_count += 1;
+                                    log(&format!(
+                                        "6-Z238: execve(\"{}\") pid={} LD env: {}",
+                                        exec_path,
+                                        pid,
+                                        ld_hits.join(" | ")
+                                    ));
+                                }
+                            }
+                        }
+
                         // ── 6-Z101 + 6-Z102: staged-exe execve ENTRY rewrite ──
                         //
                         // For direct-execve ABIs (x86_64 nr=59, aarch64
@@ -15041,11 +15272,30 @@ pub fn run_ptrace_loop(
                                 // Task 6-V: save translated path for fd
                                 // tracking at the matching open EXIT.
                                 pending_open_translated_path.insert(pid, translated.clone());
+                                // 6-Z237: the boot-window extension (loops
+                                // 400-800) is BOUNDED (first 80) — run
+                                // 33306473590 (capricorn) proved the failing
+                                // open can be translated to a path matching
+                                // NONE of the property predicates, so every
+                                // translated open in the second-stage window
+                                // lands on the record, not just property-shaped
+                                // ones.
+                                let boot_window_open = loop_count >= 400
+                                    && loop_count <= 1000
+                                    && boot_window_open_count <= 80;
                                 if translated != path
                                     && (loop_count <= 500
                                         || is_property_metadata_file(&translated)
-                                        || translated.ends_with("__properties__"))
+                                        || translated.ends_with("__properties__")
+                                        || boot_window_open)
                                 {
+                                    if boot_window_open
+                                        && loop_count > 500
+                                        && !is_property_metadata_file(&translated)
+                                        && !translated.ends_with("__properties__")
+                                    {
+                                        boot_window_open_count += 1;
+                                    }
                                     log(&format!("intercepted open({}) -> {}", path, translated));
                                 }
                                 if translated != path {
@@ -16762,6 +17012,76 @@ pub fn run_ptrace_loop(
                                             },
                                             prop_area_diag_count
                                         ));
+                                    }
+                                }
+                                // ── 6-Z237: failed-open DIAG under the guest
+                                // /dev tree in the boot window ──
+                                // Run 33306473590 (capricorn, beda55c): the
+                                // property FATAL's openat STILL produced no
+                                // 6-Z231/6-Z234/6-Z229 output — its translated
+                                // path matches NONE of the property
+                                // predicates. Log ANY FAILED open whose
+                                // translated path lives under the guest /dev
+                                // tree during the second-stage boot window
+                                // (loops 400-800), first 20, with the errno —
+                                // the EEXIST/EACCES story lands on the record
+                                // whatever path shape it uses.
+                                if ret < 0
+                                    && loop_count >= 400
+                                    && loop_count <= 1000
+                                    && p.contains("/dev/")
+                                {
+                                    dev_fail_diag_count = dev_fail_diag_count.saturating_add(1);
+                                    if dev_fail_diag_count <= 20 {
+                                        log(&format!(
+                                            "6-Z237: open FAILED \"{}\" -> {} (-errno {}) pid={} loop={} (occurrence {})",
+                                            p,
+                                            ret,
+                                            -ret,
+                                            pid,
+                                            loop_count,
+                                            dev_fail_diag_count
+                                        ));
+                                    }
+                                }
+                                // ── 6-Z238: guest-side ELF-structure dump for
+                                // .so opens ──
+                                // Merlin (run 33306470979): the guest linker
+                                // rejected the arm32 fb_hook with ".dynamic
+                                // section header was not found" on a file
+                                // that is byte-valid on the host (asset
+                                // verified: SHT_DYNAMIC == PT_DYNAMIC). This
+                                // dump reads the ELF layout THROUGH the open
+                                // fd — what the guest's own parser will see —
+                                // and names any divergence (different inode,
+                                // truncated content, mangled shdr table)
+                                // immediately at the open. UN-gated for the
+                                // hook-chain names (rare, diagnostically
+                                // critical), loop-gated for every other .so
+                                // (bounded — a full TWRP links 20+ libs).
+                                if ret >= 0 && p.ends_with(".so") {
+                                    let hook_chain = is_hook_chain_so_path(&p);
+                                    if hook_chain || loop_count <= 400 {
+                                        so_elf_diag_count = so_elf_diag_count.saturating_add(1);
+                                        if so_elf_diag_count <= 40 {
+                                            match elf_layout_summary_via_fd(pid, ret as i32) {
+                                                Some(s) => log(&format!(
+                                                    "6-Z238: open(\"{}\") fd={} {}{}",
+                                                    p,
+                                                    ret,
+                                                    s,
+                                                    if hook_chain {
+                                                        " [hook-chain]"
+                                                    } else {
+                                                        ""
+                                                    }
+                                                )),
+                                                None => log(&format!(
+                                                    "6-Z238: open(\"{}\") fd={} — ELF layout unreadable via /proc fd (non-ELF or procfs denied)",
+                                                    p, ret
+                                                )),
+                                            }
+                                        }
                                     }
                                 }
                                 // ── 6-Z169: /twres open-result DIAG (success side) ──
@@ -27767,6 +28087,29 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
     // semantics), so a stale backing file is removed before the create. The
     // decision core below must NEVER fire for readers or non-property paths —
     // the guest namespace gains a deletion power over exactly these files.
+    #[test]
+    fn z238_hook_chain_so_names() {
+        // The un-gated ELF-dump set covers exactly the Twoyi-staged
+        // hook chain + the runtime-critical libs; other names (and
+        // superstrings) must NOT match — the dump is bounded, §26.
+        assert!(is_hook_chain_so_path("/sbin/libtwrp_fb_hook.so"));
+        assert!(is_hook_chain_so_path(
+            "/data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so"
+        ));
+        assert!(is_hook_chain_so_path("/dev/libbionic_compat.so"));
+        assert!(is_hook_chain_so_path("/dev/libgetpid_hook.so"));
+        assert!(is_hook_chain_so_path("/system/lib64/libdl.so"));
+        assert!(is_hook_chain_so_path("/sbin/libc.so"));
+        assert!(is_hook_chain_so_path("/sbin/libtwoyi_loader_shlib.so"));
+        // Non-hook libs / near-misses. (Basename matching is intentional —
+        // translated open paths are absolute, so a bare relative form never
+        // reaches the predicate in practice; the ELF dump is diagnostic-only.)
+        assert!(!is_hook_chain_so_path("/sbin/libcrypto.so"));
+        assert!(!is_hook_chain_so_path("/sbin/libunwindstack.so"));
+        assert!(!is_hook_chain_so_path("/sbin/libtwrp_fb_hook.so.bak"));
+        assert!(!is_hook_chain_so_path(""));
+    }
+
     #[test]
     fn z231_fresh_create_decision_core() {
         const O_EXCL: i32 = 0x80;
