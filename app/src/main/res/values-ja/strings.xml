@@ -143,4 +143,40 @@
     <string name="profile_import_failed">プロファイルのインポートに失敗しました: %1$s</string>
     <string name="profile_from_scratch">新規作成</string>
     <string name="profile_from_import">インポートから</string>
+    <!-- 6-Z26x translations -->
+    <string name="settings_boot_recovery_summary">このスイッチは「コンテナを起動」をタップしたときにコンテナが何を起動するかを決定します。ON = インポートしたリカバリイメージ（TWRP/OrangeFox など）を起動 — リカバリ利用の通常モード。OFF = フル Android ROM を起動。「ROM を選択」でリカバリをインポートすると自動的に ON になるため、通常は変更不要です。次回のコンテナ起動時に反映されます。</string>
+    <string name="settings_boot_recovery_dialog_title">「リカバリを起動」について</string>
+    <string name="settings_boot_recovery_dialog_text">Twoyi は「ROM を選択」でインポートしたイメージをコンテナ内で実行します。\n\n• リカバリイメージをインポートした場合（TWRP/OrangeFox/SHRP などの .img/.zip）→ ON のままで起動するとそのリカバリが直接立ち上がります。\n• フル Android ROM をインポートした場合 → OFF にするとその Android システムを起動します。\n\nこの設定はインポートしたイメージのレイアウトから自動的に設定されます。変更は次回の起動時のみ有効で、スマートフォン自体は再起動しません。\n\nすでにリカバリ画面が見えているのに「リカバリを起動」という名前なのは？コンテナは「コンテナを起動」をタップするまで存在しません。このスイッチはどのゲストを起動するかをランチャーに伝えるものです。</string>
+    <string name="settings_boot_recovery_applies">起動モードを保存しました — 次回の「コンテナを起動」で有効になります</string>
+    <string name="settings_rom_installed_unnamed">ROM インストール済み — タップして別のイメージをインポート</string>
+    <string name="settings_rootfs_fm_title">Rootfs ファイルマネージャー</string>
+    <string name="settings_rootfs_fm_summary">インポートしたシステムの全ファイルを閲覧・編集：内容、名前、権限（chmod）。上級者向けツール。</string>
+    <string name="fm_warning_running">コンテナが（最近）実行中です。編集はゲストのステージングファイルと衝突する可能性があります — 編集前にコンテナを終了してください。</string>
+    <string name="fm_empty">空のディレクトリ</string>
+    <string name="fm_new_folder">新規フォルダー</string>
+    <string name="fm_new_file">新規ファイル</string>
+    <string name="fm_refresh">更新</string>
+    <string name="fm_action_edit">表示 / 編集</string>
+    <string name="fm_action_details">詳細</string>
+    <string name="fm_action_chmod">権限を変更 (chmod)</string>
+    <string name="fm_action_rename">名前を変更</string>
+    <string name="fm_action_delete">削除</string>
+    <string name="fm_details_path">パス</string>
+    <string name="fm_details_size">サイズ</string>
+    <string name="fm_details_mode">モード (8 進数)</string>
+    <string name="fm_chmod_title">chmod %s</string>
+    <string name="fm_chmod_message">新しい権限マスクを 8 進数で入力してください。例: 755 = rwxr-xr-x、644 = rw-r--r--、4755 = setuid。</string>
+    <string name="fm_chmod_invalid">無効なモード — 3〜4 桁の 8 進数 (0-7) を入力してください</string>
+    <string name="fm_chmod_failed">chmod 失敗 (errno %d)</string>
+    <string name="fm_rename_title">名前を変更</string>
+    <string name="fm_invalid_name">無効な名前です</string>
+    <string name="fm_rename_failed">名前の変更に失敗しました</string>
+    <string name="fm_delete_title">削除</string>
+    <string name="fm_delete_message">%s を削除しますか？ディレクトリは再帰的に削除されます。</string>
+    <string name="fm_delete_failed">削除に失敗しました</string>
+    <string name="fm_read_failed">ファイルを読み取れません</string>
+    <string name="fm_save">保存</string>
+    <string name="fm_save_failed">保存に失敗しました</string>
+    <string name="fm_edit_truncated_suffix">（先頭 256 KB）</string>
+    <string name="fm_create_failed">作成に失敗しました</string>
 </resources>

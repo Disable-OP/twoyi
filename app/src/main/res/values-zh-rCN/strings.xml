@@ -143,4 +143,40 @@
     <string name="profile_import_failed">导入配置文件失败：%1$s</string>
     <string name="profile_from_scratch">从零开始</string>
     <string name="profile_from_import">从导入</string>
+    <!-- 6-Z26x translations -->
+    <string name="settings_boot_recovery_summary">此开关决定点按「启动容器」时容器引导哪个系统。开启 = 引导你导入的恢复镜像（TWRP/OrangeFox 等）——恢复模式的常规用法。关闭 = 引导完整的 Android ROM。通过「选择 ROM」导入恢复镜像后会自动开启，通常无需手动更改。下次启动容器时生效。</string>
+    <string name="settings_boot_recovery_dialog_title">关于「引导恢复模式」</string>
+    <string name="settings_boot_recovery_dialog_text">Twoyi 在容器中运行你通过「选择 ROM」导入的镜像。\n\n• 导入的是恢复镜像（TWRP/OrangeFox/SHRP 等的 .img/.zip）→ 保持开启，点按启动将直接进入该恢复模式。\n• 导入的是完整 Android ROM → 关闭此项，点按启动将引导该 Android 系统。\n\n应用会根据导入镜像的布局自动设置此项；更改只影响下次启动，不会重启你的手机。\n\n为什么已经在恢复界面了还叫「引导恢复模式」？容器在你点按「启动容器」之前并不存在——此开关告诉启动器引导哪个客户系统。</string>
+    <string name="settings_boot_recovery_applies">引导模式已保存 — 下次「启动容器」时生效</string>
+    <string name="settings_rom_installed_unnamed">已安装 ROM — 点按可导入其他镜像</string>
+    <string name="settings_rootfs_fm_title">Rootfs 文件管理器</string>
+    <string name="settings_rootfs_fm_summary">浏览并编辑已导入系统的每个文件：内容、名称和权限（chmod）。高级工具。</string>
+    <string name="fm_warning_running">容器正在（或最近）运行。直接编辑可能与客户机的暂存文件冲突——建议先关闭容器再编辑。</string>
+    <string name="fm_empty">空目录</string>
+    <string name="fm_new_folder">新建文件夹</string>
+    <string name="fm_new_file">新建文件</string>
+    <string name="fm_refresh">刷新</string>
+    <string name="fm_action_edit">查看 / 编辑</string>
+    <string name="fm_action_details">详细信息</string>
+    <string name="fm_action_chmod">修改权限 (chmod)</string>
+    <string name="fm_action_rename">重命名</string>
+    <string name="fm_action_delete">删除</string>
+    <string name="fm_details_path">路径</string>
+    <string name="fm_details_size">大小</string>
+    <string name="fm_details_mode">权限（八进制）</string>
+    <string name="fm_chmod_title">chmod %s</string>
+    <string name="fm_chmod_message">以八进制输入新的权限掩码，例如 755 = rwxr-xr-x，644 = rw-r--r--，4755 = setuid。</string>
+    <string name="fm_chmod_invalid">无效的权限值 — 请输入 3 或 4 位八进制数 (0-7)</string>
+    <string name="fm_chmod_failed">chmod 失败 (errno %d)</string>
+    <string name="fm_rename_title">重命名</string>
+    <string name="fm_invalid_name">名称无效</string>
+    <string name="fm_rename_failed">重命名失败</string>
+    <string name="fm_delete_title">删除</string>
+    <string name="fm_delete_message">删除 %s？目录将被递归删除。</string>
+    <string name="fm_delete_failed">删除失败</string>
+    <string name="fm_read_failed">无法读取文件</string>
+    <string name="fm_save">保存</string>
+    <string name="fm_save_failed">保存失败</string>
+    <string name="fm_edit_truncated_suffix">（前 256 KB）</string>
+    <string name="fm_create_failed">创建失败</string>
 </resources>
