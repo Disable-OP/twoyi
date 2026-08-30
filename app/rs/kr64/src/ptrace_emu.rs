@@ -440,6 +440,21 @@ struct ChildAbi {
     fchown: i64,
     fchmod: i64,
     capget: i64,
+    // 6-Z224: capset — the WRITE side of the capability pair. OrangeFox
+    // R12.0-lavender run 33279360223 (head 537e617): guest init forked
+    // the logd service child, whose SetCapsForExec() (init/service.cpp
+    // "cannot set capabilities for <name>" — LOG(FATAL)) called capset()
+    // which the kernel rejected with -EPERM (untrusted_app uid); the
+    // fork child inherited init's SIGABRT handler (InitFatalReboot) and
+    // rebooted the whole guest — 27 boot cycles, zero UI. capget was
+    // already fake-succeeded; capset was NOT, because the field did not
+    // exist. Numbers verified against asm-generic/unistd.h (aarch64:
+    // capget=90, capset=91), asm/unistd_64.h (x86_64: capget=124,
+    // capset=125 — NOTE the pre-6-Z224 table had capget=125, which is
+    // actually CAPSET: x86_64 guests fake-succeeded capset by accident
+    // and passed real capget through — corrected here), and
+    // asm/unistd_32.h (i386: capget=184, capset=185).
+    capset: i64,
     ioprio_get: i64,
     ioprio_set: i64,
     // ── chmod / lchown / chown / fchmodat / fchownat ─────────────
@@ -1221,7 +1236,13 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // `fchown` and `fchmod` so the fix works either way).
     fchown: 93,
     fchmod: 91,
-    capget: 125,
+    // 6-Z224: x86_64 capget is 124 (NOT 125 — 125 is capset!). The
+    // pre-6-Z224 table had capget=125, so x86_64 guests fake-succeeded
+    // CAPSET by accident (masking the OrangeFox-class init FATAL on
+    // x86_64) and passed the real capget through. Both are now wired:
+    // capget=124, capset=125 (asm/unistd_64.h).
+    capget: 124,
+    capset: 125,
     ioprio_get: 252,
     // ioprio_set on x86_64 = 251 (per asm/unistd_64.h, verified in
     // Task 5-S against /usr/include/x86_64-linux-gnu/asm/unistd_64.h).
@@ -1527,6 +1548,9 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     fchown: 95,
     fchmod: 94,
     capget: 184,
+    // 6-Z224: i386 capset = 185 (asm/unistd_32.h). Same OrangeFox-class
+    // init LOG(FATAL) as the aarch64/x86_64 notes on ChildAbi.capset.
+    capset: 185,
     ioprio_get: 290,
     ioprio_set: 289,
     // chmod / lchown / chown / fchmodat / fchownat (i386 numbers
@@ -1868,6 +1892,9 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     fchown: 55,
     fchmod: 52,
     capget: 90,
+    // 6-Z224: aarch64 capset = 91 (asm-generic/unistd.h). OrangeFox run
+    // 33279360223 boot loop — see the ChildAbi.capset field doc.
+    capset: 91,
     ioprio_get: 31,
     ioprio_set: 30,
     // chmod / lchown / chown / fchmodat / fchownat (aarch64 numbers
@@ -2763,6 +2790,14 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.fchmodat
         || syscall_nr == abi.fchownat
         || syscall_nr == abi.capget
+        // 6-Z224: capset — the write side. OrangeFox run 33279360223:
+        // init's service child called capset() (SetCapsForExec for
+        // services whose .rc declares `capabilities:`) -> real -EPERM ->
+        // LOG(FATAL) -> inherited InitFatalReboot handler -> full guest
+        // reboot loop (27 cycles, zero UI). Fake-success mirrors capget
+        // above; the traced child keeps its real (cap-less) uid — only
+        // the return value the child reads is rewritten.
+        || syscall_nr == abi.capset
         || syscall_nr == abi.ioprio_get
         || syscall_nr == abi.ioprio_set
         || syscall_nr == abi.mount
@@ -3436,6 +3471,9 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "fchownat"
     } else if nr == abi.capget {
         "capget"
+    } else if nr == abi.capset {
+        // 6-Z224: see ChildAbi.capset — the OrangeFox boot-loop syscall.
+        "capset"
     } else if nr == abi.ioprio_get {
         "ioprio_get"
     } else if nr == abi.ioprio_set {
@@ -22421,6 +22459,73 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // i386 capget = 184 — pre-existing.
         assert_eq!(compute_exit_return_value(184, &ABI_X86_32), Some(0));
         assert_eq!(syscall_name(184, &ABI_X86_32), "capget");
+    }
+
+    #[test]
+    fn compute_exit_return_value_capset_returns_zero_6z224() {
+        // 6-Z224: capset fake-success on ALL THREE ABIs — OrangeFox run
+        // 33279360223: guest init's logd service child called capset()
+        // (SetCapsForExec, init/service.cpp "cannot set capabilities for
+        // logd" LOG(FATAL)) and the fork child's inherited InitFatalReboot
+        // handler rebooted the guest — 27 boot cycles, zero UI. Numbers
+        // per asm-generic/unistd.h (aarch64), asm/unistd_64.h (x86_64),
+        // asm/unistd_32.h (i386). ALSO guards the x86_64 capget fix: the
+        // pre-6-Z224 table had capget=125 (actually capset), so capget
+        // passed through and capset was faked only by accident.
+        assert_eq!(compute_exit_return_value(125, &ABI_X86_64), Some(0));
+        assert_eq!(syscall_name(125, &ABI_X86_64), "capset");
+        assert_eq!(compute_exit_return_value(185, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(185, &ABI_X86_32), "capset");
+        // capget keeps its own (now-correct) x86_64 number.
+        assert_eq!(compute_exit_return_value(124, &ABI_X86_64), Some(0));
+        assert_eq!(syscall_name(124, &ABI_X86_64), "capget");
+        // aarch64: cfg-gated (the const is #[cfg(target_arch =
+        // "aarch64")]).
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(compute_exit_return_value(91, &ABI_AARCH64), Some(0));
+            assert_eq!(syscall_name(91, &ABI_AARCH64), "capset");
+            assert_eq!(compute_exit_return_value(90, &ABI_AARCH64), Some(0));
+            assert_eq!(syscall_name(90, &ABI_AARCH64), "capget");
+        }
+    }
+
+    #[test]
+    fn child_abi_capset_numbers_do_not_collide_6z224() {
+        // Guard against the Task 5-A class of typo (fchownat=257 collided
+        // with openat on x86_64): capset/capget numbers must differ from
+        // each other AND from the heavy-traffic syscalls on their ABI
+        // (read/write/openat/exit_group), and capset must differ from
+        // capget by exactly 1 on every ABI (kernel UAPI invariant).
+        // x86_64 host: both x86 ABIs exist (the i386-GUEST emulation
+        // consts are #[cfg(target_arch = "x86_64")]).
+        for (name, abi, read_nr, write_nr, openat_nr, exit_group_nr) in [
+            ("x86_64", &ABI_X86_64, 0, 1, 2, 231),
+            ("i386", &ABI_X86_32, 3, 4, 295, 252),
+        ] {
+            assert_ne!(abi.capget, abi.capset, "{}: capget==capset", name);
+            assert_eq!(abi.capset - abi.capget, 1, "{}: capset-capget != 1", name);
+            for (field, val) in [("capget", abi.capget), ("capset", abi.capset)] {
+                assert_ne!(val, read_nr, "{}: {} collides with read", name, field);
+                assert_ne!(val, write_nr, "{}: {} collides with write", name, field);
+                assert_ne!(val, openat_nr, "{}: {} collides with openat", name, field);
+                assert_ne!(
+                    val, exit_group_nr,
+                    "{}: {} collides with exit_group",
+                    name, field
+                );
+            }
+        }
+        // aarch64: cfg-gated.
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_ne!(ABI_AARCH64.capget, ABI_AARCH64.capset);
+            assert_eq!(ABI_AARCH64.capset - ABI_AARCH64.capget, 1);
+            assert_ne!(ABI_AARCH64.capset, 63); // read
+            assert_ne!(ABI_AARCH64.capset, 64); // write
+            assert_ne!(ABI_AARCH64.capset, 56); // openat
+            assert_ne!(ABI_AARCH64.capset, 94); // exit_group
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
