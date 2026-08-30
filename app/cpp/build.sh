@@ -211,6 +211,7 @@ $NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
     -target armv7a-linux-androideabi24 \
     --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
     -nostdlib -shared -fPIC -O2 -g \
+    -marm -fomit-frame-pointer \
     -fno-builtin -fno-builtin-memset -fno-builtin-strcmp -fno-builtin-strlen \
     -Wl,--hash-style=sysv \
     -Wl,--exclude-libs,ALL \

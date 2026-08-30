@@ -337,8 +337,141 @@ static long raw_syscall5_marked(long num, long a, long b, long c, long d, long e
     return x0;
 }
 
+#elif defined(__arm__) && !defined(__aarch64__)
+
+/* 6-Z227: ARMv7 (AArch32) raw syscall variants — EABI convention:
+ * syscall number in r7, args in r0-r5, return in r0. The kernel
+ * preserves every register except r0 across svc, so r6 stays a free
+ * marker channel (same contract as aarch64 x6).
+ *
+ * BUILD REQUIREMENT: compile with -marm -fomit-frame-pointer. In Thumb
+ * mode r7 is the frame pointer, so the compiler must be told to leave
+ * it free (build.sh passes both flags for the armv7a hook build). */
+static long raw_syscall1(long num, long a) {
+    register long r0 __asm__("r0") = a;
+    register long r7 __asm__("r7") = num;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(r0)
+        : "r"(r7)
+        : "memory"
+    );
+    return r0;
+}
+
+static long raw_syscall2(long num, long a, long b) {
+    register long r0 __asm__("r0") = a;
+    register long r1 __asm__("r1") = b;
+    register long r7 __asm__("r7") = num;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(r0)
+        : "r"(r1), "r"(r7)
+        : "memory"
+    );
+    return r0;
+}
+
+static long raw_syscall3(long num, long a, long b, long c) {
+    register long r0 __asm__("r0") = a;
+    register long r1 __asm__("r1") = b;
+    register long r2 __asm__("r2") = c;
+    register long r7 __asm__("r7") = num;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(r0)
+        : "r"(r1), "r"(r2), "r"(r7)
+        : "memory"
+    );
+    return r0;
+}
+
+static long raw_syscall4(long num, long a, long b, long c, long d) {
+    register long r0 __asm__("r0") = a;
+    register long r1 __asm__("r1") = b;
+    register long r2 __asm__("r2") = c;
+    register long r3 __asm__("r3") = d;
+    register long r7 __asm__("r7") = num;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(r0)
+        : "r"(r1), "r"(r2), "r"(r3), "r"(r7)
+        : "memory"
+    );
+    return r0;
+}
+
+/* 6-Z227: the marker channel on arm32. r6 is preserved across svc and
+ * unused by the 0-4 arg syscall slots, so the marked wrappers keep the
+ * full 6-Z187c contract. The 64-bit marker constant ("twoyi123",
+ * TWOYI_SYSCALL_MARK) does not fit in a 32-bit register, so arm32 uses
+ * its low 32 bits ("i123") — the tracer's arm32 ABI must compare
+ * against THIS value (see kr64 ABI_ARM32 reg_marker handling). */
+#define TWOYI_SYSCALL_MARK_ARM32 0x69313233L /* low 32 of "twoyi123" */
+
+static long raw_syscall4_marked(long num, long a, long b, long c, long d) {
+    register long r0 __asm__("r0") = a;
+    register long r1 __asm__("r1") = b;
+    register long r2 __asm__("r2") = c;
+    register long r3 __asm__("r3") = d;
+    register long r6 __asm__("r6") = TWOYI_SYSCALL_MARK_ARM32;
+    register long r7 __asm__("r7") = num;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(r0)
+        : "r"(r1), "r"(r2), "r"(r3), "r"(r6), "r"(r7)
+        : "memory"
+    );
+    return r0;
+}
+
+static long raw_syscall3_marked(long num, long a, long b, long c) {
+    return raw_syscall4_marked(num, a, b, c, 0);
+}
+
+/* 6-Z188j: 5-arg MARKED syscall (getsockopt) — r0-r4 args, r6 marker,
+ * r7 number; r5 unused but not needed. */
+static long raw_syscall5_marked(long num, long a, long b, long c, long d, long e) {
+    register long r0 __asm__("r0") = a;
+    register long r1 __asm__("r1") = b;
+    register long r2 __asm__("r2") = c;
+    register long r3 __asm__("r3") = d;
+    register long r4 __asm__("r4") = e;
+    register long r6 __asm__("r6") = TWOYI_SYSCALL_MARK_ARM32;
+    register long r7 __asm__("r7") = num;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(r0)
+        : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r6), "r"(r7)
+        : "memory"
+    );
+    return r0;
+}
+
 #else
-#error "twrp_fb_hook.c: unsupported architecture (need __i386__ or __aarch64__)"
+#error "twrp_fb_hook.c: unsupported architecture (need __i386__, __arm__, or __aarch64__)"
+#endif
+
+// ── 6-Z227: per-arch raw syscall NUMBERS for the calls below ──────────
+// These were hardcoded aarch64 values (209/199/24/25) which are wrong
+// on every other architecture — arm32 and ia32 have completely
+// different tables. Verified against the kernel tables:
+//   arch/arm/tools/syscall.tbl, arch/x86/entry/syscalls/syscall_32.tbl.
+#if defined(__aarch64__)
+  #define TWOYI_NR_GETSOCKOPT 209
+  #define TWOYI_NR_SOCKETPAIR 199
+  #define TWOYI_NR_DUP        24   /* dup3(oldfd, newfd, flags) */
+  #define TWOYI_NR_FCNTL      25
+#elif defined(__arm__) && !defined(__aarch64__)
+  #define TWOYI_NR_GETSOCKOPT 295
+  #define TWOYI_NR_SOCKETPAIR 288
+  #define TWOYI_NR_DUP        358  /* dup3 */
+  #define TWOYI_NR_FCNTL      55
+#elif defined(__i386__)
+  #define TWOYI_NR_GETSOCKOPT 365
+  #define TWOYI_NR_SOCKETPAIR 360
+  #define TWOYI_NR_DUP        330  /* dup3 */
+  #define TWOYI_NR_FCNTL      55
 #endif
 
 // aarch64 has no SYS_mkdir — only SYS_mkdirat. Provide a portable wrapper.
@@ -736,7 +869,7 @@ static int pty_is_slave_fd(int fd) {
 static int pty_fd_is_stream_socket(int fd) {
     long val = 0;
     long len = 4;
-    long r = raw_syscall5_marked(209 /* SYS_getsockopt aarch64 */,
+    long r = raw_syscall5_marked(TWOYI_NR_GETSOCKOPT,
                                  (long)fd, 1 /*SOL_SOCKET*/, 3 /*SO_TYPE*/,
                                  (long)&val, (long)&len);
     return (r == 0 && val == 1 /*SOCK_STREAM*/) ? 1 : 0;
@@ -777,7 +910,7 @@ static int pty_open_master(int flags) {
      * <1024 sanity check on the huge long failed. Use the real type. */
     for (int attempt = 0; attempt < 3; attempt++) {
         int sv_fds[2] = { -1, -1 };
-        long r = raw_syscall4_marked(199 /* SYS_socketpair aarch64 */,
+        long r = raw_syscall4_marked(TWOYI_NR_SOCKETPAIR,
                                      1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0,
                                      (long)sv_fds);
         if (r == 0 && sv_fds[0] >= 0 && sv_fds[0] < 1024
@@ -789,7 +922,7 @@ static int pty_open_master(int flags) {
              * the child's dup(slave) return -EBADF while the master fd
              * lived: something closed the slave number alone. A second
              * copy (whatever fd the kernel picks) survives that. */
-            long b = raw_syscall3_marked(24 /* SYS_dup */, (long)sv_fds[1], 0, 0);
+            long b = raw_syscall3_marked(TWOYI_NR_DUP, (long)sv_fds[1], 0, 0);
             g_pty_backup_fd[slot] = (b >= 0 && b < 1024) ? (int)b : -1;
             pty_mark_slave_fd(sv_fds[1]);
             if (g_pty_backup_fd[slot] >= 0) pty_mark_slave_fd(g_pty_backup_fd[slot]);
@@ -876,7 +1009,7 @@ static int pty_open_slave(const char *path) {
      * saw the marked socketpair, and run 33129187020's plain dup(17)
      * came back -EBADF while fcntl said live (a faked dup). A marked
      * dup is left untouched — the KERNEL decides. */
-    long d = raw_syscall3_marked(24 /* SYS_dup aarch64 */, (long)n, 0, 0);
+    long d = raw_syscall3_marked(TWOYI_NR_DUP, (long)n, 0, 0);
     /* 6-Z188k: NEVER return fd 0/1/2. Run 33131312944: the dup landed
      * on fd 0 (freed earlier in the child) and TWRP's runSlave then did
      * dup2(slave,0/1/2); close(slave) — closing fd 0 == closing STDIN
@@ -885,7 +1018,7 @@ static int pty_open_slave(const char *path) {
      * so the escape never fired. fcntl(d, F_DUPFD, 3) is deterministic:
      * the lowest free fd >= 3, always. */
     if (d >= 0 && d <= 2) {
-        long d2 = raw_syscall3_marked(25 /* SYS_fcntl */, d,
+        long d2 = raw_syscall3_marked(TWOYI_NR_FCNTL, d,
                                       0 /* F_DUPFD */, 3 /* min fd */);
         if (d2 >= 3) {
             raw_syscall1(SYS_close, (int)d);
@@ -901,7 +1034,7 @@ static int pty_open_slave(const char *path) {
         pty_init_slots();
         for (int i = 0; i < TWOYI_PTY_SLOTS; i++) {
             if (g_pty_slave_fd[i] == n && g_pty_backup_fd[i] >= 0) {
-                long d2 = raw_syscall3_marked(24, (long)g_pty_backup_fd[i], 0, 0);
+                long d2 = raw_syscall3_marked(TWOYI_NR_DUP, (long)g_pty_backup_fd[i], 0, 0);
                 if (d2 >= 0) {
                     write_str(2, "[twrp_fb_hook] pty slave open RECOVERED via backup ");
                     write_num(2, g_pty_backup_fd[i]);
@@ -1202,6 +1335,7 @@ static int rootfs_retry_open(const char *path, int abs_fd, int flags, int mode) 
 // struct input_event layout is ARCH-DEPENDENT (6-Z171c fix):
 //   i386:    timeval = 2×u32 (8B) + type u16 + code u16 + value s32 = 16B
 //   aarch64: timeval = 2×s64 (16B) + type u16 + code u16 + value s32 = 24B
+//   armv7:   timeval = 2×u32 (8B) — SAME 16B layout as i386 (6-Z227)
 // minui read()s sizeof(struct input_event) per event — feeding an arm64
 // child 16-byte i386 frames misaligns EVERY type/code/value (garbage
 // events, no touches recognized). The header (timeval) is always zeroed
@@ -1209,6 +1343,8 @@ static int rootfs_retry_open(const char *path, int abs_fd, int flags, int mode) 
 // and the offset of type/code/value (always at INBR_EV_SIZE-8/-6/-4).
 #if defined(__aarch64__)
   #define INBR_EV_SIZE           24
+#elif defined(__arm__) && !defined(__aarch64__)
+  #define INBR_EV_SIZE           16
 #elif defined(__i386__)
   #define INBR_EV_SIZE           16
 #else
