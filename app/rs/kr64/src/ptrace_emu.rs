@@ -1340,6 +1340,57 @@ struct ChildAbi {
     // reporting registers via PTRACE_GETREGS, so we use index 19
     // there too.
     reg_sp: usize,
+    // ── 6-Z266: kill-family syscall numbers (FAKE-PID TRANSLATION) ────
+    //
+    // The tracer fakes EVERY guest process's getpid() to 1 (both the
+    // seccomp/SIGSYS fakes and the libgetpid_hook.so LD_PRELOAD — see
+    // the module doc: "getpid/getppid → return 1 (fake PID 1)"). That
+    // illusion is load-bearing for init's PID-1 self-image, but it
+    // silently BREAKS every guest self-signal: bionic's
+    //     raise(sig) = tgkill(getpid(), gettid(), sig)
+    // puts the FAKE tgid (1) into the REAL kernel syscall, the kernel
+    // finds no signalable real thread group "1" and returns -ESRCH,
+    // and `abort()` retries raise() forever — the 6-Z253 "tgkill spin
+    // class": ~30k syscall stops per second per thread, 250k+ tgkill
+    // stops per boot measured on the user's own OrangeFox R12 lavender
+    // image (CI run 33353128469: 248,083 ppoll + 250,588 tgkill DIAG
+    // samples), saturating a phone core through the single-threaded
+    // ptrace loop. That is the mechanism behind the user-reported
+    // "super long boot (~1 minute on the phone)" and the "SUPER
+    // DELAYED touch input" (the tracer thread, the input delivery and
+    // the guest threads all fight over CPU while the storm runs).
+    //
+    // THE FIX (tracer-side, semantics-preserving): at ENTRY of
+    // kill/tgkill/rt_sigqueueinfo, a pid argument equal to the fake
+    // value (1) is translated to the CALLING tracee's REAL tgid before
+    // the syscall executes. A guest's "pid 1" can only ever mean "my
+    // own fake-pid-1 self" — no guest process can legitimately address
+    // HOST pid 1 (that is precisely the leak class the 6-Z185 sandbox
+    // backstop exists to block), and the /proc virtualization never
+    // exposes any guest process numbered 1 to another guest. This
+    // completes the illusion contract the getpid fake already
+    // establishes, on the signal side.
+    //
+    // Verified against the kernel UAPI headers:
+    //   x86_64:  kill=62, tgkill=234, rt_sigqueueinfo=129
+    //   i386:    kill=37, tgkill=270, rt_sigqueueinfo=178
+    //   aarch64: kill=129, tgkill=131, rt_sigqueueinfo=138
+    //   arm32 (EABI): kill=37, tgkill=268, rt_sigqueueinfo=178
+    // No collisions with existing fields: arm32 statfs64=266/
+    // fstatfs64=267 leave 268 free for tgkill; i386 statfs64=268/
+    // fstatfs64=269 leave 270 free; the rt_sig* families (174-179 on
+    // i386/arm32) do not overlap anything already carried.
+    //
+    // tkill (x86_64=200, aarch64=130, arm32=130, i386=239) is
+    // deliberately NOT translated: it takes a bare tid (no tgid), the
+    // getpid fake never reaches its arguments, and bionic never issues
+    // it. kill(0, …) / kill(-1, …) are left untouched: 0 means "my
+    // process group" (kernel-native, correct), and negative-pid
+    // broadcast policy belongs to the 6-Z185 sandbox backstop, not to
+    // pid translation.
+    kill_nr: i64,
+    tgkill_nr: i64,
+    rt_sigqueueinfo_nr: i64,
 }
 
 // x86_64 user_regs_struct field order (as u64 array indices):
@@ -1631,6 +1682,11 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     reg_arg6: 8, // r9
     reg_marker: -1,
     reg_sp: 19, // rsp
+    // 6-Z266 kill-family numbers (see the field docs on ChildAbi):
+    // x86_64 kill=62, tgkill=234, rt_sigqueueinfo=129.
+    kill_nr: 62,
+    tgkill_nr: 234,
+    rt_sigqueueinfo_nr: 129,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -2017,6 +2073,13 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // `rsp` slot when reporting registers via PTRACE_GETREGS, so we
     // use the same index as the 64-bit ABI (19).
     reg_sp: 19, // rsp (zero-extended esp)
+    // 6-Z266 kill-family numbers (see the field docs on ChildAbi):
+    // i386 kill=37, tgkill=270, rt_sigqueueinfo=178 (per
+    // /usr/include/x86_64-linux-gnu/asm/unistd_32.h; 268/269 are
+    // statfs64/fstatfs64 here, so tgkill uses 270).
+    kill_nr: 37,
+    tgkill_nr: 270,
+    rt_sigqueueinfo_nr: 178,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -2357,6 +2420,13 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // `sp`, `pc`, `pstate`. The `sp` field is therefore at index 31
     // when reinterpreted as a flat `u64` array.
     reg_sp: 31, // sp
+    // 6-Z266 kill-family numbers (see the field docs on ChildAbi):
+    // aarch64 (asm-generic) kill=129, tgkill=131, rt_sigqueueinfo=138.
+    // THIS is the table that fires for the user's OrangeFox R12
+    // lavender storm (bionic raise() = tgkill(1, tid, sig)).
+    kill_nr: 129,
+    tgkill_nr: 131,
+    rt_sigqueueinfo_nr: 138,
 };
 
 // ── 6-Z228: ABI_ARM32 — ELF32 EM_ARM children on an arm64 host ─────
@@ -2487,6 +2557,14 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     reg_arg6: 5,    // r5
     reg_marker: 6,  // r6 (fb_hook marker channel; low 32 of the marker)
     reg_sp: 31,     // widened view sp slot (r13 -> view.sp)
+    // 6-Z266 kill-family numbers (see the field docs on ChildAbi):
+    // arm32 (EABI, per arch/arm/tools/syscall.tbl) kill=37,
+    // tgkill=268, rt_sigqueueinfo=178 (arm32 rt_sig* follow the i386
+    // numbering: 174-179; statfs64=266/fstatfs64=267 leave 268 free
+    // for tgkill).
+    kill_nr: 37,
+    tgkill_nr: 268,
+    rt_sigqueueinfo_nr: 178,
 };
 
 /// Detect whether the traced child is a 32-bit (i386) or 64-bit (x86_64)
@@ -9098,6 +9176,160 @@ struct PendingMmap2Content {
     offset_bytes: u64,
 }
 
+// ── 6-Z266: allocation-free recent-stops ring record ────────────────
+//
+// The 6-Z83 ring previously stored a PRE-FORMATTED String per stop
+// (`format!("(loop={},pid={},…)")`). At the 6-Z253 storm's ~114k
+// stops/sec that alone was ~114k heap allocations per second on the
+// single tracer thread — pure overhead paid for a buffer that is only
+// ever READ at the rare LOST-ENTRY/EPERM tripwire dumps. The ring now
+// stores a `Copy` record and formats lazily at dump time
+// (`RecentStopRecord::render` keeps the OLD string format byte-for-
+// byte so existing log-parsing habits / CI greps stay valid).
+#[derive(Clone, Copy)]
+enum RecentStopKind {
+    Entry,
+    Exit,
+    /// PTRACE_EVENT stop: carries the event number + wait signal.
+    Event(u32, i32),
+    SigTrap,
+    SigSys,
+    SigStop,
+    /// Forwarded signal: carries the signal number.
+    Signal(i32),
+    GetregsFailed,
+    /// Constructed only on aarch64 hosts (the arm32-compat getregs
+    /// failure path at the per-child ABI refresh is cfg(aarch64)) —
+    /// mirrors the ABI_ARM32 cfg_attr pattern.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    Getregs32Failed,
+}
+
+#[derive(Clone, Copy)]
+struct RecentStopRecord {
+    loop_count: u64,
+    pid: libc::pid_t,
+    kind: RecentStopKind,
+    /// syscall number (Entry/Exit) or ptrace event number (Event).
+    nr: i64,
+}
+
+impl RecentStopRecord {
+    /// Renders EXACTLY the strings the old per-site `format!` calls
+    /// produced (log-format parity is load-bearing: CI artifact greps
+    /// and the worklog's evidence chains match on them).
+    fn render(&self) -> String {
+        match self.kind {
+            RecentStopKind::Entry => format!(
+                "(loop={},pid={},entry,nr={})",
+                self.loop_count, self.pid, self.nr
+            ),
+            RecentStopKind::Exit => format!(
+                "(loop={},pid={},exit,nr={})",
+                self.loop_count, self.pid, self.nr
+            ),
+            RecentStopKind::Event(ev, sig) => format!(
+                "(loop={},pid={},event{},sig={})",
+                self.loop_count, self.pid, ev, sig
+            ),
+            RecentStopKind::SigTrap => {
+                format!("(loop={},pid={},sigtrap)", self.loop_count, self.pid)
+            }
+            RecentStopKind::SigSys => {
+                format!("(loop={},pid={},sigsys)", self.loop_count, self.pid)
+            }
+            RecentStopKind::SigStop => {
+                format!("(loop={},pid={},sigstop)", self.loop_count, self.pid)
+            }
+            RecentStopKind::Signal(sig) => {
+                format!("(loop={},pid={},sig{})", self.loop_count, self.pid, sig)
+            }
+            RecentStopKind::GetregsFailed => format!(
+                "(loop={},pid={},syscall?,getregs-FAILED)",
+                self.loop_count, self.pid
+            ),
+            RecentStopKind::Getregs32Failed => format!(
+                "(loop={},pid={},syscall?,getregs32-FAILED)",
+                self.loop_count, self.pid
+            ),
+        }
+    }
+}
+
+// ── 6-Z266: fake-pid helpers for the kill-family translation ────────
+//
+/// The guest-visible pid the tracer's identity fakes hand out
+/// (getpid()/getppid() → 1/0 — see the module doc + getpid_hook.c).
+/// Every kill-family argument equal to this value is a fake-self
+/// reference produced under that illusion.
+const FAKE_GUEST_PID: i64 = 1;
+
+/// Read the REAL thread-group id of a tracee from /proc/<pid>/status
+/// (`Tgid:` line). The tracer needs it to translate the fake
+/// kill/tgkill pid argument to the kernel-truth target (6-Z266).
+///
+/// Host-side procfs read: the tracer may always read its OWN
+/// tracees' /proc entries — this never crosses into the guest's VFS
+/// view, so the GUEST-root ≠ HOST-root invariant is untouched (the
+/// value only ever appears in kr64's own host-side log, like the
+/// existing /proc/<pid>/exe bitness reads).
+fn read_real_tgid(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.trim().parse::<libc::pid_t>().ok();
+        }
+    }
+    None
+}
+
+/// 6-Z266: shape gate for the post-cap broad-DIAG sampler (kept as a
+/// named function so the policy is unit-testable).
+/// `shape_count` = how many stops of ONE (pid, nr, in_syscall) shape
+/// have been seen since the 20000-stop full-log cap.
+fn broad_diag_shape_wants(shape_count: u64) -> bool {
+    shape_count <= 8 || shape_count % 4096 == 0
+}
+
+/// 6-Z266: kill-family ABI numbers + collision guard (see the
+/// ChildAbi kill_nr/tgkill_nr/rt_sigqueueinfo_nr field docs).
+/// Test-only: called from the per-arch kill-family ABI tests.
+#[cfg(test)]
+fn assert_kill_family_abi(name: &str, kill_nr: i64, tgkill_nr: i64, rt_sigqueueinfo_nr: i64) {
+    // Kernel UAPI truth per ABI (this is THE invariant: a wrong number
+    // here would translate the wrong syscall's arguments).
+    let expected: &[(&str, i64)] = match name {
+        "x86_64" => &[("kill", 62), ("tgkill", 234), ("sigqueueinfo", 129)],
+        "i386" => &[("kill", 37), ("tgkill", 270), ("sigqueueinfo", 178)],
+        "aarch64" => &[("kill", 129), ("tgkill", 131), ("sigqueueinfo", 138)],
+        "arm32" => &[("kill", 37), ("tgkill", 268), ("sigqueueinfo", 178)],
+        _ => unreachable!("unknown ABI {}", name),
+    };
+    let actual = [
+        ("kill", kill_nr),
+        ("tgkill", tgkill_nr),
+        ("sigqueueinfo", rt_sigqueueinfo_nr),
+    ];
+    for (field, want) in expected {
+        let got = actual
+            .iter()
+            .find(|(f, _)| f == field)
+            .map(|(_, v)| *v)
+            .unwrap();
+        assert_eq!(got, *want, "{}: {} kernel UAPI number", name, field);
+    }
+    // No collision with the other kill-family numbers on the same ABI
+    // (three distinct syscalls — an overlap would rewrite the wrong
+    // argument register).
+    assert_ne!(kill_nr, tgkill_nr, "{}: kill==tgkill", name);
+    assert_ne!(kill_nr, rt_sigqueueinfo_nr, "{}: kill==sigqueueinfo", name);
+    assert_ne!(
+        tgkill_nr, rt_sigqueueinfo_nr,
+        "{}: tgkill==sigqueueinfo",
+        name
+    );
+}
+
 /// Task 6-Z62: convert the mmap-offset argument to BYTES.
 ///
 /// i386 `mmap2` (nr=192) takes the offset in 4096-byte units — the
@@ -9992,7 +10224,16 @@ pub fn run_ptrace_loop(
     // the 6-Z83 LOST-ENTRY/EPERM tripwire dumps the ring so a lost or
     // misrouted stop is identifiable from ONE E2E logcat.
     const RECENT_STOPS_CAP: usize = 16;
-    let mut recent_stops: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut recent_stops: std::collections::VecDeque<RecentStopRecord> =
+        std::collections::VecDeque::new();
+    // 6-Z266: real-tgid cache for the kill-family fake-pid translation.
+    // Filled lazily per tracee (one /proc/<pid>/status read per pid per
+    // boot); cleared never — tracee tgids are immutable for the life of
+    // the tracee, and stale entries for dead pids are unreachable (a
+    // recycled pid would be a NEW tracee that overwrites its entry on
+    // first use).
+    let mut real_tgid_cache: std::collections::HashMap<libc::pid_t, libc::pid_t> =
+        std::collections::HashMap::new();
 
     // ── Task 6-Z9: xattr-SET syscall-rewrite state ───────────────────
     //
@@ -11966,10 +12207,12 @@ pub fn run_ptrace_loop(
                 if recent_stops.len() == RECENT_STOPS_CAP {
                     recent_stops.pop_front();
                 }
-                recent_stops.push_back(format!(
-                    "(loop={},pid={},event{},sig={})",
-                    loop_count, pid, ptrace_event, sig
-                ));
+                recent_stops.push_back(RecentStopRecord {
+                    loop_count,
+                    pid,
+                    kind: RecentStopKind::Event(ptrace_event, sig),
+                    nr: ptrace_event as i64,
+                });
                 match ptrace_event {
                     ev if ev == libc::PTRACE_EVENT_FORK as u32
                         || ev == libc::PTRACE_EVENT_VFORK as u32
@@ -12694,10 +12937,14 @@ pub fn run_ptrace_loop(
                         if recent_stops.len() == RECENT_STOPS_CAP {
                             recent_stops.pop_front();
                         }
-                        recent_stops.push_back(format!(
-                            "(loop={},pid={},syscall?,getregs-FAILED)",
-                            loop_count, pid
-                        ));
+                        recent_stops.push_back(RecentStopRecord {
+                            loop_count,
+                            pid,
+                            kind: RecentStopKind::GetregsFailed,
+                            // nr is unused by this kind's render (register
+                            // read failed — no syscall number is knowable).
+                            nr: 0,
+                        });
                         continue;
                     }
                 };
@@ -12772,10 +13019,12 @@ pub fn run_ptrace_loop(
                         if recent_stops.len() == RECENT_STOPS_CAP {
                             recent_stops.pop_front();
                         }
-                        recent_stops.push_back(format!(
-                            "(loop={},pid={},syscall?,getregs32-FAILED)",
-                            loop_count, pid
-                        ));
+                        recent_stops.push_back(RecentStopRecord {
+                            loop_count,
+                            pid,
+                            kind: RecentStopKind::Getregs32Failed,
+                            nr: syscall_num,
+                        });
                         continue;
                     }
                     v
@@ -12808,10 +13057,64 @@ pub fn run_ptrace_loop(
                     // identification in the interesting window (the RAW
                     // STOP lines carry no syscall number; the informative
                     // broad lines stopped 10000 stops earlier). Keep full
-                    // logging to 20000, then SAMPLE 1-in-64 (tagged) so a
-                    // spin loop's syscall SHAPE stays on the record for
-                    // the whole boot without flooding the log.
-                    let sampled = n >= 20000 && (n % 64) == 0;
+                    // logging to 20000, then SAMPLE (tagged).
+                    //
+                    // 6-Z266: the old 1-in-64 round-robin was itself a
+                    // phone-class performance bug. On the user's lavender
+                    // boot the post-cap storm ran at ~114,000 stops/sec →
+                    // ~1,780 formatted lines/sec pushed through the
+                    // stderr pipe into the Java FileLogger chain — I/O +
+                    // formatting CPU stacked ON TOP of the ptrace storm.
+                    // Post-cap sampling is now SHAPE-AWARE:
+                    //   * per-(pid, nr, in_syscall) shape: the first 8
+                    //     occurrences after the cap always log (a new
+                    //     shape stays visible), then every 4096th
+                    //     occurrence of THAT shape (long-run shape
+                    //     statistics survive);
+                    //   * plus a global 10/sec gate so a pathological
+                    //     boot can never emit more than ~10 sampled
+                    //     lines/sec through the pipe no matter how many
+                    //     shapes are hot;
+                    //   * each post-cap line additionally carries the
+                    //     tracee's comm + arg1/arg2 so a spin is
+                    //     attributed to a PROCESS and its poll/nfds/timeout
+                    //     pattern in one line (the ppoll-EFAULT storm
+                    //     thread this log round identified would have
+                    //     named itself on line one).
+                    let sampled = if n < 20000 {
+                        false
+                    } else {
+                        type BroadDiagShapeMap =
+                            std::collections::HashMap<(libc::pid_t, i64, bool), u64>;
+                        static SHAPE_COUNTS: std::sync::OnceLock<
+                            std::sync::Mutex<BroadDiagShapeMap>,
+                        > = std::sync::OnceLock::new();
+                        static LAST_SAMPLED_MS: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let counts = SHAPE_COUNTS.get_or_init(|| {
+                            std::sync::Mutex::new(std::collections::HashMap::new())
+                        });
+                        let shape_count = match counts.lock() {
+                            Ok(mut m) => *m
+                                .entry((pid, syscall_num, in_syscall))
+                                .and_modify(|c| *c += 1)
+                                .or_insert(1),
+                            Err(_) => 0,
+                        };
+                        let shape_wants = broad_diag_shape_wants(shape_count);
+                        if !shape_wants {
+                            false
+                        } else {
+                            let now_ms = crate::boot_elapsed_ms() as u64;
+                            let last = LAST_SAMPLED_MS.load(std::sync::atomic::Ordering::Relaxed);
+                            if now_ms.saturating_sub(last) >= 100 {
+                                LAST_SAMPLED_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
                     if n < 20000 || sampled {
                         let tag = if n < 20000 {
                             format!("broad #{}/20000", n + 1)
@@ -12824,14 +13127,29 @@ pub fn run_ptrace_loop(
                         // (the daisy OrangeFox boot showed an 18k-iteration
                         // nr=80/62/63 fstat+lseek+read loop that we could
                         // not attribute to a file).
+                        // 6-Z266: post-cap lines add comm + arg1 + arg2.
+                        let extra = if n < 20000 {
+                            String::new()
+                        } else {
+                            let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                .map(|s| s.trim().to_string())
+                                .unwrap_or_else(|_| "?".to_string());
+                            format!(
+                                " comm={} arg1={:#x} arg2={:#x}",
+                                comm,
+                                get_syscall_arg(&regs, abi.reg_arg1),
+                                get_syscall_arg(&regs, abi.reg_arg2)
+                            )
+                        };
                         log(&format!(
-                            "6-Z210 DIAG (broad): syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} arg0={:#x} [{}]",
+                            "6-Z210 DIAG (broad): syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} arg0={:#x}{} [{}]",
                             syscall_num,
                             pid,
                             loop_count,
                             in_syscall,
                             abi.mount,
                             get_syscall_arg(&regs, 0),
+                            extra,
                             tag
                         ));
                     }
@@ -12987,13 +13305,16 @@ pub fn run_ptrace_loop(
                 if recent_stops.len() == RECENT_STOPS_CAP {
                     recent_stops.pop_front();
                 }
-                recent_stops.push_back(format!(
-                    "(loop={},pid={},{},nr={})",
+                recent_stops.push_back(RecentStopRecord {
                     loop_count,
                     pid,
-                    if is_entry { "entry" } else { "exit" },
-                    syscall_num
-                ));
+                    kind: if is_entry {
+                        RecentStopKind::Entry
+                    } else {
+                        RecentStopKind::Exit
+                    },
+                    nr: syscall_num,
+                });
 
                 // Task 6-Z57: ENOSYS early override (6-Z68: EXIT stops ONLY —
                 // writing rax at an ENTRY stop is a no-op that the syscall
@@ -15356,37 +15677,167 @@ pub fn run_ptrace_loop(
                                 log("intercepted getppid() -> will return 1");
                             }
                         }
-                        // ── 6-Z251: tgkill ENTRY DIAG (the 3.7.0_11 spin class) ──
+                        // ── 6-Z251 → 6-Z266: kill-family ENTRY arm ──────
                         //
-                        // The AOSP-layout generation (ocean/kebab/
-                        // hotdog/instantnoodle) reaches init's rc/service
-                        // phase then spins in an ENDLESS tgkill loop
-                        // (run 33321548615: pid 2625 = the guest init,
-                        // sampled DIAG shows nr=131 from loop 22593 to
-                        // the end of the boot window, ~240k iterations,
-                        // ZERO child stops interleaved). tgkill is NOT
-                        // intercepted, so the target tgid/tid/signal
-                        // were never on the record — the loop's OWNER
-                        // (init self-wake? a dying service? a blocked
-                        // reap?) is unidentifiable. Log the first 24
-                        // calls with all three args; a repeating
-                        // (tgid, tid, sig) pattern names the loop.
-                        n if n == 131 && abi.open == -1 => {
-                            // aarch64 children only: on aarch64 nr 131 is
-                            // tgkill, and ABI_AARCH64 is the only ABI with
-                            // open == -1 (x86_64 children share getpid==39
-                            // but their nr 131 is rt_sigtimedwait).
-                            static TGKILL_DIAG: std::sync::atomic::AtomicU64 =
-                                std::sync::atomic::AtomicU64::new(0);
-                            let n = TGKILL_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if n < 24 {
-                                let tgid = get_syscall_arg(&regs, abi.reg_arg1);
-                                let tid = get_syscall_arg(&regs, abi.reg_arg2);
-                                let sig = get_syscall_arg(&regs, abi.reg_arg3);
-                                log(&format!(
-                                    "6-Z253: tgkill ENTRY (broad) tgid={} tid={} sig={} pid={} loop_count={} [tgkill #{}/24]",
-                                    tgid, tid, sig, pid, loop_count, n + 1
-                                ));
+                        // HISTORY: 6-Z251/6-Z253 added a DIAGNOSTICS-ONLY
+                        // tgkill ENTRY log for the AOSP-layout spin class
+                        // (ocean/kebab/hotdog/instantnoodle reached the
+                        // rc/service phase then spun in an endless tgkill
+                        // loop — run 33321548615: pid 2625 = guest init,
+                        // nr=131 from loop 22593 to the end of the boot
+                        // window, ~240k iterations, ZERO child stops
+                        // interleaved). The owner stayed unidentifiable.
+                        // 6-Z266 (this arm) identified it — bionic
+                        // raise()/abort() spinning on tgkill(1,…) = the
+                        // fake getpid() reaching the real kernel — and
+                        // REPLACES the diagnostics with the fix below.
+                        // ── 6-Z266: kill-family FAKE-PID TRANSLATION ────
+                        //
+                        // THE BUG CLASS (was "6-Z253 tgkill spin"): the
+                        // tracer fakes every guest getpid() to 1 (both the
+                        // seccomp/SIGSYS fake and libgetpid_hook.so), so
+                        // bionic's
+                        //     raise(sig) = tgkill(getpid(), gettid(), sig)
+                        // reaches the REAL kernel as tgkill(1, tid, sig).
+                        // No real signalable thread group "1" exists for
+                        // the tracee → the kernel returns -ESRCH →
+                        // abort()'s raise-retry loop spins forever at
+                        // ~30k syscall stops/sec/thread. Measured on the
+                        // user's own OrangeFox R12 lavender image (CI run
+                        // 33353128469): 250,588 tgkill + 248,083 ppoll
+                        // stops per boot; the phone's CPU saturates → the
+                        // user's "takes a minute to boot" + "touch input
+                        // is SUPER delayed".
+                        //
+                        // THE FIX (semantics-preserving virtualization):
+                        // at ENTRY, translate a pid argument equal to the
+                        // fake value (FAKE_GUEST_PID = 1) to the CALLING
+                        // tracee's REAL tgid before the syscall executes:
+                        //   * tgkill(tgid, tid, sig): tgid == 1 → real
+                        //     tgid; tid == 1 → real tgid (the group
+                        //     leader's TID IS the TGID on Linux — a guest
+                        //     that passes "pid 1" as the tid means "the
+                        //     main thread of my fake-pid-1 group").
+                        //   * kill(pid, sig): pid == 1 → real tgid.
+                        //   * rt_sigqueueinfo(pid, sig, uinfo):
+                        //     pid == 1 → real tgid.
+                        // Real (non-1) pid arguments pass through
+                        // untouched — guest↔guest signaling between real
+                        // traced pids keeps working natively, and signals
+                        // between tracees of the SAME group were already
+                        // valid. tkill is not handled (no tgid argument —
+                        // see the ChildAbi field docs); kill(0)/negative
+                        // pids are not handled (kernel-native "process
+                        // group" semantics / 6-Z185 backstop policy).
+                        //
+                        // The register rewrite uses the same
+                        // set_syscall_arg + ptrace_setregs pattern as the
+                        // path-translation arms; no scratch memory is
+                        // needed (plain register value swap). The real
+                        // syscall then executes and the kernel delivers
+                        // the signal for real — abort() finally KILLS the
+                        // aborting process the way it does on a physical
+                        // device, init reaps and restarts it (bounded),
+                        // and the storm is gone at its only source.
+                        n if (abi.kill_nr != -1 && n == abi.kill_nr)
+                            || (abi.tgkill_nr != -1 && n == abi.tgkill_nr)
+                            || (abi.rt_sigqueueinfo_nr != -1 && n == abi.rt_sigqueueinfo_nr) =>
+                        {
+                            let is_tgkill = abi.tgkill_nr != -1 && n == abi.tgkill_nr;
+                            let syscall_label = if is_tgkill {
+                                "tgkill"
+                            } else if abi.kill_nr != -1 && n == abi.kill_nr {
+                                "kill"
+                            } else {
+                                "rt_sigqueueinfo"
+                            };
+                            let pid_arg = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            let tid_arg = if is_tgkill {
+                                Some(get_syscall_arg(&regs, abi.reg_arg2) as i64)
+                            } else {
+                                None
+                            };
+                            let sig_arg = if is_tgkill {
+                                get_syscall_arg(&regs, abi.reg_arg3) as i64
+                            } else {
+                                get_syscall_arg(&regs, abi.reg_arg2) as i64
+                            };
+
+                            let tgid_translated = if pid_arg == FAKE_GUEST_PID {
+                                let real = match real_tgid_cache.get(&pid) {
+                                    Some(t) => Some(*t),
+                                    None => {
+                                        let t = read_real_tgid(pid);
+                                        if let Some(t) = t {
+                                            real_tgid_cache.insert(pid, t);
+                                        }
+                                        t
+                                    }
+                                };
+                                match real {
+                                    Some(real_tgid) => {
+                                        set_syscall_arg(&mut regs, abi.reg_arg1, real_tgid as u64);
+                                        Some(real_tgid)
+                                    }
+                                    // No /proc record (thread already
+                                    // dead?): leave the argument as-is —
+                                    // the kernel answers ESRCH exactly
+                                    // as before this fix. Never worse.
+                                    None => None,
+                                }
+                            } else {
+                                None
+                            };
+                            let tid_translated = match (is_tgkill, tid_arg) {
+                                (true, Some(tid)) if tid == FAKE_GUEST_PID => {
+                                    // Group-leader self-reference: the
+                                    // leader's TID == the TGID. Reuse the
+                                    // (possibly already translated) tgid
+                                    // argument value.
+                                    let leader = tgid_translated.unwrap_or(pid_arg as libc::pid_t);
+                                    set_syscall_arg(&mut regs, abi.reg_arg2, leader as u64);
+                                    Some(leader)
+                                }
+                                _ => None,
+                            };
+
+                            if tgid_translated.is_some() || tid_translated.is_some() {
+                                if let Err(e) = ptrace_setregs(pid, &regs, iov_len) {
+                                    log(&format!(
+                                        "6-Z266: {} translation setregs FAILED pid={}: {} — syscall will execute untranslated (ESRCH as before)",
+                                        syscall_label, pid, e
+                                    ));
+                                }
+                                // Rate-capped visibility: the first 24
+                                // translations log in full (they name the
+                                // signal loops); afterwards a sampled line
+                                // every 65536th translation proves the
+                                // fix stays hot without flooding the log
+                                // (this arm sits on the old storm path).
+                                static KILL_TRANSLATION_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let k = KILL_TRANSLATION_LOGGED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if k < 24 || k % 65536 == 0 {
+                                    log(&format!(
+                                        "6-Z266 FIX: {} (tgid={}{} sig={}) translated on pid={} → real tgid={} [translation #{}{}]",
+                                        syscall_label,
+                                        pid_arg,
+                                        match tid_arg {
+                                            Some(t) => format!(", tid={}", t),
+                                            None => String::new(),
+                                        },
+                                        sig_arg,
+                                        pid,
+                                        tgid_translated.unwrap_or(0),
+                                        k + 1,
+                                        if k < 24 {
+                                            "/24".to_string()
+                                        } else {
+                                            " sampled".to_string()
+                                        }
+                                    ));
+                                }
                             }
                         }
                         n if n == abi.open || n == abi.openat || n == abi.openat2 => {
@@ -18606,7 +19057,7 @@ pub fn run_ptrace_loop(
                                         le_pending_fd,
                                         recent_stops
                                             .iter()
-                                            .cloned()
+                                            .map(|r| r.render())
                                             .collect::<Vec<_>>()
                                             .join(" | ")
                                     ));
@@ -21995,7 +22446,16 @@ pub fn run_ptrace_loop(
                 if recent_stops.len() == RECENT_STOPS_CAP {
                     recent_stops.pop_front();
                 }
-                recent_stops.push_back(format!("(loop={},pid={},sigtrap)", loop_count, pid));
+                recent_stops.push_back(RecentStopRecord {
+                    loop_count,
+                    pid,
+                    kind: RecentStopKind::SigTrap,
+                    // Non-syscall stop branch: syscall_num is not yet in
+                    // scope here (it is only computed inside the
+                    // SIGTRAP|0x80 syscall-stop branch) and this kind's
+                    // render never reads nr.
+                    nr: 0,
+                });
                 // Regular SIGTRAP (breakpoint, single-step without 0x80
                 // marker, etc.). We did NOT request delivery of any signal
                 // so falling through to the next PTRACE_SYSCALL (with a
@@ -22161,7 +22621,13 @@ pub fn run_ptrace_loop(
                 if recent_stops.len() == RECENT_STOPS_CAP {
                     recent_stops.pop_front();
                 }
-                recent_stops.push_back(format!("(loop={},pid={},sigsys)", loop_count, pid));
+                recent_stops.push_back(RecentStopRecord {
+                    loop_count,
+                    pid,
+                    kind: RecentStopKind::SigSys,
+                    // Same scope note as SigTrap above (non-syscall stop).
+                    nr: 0,
+                });
                 let in_syscall_at_sigsys = in_syscall;
                 let mut sigsys_regs: Regs = unsafe { std::mem::zeroed() };
                 match ptrace_getregs_wide(pid, &mut sigsys_regs) {
@@ -23301,7 +23767,13 @@ pub fn run_ptrace_loop(
                 if recent_stops.len() == RECENT_STOPS_CAP {
                     recent_stops.pop_front();
                 }
-                recent_stops.push_back(format!("(loop={},pid={},sigstop)", loop_count, pid));
+                recent_stops.push_back(RecentStopRecord {
+                    loop_count,
+                    pid,
+                    kind: RecentStopKind::SigStop,
+                    // Same scope note as SigTrap above (non-syscall stop).
+                    nr: 0,
+                });
                 // ── Task 6-S: SIGSTOP for a freshly-attached child ──
                 //
                 // When PTRACE_O_TRACEFORK auto-attaches us to a new
@@ -23405,7 +23877,13 @@ pub fn run_ptrace_loop(
                 if recent_stops.len() == RECENT_STOPS_CAP {
                     recent_stops.pop_front();
                 }
-                recent_stops.push_back(format!("(loop={},pid={},sig{})", loop_count, pid, sig));
+                recent_stops.push_back(RecentStopRecord {
+                    loop_count,
+                    pid,
+                    kind: RecentStopKind::Signal(sig),
+                    // Same scope note as SigTrap above (non-syscall stop).
+                    nr: 0,
+                });
                 log(&format!("forwarding signal {} to child", sig));
 
                 // For SIGSEGV (signal 11), log the crash address and
@@ -24747,6 +25225,145 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             assert_ne!(ABI_AARCH64.capset, 56); // openat
             assert_ne!(ABI_AARCH64.capset, 94); // exit_group
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kill_family_abi_numbers_kernel_correct_6z266() {
+        // 6-Z266: the fake-pid translation rewrites a REGISTER based on
+        // these numbers — a wrong number would rewrite the wrong
+        // syscall's arguments (signal delivered to / read from garbage).
+        // Lock the kernel UAPI truth + mutual distinctness for both
+        // x86-host ABIs (aarch64/arm32 are cfg-checked separately).
+        assert_kill_family_abi(
+            "x86_64",
+            ABI_X86_64.kill_nr,
+            ABI_X86_64.tgkill_nr,
+            ABI_X86_64.rt_sigqueueinfo_nr,
+        );
+        assert_kill_family_abi(
+            "i386",
+            ABI_X86_32.kill_nr,
+            ABI_X86_32.tgkill_nr,
+            ABI_X86_32.rt_sigqueueinfo_nr,
+        );
+        // No collision with the ABI's existing heavy-traffic numbers.
+        for (name, abi) in [("x86_64", &ABI_X86_64), ("i386", &ABI_X86_32)] {
+            for (field, val) in [
+                ("kill", abi.kill_nr),
+                ("tgkill", abi.tgkill_nr),
+                ("sigqueueinfo", abi.rt_sigqueueinfo_nr),
+            ] {
+                assert_ne!(val, abi.getpid, "{}: {} collides with getpid", name, field);
+                assert_ne!(val, abi.execve, "{}: {} collides with execve", name, field);
+                assert_ne!(val, abi.mount, "{}: {} collides with mount", name, field);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn kill_family_abi_numbers_kernel_correct_aarch64_arm32_6z266() {
+        // aarch64 hosts: both the aarch64 table (the user's OrangeFox
+        // lavender storm fires HERE — bionic raise() = tgkill(1,tid,sig)
+        // with ABI_AARCH64.tgkill_nr=131) and the arm32-compat table.
+        assert_kill_family_abi(
+            "aarch64",
+            ABI_AARCH64.kill_nr,
+            ABI_AARCH64.tgkill_nr,
+            ABI_AARCH64.rt_sigqueueinfo_nr,
+        );
+        assert_kill_family_abi(
+            "arm32",
+            ABI_ARM32.kill_nr,
+            ABI_ARM32.tgkill_nr,
+            ABI_ARM32.rt_sigqueueinfo_nr,
+        );
+    }
+
+    #[test]
+    fn recent_stop_record_render_matches_legacy_strings_6z266() {
+        // The ring switched from pre-formatted Strings to Copy records;
+        // the rendered strings MUST stay byte-identical (CI artifact
+        // greps + worklog evidence chains match on them).
+        let r = |kind| RecentStopRecord {
+            loop_count: 4112065,
+            pid: 15303,
+            kind,
+            nr: 73,
+        };
+        assert_eq!(
+            r(RecentStopKind::Entry).render(),
+            "(loop=4112065,pid=15303,entry,nr=73)"
+        );
+        assert_eq!(
+            r(RecentStopKind::Exit).render(),
+            "(loop=4112065,pid=15303,exit,nr=73)"
+        );
+        assert_eq!(
+            r(RecentStopKind::Event(2, 5)).render(),
+            "(loop=4112065,pid=15303,event2,sig=5)"
+        );
+        assert_eq!(
+            r(RecentStopKind::SigTrap).render(),
+            "(loop=4112065,pid=15303,sigtrap)"
+        );
+        assert_eq!(
+            r(RecentStopKind::SigSys).render(),
+            "(loop=4112065,pid=15303,sigsys)"
+        );
+        assert_eq!(
+            r(RecentStopKind::SigStop).render(),
+            "(loop=4112065,pid=15303,sigstop)"
+        );
+        assert_eq!(
+            r(RecentStopKind::Signal(9)).render(),
+            "(loop=4112065,pid=15303,sig9)"
+        );
+        assert_eq!(
+            r(RecentStopKind::GetregsFailed).render(),
+            "(loop=4112065,pid=15303,syscall?,getregs-FAILED)"
+        );
+        assert_eq!(
+            r(RecentStopKind::Getregs32Failed).render(),
+            "(loop=4112065,pid=15303,syscall?,getregs32-FAILED)"
+        );
+        // Copy semantics (the reason the ring no longer allocates per
+        // stop): records must be trivially copyable.
+        let rec = r(RecentStopKind::Entry);
+        let _copy: RecentStopRecord = rec;
+        let _second_copy: RecentStopRecord = rec; // Copy, not clone
+    }
+
+    #[test]
+    fn read_real_tgid_self_reports_own_pid_6z266() {
+        // In the test binary the calling thread IS its thread-group
+        // leader, so /proc/self/status Tgid == std::process::id().
+        // Proves the helper parses the real /proc layout.
+        assert_eq!(
+            read_real_tgid(std::process::id() as libc::pid_t),
+            Some(std::process::id() as libc::pid_t)
+        );
+        // A bogus pid reads as None (translation falls back to
+        // pass-through — never worse than the pre-fix ESRCH).
+        assert_eq!(read_real_tgid(-1), None);
+        assert_eq!(read_real_tgid(0), None);
+    }
+
+    #[test]
+    fn broad_diag_shape_gate_6z266() {
+        // First 8 occurrences of a shape always sample (a new shape is
+        // immediately visible), then every 4096th keeps long-run
+        // statistics on the record.
+        for c in 1..=8 {
+            assert!(broad_diag_shape_wants(c), "count {} should sample", c);
+        }
+        assert!(!broad_diag_shape_wants(9));
+        assert!(!broad_diag_shape_wants(100));
+        assert!(!broad_diag_shape_wants(4095));
+        assert!(broad_diag_shape_wants(4096));
+        assert!(broad_diag_shape_wants(8192));
+        assert!(!broad_diag_shape_wants(8193));
     }
 
     #[cfg(target_arch = "x86_64")]
