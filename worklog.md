@@ -22325,3 +22325,122 @@ Stage Summary:
   (Settings -> send log) to target the remaining phone-minute phases;
   (3) the 6-Z259 tracer stop-accounting investigation now has ring
   dumps at the 6-Z257 bind window for the next cereus/daisy wave.
+
+---
+Task ID: 6-Z266 (user log-pack round: boot latency + touch-input delay)
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: The user shipped the physical-device log pack (log.tar.xz: app.log,
+boot.log, kr64.log, proc.log — the exact artifact the 6-Z265 wave asked
+for) and reported: "maybe that's why it takes super long to boot and the
+touch screen input IS SUPER DELAYED, please optimize the app HEAVILY".
+Read the [+Nms] phases, decompose the phone minute, fix the top phase.
+
+Work Log:
+- PHONE LOG-PACK EVIDENCE (device session 08:57-08:59Z, io.twoyi.debug):
+  * app.log: renderer_init +40.1s (app-relative), surface_destroyed
+    +143.154s — a 103 s session that ended in the app being killed
+    (user backgrounding / soft reboot), consistent with the crawl.
+  * kr64.log (the FileLogger's own 8 MB tail of a 31.9 MB stderr):
+    loop_count 4,112,065 -> 7,154,049 across a 26.6 s window =
+    ~114,000 waitpid-loop iterations/sec. 47,531 of the 50,308 log
+    lines are "6-Z210 DIAG (broad)" samples — the storm IS the log.
+  * Storm composition (sampled): pid 15303 ppoll 12,033 + tgkill
+    11,460; pid 15300 ppoll 6,698 + tgkill 6,076; pid 15301 read
+    5,008 + tgkill 3,096 + ppoll 2,813. Every tgkill sample shows
+    return -3 (ESRCH); every ppoll sample -14 (EFAULT).
+  * pid 15301 = a guest shell loop forking children every ~350 ms
+    that exec /system/bin/sh -> /system/bin/pigz (exit 0). pigz
+    appears ONLY in the phone pack (user-session-specific action),
+    zero hits in the full CI log — noted, not a boot-phase factor.
+  * [KR64][binder][vm0] servicemanager checkService (code=2) every
+    ~100 ms for the whole window — a v1 client polling a service
+    that never registers; the legacy v1 path cannot name the service
+    (no inline parcel). Rate-limited the INFO flood this round; the
+    NAME needs the v1 request-parcel read (BINDER-3 follow-up).
+  * proc.log: 44 threads, VmSwap 37 MB — the app is under memory
+    pressure and swapping on the phone.
+- CI CORROBORATION (run 33353128469, head 791b8ea, the user's exact
+  orangefox-R12.0-lavender image, FULL 89 MB kr64 log): 248,083
+  ppoll stops + 250,588 tgkill stops. The storm starts at +10.8 s —
+  EXACTLY the guest recovery execve point (+10.7 s per the 6-Z260
+  timeline) — so every boot carries it; server-class CPUs merely
+  hide it. The storm thread's tgkill ENTRY arg0 = 0x1.
+- ROOT CAUSE (exact mechanism, bounded):
+  getpid_hook.c + the tracer's identity fakes give EVERY guest
+  process getpid() == 1. bionic's raise(sig) is
+      tgkill(getpid(), gettid(), sig)  ->  tgkill(1, real_tid, sig)
+  The REAL kernel has no signalable thread group 1 for the tracee
+  (1 is the HOST's init — untouchable and rightly so) -> -ESRCH.
+  abort() retries raise() forever -> ~30k syscall stops/sec/thread,
+  114k tracer loop iterations/sec, half a million wasted stops per
+  boot. This is ALSO the "6-Z253 tgkill spin class" (ocean/kebab/
+  hotdog/instantnoodle endless tgkill loops, run 33321548615):
+  same mechanism, now identified. On the phone the storm saturates
+  the single tracer thread (which must also service the touch-socket
+  reads and every guest syscall) => boot ~1 minute + touch input
+  starving => "SUPER DELAYED" — and likely the residual 10 s
+  freeze-then-soft-reboot tail too (an abort that should kill the
+  aborting process instantly instead wedges the whole guest for the
+  watchdog timeout).
+- FIX 6-Z266 (tracer-side, semantics-preserving, no device hacks):
+  1) kill-family FAKE-PID TRANSLATION: new ChildAbi fields
+     kill_nr/tgkill_nr/rt_sigqueueinfo_nr (x86_64 62/234/129,
+     i386 37/270/178, aarch64 129/131/138, arm32 37/268/178 —
+     verified collision-free vs statfs64/fstatfs64 and the rest of
+     each table). At ENTRY, a pid argument equal to the fake value
+     (FAKE_GUEST_PID=1) is rewritten to the CALLING tracee's REAL
+     tgid (cached /proc/<pid>/status Tgid read); tgkill's tid==1 is
+     rewritten to the real tgid (group leader's TID == TGID). Real
+     pid args pass through; tkill untouched (no tgid arg); kill(0)/
+     negative pids untouched (kernel-native pgid semantics / 6-Z185
+     backstop policy). raise()/abort() now behave exactly as on a
+     physical device — the aborting process DIES, init reaps and
+     restarts it — and the storm is gone at its only source.
+  2) BROAD-DIAG SHAPE SAMPLER: post-cap sampling is no longer blind
+     1-in-64 (which alone produced ~1,780 formatted lines/sec
+     through the stderr pipe at 114k stops/sec). Now per-(pid, nr,
+     in_syscall) shapes: first 8 occurrences always log, then every
+     4096th of that shape, PLUS a global 10 lines/sec gate; post-cap
+     lines gain comm=, arg1=, arg2= so the next spin names its
+     process and its poll/nfds/timeout pattern on line one.
+  3) ALLOCATION-FREE STOP RING: the 6-Z83 recent-stops ring stored a
+     pre-formatted String per classified stop (~114k heap allocs/sec
+     under the storm). Now a Copy record, formatted only at dump
+     time; RecentStopRecord::render reproduces the legacy strings
+     byte-for-byte (parity test locks it).
+  4) BINDER INFO RATE LIMIT: the per-transaction "servicemanager
+     transaction" INFO line (10/sec forever on lavender) now logs
+     the first 4 per (vm, code) shape then every 200th with the
+     running count.
+- GATES: cargo fmt --check clean; cargo clippy --all-targets
+  -D warnings clean; kr64 host tests 675 green (671 + 4 new:
+  kill-family ABI kernel-truth + collision guard x86-host and
+  aarch64-host variants, ring render legacy-parity, read_real_tgid
+  /proc parsing + bogus-pid fallback, broad-DIAG shape gate policy);
+  loader mount-table 6-Z214 C host tests all pass.
+- DISPATCH: verification wave on this head — lavender (the user's
+  exact image) + daisy + whyred guards. ACCEPTANCE for the storm
+  fix: kr64 log contains "6-Z266 FIX:" translation lines instead of
+  a 6-Z210 broad-DIAG flood; nr=131/73 DIAG counts collapse from
+  ~250k+248k to noise; boot-to-first-UI on CI drops measurably
+  below the 18-20 s baseline (the execve->UI segment was ~7-9 s of
+  it on server CPUs); daisy/whyred guards stay UI_READY.
+
+Stage Summary:
+- The user's physical log pack + the full CI log converge on ONE
+  mechanism: the fake-getpid illusion breaks every guest
+  self-signal, and the abort-retry storm is the "super long boot"
+  and the "SUPER DELAYED touch input". Fixed at the source with
+  pid translation; the logging paths that rode the storm are
+  rate-limited and allocation-free; every ABI's translation numbers
+  are kernel-UAPI-locked by tests.
+- NEXT: (1) verify the wave above on CI (acceptance criteria in the
+  DISPATCH bullet); (2) after verification, measure the NEW boot
+  breakdown with 6-Z260 stamps — the 0->+10.7 s loader phase
+  (apex extraction, rootfs staging) is the next-biggest phone
+  minute contributor and is disk-I/O-shaped; (3) name the missing
+  checkService service by reading the v1 request parcel (BINDER-3
+  skeleton) — a guest polling for a service that never registers
+  is a functional gap, not just a log line; (4) the 6-Z259
+  stop-accounting investigation continues with the ring dumps.
