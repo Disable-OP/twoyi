@@ -23247,3 +23247,19 @@ Stage Summary:
 - Measured fixed-budget waits addressed this wave: ~20s keystore2/IKeystoreSecurity wait (registry was inert — now real registry + real keystore2 registration + real guest-local transaction routing), ~5s/tap vibrator wait (IVibrator/default now registered, on(ms) forwarded for REAL host vibration), 10s dm poll (synthetic uevent delivery), HIDL PING failures (answered).
 - Projected R12 boot-to-UI: 47s − ~18.5s (keystore2 poll) − ~10s (dm) ≈ 15-20s, plus theme-parse/exec CPU work remaining for later waves.
 - Next: dispatch R12 lavender CI verification on this head; while CI runs, continue the 6-Z268 T-item performance queue (T35 reap_child, T20 stop-ring, T16 setregs audit, T25/T26/T31/T34, vfs T1/T23, lib.rs T11-T13/T22/T27-T30, Java T8/T9/T10/T15/T32, T24 profile, T36).
+
+---
+Task ID: 6-Z271 CI dispatch
+Agent: Main dispatcher
+Date: 2026-08-31
+Task: verify the binder bus + HAL bridge + dm uevent wave on the user's exact OrangeFox R12 lavender image.
+
+Work Log:
+- Dispatched run 33425291816 (workflow ui-e2e-test-arm64, head 8c2495d = 6-Z271 + 6-Z271b, orangefox-R12.0-lavender, url https://api.orangefox.download/release/69f5cec33ba4241a6c1e095f/dl, md5 8dd3688b814fc99f8251e3c749812d92).
+- Not polling; continuing the T-item performance queue meanwhile.
+
+Stage Summary:
+- VERDICT GREPS for this run (discriminating evidence):
+  * binder: "addService(NAME)" lines present (keystore2/logd registered), "getService(NAME) hit" lines, ZERO 18s checkService poll gaps, "delivered transaction" lines (guest↔guest routing live), "Waiting for service 'android.hardware.vibrator.IVibrator/default'" count → 0.
+  * dm: "synthetic device-mapper uevent delivered" + NO "Wait for device-mapper returned after 10010ms".
+  * keystore2: guest logd lines showing "Successfully registered Keystore 2.0 service" (guest-side).
