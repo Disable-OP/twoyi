@@ -22876,3 +22876,23 @@ Work Log:
 
 Stage Summary:
 - 6-Z268 loader-segment win CONFIRMED by tracer stamps (10.1 s → ~40 ms) even on the failed image; boot verdict pending the A/B control.
+
+---
+Task ID: 6-Z268 fix round 1
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: root-cause the R11.1 bind regression and fix.
+
+Work Log:
+- A/B CONTROL RESULT: run 33389281715 (SAME R11.1 image, baseline commit 7a78a56 WITHOUT 6-Z268) = SUCCESS — BOOT_OK, blit_frames_last=20, pages=[filemanagerlist, menu, ...] (live UI navigation). THE BASELINE IS GREEN ON R11.1 → a 6-Z268 change regressed the property-socket bind.
+- MECHANISM PINNED (byte-level diff of the two runs):
+  * Baseline +128ms: 6-Z163 ENTRY sockaddr rewrite → real bind SUCCEEDS at {rootfs}/dev/socket/property_service → init fchownat → EPERM(-1) → 6-Z257 faked → "Created socket ... mode 666" → boot proceeds.
+  * 6-Z268 +101ms: 6-Z163 blob POKE succeeded (byte-identical blob, 01002f646174612f) BUT the following silent ptrace_getregs_wide/ptrace_setregs pair failed (no 6-Z163 log = the is_ok() tail; both callers silent by design) → bind ran on the RAW /dev/socket path → host EADDRINUSE(-98) → 6-Z101 faked 0 → follow-up fchmodat/fchownat on the canonical translated name → ENOENT(-2) (vs baseline EPERM) → init LOG(FATAL) "start_property_service socket creation failed" → exit_group(6). Teardown listing: {rootfs}/dev/socket EMPTY vs baseline's property_service/logdr/logdw/recovery sockets.
+  * ptrace worked immediately before (blob POKE) and after (6-Z257/6-Z258 EXIT fakes logged) — a transient GETREGSET/SETREGSET failure inside a microseconds-wide window; mechanism not yet nameable from the artifact because the tail had NO else-log (the exact "silent branch" class 6-Z163c was written to exterminate, present only in this last tail).
+- FIX (ptrace_emu.rs 6-Z163 tail hardening):
+  1. NO silent branches: getregs_wide failure + setregs failure now LOG errno (6-Z163 FAILED lines); setregs retries once (transient-failure class).
+  2. SELF-HEAL: when the register rewrite fails for any reason, the arm now CREATES A PLACEHOLDER NODE at the translated {rootfs}/dev/socket/property_service path — init's follow-up chmod/chown then see a real entry (chmod succeeds or EPERM→6-Z257 fake), which is byte-for-byte the baseline's survival shape, instead of the 6-Z229-documented fchmodat-ENOENT FATAL class.
+- cargo fmt clean, clippy -D warnings clean, 676/676 tests green.
+
+Stage Summary:
+- Hardened head ready for dispatch; next run either boots (placeholder saves the chain) or names the exact errno in the artifact.
