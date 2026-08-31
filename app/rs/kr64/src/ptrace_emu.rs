@@ -7040,6 +7040,7 @@ fn forget_dead_pid_state(
     accept4_einval_streak: &mut std::collections::HashMap<libc::pid_t, u64>,
     esrch_streak: &mut std::collections::HashMap<libc::pid_t, u32>,
     pending_getpid: &mut std::collections::HashSet<libc::pid_t>,
+    pending_uevent_recv: &mut std::collections::HashMap<libc::pid_t, (u64, u64, u64, u64, i64)>,
 ) {
     // 6-Z184 AUDIT FIX (agent 11): the death hygiene missed ~10 per-pid
     // maps — a pid-RECYCLED successor inherited stale state (e.g. a
@@ -7059,6 +7060,10 @@ fn forget_dead_pid_state(
     accept4_einval_streak.remove(&pid);
     esrch_streak.remove(&pid);
     pending_getpid.remove(&pid);
+    // 6-Z271b: a stale entry would make the recycled pid's FIRST EXIT
+    // consume a synthetic-uevent delivery with OLD buffers — POKEDATA
+    // into an unrelated process's memory. Must go with the process.
+    pending_uevent_recv.remove(&pid);
 }
 
 /// Task 6-Z111: drop the dead pid's property-area registrations. The
@@ -8992,6 +8997,21 @@ enum Reaped {
     /// gone either way.
     Gone,
 }
+
+/// 6-Z271b: the synthetic kernel uevent delivered to fake-uevent sockets
+/// for `/devices/virtual/misc/device-mapper`. Byte-for-byte the format
+/// the kernel emits on a uevent-file poke: `action@devpath` followed by
+/// NUL-separated `KEY=VALUE` pairs (init's `ParseEvent` walks exactly
+/// these keys). Delivered on the FIRST read of each fake-uevent socket —
+/// kernel multicast semantics (every listener gets every event once).
+///
+/// Used by BOTH delivery paths (the EXIT-side interception arm in the
+/// main loop AND the ENTRY-side getpid-rewrite path below) — whichever
+/// fires first wins; `netlink_dm_uevent_served` prevents duplicates.
+pub(crate) const DM_UEVENT_MSG: &[u8] = b"add@/devices/virtual/misc/device-mapper\0\
+ACTION=add\0DEVPATH=/devices/virtual/misc/device-mapper\0\
+SUBSYSTEM=misc\0MAJOR=254\0MINOR=0\0DEVNAME=device-mapper\0\
+SEQNUM=2001\0";
 
 /// Task 6-Z89 FIX 1a: REALLY reap a (presumed-dead) traced child.
 ///
@@ -10964,6 +10984,12 @@ pub fn run_ptrace_loop(
     // semantics: every listener gets every event exactly once).
     let mut netlink_dm_uevent_served: std::collections::HashSet<(libc::pid_t, i64)> =
         std::collections::HashSet::new();
+    // 6-Z271b: in-flight ENTRY-rewritten recvmsg/recvfrom on a fake-uevent
+    // fd — the syscall was turned into getpid (proven 6-Z257 pattern) and
+    // the EXIT stop must materialise the synthetic uevent instead. Value:
+    // (buf, buflen, src_addr, addrlen_p, fd).
+    let mut pending_uevent_recv: std::collections::HashMap<libc::pid_t, (u64, u64, u64, u64, i64)> =
+        std::collections::HashMap::new();
     // 6-Z271/T31: memoized getdents64 fd-origin verdicts per (pid, fd).
     // Cleared at every execve EXIT (the deferred-reset block) so an fd
     // number reused by the NEW image can never serve the old verdict.
@@ -12511,6 +12537,7 @@ pub fn run_ptrace_loop(
                 &mut accept4_einval_streak,
                 &mut esrch_streak,
                 &mut pending_getpid,
+                &mut pending_uevent_recv,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
@@ -12698,6 +12725,7 @@ pub fn run_ptrace_loop(
                 &mut accept4_einval_streak,
                 &mut esrch_streak,
                 &mut pending_getpid,
+                &mut pending_uevent_recv,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
@@ -16419,6 +16447,71 @@ pub fn run_ptrace_loop(
                     }
 
                     match syscall_num {
+                        n if (abi.recvmsg_nr != -1 && n == abi.recvmsg_nr)
+                            || (abi.recvfrom_nr != -1 && n == abi.recvfrom_nr) =>
+                        {
+                            // ── 6-Z271b: synthetic device-mapper uevent
+                            // delivery — ENTRY-rewrite path ──
+                            //
+                            // Run 33425291816: the EXIT-side RecvMsg arm
+                            // NEVER fired for init's recvmsg(fd=6) during
+                            // the 10 s dm wait (zero arm logs, zero
+                            // deliveries, the wait expired). This ENTRY
+                            // path rewrites the recv into getpid (the
+                            // proven 6-Z257 pattern — the native recv
+                            // never executes) and the EXIT stop
+                            // materialises the uevent. Dual-path with the
+                            // EXIT arm: whichever fires first wins
+                            // (netlink_dm_uevent_served de-dupes).
+                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            let in_set = fake_netlink_fds
+                                .get(&pid)
+                                .map_or(false, |s| s.contains(&fd));
+                            static UEVENT_RECV_ENTRY_DIAG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if UEVENT_RECV_ENTRY_DIAG
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                < 12
+                            {
+                                log(&format!(
+                                    "6-Z271b DIAG: recv ENTRY nr={} pid={} fd={:#x} in_fake_set={} buf={:#x} len={}",
+                                    syscall_num,
+                                    pid,
+                                    fd,
+                                    in_set,
+                                    get_syscall_arg(&regs, abi.reg_arg2),
+                                    get_syscall_arg(&regs, abi.reg_arg3)
+                                ));
+                            }
+                            if in_set && !netlink_dm_uevent_served.contains(&(pid, fd)) {
+                                let buf = get_syscall_arg(&regs, abi.reg_arg2);
+                                let buflen = get_syscall_arg(&regs, abi.reg_arg3);
+                                let src = get_syscall_arg(&regs, abi.reg_arg5);
+                                let addrlen_p = get_syscall_arg(&regs, abi.reg_arg6);
+                                set_syscall_num(&mut regs, &abi, abi.getpid);
+                                match ptrace_setregs(pid, &regs, iov_len) {
+                                    Ok(()) => {
+                                        if netlink_dm_uevent_served.len() >= 256 {
+                                            netlink_dm_uevent_served.clear();
+                                        }
+                                        netlink_dm_uevent_served.insert((pid, fd));
+                                        pending_uevent_recv.insert(
+                                            pid,
+                                            (buf, buflen, src, addrlen_p, fd),
+                                        );
+                                        log(&format!(
+                                            "6-Z271b: recv(fd={:#x}) ENTRY → rewritten to getpid — EXIT will deliver the synthetic device-mapper uevent ({} bytes)",
+                                            fd,
+                                            DM_UEVENT_MSG.len()
+                                        ));
+                                    }
+                                    Err(e) => log(&format!(
+                                        "6-Z271b: recv ENTRY REWRITE FAILED: {} — real recv will run (native EAGAIN)",
+                                        e
+                                    )),
+                                }
+                            }
+                        }
                         n if n == abi.getpid => {
                             pending_getpid.insert(pid);
                             if loop_count <= 20 {
@@ -20929,6 +21022,42 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    if let Some((buf, buflen, src_addr, addrlen_p, fd)) =
+                        pending_uevent_recv.remove(&pid)
+                    {
+                        // ── 6-Z271b: materialise the synthetic device-mapper
+                        // uevent for the recvmsg we rewrote to getpid at
+                        // ENTRY. Runs BEFORE the pending_getpid fake below
+                        // (that fake would overwrite our return with 1).
+                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
+                            if buf != 0 && buflen > 0 {
+                                let n = DM_UEVENT_MSG.len().min(buflen as usize);
+                                let wrote =
+                                    write_child_bytes_pokedata(pid, buf, &DM_UEVENT_MSG[..n]);
+                                let new_ret: i64 = if wrote == n { n as i64 } else { -11 };
+                                if new_ret > 0 && src_addr != 0 && addrlen_p != 0 {
+                                    let sal: [u8; 12] = [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                                    let _ = write_child_bytes_pokedata(pid, src_addr, &sal);
+                                    let _ = write_child_bytes_pokedata(
+                                        pid,
+                                        addrlen_p,
+                                        &12u32.to_ne_bytes(),
+                                    );
+                                }
+                                set_syscall_ret(&mut regs2, &abi, new_ret);
+                                let _ = ptrace_setregs(pid, &regs2, len);
+                                log(&format!(
+                                    "6-Z271b: synthetic device-mapper uevent DELIVERED to fd {:#x} pid={} ({} bytes, ret={}) — init's dm wait satisfied",
+                                    fd, pid, n, new_ret
+                                ));
+                            } else {
+                                set_syscall_ret(&mut regs2, &abi, -11);
+                                let _ = ptrace_setregs(pid, &regs2, len);
+                            }
+                        }
+                    }
+
                     if pending_getpid.contains(&pid) {
                         // Only consume for THIS pid, and only if the EXIT
                         // stop is still a syscall EXIT (the syscall_nr
@@ -22387,6 +22516,26 @@ pub fn run_ptrace_loop(
                                     .get(&pid)
                                     .map_or(false, |s| s.contains(&fd))
                                 {
+                                    // 6-Z271b DIAG (bounded): prove the arm's view
+                                    // of every recv on a fake-uevent fd — run
+                                    // 33425291816 showed ZERO RecvMsg arm firings
+                                    // despite init's recvmsg(fd=6) during the dm
+                                    // wait; this line pins fd/membership/buf so
+                                    // the next run answers why.
+                                    static UEVENT_RECV_EXIT_DIAG: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if UEVENT_RECV_EXIT_DIAG
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        < 12
+                                    {
+                                        let b = get_syscall_arg(&regs, abi.reg_arg2);
+                                        let l = get_syscall_arg(&regs, abi.reg_arg3);
+                                        log(&format!(
+                                            "6-Z271b DIAG: {:?} EXIT on fake-uevent fd {:#x} pid={} buf={:#x} len={} served={}",
+                                            op, fd, pid, b, l,
+                                            netlink_dm_uevent_served.contains(&(pid, fd))
+                                        ));
+                                    }
                                     // 6-Z271: deliver ONE synthetic device-mapper
                                     // uevent per fake-uevent socket, then fall
                                     // back to -EAGAIN. Measured on OrangeFox R12
@@ -22417,17 +22566,12 @@ pub fn run_ptrace_loop(
                                         let buflen = get_syscall_arg(&regs, abi.reg_arg3) as usize;
                                         let src_addr = get_syscall_arg(&regs, abi.reg_arg5);
                                         let addrlen_p = get_syscall_arg(&regs, abi.reg_arg6);
-                                        const DM_UEVENT: &[u8] =
-                                            b"add@/devices/virtual/misc/device-mapper\0\
-ACTION=add\0DEVPATH=/devices/virtual/misc/device-mapper\0\
-SUBSYSTEM=misc\0MAJOR=254\0MINOR=0\0DEVNAME=device-mapper\0\
-SEQNUM=2001\0";
                                         if buf != 0 && buflen > 0 {
-                                            let n = DM_UEVENT.len().min(buflen);
+                                            let n = DM_UEVENT_MSG.len().min(buflen);
                                             let wrote = write_child_bytes_pokedata(
                                                 pid,
                                                 buf,
-                                                &DM_UEVENT[..n],
+                                                &DM_UEVENT_MSG[..n],
                                             );
                                             let new_ret: i64 = if wrote == n {
                                                 n as i64
@@ -30244,8 +30388,13 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             std::collections::HashMap::new();
         let mut pending_getpid: std::collections::HashSet<libc::pid_t> =
             std::collections::HashSet::new();
+        let mut pending_uevent_recv: std::collections::HashMap<
+            libc::pid_t,
+            (u64, u64, u64, u64, i64),
+        > = std::collections::HashMap::new();
         let pid: libc::pid_t = 4242;
         in_syscall_map.insert(pid, true);
+        pending_uevent_recv.insert(pid, (0x5000, 4096, 0, 0, 6));
         prctl_rewritten_args.insert(pid, (0x1000, 0x2000));
         pending_epoll_readback.insert(pid, (0, 0, 0));
         pending_mount_enodev.insert(pid);
@@ -30278,6 +30427,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             &mut accept4_einval_streak,
             &mut esrch_streak,
             &mut pending_getpid,
+            &mut pending_uevent_recv,
         );
         // All four maps no longer have the pid entry — pid-RECYCLED
         // successor inherits NOTHING.
@@ -30294,6 +30444,10 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!accept4_einval_streak.contains_key(&pid));
         assert!(!esrch_streak.contains_key(&pid));
         assert!(!pending_getpid.contains(&pid));
+        // 6-Z271b: the in-flight uevent-recv rewrite must die with the
+        // process (a stale entry would POKEDATA the recycled pid's
+        // first EXIT with the OLD process's buffers).
+        assert!(!pending_uevent_recv.contains_key(&pid));
 
         // Tracked fds are structurally below every synthetic fake-fd
         // base — locks the disjoint-fd-set invariant the EXIT arm's
