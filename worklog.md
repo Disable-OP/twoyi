@@ -22464,3 +22464,132 @@ Work Log:
   tests). Stale runs queued on 791b8ea were auto-cancelled by the
   workflow's concurrency group. CI monitored async per protocol;
   local work continues.
+
+---
+Task ID: 6-Z267
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: fix the arm64 build errors in CI run 33366020128 (job 99406734683), then HEAVILY optimize ptrace emulation / virtualizing speed without breaking anything.
+
+Work Log:
+- BUILD FIX (the E0425): commit 38de405's 6-Z266 refactor moved the
+  per-stop diagnostics into a Copy RecentStopRecord, and the
+  ptrace_getregs_arm32 failure path (cfg(target_arch = "aarch64"))
+  stored `nr: syscall_num` — a binding declared ~90 lines LATER (the
+  top-of-block getregs result). x86_64 never compiles that block, so
+  675 local tests were green while the aarch64 CI build died with
+  "cannot find value `syscall_num`" (ptrace_emu.rs, run 33366020128).
+  Fixed with a documented placeholder nr=0: the path had NO syscall
+  number pre-ring either (the legacy string form printed the literal
+  "syscall?" placeholder) and RecentStopRecord::render never prints nr
+  for Getregs32Failed — byte-for-byte legacy parity preserved.
+  Verified: cargo check --target aarch64-linux-android --bins --lib
+  green locally. NOTE (pre-existing, NOT this regression): `cargo
+  check --target aarch64-linux-android --tests` has 129 errors in
+  #[cfg(test)] code that unconditionally references ABI_X86_64/ABI_
+  X86_32 (constants exist only on x86_64 hosts). CI never compiles
+  tests on aarch64 (kr64-tests runs ubuntu-latest; build.yml builds
+  --bin only), so this is out of the failure path; recorded for a
+  future test-cfg cleanup.
+- PERF 1 — pvm-first guest string reads (biggest per-syscall win):
+  read_child_string is the hottest guest-memory primitive (EVERY path
+  syscall reads the path TWICE: dedicated ENTRY handler + 6-Z185
+  backstop fresh snapshot) and the legacy loop paid ONE
+  PTRACE_PEEKDATA per 8 bytes — a 60-byte path cost ~8 ptrace
+  round-trips per read, ~16 per guest open(). Now process_vm_readv
+  (256-byte chunks, the proven 6-Z167 reader) runs FIRST: ONE syscall
+  for the common path, with the full legacy PEEK -> pvm ->
+  /proc/<pid>/mem chain preserved verbatim as the fallback (6-Z167/
+  6-Z187 blind-tracee corner cases unchanged). First use doubles as a
+  capability probe with the 6-Z62 write-path pattern: a seccomp TRAP
+  (KR64_SIGSYS_HITS bump / ENOSYS / EPERM / EACCES) condemns
+  process_vm_readv process-wide (PVM_READV_USABLE) — at most ONE
+  survivable SIGSYS per boot, then PEEK forever; address-specific
+  EFAULT/EINVAL/ESRCH never condemn. Shared process_vm_readv_chunk
+  helper deduplicated with read_child_string_pvm.
+- PERF 2 — stop-ring payloads are Copy records now (mirrors the
+  6-Z266 recent-stops fix; the 6-Z260 ring was missed): EVERY loop
+  iteration had formatted two Strings (RESUME + RAW STOP), including
+  a Debug-format of the GROWING tracked_pids Vec per RESUME line —
+  O(stops x tracked_pids) over a boot, thousands of bytes per line by
+  the time hundreds of children exist — plus two Mutex-guarded String
+  deque pushes. The ring stores StopRingEvent (Copy, ~24 bytes) and
+  renders the byte-identical legacy strings only at dump time
+  (stop_ring_event_render); RESUME lines carry the dump-time
+  tracked_pids snapshot (documented equivalence). Legacy-format
+  PARITY TEST locks the exact "6-Z213 RESUME #/RAW STOP #" strings;
+  the cap/eviction/rate-limit tests moved to record pushes.
+- PERF 3 — buffered tracer stderr: the loop's log() paid one write(2)
+  per line (std Stderr is UNBUFFERED) on the pipe -> FileLogger tee ->
+  logcat -> disk chain that 6-Z260 measured as a visible share of the
+  phone's boot time ("kr64 blocks when the pipe fills, the whole
+  guest is frozen while the tracer waits on write()"); the pre-cap
+  6-Z210 broad-DIAG phase alone emits up to 20k lines per boot. New
+  crate-level buffered sink (TRACE_LINE_BUF, 16 KiB threshold):
+  ~1 write per 150-300 lines, byte-identical stream (same format,
+  order, newline-terminated lines). Flush points: threshold,
+  RAII TraceLogFlushGuard held for the whole run_ptrace_loop (drains
+  every early return/teardown), Mutex-poisoned direct fallback.
+  Diagnostic evidence policy UNCHANGED (broad-DIAG pre-cap lines,
+  caps, ring dumps all still emitted — just batched).
+- PERF 4 — backstop micro-costs (per path-taking ENTRY):
+  (a) the eager /proc/<pid>/cwd readlink (format! + syscall on EVERY
+      entry, ABSOLUTE paths included, where the value is never used)
+      is now LAZY via OnceCell — read at most once per call, exactly
+      as before, only when a relative path actually needs it;
+  (b) sandbox_path_arg_slots returns a fixed [_; 4] stack buffer +
+      len instead of a heap Vec (max slots per nr = 2, rename/link
+      families; debug_assert guards the bound).
+- PERF 5 — vfs.rs translate_guest/verify_real_path hot-path
+  allocations and syscalls removed: staging-prefix String was
+  formatted per call (translate_guest runs on every path syscall) —
+  now precomputed at construction; verify_real_path step 5 paid two
+  String allocations + an fs::canonicalize PER CALL (the staging-dir
+  canonical form is invariant per boot) — now precomputed in
+  with_staging with the old per-call canonicalize kept as the
+  fallback for the dir-not-yet-created construction case (semantics
+  preserved in both branches).
+- PERF 6 — micro: esrch_streak.remove(&waited) per stop now guarded
+  by is_empty() (the map only holds entries during ESRCH ping-pong
+  streaks; the common stop skips the HashMap probe).
+- PERF 7 — release codegen: [profile.release] lto="fat" +
+  codegen-units=1 added to BOTH kr64 (tracer) and the twoyi loader
+  crate. Default release (lto off, 16 CUs) gives up cross-module
+  inlining inside the crate; the tracer loop and the loader's
+  extraction/copy loops both profit. Dev/test profiles untouched.
+  Build-time cost ~+30-60 s per ABI in CI, traded for per-syscall
+  latency on every boot.
+- NOT DONE (deliberately, semantics-first): PTRACE_SYSEMU stop-model
+  conversion (halves the stop count for fully-emulated syscalls) —
+  high-risk rewrite of the entry/exit contract (signal delivery,
+  GSI classification, seccomp interaction, the 6-Z68 phase
+  authority); needs its own investigation round with a full
+  verification wave, not a performance sweep. Caching
+  is_runtime_host_fallback exists() decisions was also rejected:
+  rootfs contents change during boot (extraction/materialization) and
+  a stale negative would permanently mis-route to host fallback.
+- GATES: cargo fmt --check clean; cargo clippy --all-targets
+  -D warnings clean; cargo test 676 green (675 + z267_stop_ring_
+  render_legacy_parity); aarch64-linux-android check green for
+  lib + bins.
+
+Stage Summary:
+- Run 33366020128's build error was a 6-Z266 aarch64-only E0425; fixed
+  with an unobservable documented placeholder (legacy render parity).
+- Seven optimization layers landed across the per-stop hot path: the
+  tracer now does ~1 pvm syscall instead of ~8-16 PEEKs per path
+  syscall (x2 reads per path syscall), zero heap allocations and zero
+  Debug-format work per loop iteration in the forensics ring, ~1
+  stderr write per 150-300 lines instead of per line, no cwd readlink
+  or staging canonicalize on absolute-path entries, no Vec allocs in
+  the slot table, and fat-LTO whole-crate codegen for both Rust
+  crates. Every change is semantics-preserving with the evidence
+  formats (CI greps) locked by a new parity test.
+- NEXT: dispatch the verification wave on this head (lavender =
+  user's exact image + daisy/whyred guards) and compare the 6-Z260
+  boot-phase timeline stamps against the 38de405 baseline
+  (execve->UI segment and total boot-to-UI); the 0->+10.7 s loader
+  phase (rootfs staging) remains the next-biggest phone-minute
+  contributor and is the follow-up optimization target; then the
+  PTRACE_SYSEMU stop-model investigation (highest ceiling, highest
+  risk — needs its own round).
