@@ -234,11 +234,46 @@ impl Drop for TraceLogFlushGuard {
     }
 }
 
+/// 6-Z268: tagged variant of [`trace_log_line`] used by the `info!` /
+/// `warning!` / `error!` macros. The macros previously expanded to
+/// `eprintln!` — one UNBUFFERED write(2) per line straight onto the
+/// stderr file, ~544 call sites including the entire pre-execve staging
+/// segment (the segment 6-Z260 measured as disk-I/O-bound; every line
+/// also woke the app-side tee). Byte-identical line format, now through
+/// the shared 16 KiB buffered sink.
+pub(crate) fn trace_log_line_tagged(level: &str, msg: &str) {
+    match TRACE_LINE_BUF.lock() {
+        Ok(mut buf) => {
+            buf.push_str(&format!(
+                "[KR64 {}][+{}ms] {}\n",
+                level,
+                boot_elapsed_ms(),
+                cap_log_line(msg, MAX_LOG_LINE)
+            ));
+            if buf.len() >= TRACE_LINE_FLUSH_BYTES {
+                trace_line_flush_locked(&mut buf);
+            }
+        }
+        Err(_) => {
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                format!(
+                    "[KR64 {}][+{}ms] {}\n",
+                    level,
+                    boot_elapsed_ms(),
+                    cap_log_line(msg, MAX_LOG_LINE)
+                )
+                .as_bytes(),
+            );
+        }
+    }
+}
+
 /// Log an info-level message to stderr.
+/// 6-Z268: routed through the buffered sink (was eprintln! per line).
 macro_rules! info {
     ($($arg:tt)*) => {
-        eprintln!("[KR64 INFO][+{}ms] {}", $crate::boot_elapsed_ms(),
-                  $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
+        $crate::trace_log_line_tagged("INFO", &format!($($arg)*))
     };
 }
 
@@ -247,18 +282,18 @@ macro_rules! info {
 /// NOTE: this macro is named `warning!` (not `warning!`) to avoid a name
 /// conflict with Rust's built-in `#[warn(...)]` lint attribute, which
 /// makes the bare name `warn` ambiguous in `pub(crate) use` exports.
+/// 6-Z268: routed through the buffered sink (was eprintln! per line).
 macro_rules! warning {
     ($($arg:tt)*) => {
-        eprintln!("[KR64 WARN][+{}ms] {}", $crate::boot_elapsed_ms(),
-                  $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
+        $crate::trace_log_line_tagged("WARN", &format!($($arg)*))
     };
 }
 
 /// Log an error-level message to stderr.
+/// 6-Z268: routed through the buffered sink (was eprintln! per line).
 macro_rules! error {
     ($($arg:tt)*) => {
-        eprintln!("[KR64 ERROR][+{}ms] {}", $crate::boot_elapsed_ms(),
-                  $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
+        $crate::trace_log_line_tagged("ERROR", &format!($($arg)*))
     };
 }
 
@@ -1489,6 +1524,194 @@ pub fn stage_guest_bootstrap_bionic(rootfs_prefix: &str) -> (usize, usize) {
 /// Returns `None` when the image is not an ELF / has no PT_DYNAMIC /
 /// the dynamic segment is malformed. An ELF with a PT_DYNAMIC but ZERO
 /// DT_NEEDED entries returns Some(vec![]).
+///
+/// 6-Z268: file-windowed variant — reads ONLY the ELF header, the
+/// program-header table, the PT_DYNAMIC segment (≤256 KiB cap) and the
+/// DT_STRTAB window (≤1 MiB cap) via seek+read_at, instead of slurping
+/// the WHOLE file. `stage_missing_dt_needed` seeds its parse queue with
+/// every regular file in {rootfs}/sbin — including the 10–25 MB
+/// recovery binary — so the old `fs::read` per queued file turned the
+/// pre-execve staging step into tens of MB of heap-churned disk I/O
+/// just to learn a handful of library names. Semantics are identical
+/// to [`dt_needed_names_from_bytes`] (same header bounds, same
+/// PT_LOAD/PT_DYNAMIC walk, same NUL-terminated string extraction).
+pub fn dt_needed_names_from_file(path: &str) -> Option<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    const DT_NULL: u64 = 0;
+    const DT_NEEDED: u64 = 1;
+    const DT_STRTAB: u64 = 5;
+    const DT_STRSZ: u64 = 10;
+
+    let mut f = std::fs::File::open(path).ok()?;
+    // ELF header (both classes fit in 64 bytes).
+    let mut ehdr = [0u8; 64];
+    f.read_exact(&mut ehdr).ok()?;
+    if ehdr[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return None;
+    }
+    let is64 = ehdr[4] == 2;
+    if ehdr[5] != 1 {
+        return None; // little-endian only (Android ABIs)
+    }
+    let (phoff, phentsize, phnum): (usize, usize, usize) = if is64 {
+        (
+            u64::from_le_bytes(ehdr[0x20..0x28].try_into().ok()?) as usize,
+            u16::from_le_bytes(ehdr[0x36..0x38].try_into().ok()?) as usize,
+            u16::from_le_bytes(ehdr[0x38..0x3A].try_into().ok()?) as usize,
+        )
+    } else {
+        (
+            u32::from_le_bytes(ehdr[0x1C..0x20].try_into().ok()?) as usize,
+            u16::from_le_bytes(ehdr[0x2A..0x2C].try_into().ok()?) as usize,
+            u16::from_le_bytes(ehdr[0x2C..0x2E].try_into().ok()?) as usize,
+        )
+    };
+    if phnum == 0 || phnum > 64 {
+        return None;
+    }
+    // Program-header table.
+    let phdr_bytes = phnum.checked_mul(phentsize)?;
+    if phdr_bytes > 64 * 128 {
+        return None;
+    }
+    let mut phdrs = vec![0u8; phdr_bytes];
+    f.seek(SeekFrom::Start(phoff as u64)).ok()?;
+    f.read_exact(&mut phdrs).ok()?;
+
+    struct Load {
+        vaddr: u64,
+        off: u64,
+        filesz: u64,
+    }
+    let mut loads: Vec<Load> = Vec::with_capacity(phnum);
+    let mut dyn_off: Option<u64> = None;
+    let mut dyn_sz: usize = 0;
+    for i in 0..phnum {
+        let base = i.checked_mul(phentsize)?;
+        if base + 40 > phdrs.len() {
+            return None;
+        }
+        if is64 {
+            let p_type = u32::from_le_bytes(phdrs[base..base + 4].try_into().ok()?);
+            let p_offset = u64::from_le_bytes(phdrs[base + 8..base + 16].try_into().ok()?);
+            let p_vaddr = u64::from_le_bytes(phdrs[base + 16..base + 24].try_into().ok()?);
+            let p_filesz = u64::from_le_bytes(phdrs[base + 32..base + 40].try_into().ok()?);
+            if p_type == PT_LOAD {
+                loads.push(Load {
+                    vaddr: p_vaddr,
+                    off: p_offset,
+                    filesz: p_filesz,
+                });
+            } else if p_type == PT_DYNAMIC {
+                dyn_off = Some(p_offset);
+                dyn_sz = p_filesz as usize;
+            }
+        } else {
+            let p_type = u32::from_le_bytes(phdrs[base..base + 4].try_into().ok()?);
+            let p_offset = u32::from_le_bytes(phdrs[base + 4..base + 8].try_into().ok()?) as u64;
+            let p_vaddr = u32::from_le_bytes(phdrs[base + 8..base + 12].try_into().ok()?) as u64;
+            let p_filesz = u32::from_le_bytes(phdrs[base + 16..base + 20].try_into().ok()?) as u64;
+            if p_type == PT_LOAD {
+                loads.push(Load {
+                    vaddr: p_vaddr,
+                    off: p_offset,
+                    filesz: p_filesz,
+                });
+            } else if p_type == PT_DYNAMIC {
+                dyn_off = Some(p_offset);
+                dyn_sz = p_filesz as usize;
+            }
+        }
+    }
+    let dyn_off = dyn_off?;
+    if dyn_sz == 0 {
+        // Mirror dt_needed_names_from_bytes: PT_DYNAMIC present but
+        // empty → zero DT_NEEDED entries.
+        return Some(Vec::new());
+    }
+    if dyn_sz > 256 * 1024 {
+        return None;
+    }
+    let mut dyn_bytes = vec![0u8; dyn_sz];
+    f.seek(SeekFrom::Start(dyn_off)).ok()?;
+    f.read_exact(&mut dyn_bytes).ok()?;
+
+    // Walk the dynamic entries for DT_NEEDED values + the STRTAB pointer
+    // and size.
+    let dyn_ent = if is64 { 16usize } else { 8usize };
+    let mut needed: Vec<u64> = Vec::new();
+    let mut strtab_vaddr: Option<u64> = None;
+    let mut strsz: usize = 0;
+    let mut off = 0usize;
+    while off + dyn_ent <= dyn_bytes.len() {
+        let (tag, val): (u64, u64) = if is64 {
+            (
+                u64::from_le_bytes(dyn_bytes[off..off + 8].try_into().ok()?),
+                u64::from_le_bytes(dyn_bytes[off + 8..off + 16].try_into().ok()?),
+            )
+        } else {
+            (
+                u32::from_le_bytes(dyn_bytes[off..off + 4].try_into().ok()?) as u64,
+                u32::from_le_bytes(dyn_bytes[off + 4..off + 8].try_into().ok()?) as u64,
+            )
+        };
+        if tag == DT_NULL {
+            break;
+        }
+        match tag {
+            DT_NEEDED => needed.push(val),
+            DT_STRTAB => strtab_vaddr = Some(val),
+            DT_STRSZ => strsz = val as usize,
+            _ => {}
+        }
+        off += dyn_ent;
+    }
+    let strtab_vaddr = strtab_vaddr?;
+    if strsz == 0 || strsz > 1024 * 1024 {
+        return None;
+    }
+    // vaddr → file offset via PT_LOAD.
+    let strtab_off = loads
+        .iter()
+        .find(|l| {
+            strtab_vaddr >= l.vaddr
+                && l.vaddr
+                    .checked_add(l.filesz)
+                    .map(|end| strtab_vaddr < end)
+                    .unwrap_or(false)
+        })
+        .map(|l| (l.off + (strtab_vaddr - l.vaddr)) as u64)?;
+    let mut strtab = vec![0u8; strsz];
+    f.seek(SeekFrom::Start(strtab_off)).ok()?;
+    // The strtab may extend past EOF on hand-crafted images — read what
+    // is there and pad implicitly (read_exact would fail).
+    let mut got = 0usize;
+    while got < strsz {
+        match f.read(&mut strtab[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(_) => break,
+        }
+    }
+    let names = needed
+        .into_iter()
+        .filter_map(|v| {
+            let v = v as usize;
+            if v >= got {
+                return None;
+            }
+            let end = strtab[v..got].iter().position(|&b| b == 0)? + v;
+            Some(String::from_utf8_lossy(&strtab[v..end]).into_owned())
+        })
+        .collect();
+    Some(names)
+}
+
+/// Returns `None` when the image is not an ELF / has no PT_DYNAMIC /
+/// the dynamic segment is malformed. An ELF with a PT_DYNAMIC but ZERO
+/// DT_NEEDED entries returns Some(vec![]).
 pub fn dt_needed_names_from_bytes(data: &[u8]) -> Option<Vec<String>> {
     const PT_LOAD: u32 = 1;
     const PT_DYNAMIC: u32 = 2;
@@ -1777,11 +2000,11 @@ pub fn stage_missing_dt_needed(rootfs_prefix: &str) -> (usize, Vec<String>, bool
             continue;
         }
         visited.insert(path.clone());
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let names = match dt_needed_names_from_bytes(&data) {
+        // 6-Z268: windowed parse — header + phdrs + PT_DYNAMIC + strtab
+        // only (see dt_needed_names_from_file). The old full-file
+        // fs::read slurped 10–25 MB for the recovery binary alone,
+        // per boot, on the pre-execve critical path.
+        let names = match dt_needed_names_from_file(&path) {
             Some(n) => n,
             None => continue, // not an ELF or no PT_DYNAMIC
         };
@@ -4627,6 +4850,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // 6-Z260: anchor the boot clock as the very first action so every
     // subsequent log line's [+Nms] prefix measures from daemon start.
     boot_clock_init();
+    // ── 6-Z268: tracer scheduling priority ──────────────────────────
+    // The tracer is a single thread emulating EVERY guest syscall; on a
+    // phone it competes with the host app's render/GC threads and
+    // system_server on the big cores. Android grants app UIDs
+    // RLIMIT_NICE=40, so raising our own nice to -8 (THREAD_PRIORITY_
+    // URGENT_DISPLAY equivalent) is permitted unprivileged; under the
+    // root-mode CI it always succeeds. Best-effort: EACCES/EPERM are
+    // tolerated silently (the old default priority remains correct).
+    unsafe {
+        if libc::setpriority(libc::PRIO_PROCESS, 0, -8) != 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if e == libc::EACCES || e == libc::EPERM {
+                // Expected on some hardened kernels — keep going.
+            }
+        }
+    }
     let mut cfg = match parse_args(args) {
         Ok(c) => c,
         Err(e) => {
@@ -4667,6 +4906,100 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     }
 
     info!("[KR64] starting daemon with config: {:?}", cfg);
+
+    // ── 6-Z268: page-cache prefetch thread ──────────────────────────
+    // The loader segment (app-start → guest execve, measured ~10.1 s)
+    // is disk-I/O shaped on a cold page cache: the traced init then
+    // re-reads the same tree (rc files, binaries, libs) through the
+    // tracer. This thread walks the rootfs issuing
+    // posix_fadvise(WILLNEED) — pure kernel readahead requests, no
+    // data copied through userspace — so the blocks are warm by the
+    // time the traced guest asks for them. Key boot files go first;
+    // then a bounded breadth walk. Time-capped at 4 s and fully
+    // best-effort (every error ignored); the thread is detached and
+    // never touches tracer state, so it is fork-safe (pre-fork threads
+    // must not hold locks at fork — this one holds no locks and only
+    // touches open/read/close + fadvise; the worst case is a one-fd
+    // leak into the child, which the 6-Z268 child_close_fds snapshot
+    // closes anyway).
+    {
+        let rootfs_for_prefetch = std::path::PathBuf::from(&cfg.rootfs);
+        let _ = std::thread::Builder::new()
+            .name("kr64-prefetch".to_string())
+            .spawn(move || {
+                let start = std::time::Instant::now();
+                let budget = std::time::Duration::from_secs(4);
+                let fadvise = |path: &std::path::Path| {
+                    if start.elapsed() > budget {
+                        return;
+                    }
+                    if let Ok(md) = std::fs::metadata(path) {
+                        if !md.is_file() || md.len() < 16 * 1024 {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                    if let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+                        unsafe {
+                            let fd = libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+                            if fd >= 0 {
+                                libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED);
+                                libc::close(fd);
+                            }
+                        }
+                    }
+                };
+                // 1. Key boot files, in boot order.
+                let key = [
+                    "init",
+                    "sbin/recovery",
+                    "system/bin/init",
+                    "system/bin/linker64",
+                    "sbin/linker64",
+                    "init.rc",
+                    "init.recovery.rc",
+                    "system/etc/sepolicy",
+                    "sbin/busybox",
+                ];
+                for k in key {
+                    if start.elapsed() > budget {
+                        return;
+                    }
+                    fadvise(&rootfs_for_prefetch.join(k));
+                }
+                // 2. Bounded breadth walk of the ROM trees.
+                let mut queue: std::collections::VecDeque<std::path::PathBuf> =
+                    ["system", "sbin", "vendor", "apex", "odm", "etc"]
+                        .iter()
+                        .map(|d| rootfs_for_prefetch.join(d))
+                        .collect();
+                let mut visited: usize = 0;
+                while let Some(dir) = queue.pop_front() {
+                    if start.elapsed() > budget || visited > 20000 {
+                        return;
+                    }
+                    visited += 1;
+                    let Ok(rd) = std::fs::read_dir(&dir) else {
+                        continue;
+                    };
+                    for entry in rd.flatten() {
+                        let Ok(ft) = entry.file_type() else {
+                            continue;
+                        };
+                        let p = entry.path();
+                        if ft.is_dir() {
+                            if queue.len() < 4096 {
+                                queue.push_back(p);
+                            }
+                        } else {
+                            fadvise(&p);
+                        }
+                    }
+                }
+            });
+    }
+
     // Task 6-Z24: log the kr64 child's OWN pid so the FileLogger tee
     // surfaces it in logcat. This distinguishes "10 separate kr64
     // children (10 different PIDs = re-spawn)" from "1 kr64 child
@@ -5167,10 +5500,59 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // path: still broken on the Android emulator per 5-U, but
             // kept as a defensive fallback for future environments
             // where loop devices DO work.
-            info!(
-                "[KR64] Option D unavailable (no real libdl.so APK asset) — falling back to APEX extraction (find_real_libdl_so)"
-            );
-            apex_extract::find_real_libdl_so(&cfg)
+            //
+            // 6-Z268: RUNTIME SELF-HEAL CACHE. The shipped asset is a
+            // 5848-byte placeholder (is_real_libdl always rejects it),
+            // so find_real_libdl_so ran its FULL pipeline on every boot:
+            // whole-.apex read (6.4 MB observed) + heap copy + temp
+            // ext4 image write + loopback mount + extraction — all
+            // pre-execve on the measured 10.1 s segment. A successful
+            // extraction now persists the ~30 KB payload to
+            // {data_dir}/cache/libdl.real.so and every subsequent boot
+            // starts from a single validated file read instead. The
+            // cache is validated with the same is_real_libdl gate and
+            // lives OUTSIDE {data_dir}/files (Java's extractLibdlAsset
+            // re-overwrites files/libdl.so from the placeholder on
+            // every app start).
+            let libdl_cache_path = format!("{}/cache/libdl.real.so", cfg.data_dir);
+            if let Ok(cached) = std::fs::read(&libdl_cache_path) {
+                if apex_extract::is_real_libdl(&cached) {
+                    info!(
+                        "[KR64] Option D+6-Z268: using cached real libdl.so from {} ({} bytes) — APEX extraction pipeline skipped",
+                        libdl_cache_path,
+                        cached.len()
+                    );
+                    Some((libdl_cache_path, cached))
+                } else {
+                    info!(
+                        "[KR64] 6-Z268: cached libdl at {} failed the is_real_libdl gate — re-running extraction",
+                        libdl_cache_path
+                    );
+                    let found = apex_extract::find_real_libdl_so(&cfg);
+                    if let Some((_, ref bytes)) = found {
+                        let _ = std::fs::create_dir_all(format!("{}/cache", cfg.data_dir));
+                        let _ = std::fs::write(&libdl_cache_path, bytes);
+                    }
+                    found
+                }
+            } else {
+                info!(
+                    "[KR64] Option D unavailable (no real libdl.so APK asset) — falling back to APEX extraction (find_real_libdl_so)"
+                );
+                let found = apex_extract::find_real_libdl_so(&cfg);
+                if let Some((_, ref bytes)) = found {
+                    // 6-Z268: persist the win — next boot skips the whole
+                    // pipeline.
+                    let _ = std::fs::create_dir_all(format!("{}/cache", cfg.data_dir));
+                    let _ = std::fs::write(&libdl_cache_path, bytes);
+                    info!(
+                        "[KR64] 6-Z268: extracted real libdl.so ({} bytes) cached to {} for subsequent boots",
+                        bytes.len(),
+                        libdl_cache_path
+                    );
+                }
+                found
+            }
         }
     };
 
@@ -8872,6 +9254,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         );
     }
 
+    // 6-Z268: drain the buffered trace sink so no staged lines straddle
+    // the fork (the child branch only uses async-signal-safe writes; the
+    // parent's buffer keeps its own ordering clean).
+    trace_log_flush();
+
+    // 6-Z268: enumerate the parent's open fds HERE (allocation is safe
+    // outside the fork window; the child inherits the list via COW).
+    // The child previously burned one close() syscall per fd in
+    // 3..RLIMIT_NOFILE — the Android soft limit is 32768, so ~32k
+    // mostly-EBADF syscalls ran inside the measured pre-execve window
+    // on every boot. The snapshot is exact: every fd open at fork time
+    // is in the list (only the readdir handle itself comes and goes,
+    // and closing it again in the child is harmless).
+    let child_close_fds: Vec<i32> = std::fs::read_dir("/proc/self/fd")
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
+                .filter(|&fd| fd >= 3)
+                .collect()
+        })
+        .unwrap_or_default();
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = std::io::Error::last_os_error();
@@ -8923,9 +9327,20 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 1024
             }
         };
-        for fd in 3..(fd_limit as i32) {
-            unsafe {
-                libc::close(fd);
+        if child_close_fds.is_empty() {
+            // Fallback (procfs unavailable): the old full-range loop.
+            for fd in 3..(fd_limit as i32) {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        } else {
+            // 6-Z268: close exactly the fds the parent had open at fork
+            // time (snapshot taken pre-fork, see child_close_fds).
+            for &fd in &child_close_fds {
+                unsafe {
+                    libc::close(fd);
+                }
             }
         }
 
@@ -10106,43 +10521,71 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                                     // phdr + interp from disk (bypassing the File's buffer
                                                     // via a fresh open) and log exactly what a subsequent
                                                     // execve would see. (6-Z157: class-aware parse.)
-                                                    let verify = std::fs::read(&recovery_path).ok().and_then(|bytes| {
-                                                        let ve64 = bytes.get(4) == Some(&2);
+                                                    // 6-Z268: WINDOWED read-back — the old
+                                                    // `std::fs::read(&recovery_path)` slurped the ENTIRE
+                                                    // multi-MB recovery binary through FUSE while the
+                                                    // guest sat SIGSTOPped on the loop-entry critical
+                                                    // path, only to parse the phdr table + one interp
+                                                    // string. Two bounded reads (64-byte ehdr + phdr
+                                                    // table, then the interp window) verify the same
+                                                    // bytes at ~4 KiB of I/O.
+                                                    let verify = (|| -> Option<(usize, usize, String, usize)> {
+                                                        use std::io::{Read, Seek, SeekFrom};
+                                                        let mut vf = std::fs::File::open(&recovery_path).ok()?;
+                                                        let file_len = vf
+                                                            .metadata()
+                                                            .ok()
+                                                            .map(|m| m.len() as usize)
+                                                            .unwrap_or(0);
+                                                        let mut vhdr = [0u8; 64];
+                                                        vf.read_exact(&mut vhdr).ok()?;
+                                                        let ve64 = vhdr[4] == 2;
                                                         let v_e_phoff: u64 = if ve64 {
-                                                            let mut a = [0u8; 8]; a.copy_from_slice(&bytes[32..40]); u64::from_le_bytes(a)
+                                                            let mut a = [0u8; 8]; a.copy_from_slice(&vhdr[32..40]); u64::from_le_bytes(a)
                                                         } else {
-                                                            let mut a = [0u8; 4]; a.copy_from_slice(&bytes[28..32]); u32::from_le_bytes(a) as u64
+                                                            let mut a = [0u8; 4]; a.copy_from_slice(&vhdr[28..32]); u32::from_le_bytes(a) as u64
                                                         };
                                                         let v_e_phentsize = if ve64 {
-                                                            u16::from_le_bytes([bytes[54], bytes[55]]) as usize
+                                                            u16::from_le_bytes([vhdr[54], vhdr[55]]) as usize
                                                         } else {
-                                                            u16::from_le_bytes([bytes[42], bytes[43]]) as usize
+                                                            u16::from_le_bytes([vhdr[42], vhdr[43]]) as usize
                                                         };
                                                         let v_e_phnum = if ve64 {
-                                                            u16::from_le_bytes([bytes[56], bytes[57]]) as usize
+                                                            u16::from_le_bytes([vhdr[56], vhdr[57]]) as usize
                                                         } else {
-                                                            u16::from_le_bytes([bytes[44], bytes[45]]) as usize
+                                                            u16::from_le_bytes([vhdr[44], vhdr[45]]) as usize
                                                         };
+                                                        if v_e_phnum == 0 || v_e_phnum > 64 || v_e_phentsize == 0 || v_e_phentsize > 128 {
+                                                            return None;
+                                                        }
                                                         let (v_off_f, v_sz_f, v_w): (u64, u64, usize) = if ve64 { (8, 32, 8) } else { (4, 16, 4) };
+                                                        let phdr_bytes = v_e_phnum * v_e_phentsize;
+                                                        let mut vphdrs = vec![0u8; phdr_bytes];
+                                                        vf.seek(SeekFrom::Start(v_e_phoff)).ok()?;
+                                                        vf.read_exact(&mut vphdrs).ok()?;
                                                         for i in 0..v_e_phnum {
                                                             let off = i * v_e_phentsize;
-                                                            let p_type = u32::from_le_bytes([bytes[v_e_phoff as usize + off], bytes[v_e_phoff as usize + off + 1], bytes[v_e_phoff as usize + off + 2], bytes[v_e_phoff as usize + off + 3]]);
+                                                            if off + 4 > vphdrs.len() { break; }
+                                                            let p_type = u32::from_le_bytes([vphdrs[off], vphdrs[off + 1], vphdrs[off + 2], vphdrs[off + 3]]);
                                                             if p_type == 3 {
-                                                                let base = v_e_phoff as usize + off;
+                                                                let base = off;
                                                                 let rd = |field: u64, width: usize| -> usize {
                                                                     let s = base + field as usize;
                                                                     let mut v = 0usize;
-                                                                    for b in (0..width).rev() { v = (v << 8) | (bytes[s + b] as usize); }
+                                                                    for b in (0..width).rev() { v = (v << 8) | (vphdrs[s + b] as usize); }
                                                                     v
                                                                 };
                                                                 let v_off = rd(v_off_f, v_w);
                                                                 let v_sz = rd(v_sz_f, v_w);
-                                                                let end = (v_off + v_sz).min(bytes.len());
-                                                                return Some((v_off, v_sz, String::from_utf8_lossy(&bytes[v_off..end]).trim_end_matches('\0').to_string(), bytes.len()));
+                                                                let read_len = v_sz.min(4096);
+                                                                let mut interp = vec![0u8; read_len];
+                                                                vf.seek(SeekFrom::Start(v_off as u64)).ok()?;
+                                                                vf.read_exact(&mut interp).ok()?;
+                                                                return Some((v_off, v_sz, String::from_utf8_lossy(&interp).trim_end_matches('\0').to_string(), file_len));
                                                             }
                                                         }
                                                         None
-                                                    });
+                                                    })();
                                                     match verify {
                                                         Some((v_off, v_sz, v_str, v_len)) => {
                                                             if v_str == new_interp_path {
@@ -10554,17 +10997,17 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
             return;
         }
     };
-    // Make the listening socket non-blocking so the thread can poll
-    // for shutdown signals (in the MVP we just loop forever).
-    let fd = listener.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    }
+    // 6-Z268: BLOCKING accept. The thread's lifetime is the process's
+    // (there is no shutdown role — "we just loop forever"), so the old
+    // O_NONBLOCK + 50 ms poll bought nothing but +50 ms of connect
+    // latency per guest connect and 20 wakeups/s of scheduler noise on
+    // a box whose tracer thread is latency-critical. Plain accept()
+    // parks the thread in the kernel until a guest connects.
 
     std::thread::Builder::new()
         .name(format!("kr64-accept-{}", name))
         .spawn(move || {
+            let fd = listener.as_raw_fd();
             info!("[KR64][{}] accept thread started (fd={})", name, fd);
             loop {
                 match listener.accept() {
@@ -10578,11 +11021,6 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
                         // dispatch to the right handler.)
                         use std::io::Write;
                         let _ = stream.write_all(&[0u8]);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No pending connection -- sleep briefly to avoid
-                        // spinning. (Real implementation would use epoll.)
-                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     Err(e) => {
                         warning!("[KR64][{}] accept error: {}", name, e);
@@ -10985,14 +11423,8 @@ fn spawn_touch_accept_thread(mut dev: devices::DeviceSocket, cfg: Config) {
             return;
         }
     };
-    // Non-blocking so we can poll for shutdown (consistent with the
-    // generic `spawn_accept_thread`).
-    let fd = listener.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    }
-
+    // 6-Z268: BLOCKING accept (see spawn_accept_thread) — the 50 ms
+    // O_NONBLOCK poll only added connect latency + wakeups.
     let width = cfg.width;
     let height = cfg.height;
     let socket_path = dev.path.clone();
@@ -11001,6 +11433,7 @@ fn spawn_touch_accept_thread(mut dev: devices::DeviceSocket, cfg: Config) {
     std::thread::Builder::new()
         .name("kr64-accept-touch".to_string())
         .spawn(move || {
+            let fd = listener.as_raw_fd();
             info!(
                 "[KR64][touch] accept thread started (fd={}, device_info_path={}, host_events_path={})",
                 fd, socket_path, touch_events_path
@@ -11045,9 +11478,6 @@ fn spawn_touch_accept_thread(mut dev: devices::DeviceSocket, cfg: Config) {
                                 touch_connection_loop(stream, dev_bytes, ev_path);
                             })
                             .ok();
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     Err(e) => {
                         warning!("[KR64][touch] accept error: {}", e);
@@ -11094,9 +11524,10 @@ fn touch_connection_loop(
 
     // Step 2: connect to the host-side touch-events IPC socket. The
     // host's input.rs is expected to bind this socket and write
-    // TouchMessage records to it. Retry for up to 30s (150 × 200ms) so
-    // a brief ordering race (kr64 started before host's input.rs) is
-    // tolerated.
+    // TouchMessage records to it. 6-Z268: exponential backoff 20 ms →
+    // 200 ms (cap 150 attempts) — the first attempts now fire within
+    // milliseconds of the guest connect instead of always paying a full
+    // 200 ms tail; the 30 s give-up budget is unchanged.
     let mut host_stream: Option<std::os::unix::net::UnixStream> = None;
     for attempt in 0..150u32 {
         match std::os::unix::net::UnixStream::connect(&touch_events_path) {
@@ -11109,7 +11540,11 @@ fn touch_connection_loop(
                 break;
             }
             Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                // 6-Z268: exponential backoff — 20 ms for the first ten
+                // attempts (the common ordering race), then the historic
+                // 200 ms.
+                let backoff_ms = if attempt < 10 { 20 } else { 200 };
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
             }
         }
     }

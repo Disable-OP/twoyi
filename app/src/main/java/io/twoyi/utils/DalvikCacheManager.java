@@ -143,6 +143,14 @@ public final class DalvikCacheManager {
      */
     private static void wipeDalvikCache(File rootfs) {
         File cacheDir = new File(rootfs, DALVIK_CACHE_REL_PATH);
+        // 6-Z268: short-circuit when there is nothing to wipe. On first
+        // boot (fresh install) the fingerprint differs from "" → the old
+        // path spawned a full `sh` process on the UI thread just for
+        // `rm -rf` to no-op on a directory that does not exist yet.
+        if (!cacheDir.exists()) {
+            Log.i(TAG, "dalvik-cache dir does not exist — skipping shell wipe");
+            return;
+        }
         String path = cacheDir.getAbsolutePath();
 
         Shell.Result result = ShellUtil.newSh().newJob()

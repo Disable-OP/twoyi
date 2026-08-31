@@ -22761,3 +22761,48 @@ Work Log:
 
 Stage Summary:
 - Audit-only commit; implementation wave follows in 6-Z268 commits. No code changed yet.
+
+---
+Task ID: 6-Z268 implementation wave
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: implement the deduplicated 23-agent audit findings — aggressive boot-time optimization toward <10 s boot-to-UI — then build + run OrangeFox R12 lavender again.
+
+Work Log:
+RUST — ptrace_emu.rs (tracer hot path):
+- pvm-first translated-path WRITES (write_child_string_unchecked): one process_vm_writev instead of 1 POKEDATA/8 bytes; 6-Z62 probe-and-condemn pattern (SIGSYS/ENOSYS/EPERM/EACCES → permanent POKEDATA fallback; EFAULT → per-call); word-padded byte footprint identical.
+- SETREGS_EPOCH (bumped on every successful setregs, both ABIs): the sandbox backstop reuses the loop-top register snapshot when NO handler wrote registers — kills the unconditional second GETREGSET on every pass-through path syscall; rewrite-carrying stops re-fetch exactly as before (6-Z135 preserved).
+- Per-stop path-write cache (STOP_PATH_WRITES): backstop consumes the exact string write_translated_path just wrote instead of a second pvm read; cleared per waitpid iteration, keyed (pid, addr), 8-slot bound.
+- vfs resolve-as-kernel memo (canon_cache, 8192 cap) + invalidate_resolve_cache() wired into guest mkdir/mknod/unlink ENTRY arms; runtime-fallback exists() memo (fallback_exists_cache, 4096 cap) + format!-free translate_guest building.
+- fstat EXIT: memoized (st_dev, st_ino) census of {rootfs}/dev/__properties__ — the per-plain-fstat directory walk (8-14 host syscalls × 5-15k fstats) is now an O(1) lookup; dir re-walk bounded to 1 per 32 distinct misses (fresh property files discovered within 32 fstats).
+- DIAG budget wave: broad-DIAG 20000→200 (sampled stream unchanged); mmap ENTRY un-gated→40; wait4 ENTRY→200; fork-family ENTRY→200; fork-family EXIT→200; xattr ENTRY→40; 6-Z156 getxattr fake→40; 6-Z211h+i fork events→8; writev capture→800 (was UNBOUNDED); exit-fake identity-write elision (fake 0 + kernel 0 → skip SETREGS + readback entirely; 6-Z145 errno-leak semantics untouched for fresh_ret<0).
+- fb0 bridge rewrite: reusable per-pid buffers, skip-if-identical frames (no write when pixels unchanged), cached host-file fd, adaptive tick 33/100/250 ms.
+- Exit-stop register churn: identity-zero elision (see above); 5-J readback skipped when no write happened.
+- Property broadcaster (6-Z111) snapshot MIRROR: 4-byte area-serial validation replaces the full 128 KiB re-read per property set; child-writes mirrored locally; per-(pid,addr) cache ≤16 entries; cache dropped on plan-None/drop.
+- read_child_u32/u64 pvm-first with PEEK fallback; reap_child running-tracee budget 128→24 ms; setregs smoke-detector/RAX audit env-gated (KR64_REGAUDIT=1); execve envp scan capped by an unconditional per-exec counter (6-Z238 gate never closed before).
+RUST — vfs.rs: canon_cache + fallback_exists_cache (above).
+RUST — lib.rs:
+- info!/warning!/error! → trace_log_line_tagged through the 16 KiB buffered sink (544 unbuffered write(2) sites → buffered; byte-identical line format) + trace_log_flush() before fork.
+- Child fd-close via a pre-fork /proc/self/fd snapshot (COW-inherited) — replaces ~32k EBADF close() syscalls inside the measured pre-execve window (procfs-unavailable fallback keeps the old loop).
+- stage_missing_dt_needed: new dt_needed_names_from_file — windowed seek-based ELF parse (ehdr + phdrs + PT_DYNAMIC ≤256 KiB + strtab ≤1 MiB) instead of full-file fs::read of every sbin file (incl. the 10-25 MB recovery).
+- PT_INTERP read-back verify: windowed (2 bounded reads) instead of a full multi-MB re-read while the guest sat SIGSTOPped on the loop-entry critical path.
+- libdl self-heal cache: successful APEX extraction persists {data_dir}/cache/libdl.real.so (is_real_libdl-validated on load); subsequent boots skip the whole .apex read + temp-ext4 + loopback pipeline. (Shipped asset is a 5848-byte placeholder — Option D was dead code.)
+- tracer setpriority(-8) best-effort at run() start; fadvise(WILLNEED) prefetch thread (key boot files → bounded breadth walk, 4 s budget, lock-free, fork-safe).
+- blocking accept for spawn_accept_thread + spawn_touch_accept_thread (threads have no shutdown role); touch-events connect retry exponential 20 ms→200 ms. qemu_pipe proxy accept → blocking (shutdown self-connect wakeup already exists).
+RUST — core.rs (host):
+- fb blit loop: stat short-circuit (mtime+nsec+size+ino) skips the open+4.6 MiB read+dirty-compare entirely when the bridge wrote nothing (bridge now writes only real changes); warm persistent handle with seek-rewind + inode-change reopen; fb0 wait poll 500→50 ms; setBuffersGeometry cached on (window,w,h,fmt); FNV digest wall-clock gated (≥1 s).
+- orphan-kr64 kill: fixed 500 ms sleep per PID → kill(0) liveness poll (10 ms cadence, 500 ms deadline) on the UI thread.
+RUST — build: [profile.release] panic="abort" + strip="symbols" in both app/rs (loader) and kr64 manifests (no catch_unwind anywhere; dev/test profiles untouched).
+JAVA:
+- BootCompletionServer: 2-party CyclicBarrier → one-shot CountDownLatch. markCompleted() no longer blocks/pins a worker; the UI's in-flight waitBoot slice wakes INSTANTLY (was: avg +2.5 s / max +5 s slice-miss dead time on TWRP-layout boots; lavender's mRecoveryDisplay path already skipped the gate).
+- FileLogger: TWO logcat reader processes merged into ONE (demuxes logcat.log + logcat-filtered.log); persistent BufferedOutputStream per file (was open+write+close per line under the global lock) with in-memory rotation counters + ~32 KiB flush cadence; kr64.log tee INCREMENTAL (was truncate + full 2×8 MiB tail copy every 2 s on the same storage as the rootfs); Log.i re-injection sampled (first 200, then 1-in-10; kr64.log keeps full fidelity).
+- BootLogTexture: render loop 60 fps software canvas → render-on-dirty at ≤8 fps (boot log bursts only).
+- ProfileManager.updateRootfsSymlink: skip-if-unchanged (removes the delete/recreate crash window that presented as "No ROM Installed" + boot-blocker).
+- DalvikCacheManager: exists() short-circuit before spawning the rm -rf shell on the UI thread.
+- ShellUtil: cached shared non-root shell (was a fresh sh per call, 2-3 shells per launch).
+- RomManager.extractArm32HookAssets: one assets-list snapshot replaces 4 guaranteed FileNotFoundExceptions per app start.
+SKIPPED (documented): PTRACE_SYSEMU stop-model (own semantics round per 6-Z267); seccomp passthrough family narrowing; prctl setter-only rewrite; binder 250 ms idle looper-gate (6-Z152 regression risk); audio/sensors/binder blocking accept (their shutdown joins have no self-connect wakeup); haptics/battery poll relaxation (negligible); pre-fork staging parallelization (fork-safety review needed); e2e script timing changes (keep CI apples-to-apples).
+
+Stage Summary:
+- cargo fmt clean; clippy -D warnings clean; 676/676 unit tests green on x86_64 (commit head).
+- Expect: loader segment (0→execve) cut by dt_needed windowing + libdl cache + fd-close + prefetch + buffered logs; execve→UI cut by backstop/canonicalize memos + pvm writes + fstat census + DIAG budget + identity-write elision + property mirror; UI delivery cut by fb0 bridge write-on-change + blit stat short-circuit + BootLogTexture/CPU de-contention.
