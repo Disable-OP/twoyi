@@ -22855,3 +22855,24 @@ Work Log:
 
 Stage Summary:
 - 6-Z268 builds green on arm64; verification running on R11.1 lavender (run 33387194667).
+
+---
+Task ID: 6-Z268 first-run forensics
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: run 33387194667 (R11.1 lavender on 6-Z268 head) classified BOOT_FAIL_EARLY_INIT — full native frame + log forensics, A/B control dispatched.
+
+Work Log:
+- FRAMES READ MANUALLY (native vision): 5s/10s/20s/30s/60s/final ALL BLACK — same signature as the 791b8ea pre-6-Z266 baseline. blit_digest_count=1 (one frame ever), presentation SINGLE_FRAME.
+- TIMELINE (tracer stamps): TWOYI daemon +0ms → guest execve chain +39ms (sbin/recovery exec'd!) → staged twoyi_init +44ms → /init second-stage exec +59ms → init property-service start +101ms → exit_group(6) at +102ms. THE 6-Z268 LOADER-SEGMENT SPEEDUPS ARE REAL: app-start→execve collapsed from the measured 10.1 s (6-Z260/6-Z267) to ~40 ms on this run.
+- FAILURE MECHANISM (kr64 log + guest kmsg, byte-level):
+  * R11.1's init (Android-9-era) CLEARS the environment on its second-stage re-exec: execve("/init") at +59ms shows `LD env:` EMPTY (total_entries=4, no LD_*). The R12.0 baseline's second-stage execve PRESERVED the full LD_PRELOAD hook chain (baseline log line 13040) — the twoyi_loader shlib interposed bind() in-process: baseline kmsg "twoyi_loader: bind: translated /dev/socket/property_service → /data/.../rootfs/dev/socket/property_service" then "init: Created socket '/dev/socket/property_service', mode 666" — the socket was REALLY created by the hook.
+  * With hooks absent, R11.1 init's raw bind reached the tracer: 6-Z163 sockaddr blob rewrite DID run (6-Z180 POKE[blob] 65B head=01002f646174612f), real bind returned -98 EADDRINUSE (the documented 6-Z101 stale-address class; baseline NEVER logged this line), 6-Z101 faked bind→0, then the chmod/chown on the never-created socket file: fchownat underlying -2 (faked 0 by 6-Z257) — but init still logged "Failed to fchmodat socket ... No such file or directory" and treated property-service creation as FATAL → exit_group(6).
+  * rootfs-socket-dir.txt (teardown probe): {rootfs}/dev/socket is EMPTY in the failed run vs property_service/logdr/logdw/recovery sockets present in the 6-Z267 baseline — the socket never got created.
+- KEY EXONERATION QUESTION: R11.1 lavender was NEVER tested before (worklog has zero prior R11.1 runs) — this is a first-exposure of a different init generation, not yet evidence of a 6-Z268 regression.
+- A/B CONTROL DISPATCHED: run 33389281715 — the EXACT same R11.1 image (url 60990355e805649489f06abf, md5 7d4ac5b20e1766d69345be1dba89f706) on the UNMODIFIED 6-Z267 baseline commit 7a78a56 (dispatched via new branch baseline-7a78a56; GitHub rejects SHA dispatches with 422).
+  * If the baseline ALSO fails on R11.1 → pre-existing image-generation gap, 6-Z268 exonerated; then fix the raw-bind class for hook-less guests (extend the bind/fchmod family coverage) as a separate task.
+  * If the baseline PASSES on R11.1 → a 6-Z268 change regressed the hook chain (prime suspects then: rc-patch env wiring is untouched, so suspicion would move to the execve-staging/scratch path interactions) — bisect from the wave commit.
+
+Stage Summary:
+- 6-Z268 loader-segment win CONFIRMED by tracer stamps (10.1 s → ~40 ms) even on the failed image; boot verdict pending the A/B control.
