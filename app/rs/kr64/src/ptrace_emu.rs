@@ -5079,6 +5079,10 @@ fn sandbox_backstop_at_entry(
     regs_fetched: &Regs,
     regs_epoch_at_fetch: u64,
     iov_len_fetched: usize,
+    // 6-Z271/T31: memoized fd-origin verdicts, cleared at every execve
+    // EXIT (fd tables churn across exec — clearing there bounds the
+    // stale-verdict window to one process lifetime).
+    getdents_verdict_cache: &mut std::collections::HashMap<(libc::pid_t, i64), bool>,
 ) {
     // Fresh register snapshot: handlers have already flushed their
     // rewrites via ptrace_setregs; this reads the FINAL staged state.
@@ -5105,19 +5109,38 @@ fn sandbox_backstop_at_entry(
     // (a) getdents64 — fd-origin check (the original incident's
     //     enumeration syscall; it takes NO path, so the open-time
     //     checks are its only path-side guard — this verifies them).
+    //     6-Z271/T31: the verdict is memoized per (pid, fd) — the fd's
+    //     /proc origin only changes when the guest closes/reopens the
+    //     fd, and the cache is cleared at every execve so reuse across
+    //     an exec can never serve a stale verdict. Directory-heavy
+    //     phases (theme parse walks /system/fonts etc.) pay one hash
+    //     lookup instead of a readlink + canonicalize walk per call.
     if abi.getdents64 != -1 && nr == abi.getdents64 {
         let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
-        match sandbox.verify_fd_origin(pid, fd) {
-            crate::vfs::SandboxVerdict::Allow => {}
-            crate::vfs::SandboxVerdict::Deny(errno, why) => {
-                log(&format!(
-                    "SANDBOX BACKSTOP: DENIED getdents64(fd={}) on pid {} — fd origin {} — faking -{} (6-Z185)",
-                    fd, pid, why, errno
-                ));
-                set_syscall_num(&mut regs, abi, abi.getpid);
-                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
-                    pending_deny.insert(pid, -(errno as i64));
-                }
+        let key = (pid, fd);
+        let allow = if let Some(&v) = getdents_verdict_cache.get(&key) {
+            v
+        } else {
+            let v = matches!(
+                sandbox.verify_fd_origin(pid, fd),
+                crate::vfs::SandboxVerdict::Allow
+            );
+            // Bounded: a boot touches a few hundred (pid, fd) pairs;
+            // 4096 entries is a generous ceiling — clear to stay flat.
+            if getdents_verdict_cache.len() >= 4096 {
+                getdents_verdict_cache.clear();
+            }
+            getdents_verdict_cache.insert(key, v);
+            v
+        };
+        if !allow {
+            log(&format!(
+                "SANDBOX BACKSTOP: DENIED getdents64(fd={}) on pid {} — fd origin outside the rootfs sandbox — faking -{} (6-Z185)",
+                fd, pid, libc::EACCES
+            ));
+            set_syscall_num(&mut regs, abi, abi.getpid);
+            if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                pending_deny.insert(pid, -(libc::EACCES as i64));
             }
         }
         return;
@@ -10919,6 +10942,11 @@ pub fn run_ptrace_loop(
     // semantics: every listener gets every event exactly once).
     let mut netlink_dm_uevent_served: std::collections::HashSet<(libc::pid_t, i64)> =
         std::collections::HashSet::new();
+    // 6-Z271/T31: memoized getdents64 fd-origin verdicts per (pid, fd).
+    // Cleared at every execve EXIT (the deferred-reset block) so an fd
+    // number reused by the NEW image can never serve the old verdict.
+    let mut getdents_verdict_cache: std::collections::HashMap<(libc::pid_t, i64), bool> =
+        std::collections::HashMap::new();
     // ── Task 6-Z110: property-service CLIENT fd tracking state ──
     //
     // `fake_propserv_fds`: per-pid set of REAL kernel fds whose FAILED
@@ -11834,6 +11862,10 @@ pub fn run_ptrace_loop(
             }
             past_first_execve = true;
             post_execve_syscall_count = 0;
+            // 6-Z271/T31: the exec'ing process's fd table was replaced —
+            // drop its memoized getdents64 verdicts so an fd number the
+            // new image reuses can never serve the old image's verdict.
+            getdents_verdict_cache.retain(|(p, _), _| *p != reset_pid);
             // CRITICAL: reset the scratch area. The scratch area was
             // allocated BELOW the child's stack pointer BEFORE execve
             // (when the child was kr64, x86_64). After execve, the
@@ -18535,6 +18567,7 @@ pub fn run_ptrace_loop(
                             &regs,
                             regs_epoch_at_fetch,
                             iov_len,
+                            &mut getdents_verdict_cache,
                         );
                         if pending_sandbox_deny.len() > deny_before {
                             sandbox_deny_count += 1;
