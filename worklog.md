@@ -23051,3 +23051,59 @@ Stage Summary:
   park-default lands on HEAD (which already carries 6-Z266 tgkill translation +
   6-Z268 app-side boot wave). R12 lavender dispatch follows on this head to
   verify: storm extinct, app-side gaps collapsed, boot-to-UI <10 s real.
+
+---
+Task ID: 6-Z269 verification run 33409396151 + 6-Z270 fast-follow
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: verify the 6-Z269 park fix on the user's own OrangeFox R12 lavender image
+(URL https://api.orangefox.download/release/69f5cec33ba4241a6c1e095f/dl,
+ zip md5 8dd3688b814fc99f8251e3c749812d92 — image re-downloaded and verified),
+ then push the next measured bottleneck out of the way.
+
+Work Log:
+- RUN 33409396151 (head 2197d6dc, orangefox-R12.0-lavender): SUCCESS, and the
+  storm is EXTINCT:
+  * ppoll/tgkill storm DIAG lines: 498,671 (run 33353128469) → 5.
+  * loop_count: 31.9M (tracer pegged, abort-spin) → 3.22M (legit boot work).
+  * glog "bad_function_call" aborts: 1+ per boot (spin source) → 0 (park fix
+    never even exercised — the abort class did not fire this run).
+  * OLD run boot screenshots: BLACK at every tick through 55 s + final. NEW
+    run: black → OrangeFox splash at the 20 s tick → FULL interactive UI at
+    the 30 s tick; terminal + file-manager + Fox-menu flows all advanced.
+- Timeline decomposition of the remaining 47 s (tracer start → UI):
+  * 0 → 10.5 s: twoyi_init phase + first-phase AOSP init (28k stops — next
+    wave target: what the staged loader does for 10 s).
+  * 10.5 → 12.7 s: services fork/exec (ueventd logd hwservicemanager
+    servicemanager vndservicemanager keystore2 recovery).
+  * 12.7 → 31.3 s: THE HOLE — TWRP's FBE decryption probe (fstab /data line
+    carries fileencryption/metadata_encryption) forks keystore_cli_v2 which
+    waits ~20 s on the keystore2 binder service that can never register
+    (no keymaster HAL in a recovery container). 4,968 stops in 15.7 s =
+    pure client-side sleep polling.
+  * 31.3 → 36 s: OrangeFox startup-script pipeline (~15 toybox execs).
+  * 36 → 47 s: theme/parse + first page render.
+  * POST-UI: every button tap fires "Waiting for service
+    android.hardware.vibrator.IVibrator/default" — a ~5 s per-press
+    binder wait (the classic SUPER DELAYED touch symptom).
+- App-side verification: fb0 bridge blitted frame #1 at tracer+131 ms —
+  the display path is instant; every remaining second is guest work.
+- 6-Z270 fixes (this commit):
+  * lib.rs sanitize_fstab_encryption_flags(): parent-side pre-fork rewrite
+    of guest fstab files — strips fileencryption= / metadata_encryption= /
+    keydirectory= / forceencrypt= / encryptable= tokens from /data rows
+    only; all other rows byte-preserved; idempotent. TWRP then skips the
+    decryption probe entirely (the unmountable-/data fallback already
+    works — it ran after the failed decrypt in 6-Z269). +1 regression test
+    (677 total, all green).
+  * twrp_fb_hook.c: constructor /proc/self/maps dump (6-Z176) now gated to
+    boot-critical daemons (init/recovery/keystore2 via /proc/self/cmdline
+    basename) — was dumping ~30 module lists per boot through the traced
+    stderr pipe; fatal-path dump stays un-gated with the 128 KiB cap.
+- Verified: cargo check/clippy -D warnings/fmt clean; 677/677 tests.
+
+Stage Summary:
+- 6-Z269 verified on the user's image: storm extinct, abort class silent,
+  R12 UI interactive at ~30-35 s (vs UI-never in the storm era). 6-Z270
+  targets the measured 20 s decryption-probe hole; dispatching run #2 on
+  this head.
