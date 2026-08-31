@@ -22710,3 +22710,54 @@ Stage Summary:
   landed; same-image artifact comparison shows BOOT_FAIL(black) ->
   UI_READY(interactive at ~40 s, touch-verified). All three wave
   images green.
+
+---
+Task ID: 6-Z268 audit wave
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: spawn 20+ read-only Opus performance agents over the ENTIRE codebase, deduplicate, implement everything, target boot-to-UI <10 s on OrangeFox R12 lavender.
+
+Work Log:
+- 23 read-only Opus Explore agents dispatched (coverage: ptrace_emu.rs in 5 slices, lib.rs in 4, vfs, binder, proc_emu+seccomp, apex_extract+symlinks, devices/mount/qemu_pipe, sensors/audio/battery/haptics, logging pipeline E2E, core.rs+Java render path, Java launch utils, Java misc+assets, cross-cutting hot census, CI measurement, build/systems). All 23 returned.
+- DEDUPED FINDINGS (consensus-weighted):
+  T1 backstop realpath/canonicalize per path syscall (vfs.rs:1395; 7 agents) -> memoize + lexical fast path
+  T2 backstop duplicate GETREGSET + path re-read (4981/5036; 5 agents) -> epoch-gated regs reuse + per-stop path cache
+  T3 translated-path write-back POKEDATA storm (9026/9852; 4 agents) -> pvm-writev first w/ probe
+  T4 fstat EXIT walks /dev/__properties__ per plain fstat (18957; 3 agents) -> gate + (dev,ino) memo
+  T5 un-gated per-syscall DIAGs: broad-DIAG 20k cap, mmap/xattr/wait4/fork EXIT un-gated, writev capture unbounded, getxattr restorecon (5 agents) -> cap/gate all
+  T6 fb0 bridge full 10 MB copy @10 Hz no dirty check (8844; 4 agents) -> persistent buf + skip-if-same + adaptive tick
+  T7 core.rs blit re-reads whole fb per tick + dirty check AFTER read (1481; 2 agents) -> stat short-circuit + persistent fd
+  T8 BootCompletionServer CyclicBarrier(2)+5 s slices = avg +2.5 s / max +5 s overlay delay (1 agent, high conf) -> CountDownLatch(1)
+  T9 BootLogTexture 60 fps software loop + spinner during splash steals tracer CPU (2 agents) -> render-on-dirty + stopAnimation
+  T10 FileLogger per-line open/write/close x2 pumps under global lock + 2 s full-copy tee + Log.i re-inject (3 agents) -> persistent streams + incremental tee + sampling
+  T11 /init read 7x write 5x per boot (7285-7736; 3 agents) -> single-pass patcher
+  T12 stage_missing_dt_needed full-reads every sbin file incl. recovery (1780; 2 agents) -> bounded seek parse
+  T13 libdl.so asset is 5848B placeholder -> APEX pipeline every boot (2 agents) -> runtime self-heal cache
+  T14 poll ENTRY sleep inert on aarch64 (poll_nr=-1) -> SKIP (documented)
+  T15 Java launch path: ensureBootFiles+2 shells+ps|awk kill on main thread in attachBaseContext; core.rs 500 ms sleep/orphan (3 agents) -> background+latch+poll
+  T16 setregs smoke-detector extra GETREGSET every setregs (2862) -> env-gate KR64_REGAUDIT
+  T17 PTRACE_GET_SYSCALL_INFO per stop (13431) -> gate behind disagreement only... risk: med; SKIP this wave
+  T18 exit fake forced-0 families: skip SETREGS when kernel already returned 0 (2 agents)
+  T19 6-Z238 envp scan gate never closes (13791) -> separate counter
+  T20 stop ring 2 mutex ops/stop (10128; 2 agents) -> lock-free ring
+  T21 property broadcaster full-area snapshot per set (7555) -> serial short-circuit
+  T22 accept threads O_NONBLOCK+sleep polls (lib.rs/qemu_pipe/binder/audio/sensors; 4 agents) -> blocking accept
+  T23 vfs translate_guest format!+exists() stat per call (1189; 2 agents) -> with_capacity + memo
+  T24 release profile: panic=abort, strip=symbols (2 agents)
+  T25 PT_INTERP full-file read-back verify while guest frozen (10109) -> bounded verify + idempotent skip
+  T26 child closes 32k fds one-by-one (8918) -> /proc/self/fd enumeration
+  T27 fadvise prefetch thread at run() start (1 agent) -> include
+  T28 tracer priority boost setpriority (2 agents) -> include
+  T29 rc files read up to 4x (patcher/idempotence/exports/strip; 2 agents) -> read-once cache
+  T30 staging info! macros bypass buffered sink (2 agents) -> route through trace_log_line + flush-before-fork
+  T31 getdents64 origin ignores fd->path map (1339; 2 agents) -> (pid,fd) verdict cache
+  T32 Java: ProfileManager symlink delete/create race, DalvikCache exists() guard, ShellUtil singleton, arm32 asset IOException storm (import agent) -> fix all
+  T33 read_child_u32/u64 PEEK-based -> pvm-first
+  T34 guest_readlink_target O(n) scans + 2 formats per readlink -> reverse map
+  T35 reap_child 128x1 ms on Running path -> split budgets
+  T36 haptics 250 ms + battery 1 s wakeups -> relax
+  T37 core.rs: fb0 wait 500 ms poll, setBuffersGeometry per blit, FNV digest every 20 frames, 500 ms orphan sleep -> all fixed
+  SKIPPED (need own semantics round / inert / med-risk): PTRACE_SYSEMU (structural), seccomp passthrough family narrowing, prctl setter-only rewrite, binder looper-gate, rc service stripping (ueventd/keystore2), pre-fork parallelization beyond 2 safe workers, e2e script timing changes (keep CI apples-to-apples).
+
+Stage Summary:
+- Audit-only commit; implementation wave follows in 6-Z268 commits. No code changed yet.
