@@ -5076,6 +5076,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             );
         }
     }
+    // 6-Z270: /dev/block/device-mapper stub — the guest's first-stage init
+    // polls for it up to 10 s before coldboot ("Wait for device-mapper
+    // returned after 10007ms"); with the node present the poll returns
+    // instantly. Non-fatal: the stub only converts a 10 s timeout into an
+    // instant ENOTTY on the DM ioctls the guest already fails gracefully.
+    if let Err(e) = devices::create_device_mapper_stubs(&cfg.rootfs) {
+        warning!("[KR64] failed to create device-mapper stubs: {}", e);
+    }
 
     // ---------------------------------------------------------------
     // Step 2.5: create the per-VM binder device + spawn the binder

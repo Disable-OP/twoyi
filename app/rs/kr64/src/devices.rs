@@ -1143,6 +1143,62 @@ pub fn create_graphics_device_stubs(rootfs: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create device-mapper control-node stubs in the guest rootfs.
+///
+/// # 6-Z270: why this saves 10 seconds of every boot
+///
+/// AOSP init (Android 12+ `system/core/init/devices.cpp`) waits up to
+/// **10 seconds** for the device-mapper control node before its device
+/// coldboot:
+///
+/// ```text
+/// <6>init: Wait for device-mapper returned after 10007ms
+/// <3>init: device-mapper device not found after polling timeout
+/// <3>init: Failed to init devices for INIT_AVB_VERSION
+/// ```
+///
+/// (captured verbatim from run 33409396151 at tracer +10.1 s — the FIRST
+/// 10 s of every R12 boot were this poll; the container has no
+/// device-mapper, so the wait always expired on its full budget).
+///
+/// Pre-creating `{rootfs}/dev/block/device-mapper` (+ the legacy
+/// `/dev/device-mapper` spelling) as a symlink to `/dev/null` makes the
+/// wait return instantly. Subsequent DM ioctls fail with `ENOTTY`
+/// against /dev/null — the SAME failure mode the guest already handles
+/// on the timeout path, minus the 10 s. This mirrors the defensive
+/// graphics-stub pattern: ENOENT→instant-success on the wait, ioctls
+/// degrade gracefully.
+pub fn create_device_mapper_stubs(rootfs: &str) -> std::io::Result<()> {
+    let block_dir = format!("{}/dev/block", rootfs);
+    fs::create_dir_all(&block_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&block_dir, fs::Permissions::from_mode(0o755));
+    }
+    let stubs: &[(&str, &str)] = &[
+        ("dev/block/device-mapper", "/dev/null"),
+        ("dev/device-mapper", "/dev/null"),
+    ];
+    for (rel, target) in stubs {
+        let path = format!("{}/{}", rootfs, rel);
+        let _ = fs::remove_file(&path);
+        match std::os::unix::fs::symlink(target, &path) {
+            Ok(()) => info!(
+                "[KR64][devices] device-mapper stub: {} -> {} (6-Z270: kills init's 10 s dm wait)",
+                path, target
+            ),
+            Err(e) => warning!(
+                "[KR64][devices] could not create device-mapper stub {} -> {}: {} (non-fatal)",
+                path,
+                target,
+                e
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// Create a virtual `/dev/graphics/fb0` (and `/dev/fb0`) for TWRP mode.
 ///
 /// # Background
