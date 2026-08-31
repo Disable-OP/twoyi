@@ -2192,13 +2192,34 @@ fn handle_transaction(
     let flags = u32::from_ne_bytes(cmd_payload[20..24].try_into().unwrap());
 
     if target_handle == SVC_MGR_HANDLE {
-        info!(
-            "[KR64][binder][vm{}] servicemanager transaction: code={} flags=0x{:02x} v2={}",
-            vm_id,
-            code,
-            flags,
-            req_blob.is_some()
-        );
+        // 6-Z266: RATE-LIMITED — the user's lavender boot poll
+        // checkService (code=2) every ~100 ms for a service that never
+        // registers, which made this per-transaction INFO line a
+        // 10-lines/sec-forever flood in the phone log pack. Keep the
+        // first 4 lines per (vm, code) shape for evidence, then one
+        // sampled line per 200th transaction carrying the running
+        // count (the shape stays provably alive without the flood).
+        static SVC_MGR_TX_SEEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<(u32, u32), u64>>,
+        > = std::sync::OnceLock::new();
+        let seen = match SVC_MGR_TX_SEEN
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+        {
+            Ok(mut m) => *m.entry((vm_id, code)).and_modify(|c| *c += 1).or_insert(1),
+            Err(_) => 0,
+        };
+        if seen <= 4 || seen % 200 == 0 {
+            info!(
+                "[KR64][binder][vm{}] servicemanager transaction: code={} flags=0x{:02x} v2={} [tx #{}{}]",
+                vm_id,
+                code,
+                flags,
+                req_blob.is_some(),
+                seen,
+                if seen <= 4 { "" } else { " sampled" }
+            );
+        }
         return servicemanager_proxy(code, services, req_blob);
     }
 
