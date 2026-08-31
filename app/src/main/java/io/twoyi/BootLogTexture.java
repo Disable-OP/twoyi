@@ -184,8 +184,18 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
             shell.newJob().add("timeout -s 9 30 logcat -v brief '*:I'").to(callbackList).submit();
 
             while (mRendering.get() && mSurfaceGeneration.get() == myGeneration) {
-                render();
-                SystemClock.sleep(16);
+                // 6-Z268: render-on-dirty with an 8 fps ceiling. The old
+                // loop locked a software canvas, cleared it and posted at
+                // 60 fps for the WHOLE splash — even with zero new log
+                // lines — burning a full core beside the latency-critical
+                // tracer on 2–4-vCPU hosts (the CPU-saturation wedge
+                // documented in core.rs). Boot log lines arrive in bursts;
+                // a 125 ms poll keeps perceived latency well under a
+                // frame's worth of relevance for a TEXT log.
+                if (mSnapshotDirty) {
+                    render();
+                }
+                SystemClock.sleep(125);
             }
 
             try {

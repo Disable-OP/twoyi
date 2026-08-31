@@ -201,7 +201,23 @@ public final class RomManager {
             // (cherry class — see bionic_compat.c).
             "libbionic_compat_arm32.so",
         };
+        // 6-Z268: ONE assets-list snapshot instead of 4 guaranteed
+        // FileNotFoundException throws (each with stack-fill + a
+        // multi-line Log.w) on EVERY app start. When the CI build stages
+        // the armv7a outputs, they appear in the list and get extracted
+        // exactly as before; when absent, one silent skip replaces four
+        // exception storms.
+        java.util.Set<String> available;
+        try {
+            available = new java.util.HashSet<>(
+                    java.util.Arrays.asList(context.getAssets().list("")));
+        } catch (IOException e) {
+            available = java.util.Collections.emptySet();
+        }
         for (String name : assets) {
+            if (!available.contains(name)) {
+                continue;
+            }
             File target = new File(context.getFilesDir(), name);
             File parent = target.getParentFile();
             if (parent != null && !parent.exists()) {

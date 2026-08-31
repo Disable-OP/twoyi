@@ -52,14 +52,10 @@ pub fn spawn_qemu_pipe_proxy(
     path: String,
     rootfs: String,
 ) -> std::io::Result<QemuPipeProxyHandle> {
-    // Non-blocking so the accept loop can poll the shutdown flag.
-    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
-    // Read-modify-write: OR O_NONBLOCK into the existing flags instead
-    // of clobbering them (F_SETFL replaces the whole status word).
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    }
+    // 6-Z268: BLOCKING accept — the shutdown path already wakes accept()
+    // via a self-connect (see QemuPipeProxyHandle::shutdown), so the
+    // O_NONBLOCK + 20 ms poll bought nothing but 50 wakeups/s of
+    // scheduler noise beside the latency-critical tracer thread.
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
@@ -92,9 +88,6 @@ pub fn spawn_qemu_pipe_proxy(
                                 }
                             })
                             .ok();
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
                     }
                     Err(e) => {
                         warning!("[KR64][qemu_pipe] accept error: {}", e);

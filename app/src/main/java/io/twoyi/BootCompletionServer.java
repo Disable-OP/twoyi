@@ -15,12 +15,10 @@ import android.util.Log;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.BrokenBarrierException;
-import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.twoyi.utils.FileLogger;
@@ -39,7 +37,7 @@ import io.twoyi.utils.LogEvents;
  *
  * <p>Architecture:
  * <ul>
- *   <li>The boot-completion latch ({@link CyclicBarrier} with 2 parties)
+ *   <li>The boot-completion latch (a one-shot {@link java.util.concurrent.CountDownLatch})
  *       lives here, not in {@link TwoyiStatusManager}.</li>
  *   <li>{@link TwoyiSocketServer#handleData(String)} delegates
  *       {@code BOOT_COMPLETED} to {@link #markCompleted()} so the existing
@@ -112,18 +110,27 @@ public class BootCompletionServer {
     private final AtomicBoolean mListening = new AtomicBoolean(false);
 
     /**
-     * Two-party barrier: one party is the UI thread in
-     * {@link Render2Activity#showBootingProcedure()} (waiting via
-     * {@link #waitBoot(long, TimeUnit)}), the other is the socket-worker
-     * thread that called {@link #markCompleted()}.
+     * Boot-completion latch.
      *
-     * <p>Using a {@link CyclicBarrier} (rather than a
-     * {@link java.util.concurrent.CountDownLatch}) means both sides
-     * rendezvous — the worker doesn't release the UI and race ahead to
-     * do post-boot work before the UI has actually woken up and hidden
-     * the loading screen. This matches Nogitsune's BootStatus behaviour.
+     * <p>6-Z268: this was a two-party {@link CyclicBarrier} — the worker
+     * calling {@link #markCompleted()} BLOCKED in {@code await()} until the
+     * UI happened to enter the next {@link #waitBoot(long, TimeUnit)}
+     * slice. Render2Activity polls waitBoot in 5 s slices, so a
+     * BOOT_COMPLETED landing just after a slice timeout sat unserved for
+     * the remainder of the slice: an average +2.5 s, worst-case +5 s of
+     * PURE DEAD TIME added to boot-to-UI after the guest had already
+     * finished (and the worker thread was pinned the whole time).
+     *
+     * <p>A one-shot {@link CountDownLatch} inverts the rendezvous:
+     * {@link #markCompleted()} counts down and returns immediately (no
+     * worker pinned, no slice-miss latency — the UI's in-flight
+     * {@code await} wakes the instant the count reaches zero), and
+     * {@link #waitBoot(long, TimeUnit)} returns {@code true} immediately
+     * whenever completion has already happened. {@link #reset()} swaps in
+     * a fresh latch (guarded by {@code synchronized} so a concurrent
+     * count-down can never be lost by the swap).
      */
-    private final CyclicBarrier mBootLatch = new CyclicBarrier(2);
+    private volatile CountDownLatch mBootLatch = new CountDownLatch(1);
 
     private BootCompletionServer() {
     }
@@ -269,10 +276,10 @@ public class BootCompletionServer {
      * {@link TwoyiStatusManager#switchOs(Context)} (which depends on
      * {@code mStarted}) keeps working unchanged.
      *
-     * <p>The 60 s {@link #mBootLatch} await is bounded so that a worker
-     * thread isn't pinned forever if the UI never shows up to rendezvous
-     * (e.g. the activity was destroyed before reaching
-     * {@link Render2Activity#showBootingProcedure()}).
+     * <p>6-Z268: this method NO LONGER BLOCKS. The old 60 s barrier
+     * rendezvous pinned a pool worker until the UI's next waitBoot slice
+     * and delayed the overlay dismissal by the slice remainder; the
+     * latch now releases every waiter immediately.
      */
     public void markCompleted() {
         if (!mCompleted.compareAndSet(false, true)) {
@@ -281,33 +288,16 @@ public class BootCompletionServer {
             FileLogger.boot("boot_completed_duplicate", "ignored (already marked)");
             return;
         }
-        FileLogger.boot("boot_completed_marked", "rendezvous with UI (60s)");
+        FileLogger.boot("boot_completed_marked", "latch released (6-Z268: non-blocking)");
 
         // Notify TwoyiStatusManager so its switchOs() / isStarted() keep
         // working. markStarted() is now a plain setter (the boot latch
         // lives here), so this can't block.
         TwoyiStatusManager.getInstance().markStarted();
 
-        try {
-            // Rendezvous with the UI thread waiting in waitBoot().
-            // 60 s mirrors the UI's wait window — if the UI never shows
-            // up (activity destroyed before showBootingProcedure), we
-            // don't pin this worker thread forever.
-            mBootLatch.await(BOOT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (BrokenBarrierException e) {
-            // Barrier was reset() (e.g. UI re-launched) — expected during
-            // a re-boot, not worth tracking as an error.
-            LogEvents.trackError(e);
-        } catch (InterruptedException e) {
-            // Restore the interrupt flag so the executor worker shuts
-            // down cleanly if the JVM is winding down.
-            Thread.currentThread().interrupt();
-            LogEvents.trackError(e);
-        } catch (TimeoutException e) {
-            // UI never showed up to rendezvous. The guest has still
-            // booted, so we just track and move on rather than blocking.
-            LogEvents.trackError(e);
-        }
+        // Wake every UI-side waiter IMMEDIATELY. No rendezvous, no slice
+        // miss, no worker pinned.
+        mBootLatch.countDown();
     }
 
     /**
@@ -327,28 +317,16 @@ public class BootCompletionServer {
     public boolean waitBoot(long timeout, TimeUnit unit) {
         FileLogger.boot("wait_boot_start", "timeout=" + timeout + " unit=" + unit);
         try {
-            mBootLatch.await(timeout, unit);
-            FileLogger.boot("wait_boot_success", null);
-            return true;
-        } catch (TimeoutException e) {
-            // Task 6-Z62: a timed-out await BREAKS the barrier — re-arm it
-            // so the caller can poll with further waitBoot() slices (see
-            // Render2Activity.showBootingProcedure). Without reset(), every
-            // subsequent waitBoot() would fail instantly with
-            // BrokenBarrierException and the UI could never be woken by a
-            // late BOOT_COMPLETED.
-            mBootLatch.reset();
-            FileLogger.boot("wait_boot_timeout", null);
-            return false;
-        } catch (BrokenBarrierException e) {
-            // Barrier was reset() out from under us — treat as "not
-            // booted yet" so the caller falls through to the boot-failure
-            // path (which is the safer default for a re-launch race).
-            // Task 6-Z62: re-arm here too so slice-polling keeps working.
-            mBootLatch.reset();
-            FileLogger.boot("wait_boot_broken_barrier", null);
-            LogEvents.trackError(e);
-            return false;
+            // 6-Z268: plain latch await — returns true instantly when the
+            // count already hit zero, false on timeout. No barrier state
+            // to re-arm between polling slices.
+            boolean ok = mBootLatch.await(timeout, unit);
+            if (ok) {
+                FileLogger.boot("wait_boot_success", null);
+            } else {
+                FileLogger.boot("wait_boot_timeout", null);
+            }
+            return ok;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             FileLogger.boot("wait_boot_interrupted", null);
@@ -371,7 +349,14 @@ public class BootCompletionServer {
      * boot attempt.
      */
     public void reset() {
-        mCompleted.set(false);
-        mBootLatch.reset();
+        synchronized (this) {
+            mCompleted.set(false);
+            // Fresh one-shot latch for the new boot cycle. The swap is
+            // serialized with itself; a markCompleted() racing the swap
+            // either counts down the OLD latch (waiters from the old
+            // cycle — correct) or CAS's mCompleted after it was cleared
+            // and counts down the NEW latch — both orderings are safe.
+            mBootLatch = new CountDownLatch(1);
+        }
     }
 }

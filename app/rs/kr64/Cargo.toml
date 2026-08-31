@@ -82,3 +82,12 @@ cc = "1.0"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+# 6-Z268: the tracer/loader never unwind (no catch_unwind anywhere in
+# the crate; a panic in the tracer thread is fatal for the guest
+# anyway) — dropping the unwind tables shrinks the hot text (better
+# I-cache) and speeds the link. `strip = "symbols"` removes the
+# symbol table (libkr64.so observed 951 KB with symbols shipped;
+# rustc >= 1.77 only strips debuginfo by default). Dev/test profiles
+# are untouched, so panic-based test asserts keep working.
+panic = "abort"
+strip = "symbols"

@@ -1024,9 +1024,23 @@ pub fn init_renderer(
                             unsafe {
                                 libc::kill(old_pid, libc::SIGKILL);
                             }
-                            // Wait briefly for the process to die + release
-                            // its resources (sockets, fds, etc.)
-                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            // 6-Z268: replaced the fixed 500 ms sleep with a
+                            // kill(0) liveness poll (10 ms cadence, 500 ms
+                            // deadline). The old sleep ran on the caller (UI)
+                            // thread per killed PID and ALWAYS paid the full
+                            // half second — even when the process was already
+                            // reaped within milliseconds.
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_millis(500);
+                            loop {
+                                let alive = unsafe { libc::kill(old_pid, 0) } == 0;
+                                if !alive
+                                    || std::time::Instant::now() >= deadline
+                                {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
                         }
                     }
                 }
@@ -1412,11 +1426,14 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
     let mut first_blit_logged = false;
 
     // Wait for the fb0 file to exist (kr64 creates it before forking init).
+    // 6-Z268: poll at 50 ms — the file appears well before init's first
+    // draw, and the old 500 ms granularity added a mean 250 ms of pure
+    // dead time before the first read.
     let mut waited = 0u32;
     while !Path::new(&fb_path).exists() {
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(50));
         waited += 1;
-        if waited > 120 {
+        if waited > 1200 {
             log::error!(
                 "[CORE][TWRP-FB] fb0 file not found after 60s: {} — giving up",
                 fb_path
@@ -1425,8 +1442,8 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
         }
     }
     info!(
-        "[CORE][TWRP-FB] fb0 file found after {}s — starting render loop",
-        waited / 2
+        "[CORE][TWRP-FB] fb0 file found after {}ms — starting render loop",
+        waited * 50
     );
 
     // Allocate the framebuffer read buffer + a "last blitted" copy for the
@@ -1444,6 +1461,14 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
     let mut last_blit: Vec<u8> = Vec::with_capacity(fb_size);
     let mut idle_ticks: u32 = 0;
     let mut short_read_logged: u32 = 0;
+    // 6-Z268: stat short-circuit state — (mtime_secs, mtime_nanos, size)
+    // of the last read. The kr64 fb0 bridge now rewrites the host file
+    // ONLY when a frame actually changed, so an unchanged (mtime, size)
+    // means an unchanged frame: skip the open + full 4.6 MiB read +
+    // dirty compare entirely (the old loop paid ~140 MB/s of page-cache
+    // copies during the whole boot window even on a static splash).
+    let mut last_fb_stat: Option<(i64, i64, u64, u64)> = None;
+    let mut fb_reader: Option<std::io::BufReader<std::fs::File>> = None;
     // Recovery-blit DIAGNOSTIC (OrangeFox verification): count CHANGED
     // frames and periodically log an FNV-1a digest of the framebuffer +
     // the center pixel. This is the CI-verifiable proof that guest
@@ -1477,44 +1502,82 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
         // Every `continue` below MUST release this reference — the tick
         // guard below (defer-style) is explicit at each site.
 
-        // Read the framebuffer file.
-        let file = match std::fs::File::open(&fb_path) {
-            Ok(f) => f,
-            Err(e) => {
-                log::warn!("[CORE][TWRP-FB] open({}) failed: {} — retrying", fb_path, e);
-                unsafe { ANativeWindow_release(window) };
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
+        // Read the framebuffer file — SKIPPED entirely when the file's
+        // (mtime, size) are unchanged since the last read (6-Z268 stat
+        // short-circuit; see last_fb_stat above). The bridge-side
+        // write-on-change guarantees mtime moves iff a new frame landed.
+        let fb_meta = std::fs::metadata(&fb_path);
+        let fb_stat = fb_meta.as_ref().ok().and_then(|m| {
+            use std::os::unix::fs::MetadataExt;
+            Some((m.mtime(), m.mtime_nsec(), m.len(), m.ino()))
+        });
+        let stat_unchanged = match (fb_stat, last_fb_stat) {
+            (Some(cur), Some(prev)) => cur == prev,
+            _ => false,
         };
-        let mut reader = std::io::BufReader::new(file);
-        // Tolerant read (6-Z172): a short fb0 file must not wedge the loop
-        // in a warn-storm — read whatever is there, zero-fill the rest so
-        // the dirty check sees a coherent frame, and log the shortfall
-        // (with the actual file size) only for the first few occurrences.
-        {
-            let mut total = 0usize;
-            while total < fb_size {
-                use std::io::Read as _;
-                match reader.read(&mut fb_buf[total..]) {
-                    Ok(0) => break,
-                    Ok(n) => total += n,
-                    Err(_) => break,
+        if !stat_unchanged {
+            let mut reader = match fb_reader.take() {
+                Some(r) => r,
+                None => match std::fs::File::open(&fb_path) {
+                    Ok(f) => std::io::BufReader::new(f),
+                    Err(e) => {
+                        log::warn!("[CORE][TWRP-FB] open({}) failed: {} — retrying", fb_path, e);
+                        unsafe { ANativeWindow_release(window) };
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                },
+            };
+            // Rewind the warm handle before re-reading (the previous read
+            // left the position at EOF).
+            {
+                use std::io::Seek as _;
+                let _ = reader.seek(std::io::SeekFrom::Start(0));
+            }
+            // Tolerant read (6-Z172): a short fb0 file must not wedge the loop
+            // in a warn-storm — read whatever is there, zero-fill the rest so
+            // the dirty check sees a coherent frame, and log the shortfall
+            // (with the actual file size) only for the first few occurrences.
+            {
+                let mut total = 0usize;
+                while total < fb_size {
+                    use std::io::Read as _;
+                    match reader.read(&mut fb_buf[total..]) {
+                        Ok(0) => break,
+                        Ok(n) => total += n,
+                        Err(_) => break,
+                    }
+                }
+                if total < fb_size {
+                    fb_buf[total..].fill(0);
+                    if short_read_logged < 5 {
+                        short_read_logged += 1;
+                        let fsize = std::fs::metadata(&fb_path).map(|m| m.len()).unwrap_or(0);
+                        log::warn!(
+                            "[CORE][TWRP-FB] short read: got {}/{} bytes (fb0 file len={}) — rendering partial frame",
+                            total,
+                            fb_size,
+                            fsize
+                        );
+                    }
                 }
             }
-            if total < fb_size {
-                fb_buf[total..].fill(0);
-                if short_read_logged < 5 {
-                    short_read_logged += 1;
-                    let fsize = std::fs::metadata(&fb_path).map(|m| m.len()).unwrap_or(0);
-                    log::warn!(
-                        "[CORE][TWRP-FB] short read: got {}/{} bytes (fb0 file len={}) — rendering partial frame",
-                        total,
-                        fb_size,
-                        fsize
-                    );
+            // Keep the handle warm for the next changed frame. If the file
+            // was REPLACED (inode changed — delete+recreate) or resized,
+            // drop the handle so the next tick reopens the fresh inode.
+            let stale_handle = match fb_stat {
+                Some((_, _, sz, ino)) => {
+                    sz != fb_size as u64
+                        || last_fb_stat.map(|prev| prev.3) .map_or(false, |pino| pino != ino)
                 }
+                None => true,
+            };
+            if stale_handle {
+                fb_reader = None;
+            } else {
+                fb_reader = Some(reader);
             }
+            last_fb_stat = fb_stat;
         }
 
         // Dirty check (u64 chunks; both buffers are fb_size long). Skip the
@@ -1538,7 +1601,22 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
                 // Periodic frame-flow digest (see changed_frames above):
                 // proves the blit loop is presenting LIVE, CHANGING guest
                 // frames — the acceptance signal for page transitions.
-                if changed_frames == 1 || changed_frames % 20 == 0 {
+                // 6-Z268: additionally wall-clock gated at one digest per
+                // second — the FNV walk is 4.6 MiB of hashing and the
+                // every-20th-frame rule fired ~30×/s during animation,
+                // right in the CPU-contended window.
+                {
+                    static LAST_DIGEST_MS: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last = LAST_DIGEST_MS.load(std::sync::atomic::Ordering::Relaxed);
+                    if changed_frames == 1
+                        || (changed_frames % 20 == 0 && now.saturating_sub(last) >= 1000)
+                    {
+                        LAST_DIGEST_MS.store(now, std::sync::atomic::Ordering::Relaxed);
                     let mut hash: u64 = 0xcbf29ce484222325;
                     for chunk in fb_buf.chunks_exact(8) {
                         for &b in chunk {
@@ -1557,6 +1635,7 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
                         "TWRP-FB frame #{} blitted digest={:016x} center=[{},{},{},{}]",
                         changed_frames, hash, px[0], px[1], px[2], px[3]
                     ));
+                    }
                 }
                 if !first_blit_logged {
                     first_blit_logged = true;
@@ -1680,14 +1759,44 @@ unsafe fn twrp_blit_to_surface(
     }
 
     // Set the buffer geometry to match the surface dimensions + RGBA8888.
-    let r = ANativeWindow_setBuffersGeometry(
-        window,
-        surface_width,
-        surface_height,
-        WINDOW_FORMAT_RGBA_8888,
-    );
-    if r != 0 {
-        return false;
+    // 6-Z268: only when it actually CHANGED — the old call re-issued the
+    // setBuffersGeometry on EVERY blit (up to 30/s during animation) with
+    // identical arguments, paying per-frame buffer revalidation churn
+    // inside the SurfaceFlinger transaction. The cache keys on the exact
+    // (window, w, h, format) quad, so a recreated/resized surface
+    // (different pointer) reconfigures immediately — the 6-Z183 semantics
+    // are unchanged for every state transition that matters.
+    {
+        static LAST_GEOM: std::sync::Mutex<(usize, i32, i32, i32, bool)> =
+            std::sync::Mutex::new((0, 0, 0, 0, false));
+        let key = (
+            window as usize,
+            surface_width,
+            surface_height,
+            WINDOW_FORMAT_RGBA_8888,
+            true,
+        );
+        let needs_set = match LAST_GEOM.lock() {
+            Ok(g) => *g != key,
+            Err(_) => true,
+        };
+        if needs_set {
+            let r = ANativeWindow_setBuffersGeometry(
+                window,
+                surface_width,
+                surface_height,
+                WINDOW_FORMAT_RGBA_8888,
+            );
+            if r != 0 {
+                return false;
+            }
+            if let Ok(mut g) = LAST_GEOM.lock() {
+                // Record the REQUESTED quad; a failed lock below still
+                // leaves this recorded, but a lock failure is transient
+                // and re-issuing setBuffersGeometry is harmless.
+                *g = key;
+            }
+        }
     }
 
     // Lock the window buffer for writing.

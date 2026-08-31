@@ -927,6 +927,27 @@ pub struct SandboxPolicy {
     staging_dir_slash: Option<String>,
     staging_dir_canon_slash: Option<String>,
     staging_dir_canon: Option<PathBuf>,
+    /// 6-Z268: memoized `resolve_as_kernel` results keyed by the
+    /// lexically-normalized path. The canonical walk (deepest-existing
+    /// ancestor via realpath) costs 8–25 host syscalls per path-taking
+    /// syscall and runs on the single tracer thread — the boot's hottest
+    /// repeated paths (init re-polling the same rc/config files, the
+    /// linker re-probing lib dirs) were paying it thousands of times.
+    /// The tracer thread is the only writer (RefCell); entries are
+    /// cleared wholesale by [`Self::invalidate_resolve_cache`] (called
+    /// from the guest's mkdir/mknod/unlink ENTRY arms — the only state
+    /// changes the guest can effect; guest symlink creation is NOT
+    /// tracer-intercepted, so no new symlink can invalidate a cached
+    /// resolution behind our back) and on cap overflow (8192).
+    canon_cache:
+        std::cell::RefCell<std::collections::HashMap<Box<str>, Option<std::path::PathBuf>>>,
+    /// 6-Z268: memoized rootfs-existence probes for the 6-Z196
+    /// runtime-host-fallback class (/system|/apex lib/linker paths).
+    /// Keyed by the rootfs-copy host path; the ROM tree is fixed for the
+    /// whole boot (import completes before the tracer starts), so the
+    /// probe result cannot change under a running boot. Cap 4096 with
+    /// clear-on-overflow.
+    fallback_exists_cache: std::cell::RefCell<std::collections::HashMap<Box<str>, bool>>,
 }
 
 impl SandboxPolicy {
@@ -961,6 +982,8 @@ impl SandboxPolicy {
             staging_dir_slash: None,
             staging_dir_canon_slash: None,
             staging_dir_canon: None,
+            canon_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            fallback_exists_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1187,8 +1210,12 @@ impl SandboxPolicy {
         // copy is absent (e.g. TWRP ramdisks that keep their runtime in
         // /sbin and ship no /system tree at all).
         if path.starts_with("/apex/") || path == "/apex" {
-            let rootfs_copy = format!("{}{}", self.rootfs.to_string_lossy(), path);
-            if self.is_runtime_host_fallback(Path::new(path)) && !Path::new(&rootfs_copy).exists() {
+            let mut rootfs_copy = String::with_capacity(self.rootfs.as_os_str().len() + path.len());
+            rootfs_copy.push_str(&self.rootfs.to_string_lossy());
+            rootfs_copy.push_str(path);
+            if self.is_runtime_host_fallback(Path::new(path))
+                && !self.fallback_exists_cached(&rootfs_copy)
+            {
                 // The guest ROM does not ship an APEX of its own — keep
                 // the kernel-PT_INTERP-parity lib path on the host.
                 return path.to_string();
@@ -1196,8 +1223,12 @@ impl SandboxPolicy {
             return rootfs_copy;
         }
         if path.starts_with("/system/") || path == "/system" {
-            let rootfs_copy = format!("{}{}", self.rootfs.to_string_lossy(), path);
-            if self.is_runtime_host_fallback(Path::new(path)) && !Path::new(&rootfs_copy).exists() {
+            let mut rootfs_copy = String::with_capacity(self.rootfs.as_os_str().len() + path.len());
+            rootfs_copy.push_str(&self.rootfs.to_string_lossy());
+            rootfs_copy.push_str(path);
+            if self.is_runtime_host_fallback(Path::new(path))
+                && !self.fallback_exists_cached(&rootfs_copy)
+            {
                 // Kernel-PT_INTERP parity: the kernel opens
                 // PT_INTERP="/system/bin/linker{,64}" itself during
                 // execve — outside tracer reach — and a mixed runtime
@@ -1300,6 +1331,34 @@ impl SandboxPolicy {
         )
     }
 
+    /// 6-Z268: drop every memoized canonical resolution. Called from the
+    /// tracer's guest mkdir/mknod/unlink ENTRY arms (the only guest-
+    /// visible rootfs mutations) so a cached deepest-existing-ancestor
+    /// can never outlive the filesystem state it was computed from.
+    pub fn invalidate_resolve_cache(&self) {
+        self.canon_cache.borrow_mut().clear();
+    }
+
+    /// 6-Z268: memoized `Path::exists()` for the runtime-host-fallback
+    /// class (see `fallback_exists_cache`). The probe runs on EVERY
+    /// /system|/apex lib-open attempt (linker dlopen storms — thousands
+    /// per boot) and each was a fresh stat through FUSE.
+    fn fallback_exists_cached(&self, rootfs_copy: &str) -> bool {
+        const FALLBACK_CACHE_CAP: usize = 4096;
+        if let Some(hit) = self.fallback_exists_cache.borrow().get(rootfs_copy) {
+            return *hit;
+        }
+        let exists = Path::new(rootfs_copy).exists();
+        {
+            let mut cache = self.fallback_exists_cache.borrow_mut();
+            if cache.len() >= FALLBACK_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(rootfs_copy.into(), exists);
+        }
+        exists
+    }
+
     /// Resolve a path AS THE KERNEL WOULD see it, following symlinks,
     /// and return the canonical result for the verdict.
     ///
@@ -1324,7 +1383,31 @@ impl SandboxPolicy {
             }
         };
         let normalized = lexical_normalize(&joined)?;
-        deepest_existing_canonical(&normalized)
+        // 6-Z268: memoize the canonical walk per normalized path (see the
+        // field doc). The walk is pure filesystem metadata — the same
+        // normalized input yields the same output until the guest mutates
+        // the tree, which triggers invalidate_resolve_cache() from the
+        // mutation arms.
+        const CANON_CACHE_CAP: usize = 8192;
+        if let Some(hit) = self
+            .canon_cache
+            .borrow()
+            .get(normalized.to_string_lossy().as_ref())
+        {
+            return hit.clone();
+        }
+        let resolved = deepest_existing_canonical(&normalized);
+        {
+            let mut cache = self.canon_cache.borrow_mut();
+            if cache.len() >= CANON_CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(
+                normalized.to_string_lossy().into_owned().into_boxed_str(),
+                resolved.clone(),
+            );
+        }
+        resolved
     }
 
     /// Backstop for fd-based directory enumeration (getdents64).
