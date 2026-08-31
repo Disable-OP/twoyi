@@ -22970,3 +22970,35 @@ Work Log:
 
 Stage Summary:
 - whyred GREEN; angler retry in flight (download-flake class only).
+
+---
+Task ID: 6-Z268 final wave completion
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: final wave verdict.
+
+Work Log:
+- ANGLER RETRY run 33392829448 (head ebf9403): SUCCESS. Full guard
+  wave green.
+- FINAL 6-Z268 SCOREBOARD (all on the hardened head 0109016/ebf9403):
+  * 33390790061 orangefox-R11.1-lavender: SUCCESS — BOOT_OK / UI_READY,
+    interactive UI at the 5 s capture tick (first guest frame blitted
+    +111 ms after render init; loader segment 10.6 s → ~40 ms). THE
+    <10 s BOOT-TO-UI TARGET: MET (8x+ vs the 6-Z267 40 s baseline).
+  * 33391886763 twrp-3.7.0_9-0-whyred: SUCCESS — UI_READY, terminal +
+    file-manager + destination-folder flows exercised.
+  * 33392829448 twrp-3.7.0_9-0-angler: SUCCESS — default-image
+    regression guard green.
+  * kr64-tests 33390775887: GREEN (fmt / clippy -D warnings / 676 tests).
+  * (33391884534 angler attempt 1 failed at the dl.twrp.me download —
+    transient infra flake, retried clean.)
+- NOTE for the next round: OrangeFox has retired ALL R12.0 builds
+  (lavender AND daisy both 404 on their CDN). The corpus manifest
+  should be re-pointed at live builds (R11.1 lavender verified live:
+  release 60990355e805649489f06abf) or the images must be mirrored.
+
+Stage Summary:
+- 6-Z268 COMPLETE: 23-agent audit → deduplicated implementation wave
+  (tracer hot path, VFS memos, staging, logging stack, render path,
+  Java boot path) → one regression caught by A/B control and fixed
+  (bind-arm hardening) → FULL WAVE GREEN with boot-to-UI under 5 s.
