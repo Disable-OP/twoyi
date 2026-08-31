@@ -23002,3 +23002,52 @@ Stage Summary:
   (tracer hot path, VFS memos, staging, logging stack, render path,
   Java boot path) → one regression caught by A/B control and fixed
   (bind-arm hardening) → FULL WAVE GREEN with boot-to-UI under 5 s.
+
+---
+Task ID: 6-Z269 storm forensics + hook park fix
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: user reported OrangeFox R12 lavender still ~1 minute to boot (URL re-provided:
+https://api.orangefox.download/release/69f5cec33ba4241a6c1e095f/dl). Uploaded on-device
+diag bundle (upload/log.tar.xz) analyzed; deployed APK identified as CI run
+33353128469 = head 791b8ea (PRE 6-Z266/6-Z268).
+
+Work Log:
+- Workspace was reset mid-wave; repo re-cloned at HEAD 739c81b (6-Z268 wave complete,
+  verified on R11.1 lavender run 33390790061: UI_READY <5 s — but NEVER on R12).
+- PHONE DIAG (R12, deployed build 791b8ea): tracer tail +77→+103 s shows ZERO-GAP
+  churn at ~120k stops/s (1,883 DIAG lines/s = every 64th stop), loop_count 7.15M;
+  storm pids 15300 (keystore2), 15303, 15301 (recovery); nr=73 ppoll EXIT -EFAULT
+  alternating nr=131 tgkill EXIT -ESRCH. Tracer thread saturated → boot crawl.
+- CI ARTIFACT of run 33353128469 (R12 lavender, 791b8ea) pulled + analyzed: the
+  abort chain is DECISIVE:
+    +10.8 s  glog FATAL "bad_function_call was thrown in -fno-exceptions mode"
+    +10.8 s  [twrp_fb_hook] abort() INTERCEPTED (our hook, guest recovery main thread)
+    +10.8 s  hook fatal_reraise loop: tgkill(getpid_fake=1, tid, 6) → -ESRCH;
+             raw_syscall2(SYS_ppoll, 0, 0) leaves x2/x3 GARBAGE → -EFAULT → never parks
+    +10.8 s→+470.5 s  the SAME pid 2619 spins to end of run: loop_count 31,961,601.
+  ROOT CAUSE = OUR OWN HOOK'S PARK LOOP: (1) ppoll argv garbage → EFAULT → busy-spin,
+  (2) fake pid 1 → tgkill ESRCH → signal never delivers. The 6-Z266 tracer fix would
+  turn the reraise into a REAL process death (recovery gone = no UI) — the pre-fix
+  ESRCH accident is what kept recovery alive with other threads producing frames.
+- App-side windows on CI (pre-6-Z268 build): +0→+25 s silent (FileLogger→import),
+  +25.8→+50.2 s silent (cpio done→Render2Activity.onCreate) — the 6-Z268 Java wave
+  (in HEAD) targets exactly these; unverified on R12 until now.
+- FIX (app/cpp/twoyi_loader/src/twrp_fb_hook.c, 6-Z269):
+  * fatal_reraise → PARK-forever default: ppoll(NULL,0,NULL,NULL) all-NULL args
+    (blocks in kernel, zero CPU, tracee sleeps at EXIT stop). Aborting thread parked,
+    process + other threads alive — same observable behavior as the accidental
+    pre-6-Z266 state, minus 31.9M stops.
+  * TWOYI_ABORT_RERAISE=1 env gate restores raise-then-park (tgkill + FIXED all-NULL
+    ppoll) for debugging.
+  * fatal_dump_maps cap 32 KiB→128 KiB (32 KiB truncated before the aborting module's
+    r-xp segment — PC 0xfa9c2b2c22fc was un-symbolizable).
+- Verified: kr64 cargo check clean, 676/676 tests pass, fmt+clippy -D warnings green;
+  hook host-syntax-check clean (ioctl decl conflict is a glibc-vs-bionic header
+  artifact, pre-existing).
+
+Stage Summary:
+- The "~1 minute boot" storm class is OUR hook's abort-park loop, not the guest:
+  park-default lands on HEAD (which already carries 6-Z266 tgkill translation +
+  6-Z268 app-side boot wave). R12 lavender dispatch follows on this head to
+  verify: storm extinct, app-side gaps collapsed, boot-to-UI <10 s real.
