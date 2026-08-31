@@ -6178,6 +6178,28 @@ fn read_child_bytes(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u8>> 
     if addr == 0 || len == 0 {
         return Some(Vec::new());
     }
+    // 6-Z271/T33: pvm-first — ONE process_vm_readv for the whole range
+    // instead of one PTRACE_PEEKDATA per 8 bytes. The callers here read
+    // small fixed-size spans (statbufs for the 6-Z121/6-Z203b rewrites,
+    // the fstat census's 16-byte st_dev/st_ino probe, iovec walks);
+    // every saved PEEK is a tracer-thread syscall round trip. The PEEK
+    // fallback preserves the exact original semantics (first-word
+    // failure → None, tail failure → partial buffer).
+    if len <= 4096 {
+        let mut buf = vec![0u8; len];
+        let n = process_vm_readv_chunk(pid, addr, &mut buf);
+        if n == len as isize {
+            return Some(buf);
+        }
+        // Partial pvm read: the bytes before the unmapped hole are
+        // still valid — surface them the way the PEEK tail-failure path
+        // does (non-empty prefix → partial Some, empty → fall to PEEK
+        // for the error-classification dance).
+        if n > 0 && (n as usize) < len {
+            buf.truncate(n as usize);
+            return Some(buf);
+        }
+    }
     let mut result = Vec::with_capacity(len);
     let mut offset = 0i64;
     while offset < len as i64 {
