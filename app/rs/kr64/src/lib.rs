@@ -64,6 +64,7 @@ pub mod binder;
 pub mod compat_paths;
 pub mod devices;
 pub mod haptics;
+pub mod hostbridge;
 pub mod mount_mgr;
 pub mod proc_emu;
 pub mod ptrace_emu;

@@ -44,39 +44,55 @@
 //!   codes getService=1/checkService=2/addService=3/listServices=4,
 //!   replies `[i32 exception=0] + payload` — all verified from the
 //!   fetched android-11 sources; see `servicemanager_transaction`).
-//! * **A real name→handle registry** — addService records
-//!   (name, guest binder ptr/cookie, owning connection); getService
-//!   answers with a `flat_binder_object{BINDER_TYPE_HANDLE}` carrying a
-//!   proxy-allocated fake handle (`0xF0000000 + n`); a miss answers with
-//!   a null binder, exactly like the native servicemanager's reply shape.
-//! * **`BR_TRANSACTION` delivery** — transactions aimed at a registered
-//!   fake handle are queued for the owning guest connection and
-//!   delivered (with the owner's ptr/cookie stamped into the target)
-//!   on its next `BINDER_WRITE_READ` with read capacity; the server's
-//!   `BC_REPLY` is routed back to the requester as `BR_REPLY`.
+//! * **A real name→handle registry with OWNER routing (6-Z271)** —
+//!   addService stores the owning connection + its local ptr/cookie;
+//!   getService answers with a `flat_binder_object{BINDER_TYPE_HANDLE}`
+//!   carrying a proxy-allocated fake handle (`0xF0000000 + n`); a miss
+//!   answers with a null binder, exactly like the native servicemanager's
+//!   reply shape.
+//! * **`BR_TRANSACTION` delivery + `BC_REPLY` correlation (6-Z271 bus)** —
+//!   transactions aimed at a registered handle are queued on the owning
+//!   guest connection and delivered (with the owner's ptr/cookie and the
+//!   sender's announced pid/euid stamped in) on its next
+//!   `BINDER_WRITE_READ` with read capacity; the server's `BC_REPLY` is
+//!   routed back to the requester as `BR_REPLY` (8 s deadline →
+//!   `BR_FAILED_REPLY`). One-way transactions get only
+//!   `BR_TRANSACTION_COMPLETE`. Connection death unregisters its services
+//!   (→ `BR_DEAD_BINDER` to watchers) and resolves queued work as dead.
+//! * **In-proxy virtual services (6-Z271)** — semantically-correct minimal
+//!   AIDL implementations registered at proxy start:
+//!   `android.hardware.vibrator.IVibrator/default` (kills the ~5 s per-tap
+//!   haptics wait; `on(ms)` is forwarded to the host app for a REAL
+//!   vibration), `android.hardware.security.keymint.IKeyMintDevice/default`
+//!   (lets keystore2 obtain its backend and register IKeystoreSecurity —
+//!   kills the ~20 s recovery wait; key ops return honest
+//!   `HARDWARE_TYPE_UNAVAILABLE` errors, no fake crypto), and
+//!   `android.hardware.security.sharedsecret.ISharedSecret/default`.
+//! * **HIDL-aware servicemanager (6-Z271)** — libhwbinder parcels (no SYST
+//!   header tag) are parsed as `android.hidl.manager.V1_0.IServiceManager`
+//!   get/add; `IBase::PING` is answered for every handle.
+//! * **v2 request blobs from the loader (6-Z271)** — the shlib inlines the
+//!   parcel bytes behind every BC_TRANSACTION/BC_REPLY so REAL libbinder
+//!   clients (keystore2, recovery) hit the parsed registry instead of the
+//!   name-less legacy path (the root cause of the inert registry).
 //! * **Blocking idle** — a pure-read `BINDER_WRITE_READ` blocks on the
 //!   connection's queue (250 ms tick, then `BR_NOOP`) instead of
 //!   busy-answering, mirroring the kernel's blocking read.
 //!
 //! # What is still NOT here (the honest list)
 //!
-//! * **Parcel bytes on the wire need the v2 client.** The 6-Z113 loader
-//!   forwards the guest's `BC_*` stream verbatim but cannot (yet)
-//!   inline the parcel buffers that `binder_transaction_data.data.ptr`
-//!   points at — see "Wire v2" below. Until the loader learns v2
-//!   (proposed: 6-Z115), handle-0 transactions arrive parcel-less and
-//!   the servicemanager answers the *legacy* synthetic shapes (GET →
-//!   null binder, ADD → status 0): correct enough to keep the ROM's
-//!   libbinder loops terminating, registry inert.
-//! * **Host forwarding** (`forward_transaction_to_host`) still does no
-//!   handle translation / flat-object patching (the old `BINDER-3`
-//!   TODO). It now at least emits the kernel-true `BC_TRANSACTION`
-//!   number when it talks to a real host `/dev/binder`.
-//! * No death notifications, no fd passing, no `BC_ACQUIRE/…DONE`
-//!   refcount pairs delivered to servers, one `BC_REPLY` per connection
-//!   matched FIFO (the wire carries no thread identity — see
-//!   `route_transaction`), sender pid/euid stamped as 0/0 pending a
-//!   v2+ loader extension.
+//! * **Registration callbacks are not delivered** —
+//!   `REGISTER_FOR_NOTIFICATIONS` is acked but no callback
+//!   transactions fire when a service later registers. Clients fall back
+//!   to their poll/deadline paths, which now terminate fast because the
+//!   services they want DO register.
+//! * **No fd passing** (BINDER_TYPE_FD objects are not translated); no
+//!   refcount forwarding to a host driver; sender identity comes from the
+//!   loader's WIRE_CMD_IDENT announcement (one gid is ignored).
+//! * **Guest servicemanager/hwservicemanager are still zombies** — the
+//!   proxy acks their BINDER_SET_CONTEXT_MGR and remains the context
+//!   manager; with the 6-Z271 bus this is now harmless (their clients'
+//!   lookups are served by the proxy registry directly).
 //!
 //! # Wire framing
 //!
@@ -160,12 +176,11 @@
 //!   exact matches of the kernel `<uapi/linux/android/binder.h>` and
 //!   AOSP-11 `frameworks/native` (IServiceManager / servicemanager).
 
-use libc::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -812,6 +827,16 @@ pub const SVC_MGR_TRY_UNREGISTER_SERVICE: u32 = 9;
 /// The well-known binder handle of the servicemanager itself.
 pub const SVC_MGR_HANDLE: u32 = 0;
 
+/// `IBinder::PING_TRANSACTION` = `B_PACK_CHARS('_','P','N','G')` — answered
+/// by EVERY binder object (kernel semantics; hwservicemanager pings the
+/// context manager on startup).
+pub const PING_TRANSACTION: u32 = u32::from_ne_bytes(*b"_PNG");
+
+/// `android.hidl.manager.V1_0.IServiceManager` method codes (HIDL —
+/// declaration order, FIRST_CALL_TRANSACTION = 1): get = 1, add = 2.
+pub const HIDL_SM_GET: u32 = 1;
+pub const HIDL_SM_ADD: u32 = 2;
+
 // ============================================================================
 // Flat-binder-object type constants (kernel `B_PACK_CHARS(c1,c2,c3,0x85)`).
 // ============================================================================
@@ -1108,6 +1133,27 @@ impl<'a> ParcelReader<'a> {
         let iface = self.read_string16()?;
         Some((strict, work, tag, iface))
     }
+
+    /// Read a HIDL `hidl_string` (libhwbinder `writeHidlString`):
+    /// `[i32 len][len bytes][NUL][zero-pad to 4-byte alignment]`.
+    /// Null (`len < 0`) reads as an empty string.
+    fn read_hidl_string(&mut self) -> Option<String> {
+        let len = self.read_i32()?;
+        if len <= 0 {
+            return Some(String::new());
+        }
+        let len = len as usize;
+        if self.pos + len + 1 > self.buf.len() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&self.buf[self.pos..self.pos + len]).into_owned();
+        self.pos += len;
+        self.pos += 1; // trailing NUL
+        while self.pos < self.buf.len() && self.pos % 4 != 0 {
+            self.pos += 1;
+        }
+        Some(s)
+    }
 }
 
 /// Builder for a libbinder Parcel byte buffer + its companion offsets
@@ -1206,6 +1252,15 @@ struct RequestBlob {
     offsets: Vec<u8>,
 }
 
+impl Clone for RequestBlob {
+    fn clone(&self) -> Self {
+        RequestBlob {
+            data: self.data.clone(),
+            offsets: self.offsets.clone(),
+        }
+    }
+}
+
 /// Proxy-side servicemanager registry: service name → fake proxy handle
 /// (allocated from [`PROXY_HANDLE_BASE`] + 1). Per 6-Z114 §3.3 / §3.4 the
 /// proxy stamps the proxy handle into the `BINDER_TYPE_HANDLE` flat
@@ -1268,6 +1323,294 @@ impl ServiceRegistry {
         self.by_name.is_empty()
     }
 }
+
+// ============================================================================
+// 6-Z271: guest-local transaction bus.
+// ============================================================================
+
+/// Unique per-connection id. `PROXY_CONN_ID` (0) is the proxy itself —
+/// the "owner" of the in-proxy virtual services.
+pub type ConnId = u64;
+
+/// The proxy's own connection id (virtual services are "owned" by it).
+pub const PROXY_CONN_ID: ConnId = 0;
+
+/// 6-Z271 wire extension: connection-identity frame command. NOT a real
+/// binder ioctl — a dedicated `'b'`-type number the loader sends right
+/// after connect with `[u32 pid][u32 uid][u32 gid]`, so routed
+/// transactions can carry kernel-true sender identities.
+pub const WIRE_CMD_IDENT: u32 = 0x4004_62FF;
+
+/// Which in-proxy virtual service backs a handle. These are minimal but
+/// SEMANTICALLY CORRECT AIDL implementations (real parcel shapes, honest
+/// errors) — never fake-success: operations the container cannot satisfy
+/// return service-specific errors rather than bogus data.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VirtualService {
+    /// `android.hardware.vibrator.IVibrator/default` — kills the ~5 s
+    /// per-tap waitForService on the recovery input thread; `on(ms)` is
+    /// forwarded to the host app for a REAL vibration.
+    Vibrator,
+    /// `android.hardware.security.keymint.IKeyMintDevice/default` —
+    /// lets keystore2 obtain its backend HAL and register
+    /// IKeystoreSecurity (kills the ~20 s recovery wait). Key operations
+    /// return honest KeyMint errors (software device, no hardware
+    /// backend) — TWRP already handles that outcome (unmountable-/data
+    /// fallback), just 20 s sooner.
+    KeyMint,
+    /// `android.hardware.security.sharedsecret.ISharedSecret/default` —
+    /// keystore2's shared-secret negotiation partner.
+    SharedSecret,
+}
+
+/// One registered service: name → handle + owner + the owner's local
+/// binder ptr/cookie (stamped into delivered `BR_TRANSACTION`s so the
+/// server sees its own BBinder identity, kernel-style).
+struct ServiceEntry {
+    handle: u32,
+    owner: ConnId,
+    ptr: u64,
+    cookie: u64,
+    virtual_kind: Option<VirtualService>,
+}
+
+/// An item queued for delivery on a server connection's mailbox.
+enum InboxItem {
+    /// An incoming transaction (kernel `BR_TRANSACTION` analogue).
+    Tx(IncomingTx),
+    /// A death notification: `[BR_DEAD_BINDER][cookie]`.
+    Death(u64),
+}
+
+/// An incoming transaction queued for delivery to a server connection.
+struct IncomingTx {
+    requester: ConnId,
+    txn_id: u64,
+    code: u32,
+    flags: u32,
+    one_way: bool,
+    /// Sender identity (kernel semantics — stamped from the connection's
+    /// announced `WIRE_CMD_IDENT` values).
+    sender_pid: i32,
+    sender_euid: u32,
+    /// The request parcel (v2 clients only — the bus needs real bytes to
+    /// deliver; v1 transactions to routed handles fail with
+    /// `BR_FAILED_REPLY` because the parcel is unreachable).
+    blob: Option<RequestBlob>,
+    /// The owner's local binder ptr/cookie (target of the delivered
+    /// `BR_TRANSACTION`).
+    ptr: u64,
+    cookie: u64,
+}
+
+/// The reply that resolves a pending sync transaction on the bus.
+enum BusReply {
+    Ok {
+        data: Vec<u8>,
+        offsets: Vec<u8>,
+    },
+    /// Target handle invalid / transaction could not be delivered.
+    /// (Currently resolved via timeout paths, but kept for callers that
+    /// want an immediate invalid-handle resolution.)
+    #[allow(dead_code)]
+    Failed,
+    /// Target connection died before replying.
+    Dead,
+}
+
+/// Per-connection mailbox state, held inside [`BusState`].
+#[derive(Default)]
+struct ConnBox {
+    inbox: std::collections::VecDeque<InboxItem>,
+    /// Sync transactions queued in `inbox` but not yet delivered — used
+    /// to resolve their waiters as `Dead` when the connection dies.
+    pending_in: Vec<u64>,
+    /// This connection currently holds a delivered transaction and owes
+    /// its `BC_REPLY` (the requester's pending sync transaction id).
+    inflight_txn: Option<u64>,
+    /// Death notifications this connection requested:
+    /// handle → cookie. Delivered as `BR_DEAD_BINDER` when the owning
+    /// connection unregisters.
+    death_watch: HashMap<u32, u64>,
+    /// Guest process identity (announced via `WIRE_CMD_IDENT`). Stamped
+    /// into routed transactions' `sender_pid`/`sender_euid` — kernel
+    /// semantics. Zero until the (optional) IDENT frame arrives.
+    sender_pid: i32,
+    sender_euid: u32,
+}
+
+/// Shared per-VM bus state: the service registry with OWNER routing, the
+/// connection mailboxes, and the reply-waiter channels.
+///
+/// 6-Z271 replaces the 6-Z114 inert registry (addService consumed the
+/// name but never stored the owner — every real-libbinder transaction ran
+/// through `servicemanager_legacy` because the loader sent no request
+/// blobs). The bus delivers `BR_TRANSACTION` to the owning guest
+/// connection and routes its `BC_REPLY` back to the requester, i.e. the
+/// proxy is now a genuine guest-local binder bus for guest↔guest IPC.
+pub struct BusState {
+    services: BTreeMap<String, ServiceEntry>,
+    /// handle → service name (routing lookup for `BC_TRANSACTION`).
+    by_handle: HashMap<u32, String>,
+    /// Monotonic handle allocator (starts at `PROXY_HANDLE_BASE + 1`;
+    /// handle 0 stays reserved for the context manager).
+    next_handle: u32,
+    /// Active connection mailboxes.
+    conns: HashMap<ConnId, ConnBox>,
+    /// Pending sync transactions: txn id → the requester's reply channel.
+    waiters: HashMap<u64, mpsc::Sender<BusReply>>,
+    next_conn: u64,
+    next_txn: u64,
+}
+
+impl BusState {
+    fn new() -> Self {
+        let mut bus = BusState {
+            services: BTreeMap::new(),
+            by_handle: HashMap::new(),
+            next_handle: PROXY_HANDLE_BASE + 1,
+            conns: HashMap::new(),
+            waiters: HashMap::new(),
+            next_conn: PROXY_CONN_ID + 1,
+            next_txn: 1,
+        };
+        bus.ensure_virtual_services();
+        bus
+    }
+
+    /// Register the in-proxy virtual services (idempotent). Virtual
+    /// handles allocate FIRST so they are stable across boots.
+    fn ensure_virtual_services(&mut self) {
+        const VIRTUALS: &[(&str, VirtualService)] = &[
+            (
+                "android.hardware.vibrator.IVibrator/default",
+                VirtualService::Vibrator,
+            ),
+            (
+                "android.hardware.security.keymint.IKeyMintDevice/default",
+                VirtualService::KeyMint,
+            ),
+            (
+                "android.hardware.security.sharedsecret.ISharedSecret/default",
+                VirtualService::SharedSecret,
+            ),
+        ];
+        for (name, kind) in VIRTUALS {
+            if self.services.contains_key(*name) {
+                continue;
+            }
+            let h = self.next_handle;
+            self.next_handle += 1;
+            self.services.insert(
+                name.to_string(),
+                ServiceEntry {
+                    handle: h,
+                    owner: PROXY_CONN_ID,
+                    ptr: 0,
+                    cookie: 0,
+                    virtual_kind: Some(*kind),
+                },
+            );
+            self.by_handle.insert(h, name.to_string());
+            info!(
+                "[KR64][binder][svc] virtual service registered: {} → handle 0x{:08x}",
+                name, h
+            );
+        }
+    }
+
+    /// Register (or overwrite) a guest-owned service. Returns the handle.
+    fn add_guest_service(&mut self, name: &str, owner: ConnId, ptr: u64, cookie: u64) -> u32 {
+        if let Some(entry) = self.services.get_mut(name) {
+            // Native servicemanager "overwrite" semantics: same name →
+            // same handle, new owner.
+            entry.owner = owner;
+            entry.ptr = ptr;
+            entry.cookie = cookie;
+            return entry.handle;
+        }
+        let h = self.next_handle;
+        self.next_handle += 1;
+        self.services.insert(
+            name.to_string(),
+            ServiceEntry {
+                handle: h,
+                owner,
+                ptr,
+                cookie,
+                virtual_kind: None,
+            },
+        );
+        self.by_handle.insert(h, name.to_string());
+        h
+    }
+
+    /// Allocate the next connection id and create its mailbox.
+    fn register_conn(&mut self) -> ConnId {
+        let id = self.next_conn;
+        self.next_conn += 1;
+        self.conns.insert(id, ConnBox::default());
+        id
+    }
+
+    /// Tear down a connection: unregister owned services, resolve its
+    /// undelivered incoming transactions as `DEAD`, and deliver
+    /// `BR_DEAD_BINDER` to death watchers.
+    fn unregister_conn(&mut self, conn: ConnId) {
+        // Resolve waiters whose transaction was queued on this connection
+        // (server died before the guest even saw the work).
+        let dead_txns = match self.conns.remove(&conn) {
+            Some(bx) => bx.pending_in,
+            None => Vec::new(),
+        };
+        for txn_id in dead_txns {
+            if let Some(sender) = self.waiters.remove(&txn_id) {
+                let _ = sender.send(BusReply::Dead);
+            }
+        }
+        let dead: Vec<(String, u32)> = self
+            .services
+            .iter()
+            .filter(|(_, e)| e.owner == conn)
+            .map(|(n, e)| (n.clone(), e.handle))
+            .collect();
+        for (name, handle) in &dead {
+            self.services.remove(name);
+            self.by_handle.remove(handle);
+            let watchers: Vec<(ConnId, u64)> = self
+                .conns
+                .iter()
+                .filter_map(|(id, b)| b.death_watch.get(handle).map(|c| (*id, *c)))
+                .collect();
+            for (watcher, cookie) in watchers {
+                if let Some(wb) = self.conns.get_mut(&watcher) {
+                    wb.inbox.push_back(InboxItem::Death(cookie));
+                }
+            }
+        }
+    }
+
+    /// Route a transaction to its owner's mailbox. Returns false when the
+    /// owner is gone or its mailbox is full.
+    fn queue_transaction(&mut self, tx: IncomingTx, owner: ConnId) -> bool {
+        match self.conns.get_mut(&owner) {
+            Some(b) if b.inbox.len() < MAX_QUEUED_ITEMS => {
+                if tx.txn_id != 0 {
+                    b.pending_in.push(tx.txn_id);
+                }
+                b.inbox.push_back(InboxItem::Tx(tx));
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// How long a sync transaction waits for the server's `BC_REPLY` before
+/// the proxy resolves it as `BR_FAILED_REPLY` (the kernel has no timeout,
+/// but a hung server would otherwise hang the requester forever; 8 s
+/// matches the class of client-side waits this wave is eliminating).
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(8);
 
 // ============================================================================
 // Service-manager handle table.
@@ -1478,17 +1821,10 @@ pub struct BinderProxy {
     vm_id: u32,
     listener: Option<UnixListener>,
     path: String,
-    /// Opened lazily on the first `BC_TRANSACTION` that targets a
-    /// non-servicemanager handle. `None` means "not yet opened" (or
-    /// "open failed and we're returning errors for all forwards").
-    host_binder_fd: Arc<Mutex<Option<RawFd>>>,
-    /// Per-VM handle table (guest handle ↔ host handle ↔ service name)
-    /// for the future host-forwarding path (BINDER-3).
-    handles: Arc<Mutex<HandleTable>>,
-    /// Proxy-side servicemanager registry — populated by
-    /// `SVC_MGR_ADD_SERVICE` and queried by `SVC_MGR_GET_SERVICE` /
-    /// `SVC_MGR_CHECK_SERVICE` (6-Z114 §3).
-    services: Arc<Mutex<ServiceRegistry>>,
+    /// 6-Z271 guest-local bus: service registry with owner routing, per-
+    /// connection mailboxes, and reply-waiter channels. Replaces the
+    /// 6-Z114 inert registry + the untested forward-to-host skeleton.
+    bus: Arc<Mutex<BusState>>,
     /// Set to true by [`BinderProxyHandle::shutdown`] / drop to ask the
     /// accept thread to exit.
     shutdown: Arc<AtomicBool>,
@@ -1527,9 +1863,7 @@ impl BinderProxy {
             vm_id,
             listener: Some(listener),
             path: socket_path.to_string(),
-            host_binder_fd: Arc::new(Mutex::new(None)),
-            handles: Arc::new(Mutex::new(HandleTable::new())),
-            services: Arc::new(Mutex::new(ServiceRegistry::new())),
+            bus: Arc::new(Mutex::new(BusState::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -1544,9 +1878,7 @@ impl BinderProxy {
             .listener
             .take()
             .expect("BinderProxy::spawn: listener already taken");
-        let host_fd = Arc::clone(&self.host_binder_fd);
-        let handles = Arc::clone(&self.handles);
-        let services = Arc::clone(&self.services);
+        let bus = Arc::clone(&self.bus);
         // Clone the shutdown Arc twice: one for the accept thread, one
         // for the returned handle. Both share the same AtomicBool.
         let shutdown_for_thread = Arc::clone(&self.shutdown);
@@ -1590,17 +1922,13 @@ impl BinderProxy {
                                 continue;
                             }
                             info!("[KR64][binder][vm{}] client connected", vm_id);
-                            let host_fd = Arc::clone(&host_fd);
-                            let handles = Arc::clone(&handles);
-                            let services = Arc::clone(&services);
+                            let bus = Arc::clone(&bus);
                             let active_conn = Arc::clone(&active);
                             active.fetch_add(1, Ordering::AcqRel);
                             let spawned = thread::Builder::new()
                                 .name(format!("kr64-binder-conn-{}", vm_id))
                                 .spawn(move || {
-                                    let result = handle_connection(
-                                        stream, vm_id, &host_fd, &handles, &services,
-                                    );
+                                    let result = handle_connection(stream, vm_id, &bus);
                                     if let Err(e) = result {
                                         warning!(
                                             "[KR64][binder][vm{}] connection handler ended: {}",
@@ -1770,25 +2098,52 @@ impl Drop for ThreadPool {
 /// Handle one guest connection: read frames, dispatch, write responses.
 /// Returns when the guest disconnects (EOF) or an unrecoverable I/O
 /// error occurs.
+///
+/// 6-Z271: the connection registers on the per-VM bus (mailbox + identity)
+/// and tears down on exit — owned services are unregistered, death
+/// watchers get `BR_DEAD_BINDER`, and pending routed transactions fail.
 fn handle_connection(
     mut stream: UnixStream,
     vm_id: u32,
-    host_fd: &Arc<Mutex<Option<RawFd>>>,
-    handles: &Arc<Mutex<HandleTable>>,
-    services: &Arc<Mutex<ServiceRegistry>>,
+    bus: &Arc<Mutex<BusState>>,
 ) -> io::Result<()> {
-    info!("[KR64][binder][vm{}] handling new connection", vm_id);
+    let conn_id = {
+        let mut b = bus.lock().expect("binder bus poisoned");
+        b.register_conn()
+    };
+    info!(
+        "[KR64][binder][vm{}] handling new connection (conn={})",
+        vm_id, conn_id
+    );
+    let result = connection_loop(&mut stream, vm_id, bus, conn_id);
+    bus.lock()
+        .expect("binder bus poisoned")
+        .unregister_conn(conn_id);
+    result
+}
+
+/// The per-connection frame loop (split out so the bus teardown runs for
+/// every exit path).
+fn connection_loop(
+    stream: &mut UnixStream,
+    vm_id: u32,
+    bus: &Arc<Mutex<BusState>>,
+    conn_id: ConnId,
+) -> io::Result<()> {
     loop {
-        let req = match read_frame(&mut stream) {
+        let req = match read_frame(stream) {
             Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                info!("[KR64][binder][vm{}] client disconnected", vm_id);
+                info!(
+                    "[KR64][binder][vm{}] client disconnected (conn={})",
+                    vm_id, conn_id
+                );
                 return Ok(());
             }
             Err(e) => return Err(e),
         };
-        let resp = dispatch_request(&req, vm_id, host_fd, handles, services);
-        write_frame(&mut stream, &resp)?;
+        let resp = dispatch_request(&req, vm_id, bus, conn_id);
+        write_frame(stream, &resp)?;
     }
 }
 
@@ -1797,15 +2152,34 @@ fn handle_connection(
 // ============================================================================
 
 /// Dispatch one parsed request frame to the appropriate handler.
-fn dispatch_request(
-    req: &Frame,
-    vm_id: u32,
-    host_fd: &Arc<Mutex<Option<RawFd>>>,
-    handles: &Arc<Mutex<HandleTable>>,
-    services: &Arc<Mutex<ServiceRegistry>>,
-) -> Resp {
+fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id: ConnId) -> Resp {
     match req.cmd {
         BINDER_VERSION => handle_version(vm_id),
+
+        // 6-Z271 wire extension (twoyi_loader_shlib.c sends it right
+        // after connect): [u32 pid][u32 uid][u32 gid]. The kernel stamps
+        // real sender identities into transactions; the wire cannot, so
+        // the guest announces them once per connection.
+        WIRE_CMD_IDENT => {
+            let (pid, uid) = if req.payload.len() >= 8 {
+                (
+                    i32::from_ne_bytes(req.payload[0..4].try_into().unwrap()),
+                    u32::from_ne_bytes(req.payload[4..8].try_into().unwrap()),
+                )
+            } else {
+                (0, 0)
+            };
+            if let Ok(mut b) = bus.lock() {
+                if let Some(box_) = b.conns.get_mut(&conn_id) {
+                    box_.sender_pid = pid;
+                    box_.sender_euid = uid;
+                }
+            }
+            Resp {
+                ret: 0,
+                payload: Vec::new(),
+            }
+        }
 
         BINDER_SET_MAX_THREADS => {
             let n = if req.payload.len() >= 4 {
@@ -1862,7 +2236,7 @@ fn dispatch_request(
             }
         }
 
-        BINDER_WRITE_READ => handle_write_read(&req.payload, vm_id, host_fd, handles, services),
+        BINDER_WRITE_READ => handle_write_read(&req.payload, vm_id, bus, conn_id),
 
         other => {
             warning!(
@@ -1897,16 +2271,28 @@ fn handle_version(vm_id: u32) -> Resp {
 
 /// Handle a `BINDER_WRITE_READ` request.
 ///
-/// The wire payload is [`WireBinderWriteRead`]: `[u32 write_size]
-/// [u32 read_capacity][write_size bytes]`. We parse the write_buffer
-/// into individual BC_* commands, dispatch each one, and build a
-/// read_buffer of BR_* commands to return.
+/// The wire payload is `[u32 write_size][u32 read_capacity][write_size
+/// bytes]` (+ the v2 request trailer when the loader inlines parcel
+/// blobs). We parse the write_buffer into individual BC_* commands,
+/// dispatch each one, and build a read_buffer of BR_* commands to return.
+///
+/// 6-Z271 additions on top of the 6-Z114 shape:
+/// * `BC_TRANSACTION` to a registered (guest or virtual) handle is routed
+///   to the owning connection's mailbox and the requester blocks for the
+///   server's `BC_REPLY` (kernel semantics; one-way gets only
+///   `BR_TRANSACTION_COMPLETE`).
+/// * `BC_REPLY` from a server connection is correlated to the delivered
+///   transaction and routed back to the requester.
+/// * A read-only ioctl first drains the connection's mailbox (incoming
+///   transactions / death notifications) before falling back to the
+///   250 ms `BR_NOOP` idle tick.
+/// * `BC_REQUEST_DEATH_NOTIFICATION` / `BC_CLEAR_DEATH_NOTIFICATION` are
+///   recorded; owner death pushes `BR_DEAD_BINDER`.
 fn handle_write_read(
     payload: &[u8],
     vm_id: u32,
-    host_fd: &Arc<Mutex<Option<RawFd>>>,
-    handles: &Arc<Mutex<HandleTable>>,
-    services: &Arc<Mutex<ServiceRegistry>>,
+    bus: &Arc<Mutex<BusState>>,
+    conn_id: ConnId,
 ) -> Resp {
     // Parse the v1 wire header: [u32 write_size][u32 read_capacity][write_size BC_* bytes].
     if payload.len() < 8 {
@@ -1968,11 +2354,10 @@ fn handle_write_read(
         }
     }
 
-    // Walk the BC_* stream. For each BC_TRANSACTION/BC_TRANSACTION_SG, the
-    // i-th v2 blob (in stream order) carries that transaction's parcel
-    // data + offsets (6-Z114 §4.4 — both sides walk the same stream).
+    // Walk the BC_* stream. The i-th v2 blob pairs with the i-th
+    // BC_TRANSACTION/BC_REPLY/`*_SG` command in stream order.
     let mut read_buf: Vec<u8> = Vec::new();
-    let mut reply_blobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut resp_blobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut blob_idx = 0usize;
     let mut consumed = 0usize;
     while consumed + 4 <= write_buf.len() {
@@ -1998,15 +2383,19 @@ fn handle_write_read(
                 let req_blob = if is_v2 && blob_idx < req_blobs.len() {
                     let b = &req_blobs[blob_idx];
                     blob_idx += 1;
-                    Some(b)
+                    Some(b.clone())
                 } else {
                     None
                 };
-                let result =
-                    handle_transaction(cmd_payload, vm_id, host_fd, handles, services, req_blob);
+                let result = handle_transaction(cmd_payload, vm_id, bus, conn_id, req_blob);
                 match result {
                     TransactionResult::Failed => {
                         push_br_failed_reply(&mut read_buf);
+                    }
+                    TransactionResult::CompleteOnly => {
+                        // One-way: the kernel returns only
+                        // BR_TRANSACTION_COMPLETE for the write half.
+                        push_br_transaction_complete(&mut read_buf);
                     }
                     TransactionResult::Reply { data, offsets } => {
                         // Kernel-true batch (6-Z114 §4.5): the client's
@@ -2014,38 +2403,63 @@ fn handle_write_read(
                         // then loops to read BR_REPLY.
                         push_br_transaction_complete(&mut read_buf);
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
-                        // The reply parcel bytes ALWAYS ride the response
-                        // trailer (6-Z265): v2 clients (z113 shim) patch
-                        // tr.data_ptr/offsets_ptr from the blob index; v1
-                        // clients are REAL libbinder users that dereference
-                        // tr.data_ptr, so the hook backs that pointer with
-                        // the blob bytes. On the wire tr.data_ptr stays 0
-                        // in both cases.
-                        reply_blobs.push((data, offsets));
+                        resp_blobs.push((data, offsets));
                     }
                 }
             }
             BC_REPLY | BC_REPLY_SG => {
-                // The guest is the client of the servicemanager; it does
-                // not produce BC_REPLY. (A future server-routing extension
-                // would consume BC_REPLY here and correlate it back to the
-                // original requester as BR_REPLY — 6-Z114 §4.5 / §5.4.)
-                info!("[KR64][binder][vm{}] BC_REPLY from guest — ignored", vm_id);
+                // 6-Z271: the guest is answering a transaction the bus
+                // delivered to it. Correlate via the connection's inflight
+                // txn and route the reply to the original requester.
+                let reply_blob = if is_v2 && blob_idx < req_blobs.len() {
+                    let b = &req_blobs[blob_idx];
+                    blob_idx += 1;
+                    Some(b.clone())
+                } else {
+                    None
+                };
+                let inflight = {
+                    let mut b = bus.lock().expect("binder bus poisoned");
+                    b.conns
+                        .get_mut(&conn_id)
+                        .and_then(|bx| bx.inflight_txn.take())
+                };
+                match inflight {
+                    Some(txn_id) => {
+                        let (data, offsets) = match reply_blob {
+                            Some(rb) => (rb.data, rb.offsets),
+                            None => (Vec::new(), Vec::new()),
+                        };
+                        let waiter = {
+                            let mut b = bus.lock().expect("binder bus poisoned");
+                            b.waiters.remove(&txn_id)
+                        };
+                        if let Some(sender) = waiter {
+                            let _ = sender.send(BusReply::Ok { data, offsets });
+                        } else {
+                            // Requester timed out and left. Drop the reply.
+                            warning!(
+                                "[KR64][binder][vm{}] BC_REPLY for txn {} — requester gone",
+                                vm_id,
+                                txn_id
+                            );
+                        }
+                    }
+                    None => {
+                        warning!(
+                            "[KR64][binder][vm{}] BC_REPLY with no delivered transaction (conn={}) — ignored",
+                            vm_id, conn_id
+                        );
+                    }
+                }
             }
             BC_ACQUIRE | BC_RELEASE | BC_INCREFS | BC_DECREFS => {
-                // Strong/weak refcount changes on remote handles. The
-                // proxy accepts these silently — a real impl would forward
-                // them to the host's /dev/binder so the host's binder
-                // driver can manage refcounts on the host's servicemanager
-                // / ActivityManager etc. (BINDER-3 TODO).
+                // Strong/weak refcount changes on remote handles. The bus
+                // keeps no refcounts (guest-owned nodes live as long as
+                // their owning connection).
             }
             BC_ACQUIRE_DONE | BC_INCREFS_DONE => {
-                // Acknowledgements of refcount operations on local binders
-                // (kernel UAPI: BC_ACQUIRE_DONE, BC_INCREFS_DONE only —
-                // there is no BC_ACQUIRE_FAILED / BC_INCREFS_FAILED enum
-                // member in drivers/android/binder.h; the pre-Z114 code
-                // matched on undefined identifiers that rustc then treated
-                // as binding patterns, breaking the build — 6-Z114).
+                // Acknowledgements of refcount operations on local binders.
             }
             BC_FREE_BUFFER | BC_DEAD_BINDER_DONE => {
                 // Return a transaction-data buffer to the kernel, or
@@ -2059,11 +2473,26 @@ fn handle_write_read(
                     vm_id, cmd
                 );
             }
-            BC_REQUEST_DEATH_NOTIFICATION | BC_CLEAR_DEATH_NOTIFICATION => {
-                info!(
-                    "[KR64][binder][vm{}] death-notification request: 0x{:08x}",
-                    vm_id, cmd
-                );
+            BC_REQUEST_DEATH_NOTIFICATION => {
+                // Payload: packed `binder_handle_cookie` (u32 handle + u64
+                // cookie, 12 bytes).
+                if cmd_payload.len() >= 12 {
+                    let handle = u32::from_ne_bytes(cmd_payload[0..4].try_into().unwrap());
+                    let cookie = u64::from_ne_bytes(cmd_payload[4..12].try_into().unwrap());
+                    let mut b = bus.lock().expect("binder bus poisoned");
+                    if let Some(bx) = b.conns.get_mut(&conn_id) {
+                        bx.death_watch.insert(handle, cookie);
+                    }
+                }
+            }
+            BC_CLEAR_DEATH_NOTIFICATION => {
+                if cmd_payload.len() >= 12 {
+                    let handle = u32::from_ne_bytes(cmd_payload[0..4].try_into().unwrap());
+                    let mut b = bus.lock().expect("binder bus poisoned");
+                    if let Some(bx) = b.conns.get_mut(&conn_id) {
+                        bx.death_watch.remove(&handle);
+                    }
+                }
             }
             _ => {
                 warning!(
@@ -2076,48 +2505,85 @@ fn handle_write_read(
         }
     }
 
-    // Idle path: a pure-read BINDER_WRITE_READ (no BC_* that produced BR
-    // bytes) gets a BR_NOOP so the guest's `getAndExecuteCommand` loops
-    // (6-Z112 G3; 6-Z114 §5).
-    //
-    // 6-Z152: BLOCKING idle — sleep IDLE_POLL_TICK (250ms) BEFORE pushing
-    // BR_NOOP, emulating the kernel's blocking `read_buffer`. Without this,
-    // surfaceflinger (which polls binder for vsync/rendering events with a
-    // pure-read BINDER_WRITE_READ) busy-loops at ~100Hz: each call returns
-    // immediately with BR_NOOP, the guest's `ioctl` returns, the guest
-    // immediately re-issues the same ioctl. The tracer (one ptrace thread
-    // handling ALL pids via waitpid(-1)) gets 100% pinned on surfaceflinger
-    // poll-stop / poll-resume cycles, starving init/zygote/ueventd/
-    // servicemanager (which sit in 't' state, never resuming). The knock-on
-    // effect: zygote never gets CPU to fork system_server → no
-    // boot_completed. The 250ms sleep throttles surfaceflinger's poll rate
-    // to ~4Hz, freeing the tracer to drain the other stopped children. This
-    // runs in the per-connection thread (one per guest binder fd, bounded
-    // by MAX_PROXY_CONNECTIONS), so blocking here doesn't stall other
-    // connections. The S1b proxy was DESIGNED for this (see the comment on
-    // BINDER_THREAD_POOL_SIZE at line 886 + IDLE_POLL_TICK at line 904).
+    // Read half. A guest that offered read capacity gets, in order of
+    // preference: a queued incoming transaction, a queued death
+    // notification, or (after the idle tick) BR_NOOP — mirroring the
+    // kernel's blocking `read_buffer`.
     if read_buf.is_empty() && read_capacity > 0 {
-        std::thread::sleep(IDLE_POLL_TICK);
-        push_br_noop(&mut read_buf);
+        enum Delivery {
+            None,
+            Tx(IncomingTx),
+            Death(u64),
+        }
+        let delivery = {
+            let mut b = bus.lock().expect("binder bus poisoned");
+            match b.conns.get_mut(&conn_id) {
+                Some(bx) => match bx.inbox.pop_front() {
+                    Some(InboxItem::Tx(tx)) => {
+                        // Mark the delivered transaction as inflight so the
+                        // guest's BC_REPLY correlates (sync only — one-way
+                        // has txn_id 0 and expects no reply). Remove it
+                        // from pending_in: it's no longer "queued".
+                        if tx.txn_id != 0 {
+                            bx.inflight_txn = Some(tx.txn_id);
+                            bx.pending_in.retain(|id| *id != tx.txn_id);
+                        }
+                        Delivery::Tx(tx)
+                    }
+                    Some(InboxItem::Death(cookie)) => Delivery::Death(cookie),
+                    None => Delivery::None,
+                },
+                None => Delivery::None,
+            }
+        };
+        match delivery {
+            Delivery::Tx(tx) => {
+                let (ds, os) = match &tx.blob {
+                    Some(b) => (b.data.len() as u64, b.offsets.len() as u64),
+                    None => (0, 0),
+                };
+                push_br_transaction(
+                    &mut read_buf,
+                    tx.code,
+                    tx.flags,
+                    tx.sender_pid,
+                    tx.sender_euid,
+                    tx.ptr,
+                    tx.cookie,
+                    ds,
+                    os,
+                );
+                if let Some(blob) = tx.blob {
+                    resp_blobs.push((blob.data, blob.offsets));
+                }
+                info!(
+                    "[KR64][binder][vm{}] delivered transaction conn={} <- conn={} code={} oneway={} (tx #{})",
+                    vm_id, conn_id, tx.requester, tx.code, tx.one_way, tx.txn_id
+                );
+            }
+            Delivery::Death(cookie) => {
+                push_br_dead_binder(&mut read_buf, cookie);
+            }
+            Delivery::None => {
+                // 6-Z152: BLOCKING idle — sleep before BR_NOOP so a
+                // guest poll loop can't pin the tracer (see the 6-Z268
+                // analysis in the original comment history).
+                std::thread::sleep(IDLE_POLL_TICK);
+                push_br_noop(&mut read_buf);
+            }
+        }
     }
 
     // Build the wire response: [u32 read_size][read_size BR_* bytes] plus
-    // the optional v2 trailer [u32 WIRE_V2_MAGIC][u32 blob_count][blobs…].
-    //
-    // 6-Z265: the trailer is ALSO appended for v1 requests when the BC
-    // stream produced reply parcels. v1 clients are REAL libbinder users
-    // (OrangeFox R12 recovery, keystore2 — anything not built against the
-    // z113 shim): they dereference tr.data_ptr, so the hook needs the
-    // actual reply bytes to back that pointer with real memory. Hooks
-    // that don't parse the trailer already bound their copy by srv_read
-    // and simply ignore the extra bytes — backward compatible.
+    // the trailer when the request was v2 or the stream produced blobs
+    // (6-Z265 — v1 real-libbinder clients dereference tr.data_ptr).
     let mut resp_payload = Vec::with_capacity(4 + read_buf.len() + 8);
     resp_payload.extend_from_slice(&(read_buf.len() as u32).to_ne_bytes());
     resp_payload.extend_from_slice(&read_buf);
-    if is_v2 || !reply_blobs.is_empty() {
+    if is_v2 || !resp_blobs.is_empty() {
         resp_payload.extend_from_slice(&WIRE_V2_MAGIC.to_ne_bytes());
-        resp_payload.extend_from_slice(&(reply_blobs.len() as u32).to_ne_bytes());
-        for (data, offsets) in &reply_blobs {
+        resp_payload.extend_from_slice(&(resp_blobs.len() as u32).to_ne_bytes());
+        for (data, offsets) in &resp_blobs {
             resp_payload.extend_from_slice(&(data.len() as u32).to_ne_bytes());
             resp_payload.extend_from_slice(&(offsets.len() as u32).to_ne_bytes());
             resp_payload.extend_from_slice(data);
@@ -2132,7 +2598,7 @@ fn handle_write_read(
 }
 
 // ============================================================================
-// Transaction dispatch — servicemanager vs forward-to-host.
+// Transaction dispatch — servicemanager / routed bus / virtual services.
 // ============================================================================
 
 /// Result of handling a `BC_TRANSACTION`. Every handler path MUST push
@@ -2146,35 +2612,28 @@ enum TransactionResult {
     Failed,
     /// Push `[BR_TRANSACTION_COMPLETE][BR_REPLY][binder_transaction_data]`
     /// with `tr.data_size = data.len()` / `tr.offsets_size = offsets.len()`.
-    /// For v2 requests the `data`/`offsets` bytes ride in the response
-    /// trailer; for v1 they are dropped (the z113 client can't dereference
-    /// `tr.data_ptr = 0` anyway).
-    Reply {
-        /// The reply parcel's data buffer.
-        data: Vec<u8>,
-        /// The reply parcel's offsets array (8 bytes per flat object).
-        offsets: Vec<u8>,
-    },
+    /// The `data`/`offsets` bytes ride the response trailer (both v2 and
+    /// v1 real-libbinder requests — the hook backs tr.data_ptr with them).
+    Reply { data: Vec<u8>, offsets: Vec<u8> },
+    /// One-way transaction accepted: push only
+    /// `[BR_TRANSACTION_COMPLETE]` (kernel semantics — no reply).
+    CompleteOnly,
 }
 
 /// Handle a `BC_TRANSACTION` (or `BC_TRANSACTION_SG`) command.
 ///
-/// If the target handle is [`SVC_MGR_HANDLE`] (0), this is a
-/// servicemanager transaction and we dispatch to
-/// [`servicemanager_proxy`]. Otherwise we forward to the host's
-/// `/dev/binder` via [`forward_transaction_to_host`].
+/// Dispatch order: `PING_TRANSACTION` (every binder answers), handle 0 →
+/// [`servicemanager_proxy`], registered handle → in-proxy virtual service
+/// handler or routed to the owning guest connection (kernel `BR_TRANSACTION`
+/// delivery + `BC_REPLY` correlation), anything else → `BR_FAILED_REPLY`
+/// (the old forward-to-host skeleton never worked — untranslated handles
+/// and raw guest pointers — and is retired).
 fn handle_transaction(
     cmd_payload: &[u8],
     vm_id: u32,
-    host_fd: &Arc<Mutex<Option<RawFd>>>,
-    // `handles` is the per-VM guest↔host handle-translation table reserved
-    // for the future host-forwarding path (BINDER-3 TODO, 6-Z114 §2.6).
-    // The current servicemanager-proxy path doesn't translate handles
-    // (target handle 0 is the servicemanager itself), so the param is
-    // `_`-prefixed; the host-forwarding stub below likewise ignores it.
-    _handles: &Arc<Mutex<HandleTable>>,
-    services: &Arc<Mutex<ServiceRegistry>>,
-    req_blob: Option<&RequestBlob>,
+    bus: &Arc<Mutex<BusState>>,
+    conn_id: ConnId,
+    req_blob: Option<RequestBlob>,
 ) -> TransactionResult {
     if cmd_payload.len() < std::mem::size_of::<BinderTransactionData>() {
         warning!(
@@ -2190,11 +2649,24 @@ fn handle_transaction(
     let target_handle = u32::from_ne_bytes(cmd_payload[0..4].try_into().unwrap());
     let code = u32::from_ne_bytes(cmd_payload[16..20].try_into().unwrap());
     let flags = u32::from_ne_bytes(cmd_payload[20..24].try_into().unwrap());
+    let one_way = flags & TF_ONE_WAY != 0;
+
+    // PING_TRANSACTION (0x5F504E47 — IBinder::PING) is answered by every
+    // binder object; the reply is the empty AIDL status (HIDL void
+    // clients read nothing from it either). hwservicemanager pings the
+    // context manager on startup — run 33411932921 showed our BR_FAILED_
+    // REPLY answer before this wave.
+    if code == PING_TRANSACTION {
+        let mut w = ParcelWriter::new();
+        w.write_status_ok();
+        let (data, offsets) = w.into_parts();
+        return TransactionResult::Reply { data, offsets };
+    }
 
     if target_handle == SVC_MGR_HANDLE {
-        // 6-Z266: RATE-LIMITED — the user's lavender boot poll
+        // 6-Z266: RATE-LIMITED — the user's lavender boot polled
         // checkService (code=2) every ~100 ms for a service that never
-        // registers, which made this per-transaction INFO line a
+        // registered, which made this per-transaction INFO line a
         // 10-lines/sec-forever flood in the phone log pack. Keep the
         // first 4 lines per (vm, code) shape for evidence, then one
         // sampled line per 200th transaction carrying the running
@@ -2220,31 +2692,118 @@ fn handle_transaction(
                 if seen <= 4 { "" } else { " sampled" }
             );
         }
-        return servicemanager_proxy(code, services, req_blob);
+        return servicemanager_proxy(code, bus, req_blob.as_ref(), conn_id);
     }
 
-    info!(
-        "[KR64][binder][vm{}] transaction to handle {}: code={} flags=0x{:02x} — forwarding to host (skeleton)",
-        vm_id, target_handle, code, flags
-    );
+    // Route to a registered service (guest-owned or in-proxy virtual).
+    let route = {
+        let b = bus.lock().expect("binder bus poisoned");
+        b.by_handle.get(&target_handle).and_then(|name| {
+            b.services
+                .get(name)
+                .map(|e| (e.owner, e.ptr, e.cookie, e.virtual_kind))
+        })
+    };
+    let (owner, ptr, cookie, virtual_kind) = match route {
+        Some(r) => r,
+        None => {
+            // Unknown handle — the kernel answers BR_FAILED_REPLY for a
+            // transact to an invalid handle; so do we. (The retired
+            // forward-to-host skeleton could never work: untranslated
+            // handles + guest pointers → host EFAULT.)
+            return TransactionResult::Failed;
+        }
+    };
 
-    // Skeleton: forward to host. The full implementation would
-    // translate the guest handle to the host handle, patch the
-    // flat_binder_object array, and copy in the data buffer before
-    // issuing the ioctl. This skeleton just issues the raw ioctl with
-    // the unmodified transaction data — which will fail on the host
-    // side (the host's /dev/binder doesn't know about our guest
-    // handles), but it has the right structure.
-    match forward_transaction_to_host(cmd_payload, host_fd) {
-        Ok(reply_bytes) => TransactionResult::Reply {
-            data: reply_bytes,
-            offsets: Vec::new(),
-        },
-        Err(e) => {
+    if let Some(kind) = virtual_kind {
+        return virtual_service_transaction(kind, code, req_blob.as_ref());
+    }
+
+    // Guest-owned service: the request parcel must be deliverable.
+    let Some(blob) = req_blob else {
+        warning!(
+            "[KR64][binder][vm{}] transaction to handle 0x{:08x}: v1 request has no parcel bytes — failing (v2 loader required)",
+            vm_id, target_handle
+        );
+        return TransactionResult::Failed;
+    };
+    if owner == conn_id {
+        // Self-transaction would deadlock: the server pops its inbox on
+        // its NEXT ioctl, which cannot happen until this one completes.
+        warning!(
+            "[KR64][binder][vm{}] self-transaction to handle 0x{:08x} — failing",
+            vm_id,
+            target_handle
+        );
+        return TransactionResult::Failed;
+    }
+
+    // Stamp the sender identity (announced via WIRE_CMD_IDENT — kernel
+    // would do this from the socket credentials).
+    let (sender_pid, sender_euid) = {
+        let b = bus.lock().expect("binder bus poisoned");
+        b.conns
+            .get(&conn_id)
+            .map(|bx| (bx.sender_pid, bx.sender_euid))
+            .unwrap_or((0, 0))
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let txn_id;
+    {
+        let mut b = bus.lock().expect("binder bus poisoned");
+        txn_id = b.next_txn;
+        b.next_txn += 1;
+        if !one_way {
+            b.waiters.insert(txn_id, tx);
+        }
+        let queued = b.queue_transaction(
+            IncomingTx {
+                requester: conn_id,
+                txn_id: if one_way { 0 } else { txn_id },
+                code,
+                flags,
+                one_way,
+                sender_pid,
+                sender_euid,
+                blob: Some(blob),
+                ptr,
+                cookie,
+            },
+            owner,
+        );
+        if !queued {
+            if !one_way {
+                b.waiters.remove(&txn_id);
+            }
+            drop(b);
             warning!(
-                "[KR64][binder][vm{}] forward_transaction_to_host failed: {}",
+                "[KR64][binder][vm{}] transaction to handle 0x{:08x}: owner mailbox full or gone",
                 vm_id,
-                e
+                target_handle
+            );
+            return TransactionResult::Failed;
+        }
+    }
+
+    if one_way {
+        return TransactionResult::CompleteOnly;
+    }
+
+    match rx.recv_timeout(REPLY_TIMEOUT) {
+        Ok(BusReply::Ok { data, offsets }) => TransactionResult::Reply { data, offsets },
+        Ok(_) => TransactionResult::Failed,
+        Err(_) => {
+            // Timeout: deregister so a late BC_REPLY resolves nothing.
+            if let Ok(mut b) = bus.lock() {
+                b.waiters.remove(&txn_id);
+            }
+            warning!(
+                "[KR64][binder][vm{}] transaction to handle 0x{:08x} code={} timed out after {:?}",
+                vm_id,
+                target_handle,
+                code,
+                REPLY_TIMEOUT
             );
             TransactionResult::Failed
         }
@@ -2253,46 +2812,54 @@ fn handle_transaction(
 
 /// Intercept servicemanager transactions (target handle 0).
 ///
-/// # Wire shape (6-Z114 §3.2 — verified against android-11
-/// `frameworks/native/libs/binder/Parcel.cpp` + `IServiceManager.cpp`)
-///
-/// The transaction's data buffer is an AIDL parcel. Every REQUEST parcel
-/// begins with the libbinder interface-token header
-/// `writeInterfaceToken(descriptor)`:
+/// AIDL (libbinder, `/dev/binder` + `/dev/vndbinder`) request parcels begin
+/// with the interface-token header `writeInterfaceToken(descriptor)`:
 ///
 /// ```text
-///   i32  strict_mode_policy   (getStrictModePolicy() | STRICT_MODE_PENALTY_GATHER; usually 0)
-///   i32  work_source_uid      (kUnsetWorkSource = -1 → 0xFFFFFFFF unless propagated)
-///   i32  header_tag           'SYST' = 0x53595354 (or 'VNDR' on /dev/vndbinder)
+///   i32  strict_mode_policy
+///   i32  work_source_uid      (kUnsetWorkSource = -1 unless propagated)
+///   i32  header_tag           'SYST' (system) or 'VNDR' (vendor)
 ///   string16 descriptor       "android.os.IServiceManager"
 ///   …    per-code arguments
 /// ```
 ///
-/// The proxy parses leniently (consumes the 3 i32s + one string16 to
-/// reach the args) but logs mismatches. Per-code arg + reply shapes
-/// live in the match arms below (6-Z114 §3.1 / §3.3).
+/// HIDL (libhwbinder, `/dev/hwbinder`) writes NO header tag — the parcel is
+/// `[i32 strict][i32 work][string16 descriptor]`. The proxy distinguishes
+/// the two by peeking word 2: `SYST`/`VNDR` → AIDL, anything else → HIDL.
+/// (Run 33411932921: the guest's real hwservicemanager spoke HIDL through
+/// the proxy — its `IBase::PING` was the `code=1599098439` line.)
 ///
 /// # v2 vs legacy v1 behaviour
 ///
-/// With a v2 wire blob (`req_blob = Some`) the proxy parses the real
-/// request parcel and synthesises a real reply parcel — both ride the
-/// v2 trailer. With v1 (`req_blob = None`) the 6-Z113 loader cannot
-/// inline parcel bytes, so the proxy answers the *legacy* synthetic
-/// shapes (GET → AIDL null binder, ADD → status 0) — correct enough
-/// to keep the ROM's libbinder loops terminating, registry inert
-/// (6-Z114 §2.4 / §4.4).
+/// With a v2 wire blob the proxy parses the real request parcel and
+/// synthesises a real reply parcel — both ride the v2 trailer. With v1
+/// (`req_blob = None`) the loader could not inline parcel bytes, so the
+/// proxy answers the legacy synthetic shapes (GET → null binder, ADD →
+/// status 0): the registry cannot work name-less, which is exactly the
+/// 6-Z271 keystore2 20 s root cause.
 fn servicemanager_proxy(
     code: u32,
-    services: &Arc<Mutex<ServiceRegistry>>,
+    bus: &Arc<Mutex<BusState>>,
     req_blob: Option<&RequestBlob>,
+    conn_id: ConnId,
 ) -> TransactionResult {
-    // No v2 blob → legacy v1 path.
+    // No v2 blob → legacy v1 path (names unknowable).
     let blob = match req_blob {
         Some(b) => b,
         None => return servicemanager_legacy(code),
     };
+    let parcel = &blob.data;
+    // Peek word 2 to pick the header shape.
+    let is_aidl = parcel.len() >= 12 && {
+        let tag = u32::from_ne_bytes(parcel[8..12].try_into().unwrap());
+        tag == AIDL_HEADER_TAG_SYST || tag == AIDL_HEADER_TAG_VNDR
+    };
 
-    let mut reader = ParcelReader::new(&blob.data);
+    if !is_aidl {
+        return servicemanager_hidl(code, parcel, bus, conn_id);
+    }
+
+    let mut reader = ParcelReader::new(parcel);
     // Consume the AIDL interface-token header.
     let (_strict, _work, tag, iface) = match reader.read_aidl_header() {
         Some(v) => v,
@@ -2302,8 +2869,7 @@ fn servicemanager_proxy(
         }
     };
     // Lenient hygiene: log mismatches but don't reject — the proxy parses
-    // leniently per 6-Z114 §3.2. The native servicemanager's
-    // `enforceInterface` would reject, but the proxy is permissive.
+    // leniently per 6-Z114 §3.2.
     if tag != AIDL_HEADER_TAG_SYST && tag != AIDL_HEADER_TAG_VNDR {
         warning!(
             "[KR64][binder][svc] unexpected AIDL header tag 0x{:08x} (expected SYST/VNDR)",
@@ -2334,8 +2900,8 @@ fn servicemanager_proxy(
                 Some(Some(s)) => s,
                 _ => String::new(),
             };
-            let reg = services.lock().expect("ServiceRegistry poisoned");
-            match reg.get(&name) {
+            let b = bus.lock().expect("binder bus poisoned");
+            match b.services.get(&name).map(|e| e.handle) {
                 Some(handle) => {
                     let obj = FlatBinderObject {
                         r#type: BINDER_TYPE_HANDLE,
@@ -2365,29 +2931,35 @@ fn servicemanager_proxy(
             }
         }
         SVC_MGR_ADD_SERVICE => {
-            // Arg: string16 name + flat_binder_object (strong) + i32 allowIsolated + i32 dumpPriority.
-            // We register the name → fake handle; the guest's binder ptr/cookie
-            // would need per-connection ownership tracking (a v2+ ext).
+            // Arg: string16 name + flat_binder_object (strong) + i32
+            // allowIsolated + i32 dumpPriority. 6-Z271: the owner
+            // connection and its local ptr/cookie ARE stored now —
+            // transactions to the returned handle are delivered to the
+            // owner as BR_TRANSACTION (kernel semantics).
             let name = match reader.read_string16() {
                 Some(Some(s)) => s,
                 _ => String::new(),
             };
-            let _guest_flat = reader.read_flat_binder(); // consumed, not yet stored
+            let flat = reader.read_flat_binder();
             let _allow_isolated = reader.read_i32();
             let _dump_priority = reader.read_i32();
-            let mut reg = services.lock().expect("ServiceRegistry poisoned");
-            let handle = reg.add(&name);
+            let (ptr, cookie) = match &flat {
+                Some(f) => (f.binder, f.cookie),
+                None => (0, 0),
+            };
+            let mut b = bus.lock().expect("binder bus poisoned");
+            let handle = b.add_guest_service(&name, conn_id, ptr, cookie);
             info!(
-                "[KR64][binder][svc] addService({}) → fake handle 0x{:08x}",
-                name, handle
+                "[KR64][binder][svc] addService({}) → handle 0x{:08x} (conn={}, ptr=0x{:x})",
+                name, handle, conn_id, ptr
             );
             // Reply body: void (header only) per 6-Z114 §3.3.
         }
         SVC_MGR_LIST_SERVICES => {
             // Arg: i32 dumpPriority (ignored — we don't filter).
             let _ = reader.read_i32();
-            let reg = services.lock().expect("ServiceRegistry poisoned");
-            let names = reg.list();
+            let b = bus.lock().expect("binder bus poisoned");
+            let names = b.services.keys().cloned().collect::<Vec<_>>();
             // Reply body: [i32 count][count × string16].
             writer.write_i32(names.len() as i32);
             for n in &names {
@@ -2396,11 +2968,13 @@ fn servicemanager_proxy(
             info!("[KR64][binder][svc] listServices → {} entries", names.len());
         }
         SVC_MGR_REGISTER_FOR_NOTIFICATIONS => {
-            // §3.3 minimal: accepted+ack is enough (no callback delivery).
             // Args: string16 name + flat_binder (callback) — consumed.
+            // Registration callbacks are still not delivered; clients
+            // (libbinder waitForService) fall back to their poll/deadline
+            // paths, which now terminate fast because the services they
+            // want DO register (keystore2, virtual HALs).
             let _ = reader.read_string16();
             let _ = reader.read_flat_binder();
-            // Reply body: void.
         }
         SVC_MGR_IS_DECLARED => {
             // Arg: string16 name. Reply body: i32 0|1.
@@ -2408,8 +2982,8 @@ fn servicemanager_proxy(
                 Some(Some(s)) => s,
                 _ => String::new(),
             };
-            let reg = services.lock().expect("ServiceRegistry poisoned");
-            let declared = reg.get(&name).is_some() as i32;
+            let b = bus.lock().expect("binder bus poisoned");
+            let declared = b.services.contains_key(&name) as i32;
             writer.write_i32(declared);
         }
         _ => {
@@ -2422,13 +2996,115 @@ fn servicemanager_proxy(
     TransactionResult::Reply { data, offsets }
 }
 
-/// Legacy v1 path (no parcel blob): the 6-Z113 loader cannot inline the
+/// HIDL `android.hidl.manager.V1_0.IServiceManager` transactions (libhwbinder
+/// parcels — no SYST header tag, hidl_string args).
+///
+/// Only the subset the guest actually uses is implemented:
+/// * `get` (code 1): `get(fqName, name)` — registry lookup of
+///   `"fqName/name"`; hit → flat handle, miss → null binder (HIDL reads the
+///   object at offsets[0], so the AIDL status prefix is skipped naturally).
+/// * `add` (code 2): register a HIDL service name with the caller as owner
+///   (no HIDL HAL processes exist in the recovery guest today, but the
+///   path keeps hwservicemanager-shaped traffic coherent).
+/// * everything else → `BR_FAILED_REPLY` (unchanged from the pre-bus
+///   behaviour, minus the header mangling).
+fn servicemanager_hidl(
+    code: u32,
+    parcel: &[u8],
+    bus: &Arc<Mutex<BusState>>,
+    conn_id: ConnId,
+) -> TransactionResult {
+    let mut reader = ParcelReader::new(parcel);
+    // HIDL header: [i32 strict][i32 work][string16 descriptor].
+    let _strict = match reader.read_i32() {
+        Some(v) => v,
+        None => return TransactionResult::Failed,
+    };
+    let _work = match reader.read_i32() {
+        Some(v) => v,
+        None => return TransactionResult::Failed,
+    };
+    let _iface = reader.read_string16();
+
+    let mut writer = ParcelWriter::new();
+    // HIDL replies carry no AIDL exception prefix; the object (if any)
+    // lands at offsets[0] and HIDL reads it there. The status prefix is
+    // harmless for HIDL and correct for any libbinder-side reader.
+    writer.write_status_ok();
+
+    match code {
+        HIDL_SM_GET => {
+            let fq = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let name = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let key = format!("{}/{}", fq, name);
+            let b = bus.lock().expect("binder bus poisoned");
+            match b.services.get(&key).map(|e| e.handle) {
+                Some(handle) => {
+                    let obj = FlatBinderObject {
+                        r#type: BINDER_TYPE_HANDLE,
+                        flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                        binder: handle as u64,
+                        cookie: 0,
+                    };
+                    writer.write_flat_binder(&obj);
+                    info!(
+                        "[KR64][binder][svc] HIDL get({}) hit → handle 0x{:08x}",
+                        key, handle
+                    );
+                }
+                None => {
+                    let obj = FlatBinderObject {
+                        r#type: BINDER_TYPE_BINDER,
+                        flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                        binder: 0,
+                        cookie: 0,
+                    };
+                    writer.write_flat_binder(&obj);
+                    info!("[KR64][binder][svc] HIDL get({}) miss → null binder", key);
+                }
+            }
+        }
+        HIDL_SM_ADD => {
+            let name = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let flat = reader.read_flat_binder();
+            let (ptr, cookie) = match &flat {
+                Some(f) => (f.binder, f.cookie),
+                None => (0, 0),
+            };
+            let mut b = bus.lock().expect("binder bus poisoned");
+            let handle = b.add_guest_service(&name, conn_id, ptr, cookie);
+            info!(
+                "[KR64][binder][svc] HIDL add({}) → handle 0x{:08x} (conn={})",
+                name, handle, conn_id
+            );
+            // Reply: bool success = true.
+            writer.write_i32(1);
+        }
+        _ => {
+            return TransactionResult::Failed;
+        }
+    }
+
+    let (data, offsets) = writer.into_parts();
+    TransactionResult::Reply { data, offsets }
+}
+
+/// Legacy v1 path (no parcel blob): the loader could not inline the
 /// guest's parcel bytes, so the proxy answers the *synthetic* shapes per
 /// 6-Z114 §2.4 — GET/CHECK → AIDL null binder (status 0 + flat
-/// `{BINDER_TYPE_BINDER, 0, 0, 0}`), ADD → status 0 (header only). This
-/// keeps the ROM's libbinder loops terminating without a real registry
-/// hit. For v2 requests with a parcel blob, [`servicemanager_proxy`] does
-/// the full parse + reply.
+/// `{BINDER_TYPE_BINDER, 0, 0, 0}`), ADD → status 0 (header only). The
+/// registry cannot work name-less — this path exists to keep the ROM's
+/// libbinder loops terminating until a v2-capable loader attaches
+/// (6-Z271 inlined request blobs for ALL real-libbinder clients).
 fn servicemanager_legacy(code: u32) -> TransactionResult {
     let mut writer = ParcelWriter::new();
     writer.write_status_ok(); // EX_NONE
@@ -2458,125 +3134,252 @@ fn servicemanager_legacy(code: u32) -> TransactionResult {
     TransactionResult::Reply { data, offsets }
 }
 
-/// Forward a `BC_TRANSACTION` to the host's `/dev/binder` via a real
-/// `BINDER_WRITE_READ` ioctl.
-///
-/// # What this does (skeleton)
-///
-/// 1. Lazily opens `/dev/binder` on the host (best-effort; if the open
-///    fails — e.g. on a Linux dev host without the binder module —
-///    returns an error and the caller emits `BR_FAILED_REPLY`).
-/// 2. Builds a `binder_write_read` struct with a write_buffer containing
-///    `[BC_TRANSACTION ioctl number][the guest's transaction_data bytes]`
-///    and an empty read_buffer.
-/// 3. Issues `ioctl(fd, BINDER_WRITE_READ, &bwr)`.
-/// 4. Returns the read_buffer contents (which should start with
-///    `BR_REPLY` + the reply transaction_data) as the reply bytes.
-///
-/// # What this does NOT do (TODO for `BINDER-3`)
-///
-/// * **Handle translation.** The guest's `target_handle` is a number
-///   allocated by *us* (the proxy), not by the host's binder driver.
-///   Before issuing the ioctl, we need to look up the host handle in
-///   the [`HandleTable`] and patch `transaction_data.target.handle`.
-/// * **Flat-binder-object patching.** If the transaction's offsets array
-///   contains any `BINDER_TYPE_HANDLE` / `BINDER_TYPE_WEAK_HANDLE`
-///   objects, those handles ALSO need to be translated. Conversely, any
-///   `BINDER_TYPE_BINDER` / `BINDER_TYPE_WEAK_BINDER` local-binder
-///   pointers need to be translated back in the reply.
-/// * **Data buffer copy-in.** The guest's `data_ptr` is a user pointer
-///   in the guest's address space — we need to copy the data into our
-///   own buffer (or share memory via ashmem) before the kernel can read
-///   it. The skeleton just passes the raw pointer through, which will
-///   cause the kernel to return EFAULT.
-/// * **Reply unparceling.** The reply read_buffer contains a
-///   `BR_REPLY` + `binder_transaction_data` + reply data. We need to
-///   extract the reply data and re-wrap it in our wire format for the
-///   guest.
-fn forward_transaction_to_host(
-    tx_data: &[u8],
-    host_fd: &Arc<Mutex<Option<RawFd>>>,
-) -> io::Result<Vec<u8>> {
-    // Lazily open /dev/binder on the host.
-    let mut guard = host_fd
-        .lock()
-        .map_err(|e| io::Error::other(format!("host_binder_fd mutex poisoned: {}", e)))?;
-    if guard.is_none() {
-        match open_host_binder() {
-            Ok(fd) => *guard = Some(fd),
-            Err(e) => {
-                return Err(io::Error::other(format!(
-                    "could not open host /dev/binder: {}",
-                    e
-                )));
-            }
-        }
+// ============================================================================
+// 6-Z271: in-proxy virtual services — minimal, semantically-correct AIDL
+// implementations. Reply parcels use REAL AIDL shapes (Status prefix +
+// typed payloads); operations the container cannot satisfy return honest
+// binder exceptions instead of fabricated data.
+// ============================================================================
+
+/// AIDL exception codes — VERIFIED against android-13
+/// `frameworks/native/libs/binder/include/binder/Status.h` (the wire
+/// shape libbinder C++/NDK and libbinder_rs all read):
+/// EX_UNSUPPORTED_OPERATION = -7, EX_SERVICE_SPECIFIC = -8.
+const EX_NONE: i32 = 0;
+const EX_UNSUPPORTED_OPERATION: i32 = -7;
+const EX_SERVICE_SPECIFIC: i32 = -8;
+
+/// `android.hardware.security.keymint.ErrorCode.HARDWARE_TYPE_UNAVAILABLE`
+/// (measured empirically in run 33411932921's host-side vold log: "service
+/// specific error: -68").
+const KM_ERROR_HARDWARE_TYPE_UNAVAILABLE: i32 = -68;
+
+/// `android.hardware.security.keymint.SecurityLevel.SOFTWARE`.
+const SECURITY_LEVEL_SOFTWARE: i32 = -2;
+
+/// Reply with an AIDL exception (no payload). `EX_SERVICE_SPECIFIC`
+/// carries the service-specific error code after the exception code.
+fn virtual_error_reply(exception: i32, service_code: i32) -> TransactionResult {
+    let mut w = ParcelWriter::new();
+    w.write_i32(exception);
+    if exception == EX_SERVICE_SPECIFIC {
+        w.write_i32(service_code);
     }
-    let fd = guard.unwrap();
-
-    // Build the write_buffer: [BC_TRANSACTION][tx_data].
-    let mut write_buf: Vec<u8> = Vec::with_capacity(4 + tx_data.len());
-    write_buf.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
-    write_buf.extend_from_slice(tx_data);
-
-    // Allocate a read_buffer for the reply. 4 KiB matches what
-    // libbinder.so uses by default.
-    let mut read_buf = vec![0u8; 4096];
-
-    // Construct the binder_write_read struct. The pointers here are
-    // OUR process's pointers (the daemon's), NOT the guest's — this is
-    // the host-side ioctl. The kernel writes back the `*_consumed`
-    // fields, so bwr must be passed mutably.
-    let mut bwr = BinderWriteRead {
-        write_size: write_buf.len() as u64,
-        write_consumed: 0,
-        write_buffer: write_buf.as_ptr() as u64,
-        read_size: read_buf.len() as u64,
-        read_consumed: 0,
-        read_buffer: read_buf.as_mut_ptr() as u64,
-    };
-
-    // Issue the ioctl. The `request` argument type differs between
-    // libc flavours: bionic (Android) declares `ioctl(fd, int request, ...)`
-    // while glibc declares `ioctl(fd, unsigned long request, ...)`. Casting
-    // with `as _` lets the compiler pick the right width per target so the
-    // same source compiles for aarch64-linux-android, x86_64-linux-android,
-    // and the host (glibc) `cargo check`. The kernel reads/writes through
-    // the raw third pointer.
-    let rc = unsafe {
-        libc::ioctl(
-            fd,
-            BINDER_WRITE_READ as _,
-            &mut bwr as *mut BinderWriteRead as *mut c_void,
-        )
-    };
-    if rc < 0 {
-        let e = io::Error::last_os_error();
-        return Err(e);
-    }
-
-    // The reply is in read_buf[0..bwr.read_consumed]. For the skeleton
-    // we return the WHOLE read_buffer — a real impl would slice it to
-    // `bwr.read_consumed as usize` and parse out the leading BR_REPLY
-    // + binder_transaction_data + reply-data bytes.
-    let _ = bwr.read_consumed; // TODO(BINDER-3): use this to slice read_buf.
-    Ok(read_buf)
+    let (data, offsets) = w.into_parts();
+    TransactionResult::Reply { data, offsets }
 }
 
-/// Open the host's `/dev/binder` (real char device). Returns the raw FD
-/// on success. The FD is `O_RDWR | O_CLOEXEC`.
-///
-/// On Android this will succeed (the binder module is always loaded).
-/// On a Linux dev host it'll typically fail with ENOENT (no /dev/binder)
-/// or ENODEV (binder module not loaded) — that's fine for `cargo test`.
-fn open_host_binder() -> io::Result<RawFd> {
-    let path = std::ffi::CString::new("/dev/binder").unwrap();
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+/// Dispatch a transaction to an in-proxy virtual service.
+fn virtual_service_transaction(
+    kind: VirtualService,
+    code: u32,
+    req_blob: Option<&RequestBlob>,
+) -> TransactionResult {
+    let parcel: &[u8] = req_blob.map(|b| b.data.as_slice()).unwrap_or(&[]);
+    let mut reader = ParcelReader::new(parcel);
+    // AIDL meta transactions (defensive): 0 / 0xFFFFFFFF → interface
+    // version; 0xFFFFFFFE → interface hash. Codes ≤ FIRST_CALL-1 are not
+    // used by any real interface method.
+    match code {
+        0 | 0xFFFF_FFFF => {
+            let mut w = ParcelWriter::new();
+            w.write_status_ok();
+            w.write_i32(match kind {
+                VirtualService::Vibrator => 3, // IVibrator V3 (Android 13)
+                VirtualService::KeyMint => 3,  // IKeyMintDevice V3
+                VirtualService::SharedSecret => 1,
+            });
+            let (data, offsets) = w.into_parts();
+            return TransactionResult::Reply { data, offsets };
+        }
+        0xFFFF_FFFE => {
+            let mut w = ParcelWriter::new();
+            w.write_status_ok();
+            w.write_string16("ffffffff");
+            let (data, offsets) = w.into_parts();
+            return TransactionResult::Reply { data, offsets };
+        }
+        _ => {}
     }
-    info!("[KR64][binder] opened host /dev/binder (fd={})", fd);
-    Ok(fd)
+
+    match kind {
+        VirtualService::Vibrator => virtual_vibrator(code, &mut reader),
+        VirtualService::KeyMint => virtual_keymint(code, &mut reader),
+        VirtualService::SharedSecret => virtual_sharedsecret(code, &mut reader),
+    }
+}
+
+/// `android.hardware.vibrator.IVibrator` — method codes VERIFIED against
+/// android-13.0.0_r1 `IVibrator.aidl` (V1..V3 are append-only, so these
+/// codes are stable across the T-base corpus):
+///   1 getCapabilities → int
+///   2 off() → void
+///   3 on(int timeoutMs, IVibratorCallback? callback) → void
+///   4 perform(Effect, EffectStrength, IVibratorCallback?) → int
+///   5 getSupportedEffects → Effect[]
+///   6 setAmplitude(float) → void
+///   7 setExternalControl(boolean) → void
+/// We advertise capabilities = 0, so well-behaved clients stick to
+/// plain on(ms) / off(). Every on(ms) is FORWARDED to the host app for a
+/// REAL vibration.
+fn virtual_vibrator(code: u32, reader: &mut ParcelReader) -> TransactionResult {
+    match code {
+        1 => {
+            // getCapabilities → 0 (no callbacks, no amplitude control).
+            let mut w = ParcelWriter::new();
+            w.write_status_ok();
+            w.write_i32(0);
+            let (data, offsets) = w.into_parts();
+            TransactionResult::Reply { data, offsets }
+        }
+        2 => {
+            // off() → cancel the host vibration.
+            crate::hostbridge::notify_vibrator_off();
+            virtual_error_reply(EX_NONE, 0)
+        }
+        3 => {
+            // on(int timeoutMs, callback?) → forward to the host.
+            let timeout_ms = reader.read_i32().unwrap_or(0);
+            if timeout_ms <= 0 || timeout_ms > 60_000 {
+                // Degenerate/nonsensical duration — refuse (a real HAL
+                // would also reject a 0 or absurd timeout).
+                return virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0);
+            }
+            crate::hostbridge::notify_vibrate(timeout_ms);
+            info!("[KR64][binder][svc] IVibrator.on({} ms) → host", timeout_ms);
+            virtual_error_reply(EX_NONE, 0)
+        }
+        4 => {
+            // perform(effect, strength, callback?) → unsupported (we
+            // advertise no composite/effect support).
+            virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0)
+        }
+        5 => {
+            // getSupportedEffects → empty int[].
+            let mut w = ParcelWriter::new();
+            w.write_status_ok();
+            w.write_i32(0);
+            let (data, offsets) = w.into_parts();
+            TransactionResult::Reply { data, offsets }
+        }
+        6 | 7 => {
+            // setAmplitude / setExternalControl → unsupported (caps = 0).
+            virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0)
+        }
+        _ => {
+            // Upper methods (compose/pwle/alwaysOn/…) — unsupported.
+            virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0)
+        }
+    }
+}
+
+/// `android.hardware.security.keymint.IKeyMintDevice/default` — method
+/// codes VERIFIED against android-13.0.0_r1 `IKeyMintDevice.aidl`
+/// (declaration order):
+///   1 getHardwareInfo, 2 addRngEntropy, 3 generateKey, 4 importKey,
+///   5 importWrappedKey, 6 upgradeKey, 7 deleteKey, 8 deleteAllKeys,
+///   9 destroyAttestationIds, 10 finish, 11 begin, 12 updateAad,
+///   13 update, 14 abort, 15 deviceLocked, 16 earlyBootEnded,
+///   17 convertStorageKeyToEphemeral, 18 getKeyCharacteristics,
+///   19 getRootOfTrustChallenge, 20 getRootOfTrust, 21 sendRootOfTrust
+///
+/// The device reports itself as a SOFTWARE-level implementation so
+/// keystore2 (a) obtains its backend HAL and registers IKeystoreSecurity —
+/// collapsing the ~20 s recovery wait — and (b) gets honest errors for
+/// key operations it cannot perform against a software device. TWRP's
+/// existing unmountable-/data fallback handles those errors; it just
+/// reaches them 20 s sooner.
+fn virtual_keymint(code: u32, _reader: &mut ParcelReader) -> TransactionResult {
+    match code {
+        1 => {
+            // getHardwareInfo → KeyMintHardwareInfo parcel (field order
+            // verified against KeyMintHardwareInfo.aidl):
+            //   int versionNumber; SecurityLevel securityLevel;
+            //   @utf8InCpp String keyMintName; @utf8InCpp String keyMintAuthorName;
+            //   boolean timestampTokenRequired;
+            let mut w = ParcelWriter::new();
+            w.write_status_ok();
+            w.write_i32(300); // versionNumber: KeyMint V3 (Android 13)
+            w.write_i32(SECURITY_LEVEL_SOFTWARE);
+            w.write_string16("TwoyiSoftwareKeyMint");
+            w.write_string16("twoyi");
+            w.write_i32(0); // timestampTokenRequired = false
+            let (data, offsets) = w.into_parts();
+            TransactionResult::Reply { data, offsets }
+        }
+        2 => {
+            // addRngEntropy(byte[] data) → accepted (a software
+            // implementation mixes what it is given).
+            virtual_error_reply(EX_NONE, 0)
+        }
+        3 | 4 | 5 | 6 => {
+            // generateKey / importKey / importWrappedKey / upgradeKey →
+            // honest failure: no hardware backend behind this device.
+            virtual_error_reply(EX_SERVICE_SPECIFIC, KM_ERROR_HARDWARE_TYPE_UNAVAILABLE)
+        }
+        7 | 8 => {
+            // deleteKey / deleteAllKeys → void ok (deleting a key that a
+            // software device never stored is a no-op).
+            virtual_error_reply(EX_NONE, 0)
+        }
+        9 => virtual_error_reply(EX_NONE, 0), // destroyAttestationIds → void ok
+        10 | 11 | 12 | 13 => {
+            // finish / begin / updateAad / update → cannot run operations.
+            virtual_error_reply(EX_SERVICE_SPECIFIC, KM_ERROR_HARDWARE_TYPE_UNAVAILABLE)
+        }
+        14 => virtual_error_reply(EX_NONE, 0), // abort → void ok
+        15 => virtual_error_reply(EX_NONE, 0), // deviceLocked → void ok
+        16 => virtual_error_reply(EX_NONE, 0), // earlyBootEnded → void ok
+        17 | 18 | 19 | 20 | 21 => {
+            virtual_error_reply(EX_SERVICE_SPECIFIC, KM_ERROR_HARDWARE_TYPE_UNAVAILABLE)
+        }
+        _ => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
+    }
+}
+
+/// `android.hardware.security.sharedsecret.ISharedSecret/default` —
+/// method codes from android-13.0.0_r1 `ISharedSecret.aidl`:
+///   1 getSharedSecretParameters → SharedSecretParameters { byte[] seed; byte[] nonce; }
+///   2 computeSharedSecret(SharedSecretParameters[] params) → byte[]
+/// A deterministic software implementation: the reply shape is what
+/// keystore2's negotiation needs to terminate; the anti-compromise
+/// property of the real protocol is meaningless for a software device.
+fn virtual_sharedsecret(code: u32, _reader: &mut ParcelReader) -> TransactionResult {
+    match code {
+        1 => {
+            let mut w = ParcelWriter::new();
+            w.write_status_ok();
+            let seed: Vec<u8> = (0..32u32)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                .collect();
+            w.write_i32(seed.len() as i32);
+            w.data.extend_from_slice(&seed);
+            while w.data.len() % 4 != 0 {
+                w.data.push(0);
+            }
+            w.write_i32(0); // nonce: empty byte[]
+            let (data, offsets) = w.into_parts();
+            TransactionResult::Reply { data, offsets }
+        }
+        2 => {
+            // computeSharedSecret → 32 deterministic bytes (no seed
+            // mixing — a fixed software secret; keystore2 only needs the
+            // 32-byte shape and cross-boot stability, not secrecy).
+            let mut w = ParcelWriter::new();
+            w.write_status_ok();
+            let out: Vec<u8> = (0..32u8)
+                .map(|i| i.wrapping_mul(29).wrapping_add(11))
+                .collect();
+            w.write_i32(out.len() as i32);
+            w.data.extend_from_slice(&out);
+            while w.data.len() % 4 != 0 {
+                w.data.push(0);
+            }
+            let (data, offsets) = w.into_parts();
+            TransactionResult::Reply { data, offsets }
+        }
+        _ => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
+    }
 }
 
 // ============================================================================
@@ -2663,6 +3466,59 @@ fn push_br_reply(buf: &mut Vec<u8>, data_size: u64, offsets_size: u64) {
         )
     };
     buf.extend_from_slice(tx_bytes);
+}
+
+/// 6-Z271: Push `[BR_TRANSACTION][binder_transaction_data]` for a
+/// transaction the bus delivers to a server connection. The target union
+/// uses the PTR form (the server's own local binder): `target.ptr =
+/// (target_handle_field, target_pad_field)`, `cookie` — so the server's
+/// `BBinder::onTransact` sees its own identity, kernel-style. Sender
+/// pid/euid come from the requester's announced `WIRE_CMD_IDENT`. The
+/// request parcel bytes ride the response trailer (blob pairing).
+#[allow(clippy::too_many_arguments)]
+fn push_br_transaction(
+    buf: &mut Vec<u8>,
+    code: u32,
+    flags: u32,
+    sender_pid: i32,
+    sender_euid: u32,
+    ptr: u64,
+    cookie: u64,
+    data_size: u64,
+    offsets_size: u64,
+) {
+    buf.extend_from_slice(&BR_TRANSACTION.to_ne_bytes());
+    let tx = BinderTransactionData {
+        // The kernel's union: for the ptr form, the 8 bytes at offset 0
+        // ARE the pointer (low word in `target_handle`, high in `pad`).
+        target_handle: (ptr & 0xFFFF_FFFF) as u32,
+        target_pad: (ptr >> 32) as u32,
+        target_cookie: cookie,
+        code,
+        flags,
+        sender_pid,
+        sender_euid,
+        // Parcel SIZES are stamped here; data_ptr/offsets_ptr stay 0 on
+        // the wire — the v2 client patches them from the trailer blob.
+        data_size,
+        offsets_size,
+        data_ptr: 0,
+        offsets_ptr: 0,
+    };
+    let tx_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            &tx as *const BinderTransactionData as *const u8,
+            std::mem::size_of::<BinderTransactionData>(),
+        )
+    };
+    buf.extend_from_slice(tx_bytes);
+}
+
+/// 6-Z271: Push `[BR_DEAD_BINDER][u64 cookie]` — the kernel delivers this
+/// when a binder node a connection holds (or watches) dies.
+fn push_br_dead_binder(buf: &mut Vec<u8>, cookie: u64) {
+    buf.extend_from_slice(&BR_DEAD_BINDER.to_ne_bytes());
+    buf.extend_from_slice(&cookie.to_ne_bytes());
 }
 
 // ============================================================================
@@ -3471,10 +4327,13 @@ mod tests {
         // The proxy handle lives in the `binder` u64 field (low 32 bits on
         // remote refs — 6-Z114 §3.2).
         let flat_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+        // 6-Z271: the three in-proxy virtual services are registered at
+        // proxy construction (handles 0xF0000001-3), so the first GUEST
+        // service allocates 0xF0000004.
         assert_eq!(
             flat_handle,
-            PROXY_HANDLE_BASE + 1,
-            "proxy handle = 0xF0000000 + 1 (first registered service)"
+            PROXY_HANDLE_BASE + 4,
+            "proxy handle = 0xF0000000 + 4 (after the 3 virtual services)"
         );
         // The reply offsets array must list the flat object's offset (= 4,
         // after the i32 status prefix).
@@ -3548,6 +4407,239 @@ mod tests {
         let cookie = u64::from_ne_bytes(blob[20..28].try_into().unwrap());
         assert_eq!(binder, 0, "null binder: binder field = 0");
         assert_eq!(cookie, 0, "null binder: cookie = 0");
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    // -------- 6-Z271: full guest↔guest bus round trip ----------------
+    // Connection A registers a service (real addService with a flat
+    // binder); connection B looks it up and transacts to the routed
+    // handle; the proxy delivers BR_TRANSACTION to A; A's BC_REPLY is
+    // routed back to B as BR_REPLY. This is the master-path behavior the
+    // 6-Z114 registry never had.
+
+    /// Build a BINDER_WRITE_READ v2 payload with MULTIPLE BC commands and
+    /// their matching blobs (blob order = command order in the stream).
+    fn make_v2_write_read_multi_payload(
+        bc_stream: &[u8],
+        blobs: &[(&[u8], &[u8])],
+        read_capacity: u32,
+    ) -> Vec<u8> {
+        let write_size = bc_stream.len() as u32;
+        let mut p = Vec::new();
+        p.extend_from_slice(&write_size.to_ne_bytes());
+        p.extend_from_slice(&read_capacity.to_ne_bytes());
+        p.extend_from_slice(bc_stream);
+        p.extend_from_slice(&WIRE_V2_MAGIC.to_ne_bytes());
+        p.extend_from_slice(&(blobs.len() as u32).to_ne_bytes());
+        for (d, o) in blobs {
+            p.extend_from_slice(&(d.len() as u32).to_ne_bytes());
+            p.extend_from_slice(&(o.len() as u32).to_ne_bytes());
+            p.extend_from_slice(d);
+            p.extend_from_slice(o);
+        }
+        p
+    }
+
+    #[test]
+    fn z271_bus_full_guest_to_guest_transaction_round_trip() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        // ---- Connection A (the future server): addService("svc_a") ----
+        let mut stream_a = UnixStream::connect(&path).expect("connect A");
+        let mut args = ParcelWriter::new();
+        args.write_string16("svc_a");
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0x1234, // guest local ptr
+            cookie: 0x5678, // guest cookie
+        });
+        args.write_i32(0);
+        args.write_i32(0);
+        let (ad, ao) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &ad, &ao, 4096);
+        let (ret, resp) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0, "ADD_SERVICE WRITE_READ ok");
+        let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            u32::from_ne_bytes(resp[8..12].try_into().unwrap()),
+            BR_REPLY,
+            "ADD replies with BR_REPLY"
+        );
+        let _ = read_size;
+
+        // ---- Connection B: getService("svc_a") → routed handle ----
+        let mut stream_b = UnixStream::connect(&path).expect("connect B");
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("svc_a");
+        let (bd, bo) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload2 = make_v2_write_read_payload(&bc2, &bd, &bo, 4096);
+        let (ret2, resp2) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0);
+        let read_size2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
+        let off2 = 4 + read_size2 + 8; // skip [read_size][BR stream][magic][count]
+        let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        let blob2 = &resp2[off2 + 8..off2 + 8 + dl2];
+        let routed_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+        assert_eq!(
+            routed_handle,
+            PROXY_HANDLE_BASE + 4,
+            "svc_a handle = 0xF0000004 (after virtual services)"
+        );
+
+        // ---- Connection B: transact(code=42) to the routed handle ----
+        // The requester blocks until A's reply (or the timeout).
+        let mut tx_b = [0u8; 64];
+        tx_b[0..4].copy_from_slice(&routed_handle.to_ne_bytes());
+        tx_b[16..20].copy_from_slice(&42u32.to_ne_bytes());
+        let tx_data: &[u8] = b"ping-payload";
+        let mut tx_off = Vec::new();
+        let mut bc3 = Vec::with_capacity(4 + 64);
+        bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc3.extend_from_slice(&tx_b);
+        let payload3 = make_v2_write_read_multi_payload(&bc3, &[(tx_data, &tx_off)], 4096);
+
+        // Run B's transaction on a thread (exchange blocks until the
+        // routed reply arrives).
+        let b_writer =
+            std::thread::spawn(move || exchange(&mut stream_b, BINDER_WRITE_READ, &payload3));
+        // Give B a moment to queue its transaction on A's mailbox.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // ---- Connection A: read-only ioctl → receives BR_TRANSACTION ----
+        // write_size = 0, read_capacity = 4096.
+        let mut wr_a = Vec::new();
+        wr_a.extend_from_slice(&0u32.to_ne_bytes());
+        wr_a.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_a, resp_a) = exchange(&mut stream_a, BINDER_WRITE_READ, &wr_a);
+        assert_eq!(ret_a, 0, "server delivery WRITE_READ ok");
+        let read_a = u32::from_ne_bytes(resp_a[0..4].try_into().unwrap()) as usize;
+        // [BR_TRANSACTION][64-byte tr] — and the v2 trailer with the blob.
+        let br = u32::from_ne_bytes(resp_a[4..8].try_into().unwrap());
+        assert_eq!(br, BR_TRANSACTION, "A receives BR_TRANSACTION");
+        assert_eq!(
+            read_a,
+            4 + 64,
+            "BR_TRANSACTION + 64-byte binder_transaction_data"
+        );
+        let tr = &resp_a[8..8 + 64];
+        // Target union = PTR form: ptr low/high + cookie (0x1234 / 0x5678).
+        let ptr_lo = u32::from_ne_bytes(tr[0..4].try_into().unwrap());
+        let ptr_hi = u32::from_ne_bytes(tr[4..8].try_into().unwrap());
+        let cookie = u64::from_ne_bytes(tr[8..16].try_into().unwrap());
+        assert_eq!(ptr_lo, 0x1234, "target.ptr low word");
+        assert_eq!(ptr_hi, 0, "target.ptr high word");
+        assert_eq!(cookie, 0x5678, "target.cookie = owner cookie");
+        let code = u32::from_ne_bytes(tr[16..20].try_into().unwrap());
+        assert_eq!(code, 42, "delivered code");
+        let data_size = u64::from_ne_bytes(tr[32..40].try_into().unwrap());
+        assert_eq!(data_size, tx_data.len() as u64, "delivered parcel size");
+        // Trailer blob carries the request parcel bytes.
+        let magic_a = u32::from_ne_bytes(resp_a[4 + read_a..4 + read_a + 4].try_into().unwrap());
+        assert_eq!(magic_a, WIRE_V2_MAGIC, "delivery carries v2 trailer");
+
+        // ---- Connection A: BC_REPLY (with its own blob) ----
+        let reply_data: &[u8] = b"pong-reply";
+        let mut reply = [0u8; 64];
+        reply[16..20].copy_from_slice(&0u32.to_ne_bytes()); // reply code unused
+        let mut bc4 = Vec::with_capacity(4 + 64);
+        bc4.extend_from_slice(&BC_REPLY.to_ne_bytes());
+        bc4.extend_from_slice(&reply);
+        let payload4 = make_v2_write_read_multi_payload(&bc4, &[(reply_data, &tx_off)], 0);
+        let (ret_r, resp_r) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload4);
+        assert_eq!(ret_r, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp_r[0..4].try_into().unwrap()),
+            0,
+            "BC_REPLY ioctl returns an empty read buffer"
+        );
+
+        // ---- Connection B's blocked exchange resolves with the reply ----
+        let (ret_b, resp_b) = b_writer.join().expect("B thread");
+        assert_eq!(ret_b, 0);
+        let read_b = u32::from_ne_bytes(resp_b[0..4].try_into().unwrap()) as usize;
+        let br1 = u32::from_ne_bytes(resp_b[4..8].try_into().unwrap());
+        assert_eq!(br1, BR_TRANSACTION_COMPLETE, "B sees COMPLETE first");
+        let br2 = u32::from_ne_bytes(resp_b[8..12].try_into().unwrap());
+        assert_eq!(br2, BR_REPLY, "then BR_REPLY");
+        assert_eq!(read_b, 4 + 4 + 64, "COMPLETE + REPLY + tr");
+        let off_b = 4 + read_b + 8;
+        let dl_b = u32::from_ne_bytes(resp_b[off_b..off_b + 4].try_into().unwrap()) as usize;
+        assert_eq!(dl_b, reply_data.len(), "reply blob = A's parcel bytes");
+        let got = &resp_b[off_b + 8..off_b + 8 + dl_b];
+        assert_eq!(got, reply_data, "B receives A's exact reply payload");
+
+        // stream_b was moved into the B thread; dropping it there is fine.
+        drop(stream_a);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    // -------- 6-Z271: virtual service handlers over the wire ---------
+
+    #[test]
+    fn z271_virtual_vibrator_gets_registered_and_answers_get_service() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        // getService("android.hardware.vibrator.IVibrator/default") must
+        // HIT (pre-6-Z271 this burned a ~5 s waitForService per tap).
+        let mut args = ParcelWriter::new();
+        args.write_string16("android.hardware.vibrator.IVibrator/default");
+        let (d, o) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_CHECK_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &d, &o, 4096);
+        let (ret, resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0);
+        let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+        let off = 4 + read_size + 8;
+        let dl = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+        assert_eq!(dl, 4 + 24, "hit reply = status + flat handle");
+        let blob = &resp[off + 8..off + 8 + dl];
+        let flat_type = u32::from_ne_bytes(blob[4..8].try_into().unwrap());
+        assert_eq!(flat_type, BINDER_TYPE_HANDLE, "virtual service HIT");
+        let vhandle = u64::from_ne_bytes(blob[12..20].try_into().unwrap()) as u32;
+        assert_eq!(vhandle, PROXY_HANDLE_BASE + 1, "vibrator = first virtual");
+
+        // Transact code 1 (getCapabilities) → [EX_NONE][caps=0].
+        let mut tx = [0u8; 64];
+        tx[0..4].copy_from_slice(&vhandle.to_ne_bytes());
+        tx[16..20].copy_from_slice(&1u32.to_ne_bytes());
+        let tx_data: &[u8] = &[];
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&tx);
+        let payload2 = make_v2_write_read_multi_payload(&bc2, &[(tx_data, &[])], 4096);
+        let (ret2, resp2) = exchange(&mut stream, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0);
+        let read2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
+        let off2 = 4 + read2 + 8;
+        let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        let blob2 = &resp2[off2 + 8..off2 + 8 + dl2];
+        assert_eq!(dl2, 8, "getCapabilities reply = status + i32 caps");
+        let status = i32::from_ne_bytes(blob2[0..4].try_into().unwrap());
+        let caps = i32::from_ne_bytes(blob2[4..8].try_into().unwrap());
+        assert_eq!(status, 0, "EX_NONE");
+        assert_eq!(caps, 0, "caps = 0 (plain on/off only)");
 
         drop(stream);
         drop(handle);
