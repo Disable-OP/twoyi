@@ -827,10 +827,12 @@ pub const SVC_MGR_TRY_UNREGISTER_SERVICE: u32 = 9;
 /// The well-known binder handle of the servicemanager itself.
 pub const SVC_MGR_HANDLE: u32 = 0;
 
-/// `IBinder::PING_TRANSACTION` = `B_PACK_CHARS('_','P','N','G')` — answered
-/// by EVERY binder object (kernel semantics; hwservicemanager pings the
-/// context manager on startup).
-pub const PING_TRANSACTION: u32 = u32::from_ne_bytes(*b"_PNG");
+/// `IBinder::PING_TRANSACTION` = `B_PACK_CHARS('_','P','N','G')` —
+/// big-endian char packing = 0x5F504E47 (VERIFIED on-device: run
+/// 33411932921 logged hwservicemanager pings as `code=1599098439`).
+/// The pre-6-Z271c `from_ne_bytes` spelling was byte-swapped, so the
+/// PING fast-path never matched a real ping.
+pub const PING_TRANSACTION: u32 = u32::from_be_bytes(*b"_PNG");
 
 /// `android.hidl.manager.V1_0.IServiceManager` method codes (HIDL —
 /// declaration order, FIRST_CALL_TRANSACTION = 1): get = 1, add = 2.
@@ -945,13 +947,33 @@ pub const MAX_QUEUED_ITEMS: usize = 256;
 pub const WIRE_V2_MAGIC: u32 = u32::from_ne_bytes(*b"WV20");
 
 /// AIDL interface-token header tag for `/dev/binder` clients
-/// (`Parcel::writeInterfaceToken`); `SYST` = `'S' 'Y' 'S' 'T'`.
-pub const AIDL_HEADER_TAG_SYST: u32 = u32::from_ne_bytes(*b"SYST");
+/// (`Parcel::writeInterfaceToken`): `B_PACK_CHARS('S','Y','S','T')` —
+/// big-endian char packing, so the wire u32 is 0x53595354. NOTE: this
+/// must be `from_be_bytes` — the pre-6-Z271c constant was byte-swapped
+/// (masked by the self-consistent test codec) so EVERY real guest parcel
+/// failed the tag peek and fell into the HIDL branch, where addService
+/// (code 3) is unhandled → the registry stayed inert even after the v2
+/// request inlining landed (run 33425291816: v2=true everywhere, zero
+/// parse-success logs, the 18.5 s wait intact).
+pub const AIDL_HEADER_TAG_SYST: u32 = u32::from_be_bytes(*b"SYST");
 
 /// AIDL interface-token header tag for `/dev/vndbinder` clients
-/// (vendor-context binder). Accepted alongside `SYST` (the proxy does
-/// not yet split contexts).
-pub const AIDL_HEADER_TAG_VNDR: u32 = u32::from_ne_bytes(*b"VNDR");
+/// (`B_PACK_CHARS('V','N','D','R')`). Accepted alongside `SYST` (the
+/// proxy does not split contexts).
+pub const AIDL_HEADER_TAG_VNDR: u32 = u32::from_be_bytes(*b"VNDR");
+
+/// AIDL interface-token header tag written by a libbinder built with
+/// `__ANDROID_RECOVERY__` — `B_PACK_CHARS('R','E','C','O')` (LineageOS-20
+/// `libs/binder/Parcel.cpp`: `#elif defined(__ANDROID_RECOVERY__)
+/// constexpr int32_t kHeader = B_PACK_CHARS('R','E','C','O');`). The
+/// RECOVERY guests ARE the primary corpus (TWRP/OrangeFox) — every
+/// servicemanager parcel they emit carries THIS tag, never SYST.
+pub const AIDL_HEADER_TAG_RECO: u32 = u32::from_be_bytes(*b"RECO");
+
+/// All AIDL header tags the proxy accepts at the `is_aidl` peek.
+pub(crate) fn is_aidl_header_tag(tag: u32) -> bool {
+    tag == AIDL_HEADER_TAG_SYST || tag == AIDL_HEADER_TAG_VNDR || tag == AIDL_HEADER_TAG_RECO
+}
 
 /// The servicemanager AIDL interface descriptor (the string16 that
 /// follows the 3-i32 header in every `android.os.IServiceManager`
@@ -2849,10 +2871,11 @@ fn servicemanager_proxy(
         None => return servicemanager_legacy(code),
     };
     let parcel = &blob.data;
-    // Peek word 2 to pick the header shape.
+    // Peek word 2 to pick the header shape (SYST / VNDR / RECO → AIDL;
+    // anything else is a HIDL parcel — libhwbinder writes no tag).
     let is_aidl = parcel.len() >= 12 && {
         let tag = u32::from_ne_bytes(parcel[8..12].try_into().unwrap());
-        tag == AIDL_HEADER_TAG_SYST || tag == AIDL_HEADER_TAG_VNDR
+        is_aidl_header_tag(tag)
     };
 
     if !is_aidl {
@@ -2868,11 +2891,28 @@ fn servicemanager_proxy(
             return TransactionResult::Failed;
         }
     };
+    // 6-Z271c DIAG (bounded): the first SM parcels of a boot, hex-dumped —
+    // this is the ground truth of what the guest's libbinder actually
+    // writes (the RECO-tag discovery came from the source; this proves it
+    // on-device).
+    static SM_PARCEL_DUMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SM_PARCEL_DUMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        let mut hex = String::new();
+        for b in parcel.iter().take(24) {
+            hex.push_str(&format!("{:02x} ", b));
+        }
+        info!(
+            "[KR64][binder][svc] SM parcel head (code={}, {} bytes): {}",
+            code,
+            parcel.len(),
+            hex
+        );
+    }
     // Lenient hygiene: log mismatches but don't reject — the proxy parses
     // leniently per 6-Z114 §3.2.
-    if tag != AIDL_HEADER_TAG_SYST && tag != AIDL_HEADER_TAG_VNDR {
+    if !is_aidl_header_tag(tag) {
         warning!(
-            "[KR64][binder][svc] unexpected AIDL header tag 0x{:08x} (expected SYST/VNDR)",
+            "[KR64][binder][svc] unexpected AIDL header tag 0x{:08x} (expected SYST/VNDR/RECO)",
             tag
         );
     }
