@@ -9037,6 +9037,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 slot_suffix
             );
         }
+        // 6-Z270: strip FBE/FDE fs_mgr flags from /data entries so the
+        // guest recovery skips its decryption probe entirely (the probe
+        // forks keystore_cli_v2 which burns a ~20 s binder service-wait
+        // budget per boot in the container — see the function doc).
+        // Runs AFTER 6-Z219's slotselect scan (slotselect lives on
+        // system/vendor lines we never touch; ordering is belt-and-braces).
+        sanitize_fstab_encryption_flags(&rootfs_prefix);
         // 6-Z219: guest-derived slot suffix ("" = A-only → key omitted —
         // an empty `androidboot.slot_suffix=` would poison
         // fs_mgr_get_boot_config: "found but empty" short-circuits the
@@ -11749,6 +11756,143 @@ pub fn detect_guest_slot_suffix(rootfs_prefix: &str) -> String {
     String::new()
 }
 
+/// 6-Z270: strip FBE/FDE fs_mgr flags from the guest's /data fstab entries.
+///
+/// WHY (run 33409396151, OrangeFox R12.0 lavender — boot-to-UI 47 s): the
+/// device fstab's /data line carries
+/// `fileencryption=aes-256-xts:aes-256-cts:v2+inlinecrypt_optimized,
+/// metadata_encryption=…,keydirectory=/metadata/vold/metadata_encryption`.
+/// TWRP's PartitionManager sees the FBE flags and runs its full decryption
+/// probe: it forks /system/bin/keystore_cli_v2 (tracer +10.6 s) which
+/// blocks on the keystore2 binder service — a service our container can
+/// never satisfy (keystore2 has no working keymaster HAL behind it) —
+/// until the cli's ~20 s service-wait budget expires. Measured cost on
+/// the 6-Z269 run: +12.7 s → +31.3 s of wall clock with only 4,968
+/// tracer stops in the window (316 stops/s — pure client-side sleep
+/// polling, zero useful work). The /data mount itself fails either way
+/// in the container (no block device behind it), so the decryption probe
+/// is unconditionally wasted time on EVERY recovery boot.
+///
+/// FIX: parent-side, pre-fork, rewrite the guest's own fstab files with
+/// the crypto tokens removed from /data entries. TWRP then classifies
+/// /data as not-FBE and skips the keystore chain entirely (its data/media
+/// fallback path handles the unmountable /data exactly as before — the
+/// 6-Z269 log already shows the fallback running after the decrypt
+/// failure). Everything except /data lines is preserved byte-for-byte;
+/// untouched lines are preserved byte-for-byte (only rewritten lines are
+/// re-joined, single-space separated — fstab parsing is
+/// whitespace-agnostic).
+pub fn sanitize_fstab_encryption_flags(rootfs_prefix: &str) {
+    // Same location census as detect_guest_slot_suffix — fstab files
+    // live in any of these across Android generations/ramdisk layouts.
+    const SCAN_DIRS: &[&str] = &[
+        "",
+        "etc",
+        "system/etc",
+        "system/system_ext/etc",
+        "vendor/etc",
+        "odm/etc",
+        "first_stage_ramdisk",
+        "first_stage_ramdisk/etc",
+    ];
+    for dir in SCAN_DIRS {
+        let full = if dir.is_empty() {
+            rootfs_prefix.to_string()
+        } else {
+            format!("{}/{}", rootfs_prefix, dir)
+        };
+        let rd = match std::fs::read_dir(&full) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !(name == "recovery.fstab" || name.starts_with("fstab")) {
+                continue;
+            }
+            let path = format!("{}/{}", full, name);
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let mut changed = false;
+            let mut out: Vec<String> = Vec::new();
+            for line in content.split_inclusive('\n') {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with('#') {
+                    out.push(line.trim_end_matches('\n').to_string());
+                    continue;
+                }
+                let fields: Vec<&str> = t.split_whitespace().collect();
+                // fstab row: src mount_point type mnt_flags fs_mgr_flags —
+                // only touch rows whose MOUNT POINT (2nd field) is /data.
+                if fields.len() < 3 || fields[1] != "/data" {
+                    out.push(line.trim_end_matches('\n').to_string());
+                    continue;
+                }
+                let mut line_changed = false;
+                let rebuilt: Vec<String> = fields
+                    .iter()
+                    .map(|f| {
+                        let kept: Vec<&str> = f
+                            .split(',')
+                            .filter(|tok| {
+                                let drop = tok.starts_with("fileencryption=")
+                                    || tok.starts_with("metadata_encryption=")
+                                    || tok.starts_with("keydirectory=")
+                                    || tok.starts_with("forceencrypt=")
+                                    || tok.starts_with("encryptable=")
+                                    || *tok == "fileencryption"
+                                    || *tok == "metadata_encryption"
+                                    || *tok == "forceencrypt"
+                                    || *tok == "encryptable";
+                                if drop {
+                                    line_changed = true;
+                                }
+                                !drop
+                            })
+                            .collect();
+                        kept.join(",")
+                    })
+                    .collect();
+                if !line_changed {
+                    out.push(line.trim_end_matches('\n').to_string());
+                    continue;
+                }
+                changed = true;
+                let mut new_fields = rebuilt;
+                // A flags field that consisted ONLY of crypto tokens would
+                // collapse to "" — keep the field count intact (fstab
+                // parsers want >= 5 fields) with a harmless standard flag.
+                for f in new_fields.iter_mut() {
+                    if f.is_empty() {
+                        *f = "wait".to_string();
+                    }
+                }
+                out.push(new_fields.join(" "));
+            }
+            if changed {
+                let mut new_content = out.join("\n");
+                if content.ends_with('\n') && !new_content.ends_with('\n') {
+                    new_content.push('\n');
+                }
+                match std::fs::write(&path, &new_content) {
+                    Ok(_) => info!(
+                        "[KR64] PARENT: 6-Z270: stripped FBE/FDE flags from /data entries in {} ({} bytes -> {} bytes)",
+                        path,
+                        content.len(),
+                        new_content.len()
+                    ),
+                    Err(e) => warning!(
+                        "[KR64] PARENT: 6-Z270: FAILED to rewrite {}: {}",
+                        path, e
+                    ),
+                }
+            }
+        }
+    }
+}
+
 /// 6-Z223: build the ordered androidboot.* item list for the guest
 /// /proc/cmdline. `hw` is the detected androidboot.hardware (6-Z159);
 /// `slot_suffix` is 6-Z219's guest-derived value ("_a") or "" for A-only
@@ -11836,6 +11980,52 @@ pub fn join_hybrid_cmdline(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 6-Z270: sanitize_fstab_encryption_flags ─────────────────────────
+    #[test]
+    fn fstab_encryption_sanitize_strips_fbe_flags_from_data_only_6z270() {
+        let dir = std::env::temp_dir().join(format!("kr64_6z270_test_{}", std::process::id()));
+        let etc = dir.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        let path = etc.join("recovery.fstab");
+        std::fs::write(
+            &path,
+            "# comment with fileencryption=keep-me\n\
+             /dev/block/by-name/system\t/system\text4\tro,barrier=1\twait,logical,first_stage_mount\n\
+             /dev/block/bootdevice/by-name/userdata\t/data\tf2fs\tnosuid,nodev\twait,check,formattable,fileencryption=aes-256-xts:aes-256-cts:v2+inlinecrypt_optimized,metadata_encryption=aes-256-xts,keydirectory=/metadata/vold/metadata_encryption,reservedsize=128M,checkpoint=fs\n\
+             /dev/block/by-name/cache\t/cache\text4\trw\twait\n",
+        )
+        .unwrap();
+        sanitize_fstab_encryption_flags(dir.to_str().unwrap());
+        let out = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        // comment preserved (even though it mentions the token)
+        assert!(
+            lines[0].starts_with("# comment"),
+            "comment line rewritten: {out}"
+        );
+        // non-/data rows byte-preserved
+        assert!(lines[1].contains('\t'), "non-data row must keep raw bytes");
+        assert!(lines[1].contains("first_stage_mount"));
+        assert!(!lines[1].starts_with("/dev/block/bootdevice"));
+        // /data row: crypto tokens stripped, other flags kept, field count kept
+        let data = lines[2];
+        assert!(!data.contains("fileencryption"), "{data}");
+        assert!(!data.contains("metadata_encryption"), "{data}");
+        assert!(!data.contains("keydirectory"), "{data}");
+        assert!(data.contains("wait,check,formattable"), "{data}");
+        assert!(data.contains("reservedsize=128M"), "{data}");
+        assert!(data.contains("checkpoint=fs"), "{data}");
+        assert!(data.contains("/data"), "{data}");
+        assert!(data.split_whitespace().count() >= 5, "{data}");
+        // /cache row untouched
+        assert_eq!(lines[3], "/dev/block/by-name/cache\t/cache\text4\trw\twait");
+        // idempotent second run: no further change
+        sanitize_fstab_encryption_flags(dir.to_str().unwrap());
+        let out2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(out, out2, "second sanitize must be a no-op");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         std::iter::once("kr64".to_string())

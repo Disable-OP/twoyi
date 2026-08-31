@@ -2372,7 +2372,69 @@ static void twrp_fb_hook_init(void) {
     // offline. Runs BEFORE the tracer's per-syscall spam, so the dump
     // lands clean (no byte interleaving). One dump per process load
     // (~8KB × the crash-restart cycle count — cheap evidence).
-    fatal_dump_maps();
+    //
+    // 6-Z270: GATE the constructor dump to the boot-critical binaries.
+    // Every guest binary (sh, chmod, toybox applets, the OrangeFox
+    // startup-script pipeline — ~30 processes in the first 40 s of an
+    // R12 boot) was dumping its full module list to the shared stderr
+    // pipe at load; the tracer DIAG-logs every stderr write chunk with
+    // content escaping, so this was hundreds of 2 KiB copies through
+    // the single-threaded ptrace loop per boot — measurable boot tax
+    // and log flood (each dump also interleaves into the merged guest
+    // log, obscuring the real evidence). Keep the dump ONLY for the
+    // crash-prone boot daemons (init / recovery / keystore2): their
+    // module bases anchor every later process (same rootfs, same lib
+    // set), and crashes in OTHER processes still dump at the FATAL
+    // site (fatal_evidence_once → fatal_dump_maps, un-gated).
+    //
+    // The gate reads /proc/self/cmdline (raw syscalls — /proc passes
+    // through the tracer untranslated per the 6-Z170 finding). At
+    // constructor time the path is the STAGED exec target
+    // (/data/…/twoyi_stage/_system_bin_<name>_<hash>), so the basenames
+    // we match carry the _system_bin/_sbin prefix; plain "init" and
+    // "twoyi_init" cover the non-staged early loads.
+    {
+        volatile char cbuf[96];
+        int dump_it = 0;
+        {
+            static const char csrc[] = "/proc/self/cmdline";
+            volatile char cpath[sizeof(csrc)];
+            unsigned k;
+            for (k = 0; k < sizeof(csrc); k++) cpath[k] = csrc[k];
+            int cfd = (int)raw_syscall4(SYS_openat, (long)-100 /*AT_FDCWD*/,
+                                        (long)(const char *)cpath, 0, 0);
+            if (cfd >= 0) {
+                long n = raw_syscall3(SYS_read, cfd, (long)(char *)cbuf,
+                                      (long)(sizeof(cbuf) - 1));
+                raw_syscall1(SYS_close, cfd);
+                if (n > 0) {
+                    char *p = (char *)cbuf;
+                    char *base = p;
+                    long i;
+                    for (i = 0; i < n; i++) {
+                        if (p[i] == '\0') { p[i] = '\0'; break; }
+                        if (p[i] == '/') base = &p[i + 1];
+                    }
+                    p[n] = '\0';
+                    /* staged basenames: _system_bin_<name>_<hash> /
+                     * _sbin_<name>_<hash>; match the daemon prefixes. */
+                    if (strncmp(base, "_system_bin_init", 16) == 0 ||
+                        strncmp(base, "_system_bin_recovery", 20) == 0 ||
+                        strncmp(base, "_system_bin_keystore2", 21) == 0 ||
+                        strncmp(base, "_sbin_recovery", 14) == 0 ||
+                        strcmp(base, "init") == 0 ||
+                        strcmp(base, "recovery") == 0 ||
+                        strcmp(base, "twoyi_init") == 0 ||
+                        strcmp(base, "keystore2") == 0) {
+                        dump_it = 1;
+                    }
+                }
+            }
+        }
+        if (dump_it) {
+            fatal_dump_maps();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
