@@ -23107,3 +23107,93 @@ Stage Summary:
   R12 UI interactive at ~30-35 s (vs UI-never in the storm era). 6-Z270
   targets the measured 20 s decryption-probe hole; dispatching run #2 on
   this head.
+
+---
+Task ID: 6-Z270b device-mapper stub + wave 2 dispatches
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: eliminate the second fixed-budget wait found in the 6-Z269 timeline.
+
+Work Log:
+- Second 10 s hole decoded from run 33409396151: the guest's own AOSP
+  first-stage init polls for the device-mapper control node with a 10 s
+  budget — "<6>init: Wait for device-mapper returned after 10007ms /
+  <3>init: device-mapper device not found after polling timeout" — the
+  ENTIRE 0→10.5 s init phase was this poll (28k stops = coldboot work
+  after the wait expired).
+- devices.rs create_device_mapper_stubs(): {rootfs}/dev/block/device-mapper
+  + /dev/device-mapper symlinked to /dev/null (same defensive pattern as
+  the graphics stubs); wired into the parent-side device phase next to
+  create_dm_user_device. DM ioctls fail ENOTTY — the identical failure
+  mode the post-timeout path already handled, minus 10 s.
+- Verified: cargo check/clippy/fmt green, 677/677 tests.
+- Dispatched two isolating R12 lavender verification runs:
+  * 33411460944 (ce7fd16): 6-Z270a fstab sanitize + maps-dump gate only.
+  * 33411932921 (e8bfd72): + 6-Z270b device-mapper stubs.
+- Remaining measured segments for the next waves (6-Z271 candidates):
+  * ~31→36 s: OrangeFox startup-script pipeline (~15 toybox execs,
+    ~300 ms each — fork+stage+link cost under the tracer).
+  * ~36→47 s: theme/XML parse + first-page render (guest CPU under
+    per-syscall tax).
+  * POST-UI: every vibrate-capable tap blocks ~5 s on
+    "Waiting for service 'android.hardware.vibrator.IVibrator/default'"
+    (AIDL HAL absent; the legacy sysfs vibrator stubs from haptics.rs
+    don't help R12's binder path). Candidate fix: a minimal
+    libbinder_ndk C HAL (AServiceManager_addService) staged into the
+    rootfs with an rc service line, OR interposing the waitForService
+    entry the recovery uses (C++ ServiceManagerShim::waitForService is
+    a VIRTUAL call — symbol interposition will NOT catch it; the fake
+    HAL is the realistic path).
+
+Stage Summary:
+- Two more fixed multi-second waits eliminated (dm poll 10 s, decrypt
+  probe ~20 s). Projected boot-to-UI after both verify: ~15-20 s from
+  47 s. Next targets: startup-script exec batching, theme parse, and
+  the vibrator HAL for interaction latency.
+
+---
+Task ID: 6-Z270 wave verdict (run 33411932921) + 6-Z271 handoff
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: read run 33411932921 (head e8bfd72, orangefox-R12.0-lavender, md5
+8dd3688b814fc99f8251e3c749812d92) frame-by-frame and close the wave.
+
+Work Log:
+- Run 33411932921: SUCCESS. Boot curve unchanged vs 6-Z269 (splash at the
+  20 s capture tick, full interactive UI at the 30 s tick ≈ tracer+34/+47 s;
+  loop_count 3.57M; all terminal/file-manager flows exercised).
+- FIX VERIFICATIONS:
+  * fstab sanitize FIRED ("stripped FBE/FDE flags ... 4226 -> 3870 bytes")
+    and ELIMINATED the keystore_cli_v2 fork (0 occurrences vs the 6-Z269
+    run) — correct and kept. The ~20 s hole REMAINED: it is NOT the cli.
+  * dm stubs created; the guest OPENED /dev/device-mapper (hook log) but
+    the init poller still waited 10010 ms — it checks beyond file
+    existence (S_ISBLK/uevent). Kept as defensive nodes with corrected
+    claims; deeper faking (block-stat + DM ioctls) deliberately NOT done
+    (first-stage-mount InitFatalReboot class).
+- REMAINING 20 s HOLE ROOT-CAUSED (this run): keystore_cli_v2 is gone,
+  but TWRP's IN-PROCESS keystore2 binder lookup still blocks ~20 s:
+  * TWRP decides keymaster_ver=4.x from ro.build.version.sdk (R12 =
+    Android 13), NOT from the fstab or the VINTF manifest ("Separate
+    manifest doesn't exist" → manifest stripping is useless).
+  * the recovery's main thread blocks in a binder waitForService on
+    IKeystoreSecurity (~20 s client budget) while KEYSOTORE2 ITSELF
+    never registers: its thread (pid 2697, comm _system_bin_key =
+    truncated staged keystore2) nanosleep-loops through the hole.
+  * 6-Z271 candidate fixes, in order of safety:
+      1. investigate why keystore2 does not register under the
+         emulated binder/selinux layer (the shlib's binder ioctl
+         emulation replies — check BC_ADD_SERVICEMANAGER /
+         addService ACL on the fake context);
+      2. a minimal libbinder_ndk C fake HAL registering
+         android.hardware.vibrator.IVibrator/default (kills the ~5 s
+         per-tap vibrator wait — C++ ServiceManagerShim::waitForService
+         is a VIRTUAL call, symbol interposition will not catch it);
+      3. guest-prop spoofing (ro.crypto.state) is KNOWN-HAZARDOUS
+         (SIGABRT regression history in proc_emu.rs comments) — only
+         behind an explicit env gate if ever.
+- Wave totals: storm extinct (498k storm lines → 5), loop_count 31.9M →
+  3.57M, UI reachable + interactive (storm era never rendered), boot-to-UI
+  ~47 s tracer-side. Remaining fixed budget on this image: 10 s dm poll
+  (unsatisfiable without dm emulation) + ~20 s keystore2 binder chain
+  (6-Z271) + ~5 s startup-script execs + ~11 s theme parse.

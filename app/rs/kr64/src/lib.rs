@@ -5076,11 +5076,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             );
         }
     }
-    // 6-Z270: /dev/block/device-mapper stub — the guest's first-stage init
-    // polls for it up to 10 s before coldboot ("Wait for device-mapper
-    // returned after 10007ms"); with the node present the poll returns
-    // instantly. Non-fatal: the stub only converts a 10 s timeout into an
-    // instant ENOTTY on the DM ioctls the guest already fails gracefully.
+    // 6-Z270b: /dev/block/device-mapper defensive stubs. Run 33411932921
+    // measured this init's poller checking BEYOND file existence (still
+    // 10010 ms with the node present) — see the devices.rs caveat: kept
+    // for access()/open()-style pollers, NOT a fix for this image's wait.
     if let Err(e) = devices::create_device_mapper_stubs(&cfg.rootfs) {
         warning!("[KR64] failed to create device-mapper stubs: {}", e);
     }

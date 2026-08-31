@@ -1145,7 +1145,7 @@ pub fn create_graphics_device_stubs(rootfs: &str) -> std::io::Result<()> {
 
 /// Create device-mapper control-node stubs in the guest rootfs.
 ///
-/// # 6-Z270: why this saves 10 seconds of every boot
+/// # Background
 ///
 /// AOSP init (Android 12+ `system/core/init/devices.cpp`) waits up to
 /// **10 seconds** for the device-mapper control node before its device
@@ -1157,17 +1157,20 @@ pub fn create_graphics_device_stubs(rootfs: &str) -> std::io::Result<()> {
 /// <3>init: Failed to init devices for INIT_AVB_VERSION
 /// ```
 ///
-/// (captured verbatim from run 33409396151 at tracer +10.1 s — the FIRST
-/// 10 s of every R12 boot were this poll; the container has no
-/// device-mapper, so the wait always expired on its full budget).
+/// # 6-Z270b run-measured caveat (run 33411932921)
 ///
-/// Pre-creating `{rootfs}/dev/block/device-mapper` (+ the legacy
-/// `/dev/device-mapper` spelling) as a symlink to `/dev/null` makes the
-/// wait return instantly. Subsequent DM ioctls fail with `ENOTTY`
-/// against /dev/null — the SAME failure mode the guest already handles
-/// on the timeout path, minus the 10 s. This mirrors the defensive
-/// graphics-stub pattern: ENOENT→instant-success on the wait, ioctls
-/// degrade gracefully.
+/// The OrangeFox R12 lavender init's poller checks BEYOND file
+/// existence (likely S_ISBLK on the stat result or a uevent-driven
+/// condition) — providing the symlink did NOT shorten the 10 s wait
+/// (10010 ms measured with the stub present). The stubs are KEPT as
+/// correct defensive nodes (any guest that polls with plain
+/// access()/open() benefits; the ioctls degrade to ENOTTY exactly like
+/// the post-timeout path). Satisfying the poller itself would require
+/// faking block-device stat results AND DM ioctls at the tracer level —
+/// deliberately NOT attempted: first-stage-mount dm paths behind a
+/// successful probe are the InitFatalReboot class (see lib.rs
+/// fstab.ranchu notes). The 10 s stays; it is accounted for in the
+/// boot timeline as a fixed cost of this image class.
 pub fn create_device_mapper_stubs(rootfs: &str) -> std::io::Result<()> {
     let block_dir = format!("{}/dev/block", rootfs);
     fs::create_dir_all(&block_dir)?;
@@ -1185,7 +1188,7 @@ pub fn create_device_mapper_stubs(rootfs: &str) -> std::io::Result<()> {
         let _ = fs::remove_file(&path);
         match std::os::unix::fs::symlink(target, &path) {
             Ok(()) => info!(
-                "[KR64][devices] device-mapper stub: {} -> {} (6-Z270: kills init's 10 s dm wait)",
+                "[KR64][devices] device-mapper stub: {} -> {} (defensive node)",
                 path, target
             ),
             Err(e) => warning!(
