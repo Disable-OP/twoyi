@@ -405,6 +405,11 @@ public final class FileLogger {
             return;
         }
         File logcatFile = new File(mLogDir, "logcat.log");
+        // 6-Z268: the (former) filtered pump's file is now written by THIS
+        // thread — one logcat reader process instead of two. Two
+        // competing `logcat -v threadtime *:V` readers doubled the logd
+        // stream cost during the boot window for zero information.
+        File filteredFile = new File(mLogDir, "logcat-filtered.log");
         Thread pump = new Thread(() -> {
             // `logcat -v threadtime` prints: "MM-DD HH:MM:SS.mmm PID TID LEVEL/TAG: message"
             // We use -v threadtime so we get PID+TID (useful for diagnosing
@@ -414,26 +419,65 @@ public final class FileLogger {
             pb.redirectErrorStream(true);
             java.lang.Process proc = null;
             BufferedReader reader = null;
+            // 6-Z268: PERSISTENT buffered streams. The old loop did
+            // exists() + length() + open + write + close PER LINE through
+            // FUSE — ~5 syscalls × every logcat line × the whole boot.
+            // One stream per file, flushed every ~32 KiB of pending data
+            // (a crash loses at most the last 32 KiB of logcat.log —
+            // acceptable for diagnostic logs), rotation tracked by an
+            // in-memory size counter instead of per-line stats.
+            java.io.BufferedOutputStream bos = null;
+            long logcatSize = logcatFile.exists() ? logcatFile.length() : 0;
+            long logcatPending = 0;
+            java.io.BufferedOutputStream fbos = null;
+            long filteredSize = filteredFile.exists() ? filteredFile.length() : 0;
+            long filteredPending = 0;
             try {
                 proc = pb.start();
                 reader = new BufferedReader(
                         new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8));
-                byte[] newline = "\n".getBytes(StandardCharsets.UTF_8);
+                bos = new java.io.BufferedOutputStream(
+                        new FileOutputStream(logcatFile, true), 64 * 1024);
+                fbos = new java.io.BufferedOutputStream(
+                        new FileOutputStream(filteredFile, true), 16 * 1024);
                 String line;
                 while ((line = reader.readLine()) != null) {
                     try {
                         byte[] bytes = (line + "\n").getBytes(StandardCharsets.UTF_8);
-                        // Append directly (bypassing the mWriter executor) on
-                        // THIS thread — logcat can produce hundreds of lines
-                        // per second, and queueing each one would OOM the
-                        // executor's task queue under heavy load.
                         synchronized (FileLogger.class) {
-                            if (logcatFile.exists()
-                                    && logcatFile.length() + bytes.length > MAX_LOG_BYTES) {
+                            if (logcatSize + bytes.length > MAX_LOG_BYTES) {
+                                bos.flush();
+                                bos.close();
                                 rotate(logcatFile);
+                                bos = new java.io.BufferedOutputStream(
+                                        new FileOutputStream(logcatFile, true), 64 * 1024);
+                                logcatSize = 0;
+                                logcatPending = 0;
                             }
-                            try (FileOutputStream fos = new FileOutputStream(logcatFile, true)) {
-                                fos.write(bytes);
+                            bos.write(bytes);
+                            logcatSize += bytes.length;
+                            logcatPending += bytes.length;
+                            if (logcatPending >= 32 * 1024) {
+                                bos.flush();
+                                logcatPending = 0;
+                            }
+                            if (FILTER_PATTERN.matcher(line).find()) {
+                                if (filteredSize + bytes.length > MAX_LOG_BYTES) {
+                                    fbos.flush();
+                                    fbos.close();
+                                    rotate(filteredFile);
+                                    fbos = new java.io.BufferedOutputStream(
+                                            new FileOutputStream(filteredFile, true), 16 * 1024);
+                                    filteredSize = 0;
+                                    filteredPending = 0;
+                                }
+                                fbos.write(bytes);
+                                filteredSize += bytes.length;
+                                filteredPending += bytes.length;
+                                if (filteredPending >= 16 * 1024) {
+                                    fbos.flush();
+                                    filteredPending = 0;
+                                }
                             }
                         }
                     } catch (IOException ignored) {
@@ -449,6 +493,8 @@ public final class FileLogger {
             } finally {
                 if (reader != null) try { reader.close(); } catch (IOException ignored) {}
                 if (proc != null) proc.destroy();
+                try { if (bos != null) bos.close(); } catch (IOException ignored) {}
+                try { if (fbos != null) fbos.close(); } catch (IOException ignored) {}
                 mLogcatPumpRunning.set(false);
             }
         }, "FileLogger-Logcat");
@@ -474,50 +520,11 @@ public final class FileLogger {
                   + "SettingsActivity|ProfileManager|RomManager");
 
     private void startFilteredLogcatPump() {
-        File filteredFile = new File(mLogDir, "logcat-filtered.log");
-        Thread t = new Thread(() -> {
-            // Same logcat invocation as the main pump, but we filter each
-            // line through FILTER_PATTERN and only write matches. This
-            // gives the user a compact "boot milestone" view without the
-            // noise of the full logcat.
-            ProcessBuilder pb = new ProcessBuilder(
-                    "logcat", "-v", "threadtime", "*:V");
-            pb.redirectErrorStream(true);
-            java.lang.Process proc = null;
-            BufferedReader reader = null;
-            try {
-                proc = pb.start();
-                reader = new BufferedReader(
-                        new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8));
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (!FILTER_PATTERN.matcher(line).find()) {
-                        continue;
-                    }
-                    try {
-                        byte[] bytes = (line + "\n").getBytes(StandardCharsets.UTF_8);
-                        synchronized (FileLogger.class) {
-                            if (filteredFile.exists()
-                                    && filteredFile.length() + bytes.length > MAX_LOG_BYTES) {
-                                rotate(filteredFile);
-                            }
-                            try (FileOutputStream fos = new FileOutputStream(filteredFile, true)) {
-                                fos.write(bytes);
-                            }
-                        }
-                    } catch (IOException ignored) {
-                        // Keep going.
-                    }
-                }
-            } catch (IOException ignored) {
-                // logcat binary not available — the main pump already logged this.
-            } finally {
-                if (reader != null) try { reader.close(); } catch (IOException ignored) {}
-                if (proc != null) proc.destroy();
-            }
-        }, "FileLogger-LogcatFiltered");
-        t.setDaemon(true);
-        t.start();
+        // 6-Z268: NO-OP — the filtered file (logcat-filtered.log) is now
+        // demuxed by the single merged logcat pump (see startLogcatPump).
+        // The second `logcat -v threadtime *:V` reader process this method
+        // used to spawn doubled logd stream cost during the boot window.
+        // Kept as a no-op so the start() call order stays unchanged.
     }
 
     // -------------------------------------------------------------------------
@@ -548,37 +555,46 @@ public final class FileLogger {
         // Also tee the fallback linker path log (log.txt) into the same file.
         final File src2 = new File(context.getApplicationInfo().dataDir, "log.txt");
         Thread t = new Thread(() -> {
-            // 6-Z87 FIX 3: incremental logcat offsets, PRIVATE to this pump
-            // thread (next unread byte; 0 = nothing logged yet). Reset to 0
-            // by logcatTeeIncremental when the file shrinks (fresh launch).
+            // 6-Z87 FIX 3: incremental offsets, PRIVATE to this pump thread
+            // (next unread byte; 0 = nothing logged yet). Reset to 0 by the
+            // helpers when the file shrinks (fresh launch).
+            // 6-Z268: the FILE copy is now INCREMENTAL too. It was a
+            // truncate + full bounded tail copy of up to 2×8 MiB every
+            // 2 s — up to ~80–160 MB/min of FUSE writes on the SAME
+            // storage the guest rootfs lives on, during exactly the
+            // boot window we are trying to speed up. Truncation (the
+            // fresh-launch signature) is detected by the shrink check
+            // and restarts the append cleanly.
             long teeOffset = 0;   // kr64-app-stderr.log (primary)
             long tee2Offset = 0;  // log.txt (fallback linker path)
+            // 6-Z268: Log.i re-injection sampler — the tee previously
+            // re-logged EVERY new kr64 line into logd on top of the file
+            // copy (logcat pumps then wrote each of those lines back to
+            // FUSE). First 200 lines keep full fidelity (early-boot
+            // milestones), then 1-in-10; the full-fidelity record stays
+            // in kr64.log regardless.
+            long[] injectedCounter = {0};
             while (true) {
                 try {
-                    // 6-Z184 STREAM COPY: the previous pass materialised the
-                    // ENTIRE source file in a StringBuilder before writing
-                    // (bounded per LINE, but total memory = file size — a
-                    // 145 MB kr64 log still OOM'd at sb.toString().getBytes()).
-                    // Stream in 64 KB chunks instead, capping the copied tail
-                    // at MAX_TEE_COPY_BYTES so kr64.log stays bounded no
-                    // matter how large the guest's stderr grows.
                     synchronized (FileLogger.class) {
-                        try (FileOutputStream fos = new FileOutputStream(dst, false)) {
-                            copyTailBounded(src, "kr64-app-stderr.log", fos);
-                            copyTailBounded(src2, "log.txt", fos);
+                        try (FileOutputStream fos = new FileOutputStream(dst, true)) {
+                            teeOffset = appendIncrementalBounded(
+                                    src, "kr64-app-stderr.log", teeOffset, fos);
+                            tee2Offset = appendIncrementalBounded(
+                                    src2, "log.txt", tee2Offset, fos);
                         } catch (IOException ioe) {
                             android.util.Log.w(TAG, "kr64 tee copy failed: " + ioe.getMessage());
                         }
                     }
-                    // 6-Z87 FIX 3: the logcat tee now logs only the NEW
-                    // lines since the last pass (full-file re-logging was
-                    // the O(N²) flood that fabricated the "2 s relaunch
-                    // loop" myth — see the method javadoc). The kr64.log
-                    // FILE COPY above stays full-file on purpose.
+                    // 6-Z87 FIX 3: the logcat tee logs only the NEW lines
+                    // since the last pass. 6-Z268: sampled after the first
+                    // 200 lines (1-in-10) to cut the logd churn.
                     teeOffset = logcatTeeIncremental(src, teeOffset,
-                            "-- kr64 log truncated (fresh container launch) --");
+                            "-- kr64 log truncated (fresh container launch) --",
+                            injectedCounter);
                     tee2Offset = logcatTeeIncremental(src2, tee2Offset,
-                            "-- log.txt truncated (fresh container launch) --");
+                            "-- log.txt truncated (fresh container launch) --",
+                            injectedCounter);
                 } catch (OutOfMemoryError | Exception e) {
                     // 6-Z131: NEVER let the tee kill the app. Run
                     // 32786386000 died exactly here — the old unbounded
@@ -671,9 +687,14 @@ public final class FileLogger {
      * truncates the log at container start) — so the offset resets to 0 and
      * exactly one {@code truncatedMsg} notice is logged.
      *
+     * 6-Z268: {@code injectedCounter[0]} carries the cross-call Log.i
+     * sampling state — the first 200 lines are injected at full fidelity,
+     * then every 10th line (the full-fidelity record stays in kr64.log).
+     *
      * @return the updated offset (file position after the last logged line)
      */
-    private static long logcatTeeIncremental(File src, long offset, String truncatedMsg) {
+    private static long logcatTeeIncremental(File src, long offset, String truncatedMsg,
+                                             long[] injectedCounter) {
         if (src == null || !src.exists()) {
             return offset;
         }
@@ -711,10 +732,79 @@ public final class FileLogger {
         }
         for (String line : chunk.substring(0, lastNl).split("\n")) {
             if (!line.isEmpty()) {
-                Log.i("KR64", line);
+                // 6-Z268: Log.i re-injection sampler — first 200 lines at
+                // full fidelity, then 1-in-10. The full-fidelity record
+                // lives in kr64.log (appendIncrementalBounded below);
+                // re-injecting every line into logd (which the logcat
+                // pumps then wrote back to FUSE) tripled the boot-window
+                // log I/O for no diagnostic gain.
+                long n = injectedCounter[0]++;
+                if (n < 200 || n % 10 == 0) {
+                    Log.i("KR64", line);
+                }
             }
         }
         return offset + lastNl + 1;
+    }
+
+    /**
+     * 6-Z268: incremental FILE leg of the kr64 tee — replaces the
+     * truncate + full-tail-copy that re-wrote up to 2×8 MiB every 2 s.
+     * Appends ONLY the bytes past {@code offset} (bounded per pass by
+     * {@link #MAX_TEE_COPY_BYTES}), writing the source label header when
+     * (re)starting. A shrunken file means kr64 truncated its log (fresh
+     * launch): the offset resets to 0 and the tail-cap logic applies to
+     * the fresh pass, exactly like the old full copy did.
+     *
+     * @return the updated offset (bytes of {@code src} appended so far)
+     */
+    private static long appendIncrementalBounded(File src, String label, long offset,
+                                                 FileOutputStream fos) throws IOException {
+        if (src == null || !src.exists()) {
+            return offset;
+        }
+        final long len = src.length();
+        if (len == offset) {
+            return offset; // nothing new
+        }
+        boolean freshPass = len < offset;
+        long from = freshPass ? 0 : offset;
+        long available = len - from;
+        long skipped = 0;
+        if (available > MAX_TEE_COPY_BYTES) {
+            skipped = available - MAX_TEE_COPY_BYTES;
+            from += skipped;
+            available = MAX_TEE_COPY_BYTES;
+        }
+        if (freshPass || offset == 0) {
+            fos.write(("── " + label + " (" + len + " bytes) ──\n")
+                    .getBytes(StandardCharsets.UTF_8));
+        }
+        if (skipped > 0) {
+            fos.write(("...[skipped " + skipped + " of " + len
+                    + " bytes — tail follows...]\n")
+                    .getBytes(StandardCharsets.UTF_8));
+        }
+        if (available <= 0) {
+            return len;
+        }
+        try (FileInputStream fis = new FileInputStream(src)) {
+            long toSkip = from;
+            while (toSkip > 0) {
+                long s = fis.skip(toSkip);
+                if (s <= 0) break;
+                toSkip -= s;
+            }
+            byte[] buf = new byte[64 * 1024];
+            long remaining = available;
+            int n;
+            while (remaining > 0 && (n = fis.read(buf, 0,
+                    (int) Math.min(buf.length, remaining))) > 0) {
+                fos.write(buf, 0, n);
+                remaining -= n;
+            }
+        }
+        return len;
     }
 
     // -------------------------------------------------------------------------

@@ -2847,34 +2847,50 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Res
     // surrounding log context in one run.
     #[cfg(target_arch = "aarch64")]
     {
-        use std::cell::Cell;
-        thread_local! {
-            static SMOKE_COUNT: Cell<u32> = const { Cell::new(0) };
-        }
-        let new_pc = {
-            let rp = regs as *const Regs as *const u64;
-            unsafe { *rp.add(32) }
-        };
-        let new_sp = {
-            let rp = regs as *const Regs as *const u64;
-            unsafe { *rp.add(31) }
-        };
-        let mut old: Regs = unsafe { std::mem::zeroed() };
-        if ptrace_getregs(pid, &mut old).is_ok() {
-            let rp = &old as *const Regs as *const u64;
-            let old_pc = unsafe { *rp.add(32) };
-            let old_sp = unsafe { *rp.add(31) };
-            if old_pc != new_pc || old_sp != new_sp {
-                SMOKE_COUNT.with(|c| {
-                    let n = c.get();
-                    if n < 60 {
-                        c.set(n + 1);
-                        crate::info!(
-                            "6-Z180 SETREGS-SMOKE: pid={} pc {:#x} -> {:#x}, sp {:#x} -> {:#x} — STALE/CROSS-THREAD REGISTER WRITE (legitimate rewrites never touch pc/sp)",
-                            pid, old_pc, new_pc, old_sp, new_sp
-                        );
-                    }
-                });
+        // 6-Z268: the PC/SP smoke detector costs a full GETREGSET per
+        // setregs call (~69 call sites, one to several per stop — the
+        // write_translated_path loop alone calls setregs once per
+        // translated path). That DOUBLES register traffic on the hottest
+        // primitive. The audit now runs only when KR64_REGAUDIT=1 is set
+        // in the environment (OneLock-cached); the stale-write class it
+        // hunts is otherwise covered by the 6-Z180 crash forensics and
+        // the detector remains available for targeted investigations.
+        static REGAUDIT_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let regaudit = *REGAUDIT_ENABLED.get_or_init(|| {
+            std::env::var("KR64_REGAUDIT")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        });
+        if regaudit {
+            use std::cell::Cell;
+            thread_local! {
+                static SMOKE_COUNT: Cell<u32> = const { Cell::new(0) };
+            }
+            let new_pc = {
+                let rp = regs as *const Regs as *const u64;
+                unsafe { *rp.add(32) }
+            };
+            let new_sp = {
+                let rp = regs as *const Regs as *const u64;
+                unsafe { *rp.add(31) }
+            };
+            let mut old: Regs = unsafe { std::mem::zeroed() };
+            if ptrace_getregs(pid, &mut old).is_ok() {
+                let rp = &old as *const Regs as *const u64;
+                let old_pc = unsafe { *rp.add(32) };
+                let old_sp = unsafe { *rp.add(31) };
+                if old_pc != new_pc || old_sp != new_sp {
+                    SMOKE_COUNT.with(|c| {
+                        let n = c.get();
+                        if n < 60 {
+                            c.set(n + 1);
+                            crate::info!(
+                                "6-Z180 SETREGS-SMOKE: pid={} pc {:#x} -> {:#x}, sp {:#x} -> {:#x} — STALE/CROSS-THREAD REGISTER WRITE (legitimate rewrites never touch pc/sp)",
+                                pid, old_pc, new_pc, old_sp, new_sp
+                            );
+                        }
+                    });
+                }
             }
         }
     }
@@ -2899,6 +2915,10 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Res
     if r == -1 {
         return Err(std::io::Error::last_os_error());
     }
+    // 6-Z268: register-write epoch — see SETREGS_EPOCH. Bumped on every
+    // SUCCESSFUL setregs so the sandbox backstop can tell whether the
+    // loop's own snapshot is still the child's final staged state.
+    SETREGS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -2918,33 +2938,44 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, _iov_len: usize) -> std::io::Re
     // next run names the exact corrupting call site. Thread-local to
     // avoid touching the 100+ call sites; cheap (one compare per call).
     {
-        use std::cell::Cell;
-        thread_local! {
-            static RAX_AUDIT_COUNT: Cell<u32> = const { Cell::new(0) };
-        }
-        // rax is u64 index 10 in the x86_64 user_regs_struct view.
-        let regs_ptr = regs as *const Regs as *const u64;
-        let new_rax = unsafe { *regs_ptr.add(10) };
-        let mut old: Regs = unsafe { std::mem::zeroed() };
-        if ptrace_getregs(pid, &mut old).is_ok() {
-            let old_ptr = &old as *const Regs as *const u64;
-            let old_rax = unsafe { *old_ptr.add(10) };
-            if old_rax != new_rax {
-                let orig_rax = unsafe { *old_ptr.add(15) }; // orig_rax idx 15
-                RAX_AUDIT_COUNT.with(|c| {
-                    let n = c.get();
-                    if n < 4000 {
-                        c.set(n + 1);
-                        crate::info!(
-                            "6-Z135 RAX-AUDIT: pid={} setregs rax {:#x} -> {:#x} (orig_rax={} [{}])",
-                            pid,
-                            old_rax,
-                            new_rax,
-                            orig_rax as i64,
-                            syscall_name(orig_rax as i64, &ABI_X86_64)
-                        );
-                    }
-                });
+        // 6-Z268: env-gated like the aarch64 smoke detector above — see
+        // KR64_REGAUDIT. The x86_64 RAX audit paid one GETREGS per setregs
+        // on the x86 CI/emulator path.
+        static REGAUDIT_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let regaudit = *REGAUDIT_ENABLED.get_or_init(|| {
+            std::env::var("KR64_REGAUDIT")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        });
+        if regaudit {
+            use std::cell::Cell;
+            thread_local! {
+                static RAX_AUDIT_COUNT: Cell<u32> = const { Cell::new(0) };
+            }
+            // rax is u64 index 10 in the x86_64 user_regs_struct view.
+            let regs_ptr = regs as *const Regs as *const u64;
+            let new_rax = unsafe { *regs_ptr.add(10) };
+            let mut old: Regs = unsafe { std::mem::zeroed() };
+            if ptrace_getregs(pid, &mut old).is_ok() {
+                let old_ptr = &old as *const Regs as *const u64;
+                let old_rax = unsafe { *old_ptr.add(10) };
+                if old_rax != new_rax {
+                    let orig_rax = unsafe { *old_ptr.add(15) }; // orig_rax idx 15
+                    RAX_AUDIT_COUNT.with(|c| {
+                        let n = c.get();
+                        if n < 4000 {
+                            c.set(n + 1);
+                            crate::info!(
+                                "6-Z135 RAX-AUDIT: pid={} setregs rax {:#x} -> {:#x} (orig_rax={} [{}])",
+                                pid,
+                                old_rax,
+                                new_rax,
+                                orig_rax as i64,
+                                syscall_name(orig_rax as i64, &ABI_X86_64)
+                            );
+                        }
+                    });
+                }
             }
         }
     }
@@ -2963,7 +2994,68 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, _iov_len: usize) -> std::io::Re
     if r == -1 {
         return Err(std::io::Error::last_os_error());
     }
+    // 6-Z268: register-write epoch (see SETREGS_EPOCH).
+    SETREGS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// 6-Z268: monotonically increasing counter bumped on every SUCCESSFUL
+/// `ptrace_setregs` (all ABIs funnel through the two cfg'd variants).
+///
+/// The sandbox backstop previously took a FRESH GETREGSET on every
+/// path-taking ENTRY stop because "handlers have already flushed their
+/// rewrites". But most path stops rewrite NOTHING — the flush never
+/// happens and the fresh 272-byte GETREGSET is pure waste on the
+/// hottest stop class. With the epoch, the backstop can reuse the
+/// loop-top snapshot whenever no handler has written registers since
+/// it was fetched: identical final-state semantics, one ptrace call
+/// saved per pass-through path syscall.
+static SETREGS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// 6-Z268: per-stop record of strings this tracer WROTE into the child
+// (`write_translated_path` + scratch rewrites). The sandbox backstop
+// previously re-read every rewritten path from the child with a full
+// `process_vm_readv` string read — duplicating work the ENTRY handler
+// had done microseconds earlier. Records live for exactly one stop:
+// the loop clears the cache at the top of every waitpid iteration and
+// the backstop consumes it at the END of the ENTRY arm.
+// Lookup key is (pid, exact guest address), so stale entries can
+// never satisfy a different arg — addresses come from the (fresh)
+// register snapshot and each rewrite in a stop lands at a distinct
+// scratch offset.
+thread_local! {
+    static STOP_PATH_WRITES: std::cell::RefCell<Vec<(libc::pid_t, u64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Clear the per-stop write cache (called once per waitpid iteration).
+fn stop_path_writes_clear() {
+    STOP_PATH_WRITES.with(|c| c.borrow_mut().clear());
+}
+
+/// Record a string written to `addr` in the child this stop.
+fn stop_path_write_record(pid: libc::pid_t, addr: u64, s: &str) {
+    STOP_PATH_WRITES.with(|c| {
+        let mut v = c.borrow_mut();
+        if v.len() < 8 {
+            v.push((pid, addr, s.to_string()));
+        } else {
+            // Bounded: overwrite the oldest slot (8 path args per stop
+            // is far beyond any real syscall — renameat2 has 2).
+            v.remove(0);
+            v.push((pid, addr, s.to_string()));
+        }
+    });
+}
+
+/// Fetch the string we WROTE to `addr` this stop, if any.
+fn stop_path_write_lookup(pid: libc::pid_t, addr: u64) -> Option<String> {
+    STOP_PATH_WRITES.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(p, a, _)| *p == pid && *a == addr)
+            .map(|(_, _, s)| s.clone())
+    })
 }
 
 /// Get the syscall number from registers.
@@ -4967,6 +5059,16 @@ fn marker_present_in_regs(regs: &Regs, abi: &ChildAbi) -> bool {
 
 /// The backstop itself. See the module-style comment above. Returns
 /// and logs only; the pending map drives the EXIT-side fake return.
+///
+/// 6-Z268: `regs_fetched` / `regs_epoch_at_fetch` / `iov_len_fetched`
+/// carry the loop-top register snapshot and the SETREGS_EPOCH value
+/// captured right after it was read. When no handler has written
+/// registers since (`SETREGS_EPOCH` unchanged), that snapshot IS the
+/// final staged state and the fresh GETREGSET this fn used to take on
+/// every path-taking ENTRY is skipped. Any successful `ptrace_setregs`
+/// bumps the epoch, so rewrite-carrying stops still re-fetch exactly
+/// as before.
+#[allow(clippy::too_many_arguments)]
 fn sandbox_backstop_at_entry(
     pid: libc::pid_t,
     sandbox: &crate::vfs::SandboxPolicy,
@@ -4974,14 +5076,25 @@ fn sandbox_backstop_at_entry(
     pending_deny: &mut std::collections::HashMap<libc::pid_t, i64>,
     execve_claim: Option<&(libc::pid_t, String)>,
     log: &dyn Fn(&str),
+    regs_fetched: &Regs,
+    regs_epoch_at_fetch: u64,
+    iov_len_fetched: usize,
 ) {
     // Fresh register snapshot: handlers have already flushed their
     // rewrites via ptrace_setregs; this reads the FINAL staged state.
-    let mut regs: Regs = unsafe { std::mem::zeroed() };
-    let iov_len = match ptrace_getregs(pid, &mut regs) {
-        Ok(len) => len,
-        Err(_) => return, // child gone — nothing to protect
-    };
+    // 6-Z268: only re-fetch when a handler actually wrote registers
+    // since the loop-top fetch (epoch moved); otherwise the loop-top
+    // snapshot is already the final state.
+    let (mut regs, iov_len): (Regs, usize) =
+        if SETREGS_EPOCH.load(std::sync::atomic::Ordering::Relaxed) == regs_epoch_at_fetch {
+            (*regs_fetched, iov_len_fetched)
+        } else {
+            let mut r: Regs = unsafe { std::mem::zeroed() };
+            match ptrace_getregs(pid, &mut r) {
+                Ok(len) => (r, len),
+                Err(_) => return, // child gone — nothing to protect
+            }
+        };
     let nr = get_syscall_num(&regs, abi);
     if nr == abi.getpid || nr == -1 || nr <= 0 {
         // Rewritten-inert (xattr/TLS/set_thread_area fakes replaced the
@@ -5033,7 +5146,13 @@ fn sandbox_backstop_at_entry(
         if addr == 0 {
             continue;
         }
-        let Some(path) = read_child_string(pid, addr) else {
+        // 6-Z268: consume this stop's own write when the backstop is
+        // verifying a path this tracer just rewrote — the string was
+        // written microseconds ago and the child cannot have changed
+        // it (it is stopped). Saves a full pvm string read per
+        // translated path syscall.
+        let Some(path) = stop_path_write_lookup(pid, addr).or_else(|| read_child_string(pid, addr))
+        else {
             // ── 6-Z187: execve with an UNREADABLE path FAILS CLOSED ──
             // Historically this `continue` meant an execve whose path the
             // tracer cannot read (the PEEK/pvm/proc-mem-blind recovery-fork
@@ -6406,6 +6525,25 @@ fn read_child_u32(pid: libc::pid_t, addr: u64) -> Option<u32> {
     if addr == 0 {
         return None;
     }
+    // 6-Z268: pvm-first — one process_vm_readv of 4 bytes instead of a
+    // PTRACE_PEEKDATA round-trip (the 6-Z267 read path for strings;
+    // these field readers were still per-word PEEKs and run in the
+    // iov/msghdr walkers + connect checks). PEEK fallback preserves the
+    // exact failure semantics.
+    {
+        let mut b = [0u8; 4];
+        let n = process_vm_readv_chunk(pid, addr, &mut b);
+        if n == 4 {
+            return Some(u32::from_ne_bytes(b));
+        }
+        if n >= 0 {
+            // Short read = unmapped tail — treat as failure like PEEK.
+            if n == 0 {
+                // A zero-length read at a VALID address is possible only
+                // for zero-length ranges — not our case; fall through.
+            }
+        }
+    }
     // errno dance per ptrace(2): PEEKDATA returns -1 on error, but -1 is
     // also a valid word value — clear errno first, then check after. On
     // Android __errno_location is not exposed by the libc crate; the
@@ -6427,6 +6565,14 @@ fn read_child_u32(pid: libc::pid_t, addr: u64) -> Option<u32> {
 fn read_child_u64(pid: libc::pid_t, addr: u64) -> Option<u64> {
     if addr == 0 {
         return None;
+    }
+    // 6-Z268: pvm-first (see read_child_u32).
+    {
+        let mut b = [0u8; 8];
+        let n = process_vm_readv_chunk(pid, addr, &mut b);
+        if n == 8 {
+            return Some(u64::from_ne_bytes(b));
+        }
     }
     let _ = std::io::Error::last_os_error(); // clear errno
     let word = unsafe { libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64, 0) };
@@ -7552,6 +7698,9 @@ fn prop_area_plan_update(
 /// areas get the write FIRST (the same-process read-back latency
 /// matters: a setter that immediately re-reads its own value sees
 /// the new value if its area was written first).
+type Z111SnapshotCache = std::collections::HashMap<(libc::pid_t, u64), (Vec<u8>, usize, u32)>;
+
+#[allow(clippy::too_many_arguments)]
 fn z111_apply_property_set(
     setter_pid: libc::pid_t,
     name: &str,
@@ -7560,6 +7709,8 @@ fn z111_apply_property_set(
     vm_writev_usable: &mut Option<bool>,
     prop_area_log_count: &mut u32,
     log_cap: u32,
+    // 6-Z268: per-area snapshot mirror — see the comment inside.
+    snapshot_cache: &mut Z111SnapshotCache,
 ) {
     if name.is_empty() {
         return; // nothing to write (a malformed prop_msg)
@@ -7591,44 +7742,82 @@ fn z111_apply_property_set(
         return;
     }
     let mut drop_pids: Vec<(libc::pid_t, u64)> = Vec::new();
+    if snapshot_cache.len() > 16 {
+        // Bounded memory: 16 × 128 KiB = 2 MiB worst case.
+        snapshot_cache.clear();
+    }
     for (area_pid, addr, len) in all_areas {
         let snap_len = std::cmp::min(len, PROP_AREA_SIZE);
         if snap_len < 128 {
             drop_pids.push((area_pid, addr));
             continue;
         }
-        let mut snapshot = vec![0u8; snap_len];
-        // Primary: process_vm_readv via fb0_bridge_read_child_mem
-        // (it has the 6-Z84 TRAP guard that detects a seccomp-blocked
-        // readv via the syscall-number-leak value).
-        let n = fb0_bridge_read_child_mem(area_pid, addr, &mut snapshot);
-        if n <= 0 || n == 310 || n == 270 {
-            // Fallback: PEEKDATA. read_child_bytes reads word-sized
-            // chunks and stops at the first unmapped address.
-            match read_child_bytes(area_pid, addr, snap_len) {
-                Some(b) => {
-                    if b.len() < snap_len {
-                        snapshot[..b.len()].copy_from_slice(&b);
-                        snapshot[b.len()..].fill(0);
-                    } else {
-                        snapshot.copy_from_slice(&b);
-                    }
-                }
-                None => {
-                    if *prop_area_log_count < log_cap {
-                        *prop_area_log_count += 1;
-                        fb0_log(&format!(
-                            "6-Z111: area update READ FAILED for pid={} @ {:#x} (process_vm_readv AND PEEKDATA both failed — mapping gone?) — dropping the registration (self-heal for munmap/execve staleness)",
-                            area_pid, addr
-                        ));
-                    }
-                    drop_pids.push((area_pid, addr));
-                    continue;
+        // ── 6-Z268: snapshot mirror ─────────────────────────────
+        // The old body read the FULL property area (up to 128 KiB)
+        // from the child for EVERY property set of EVERY tracked
+        // area — ~380 sets/boot × areas × 128 KiB of pvm reads plus
+        // a fresh zeroed Vec each time, all on the single tracer
+        // thread. The mirror keeps the last snapshot per (pid, addr)
+        // and validates it with ONE 4-byte area-serial read: the
+        // area serial changes on every successful write (ours or
+        // the guest's), so serial equality ⇒ our mirror is current.
+        // Any mismatch falls back to the full read exactly as
+        // before. Plans are computed from the mirror and every
+        // child-write below is mirrored locally, so plan inputs stay
+        // byte-identical to a fresh read while the pvm traffic drops
+        // from ~380×128 KiB to 1×128 KiB + 380×4 B per area.
+        let mut snapshot: Vec<u8> = Vec::new();
+        let mut mirror_hit = false;
+        if let Some((cached, cached_serial_off, cached_serial)) =
+            snapshot_cache.get(&(area_pid, addr))
+        {
+            if cached.len() == snap_len {
+                let mut b4 = [0u8; 4];
+                let n = fb0_bridge_read_child_mem(
+                    area_pid,
+                    addr.wrapping_add(*cached_serial_off as u64),
+                    &mut b4,
+                );
+                if n == 4 && u32::from_le_bytes(b4) == *cached_serial {
+                    snapshot = cached.clone();
+                    mirror_hit = true;
                 }
             }
-        } else {
-            for i in (n as usize)..snap_len {
-                snapshot[i] = 0;
+        }
+        if !mirror_hit {
+            snapshot = vec![0u8; snap_len];
+            // Primary: process_vm_readv via fb0_bridge_read_child_mem
+            // (it has the 6-Z84 TRAP guard that detects a seccomp-blocked
+            // readv via the syscall-number-leak value).
+            let n = fb0_bridge_read_child_mem(area_pid, addr, &mut snapshot);
+            if n <= 0 || n == 310 || n == 270 {
+                // Fallback: PEEKDATA. read_child_bytes reads word-sized
+                // chunks and stops at the first unmapped address.
+                match read_child_bytes(area_pid, addr, snap_len) {
+                    Some(b) => {
+                        if b.len() < snap_len {
+                            snapshot[..b.len()].copy_from_slice(&b);
+                            snapshot[b.len()..].fill(0);
+                        } else {
+                            snapshot.copy_from_slice(&b);
+                        }
+                    }
+                    None => {
+                        if *prop_area_log_count < log_cap {
+                            *prop_area_log_count += 1;
+                            fb0_log(&format!(
+                                "6-Z111: area update READ FAILED for pid={} @ {:#x} (process_vm_readv AND PEEKDATA both failed — mapping gone?) — dropping the registration (self-heal for munmap/execve staleness)",
+                                area_pid, addr
+                            ));
+                        }
+                        drop_pids.push((area_pid, addr));
+                        continue;
+                    }
+                }
+            } else {
+                for i in (n as usize)..snap_len {
+                    snapshot[i] = 0;
+                }
             }
         }
         match prop_area_plan_update(&snapshot, name, value) {
@@ -7665,6 +7854,31 @@ fn z111_apply_property_set(
                     &area_bytes,
                     vm_writev_usable,
                 );
+                // 6-Z268: mirror every child-write into the local copy so
+                // the next mirror-validated plan sees the same bytes a
+                // fresh read would.
+                if let Some(entry) = snapshot_cache.get_mut(&(area_pid, addr)) {
+                    let (cached, _, cached_serial) = entry;
+                    if cached.len() == snap_len {
+                        let dirty = (plan.old_serial | PROP_SERIAL_DIRTY_BIT).to_le_bytes();
+                        cached[plan.prop_info_off..plan.prop_info_off + 4].copy_from_slice(&dirty);
+                        let voff = plan.value_off;
+                        if voff + plan.value_bytes.len() <= cached.len() {
+                            cached[voff..voff + plan.value_bytes.len()]
+                                .copy_from_slice(&plan.value_bytes);
+                        }
+                        cached[plan.prop_info_off..plan.prop_info_off + 4]
+                            .copy_from_slice(&plan.new_serial.to_le_bytes());
+                        cached[plan.area_serial_off..plan.area_serial_off + 4]
+                            .copy_from_slice(&plan.new_area_serial.to_le_bytes());
+                        *cached_serial = plan.new_area_serial;
+                    }
+                } else {
+                    snapshot_cache.insert(
+                        (area_pid, addr),
+                        (snapshot.clone(), plan.area_serial_off, plan.new_area_serial),
+                    );
+                }
                 if *prop_area_log_count < log_cap {
                     *prop_area_log_count += 1;
                     let old_len = (plan.old_serial >> PROP_SERIAL_LEN_SHIFT) as usize;
@@ -7688,6 +7902,9 @@ fn z111_apply_property_set(
                 }
             }
             Ok(None) => {
+                // 6-Z268: the area did not yield a plan — don't keep its
+                // mirror (state may be re-initialized underneath us).
+                snapshot_cache.remove(&(area_pid, addr));
                 if *prop_area_log_count < log_cap {
                     *prop_area_log_count += 1;
                     let fmt = prop_area_detect_format(&snapshot);
@@ -7720,6 +7937,7 @@ fn z111_apply_property_set(
         }
     }
     for (drop_pid, drop_addr) in drop_pids {
+        snapshot_cache.remove(&(drop_pid, drop_addr));
         if let Some(entries) = prop_area_maps.get_mut(&drop_pid) {
             entries.retain(|&(a, _)| a != drop_addr);
         }
@@ -8749,6 +8967,14 @@ enum Reaped {
 /// budget while the pid still exists (Running).
 fn reap_child(pid: libc::pid_t) -> Reaped {
     let mut status: libc::c_int = 0;
+    // 6-Z268: split budgets. The full 128×1 ms window is only deserved
+    // while waitpid keeps returning the child (progress toward a
+    // death report). For `r == 0` — a live RUNNING tracee with nothing
+    // to report — every burned millisecond froze the WHOLE guest
+    // (single tracer thread) for a verdict the caller only needs
+    // eventually; 24 ms is ample for a dying child's final stop to
+    // surface and the caller re-enters its blocking waitpid anyway.
+    let mut no_report_rounds: u32 = 0;
     for _ in 0..128 {
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if r == pid {
@@ -8765,7 +8991,12 @@ fn reap_child(pid: libc::pid_t) -> Reaped {
         // r == 0 → the pid exists as our child but nothing to report
         // yet. For a presumed-dead child this is transient; for a
         // running tracee this is the window in which its next syscall
-        // stop may land. Sleep 1 ms and retry (bounded).
+        // stop may land. Sleep 1 ms and retry (bounded; running-tracee
+        // budget 24 rounds, see above).
+        no_report_rounds += 1;
+        if no_report_rounds >= 24 {
+            return Reaped::Running;
+        }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     Reaped::Running
@@ -8839,13 +9070,45 @@ fn fb0_bridge_read_child_mem(pid: libc::pid_t, addr: u64, buf: &mut [u8]) -> isi
     raw
 }
 
-/// The bridge thread body: every 100 ms, for every registered mapping,
+/// The bridge thread body: every tick, for every registered mapping,
 /// child-mem → fb0 file. Self-cleans dead mappings (readv ESRCH/EPERM).
+///
+/// 6-Z268 rewrite — the old body allocated a fresh 10 MB zeroed Vec,
+/// read the full framebuffer, and rewrote the whole host file EVERY
+/// 100 ms whether or not a single pixel changed (lavender fb0 ≈
+/// 1080×2340×4 ≈ 9.6 MiB → ~100 MB/s of memset+pvm_read+file_write
+/// competing with the single-threaded tracer during the entire
+/// splash→UI window; splash is largely static so nearly all of it was
+/// waste). Now:
+///   * one reusable buffer + last-written copy per mapping — zero
+///     per-tick allocations;
+///   * identical frames are NOT written (memcmp ≈ 1 ms for 10 MB) —
+///     the host blit loop's own dirty check then also goes quiet;
+///   * the host file fd is opened once and reused (open+close per
+///     tick removed);
+///   * adaptive tick: 33 ms while frames are flowing (animation),
+///     100 ms when idle, 250 ms after 5 s without a change — with
+///     delivery latency now bounded by change detection instead of a
+///     fixed 100 ms poll.
 fn fb0_bridge_thread() {
+    use std::collections::HashMap;
+    use std::io::Write;
     let mut tick: u64 = 0;
+    let mut idle_ticks: u64 = 0;
+    // pid → (read buffer, last-written copy, cached file handle)
+    type Fb0BridgeState = HashMap<libc::pid_t, (Vec<u8>, Vec<u8>, Option<std::fs::File>)>;
+    let mut state: Fb0BridgeState = HashMap::new();
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let sleep_ms: u64 = if idle_ticks < 20 {
+            33
+        } else if idle_ticks < 150 {
+            100
+        } else {
+            250
+        };
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         tick = tick.saturating_add(1);
+        idle_ticks = idle_ticks.saturating_add(1);
         let snapshot: Vec<Fb0Mapping> = match FB0_MAPPINGS.lock() {
             Ok(guard) => guard.clone(),
             Err(_) => continue,
@@ -8855,8 +9118,17 @@ fn fb0_bridge_thread() {
         }
         let mut dead: Vec<libc::pid_t> = Vec::new();
         for m in &snapshot {
-            let mut buf = vec![0u8; m.len];
-            let n = fb0_bridge_read_child_mem(m.pid, m.addr, &mut buf);
+            let entry = state
+                .entry(m.pid)
+                .or_insert_with(|| (vec![0u8; m.len], Vec::new(), None));
+            if entry.0.len() != m.len {
+                // Remap with a different size (reinit / double buffer).
+                entry.0.clear();
+                entry.0.resize(m.len, 0);
+                entry.1.clear();
+            }
+            let (buf, prev, file) = (&mut entry.0, &mut entry.1, &mut entry.2);
+            let n = fb0_bridge_read_child_mem(m.pid, m.addr, buf);
             if n <= 0 {
                 // ESRCH: child gone. EPERM/other: bridge can't serve this
                 // mapping — drop it either way (log on the first ticks).
@@ -8870,16 +9142,38 @@ fn fb0_bridge_thread() {
                 continue;
             }
             let got = n as usize;
-            match std::fs::OpenOptions::new().write(true).open(&m.host_file) {
-                Ok(mut f) => {
-                    if let Err(e) = std::io::Write::write_all(&mut f, &buf[..got]) {
+            // 6-Z268: skip identical frames entirely.
+            let changed = prev.len() != got || buf[..got] != prev[..];
+            if !changed {
+                continue;
+            }
+            idle_ticks = 0;
+            let opened_here;
+            let f: &mut std::fs::File = match file {
+                Some(f) => f,
+                None => match std::fs::OpenOptions::new().write(true).open(&m.host_file) {
+                    Ok(nf) => {
+                        opened_here = true;
+                        let _ = opened_here;
+                        file.get_or_insert(nf)
+                    }
+                    Err(e) => {
                         if tick <= 30 {
                             fb0_log(&format!(
-                                "6-Z73: fb0 bridge write FAILED to {}: {}",
+                                "6-Z73: fb0 bridge can't open {}: {} — dropping mapping",
                                 m.host_file, e
                             ));
+                            dead.push(m.pid);
                         }
-                    } else if tick == 1 || tick % 600 == 0 {
+                        continue;
+                    }
+                },
+            };
+            match f.write_all(&buf[..got]) {
+                Ok(()) => {
+                    prev.clear();
+                    prev.extend_from_slice(&buf[..got]);
+                    if tick == 1 || tick % 600 == 0 {
                         // First copy + once a minute: visibility without
                         // logcat flooding.
                         fb0_log(&format!(
@@ -8891,17 +9185,21 @@ fn fb0_bridge_thread() {
                 Err(e) => {
                     if tick <= 30 {
                         fb0_log(&format!(
-                            "6-Z73: fb0 bridge can't open {}: {} — dropping mapping",
+                            "6-Z73: fb0 bridge write FAILED to {}: {}",
                             m.host_file, e
                         ));
-                        dead.push(m.pid);
                     }
+                    // Stale handle — force a reopen next tick.
+                    *file = None;
                 }
             }
         }
         if !dead.is_empty() {
             if let Ok(mut guard) = FB0_MAPPINGS.lock() {
                 guard.retain(|m| !dead.contains(&m.pid));
+            }
+            for d in &dead {
+                state.remove(d);
             }
         }
     }
@@ -9029,6 +9327,61 @@ fn write_child_string_unchecked(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     }
     let mut new_bytes = s.as_bytes().to_vec();
     new_bytes.push(0); // NUL terminator
+                       // ── 6-Z268: process_vm_writev-FIRST fast path ────────────────────
+                       //
+                       // The POKEDATA loop below costs one ptrace syscall per 8 bytes — a
+                       // ~60-byte translated path costs 8 round-trips, and this function
+                       // runs for EVERY rewritten path syscall (openat/newfstatat/access/
+                       // readlink/execve — the hottest families of the whole boot, tens of
+                       // thousands of times). The read side got the pvm-first fix in
+                       // 6-Z267; the write side now gets the same treatment using the
+                       // proven 6-Z62 probe-and-condemn pattern (SIGSYS hit / ENOSYS /
+                       // EPERM / EACCES → permanently condemned, POKEDATA forever after;
+                       // EFAULT/short → address-specific, POKEDATA for this call only).
+                       //
+                       // Byte footprint is IDENTICAL to the POKEDATA loop: we pad the
+                       // payload to a full word with zeros exactly like the per-word loop
+                       // did (scratch layout and later reads both depend on that). A
+                       // short/EFAULT pvm write is followed by the full POKEDATA loop,
+                       // which is idempotent (rewrites the same bytes).
+    {
+        const PVM_WRITE_UNKNOWN: i8 = 0;
+        const PVM_WRITE_USABLE: i8 = 1;
+        const PVM_WRITE_CONDEMNED: i8 = -1;
+        static PVM_WRITE_STRING_STATE: std::sync::atomic::AtomicI8 =
+            std::sync::atomic::AtomicI8::new(PVM_WRITE_UNKNOWN);
+        let word_size = std::mem::size_of::<libc::c_long>();
+        while new_bytes.len() % word_size != 0 {
+            new_bytes.push(0);
+        }
+        let state = PVM_WRITE_STRING_STATE.load(std::sync::atomic::Ordering::Relaxed);
+        if state != PVM_WRITE_CONDEMNED {
+            let before = KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let n = process_vm_writev_chunk(pid, addr, &new_bytes);
+            let sigsys_fired = KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed) > before;
+            if sigsys_fired || n == libc::SYS_process_vm_writev as isize {
+                // SECCOMP_RET_TRAP — syscall never executed (rollback
+                // leaks the syscall number as the "return"). Condemn.
+                PVM_WRITE_STRING_STATE
+                    .store(PVM_WRITE_CONDEMNED, std::sync::atomic::Ordering::Relaxed);
+            } else if n < 0 {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if e == libc::ENOSYS || e == libc::EPERM || e == libc::EACCES {
+                    PVM_WRITE_STRING_STATE
+                        .store(PVM_WRITE_CONDEMNED, std::sync::atomic::Ordering::Relaxed);
+                }
+                // EFAULT / EINVAL / … — address-specific: fall through to
+                // POKEDATA for THIS call without condemning the mechanism.
+            } else if n as usize == new_bytes.len() {
+                if state == PVM_WRITE_UNKNOWN {
+                    PVM_WRITE_STRING_STATE
+                        .store(PVM_WRITE_USABLE, std::sync::atomic::Ordering::Relaxed);
+                }
+                return true;
+            }
+            // Short write → fall through to the POKEDATA loop (idempotent).
+        }
+    }
     let word_size = std::mem::size_of::<libc::c_long>();
     let mut offset = 0i64;
     while offset < new_bytes.len() as i64 {
@@ -9941,6 +10294,11 @@ fn write_translated_path(
     // Keep the caller's snapshot consistent too (for any later reads of
     // the arg in the same arm) — but the SETREGS above no longer uses it.
     set_syscall_arg(regs, path_arg_index, new_addr);
+    // 6-Z268: record the exact bytes we just wrote for the sandbox
+    // backstop — it re-verifies every path arg at the end of the ENTRY
+    // arm and can now consume this string instead of paying a second
+    // process_vm_readv of the child's memory.
+    stop_path_write_record(pid, new_addr, translated);
     // Advance the rotating cursor: round up the path length (including
     // the NUL terminator) to 8-byte alignment so the next path starts
     // on a clean word boundary. Wrap to 0 when fewer than 256 bytes
@@ -10609,6 +10967,12 @@ pub fn run_ptrace_loop(
         std::collections::HashSet::new();
     let mut prop_area_maps: std::collections::HashMap<libc::pid_t, Vec<(u64, usize)>> =
         std::collections::HashMap::new();
+    // 6-Z268: per-area snapshot mirrors for the 6-Z111 broadcaster —
+    // (snapshot bytes, area_serial_off, last known area serial).
+    let mut z111_snapshot_cache: std::collections::HashMap<
+        (libc::pid_t, u64),
+        (Vec<u8>, usize, u32),
+    > = std::collections::HashMap::new();
     let mut prop_area_log_count: u32 = 0;
     const PROP_AREA_LOG_CAP: u32 = 400;
     const PROP_AREA_MAPS_PER_PID_CAP: usize = 8;
@@ -10625,6 +10989,18 @@ pub fn run_ptrace_loop(
     // could be resolved NEITHER from open_fd_owner_paths NOR from the
     // /proc/<pid>/fd/<fd> readlink fallback (diagnostic only).
     let mut z198_unresolved_fstat: u32 = 0;
+    // 6-Z268: memoized census of {rootfs}/dev/__properties__ file inodes
+    // for the 6-Z199b fstat fallback. Previously EVERY successful plain
+    // fstat (nr=80 — a top-5 syscall; 5–15k per boot) whose fd path was
+    // not already a property file paid read_child_bytes + read_dir +
+    // lstat+stat per directory entry — 8–14 host syscalls of pure
+    // single-threaded waste per call. The census builds once on the
+    // first miss, hits are O(1) HashSet lookups, and the dir is
+    // re-walked at most once per 32 distinct misses (so property files
+    // created mid-boot are discovered within 32 fstats, not never).
+    let mut prop_inode_census: std::collections::HashSet<(u64, u64)> =
+        std::collections::HashSet::new();
+    let mut fstat_census_misses: u32 = 0;
     // 6-Z206: bounded counter for stat-family DIAG logs on critical boot
     // paths (/init, /system/bin/init, /sbin/recovery, linker candidates)
     // — keeps the log readable on TWRP init's stat-poll loops while
@@ -11150,6 +11526,13 @@ pub fn run_ptrace_loop(
     let mut so_elf_diag_count: u64 = 0;
     // 6-Z238: execve envp LD_* scan counter (first 24 execs with LD vars).
     let mut exec_env_diag_count: u64 = 0;
+    // 6-Z268: total execve envp scans. The old gate only bumped
+    // exec_env_diag_count when a scan was "interesting" (LD_ hits or a
+    // missing std var) — clean execs never bumped it, so up to 96
+    // pointer+string reads ran for EVERY execve of the boot until 24
+    // interesting ones (which may never exist) accumulated. The scan
+    // budget is now enforced by this unconditional per-exec counter.
+    let mut exec_env_scans: u64 = 0;
     // 6-Z237: bounded boot-window "intercepted open" extension counter
     // (loops 400-1000, first 80 non-property translated opens).
     let mut boot_window_open_count: u64 = 0;
@@ -12012,6 +12395,9 @@ pub fn run_ptrace_loop(
         // `init_pid` retains the original init PID for the exit-check
         // below ("is this init exiting, or a forked child?").
         let pid: libc::pid_t = current_pid;
+        // 6-Z268: the per-stop translated-path write cache is valid for
+        // exactly ONE stop — clear it now that a new stop has arrived.
+        stop_path_writes_clear();
 
         // Check if the child exited.
         if libc::WIFEXITED(status) {
@@ -12607,15 +12993,23 @@ pub fn run_ptrace_loop(
                         // the parent's mount() ENTRY syscall-stop (status 0x857f)
                         // → 6-Z210 classification never fired.
                         skip_next_resume = true;
-                        log(&format!(
-                            "6-Z211h+i FIX: post-PTRACE_EVENT_{} handler — reset in_syscall=false for parent pid={} current_pid={} (was true) tracked_pids={:?} — explicitly PTRACE_SYSCALL-resumed parent pid={} (ret={}) AND set skip_next_resume=true to prevent loop-top double-resume (which would trigger 6-Z89 ESRCH reap loop + drain the parent's mount() syscall-stop)",
-                            event_name,
-                            pid,
-                            current_pid,
-                            tracked_pids,
-                            parent_pid,
-                            resume_r,
-                        ));
+                        // 6-Z268: capped at 8 — this fires per fork/clone
+                        // EVENT and formatted the whole tracked_pids Vec
+                        // each time; thread storms made it a log-flood
+                        // source. The first 8 keep the correlation value.
+                        static Z211_EVENT_DIAG: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if Z211_EVENT_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                            log(&format!(
+                                "6-Z211h+i FIX: post-PTRACE_EVENT_{} handler — reset in_syscall=false for parent pid={} current_pid={} (was true) tracked_pids={:?} — explicitly PTRACE_SYSCALL-resumed parent pid={} (ret={}) AND set skip_next_resume=true to prevent loop-top double-resume (which would trigger 6-Z89 ESRCH reap loop + drain the parent's mount() syscall-stop)",
+                                event_name,
+                                pid,
+                                current_pid,
+                                tracked_pids,
+                                parent_pid,
+                                resume_r,
+                            ));
+                        }
                         continue;
                     }
                     ev if ev == libc::PTRACE_EVENT_EXIT as u32 => {
@@ -13232,6 +13626,12 @@ pub fn run_ptrace_loop(
                     regs
                 };
 
+                // 6-Z268: snapshot the register-write epoch right after
+                // the (possibly arm32-widened) register read. If no
+                // handler writes registers during this stop's ENTRY
+                // processing, the sandbox backstop can reuse this
+                // snapshot instead of taking a second GETREGSET.
+                let regs_epoch_at_fetch = SETREGS_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
                 let syscall_num = get_syscall_num(&regs, &abi);
 
                 // 6-Z210 DIAG (broad): fires for EVERY syscall-stop (capped
@@ -13281,7 +13681,17 @@ pub fn run_ptrace_loop(
                     //     pattern in one line (the ppoll-EFAULT storm
                     //     thread this log round identified would have
                     //     named itself on line one).
-                    let sampled = if n < 20000 {
+                    // 6-Z268: the pre-cap budget drops 20000 → 200. The
+                    // firehose was the #1 log-volume source of the boot
+                    // (6-Z210 measured the stderr chain as a visible share
+                    // of boot; the 6-Z267 log still carried ~117k lines) —
+                    // every line costs 2×format! + the whole tee chain, and
+                    // the RAW-stop ring above already covers stop
+                    // forensics for the anomaly windows. Shape statistics
+                    // and the 10/sec sampled stream past the cap are
+                    // unchanged (n >= 200 now arms them, earlier than
+                    // before — better long-run shape coverage).
+                    let sampled = if n < 200 {
                         false
                     } else {
                         type BroadDiagShapeMap =
@@ -13315,9 +13725,9 @@ pub fn run_ptrace_loop(
                             }
                         }
                     };
-                    if n < 20000 || sampled {
-                        let tag = if n < 20000 {
-                            format!("broad #{}/20000", n + 1)
+                    if n < 200 || sampled {
+                        let tag = if n < 200 {
+                            format!("broad #{}/200", n + 1)
                         } else {
                             format!("sampled #{} past cap", n + 1)
                         };
@@ -13328,7 +13738,7 @@ pub fn run_ptrace_loop(
                         // nr=80/62/63 fstat+lseek+read loop that we could
                         // not attribute to a file).
                         // 6-Z266: post-cap lines add comm + arg1 + arg2.
-                        let extra = if n < 20000 {
+                        let extra = if n < 200 {
                             String::new()
                         } else {
                             let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
@@ -13668,17 +14078,34 @@ pub fn run_ptrace_loop(
                         || syscall_num == 435;
                     let is_wait4 = syscall_num == abi.wait4_nr;
                     if is_fork_family {
-                        log(&format!(
-                            "DIAG fork-family ENTRY: nr={} (pid={}), loop_count={}, in_syscall_was={}",
-                            syscall_num, pid, loop_count, in_syscall
-                        ));
+                        // 6-Z268: capped at 200 — init's Service::Start
+                        // loop + ueventd/thermald respawns issue thousands
+                        // of fork/vfork/clone ENTRY stops per boot; each
+                        // was an unconditional format!+log line. The
+                        // first 200 keep the daemonize-window visibility.
+                        static FORK_ENTRY_DIAG: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if FORK_ENTRY_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200
+                        {
+                            log(&format!(
+                                "DIAG fork-family ENTRY: nr={} (pid={}), loop_count={}, in_syscall_was={}",
+                                syscall_num, pid, loop_count, in_syscall
+                            ));
+                        }
                     }
                     if is_wait4 {
-                        let wait_pid = get_syscall_arg(&regs, abi.reg_arg1) as i64;
-                        log(&format!(
-                            "DIAG wait4 ENTRY: nr={}, wait_pid={} (0=any, -1=any-block, >0=specific), loop_count={}",
-                            syscall_num, wait_pid, loop_count
-                        ));
+                        // 6-Z268: capped at 200 — init/recovery reap loops
+                        // hit wait4 thousands of times per boot.
+                        static WAIT4_ENTRY_DIAG: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if WAIT4_ENTRY_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200
+                        {
+                            let wait_pid = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            log(&format!(
+                                "DIAG wait4 ENTRY: nr={}, wait_pid={} (0=any, -1=any-block, >0=specific), loop_count={}",
+                                syscall_num, wait_pid, loop_count
+                            ));
+                        }
                     }
 
                     // Log every syscall number on entry for the first 50
@@ -13733,7 +14160,8 @@ pub fn run_ptrace_loop(
                             let exec_path = read_child_string(pid, path_addr_env)
                                 .unwrap_or_else(|| "<unreadable>".to_string());
                             let envp_addr = get_syscall_arg(&regs, abi.reg_arg3);
-                            if envp_addr != 0 && exec_env_diag_count <= 24 {
+                            if envp_addr != 0 && exec_env_diag_count <= 24 && exec_env_scans <= 24 {
+                                exec_env_scans += 1;
                                 let stride: u64 = if abi.execve == 11 { 4 } else { 8 };
                                 let mut ld_hits: Vec<String> = Vec::new();
                                 // 6-Z255: standard-Android-env presence scan —
@@ -16923,16 +17351,29 @@ pub fn run_ptrace_loop(
                             let fd = get_syscall_arg(&regs, abi.reg_arg5) as i32;
                             // Task 6-Z2: ALWAYS log mmap2 args so we can see
                             // what the early calls (that return -38 ENOSYS) are.
-                            log(&format!(
-                                "DIAG mmap2 ENTRY: nr={} flags=0x{:x} (MAP_SHARED={},MAP_PRIVATE={},MAP_ANONYMOUS={}) fd={} prop_fd={:?}",
-                                syscall_num,
-                                flags,
-                                (flags & libc::MAP_SHARED) != 0,
-                                (flags & libc::MAP_PRIVATE) != 0,
-                                (flags & libc::MAP_ANONYMOUS) != 0,
-                                fd,
-                                properties_fd
-                            ));
+                            // 6-Z268: rate-capped at 40 — this was UN-gated and
+                            // fired for every linker/scudo/fb mapping of every
+                            // ABI (10–25k lines/boot); the first 40 keep the
+                            // early-call visibility the log was built for.
+                            {
+                                static MMAP_ENTRY_DIAG: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if MMAP_ENTRY_DIAG
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    < 40
+                                {
+                                    log(&format!(
+                                        "DIAG mmap2 ENTRY: nr={} flags=0x{:x} (MAP_SHARED={},MAP_PRIVATE={},MAP_ANONYMOUS={}) fd={} prop_fd={:?}",
+                                        syscall_num,
+                                        flags,
+                                        (flags & libc::MAP_SHARED) != 0,
+                                        (flags & libc::MAP_PRIVATE) != 0,
+                                        (flags & libc::MAP_ANONYMOUS) != 0,
+                                        fd,
+                                        properties_fd
+                                    ));
+                                }
+                            }
                             // Task 6-Z2: rewrite ALL file-backed mmap2 (both
                             // MAP_SHARED AND MAP_PRIVATE) to MAP_ANONYMOUS.
                             // The zygote's seccomp blocks ALL file-backed mmap2
@@ -17057,6 +17498,9 @@ pub fn run_ptrace_loop(
                         // unlink: path in arg1. unlinkat: dirfd in arg1, path in
                         // arg2 (like openat).
                         n if n == abi.unlink || n == abi.unlinkat => {
+                            // 6-Z268: guest file removal — drop memoized
+                            // canonical resolutions (see mkdir arm).
+                            sandbox.invalidate_resolve_cache();
                             let path_arg_index = if syscall_num == abi.unlink {
                                 abi.reg_arg1
                             } else {
@@ -17248,6 +17692,10 @@ pub fn run_ptrace_loop(
                         n if (abi.mkdir != -1 && n == abi.mkdir)
                             || (abi.mkdirat != -1 && n == abi.mkdirat) =>
                         {
+                            // 6-Z268: a guest directory creation changes the
+                            // deepest-existing-ancestor topology — drop the
+                            // memoized canonical resolutions.
+                            sandbox.invalidate_resolve_cache();
                             // mkdir → path in arg1; mkdirat → dirfd in
                             // arg1, path in arg2 (like openat).
                             let (name, path_arg_index) = if abi.mkdirat != -1 && n == abi.mkdirat {
@@ -17485,19 +17933,34 @@ pub fn run_ptrace_loop(
                         n if n == abi.setxattr || n == abi.lsetxattr || n == abi.fsetxattr => {
                             pending_xattr_fake_pid = Some(pid); // 6-Z83: per-pid
                             set_syscall_num(&mut regs, &abi, abi.getpid);
+                            // 6-Z268: capped at 40 — restorecon labels
+                            // hundreds–thousands of files and each SET paid
+                            // this format!+log on the hot path.
+                            static XATTR_ENTRY_DIAG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let xdiag =
+                                XATTR_ENTRY_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             match ptrace_setregs(pid, &regs, iov_len) {
-                                Ok(()) => log(&format!(
-                                    "DIAG xattr ENTRY: {} nr={} → rewritten to getpid nr={} (kernel will execute getpid; EXIT will fake return 0) — avoids kernel EPERM/EACCES/EOPNOTSUPP for security.* xattr SET as untrusted_app",
-                                    syscall_name(syscall_num, &abi),
-                                    syscall_num,
-                                    abi.getpid
-                                )),
-                                Err(e) => log(&format!(
-                                    "DIAG xattr ENTRY REWRITE FAILED: {} nr={} → getpid: ptrace_setregs: {} — kernel will execute the xattr syscall (EXIT will still fake return 0 via pending_xattr_fake)",
-                                    syscall_name(syscall_num, &abi),
-                                    syscall_num,
-                                    e
-                                )),
+                                Ok(()) => {
+                                    if xdiag < 40 {
+                                        log(&format!(
+                                            "DIAG xattr ENTRY: {} nr={} → rewritten to getpid nr={} (kernel will execute getpid; EXIT will fake return 0) — avoids kernel EPERM/EACCES/EOPNOTSUPP for security.* xattr SET as untrusted_app",
+                                            syscall_name(syscall_num, &abi),
+                                            syscall_num,
+                                            abi.getpid
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    if xdiag < 40 {
+                                        log(&format!(
+                                            "DIAG xattr ENTRY REWRITE FAILED: {} nr={} → getpid: ptrace_setregs: {} — kernel will execute the xattr syscall (EXIT will still fake return 0 via pending_xattr_fake)",
+                                            syscall_name(syscall_num, &abi),
+                                            syscall_num,
+                                            e
+                                        ));
+                                    }
+                                }
                             }
                         }
                         // ── 6-Z257/6-Z258: fchmodat/fchownat ENTRY ──
@@ -17998,6 +18461,9 @@ pub fn run_ptrace_loop(
                             &mut pending_sandbox_deny,
                             execve_rewrite_claim.as_ref(),
                             &log,
+                            &regs,
+                            regs_epoch_at_fetch,
+                            iov_len,
                         );
                         if pending_sandbox_deny.len() > deny_before {
                             sandbox_deny_count += 1;
@@ -18094,11 +18560,17 @@ pub fn run_ptrace_loop(
                         || syscall_num == abi.vfork_nr
                         || syscall_num == 435
                     {
-                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        log(&format!(
-                            "DIAG fork-family EXIT: nr={} returned {} (0=child, >0=parent's-child-pid, <0=error)",
-                            syscall_num, ret
-                        ));
+                        // 6-Z268: capped at 200 (was UN-gated; every
+                        // fork-family EXIT of every service start logged).
+                        static FORK_EXIT_DIAG: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if FORK_EXIT_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                            let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            log(&format!(
+                                "DIAG fork-family EXIT: nr={} returned {} (0=child, >0=parent's-child-pid, <0=error)",
+                                syscall_num, ret
+                            ));
+                        }
                     }
 
                     // ── DIAGNOSTIC (6-U): KLOG fd tracking + write() ──
@@ -18972,33 +19444,58 @@ pub fn run_ptrace_loop(
                                             let stat_ino = u64::from_ne_bytes(
                                                 bytes[8..16].try_into().unwrap_or([0u8; 8]),
                                             );
-                                            if let Ok(prop_dir) = std::path::Path::new(rootfs)
-                                                .join("dev/__properties__")
-                                                .read_dir()
-                                            {
-                                                for entry in prop_dir.flatten() {
-                                                    if !entry.path().is_file() {
-                                                        continue;
-                                                    }
-                                                    if let Ok(md) = std::fs::metadata(entry.path())
+                                            // 6-Z268: memoized census (see the
+                                            // declaration at loop top). The
+                                            // 6-Z199b semantics are preserved:
+                                            // the same (st_dev, st_ino) match,
+                                            // the same resolved_path fill-in —
+                                            // but the directory walk now runs
+                                            // once per 32 distinct misses
+                                            // instead of once per fstat.
+                                            if !prop_inode_census.contains(&(stat_dev, stat_ino)) {
+                                                fstat_census_misses += 1;
+                                                if fstat_census_misses >= 32
+                                                    || prop_inode_census.is_empty()
+                                                {
+                                                    fstat_census_misses = 0;
+                                                    if let Ok(prop_dir) =
+                                                        std::path::Path::new(rootfs)
+                                                            .join("dev/__properties__")
+                                                            .read_dir()
                                                     {
-                                                        use std::os::unix::fs::MetadataExt;
-                                                        if md.dev() == stat_dev
-                                                            && md.ino() == stat_ino
-                                                        {
-                                                            resolved_is_property_file = true;
-                                                            if resolved_path.is_none() {
-                                                                resolved_path = Some(
-                                                                    entry
-                                                                        .path()
-                                                                        .to_string_lossy()
-                                                                        .into_owned(),
-                                                                );
+                                                        for entry in prop_dir.flatten() {
+                                                            if !entry.path().is_file() {
+                                                                continue;
                                                             }
-                                                            break;
+                                                            if let Ok(md) =
+                                                                std::fs::metadata(entry.path())
+                                                            {
+                                                                use std::os::unix::fs::MetadataExt;
+                                                                prop_inode_census
+                                                                    .insert((md.dev(), md.ino()));
+                                                                if md.dev() == stat_dev
+                                                                    && md.ino() == stat_ino
+                                                                {
+                                                                    resolved_is_property_file =
+                                                                        true;
+                                                                    if resolved_path.is_none() {
+                                                                        resolved_path = Some(
+                                                                            entry
+                                                                                .path()
+                                                                                .to_string_lossy()
+                                                                                .into_owned(),
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
+                                            } else {
+                                                // Census hit WITHOUT the walk —
+                                                // the fd stats a known property
+                                                // metadata file.
+                                                resolved_is_property_file = true;
                                             }
                                         }
                                     }
@@ -19651,58 +20148,69 @@ pub fn run_ptrace_loop(
                         && abi.writev_nr != -1
                         && syscall_num == abi.writev_nr
                     {
-                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        if ret > 0 && ret <= 512 {
-                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
-                            let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
-                            let iovcnt = get_syscall_arg(&regs, abi.reg_arg3) as i64;
-                            if iovcnt >= 1 {
-                                // 6-Z160: iovec layout by ABI. i386: 4-byte
-                                // iov_base + 4-byte iov_len (8 bytes total).
-                                // aarch64/x86_64: 8-byte iov_base + 8-byte
-                                // iov_len (16 bytes total). The old i386-only
-                                // decode read the HIGH half of the 64-bit
-                                // iov_base as iov_len (usually 0) → every
-                                // arm64 writev capture silently vanished —
-                                // including recovery's fatal log lines right
-                                // before its exit(1) (run 32981635332:
-                                // socket→fcntl→connect→writev→close→exit).
-                                let iov0_base_addr: Option<u64>;
-                                let iov0_len: Option<u64>;
-                                if abi.execve == 221 || abi.execve == 59 {
-                                    // 64-bit ABIs (aarch64 / x86_64)
-                                    iov0_base_addr = read_child_u64(pid, iov_ptr);
-                                    iov0_len = read_child_u64(pid, iov_ptr.wrapping_add(8));
-                                } else {
-                                    // i386
-                                    iov0_base_addr = read_child_u32(pid, iov_ptr).map(|v| v as u64);
-                                    iov0_len = read_child_u32(pid, iov_ptr.wrapping_add(4))
-                                        .map(|v| v as u64);
-                                }
-                                if let (Some(base), Some(len)) = (iov0_base_addr, iov0_len) {
-                                    let to_read = std::cmp::min(
-                                        std::cmp::min(len as usize, ret as usize),
-                                        128,
-                                    );
-                                    if to_read > 0 {
-                                        let captured = read_child_bytes(pid, base, to_read);
-                                        if let Some(bytes) = captured {
-                                            let captured_str = String::from_utf8_lossy(&bytes);
-                                            log(&format!(
+                        // 6-Z268: capture budget 800 — symmetric with the
+                        // write/read captures' caps. This was UNBOUNDED and
+                        // (unlike them) fired for the whole boot in
+                        // boot_recovery mode: every klog/init writev paid
+                        // 4–6 guest-memory reads + 2 format!+log lines.
+                        static WRITEV_CAPTURE: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if WRITEV_CAPTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 800 {
+                            let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            if ret > 0 && ret <= 512 {
+                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                let iovcnt = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                                if iovcnt >= 1 {
+                                    // 6-Z160: iovec layout by ABI. i386: 4-byte
+                                    // iov_base + 4-byte iov_len (8 bytes total).
+                                    // aarch64/x86_64: 8-byte iov_base + 8-byte
+                                    // iov_len (16 bytes total). The old i386-only
+                                    // decode read the HIGH half of the 64-bit
+                                    // iov_base as iov_len (usually 0) → every
+                                    // arm64 writev capture silently vanished —
+                                    // including recovery's fatal log lines right
+                                    // before its exit(1) (run 32981635332:
+                                    // socket→fcntl→connect→writev→close→exit).
+                                    let iov0_base_addr: Option<u64>;
+                                    let iov0_len: Option<u64>;
+                                    if abi.execve == 221 || abi.execve == 59 {
+                                        // 64-bit ABIs (aarch64 / x86_64)
+                                        iov0_base_addr = read_child_u64(pid, iov_ptr);
+                                        iov0_len = read_child_u64(pid, iov_ptr.wrapping_add(8));
+                                    } else {
+                                        // i386
+                                        iov0_base_addr =
+                                            read_child_u32(pid, iov_ptr).map(|v| v as u64);
+                                        iov0_len = read_child_u32(pid, iov_ptr.wrapping_add(4))
+                                            .map(|v| v as u64);
+                                    }
+                                    if let (Some(base), Some(len)) = (iov0_base_addr, iov0_len) {
+                                        let to_read = std::cmp::min(
+                                            std::cmp::min(len as usize, ret as usize),
+                                            128,
+                                        );
+                                        if to_read > 0 {
+                                            let captured = read_child_bytes(pid, base, to_read);
+                                            if let Some(bytes) = captured {
+                                                let captured_str = String::from_utf8_lossy(&bytes);
+                                                log(&format!(
                                                 "6-Z110-TWRP-GATE-DIAG-WRITEV: writev(fd={}, iovcnt={}, ret={}): {:?}",
                                                 fd, iovcnt, ret, captured_str
                                             ));
+                                            }
                                         }
-                                    }
-                                    // 6-Z160a: ALSO capture iov[1] — kmsg-style
-                                    // writes are 2-iov (prefix "<N>tag: " in
-                                    // iov0, the message text in iov1). Without
-                                    // this the arm64 captures only ever showed
-                                    // the prefix (run 32983006496: every line
-                                    // read "<5>init: " with the payload lost).
-                                    if iovcnt >= 2 {
-                                        let (b1, l1): (Option<u64>, Option<u64>) =
-                                            if abi.execve == 221 || abi.execve == 59 {
+                                        // 6-Z160a: ALSO capture iov[1] — kmsg-style
+                                        // writes are 2-iov (prefix "<N>tag: " in
+                                        // iov0, the message text in iov1). Without
+                                        // this the arm64 captures only ever showed
+                                        // the prefix (run 32983006496: every line
+                                        // read "<5>init: " with the payload lost).
+                                        if iovcnt >= 2 {
+                                            let (b1, l1): (Option<u64>, Option<u64>) = if abi.execve
+                                                == 221
+                                                || abi.execve == 59
+                                            {
                                                 (
                                                     read_child_u64(pid, iov_ptr.wrapping_add(16)),
                                                     read_child_u64(pid, iov_ptr.wrapping_add(24)),
@@ -19715,21 +20223,22 @@ pub fn run_ptrace_loop(
                                                         .map(|v| v as u64),
                                                 )
                                             };
-                                        if let (Some(base1), Some(len1)) = (b1, l1) {
-                                            let to_read1 = std::cmp::min(
-                                                std::cmp::min(len1 as usize, ret as usize),
-                                                256,
-                                            );
-                                            if to_read1 > 0 {
-                                                if let Some(bytes1) =
-                                                    read_child_bytes(pid, base1, to_read1)
-                                                {
-                                                    let s1 = String::from_utf8_lossy(&bytes1);
-                                                    let s1 = crate::cap_log_line(&s1, 2048);
-                                                    log(&format!(
+                                            if let (Some(base1), Some(len1)) = (b1, l1) {
+                                                let to_read1 = std::cmp::min(
+                                                    std::cmp::min(len1 as usize, ret as usize),
+                                                    256,
+                                                );
+                                                if to_read1 > 0 {
+                                                    if let Some(bytes1) =
+                                                        read_child_bytes(pid, base1, to_read1)
+                                                    {
+                                                        let s1 = String::from_utf8_lossy(&bytes1);
+                                                        let s1 = crate::cap_log_line(&s1, 2048);
+                                                        log(&format!(
                                                         "6-Z160-WRITEV-IOV1: writev(fd={}, ret={}): {:?}",
                                                         fd, ret, s1
                                                     ));
+                                                    }
                                                 }
                                             }
                                         }
@@ -21062,6 +21571,13 @@ pub fn run_ptrace_loop(
                         || syscall_num == abi.fgetxattr_nr
                     {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        // 6-Z268: log-budget for the 6-Z156 fake — one
+                        // static counter shared by the three log sites
+                        // below. restorecon labels thousands of rootfs
+                        // files and each successful fake logged a full
+                        // format! line; the first 40 keep the evidence.
+                        static Z156_LOG: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
                         if let Ok(len2) = ptrace_getregs_wide(pid, &mut regs2) {
                             let fresh_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
                             if fresh_ret == -61 || fresh_ret == -1 {
@@ -21075,12 +21591,17 @@ pub fn run_ptrace_loop(
                                             // size probe → required length
                                             set_syscall_ret(&mut regs2, &abi, LABEL.len() as i64);
                                             let _ = ptrace_setregs(pid, &regs2, len2);
-                                            log(&format!(
+                                            if Z156_LOG
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                                < 40
+                                            {
+                                                log(&format!(
                                                 "6-Z156: {}(\"security.selinux\") size probe returned {} — faked {} (sandbox label length; file has no real xattr)",
                                                 syscall_name(syscall_num, &abi),
                                                 fresh_ret,
                                                 LABEL.len()
                                             ));
+                                            }
                                         } else if value_addr != 0 {
                                             let mut buf = LABEL.to_vec();
                                             buf.push(0);
@@ -21097,7 +21618,12 @@ pub fn run_ptrace_loop(
                                                     LABEL.len() as i64,
                                                 );
                                                 let _ = ptrace_setregs(pid, &regs2, len2);
-                                                log(&format!(
+                                                if Z156_LOG.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                ) < 40
+                                                {
+                                                    log(&format!(
                                                     "6-Z156: {}(\"security.selinux\") returned {} — faked label \"{}\" ({} bytes via {}) + ret {} (real kernel: no xattr on app-data rootfs — ENODATA is fatal for the old omni libselinux restorecon)",
                                                     syscall_name(syscall_num, &abi),
                                                     fresh_ret,
@@ -21106,6 +21632,7 @@ pub fn run_ptrace_loop(
                                                     how,
                                                     LABEL.len()
                                                 ));
+                                                }
                                             } else {
                                                 log(&format!(
                                                     "6-Z156: FAILED to inject label buffer ({} of {} bytes via {}) — leaving kernel return {}",
@@ -21420,13 +21947,28 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                                 if let Some(fake_val) = _forced_ret {
-                                    set_syscall_ret(&mut regs2, &abi, fake_val);
+                                    // 6-Z268: identity-write elision — when the
+                                    // fake is 0 AND the kernel already returned
+                                    // 0, the SETREGS is a semantic no-op
+                                    // (writing 0 over 0; the 6-Z145 errno-leak
+                                    // concern only covers fresh_ret < 0).
+                                    // Skipping the register round-trip removes
+                                    // 2 ptrace calls per successful fake in the
+                                    // chmod/chown/xattr/mknod families that
+                                    // succeed natively on rootfs-owned files.
+                                    let identity_zero = fake_val == 0 && fresh_ret == 0;
+                                    if !identity_zero {
+                                        set_syscall_ret(&mut regs2, &abi, fake_val);
+                                    }
                                 }
-                                let setregs_result = if _forced_ret.is_some() {
-                                    ptrace_setregs(pid, &regs2, len)
-                                } else {
-                                    Ok(()) // nothing to write — preserve
-                                };
+                                let identity_write_skipped =
+                                    _forced_ret == Some(0) && fresh_ret == 0;
+                                let setregs_result =
+                                    if _forced_ret.is_some() && !identity_write_skipped {
+                                        ptrace_setregs(pid, &regs2, len)
+                                    } else {
+                                        Ok(()) // nothing to write — preserve
+                                    };
                                 if let Err(e) = setregs_result {
                                     // 5-J diagnostic: surface silent setregs failures
                                     // (previously discarded with `let _ =` — a
@@ -21467,7 +22009,7 @@ pub fn run_ptrace_loop(
                                     || syscall_num == abi.lsetxattr
                                     || syscall_num == abi.fsetxattr
                                 {
-                                    if _forced_ret.is_some() {
+                                    if _forced_ret.is_some() && !identity_write_skipped {
                                         let mut readback: Regs = unsafe { std::mem::zeroed() };
                                         if ptrace_getregs_wide(pid, &mut readback).is_ok() {
                                             let readback_rax =
@@ -22001,6 +22543,7 @@ pub fn run_ptrace_loop(
                                                     &mut vm_writev_usable,
                                                     &mut prop_area_log_count,
                                                     PROP_AREA_LOG_CAP,
+                                                    &mut z111_snapshot_cache,
                                                 );
                                             }
                                         }
@@ -22320,6 +22863,7 @@ pub fn run_ptrace_loop(
                                                     &mut vm_writev_usable,
                                                     &mut prop_area_log_count,
                                                     PROP_AREA_LOG_CAP,
+                                                    &mut z111_snapshot_cache,
                                                 );
                                             }
                                         }

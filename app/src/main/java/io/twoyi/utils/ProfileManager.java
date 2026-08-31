@@ -431,6 +431,17 @@ public class ProfileManager {
                 profileRootfsDir.mkdirs();
             }
 
+            // 6-Z268: skip-if-unchanged — the old delete-then-recreate ran
+            // on EVERY process start (attachBaseContext), including a crash
+            // window between the two calls that presented as
+            // "No ROM Installed" (romExist() stats <dataDir>/rootfs/init)
+            // and blocked boot on the user. When the symlink already
+            // points at the active profile there is nothing to do.
+            if (Files.isSymbolicLink(rootfsSymlink)
+                    && profileRootfsDir.toPath().equals(Files.readSymbolicLink(rootfsSymlink))) {
+                return true;
+            }
+
             // Remove existing symlink or directory
             Files.deleteIfExists(rootfsSymlink);
 
