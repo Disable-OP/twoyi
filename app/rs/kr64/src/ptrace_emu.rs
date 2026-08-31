@@ -10813,6 +10813,18 @@ pub fn run_ptrace_loop(
     // map saves/restores `in_syscall` per child PID on each waitpid switch.
     let mut in_syscall_map: std::collections::HashMap<libc::pid_t, bool> =
         std::collections::HashMap::new();
+    // 6-Z271d: per-pid last-stop timestamps + stall-log budgets. A tracee
+    // blocked IN-KERNEL (ppoll/futex/read on a socket nobody writes) gets
+    // exactly ONE ENTRY stop and then silence — invisible to every
+    // shape-sampled DIAG. The OrangeFox R12 run 33428365193 showed the
+    // recovery main thread blocked ~18 s with zero stops and zero binder
+    // traffic; this detector names the blocked syscall + wchan.
+    let mut last_stop_at: std::collections::HashMap<libc::pid_t, std::time::Instant> =
+        std::collections::HashMap::new();
+    let mut stall_log_budget: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    // 6-Z271d: throttle for the stall scan (every 256th stop).
+    let mut stall_tick: u64 = 0;
     // 6-Z184 AUDIT FIX (agent 12): this used to be a single global bool —
     // armed by child A's getpid ENTRY, then consumed by the NEXT EXIT stop
     // of ANY child (no pid check), so an interleaved child B got its real
@@ -12471,6 +12483,8 @@ pub fn run_ptrace_loop(
             }
         }
         current_pid = waited;
+        // 6-Z271d: record liveness for the stall detector.
+        last_stop_at.insert(waited, std::time::Instant::now());
         // Shadow the function-parameter `pid` (init's PID) with
         // `current_pid` for the rest of this iteration. All the handler
         // code below — ptrace_getregs(pid, …), read_child_string(pid, …),
@@ -12483,6 +12497,49 @@ pub fn run_ptrace_loop(
         // 6-Z268: the per-stop translated-path write cache is valid for
         // exactly ONE stop — clear it now that a new stop has arrived.
         stop_path_writes_clear();
+
+        // ── 6-Z271d: blocked-in-kernel stall detector ──
+        // Every 256th stop, scan the per-pid liveness map: a tracee whose
+        // LAST stop is >5 s old and whose state is in_syscall=true is
+        // blocked in-kernel (ppoll/futex/read/...) — exactly the class
+        // that shape-sampled DIAGs can never see (a shape that occurs
+        // once never reaches its sampling threshold). Log nr + wchan +
+        // state, at most 4 lines per pid per boot.
+        stall_tick = stall_tick.wrapping_add(1);
+        if stall_tick % 256 == 0 {
+            let now = std::time::Instant::now();
+            let mut stall_pids: Vec<(libc::pid_t, std::time::Duration)> = last_stop_at
+                .iter()
+                .filter(|(p, t)| {
+                    now.duration_since(**t) > std::time::Duration::from_secs(5)
+                        && in_syscall_map.get(*p).copied().unwrap_or(false)
+                        && stall_log_budget.get(p).copied().unwrap_or(0) < 4
+                })
+                .map(|(p, t)| (*p, now.duration_since(*t)))
+                .collect();
+            stall_pids.sort_by_key(|(p, _)| *p);
+            for (sp, elapsed) in stall_pids {
+                let budget = stall_log_budget.entry(sp).or_insert(0);
+                *budget += 1;
+                let wchan = std::fs::read_to_string(format!("/proc/{}/wchan", sp))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                let comm = std::fs::read_to_string(format!("/proc/{}/comm", sp))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                log(&format!(
+                    "6-Z271d STALL: pid={} comm={} in_syscall=true for {:.1}s — blocked in-kernel (wchan={}) — nr at last ENTRY stop: {}",
+                    sp,
+                    comm,
+                    elapsed.as_secs_f32(),
+                    wchan,
+                    pending_entry_fd
+                        .get(&sp)
+                        .map(|(nr, _)| *nr)
+                        .unwrap_or(-1)
+                ));
+            }
+        }
 
         // Check if the child exited.
         if libc::WIFEXITED(status) {
