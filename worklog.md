@@ -22593,3 +22593,41 @@ Stage Summary:
   contributor and is the follow-up optimization target; then the
   PTRACE_SYSEMU stop-model investigation (highest ceiling, highest
   risk — needs its own round).
+
+---
+Task ID: 6-Z267 dispatch record
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: record the 6-Z267 verification-wave CI run IDs (HEAD 7a78a56).
+
+Work Log:
+- Pushed 7a78a56 to origin/main (build fix + 6-Z267 optimization
+  wave). The kr64-tests workflow on this head completed GREEN:
+  run 33371466624 (fmt / clippy -D warnings / 676 tests).
+- Dispatched verification wave (workflow ui-e2e-test-arm64,
+  ref main = 7a78a56, boot_wait_seconds=60; run IDs assigned in
+  dispatch order, timestamps confirm the mapping):
+  * run 33371788724 (08:12:12Z) — orangefox-R12.0-lavender (the
+    user's exact image, md5-verified)
+  * run 33371790961 (08:12:14Z) — twrp-3.7.0_9-0-daisy (guard,
+    dl.twrp.me + referer input)
+  * run 33371793007 (08:12:15Z) — twrp-3.7.0_9-0-whyred (guard,
+    dl.twrp.me + referer input, md5-verified)
+- ACCEPTANCE for the optimization wave (compare against the 38de405
+  6-Z260 timeline baseline):
+  * the build succeeds on arm64 (the 6-Z267 E0425 fix) — the primary
+    gate;
+  * lavender boots to UI with the 6-Z266 storm fix intact: "6-Z266
+    FIX:" translation lines present, no 6-Z210 broad-DIAG flood;
+  * boot-to-first-UI on CI drops measurably vs the 38de405 baseline
+    (the per-stop layers removed: ~8-32 PEEKs -> 1 pvm read per path
+    syscall x2 reads, 2 ring format!s + tracked_pids Debug per
+    iteration, per-line stderr writes, eager cwd readlink, staging
+    canonicalize per path syscall, Vec slot table, LTO-off codegen);
+  * daisy/whyred guards stay UI_READY (no regression from the pvm
+    string-read flip — the 6-Z167/6-Z187 blind-tracee fallback chain
+    is preserved verbatim, so any seccomp/hardware corner degrades to
+    the old behavior, never to a worse one).
+- CI monitored async per protocol; local work continues (loader-phase
+  I/O optimization is the next perf target, then the PTRACE_SYSEMU
+  stop-model investigation).
