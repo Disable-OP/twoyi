@@ -104,3 +104,10 @@ pub fn notify_vibrate(timeout_ms: i32) {
 pub fn notify_vibrator_off() {
     let _ = send_to_app_sock("TWOYI_VIBRATE_OFF");
 }
+
+/// Forward a guest torch-LED write to the host app → the real camera
+/// flash via `CameraManager.setTorchMode`. `on=false` turns it off.
+pub fn notify_torch(on: bool) {
+    let msg = if on { "TWOYI_TORCH:1" } else { "TWOYI_TORCH:0" };
+    let _ = send_to_app_sock(msg);
+}

@@ -53,6 +53,9 @@ pub const LEDS_BACKLIGHT_DIR_REL: &str = "sys/class/leds/lcd-backlight";
 /// Where the panel backlight lives, relative to the rootfs (TWRP's
 /// `/sys/class/backlight` Find_File scan).
 pub const BACKLIGHT_DIR_REL: &str = "sys/class/backlight/panel";
+/// 6-Z271: where the torch LED lives, relative to the rootfs. Writes of a
+/// non-zero brightness are forwarded to the host app (real camera flash).
+pub const TORCH_DIR_REL: &str = "sys/class/leds/torch_0";
 
 /// Default maximum brightness (a common panel value).
 pub const DEFAULT_MAX_BRIGHTNESS: u32 = 255;
@@ -74,6 +77,7 @@ pub struct HapticsDevice {
     timed_output_dir: PathBuf,
     leds_vibrator_dir: PathBuf,
     backlight_dirs: Vec<PathBuf>,
+    torch_dir: PathBuf,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -84,12 +88,14 @@ impl HapticsDevice {
         let leds_vibrator_dir = Path::new(rootfs).join(LEDS_VIBRATOR_DIR_REL);
         let leds_backlight_dir = Path::new(rootfs).join(LEDS_BACKLIGHT_DIR_REL);
         let panel_backlight_dir = Path::new(rootfs).join(BACKLIGHT_DIR_REL);
+        let torch_dir = Path::new(rootfs).join(TORCH_DIR_REL);
 
         for d in [
             &timed_output_dir,
             &leds_vibrator_dir,
             &leds_backlight_dir,
             &panel_backlight_dir,
+            &torch_dir,
         ] {
             fs::create_dir_all(d)?;
             let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o755));
@@ -131,6 +137,11 @@ impl HapticsDevice {
         )?;
         write_file(&panel_backlight_dir, "bl_power", "0")?;
 
+        // 6-Z271: torch LED (the canonical `torch_0` name recoveries
+        // probe). brightness 0/1; writes are forwarded to the host app.
+        write_file(&torch_dir, "brightness", "0")?;
+        write_file(&torch_dir, "max_brightness", "1")?;
+
         info!(
             "[KR64][haptics] materialised vibrator (timed_output + leds) \
              and backlight (lcd-backlight + panel) sysfs under {}",
@@ -141,6 +152,7 @@ impl HapticsDevice {
             timed_output_dir,
             leds_vibrator_dir,
             backlight_dirs: vec![leds_backlight_dir, panel_backlight_dir],
+            torch_dir,
             shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -148,22 +160,38 @@ impl HapticsDevice {
     /// Start the one-shot drain thread: a non-zero `enable`/`activate`
     /// value schedules a reset to 0 after that many milliseconds, which
     /// is what a real timed_output/vibrator does after the timeout.
+    ///
+    /// 6-Z271: vibrator triggers and torch brightness writes are ALSO
+    /// forwarded to the host app (real vibration / real camera flash) —
+    /// the virtual sysfs keeps its full ABI role, but the effect is now
+    /// host-backed instead of fake.
     pub fn spawn(self) -> io::Result<HapticsDeviceHandle> {
         let shutdown = self.shutdown.clone();
         let timed_dir = self.timed_output_dir.clone();
         let leds_dir = self.leds_vibrator_dir.clone();
+        let torch_dir = self.torch_dir.clone();
         let _backlights = self.backlight_dirs.clone();
 
         let join = thread::Builder::new()
             .name("kr64-haptics".into())
             .spawn(move || {
+                let mut torch_on = false;
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
-                    // Read enable/duration; emulate the one-shot.
-                    let _ = drain_one_shot(&timed_dir, "enable");
-                    let _ = drain_one_shot(&leds_dir, "activate");
+                    // Read enable/duration; emulate the one-shot + notify.
+                    let _ = drain_one_shot_host(&timed_dir, "enable");
+                    let _ = drain_one_shot_host(&leds_dir, "activate");
+                    // Torch: edge-triggered host notification.
+                    let raw = fs::read_to_string(torch_dir.join("brightness"))
+                        .unwrap_or_else(|_| "0".into());
+                    let val = raw.trim().parse::<u32>().unwrap_or(0);
+                    let want_on = val > 0;
+                    if want_on != torch_on {
+                        crate::hostbridge::notify_torch(want_on);
+                        torch_on = want_on;
+                    }
                     thread::sleep(Duration::from_millis(DRAIN_POLL_MS));
                 }
             })?;
@@ -220,6 +248,21 @@ fn drain_one_shot(dir: &Path, name: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// 6-Z271 host-backed variant: forward the vibration to the host app when
+/// a non-zero duration is detected (BEFORE the wait, so the phone buzzes
+/// immediately), then keep the ABI-true one-shot reset.
+fn drain_one_shot_host(dir: &Path, name: &str) -> io::Result<()> {
+    let p = dir.join(name);
+    let raw = fs::read_to_string(&p).unwrap_or_else(|_| "0".into());
+    let ms: u64 = raw.trim().parse().unwrap_or(0);
+    if ms > 0 {
+        // Cap at the hostbridge limit (60 s enforced on both sides).
+        crate::hostbridge::notify_vibrate(ms.min(60_000) as i32);
+        drain_one_shot(dir, name)?;
+    }
+    Ok(())
+}
+
 // ============================================================================
 // tests
 // ============================================================================
@@ -250,6 +293,8 @@ mod tests {
             "sys/class/backlight/panel/brightness",
             "sys/class/backlight/panel/max_brightness",
             "sys/class/backlight/panel/bl_power",
+            "sys/class/leds/torch_0/brightness",
+            "sys/class/leds/torch_0/max_brightness",
         ] {
             assert!(root.join(rel).exists(), "missing {}", rel);
         }

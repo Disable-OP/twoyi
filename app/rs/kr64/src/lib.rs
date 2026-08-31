@@ -3524,6 +3524,29 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     touch("sys/fs/selinux/load", 0o666, "");
     touch("sys/fs/selinux/null", 0o666, "");
 
+    // 6-Z271: device-mapper /sys node. First-stage init's
+    // BlockDevInitializer::InitMiscDevice() (AOSP system/core/init/
+    // block_dev_initializer.cpp) REGENERATES the dm uevent by opening
+    // /sys/devices/virtual/misc/device-mapper/uevent for WRITING and
+    // writing "add\n", then reads the NETLINK uevent socket (the tracer's
+    // 6-Z271 synthetic-uevent delivery answers that read). Without the
+    // directory, RegenerateUeventsForPath fails at opendir and init falls
+    // to uevent_listener_.Poll(10s) — the measured "Wait for
+    // device-mapper returned after 10010ms" hole (run 33411932921).
+    mkdir("sys/devices", 0o755);
+    mkdir("sys/devices/virtual", 0o755);
+    mkdir("sys/devices/virtual/misc", 0o755);
+    mkdir("sys/devices/virtual/misc/device-mapper", 0o755);
+    // Seed mirrors the real kernel's uevent file for a misc device;
+    // init's HandleUevent re-creates /dev/device-mapper via the tracer's
+    // mknod fake — the ioctl surface stays ENOTTY (unchanged failure
+    // mode vs the post-timeout path the boot already survived).
+    touch(
+        "sys/devices/virtual/misc/device-mapper/uevent",
+        0o644,
+        "MAJOR=254\nMINOR=0\nDEVNAME=device-mapper\nDEVTYPE=misc\n",
+    );
+
     info!(
         "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1))",
         rootfs_prefix

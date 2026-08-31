@@ -10914,6 +10914,11 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     // Rate-limit for recv-on-fake-fd logs (a poll spin can hot-loop).
     let mut netlink_recv_log_count: u32 = 0;
+    // 6-Z271: fake-uevent fds that already received the synthetic
+    // device-mapper uevent (one delivery per socket — kernel multicast
+    // semantics: every listener gets every event exactly once).
+    let mut netlink_dm_uevent_served: std::collections::HashSet<(libc::pid_t, i64)> =
+        std::collections::HashSet::new();
     // ── Task 6-Z110: property-service CLIENT fd tracking state ──
     //
     // `fake_propserv_fds`: per-pid set of REAL kernel fds whose FAILED
@@ -22327,21 +22332,100 @@ pub fn run_ptrace_loop(
                                     .get(&pid)
                                     .map_or(false, |s| s.contains(&fd))
                                 {
-                                    // -EAGAIN = "nothing yet": consistent with
-                                    // the SOCK_NONBLOCK the socket was created
-                                    // with, never an eternal in-kernel block,
-                                    // and NOT 0 (0 = orderly-shutdown would
-                                    // look like a valid empty uevent).
-                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                    if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
-                                        set_syscall_ret(&mut regs2, &abi, -11);
-                                        let _ = ptrace_setregs(pid, &regs2, len);
-                                        if netlink_recv_log_count < 20 {
-                                            netlink_recv_log_count += 1;
+                                    // 6-Z271: deliver ONE synthetic device-mapper
+                                    // uevent per fake-uevent socket, then fall
+                                    // back to -EAGAIN. Measured on OrangeFox R12
+                                    // (run 33411932921): first-stage init's
+                                    // BlockDevInitializer::InitMiscDevice() waits
+                                    // 10 s for the device-mapper uevent —
+                                    // RegenerateUeventsForPath pokes
+                                    // /sys/devices/virtual/misc/device-mapper/uevent
+                                    // then READS THE NETLINK SOCKET; the real
+                                    // kernel would regenerate the event, this
+                                    // container has no kernel driver behind the
+                                    // fake /sys, so the read must deliver it.
+                                    // (init passes src_addr = NULL for the 3-arg
+                                    // uevent_kernel_multicast_recv; a non-NULL
+                                    // sockaddr_nl is filled defensively.)
+                                    let key = (pid, fd);
+                                    let deliver = !netlink_dm_uevent_served.contains(&key);
+                                    if deliver {
+                                        // Bounded bookkeeping (a boot opens a
+                                        // handful of uevent sockets; 256 is a
+                                        // generous cap — clear to stay flat).
+                                        if netlink_dm_uevent_served.len() >= 256 {
+                                            netlink_dm_uevent_served.clear();
+                                        }
+                                        netlink_dm_uevent_served.insert(key);
+
+                                        let buf = get_syscall_arg(&regs, abi.reg_arg2);
+                                        let buflen = get_syscall_arg(&regs, abi.reg_arg3) as usize;
+                                        let src_addr = get_syscall_arg(&regs, abi.reg_arg5);
+                                        let addrlen_p = get_syscall_arg(&regs, abi.reg_arg6);
+                                        const DM_UEVENT: &[u8] =
+                                            b"add@/devices/virtual/misc/device-mapper\0\
+ACTION=add\0DEVPATH=/devices/virtual/misc/device-mapper\0\
+SUBSYSTEM=misc\0MAJOR=254\0MINOR=0\0DEVNAME=device-mapper\0\
+SEQNUM=2001\0";
+                                        if buf != 0 && buflen > 0 {
+                                            let n = DM_UEVENT.len().min(buflen);
+                                            let wrote = write_child_bytes_pokedata(
+                                                pid,
+                                                buf,
+                                                &DM_UEVENT[..n],
+                                            );
+                                            let new_ret: i64 = if wrote == n {
+                                                n as i64
+                                            } else {
+                                                -11 // EAGAIN — couldn't inject
+                                            };
+                                            // Fill a sockaddr_nl {nl_family=16,
+                                            // pad, nl_pid=0, nl_groups=0} when
+                                            // the caller asked for the source.
+                                            if new_ret > 0 && src_addr != 0 && addrlen_p != 0 {
+                                                let sal: [u8; 12] =
+                                                    [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                                                let _ =
+                                                    write_child_bytes_pokedata(pid, src_addr, &sal);
+                                                let _ = write_child_bytes_pokedata(
+                                                    pid,
+                                                    addrlen_p,
+                                                    &12u32.to_ne_bytes(),
+                                                );
+                                            }
+                                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                            if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
+                                                set_syscall_ret(&mut regs2, &abi, new_ret);
+                                                let _ = ptrace_setregs(pid, &regs2, len);
+                                            }
                                             log(&format!(
-                                                "6-Z99: fake netlink fd {:#x}: {:?} returned {} — faked to -EAGAIN (no uevents will ever arrive; poll stays not-readable via 6-Z5/6-Z17)",
-                                                fd, op, ret
+                                                "6-Z271: synthetic device-mapper uevent delivered to fake-uevent fd {:#x} ({} bytes, ret={}) — kills init's 10 s dm wait",
+                                                fd, n, new_ret
                                             ));
+                                        } else {
+                                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                            if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
+                                                set_syscall_ret(&mut regs2, &abi, -11);
+                                                let _ = ptrace_setregs(pid, &regs2, len);
+                                            }
+                                        }
+                                    } else {
+                                        // -EAGAIN = "nothing yet": consistent with
+                                        // the SOCK_NONBLOCK the socket was created
+                                        // with, never an eternal in-kernel block,
+                                        // and NOT 0 (0 = orderly-shutdown would
+                                        // look like a valid empty uevent).
+                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                        if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
+                                            set_syscall_ret(&mut regs2, &abi, -11);
+                                            let _ = ptrace_setregs(pid, &regs2, len);
+                                            if netlink_recv_log_count < 20 {
+                                                netlink_recv_log_count += 1;
+                                                log(&format!(
+                                                    "6-Z99: fake netlink fd {:#x}: {:?} returned {} — faked to -EAGAIN (no uevents will ever arrive; poll stays not-readable via 6-Z5/6-Z17)",
+                                                    fd, op, ret
+                                                ));
+                                            }
                                         }
                                     }
                                 }

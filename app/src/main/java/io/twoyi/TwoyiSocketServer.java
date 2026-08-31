@@ -43,6 +43,12 @@ public class TwoyiSocketServer {
 
     private static final String JUMP_HOST_SETTINGS= "SETTINGS";
 
+    // 6-Z271: host-backed HAL bridge requests from the guest's virtual
+    // binder services / sysfs (kr64 hostbridge.rs).
+    private static final String TWOYI_VIBRATE = "TWOYI_VIBRATE";
+    private static final String TWOYI_VIBRATE_OFF = "TWOYI_VIBRATE_OFF";
+    private static final String TWOYI_TORCH = "TWOYI_TORCH";
+
     // Fixed: use fixed thread pool with daemon threads to prevent
     // unbounded thread growth and JVM shutdown issues
     private static ExecutorService EXECUTOR = Executors.newFixedThreadPool(4, r -> {
@@ -201,6 +207,24 @@ public class TwoyiSocketServer {
         } else if (msg.startsWith(JUMP_HOST_SETTINGS)) {
             // UIHelper.startActivity(mContext, AboutActivity.class);
             UIHelper.startActivity(mContext, SettingsActivity.class);
+        } else if (msg.startsWith(TWOYI_VIBRATE_OFF)) {
+            // 6-Z271: guest IVibrator.off() / sysfs one-shot reset —
+            // cancel the host phone's real vibration.
+            HostHalBridge.cancelVibrate(mContext);
+        } else if (msg.startsWith(TWOYI_VIBRATE)) {
+            // 6-Z271: guest IVibrator.on(ms) — REAL host vibration.
+            // Format: "TWOYI_VIBRATE:<ms>".
+            try {
+                long ms = Long.parseLong(msg.substring(TWOYI_VIBRATE.length() + 1).trim());
+                HostHalBridge.vibrate(mContext, ms);
+            } catch (RuntimeException e) {
+                Log.w(TAG, "malformed vibrate request: " + msg);
+            }
+        } else if (msg.startsWith(TWOYI_TORCH)) {
+            // 6-Z271: guest torch LED write — real camera flash.
+            // Format: "TWOYI_TORCH:1" / "TWOYI_TORCH:0".
+            String arg = msg.substring(TWOYI_TORCH.length() + 1).trim();
+            HostHalBridge.setTorch(mContext, arg.equals("1"));
         }
     }
 }
