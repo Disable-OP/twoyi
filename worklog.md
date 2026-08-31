@@ -22947,3 +22947,26 @@ Stage Summary:
 - 6-Z268 wave SHIPPED and VERIFIED: UI_READY under 5 s (8x faster than
   the 6-Z267 baseline's 40 s), first frame at ~0.1 s, loader segment
   10.6 s -> ~40 ms. Guard runs in flight.
+
+---
+Task ID: 6-Z268 guard results
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: guard wave results on the hardened 6-Z268 head.
+
+Work Log:
+- WHYRED GUARD run 33391886763 (twrp-3.7.0_9-0-whyred, dl.twrp.me):
+  SUCCESS — overall UI_READY / BOOT_OK, pages advanced →
+  terminalcommand → filemanagerlist → filemanageroptions →
+  choosedestinationfolder → main → main2 (terminal + file-manager +
+  destination-folder flows all exercised). ZERO 6-Z268 regressions on
+  the TWRP-layout guard.
+- ANGLER GUARD run 33391884534: FAILED AT THE DOWNLOAD STEP
+  (dl.twrp.me default-image flake — the APK build succeeded; identical
+  transient class to prior waves' download flakes). RETRY dispatched:
+  run 33392829448 (head ebf9403).
+- Daisy guard impossible this round: OrangeFox daisy R12 retired (404),
+  dl.twrp.me has no daisy 3.7.0 image (404 on every version probe).
+
+Stage Summary:
+- whyred GREEN; angler retry in flight (download-flake class only).
