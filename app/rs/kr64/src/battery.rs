@@ -92,6 +92,15 @@ use crate::{error, info, warning};
 /// Path of the battery sysfs tree *inside the rootfs* (relative).
 pub const BATTERY_DIR_REL: &str = "sys/class/power_supply/battery";
 
+/// Charger power-supply nodes (6-Z271h). AOSP's `BatteryMonitor::init`
+/// scans `/sys/class/power_supply/*` and classifies each node by its
+/// `type` file; the charge status it reports (and TWRP's plug icon)
+/// needs at least the `usb` node with a real `online` value. Without
+/// them newer recoveries show a dead charging state even when the
+/// battery percentage itself is fine.
+pub const USB_CHARGER_DIR_REL: &str = "sys/class/power_supply/usb";
+pub const AC_CHARGER_DIR_REL: &str = "sys/class/power_supply/ac";
+
 /// Refresh interval for the periodic update thread (seconds). 30 s
 /// matches the spec and is well within the guest's typical poll
 /// cadence (1 minute); shorter would burn CPU for no perceptual gain.
@@ -206,13 +215,13 @@ pub struct BatteryDevice {
 
 impl BatteryDevice {
     /// Materialise the sysfs tree under `{rootfs}/sys/class/power_supply/battery/`
-    /// and write default values to all eight files.
+    /// plus the two charger nodes, and write default values to all files.
     ///
     /// Idempotent — calling it twice on the same rootfs simply
     /// overwrites the files (no `EEXIST` errors). Missing parent
     /// directories (`sys/`, `sys/class/`, `sys/class/power_supply/`)
     /// are created on demand with mode 0755; the battery dir itself
-    /// is created with mode 0755; the eight files are created with
+    /// is created with mode 0755; the files are created with
     /// mode 0644 (world-readable so the guest's `system_server` can
     /// read them regardless of its uid inside the chroot).
     pub fn new(rootfs: &str) -> std::io::Result<Self> {
@@ -222,6 +231,14 @@ impl BatteryDevice {
         fs::create_dir_all(&dir)?;
         // 0755 on the battery dir itself (and any parent we created).
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
+
+        // 6-Z271h: charger nodes — same parent chain, already created.
+        let usb_dir = Path::new(rootfs).join(USB_CHARGER_DIR_REL);
+        let ac_dir = Path::new(rootfs).join(AC_CHARGER_DIR_REL);
+        fs::create_dir_all(&usb_dir)?;
+        fs::create_dir_all(&ac_dir)?;
+        let _ = fs::set_permissions(&usb_dir, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&ac_dir, fs::Permissions::from_mode(0o755));
 
         let dev = Self {
             dir,
@@ -234,7 +251,7 @@ impl BatteryDevice {
         dev.refresh()?;
 
         info!(
-            "[KR64][battery] materialised {} with default values (capacity={}%, status={})",
+            "[KR64][battery] materialised {} (+usb, +ac) with default values (capacity={}%, status={})",
             dev.dir.display(),
             DEFAULT_CAPACITY,
             BatteryStatus::Discharging.as_str(),
@@ -494,6 +511,25 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
     // lineage-22.2-sailfish run 33282962805 kmsg). "Battery" is the
     // canonical class for /sys/class/power_supply/battery.
     try_write!("type", "Battery");
+    // 6-Z271h: the remaining files AOSP's BatteryMonitor::update() reads
+    // (system/healthd/BatteryMonitor.cpp, A9→A13). Missing ones degrade
+    // newer recoveries' battery display even when capacity is present:
+    //   present        — without it BatteryMonitor treats the device as
+    //                    absent (mBatteryDevicePresent=false → level is
+    //                    reported as 0/50-fake and TWRP shows no battery).
+    //   charge_counter — µAh; some UIs prefer it over capacity.
+    //   current_now    — µA; signed (positive charging, negative drain).
+    //   cycle_count    — read unconditionally, defaults 0 when absent.
+    //   charge_status  — A11+ reads it for the charge_status prop; the
+    //                    same string set as `status`.
+    try_write!("present", "1");
+    try_write!("charge_counter", &(level.min(100) as u32 * 3_500).to_string());
+    try_write!(
+        "current_now",
+        if status.is_charging() { "500000" } else { "-300000" }
+    );
+    try_write!("cycle_count", "0");
+    try_write!("charge_status", status.as_str());
     // `voltage_now` is in microvolts (uV) per the Linux `power_supply` ABI;
     // `voltage` (from `jni_get_battery_voltage`) is in millivolts (mV).
     // Convert mV → uV so the guest's health HAL reads the right value.
@@ -502,10 +538,35 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
     try_write!("technology", DEFAULT_TECHNOLOGY);
     try_write!("health", DEFAULT_HEALTH);
 
+    // 6-Z271h: charger nodes — siblings of `battery` under
+    // /sys/class/power_supply. BatteryMonitor classifies them by `type`
+    // ("USB" → mChargerUsbPresent, "Mains" → mChargerAcPresent) and reads
+    // `online` for the plugged state; TWRP's plug icon and the
+    // "Charging"/"Discharging" derivation both consult these. `usb`
+    // follows the charge status (the host charges over USB); `ac` stays
+    // offline (no wireless/wall supply is being emulated).
+    if let Some(ps_dir) = dir.parent() {
+        let usb_dir = ps_dir.join("usb");
+        let ac_dir = ps_dir.join("ac");
+        let _ = fs::create_dir_all(&usb_dir);
+        let _ = fs::create_dir_all(&ac_dir);
+        try_write_at(&usb_dir, "type", "USB");
+        try_write_at(&usb_dir, "online", if status.is_charging() { "1" } else { "0" });
+        try_write_at(&ac_dir, "type", "Mains");
+        try_write_at(&ac_dir, "online", "0");
+    }
+
     match first_err {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Non-failing write used for the charger nodes: a failure is recorded in
+/// `first_err` by the caller's macro only for the battery dir itself; the
+/// chargers are best-effort (older trees never had them either).
+fn try_write_at(dir: &Path, name: &str, value: &str) {
+    let _ = write_file_at(dir, name, value);
 }
 
 // ============================================================================
@@ -690,6 +751,51 @@ mod tests {
             let content = fs::read_to_string(&p).unwrap();
             assert!(!content.is_empty(), "file {} should be non-empty", name);
         }
+
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z271h_batterymonitor_files_and_charger_nodes_present() {
+        // 6-Z271h: AOSP BatteryMonitor::update() reads present/
+        // charge_counter/current_now/cycle_count/charge_status, and its
+        // init() classifies the charger nodes by `type` + `online`.
+        // Newer recoveries show a dead battery/plug state without them.
+        let rootfs = tmpdir();
+        let dev = BatteryDevice::new(&rootfs).expect("BatteryDevice::new");
+
+        for (name, expected) in [
+            ("present", "1"),
+            ("type", "Battery"),
+            ("charge_status", "Discharging"),
+        ] {
+            let content = fs::read_to_string(dev.dir().join(name)).unwrap();
+            assert_eq!(content.trim(), expected, "battery file {}", name);
+        }
+        for name in ["charge_counter", "current_now", "cycle_count"] {
+            let p = dev.dir().join(name);
+            assert!(p.exists(), "BatteryMonitor file {} missing", name);
+        }
+        // current_now negative while discharging (µA, signed per ABI).
+        let cur: i64 = fs::read_to_string(dev.dir().join("current_now"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(cur < 0, "discharging current_now must be negative");
+
+        // Charger nodes are siblings of the battery dir.
+        let ps = dev.dir().parent().unwrap();
+        let usb_type = fs::read_to_string(ps.join("usb/type")).unwrap();
+        assert_eq!(usb_type.trim(), "USB", "usb node type");
+        let usb_online: u32 = fs::read_to_string(ps.join("usb/online"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(usb_online, 0, "usb offline while discharging");
+        let ac_type = fs::read_to_string(ps.join("ac/type")).unwrap();
+        assert_eq!(ac_type.trim(), "Mains", "ac node type");
 
         let _ = fs::remove_dir_all(&rootfs);
     }
