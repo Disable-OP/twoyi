@@ -22806,3 +22806,21 @@ SKIPPED (documented): PTRACE_SYSEMU stop-model (own semantics round per 6-Z267);
 Stage Summary:
 - cargo fmt clean; clippy -D warnings clean; 676/676 unit tests green on x86_64 (commit head).
 - Expect: loader segment (0→execve) cut by dt_needed windowing + libdl cache + fd-close + prefetch + buffered logs; execve→UI cut by backstop/canonicalize memos + pvm writes + fstat census + DIAG budget + identity-write elision + property mirror; UI delivery cut by fb0 bridge write-on-change + blit stat short-circuit + BootLogTexture/CPU de-contention.
+
+---
+Task ID: 6-Z268 verification dispatch
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: record the 6-Z268 verification dispatch.
+
+Work Log:
+- Pushed the full 6-Z268 wave to origin/main as 8072616 (worklog commit 881591c precedes it).
+- Dispatched OrangeFox R12.0 lavender verification (the user's exact image, same URL/md5 as all prior lavender rounds) on head 8072616:
+  RUN 33386125966 — inputs recovery_name=orangefox-R12.0-lavender,
+  recovery_url=https://api.orangefox.download/release/69f5cec33ba4241ac1e095f/dl,
+  recovery_md5=8dd3688b814fc99f8251e3c749812d92, boot_wait_seconds=60.
+- Baseline for comparison: run 33371788724 (7a78a56, 6-Z267) — UI_READY, splash at the 20 s frame, first interactive UI at the 40 s frame.
+- Verification plan: frame-by-frame NATIVE analysis of the artifact screenshots + kr64 [+]ms timeline deltas vs the baseline; the <10 s target will be judged from the frame manifest + log stamps (5 s frame cadence bounds the observable resolution).
+
+Stage Summary:
+- Run 33386125966 in_progress at recording time. Continuing local work while it runs; will read frames manually on completion.
