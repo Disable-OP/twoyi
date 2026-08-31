@@ -23197,3 +23197,28 @@ Work Log:
   ~47 s tracer-side. Remaining fixed budget on this image: 10 s dm poll
   (unsatisfiable without dm emulation) + ~20 s keystore2 binder chain
   (6-Z271) + ~5 s startup-script execs + ~11 s theme parse.
+
+---
+Task ID: 6-Z271 wave start (artifact forensics)
+Agent: Main dispatcher
+Date: 2026-08-31
+Task: decode the remaining R12 lavender waits from run 33411932921 artifacts; start the binder-completeness wave.
+
+Work Log:
+- Pulled artifact 9765814025 (ui-e2e-arm64-logs) for run 33411932921; extracted kr64-app-stderr.log, twrp-recovery.log, dev-__kmsg__, logcat.txt.
+- logcat.txt provenance check: it is the HOST redroid Android logcat (io.twoyi.debug installed 16:08:02, host system_server pid 241) — the "keystore2 Successfully registered" lines in it are the HOST's keystore2, NOT the guest. Guest truth = kmsg + recovery.log + proxy logs only.
+- Binder proxy forensics (kr64-app-stderr.log):
+  * 4 clients connect +10.56-10.68s; HIDL IBase::PING (code=1599098439=0x5F504E47) at +10.661s and +52.186s.
+  * ONE addService (code=3) at +11.427s — went through the LEGACY path: the request was v1 (log shows v2=false; the shlib never inlines v2 request blobs — it only parses v2 RESPONSE trailers) so the service NAME WAS NEVER PARSED. Registry is INERT for real libbinder clients.
+  * checkService (code=2) polls: tx #1-4 logged at +11.929-12.431s, then log cap; tx #200 sampled at +70.276s → ~170 polls between +12.4s and +31.1s at ~100-110ms cadence = THE ~18.5s HOLE. The poller is the recovery main thread waiting for a service (keystore2-class) that can never register.
+  * All servicemanager transactions were v1 → servicemanager_legacy() → GET/CHECK always null binder, ADD always accepted-and-discarded.
+- Guest kmsg: services started = ueventd, logd, servicemanager, hwservicemanager, vndservicemanager, keystore2, recovery. NO keymaster HAL binary exists in the guest (rc parses; binary absent; zero "starting service 'android.hardware.keymaster*'" lines).
+- keystore2 (pid 2697, comm _system_bin_key): nanosleep (nr=101) retry loop at ~400-500ms cadence through the whole hole window (+12.8s→31s+) — its KeyMint connect (AIDL via proxy: miss; HIDL legacy via hwservicemanager: nothing registered) can never succeed, so it never registers IKeystoreSecurity.
+- hwservicemanager/servicemanager/vndservicemanager (pids 2690-2692): idle on 5s timerfd epoll cycles — zombie context managers (our proxy acked BINDER_SET_CONTEXT_MGR and never delivers transactions).
+- TWRP: "Found version in manifest: 4.0" — keymaster version detection completes; the hole is BEFORE it (12.7→31.1s), i.e. the recovery main thread's own service wait.
+- ROOT CAUSE (20s hole): the binder registry is inert because the loader shlib never inlines v2 REQUEST blobs, so every real-libbinder addService/checkService hits servicemanager_legacy() where names are discarded. keystore2's addService was lost at +11.4s. TWRP then polls checkService ~170× over 18.5s.
+- ROOT CAUSE (5s/tap vibrator): waitForService("android.hardware.vibrator.IVibrator/default") runs on the input thread; proxy answers misses instantly but libbinder's retry cadence burns the ~5s client budget per tap; no IVibrator is ever registered.
+- Post-hole guest flow verified: +31.14s recovery (pid 2694) forks sh -c find /vendor/etc/vintf/manifest/... (keymaster version detection) → "Starting the UI..." → graphics probe.
+
+Stage Summary:
+- 6-Z271 plan: (1) shlib v2 request-blob inlining [unlocks the registry for ALL real libbinder clients]; (2) binder.rs guest-local bus: addService stores owner conn + ptr/cookie, getService returns routed handles, BC_TRANSACTION to routed handle → BR_TRANSACTION delivery to owner + BC_REPLY correlation back to requester, death notifications, HIDL-aware header parse (libhwbinder has no SYST header tag) + HIDL PING answer, registry-miss transact → BR_FAILED_REPLY (retire the untested forward-to-host skeleton); (3) in-proxy virtual services: IVibrator/default (on(ms) forwarded to host for REAL vibration), IKeyMintDevice/default + ISharedSecret/default (minimal semantically-correct: getHardwareInfo/earlyBootEnded/addRngEntropy real; key ops → honest KeyMint errors) so keystore2 can actually start and register; (4) host HAL bridge over the existing TWOYI_SOCK channel: VIBRATE/VIBRATE_OFF/TORCH messages → Java VibratorManager/CameraManager; battery via ACTION_BATTERY_CHANGED → host-battery file → battery.rs serves live values; (5) dm-poll kill: path-gated S_IFBLK statbuf rewrite for /dev/device-mapper (6-Z203b template). Then CI on R12 lavender.
