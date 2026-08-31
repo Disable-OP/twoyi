@@ -70,6 +70,7 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -3188,7 +3189,11 @@ static void fatal_dump_maps(void) {
         if (n <= 0) break;
         raw_syscall3(SYS_write, 2, (long)buf, n);
         total += n;
-        if (total > 32768) break;
+        /* 6-Z269: 32 KiB truncated before the aborting module's r-xp
+         * segment on OrangeFox R12 (the PC ended up un-symbolizable);
+         * 128 KiB covers the full module list without drowning the
+         * stderr pipe. */
+        if (total > 131072) break;
     }
     raw_syscall1(SYS_close, mfd);
     write_str(2, "[twrp_fb_hook] --- end maps ---\n");
@@ -3206,18 +3211,78 @@ static void fatal_evidence_once(const char *kind, void *pc) {
     fatal_dump_maps();
 }
 
-// Re-raise SIGABRT with default semantics, without touching errno/TLS:
-// rt_sigaction would need a kernel sigaction struct (restorer fields) —
-// instead we tgkill directly. If the process installed a SIGABRT handler
-// (TWRP's crash handler does), it fires — same as bionic's first
-// raise(). If it returns, pause forever (abort must not return).
+// 6-Z269: park forever instead of re-raising, with EXPLICIT NULL args.
+//
+// WHY THIS CHANGED (the 31.9M-stop storm, CI run 33353128469): the old
+// loop was
+//     for (;;) { tgkill(pid, tid, SIGABRT); raw_syscall2(SYS_ppoll, 0, 0); }
+// with TWO independent bugs that turned every guest abort() into a
+// tracer-melting busy-spin:
+//
+//   1. raw_syscall2(SYS_ppoll, 0, 0) sets ONLY x0/x1 (fds=NULL, nfds=0).
+//      On aarch64/x86_64 the inline asm leaves x2 (timespec*) and x3
+//      (sigmask*) holding whatever the caller frame left there — at the
+//      abort site that is garbage (saved PCs, clobbered temporaries).
+//      The kernel then copies the timespec from a wild pointer →
+//      ppoll returns -EFAULT IMMEDIATELY instead of blocking. The
+//      "park" call never parked: the loop ran at full speed,
+//      tgkill+ppoll pairs at ~60k/s, tracer loop pegged at 100% CPU —
+//      measured 31,961,601 loop stops over one boot (nr=73 EXIT -14 +
+//      nr=131 EXIT -3 alternating in every kr64 log line of the storm
+//      window), the single biggest component of the user-reported
+//      "~1 minute to boot".
+//
+//   2. raw_syscall1(SYS_getpid) returns the TRACER-FAKED pid 1 (the
+//      seccomp/SIGSYS getpid fake), so tgkill(1, tid, SIGABRT) fails
+//      with -ESRCH in the real kernel — the signal was never delivered
+//      to anyone, the abort never completed, and (with tracer 6-Z266
+//      now translating fake-pid-1 kill-family arguments to the real
+//      tgid) a raise here WOULD actually deliver SIGABRT and kill the
+//      whole process.
+//
+// WHY PARK (default) INSTEAD OF DIE: the aborting site on OrangeFox R12
+// lavender is a glog "bad_function_call was thrown in -fno-exceptions
+// mode" FATAL in the recovery main thread ~10 s into boot. On a physical
+// device abort() kills the process and init restarts it. Under twoyi a
+// full process death means: recovery gone → no framebuffer producer →
+// the boot-to-UI run is over (and an init restart loop would re-abort
+// every cycle). The pre-6-Z266 behavior — ESRCH spin — accidentally kept
+// the process alive while the OTHER threads (minui render, input,
+// fb_hook splash) kept producing frames. The park preserves exactly that
+// observable behavior (aborting thread gone from the scheduler, process
+// alive) at ZERO CPU: ppoll(NULL, 0, NULL, NULL) with all-NULL args
+// blocks in the kernel forever (nfds=0, no timeout, no sigmask), the
+// tracee sleeps, the tracer waits at its EXIT stop, nothing runs.
+//
+// TWOYI_ABORT_RERAISE=1 (opt-in, read once) restores the old
+// raise-then-park semantics for debugging, with the ppoll args FIXED
+// (all-NULL) so the park between re-raises actually parks.
+static volatile int g_abort_reraise_mode = -1; /* -1 = unresolved */
+
 static void fatal_reraise(void) __attribute__((noreturn));
 static void fatal_reraise(void) {
-    long pid = raw_syscall1(SYS_getpid, 0);
-    long tid = raw_syscall1(SYS_gettid, 0);
+    if (g_abort_reraise_mode < 0) {
+        /* Raw getenv-free probe: reading an env var through libc getenv
+         * is safe here (no TLS/errno hazards — environ is plain data). */
+        const char *m = getenv("TWOYI_ABORT_RERAISE");
+        g_abort_reraise_mode = (m != NULL && m[0] == '1') ? 1 : 0;
+    }
+    if (g_abort_reraise_mode) {
+        long pid = raw_syscall1(SYS_getpid, 0);
+        long tid = raw_syscall1(SYS_gettid, 0);
+        for (;;) {
+            raw_syscall4(SYS_tgkill, pid, tid, 6 /*SIGABRT*/, 0);
+            /* 6-Z269 FIX: was raw_syscall2(SYS_ppoll, 0, 0) — x2/x3
+             * garbage → EFAULT → busy-spin. All-NULL ppoll blocks. */
+            raw_syscall4(SYS_ppoll, 0, 0, 0, 0);
+        }
+    }
+    /* Default: park this thread forever at zero cost. ppoll with
+     * nfds=0, NULL timeout and NULL sigmask has nothing to copy from
+     * user memory — no EFAULT path — and blocks until a signal (which
+     * for an aborting thread never meaningfully arrives). */
     for (;;) {
-        raw_syscall4(SYS_tgkill, pid, tid, 6 /*SIGABRT*/, 0);
-        raw_syscall2(SYS_ppoll, 0, 0); /* park if a handler returns */
+        raw_syscall4(SYS_ppoll, 0, 0, 0, 0);
     }
 }
 
