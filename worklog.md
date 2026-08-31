@@ -22444,3 +22444,23 @@ Stage Summary:
   skeleton) — a guest polling for a service that never registers
   is a functional gap, not just a log line; (4) the 6-Z259
   stop-accounting investigation continues with the ring dumps.
+
+---
+Task ID: 6-Z266 dispatch record
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: record the 6-Z266 verification-wave CI run IDs (HEAD 38de405).
+
+Work Log:
+- Pushed 38de405 to origin/main. An initial push attempt failed
+  (credential-helper format); fixed via a GIT_ASKPASS shim reading
+  a 0600 token file — the PAT is never displayed, logged, or echoed.
+- Dispatched (workflow ui-e2e-test-arm64, ref main = 38de405):
+  * run 33366020128 — orangefox-R12.0-lavender (the user's exact
+    image, md5-verified)
+  * run 33366018389 — twrp-3.7.0_9-0-daisy (guard)
+  * run 33366022293 — twrp-3.7.0_9-0-whyred (guard)
+- The kr64-tests workflow also runs on the push (fmt/clippy/675
+  tests). Stale runs queued on 791b8ea were auto-cancelled by the
+  workflow's concurrency group. CI monitored async per protocol;
+  local work continues.
