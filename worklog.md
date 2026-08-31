@@ -23289,3 +23289,24 @@ Work Log:
 Stage Summary:
 - 3 runs in flight: 33425291816 (R12 lavender, 8c2495d), 33425873199
   (whyred), 33425883460 (angler). Frame reading when complete.
+
+---
+Task ID: 6-Z271c — the RECO header tag root cause
+Agent: Main dispatcher
+Date: 2026-08-31
+Task: decode run 33425291816's residual waits; fix and re-dispatch.
+
+Work Log:
+- RUN 33425291816 (R12, head 8c2495d): SUCCESS, UI interactive at the 30s tick, loop_count 3.85M (storm still extinct), and the v2 request inlining PROVED live (every servicemanager transaction logged v2=true).
+- BUT: zero addService(NAME)/getService(NAME) parse-success lines; the checkService poll pattern unchanged (tx#200 sampled at +69.98s, same as the pre-fix run); vibrator "Waiting for service" still 14x; the find-at-+31.2s still at +31.2s → the ~18.5s hole and the 5s/tap wait were BOTH still live.
+- ROOT CAUSE (two compounding bugs, masked by a self-consistent test codec):
+  1. LineageOS-20 libs/binder/Parcel.cpp: kHeader = B_PACK_CHARS('S','Y','S','T') — BIG-endian char packing = 0x53595354. The old from_ne_bytes(*b"SYST") constant was byte-swapped (0x54535953) and never matched a real parcel.
+  2. THE RECOVERY FLAVOR: libbinder built with __ANDROID_RECOVERY__ writes B_PACK_CHARS('R','E','C','O') (0x5245434F) — the recovery corpus NEVER writes SYST at all. Every guest SM parcel failed the is_aidl peek → servicemanager_hidl → AIDL addService (code 3) unhandled → silent BR_FAILED_REPLY; checkService (code 2) collided with HIDL_SM_ADD=2 → garbage name → miss. Registry inert AGAIN, waits intact.
+  3. Same byte-swap in PING_TRANSACTION (0x474E505F vs the real 0x5F504E47 — the artifact's code=1599098439 line proves it) — the PING fast-path never matched.
+- FIXES (commit 3263b7e): SYST/VNDR corrected to from_be_bytes; new AIDL_HEADER_TAG_RECO accepted at the is_aidl peek and the leniency warning; PING_TRANSACTION corrected; bounded SM-parcel hexdump DIAG (first 8 parcels) for on-device proof.
+- Also this round: 6-Z271b dual-path dm uevent delivery (the run's EXIT-arm never fired for init's recvmsg — added an ENTRY-side getpid-rewrite delivery path + bounded DIAGs at both), T31 getdents verdict cache, T33 pvm-first read_child_bytes.
+- GUARDS: whyred 33425873199 SUCCESS, angler 33425883460 SUCCESS (the binder bus does not regress TWRP-class images).
+- RE-DISPATCHED: run 33428365193 (R12 lavender, head 3263b7e).
+
+Stage Summary:
+- Boot-to-UI was already interactive-at-30s-tick BEFORE the tag fix; the tag fix targets the REMAINING 18.5s hole + 5s/tap. Expected: hole collapses (keystore2 registers; TWRP's lookup hits), vibrator waits vanish, UI well under 20s; theme-parse/exec CPU phases become the next measured bottleneck.
