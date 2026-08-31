@@ -15484,7 +15484,21 @@ pub fn run_ptrace_loop(
                                             if write_child_blob(pid, sa_scratch, &new_sa) {
                                                 let new_len = new_sa.len() as i64;
                                                 let mut fresh: Regs = unsafe { std::mem::zeroed() };
-                                                if ptrace_getregs_wide(pid, &mut fresh).is_ok() {
+                                                let mut rewrite_ok = false;
+                                                if let Err(e) = ptrace_getregs_wide(pid, &mut fresh)
+                                                {
+                                                    // 6-Z268: NO silent branch left —
+                                                    // run 33387194667 hit an
+                                                    // invisible failure here (blob
+                                                    // written, no 6-Z163 line, raw
+                                                    // bind → host EADDRINUSE → 6-Z101
+                                                    // fake → canonical fchmodat/fchownat
+                                                    // ENOENT → init FATAL exit(6)).
+                                                    log(&format!(
+                                                        "6-Z163 FAILED: ptrace_getregs_wide after sockaddr blob write: {} — bind will run on the RAW path",
+                                                        e
+                                                    ));
+                                                } else {
                                                     set_syscall_arg(
                                                         &mut fresh,
                                                         abi.reg_arg2,
@@ -15495,26 +15509,78 @@ pub fn run_ptrace_loop(
                                                         abi.reg_arg3,
                                                         new_len as u64,
                                                     );
-                                                    if ptrace_setregs(pid, &fresh, iov_len).is_ok()
+                                                    match ptrace_setregs(pid, &fresh, iov_len) {
+                                                        Ok(()) => rewrite_ok = true,
+                                                        Err(e) => {
+                                                            // 6-Z268: one retry — a
+                                                            // transient GETREGSET/SETREGSET
+                                                            // failure here silently
+                                                            // downgraded the whole
+                                                            // property-service bootstrap.
+                                                            match ptrace_setregs(
+                                                                pid, &fresh, iov_len,
+                                                            ) {
+                                                                Ok(()) => {
+                                                                    rewrite_ok = true;
+                                                                    log(
+                                                                        "6-Z268: bind sockaddr setregs retry SUCCEEDED after first failure",
+                                                                    );
+                                                                }
+                                                                Err(e2) => log(&format!(
+                                                                    "6-Z163 FAILED: ptrace_setregs after sockaddr blob write: {} then {} — bind will run on the RAW path",
+                                                                    e, e2
+                                                                )),
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if rewrite_ok {
+                                                    set_syscall_arg(
+                                                        &mut regs,
+                                                        abi.reg_arg2,
+                                                        sa_scratch,
+                                                    );
+                                                    set_syscall_arg(
+                                                        &mut regs,
+                                                        abi.reg_arg3,
+                                                        new_len as u64,
+                                                    );
+                                                    log(&format!(
+                                                        "6-Z163: bind(fd={}, {}) sockaddr REWRITTEN to {} (len {} -> {}) — kernel will bind FOR REAL",
+                                                        get_syscall_arg(&regs, abi.reg_arg1),
+                                                        guest_path,
+                                                        host_path,
+                                                        sa_len,
+                                                        new_len
+                                                    ));
+                                                } else {
+                                                    // 6-Z268: the register rewrite
+                                                    // failed — the real bind will run
+                                                    // against the RAW guest path (host
+                                                    // /dev/socket/...) and fail with
+                                                    // EACCES/EADDRINUSE, and init's
+                                                    // follow-up fchmodat/fchownat on the
+                                                    // CANONICAL translated name would
+                                                    // ENOENT → LOG(FATAL) exit (the
+                                                    // 6-Z229-documented starlte class).
+                                                    // Create a placeholder node at the
+                                                    // translated path so the follow-up
+                                                    // chmod/chown see a real entry (the
+                                                    // 6-Z257 family fake covers the
+                                                    // EPERM case; ENOENT was fatal).
+                                                    match std::fs::OpenOptions::new()
+                                                        .create(true)
+                                                        .append(true)
+                                                        .open(&host_path)
                                                     {
-                                                        set_syscall_arg(
-                                                            &mut regs,
-                                                            abi.reg_arg2,
-                                                            sa_scratch,
-                                                        );
-                                                        set_syscall_arg(
-                                                            &mut regs,
-                                                            abi.reg_arg3,
-                                                            new_len as u64,
-                                                        );
-                                                        log(&format!(
-                                                            "6-Z163: bind(fd={}, {}) sockaddr REWRITTEN to {} (len {} -> {}) — kernel will bind FOR REAL",
-                                                            get_syscall_arg(&regs, abi.reg_arg1),
-                                                            guest_path,
-                                                            host_path,
-                                                            sa_len,
-                                                            new_len
-                                                        ));
+                                                        Ok(_) => log(&format!(
+                                                            "6-Z268: bind rewrite FAILED — placeholder node created at {} so init's chmod/chown chain survives the faked bind",
+                                                            host_path
+                                                        )),
+                                                        Err(e) => log(&format!(
+                                                            "6-Z268: bind rewrite FAILED and placeholder creation at {} failed: {} — expect the 6-Z229 fchmodat-ENOENT FATAL class",
+                                                            host_path, e
+                                                        )),
                                                     }
                                                 }
                                             }
