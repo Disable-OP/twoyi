@@ -23263,3 +23263,29 @@ Stage Summary:
   * binder: "addService(NAME)" lines present (keystore2/logd registered), "getService(NAME) hit" lines, ZERO 18s checkService poll gaps, "delivered transaction" lines (guest↔guest routing live), "Waiting for service 'android.hardware.vibrator.IVibrator/default'" count → 0.
   * dm: "synthetic device-mapper uevent delivered" + NO "Wait for device-mapper returned after 10010ms".
   * keystore2: guest logd lines showing "Successfully registered Keystore 2.0 service" (guest-side).
+
+---
+Task ID: 6-Z271 regression guards dispatched
+Agent: Main dispatcher
+Date: 2026-08-31
+Task: multi-recovery regression matrix for the binder bus wave (master prompt §15).
+
+Work Log:
+- WHYRED GUARD run 33425873199 (twrp-3.7.0_9-0-whyred, head 6b8a10e).
+- ANGLER GUARD run 33425883460 (twrp-3.7.0_9-0-angler, head 6b8a10e).
+- Both guards exercise the same binder bus + virtual services as the R12
+  run: TWRP 3.7.0-class images are real libbinder clients (their shlib
+  now inlines v2 request blobs), so an addService/registry/routing
+  regression would show as boot failure or frozen flows.
+- T31 committed (6b8a10e): getdents64 fd-origin verdict cache (per pid/fd,
+  cleared on that pid's execve) — directory-heavy phases skip the
+  readlink+canonicalize walk per call.
+- Known limitation documented (honest list): bidirectional SYNC
+  transactions between two single-binder-threaded guest processes cannot
+  both be in flight (wire serializes per process; kernel uses a second
+  binder thread). The class degrades to the 8 s REPLY_TIMEOUT →
+  BR_FAILED_REPLY, never a hang; recovery-class guests are one-directional.
+
+Stage Summary:
+- 3 runs in flight: 33425291816 (R12 lavender, 8c2495d), 33425873199
+  (whyred), 33425883460 (angler). Frame reading when complete.
