@@ -22631,3 +22631,56 @@ Work Log:
 - CI monitored async per protocol; local work continues (loader-phase
   I/O optimization is the next perf target, then the PTRACE_SYSEMU
   stop-model investigation).
+
+---
+Task ID: 6-Z267 frame verification
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: manual (native-visual) frame analysis of the 6-Z267 lavender run vs the 791b8ea baseline artifact — boot-to-UI timeline ground truth.
+
+Work Log:
+- Pulled BOTH artifact bundles for the SAME image (orangefox-R12.0-
+  lavender, md5-verified) and read the 5 s-cadence boot screenshots
+  natively:
+  * BASELINE run 33353128469 (791b8ea, pre-6-Z266/6-Z267): screen
+    BLACK at 10/15/25/30/40/50/55/60 s AND in 08_final. Its own
+    result-pretty.json: boot=BOOT_FAIL, overall=BOOT_FAIL, ui=
+    NOT_REACHED, pages=[], presentation=NONE. The storm-era boot was
+    so starved the recovery never drew a single frame in the whole
+    E2E window on this run.
+  * 6-Z267 run 33371788724 (7a78a56): 5/10/15 s black (guest init
+    first+second stage; recovery execs at +10.6 s per the 6-Z260
+    stamps), OrangeFox splash rendered correctly at 20/25/30/35 s,
+    FIRST INTERACTIVE UI (Files landing page, theme intact, status
+    bar alive) at the 40 s frame, and by the 60 s frame the E2E flow
+    had already browsed INTO /sdcard/Fox/logs — touch input working
+    end-to-end mid-boot-window. Classifier: BOOT_OK / UI_READY /
+    terminal OK / theme OK / VFS CLEAN / presentation FLOWING /
+    recovery_instances=0 (single clean start — the 6-Z265 crash-loop
+    stays extinct) / 13 UI pages navigated incl. File Manager +
+    rename dialog.
+  * Renamed-dialog + terminal frames also verified natively (rename
+    sheet with IME open, /sdcard/Fox path — deep touch flows OK).
+- CONCLUSION (evidence-backed): on the user's exact image the 6-Z266
+  storm fix + 6-Z267 optimization stack turned the same-image CI
+  result from BOOT_FAIL (no frame EVER, baseline artifact) into
+  UI_READY with first interactive frame inside the 40 s window and
+  touch-verified navigation from the 40 s mark onward. The kr64 log
+  carries 24 "6-Z266 FIX:" translation lines (the raise()/abort()
+  storm's only source stays translated) and the whole log is ~117k
+  lines (vs the 89 MB / ~500k-stop storm logs of the 791b8ea era).
+- Guard updates: whyred guard run 33371793007 (7a78a56) completed
+  SUCCESS with the full optimization stack. The daisy guard dispatch
+  used a WRONG URL first (constructed twrp-3.7.0_9-0-daisy on
+  dl.twrp.me -> HTTP 404, run 33371790961 failed at download; the
+  manifest has no TWRP daisy entry — the prior 6-Z266 "daisy" run
+  never reached its download step either: it died at the same arm64
+  build error). Re-dispatched the manifest's orangefox-daisy entry
+  (api.orangefox.download/release/60a29455e805649489f06b38) — run
+  33372488386 (head 7052ac7), in_progress at recording time; kr64
+  lint+test on 7052ac7 (33372196799) green.
+- NEXT: (1) daisy guard result; (2) the +10.1 s 0->execve loader
+  segment is confirmed UNCHANGED by the optimization wave (disk-I/O
+  shaped, as 6-Z260 predicted) — it is the next optimization target;
+  (3) PTRACE_SYSEMU stop-model investigation remains the highest-
+  ceiling item behind an explicit semantics round.
