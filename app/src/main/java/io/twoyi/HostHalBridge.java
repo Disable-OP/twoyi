@@ -189,15 +189,42 @@ public final class HostHalBridge {
             }
 
             int pct = (level >= 0 && scale > 0) ? Math.round(level * 100f / scale) : -1;
+            boolean charging = plugged != 0;
             if (pct >= 0) write(batteryDir, "capacity", String.valueOf(pct));
             if (status >= 0) write(batteryDir, "status", statusName(status));
-            write(batteryDir, "charging", plugged != 0 ? "1" : "0");
+            write(batteryDir, "charging", charging ? "1" : "0");
+            // 6-Z271h: match battery.rs refresh_dir's file set — AOSP's
+            // BatteryMonitor::update() reads these, and newer recoveries
+            // surface a dead battery when they are missing.
+            write(batteryDir, "present", "1");
+            if (status >= 0) write(batteryDir, "charge_status", statusName(status));
+            if (pct >= 0) write(batteryDir, "charge_counter",
+                    String.valueOf(pct * 3500)); // µAh (~3500 mAh pack)
+            write(batteryDir, "current_now", charging ? "500000" : "-300000");
+            write(batteryDir, "cycle_count", "0");
             if (voltageMv > 0) write(batteryDir, "voltage_now",
                     String.valueOf(voltageMv * 1000L)); // mV → µV (ABI)
             if (tempDecic > 0) write(batteryDir, "temp", String.valueOf(tempDecic));
             if (technology != null) write(batteryDir, "technology", technology);
             if (health >= 0) write(batteryDir, "health", healthName(health));
             write(batteryDir, "type", "Battery");
+
+            // Charger nodes — BatteryMonitor classifies them by `type` and
+            // reads `online` for the plugged state (TWRP's plug icon).
+            File psDir = batteryDir.getParentFile();
+            if (psDir != null) {
+                File usbDir = new File(psDir, "usb");
+                File acDir = new File(psDir, "ac");
+                if ((usbDir.isDirectory() || usbDir.mkdirs())) {
+                    write(usbDir, "type", "USB");
+                    write(usbDir, "online", charging ? "1" : "0");
+                }
+                if (acDir.isDirectory() || acDir.mkdirs()) {
+                    write(acDir, "type", "Mains");
+                    write(acDir, "online", "0");
+                }
+            }
+
             // Marker: kr64's refresh thread stands down when it sees this.
             write(batteryDir, ".host-managed", "1");
         } catch (Throwable t) {
