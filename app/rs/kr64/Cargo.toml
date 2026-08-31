@@ -67,3 +67,18 @@ flate2 = "1.0"
 
 [build-dependencies]
 cc = "1.0"
+
+# ── 6-Z267: hot-loop codegen tuning ─────────────────────────────────
+# The tracer is a single-threaded syscall-translation loop where every
+# guest syscall pays the per-stop code path (register access, dispatch
+# match, VFS translation, ptrace resume). The default release profile
+# (lto off, 16 codegen units) splits the crate into 16 chunks and
+# gives up cross-module inlining inside each chunk; on the emulator
+# loop that measurably costs at the syscall-rate level. `fat` LTO +
+# one codegen unit restore whole-crate inlining. No semantic change:
+# the dev/test profiles used by `cargo test` are untouched.
+# Build-time cost: roughly +30-60 s per ABI in CI — traded for
+# per-syscall latency on every boot.
+[profile.release]
+lto = "fat"
+codegen-units = 1

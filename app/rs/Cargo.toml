@@ -33,3 +33,12 @@ unix_socket = "0.5.0"
 
 [patch.crates-io]
 uinput-sys = { git = 'https://github.com/tiann/rust-uinput-sys' }
+# ── 6-Z267: loader codegen tuning (same rationale as kr64) ──────────
+# The loader (rootfs staging, APEX extraction, guest init exec) is the
+# 0→+10.7 s boot phase the 6-Z260 instrumentation identified as the
+# biggest server-hidden contributor on phones. Whole-crate LTO and a
+# single codegen unit inline the copy/extraction hot loops fully.
+# Dev/test profiles are untouched.
+[profile.release]
+lto = "fat"
+codegen-units = 1

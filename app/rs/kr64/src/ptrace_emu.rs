@@ -4359,12 +4359,34 @@ fn syscall_dirfd(raw: u64) -> i64 {
 /// forced to 0 at EXIT for boot-critical reasons (the EPERM
 /// workaround set — see `compute_exit_return_value`); a DENY there
 /// must fake 0 as well or the guest's boot regresses.
-fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> Vec<(PathArgSlot, bool)> {
+fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> ([(PathArgSlot, bool); 4], usize) {
     let a1 = abi.reg_arg1;
     let a2 = abi.reg_arg2;
     let a4 = abi.reg_arg4;
-    let mut v: Vec<(PathArgSlot, bool)> = Vec::new();
-    let mut push = |slot: PathArgSlot, fake: bool| v.push((slot, fake));
+    // 6-Z267: fixed-capacity stack buffer instead of a heap Vec — this
+    // runs on EVERY path-taking syscall ENTRY (backstop), and the max
+    // slot count per syscall number is 2 (rename/link families), so a
+    // [_; 4] buffer with an explicit length is always sufficient
+    // (debug_asserted below). Semantics identical; allocation removed.
+    let empty_slot = (
+        PathArgSlot {
+            path_reg: 0,
+            dirfd_reg: None,
+        },
+        false,
+    );
+    let mut arr: [(PathArgSlot, bool); 4] = [empty_slot, empty_slot, empty_slot, empty_slot];
+    let mut len: usize = 0;
+    let mut push = |slot: PathArgSlot, fake: bool| {
+        debug_assert!(
+            len < arr.len(),
+            "path-arg slot overflow — raise the [; 4] buffer"
+        );
+        if len < arr.len() {
+            arr[len] = (slot, fake);
+            len += 1;
+        }
+    };
     // open / openat / openat2
     if nr == abi.open {
         push(
@@ -4724,7 +4746,7 @@ fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> Vec<(PathArgSlot, bool)> {
             false,
         );
     }
-    v
+    (arr, len)
 }
 
 /// 6-Z200: substitute "/proc/self/" (and "/proc/thread-self/") in a
@@ -4933,7 +4955,7 @@ fn guest_readlink_target(
 /// on the stop's OWN register snapshot — zero cost for the ~90% of
 /// syscalls that take no path.)
 fn sandbox_backstop_may_apply(nr: i64, abi: &ChildAbi) -> bool {
-    nr == abi.getdents64 || !sandbox_path_arg_slots(nr, abi).is_empty()
+    nr == abi.getdents64 || sandbox_path_arg_slots(nr, abi).1 > 0
 }
 
 /// 6-Z187c: backstop-side marker check (the regs here are the
@@ -4991,12 +5013,22 @@ fn sandbox_backstop_at_entry(
     // (b) path-taking syscalls — verify every path argument's final
     //     resolution. Relative paths resolve against the *at dirfd
     //     (/proc/<pid>/fd/<dirfd>) or the cwd (/proc/<pid>/cwd).
-    let slots = sandbox_path_arg_slots(nr, abi);
-    if slots.is_empty() {
+    let (slots, slots_len) = sandbox_path_arg_slots(nr, abi);
+    if slots_len == 0 {
         return;
     }
-    let cwd = std::fs::read_link(format!("/proc/{}/cwd", pid)).ok();
-    for (slot, fake_success) in slots {
+    // 6-Z267: the cwd readlink is now LAZY (OnceCell-cached, read at
+    // most once per call exactly as before). The old eager
+    // `read_link("/proc/<pid>/cwd")` cost one format! + one readlink
+    // syscall on EVERY path-taking ENTRY — including every ABSOLUTE
+    // path open/stat, where the value is never consulted.
+    let cwd_cell: std::cell::OnceCell<Option<std::path::PathBuf>> = std::cell::OnceCell::new();
+    let cwd = || -> Option<std::path::PathBuf> {
+        cwd_cell
+            .get_or_init(|| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+            .clone()
+    };
+    for (slot, fake_success) in slots.into_iter().take(slots_len) {
         let addr = get_syscall_arg(&regs, slot.path_reg);
         if addr == 0 {
             continue;
@@ -5041,12 +5073,12 @@ fn sandbox_backstop_at_entry(
                     // registers so AT_FDCWD never matched the raw i64.
                     let dirfd = syscall_dirfd(get_syscall_arg(&regs, dirfd_reg));
                     if dirfd == AT_FDCWD {
-                        cwd.clone()
+                        cwd()
                     } else {
                         std::fs::read_link(format!("/proc/{}/fd/{}", pid, dirfd)).ok()
                     }
                 }
-                None => cwd.clone(),
+                None => cwd(),
             };
             let Some(base) = base else {
                 log(&format!(
@@ -5695,9 +5727,79 @@ fn hook_marker_present(regs: &Regs, abi: &ChildAbi) -> bool {
     }
 }
 
+// ── 6-Z267: process_vm_readv capability cache for GUEST STRING READS ──
+//
+// read_child_string is the hottest guest-memory primitive in the
+// tracer: EVERY path-taking syscall (open/stat/access/readlink/chdir/
+// execve …) reads the guest's path string at least TWICE per boot
+// syscall (once in the dedicated ENTRY handler, once in the 6-Z185
+// sandbox backstop's fresh snapshot). The legacy PEEK loop below pays
+// one ptrace syscall per 8 bytes — a 60-byte path costs ~8 PEEKs per
+// read, ~16 per guest open().
+//
+// read_child_string_pvm (the 6-Z167 fallback) already implements the
+// same semantics with 256-byte chunks — ONE syscall for the
+// overwhelmingly common path length. This cache flips the order:
+// process_vm_readv first (chunked, 1 syscall), the PEEK-word loop +
+// /proc/<pid>/mem chain preserved verbatim as the fallback for
+// (a) kernels without process_vm_readv, (b) the inherited-app seccomp
+// filter TRAPPING it (same probe-and-condemn pattern as the 6-Z62
+// write path — one survivable SIGSYS per process, then PEEK forever),
+// (c) the PEEK-only-readable corner cases (6-Z167/6-Z187 keep their
+// full chain in the fallback path).
+//
+//   0 = not probed yet, 1 = usable, -1 = blocked (never try again)
+static PVM_READV_USABLE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(0);
+
 fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
     if addr == 0 {
         return None;
+    }
+    // ── 6-Z267 pvm-FIRST FAST PATH ─────────────────────────────────
+    // One 256-byte-chunk process_vm_readv per chunk (a typical path =
+    // ONE syscall) instead of the legacy loop's one PEEK per 8 bytes
+    // (~8 ptrace round-trips for a 60-byte path — paid TWICE per path
+    // syscall: dedicated ENTRY handler + 6-Z185 backstop). Semantics
+    // match the PEEK loop exactly:
+    //   * NUL-terminated string → Some(string);
+    //   * unreadable byte mid-string (page boundary) → same break
+    //     semantics, Some(prefix) / None-if-empty;
+    //   * FIRST chunk unreadable → fall through to the legacy chain
+    //     below, which keeps the full PEEK → pvm → /proc/<pid>/mem
+    //     fallback order (6-Z167/6-Z187 corner cases preserved).
+    // First use doubles as the capability probe: a seccomp TRAP on
+    // process_vm_readv (same inherited-filter hazard as the 6-Z62
+    // write probe) is detected via the KR64_SIGSYS_HITS counter /
+    // ENOSYS/EPERM/EACCES and condemns the capability process-wide —
+    // the surviving SIGSYS is caught by the 6-Z62 catcher installed
+    // at run_ptrace_loop entry, so the probe costs at most ONE
+    // survivable signal per process, then PEEK forever.
+    match PVM_READV_USABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        -1 => {} // condemned — go straight to the legacy chain
+        _ => {
+            let before = KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let got = read_child_string_pvm(pid, addr);
+            let sigsys_fired = KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed) > before;
+            if got.is_some() {
+                PVM_READV_USABLE.store(1, std::sync::atomic::Ordering::Relaxed);
+                return got;
+            }
+            // Failure: decide whether this CONDEMNS the capability.
+            // A seccomp block (trap → ENOSYS, ERRNO → EPERM/EACCES, or
+            // the catcher's counter moved) means EVERY later call would
+            // fail the same way — remember it. An address-specific
+            // fault (EFAULT/EINVAL/ESRCH…) must NOT condemn: only that
+            // address was unreadable (mirror of the write path).
+            if sigsys_fired {
+                PVM_READV_USABLE.store(-1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == libc::ENOSYS || errno == libc::EPERM || errno == libc::EACCES {
+                    PVM_READV_USABLE.store(-1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            // Fall through to the legacy chain for THIS read.
+        }
     }
     let mut result = Vec::new();
     let mut offset = 0i64;
@@ -5848,30 +5950,15 @@ fn script_shebang_interpreter(path: &str) -> Option<(String, Option<String>)> {
 /// 6-Z167: read a NUL-terminated C string from the child via
 /// process_vm_readv (256-byte chunks, 4096 cap). Returns None when the
 /// very first chunk fails — callers fall back to the legacy PEEK result.
+/// 6-Z267: the per-chunk syscall is the shared `process_vm_readv_chunk`
+/// helper (same raw-syscall invocation; also serves the 6-Z267 pvm-first
+/// fast path in read_child_string and its seccomp capability probe).
 fn read_child_string_pvm(pid: libc::pid_t, addr: u64) -> Option<String> {
     let mut result = Vec::new();
     let mut off = 0usize;
     while result.len() <= 4096 {
         let mut buf = [0u8; 256];
-        let local = libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let remote = libc::iovec {
-            iov_base: (addr as usize + off) as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        let n = unsafe {
-            libc::syscall(
-                libc::SYS_process_vm_readv,
-                pid,
-                &local as *const libc::iovec,
-                1 as libc::c_ulong,
-                &remote as *const libc::iovec,
-                1 as libc::c_ulong,
-                0 as libc::c_ulong,
-            )
-        };
+        let n = process_vm_readv_chunk(pid, (addr as usize + off) as u64, &mut buf);
         if n <= 0 {
             break;
         }
@@ -9593,6 +9680,36 @@ fn process_vm_writev_chunk(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> isize {
     }
 }
 
+/// 6-Z267: one process_vm_readv(2) call filling `buf` from the child at
+/// `addr` (same raw-syscall rationale as process_vm_writev_chunk — bionic
+/// at android21 exports no wrapper symbol; libc::SYS_process_vm_readv is
+/// the kernel-ABI constant, no linking involved). Returns the byte count
+/// (may be SHORT when the read hit the end of a readable mapping) or -1.
+fn process_vm_readv_chunk(pid: libc::pid_t, addr: u64, buf: &mut [u8]) -> isize {
+    if buf.is_empty() {
+        return 0;
+    }
+    let local = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    unsafe {
+        libc::syscall(
+            libc::SYS_process_vm_readv,
+            pid,
+            &local,
+            1usize,
+            &remote,
+            1usize,
+            0usize,
+        ) as isize
+    }
+}
+
 /// Task 6-Z62: write `bytes` into the child at `addr` with
 /// process_vm_writev, in 1 MiB calls (the syscall accepts up to
 /// MAX_RW_COUNT ≈ 2 GiB per call; 1 MiB keeps each call's kernel-side
@@ -9962,7 +10079,41 @@ fn poke_capget_data(pid: libc::pid_t, addr: u64) -> bool {
 // the anomaly — exactly the window the investigation needs — instead of
 // being scattered across a 10 MB log. Steady-state stderr volume drops
 // by ~2/3 per boot.
-static STOP_RING: std::sync::Mutex<std::collections::VecDeque<String>> =
+// ── 6-Z267: STOP RING PAYLOAD → Copy records (render at dump time) ──
+//
+// 6-Z266 made the recent-stops ring allocation-free; the 6-Z260 RAW
+// STOP + RESUME forensics ring (below) still paid, on EVERY loop
+// iteration (every ptrace stop — ×2 per guest syscall):
+//   * two format!() heap allocations,
+//   * a Debug-format of the GROWING tracked_pids Vec per RESUME line
+//     (O(stops × tracked_pids) over a boot — hundreds of forked
+//     children make every line thousands of bytes long),
+//   * two Mutex-guarded String deque pushes.
+// The storm fix removed the pathological rates, but the per-stop cost
+// stayed on the phone's boot path. The ring now stores a `Copy`
+// record (16 bytes) and renders the byte-identical legacy strings only
+// at dump time (`stop_ring_drain`), mirroring the RecentStopRecord
+// pattern and its parity-test discipline.
+#[derive(Clone, Copy)]
+enum StopRingEvent {
+    /// 6-Z213 RESUME line payload (pre-resume forensics).
+    Resume {
+        seq: u64,
+        pid: libc::pid_t,
+        loop_count: u64,
+        resume_signal: i32,
+    },
+    /// 6-Z213 RAW STOP line payload (post-waitpid forensics).
+    RawStop {
+        seq: u64,
+        pid: libc::pid_t,
+        status: u32,
+        wstopsig: i32,
+        ptrace_event: u32,
+    },
+}
+
+static STOP_RING: std::sync::Mutex<std::collections::VecDeque<StopRingEvent>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 /// Cap: 6000 lines ≈ the last ~3000 resume+stop pairs (~700 KB).
 const STOP_RING_CAP: usize = 6000;
@@ -9974,20 +10125,51 @@ const STOP_RING_MAX_DUMPS: u64 = 24;
 static STOP_RING_LAST_DUMP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STOP_RING_DUMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn stop_ring_push(line: String) {
+fn stop_ring_push_event(ev: StopRingEvent) {
     if let Ok(mut ring) = STOP_RING.lock() {
         if ring.len() >= STOP_RING_CAP {
             ring.pop_front();
         }
-        ring.push_back(line);
+        ring.push_back(ev);
     }
 }
 
-/// Drain the ring for a `reason`. Rate-limited; returns the lines to log
-/// (header first, payload next, footer last) — empty when suppressed or
-/// empty. The caller owns the actual logging, which keeps this free of
-/// closure-lifetime coupling with the loop's `log` helper.
-fn stop_ring_drain(reason: &str) -> Vec<String> {
+/// Render a stored event to its LEGACY log format (byte-identical to
+/// the old per-iteration format! strings — CI artifact greps and the
+/// worklog evidence chains match on them). `tracked` is the tracer's
+/// CURRENT tracked-pids snapshot at dump time: the legacy RESUME line
+/// carried the list as-it-was-at-push; for the dump's correlation
+/// purpose (which children the tracer knew about) the dump-time
+/// snapshot is equivalent and costs nothing per stop. `{:?}` on a
+/// slice renders identically to the old Vec Debug.
+fn stop_ring_event_render(ev: StopRingEvent, tracked: &[libc::pid_t]) -> String {
+    match ev {
+        StopRingEvent::Resume {
+            seq,
+            pid,
+            loop_count,
+            resume_signal,
+        } => format!(
+            "6-Z213 RESUME #{}: pid={} loop_count={} resume_signal={} tracked_pids={:?}",
+            seq, pid, loop_count, resume_signal, tracked
+        ),
+        StopRingEvent::RawStop {
+            seq,
+            pid,
+            status,
+            wstopsig,
+            ptrace_event,
+        } => format!(
+            "6-Z213 RAW STOP #{}{}: pid={} status=0x{:08x} wstopsig={} ptrace_event={}",
+            seq, "", pid, status, wstopsig, ptrace_event
+        ),
+    }
+}
+
+/// Drain the ring for a `reason` (rate-limited; header + rendered
+/// payload + footer — empty when suppressed or empty). `tracked` is
+/// the dump-time tracked-pids snapshot used for the RESUME lines.
+fn stop_ring_drain(reason: &str, tracked: &[libc::pid_t]) -> Vec<String> {
     let now_ms = crate::boot_elapsed_ms() as u64;
     let last = STOP_RING_LAST_DUMP_MS.load(std::sync::atomic::Ordering::Relaxed);
     let dumps = STOP_RING_DUMPS.load(std::sync::atomic::Ordering::Relaxed);
@@ -9996,7 +10178,7 @@ fn stop_ring_drain(reason: &str) -> Vec<String> {
     {
         return Vec::new();
     }
-    let drained: Vec<String> = match STOP_RING.lock() {
+    let drained: Vec<StopRingEvent> = match STOP_RING.lock() {
         Ok(mut ring) => ring.drain(..).collect(),
         Err(_) => return Vec::new(),
     };
@@ -10011,7 +10193,11 @@ fn stop_ring_drain(reason: &str) -> Vec<String> {
         "6-Z260 STOP-RING DUMP (reason={}, lines={}): ── last {} resume/stop pairs before this anomaly ──",
         reason, n, n
     ));
-    out.extend(drained);
+    out.extend(
+        drained
+            .into_iter()
+            .map(|ev| stop_ring_event_render(ev, tracked)),
+    );
     out.push(format!(
         "6-Z260 STOP-RING DUMP (reason={}): ── end ──",
         reason
@@ -10040,25 +10226,19 @@ pub fn run_ptrace_loop(
     recovery_pid: Option<libc::pid_t>,
     boot_recovery: bool,
 ) -> i32 {
-    use std::io::Write;
+    // 6-Z267: the loop's lines flow through the crate-level BUFFERED
+    // trace-line sink (see lib.rs) — one write per ~16 KiB instead of
+    // one write(2) per line on the pipe → FileLogger tee → logcat →
+    // disk chain that 6-Z260 measured as a visible share of the phone's
+    // boot time. Line format/order is byte-identical; the RAII guard
+    // below drains the tail on every loop exit path.
     let log = |msg: &str| {
-        // 6-Z131: cap every emitted line at MAX_LOG_LINE bytes — the
-        // app-side FileLogger tee re-reads this process's stderr
-        // line-by-line, and a huge diagnostic line OOM'd the whole app
-        // (run 32786386000: a single 145 MB "line").
-        // 6-Z260: carry the boot-elapsed stamp on every ptrace-loop line
-        // (the info!/warning!/error! macros carry the same stamp) so a
-        // raw kr64-app-stderr.log converts directly into a boot-phase
-        // timeline — the "OrangeFox takes a minute on the physical
-        // phone" class needs per-phase wall times, which the artifact
-        // alone could not provide (no timestamps on this stream).
-        let _ = writeln!(
-            std::io::stderr(),
-            "[KR64][ptrace][+{}ms] {}",
-            crate::boot_elapsed_ms(),
-            crate::cap_log_line(msg, crate::MAX_LOG_LINE)
-        );
+        crate::trace_log_line(msg);
     };
+    // Every run_ptrace_loop exit path (early returns included) reclaims
+    // this guard, flushing any buffered tail before the caller reads
+    // the return code / exits.
+    let _trace_flush_guard = crate::TraceLogFlushGuard::new();
 
     log(&format!(
         "ptrace loop started for pid {} (rootfs={}, data_dir={})",
@@ -11349,15 +11529,16 @@ pub fn run_ptrace_loop(
             // 6-Z260: ring-buffered — emitted to stderr only in the
             // anomaly-window dumps (see stop_ring_dump). Keeps the full
             // resume correlation evidence at near-zero steady-state I/O.
+            // 6-Z267: allocation-free Copy record — the legacy String
+            // (including the O(len) Debug-format of the GROWING
+            // tracked_pids Vec) is now rendered only at dump time.
             let _ = n;
-            stop_ring_push(format!(
-                "6-Z213 RESUME #{}: pid={} loop_count={} resume_signal={} tracked_pids={:?}",
-                n + 1,
-                current_pid,
+            stop_ring_push_event(StopRingEvent::Resume {
+                seq: n + 1,
+                pid: current_pid,
                 loop_count,
                 resume_signal,
-                tracked_pids,
-            ));
+            });
             unsafe {
                 libc::ptrace(
                     libc::PTRACE_SYSCALL,
@@ -11734,7 +11915,7 @@ pub fn run_ptrace_loop(
             log(&format!("waitpid failed: {}", e));
             // 6-Z260: the ring holds the last resume/stop pairs — dump
             // them so the teardown window is attributable.
-            for line in stop_ring_drain("ptrace-loop-waitpid-failed") {
+            for line in stop_ring_drain("ptrace-loop-waitpid-failed", &tracked_pids) {
                 log(&line);
             }
             return -1;
@@ -11765,21 +11946,27 @@ pub fn run_ptrace_loop(
             let n = RAW_STOP_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // 6-Z260: ring-buffered — emitted to stderr only in the
             // anomaly-window dumps (see stop_ring_dump).
+            // 6-Z267: allocation-free Copy record — rendered to the
+            // byte-identical legacy string only at dump time.
             let _ = n;
-            stop_ring_push(format!(
-                "6-Z213 RAW STOP #{}{}: pid={} status=0x{:08x} wstopsig={} ptrace_event={}",
-                n + 1,
-                String::new(),
-                waited,
-                status as u32,
-                libc::WSTOPSIG(status),
-                ((status as u32) >> 16) & 0xFFFF,
-            ));
+            stop_ring_push_event(StopRingEvent::RawStop {
+                seq: n + 1,
+                pid: waited,
+                status: status as u32,
+                wstopsig: libc::WSTOPSIG(status),
+                ptrace_event: ((status as u32) >> 16) & 0xFFFF,
+            });
         }
         // 6-Z126: a successfully received stop proves the tracee
         // relationship is healthy — reset its ESRCH streak (the streak
         // only survives while PTRACE_SYSCALL keeps failing).
-        esrch_streak.remove(&waited);
+        // 6-Z267: the streak map is almost always EMPTY (entries exist
+        // only while a pid ping-pongs ESRCH) — guard the per-stop map
+        // write with an emptiness check so the common stop costs no
+        // HashMap probe at all.
+        if !esrch_streak.is_empty() {
+            esrch_streak.remove(&waited);
+        }
         // Update `current_pid` to the child that actually stopped. The
         // shadow `let pid = current_pid` below makes the existing
         // handler code (which uses `pid` for ptrace_getregs /
@@ -12493,7 +12680,9 @@ pub fn run_ptrace_loop(
                             // stop-ring exists for — dump the last resume/stop
                             // pairs around it.
                             if libc::WIFSIGNALED(ws) {
-                                for line in stop_ring_drain("tracee-killed-by-signal") {
+                                for line in
+                                    stop_ring_drain("tracee-killed-by-signal", &tracked_pids)
+                                {
                                     log(&line);
                                 }
                             }
@@ -13023,7 +13212,18 @@ pub fn run_ptrace_loop(
                             loop_count,
                             pid,
                             kind: RecentStopKind::Getregs32Failed,
-                            nr: syscall_num,
+                            // 6-Z267: no syscall number exists on this
+                            // path — the compat GETREGSET itself failed,
+                            // so the registers hold nothing trustworthy
+                            // (this mirrors the pre-ring string form,
+                            // which printed the literal "syscall?"
+                            // placeholder). `render()` never prints `nr`
+                            // for Getregs32Failed, so the placeholder is
+                            // unobservable. Referencing the later
+                            // `syscall_num` binding here compiled on
+                            // x86_64 only and broke the aarch64 CI build
+                            // (E0425, run 33366020128).
+                            nr: 0,
                         });
                         continue;
                     }
@@ -14655,7 +14855,8 @@ pub fn run_ptrace_loop(
                                 // window (6-Z259's tracer stop-accounting
                                 // investigation) — dump the surrounding
                                 // resume/stop pairs with it.
-                                for line in stop_ring_drain("6-Z257-bind-outer-gate") {
+                                for line in stop_ring_drain("6-Z257-bind-outer-gate", &tracked_pids)
+                                {
                                     log(&line);
                                 }
                             }
@@ -24166,14 +24367,22 @@ mod tests {
         let _guard = Z260_TEST_LOCK.lock();
         // Drain anything left by other tests; also resets the dump
         // bookkeeping for THIS test's window below.
-        let _ = stop_ring_drain("z260-test-reset");
+        let _ = stop_ring_drain("z260-test-reset", &[]);
         STOP_RING_DUMPS.store(0, std::sync::atomic::Ordering::Relaxed);
         STOP_RING_LAST_DUMP_MS.store(0, std::sync::atomic::Ordering::Relaxed);
 
         for i in 0..(STOP_RING_CAP + 100) {
-            stop_ring_push(format!("line-{}", i));
+            // 6-Z267: records now; the render parity test below locks
+            // the legacy strings this used to push directly.
+            stop_ring_push_event(StopRingEvent::RawStop {
+                seq: (i + 1) as u64,
+                pid: 4242,
+                status: 0x0000_857f,
+                wstopsig: 0x80 | libc::SIGTRAP,
+                ptrace_event: 0,
+            });
         }
-        let out = stop_ring_drain("z260-cap-test");
+        let out = stop_ring_drain("z260-cap-test", &[]);
         assert!(out.len() >= 3);
         // header first, footer last
         assert!(out[0].starts_with("6-Z260 STOP-RING DUMP (reason=z260-cap-test,"));
@@ -24181,27 +24390,119 @@ mod tests {
         // payload bounded by the cap, and it holds the NEWEST lines
         let payload = out.len() - 2;
         assert_eq!(payload, STOP_RING_CAP);
-        assert_eq!(out[1], format!("line-{}", 100)); // oldest survivor
-        assert_eq!(out[out.len() - 2], format!("line-{}", STOP_RING_CAP + 99));
+        // 6-Z267: records render at dump time — the oldest survivor is
+        // the event pushed at i=100 (seq=101) and the newest at
+        // i=CAP+99 (seq=CAP+100). stop_ring_event_render is the SAME
+        // function the production dumps use, so build the expected
+        // strings with it (the dedicated parity test below locks the
+        // legacy format itself).
+        let expect_first = stop_ring_event_render(
+            StopRingEvent::RawStop {
+                seq: 101,
+                pid: 4242,
+                status: 0x0000_857f,
+                wstopsig: 0x80 | libc::SIGTRAP,
+                ptrace_event: 0,
+            },
+            &[],
+        );
+        assert_eq!(out[1], expect_first); // oldest survivor
+        let expect_last = stop_ring_event_render(
+            StopRingEvent::RawStop {
+                seq: (STOP_RING_CAP + 100) as u64,
+                pid: 4242,
+                status: 0x0000_857f,
+                wstopsig: 0x80 | libc::SIGTRAP,
+                ptrace_event: 0,
+            },
+            &[],
+        );
+        assert_eq!(out[out.len() - 2], expect_last);
         // ring is empty after a drain
-        let second = stop_ring_drain("z260-empty-test");
+        let second = stop_ring_drain("z260-empty-test", &[]);
         assert!(second.is_empty(), "drain must empty the ring");
+    }
+
+    // ── 6-Z267: stop-ring render PARITY with the legacy per-stop
+    // format! strings ────────────────────────────────────────────────
+    //
+    // CI artifact greps and the worklog evidence chains match on the
+    // exact "6-Z213 RESUME #..." / "6-Z213 RAW STOP #..." lines; the
+    // Copy-record refactor must reproduce them byte-for-byte.
+    #[test]
+    fn z267_stop_ring_render_legacy_parity() {
+        let tracked: Vec<libc::pid_t> = vec![7, 42, 4242];
+        let resume = stop_ring_event_render(
+            StopRingEvent::Resume {
+                seq: 12,
+                pid: 42,
+                loop_count: 3456,
+                resume_signal: 5,
+            },
+            &tracked,
+        );
+        assert_eq!(
+            resume,
+            "6-Z213 RESUME #12: pid=42 loop_count=3456 resume_signal=5 tracked_pids=[7, 42, 4242]"
+        );
+        let raw = stop_ring_event_render(
+            StopRingEvent::RawStop {
+                seq: 314,
+                pid: 15303,
+                status: 0x0000_857f,
+                wstopsig: 0x80 | libc::SIGTRAP,
+                ptrace_event: 0,
+            },
+            &tracked,
+        );
+        assert_eq!(
+            raw,
+            "6-Z213 RAW STOP #314: pid=15303 status=0x0000857f wstopsig=133 ptrace_event=0"
+        );
+        // fork event stop: ptrace_event = PTRACE_EVENT_CLONE (3),
+        // status = (event << 16) | (SIGTRAP|0x80) << 8 | 0x7f.
+        let fork = stop_ring_event_render(
+            StopRingEvent::RawStop {
+                seq: 1,
+                pid: 9,
+                status: 0x0003_857f,
+                wstopsig: 0x80 | libc::SIGTRAP,
+                ptrace_event: 3,
+            },
+            &[],
+        );
+        assert_eq!(
+            fork,
+            "6-Z213 RAW STOP #1: pid=9 status=0x0003857f wstopsig=133 ptrace_event=3"
+        );
     }
 
     #[test]
     fn z260_stop_ring_rate_limits_hot_anomaly_sites() {
         let _guard = Z260_TEST_LOCK.lock();
-        let _ = stop_ring_drain("z260-test-reset-2");
+        let _ = stop_ring_drain("z260-test-reset-2", &[]);
         STOP_RING_DUMPS.store(0, std::sync::atomic::Ordering::Relaxed);
         STOP_RING_LAST_DUMP_MS.store(0, std::sync::atomic::Ordering::Relaxed);
 
-        stop_ring_push("a".to_string());
-        assert!(!stop_ring_drain("z260-rate-1").is_empty());
+        stop_ring_push_event(StopRingEvent::RawStop {
+            seq: 1,
+            pid: 1,
+            status: 0,
+            wstopsig: 0,
+            ptrace_event: 0,
+        });
+        assert!(!stop_ring_drain("z260-rate-1", &[]).is_empty());
         // Immediate second drain must be suppressed (boot_elapsed_ms is
         // anchored at daemon start, so in-test it is ~0 ms — far below
         // STOP_RING_DUMP_MIN_INTERVAL_MS).
-        stop_ring_push("b".to_string());
-        assert!(stop_ring_drain("z260-rate-2").is_empty());
+        stop_ring_push_event(StopRingEvent::RawStop {
+            seq: 2,
+            pid: 1,
+            status: 0,
+            wstopsig: 0,
+            ptrace_event: 0,
+        });
+        assert!(stop_ring_drain("z260-rate-2", &[]).is_empty());
     }
 
     // ── 6-Z257: fchmodat/fchownat ENTRY-rewrite reachability ─────────

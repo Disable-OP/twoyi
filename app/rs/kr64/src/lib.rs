@@ -141,6 +141,99 @@ pub(crate) fn boot_clock_init() {
     let _ = BOOT_CLOCK.set(std::time::Instant::now());
 }
 
+// ── 6-Z267: buffered tracer-stderr line sink ─────────────────────────
+//
+// The ptrace loop's `log` used to pay ONE write(2) per line on the
+// stderr pipe (std's Stderr is UNBUFFERED) — and the downstream chain
+// (app-side FileLogger tee reading the pipe line-by-line → logcat →
+// disk) is the exact chain 6-Z260 measured as a visible share of the
+// phone's boot time ("kr64 blocks when the pipe fills, and the whole
+// guest is frozen while the tracer waits on write()"). The pre-cap
+// 6-Z210 broad-DIAG phase alone emits up to 20k lines per boot.
+//
+// The sink batches whole lines into a 16 KiB buffer (≈1 write per
+// 150-300 lines instead of one per line) while keeping the emitted
+// byte stream IDENTICAL: same line format, same order, newline-
+// terminated lines (the tee's line reader is unaffected). Flush points:
+//   * threshold reached inside the sink (the common case),
+//   * an explicit flush() (RAII guard at run_ptrace_loop exit — every
+//     early return reclaims the guard and drains the tail),
+//   * Mutex-poisoned fallback writes directly (never lose a line to a
+//     poisoned lock).
+// The only unflushed-tail window is a hard SIGKILL mid-boot with a
+// non-empty buffer (≤16 KiB) — the same window in which ANY stderr
+// writer on the device loses data; the stop-ring dumps cover forensics.
+static TRACE_LINE_BUF: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+const TRACE_LINE_FLUSH_BYTES: usize = 16 * 1024;
+
+fn trace_line_flush_locked(buf: &mut String) {
+    if !buf.is_empty() {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), buf.as_bytes());
+        buf.clear();
+    }
+}
+
+/// Emit one tracer line through the buffer (format identical to the
+/// old direct writeln!: `[KR64][ptrace][+<ms>] <line>`).
+pub(crate) fn trace_log_line(msg: &str) {
+    match TRACE_LINE_BUF.lock() {
+        Ok(mut buf) => {
+            buf.push_str(&format!(
+                "[KR64][ptrace][+{}ms] {}\n",
+                boot_elapsed_ms(),
+                cap_log_line(msg, MAX_LOG_LINE)
+            ));
+            if buf.len() >= TRACE_LINE_FLUSH_BYTES {
+                trace_line_flush_locked(&mut buf);
+            }
+        }
+        Err(_) => {
+            // Poisoned (a panic while the buffer was held): never drop
+            // a line — write it through directly.
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                format!(
+                    "[KR64][ptrace][+{}ms] {}\n",
+                    boot_elapsed_ms(),
+                    cap_log_line(msg, MAX_LOG_LINE)
+                )
+                .as_bytes(),
+            );
+        }
+    }
+}
+
+/// Drain the buffer to stderr immediately (teardown paths).
+pub(crate) fn trace_log_flush() {
+    if let Ok(mut buf) = TRACE_LINE_BUF.lock() {
+        trace_line_flush_locked(&mut buf);
+    }
+}
+
+/// RAII guard: flushes the trace-line buffer when dropped. Held for the
+/// lifetime of `run_ptrace_loop` so EVERY early return (waitpid
+/// failure, all-children-gone, teardown) drains the tail exactly once,
+/// with no per-path bookkeeping.
+pub(crate) struct TraceLogFlushGuard;
+
+impl TraceLogFlushGuard {
+    pub(crate) fn new() -> Self {
+        TraceLogFlushGuard
+    }
+}
+
+impl Default for TraceLogFlushGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for TraceLogFlushGuard {
+    fn drop(&mut self) {
+        trace_log_flush();
+    }
+}
+
 /// Log an info-level message to stderr.
 macro_rules! info {
     ($($arg:tt)*) => {

@@ -914,6 +914,19 @@ pub struct SandboxPolicy {
     /// by the 6-Z101/6-Z102 execve staging (the rootfs lives on a
     /// noexec partition; staged guest binaries MUST be exec'able).
     staging_dir: Option<PathBuf>,
+    /// 6-Z267: `format!("{}/", staging_dir)` precomputed — translate_guest
+    /// runs on EVERY path-taking syscall and previously allocated this
+    /// prefix string on EVERY call just to starts_with against it.
+    staging_prefix: Option<String>,
+    /// 6-Z267: canonical staging-dir forms precomputed at construction
+    /// (the staging dir is created by the app BEFORE kr64 starts, so
+    /// canonicalization here succeeds in the normal boot; when it
+    /// fails — dir not yet created — the fields stay None and
+    /// verify_real_path keeps the old per-call canonicalize fallback,
+    /// preserving the exact old semantics at the old cost).
+    staging_dir_slash: Option<String>,
+    staging_dir_canon_slash: Option<String>,
+    staging_dir_canon: Option<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -944,6 +957,10 @@ impl SandboxPolicy {
             rootfs_canon_slash,
             rootfs_canon: rootfs_canon.unwrap_or_else(|| PathBuf::from(rootfs)),
             staging_dir: None,
+            staging_prefix: None,
+            staging_dir_slash: None,
+            staging_dir_canon_slash: None,
+            staging_dir_canon: None,
         }
     }
 
@@ -960,6 +977,33 @@ impl SandboxPolicy {
     pub fn with_staging(rootfs: &str, data_dir: &str) -> Self {
         let mut p = SandboxPolicy::new(rootfs);
         p.staging_dir = Some(PathBuf::from(data_dir).join("cache"));
+        // 6-Z267: precompute the matching prefix once (with the trailing
+        // '/') so the per-syscall translate_guest check is allocation-free.
+        p.staging_prefix = p
+            .staging_dir
+            .as_ref()
+            .map(|s| format!("{}/", s.to_string_lossy()));
+        // 6-Z267: precompute the canonical forms for verify_real_path —
+        // one canonicalize at construction instead of one per path
+        // syscall. Failure (dir missing at this instant) leaves None;
+        // verify_real_path falls back to the per-call canonicalize,
+        // exactly as it always did.
+        if let Some(staging) = p.staging_dir.as_ref() {
+            let st = staging.to_string_lossy().into_owned();
+            let mut st_slash = st.clone();
+            if !st_slash.ends_with('/') {
+                st_slash.push('/');
+            }
+            p.staging_dir_slash = Some(st_slash);
+            if let Ok(c) = std::fs::canonicalize(staging) {
+                let mut c_slash = c.to_string_lossy().into_owned();
+                if !c_slash.ends_with('/') {
+                    c_slash.push('/');
+                }
+                p.staging_dir_canon_slash = Some(c_slash);
+                p.staging_dir_canon = Some(c);
+            }
+        }
         p
     }
 
@@ -1076,13 +1120,12 @@ impl SandboxPolicy {
         // If yes, return the path UNCHANGED — it's a host backing
         // path that the kernel + the tracer's execve staging both
         // already know about.
-        if let Some(ref staging) = self.staging_dir {
-            let staging_str = staging.to_string_lossy();
-            let staging_str = staging_str.as_ref();
+        if let Some(ref staging_prefix) = self.staging_prefix {
             // Match either /data/.../cache (the dir itself) or
             // /data/.../cache/... (anything under it). Both are
             // host backing paths.
-            if path == staging_str || path.starts_with(&format!("{}/", staging_str)) {
+            let staging_str: &str = staging_prefix.trim_end_matches('/');
+            if path == staging_str || path.starts_with(staging_prefix.as_str()) {
                 return path.to_string();
             }
         }
@@ -1219,26 +1262,35 @@ impl SandboxPolicy {
         //    the literal and the canonical form are accepted (the
         //    staging dir may not exist yet at policy-construction
         //    time, and /data/user/0 vs /data/data aliasing applies).
+        //    6-Z267: the canonical forms are precomputed at policy
+        //    construction; this per-call canonicalize fallback only
+        //    runs when construction-time canonicalization failed (dir
+        //    not yet created) — keeping the old acceptance semantics.
         if let Some(staging) = &self.staging_dir {
-            let st = staging.to_string_lossy().into_owned();
-            let st_slash = if st.ends_with('/') {
-                st.clone()
-            } else {
-                format!("{}/", st)
-            };
-            if s.starts_with(&st_slash) || *real == *staging {
-                return SandboxVerdict::Allow;
-            }
-            if let Ok(c) = std::fs::canonicalize(&staging) {
-                let c_slash = {
-                    let mut x = c.to_string_lossy().into_owned();
-                    if !x.ends_with('/') {
-                        x.push('/');
-                    }
-                    x
-                };
-                if s.starts_with(&c_slash) || *real == c {
+            if let Some(st_slash) = &self.staging_dir_slash {
+                if s.starts_with(st_slash.as_str()) || *real == *staging {
                     return SandboxVerdict::Allow;
+                }
+            }
+            if let Some(c_slash) = &self.staging_dir_canon_slash {
+                if s.starts_with(c_slash.as_str())
+                    || self.staging_dir_canon.as_deref() == Some(real)
+                {
+                    return SandboxVerdict::Allow;
+                }
+            }
+            // Fallback: precomputed canonical form unavailable (the
+            // staging dir did not exist at construction). Canonicalize
+            // now — the dir may have been created since.
+            if self.staging_dir_canon.is_none() {
+                if let Ok(c) = std::fs::canonicalize(staging) {
+                    let mut c_slash = c.to_string_lossy().into_owned();
+                    if !c_slash.ends_with('/') {
+                        c_slash.push('/');
+                    }
+                    if s.starts_with(&c_slash) || *real == c {
+                        return SandboxVerdict::Allow;
+                    }
                 }
             }
         }
