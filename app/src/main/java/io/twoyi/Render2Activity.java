@@ -211,6 +211,16 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             FileLogger.boot("renderer_set_data_dir", "dataDir=" + dataDir);
             FileLogger.i(TAG, "surfaceCreated: dataDir=" + dataDir);
 
+            // 6-Z271: push REAL host battery values into the guest's
+            // power_supply sysfs (sticky ACTION_BATTERY_CHANGED receiver;
+            // kr64's static-default refresh thread stands down via the
+            // .host-managed marker). Idempotent.
+            try {
+                HostHalBridge.startBatteryReporting(getApplicationContext());
+            } catch (Throwable t) {
+                FileLogger.i(TAG, "startBatteryReporting failed: " + t);
+            }
+
             // Set the Boot Recovery (TWRP) flag BEFORE init() so the
             // native core knows whether to pass --boot-recovery to kr64.
             // The flag is read from the active profile's settings, so

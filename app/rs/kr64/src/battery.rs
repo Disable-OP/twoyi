@@ -460,6 +460,14 @@ fn write_file_at(dir: &Path, name: &str, value: &str) -> std::io::Result<()> {
 /// still attempted — a partial refresh is better than none, and the
 /// next tick will retry the failed file).
 fn refresh_dir(dir: &Path) -> std::io::Result<()> {
+    // 6-Z271: the host app can take over this directory by creating the
+    // `.host-managed` marker (HostHalBridge.startBatteryReporting pushes
+    // REAL values from ACTION_BATTERY_CHANGED on every change). When the
+    // marker exists the refresh thread must NOT clobber live values with
+    // the static defaults below.
+    if dir.join(".host-managed").exists() {
+        return Ok(());
+    }
     let level = jni_get_battery_level();
     let status =
         BatteryStatus::from_u8(jni_get_battery_status()).unwrap_or(BatteryStatus::Discharging);
