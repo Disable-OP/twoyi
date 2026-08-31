@@ -523,10 +523,17 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
     //   charge_status  — A11+ reads it for the charge_status prop; the
     //                    same string set as `status`.
     try_write!("present", "1");
-    try_write!("charge_counter", &(level.min(100) as u32 * 3_500).to_string());
+    try_write!(
+        "charge_counter",
+        &(level.min(100) as u32 * 3_500).to_string()
+    );
     try_write!(
         "current_now",
-        if status.is_charging() { "500000" } else { "-300000" }
+        if status.is_charging() {
+            "500000"
+        } else {
+            "-300000"
+        }
     );
     try_write!("cycle_count", "0");
     try_write!("charge_status", status.as_str());
@@ -551,7 +558,11 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
         let _ = fs::create_dir_all(&usb_dir);
         let _ = fs::create_dir_all(&ac_dir);
         try_write_at(&usb_dir, "type", "USB");
-        try_write_at(&usb_dir, "online", if status.is_charging() { "1" } else { "0" });
+        try_write_at(
+            &usb_dir,
+            "online",
+            if status.is_charging() { "1" } else { "0" },
+        );
         try_write_at(&ac_dir, "type", "Mains");
         try_write_at(&ac_dir, "online", "0");
     }

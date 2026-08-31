@@ -2150,7 +2150,11 @@ struct Ucred {
 const SO_PEERCRED_RAW: i32 = 1;
 
 fn peer_credentials(stream: &UnixStream) -> (i32, u32, u32) {
-    let mut cred = Ucred { pid: 0, uid: 0, gid: 0 };
+    let mut cred = Ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
     let mut len = std::mem::size_of::<Ucred>() as u32;
     let rc = unsafe {
         libc::getsockopt(
@@ -2697,11 +2701,7 @@ fn handle_write_read(
         if matches!(delivery, Delivery::None) {
             let stolen = {
                 let mut b = bus.lock().expect("binder bus poisoned");
-                let my_pid = b
-                    .conns
-                    .get(&conn_id)
-                    .map(|bx| bx.sender_pid)
-                    .unwrap_or(0);
+                let my_pid = b.conns.get(&conn_id).map(|bx| bx.sender_pid).unwrap_or(0);
                 if my_pid == 0 {
                     None
                 } else {
@@ -4891,11 +4891,7 @@ mod tests {
 
         // ---- Conn A (pid 7777): addService("svc_a") ----
         let mut stream_a = UnixStream::connect(&path).expect("connect A");
-        let (ret_i, _r) = exchange(
-            &mut stream_a,
-            WIRE_CMD_IDENT,
-            &ident_payload(7777),
-        );
+        let (ret_i, _r) = exchange(&mut stream_a, WIRE_CMD_IDENT, &ident_payload(7777));
         assert_eq!(ret_i, 0, "IDENT A accepted");
         let mut args = ParcelWriter::new();
         args.write_string16("svc_a");
@@ -4922,11 +4918,7 @@ mod tests {
 
         // ---- Conn B (pid 8888): getService → handle ----
         let mut stream_b = UnixStream::connect(&path).expect("connect B");
-        let (ret_i2, _r2) = exchange(
-            &mut stream_b,
-            WIRE_CMD_IDENT,
-            &ident_payload(8888),
-        );
+        let (ret_i2, _r2) = exchange(&mut stream_b, WIRE_CMD_IDENT, &ident_payload(8888));
         assert_eq!(ret_i2, 0);
         let mut args2 = ParcelWriter::new();
         args2.write_string16("svc_a");
@@ -4959,11 +4951,7 @@ mod tests {
 
         // ---- Conn A2 (pid 7777, SIBLING): read-only ioctl STEALS ----
         let mut stream_a2 = UnixStream::connect(&path).expect("connect A2");
-        let (ret_i3, _r3) = exchange(
-            &mut stream_a2,
-            WIRE_CMD_IDENT,
-            &ident_payload(7777),
-        );
+        let (ret_i3, _r3) = exchange(&mut stream_a2, WIRE_CMD_IDENT, &ident_payload(7777));
         assert_eq!(ret_i3, 0);
         let mut wr_a2 = Vec::new();
         wr_a2.extend_from_slice(&0u32.to_ne_bytes());

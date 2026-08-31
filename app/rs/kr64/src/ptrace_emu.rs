@@ -8889,15 +8889,16 @@ fn stall_forensic_dump(pid: libc::pid_t) {
     if parts.len() < 3 {
         return;
     }
-    let parse_hex = |s: &str| -> u64 {
-        u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
-    };
+    let parse_hex =
+        |s: &str| -> u64 { u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0) };
     let nr: i64 = parts[0].parse().unwrap_or(-1);
     let a0 = parse_hex(parts[1]);
     let a1 = parse_hex(parts[2]);
     let a2 = parts.get(3).map(|s| parse_hex(s)).unwrap_or(0);
-    let sp = parts.get(8).map(|s| parse_hex(s)).unwrap_or(0);
-    let pc = parts.get(9).map(|s| parse_hex(s)).unwrap_or(0);
+    // /proc/<pid>/syscall layout: nr, arg0..arg5, sp, pc → 9 tokens;
+    // sp = index 7, pc = index 8 (the 6-arg form is fixed by the ABI).
+    let sp = parts.get(7).map(|s| parse_hex(s)).unwrap_or(0);
+    let pc = parts.get(8).map(|s| parse_hex(s)).unwrap_or(0);
 
     // pc → maps attribution (bounded: stop at the first containing line).
     let mut region = String::from("?");
@@ -8919,14 +8920,25 @@ fn stall_forensic_dump(pid: libc::pid_t) {
     ));
 
     // Futex word interpretation (see doc above for the nr set + masking).
+    // NOTE on bionic: a NORMAL (non-PI) bionic pthread mutex state word is
+    // NOT the holder tid (that's glibc) — 0=unlocked, 1=locked, 2=locked
+    // with waiters, and the whole word is 0 when the guest mutex is a
+    // different primitive. A bionic PI/robust word DOES carry the owner
+    // tid with bit 30 set. Word==2 therefore means "some other thread of
+    // this process holds the mutex" — pair with the STALL lines of the
+    // sibling threads to find the holder.
     if nr == 98 || nr == 202 || nr == 240 {
         let word = read_child_u32(pid, a0);
         match word {
             Some(w) => {
                 let desc = if w & 0x4000_0000 != 0 {
                     format!("PI/robust word — held by tid={}", w & !0x4000_0000)
+                } else if w == 2 {
+                    "bionic mutex locked-WITH-WAITERS — a sibling thread holds it (check sibling STALL lines)".to_string()
+                } else if w == 1 {
+                    "bionic mutex locked (no waiters bit) — holder not self-identified".to_string()
                 } else if w != 0 {
-                    format!("nonzero — likely contended pthread mutex, holder tid={}", w)
+                    format!("nonzero word {:#x} (possibly tid={} holder)", w, w)
                 } else {
                     "zero (uncontended or not a mutex word)".to_string()
                 };
