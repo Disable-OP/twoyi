@@ -8856,6 +8856,93 @@ fn proc_ppid(pid: libc::pid_t) -> Option<libc::pid_t> {
     tokens.next()?.parse::<libc::pid_t>().ok()
 }
 
+/// 6-Z271f: forensic dump for one blocked-in-syscall tracee.
+///
+/// /proc/<pid>/syscall exposes the REAL syscall nr, its 6 argument
+/// registers, sp and pc for a task blocked in-kernel — read straight
+/// from the task's saved pt_regs via procfs, NO ptrace stop required
+/// (a tracee that is merely blocked, not ptrace-stopped, cannot be
+/// GETREGS'd without PTRACE_INTERRUPT resync games; procfs is free and
+/// side-effect-free). Format: "nr arg0 arg1 arg2 arg3 arg4 arg5 sp pc"
+/// (all hex except nr). "running" means the task was on-CPU at read
+/// time — not our class, skip.
+///
+/// Follow-ups once nr+args are known:
+///   * pc → /proc/<pid>/maps: names the library+offset the blocked
+///     thread will return into (the shlib? libbinder? bionic?), the one
+///     datum that separated "our mutex" from "libbinder's lock" in the
+///     conn=4 futex stall.
+///   * nr == futex (aarch64=98, x86_64=202, i386/arm32=240): read the
+///     4-byte futex WORD at uaddr. A bionic pthread mutex word holds
+///     the owning TID while contended (normal mutexes store the tid
+///     directly; robust/PI words have bit 30 set) — logging it NAMES
+///     the lock holder outright when the holder is another guest thread.
+fn stall_forensic_dump(pid: libc::pid_t) {
+    let raw = match std::fs::read_to_string(format!("/proc/{}/syscall", pid)) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return, // gone, or kernel without CONFIG_HAVE_ARCH_TRACEHOOK
+    };
+    if raw.is_empty() || raw == "running" {
+        return;
+    }
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    if parts.len() < 3 {
+        return;
+    }
+    let parse_hex = |s: &str| -> u64 {
+        u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
+    };
+    let nr: i64 = parts[0].parse().unwrap_or(-1);
+    let a0 = parse_hex(parts[1]);
+    let a1 = parse_hex(parts[2]);
+    let a2 = parts.get(3).map(|s| parse_hex(s)).unwrap_or(0);
+    let sp = parts.get(8).map(|s| parse_hex(s)).unwrap_or(0);
+    let pc = parts.get(9).map(|s| parse_hex(s)).unwrap_or(0);
+
+    // pc → maps attribution (bounded: stop at the first containing line).
+    let mut region = String::from("?");
+    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{}/maps", pid)) {
+        for line in maps.lines() {
+            let mut r = line.splitn(2, ' ');
+            let mut range = r.next().unwrap_or("").split('-');
+            let lo = u64::from_str_radix(range.next().unwrap_or("0"), 16).unwrap_or(0);
+            let hi = u64::from_str_radix(range.next().unwrap_or("0"), 16).unwrap_or(0);
+            if pc >= lo && pc < hi {
+                region = line.to_string();
+                break;
+            }
+        }
+    }
+    crate::trace_log_line(&format!(
+        "6-Z271f STALL-DUMP: pid={} nr={} arg0={:#x} arg1={:#x} arg2={:#x} sp={:#x} pc={:#x} maps[pc]={}",
+        pid, nr, a0, a1, a2, sp, pc, region
+    ));
+
+    // Futex word interpretation (see doc above for the nr set + masking).
+    if nr == 98 || nr == 202 || nr == 240 {
+        let word = read_child_u32(pid, a0);
+        match word {
+            Some(w) => {
+                let desc = if w & 0x4000_0000 != 0 {
+                    format!("PI/robust word — held by tid={}", w & !0x4000_0000)
+                } else if w != 0 {
+                    format!("nonzero — likely contended pthread mutex, holder tid={}", w)
+                } else {
+                    "zero (uncontended or not a mutex word)".to_string()
+                };
+                crate::trace_log_line(&format!(
+                    "6-Z271f STALL-DUMP: pid={} futex uaddr={:#x} op={} word={:#x} — {}",
+                    pid, a0, a1, w, desc
+                ));
+            }
+            None => crate::trace_log_line(&format!(
+                "6-Z271f STALL-DUMP: pid={} futex uaddr={:#x} UNREADABLE (pvm+peek both failed)",
+                pid, a0
+            )),
+        }
+    }
+}
+
 /// 6-Z190: coverage watchdog sweep — heal UNTRACED guest-tree processes.
 ///
 /// EVIDENCE (TWRP 2.8.7.2 angler, run 33148931282): a THIRD recovery
@@ -12538,6 +12625,20 @@ pub fn run_ptrace_loop(
                         .map(|(nr, _)| *nr)
                         .unwrap_or(-1)
                 ));
+                // 6-Z271f: forensic dump — the STALL line above carries a
+                // STALE nr (the last ENTRY the tracer happened to see;
+                // entries are missed under stop-storm load, hence the -1s
+                // and the misleading 64/200/207s). /proc/<pid>/syscall
+                // exposes the REAL blocked syscall nr + 6 args + sp + pc
+                // straight from the task's saved register state — no
+                // ptrace stop needed (a tracee blocked in-kernel cannot be
+                // GETREGS'd without PTRACE_INTERRUPT, but procfs always
+                // reports the saved state). Run 33431538542's decisive
+                // unknown — pid 2684 `Binder:1_2` in futex_do_wait with a
+                // stale recvfrom ENTRY — becomes answerable: true nr,
+                // futex uaddr/op, the futex WORD (a pthread mutex word
+                // holds the owning TID), and the library owning PC.
+                stall_forensic_dump(sp);
             }
         }
 

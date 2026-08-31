@@ -85,6 +85,7 @@ typedef struct prop_info prop_info;
   #define NR_fchownat 260
   #define NR_close    3
   #define NR_write    1
+  #define NR_read     0
   #define NR_getpid   39
   #define NR_setuid   105
   #define NR_setgid   106
@@ -129,6 +130,7 @@ typedef struct prop_info prop_info;
   #define NR_fchownat 55
   #define NR_close    57
   #define NR_write    64
+  #define NR_read     63
   #define NR_getpid   172
   #define NR_setuid   146
   #define NR_setgid   144
@@ -159,6 +161,7 @@ typedef struct prop_info prop_info;
   #define NR_fchownat 325
   #define NR_close    6
   #define NR_write    4
+  #define NR_read     3
   #define NR_getpid   20
   // 6-Z227: bionic on arm32 issues the *32 uid-syscall variants (the
   // plain-number slots are the 16-bit uid legacy entries). Verified
@@ -716,9 +719,12 @@ static void qemu_pipe_fd_clear_proxy(int fd) {
 // handle_connection reads one frame, dispatches, writes one response), but
 // libbinder shares a single driver fd across its thread pool — concurrent
 // ioctl()s on the same fd would interleave frames and desync the stream.
-// Serializing preserves correctness (a throughput cap, not a deadlock: the
-// proxy always answers exactly one response per request).
-static pthread_mutex_t g_bp_wire_lock = PTHREAD_MUTEX_INITIALIZER;
+// 6-Z271g: that serialization moved from a process-wide mutex to
+// PER-THREAD connections (see g_bp_thread_conns above the WRITE_READ
+// marshalling) — the old g_bp_wire_lock is GONE. Rationale: with one
+// shared conn the wire lock was held for the full response wait (idle
+// looper ticks, 8 s REPLY_TIMEOUT waits), which futex-froze every other
+// binder thread of the process — the measured 20 s stall class.
 
 static int bp_send_all(int fd, const void *buf, size_t len) {
     const unsigned char *p = (const unsigned char *)buf;
@@ -783,6 +789,33 @@ static unsigned char *bp_exchange(int fd, uint32_t cmd,
     return p;
 }
 
+// Real guest pid WITHOUT the getpid fake: the tracer's synthetic
+// /proc/self/status reports the REAL tracer-child pid (vfs.rs
+// make_proc_self_status writes `Pid:\t<real pid>`). Raw syscalls only —
+// no PLT hooks in the way. Returns 0 when unreadable (never the faked 1).
+static uint32_t bp_stat_pid(void) {
+    char buf[512];
+    long fd = syscall(NR_openat, (long)AT_FDCWD, "/proc/self/status",
+                      O_RDONLY, 0l);
+    if (fd < 0) return 0;
+    long n = syscall(NR_read, fd, buf, (long)(sizeof(buf) - 1));
+    syscall(NR_close, fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    // `Pid:\t<digits>` — the synthetic status starts with `Name:` so a
+    // plain strstr for "\nPid:\t" is unambiguous.
+    static const char key[] = "\nPid:\t";
+    char *p = strstr(buf, key);
+    if (!p) return 0;
+    p += sizeof(key) - 1;
+    uint32_t v = 0;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10u + (uint32_t)(*p - '0');
+        p++;
+    }
+    return v;
+}
+
 // Connect a Unix stream socket to the kr64 binder proxy. Candidates, in
 // order (fb-hook input-bridge recipe — fresh socket per candidate because a
 // failed connect(2) leaves socket state unspecified):
@@ -834,8 +867,21 @@ static int binder_proxy_connect(const char *guest_path) {
             // stamp real sender_pid/sender_euid into routed transactions
             // (the kernel would do this; the wire doesn't). Best-effort:
             // a failed IDENT still leaves the connection usable (pid=0).
+            //
+            // 6-Z271f: the announced pid used to be getpid() — which the
+            // tracer FAKES to 1 for every guest process (load-bearing
+            // illusion), so run 33431538542 had all four conns announce
+            // "pid=1" and conn ownership stayed unattributable. Honest
+            // source: the tracer's synthetic /proc/self/status reports
+            // the REAL tracer-child pid (vfs.rs make_proc_self_status
+            // writes `Pid:\t<real pid>`), read here with raw syscalls
+            // only (no PLT hooks in the way). The proxy's SO_PEERCRED
+            // stamp (kernel truth on real kernels) takes precedence;
+            // this announcement fills the gap when creds are stripped
+            // (hardened kernels zero them). 0 = unknown — NEVER stamp
+            // the faked getpid() value.
             struct bp_ident { uint32_t pid; uint32_t uid; uint32_t gid; } ident;
-            ident.pid = (uint32_t)getpid();
+            ident.pid = bp_stat_pid();
             ident.uid = (uint32_t)getuid();
             ident.gid = (uint32_t)getgid();
             unsigned char ihdr[8];
@@ -893,6 +939,132 @@ struct bp_binder_write_read {
     uint64_t read_consumed;
     uint64_t read_buffer;    // guest pointer
 };
+
+// ---------------------------------------------------------------------------
+// 6-Z271g: PER-THREAD proxy connections.
+//
+// Until now one proxy conn served the whole PROCESS, serialized by
+// g_bp_wire_lock — but a WRITE_READ response can legitimately take a long
+// time: an idle looper's 250 ms BR_NOOP tick (6-Z152), or up to
+// REPLY_TIMEOUT = 8 s while the proxy waits for a routed transaction's
+// reply. While one thread waited, EVERY other binder thread of the
+// process blocked in futex on the wire lock. That is the measured
+// futex_do_wait stall class: run 33431538542's pid 2684 `Binder:1_2`
+// blocked 20 s with a stale recvfrom ENTRY, and the same chain deadlocked
+// guest services whose threads needed the wire to drain the very inbox a
+// blocked sender was waiting on — a guaranteed 8 s timeout per call, and
+// recovery's ~18.5 s hole ≈ two chained timeouts. It is also the user's
+// "vibration freezes everything" symptom: the haptic binder call froze
+// behind whatever thread held the lock.
+//
+// Real binder is PER-THREAD: every IPCThreadState talks to the driver
+// independently and blocks only itself. Mirror that: every guest thread
+// issuing a binder ioctl gets its OWN proxy connection, lazily
+// established on first use (IDENT included — the proxy then attributes
+// transactions per thread). No cross-thread lock is ever held during
+// I/O; the table lock below guards lookup/insert/remove only.
+// ---------------------------------------------------------------------------
+struct bp_thread_conn {
+    int binder_fd;    // the fd libbinder opened (the "driver" fd)
+    uint32_t tid;     // gettid of the owning guest thread
+    int conn_fd;      // the dedicated proxy connection
+};
+#define BP_THREAD_CONN_MAX 48
+static struct bp_thread_conn g_bp_thread_conns[BP_THREAD_CONN_MAX];
+static pthread_mutex_t g_bp_thread_conn_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t bp_gettid(void) {
+    return (uint32_t)syscall(SYS_gettid);
+}
+
+// Lookup (no insert). Returns the dedicated conn fd or -1.
+static int bp_thread_conn_lookup(int binder_fd, uint32_t tid) {
+    int conn = -1;
+    pthread_mutex_lock(&g_bp_thread_conn_lock);
+    for (int i = 0; i < BP_THREAD_CONN_MAX; i++) {
+        if (g_bp_thread_conns[i].binder_fd == binder_fd &&
+            g_bp_thread_conns[i].tid == tid &&
+            g_bp_thread_conns[i].conn_fd > 0) {
+            conn = g_bp_thread_conns[i].conn_fd;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_bp_thread_conn_lock);
+    return conn;
+}
+
+// Insert. Returns conn_fd on success, -1 when the table is full.
+static int bp_thread_conn_insert(int binder_fd, uint32_t tid, int conn_fd) {
+    int stored = -1;
+    pthread_mutex_lock(&g_bp_thread_conn_lock);
+    for (int i = 0; i < BP_THREAD_CONN_MAX; i++) {
+        if (g_bp_thread_conns[i].conn_fd == 0) {
+            g_bp_thread_conns[i].binder_fd = binder_fd;
+            g_bp_thread_conns[i].tid = tid;
+            g_bp_thread_conns[i].conn_fd = conn_fd;
+            stored = conn_fd;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_bp_thread_conn_lock);
+    return stored;
+}
+
+// Remove one (binder_fd, tid) entry, closing its conn. Returns the conn
+// fd that was closed, or -1.
+static int bp_thread_conn_remove(int binder_fd, uint32_t tid) {
+    int closed_fd = -1;
+    pthread_mutex_lock(&g_bp_thread_conn_lock);
+    for (int i = 0; i < BP_THREAD_CONN_MAX; i++) {
+        if (g_bp_thread_conns[i].binder_fd == binder_fd &&
+            g_bp_thread_conns[i].tid == tid &&
+            g_bp_thread_conns[i].conn_fd > 0) {
+            closed_fd = g_bp_thread_conns[i].conn_fd;
+            g_bp_thread_conns[i].binder_fd = -1;
+            g_bp_thread_conns[i].tid = 0;
+            g_bp_thread_conns[i].conn_fd = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_bp_thread_conn_lock);
+    return closed_fd;
+}
+
+// close(fd) of the BINDER fd itself: tear down every per-thread conn
+// bound to it (the process is dropping the driver; leaving the sockets
+// open would leak proxy conns and keep ghost registrations alive).
+static void bp_thread_conn_close_for_binder(int binder_fd) {
+    pthread_mutex_lock(&g_bp_thread_conn_lock);
+    for (int i = 0; i < BP_THREAD_CONN_MAX; i++) {
+        if (g_bp_thread_conns[i].binder_fd == binder_fd &&
+            g_bp_thread_conns[i].conn_fd > 0) {
+            syscall(NR_close, g_bp_thread_conns[i].conn_fd);
+            g_bp_thread_conns[i].binder_fd = -1;
+            g_bp_thread_conns[i].tid = 0;
+            g_bp_thread_conns[i].conn_fd = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_bp_thread_conn_lock);
+}
+
+// Resolve the caller's dedicated conn for this binder fd: cached, or a
+// fresh connection (binder_proxy_connect sends the IDENT). Falls back to
+// the binder fd itself when the table is full or the proxy is gone —
+// the degraded shared path, not a failure.
+static int bp_conn_for_ioctl(int binder_fd) {
+    uint32_t tid = bp_gettid();
+    int conn = bp_thread_conn_lookup(binder_fd, tid);
+    if (conn >= 0) return conn;
+    conn = binder_proxy_connect(NULL);
+    if (conn < 0) return binder_fd;
+    if (bp_thread_conn_insert(binder_fd, tid, conn) < 0) {
+        // Table full — drop the spare and share the primary (rare: the
+        // cap is 48 vs ~16 binder threads per process).
+        syscall(NR_close, conn);
+        return binder_fd;
+    }
+    return conn;
+}
 
 // ---------------------------------------------------------------------------
 // 6-Z271: v2 REQUEST blob inlining.
@@ -1200,17 +1372,26 @@ static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
     if (req == 0x40046210u) {
         return 0;
     }
+    // 6-Z271g: BINDER_THREAD_EXIT = _IOW('b', 8, size_t) = 0x40086208 —
+    // a departing pool thread tells the driver to tear down its state.
+    // Close and forget this thread's dedicated proxy conn (its mailbox,
+    // registrations and inflight txn die with the conn, exactly like the
+    // kernel's per-thread bookkeeping).
+    if (req == 0x40086208u) {
+        int gone = bp_thread_conn_remove(fd, bp_gettid());
+        (void)gone;
+        return 0;
+    }
 
-    pthread_mutex_lock(&g_bp_wire_lock);
+    // 6-Z271g: per-thread conn — NO wire lock anywhere on this path (see
+    // the g_bp_thread_conns table comment).
+    int conn = bp_conn_for_ioctl(fd);
 
     if (req == BP_IOC_WRITE_READ) {
-        int rv = -1;
         if (argp)
-            rv = binder_proxy_write_read(fd, (struct bp_binder_write_read *)argp);
-        else
-            errno = EFAULT;
-        pthread_mutex_unlock(&g_bp_wire_lock);
-        return rv;
+            return binder_proxy_write_read(conn, (struct bp_binder_write_read *)argp);
+        errno = EFAULT;
+        return -1;
     }
 
     if (req == BP_IOC_VERSION_GUEST || req == BP_IOC_VERSION_ALT) {
@@ -1236,7 +1417,7 @@ static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
     {
         int32_t ret = 0;
         uint32_t rlen = 0;
-        unsigned char *resp = bp_exchange(fd, wire, req_payload, req_len,
+        unsigned char *resp = bp_exchange(conn, wire, req_payload, req_len,
                                           &ret, &rlen);
         if (!resp) {
             char msg[192];
@@ -1268,11 +1449,9 @@ static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
         }
         free(resp);
     }
-    pthread_mutex_unlock(&g_bp_wire_lock);
     return 0;
 
 fail:
-    pthread_mutex_unlock(&g_bp_wire_lock);
     return -1;
 }
 
@@ -2601,6 +2780,10 @@ int close(int fd) {
     if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
     binder_fd_clear(fd);
     binder_fd_clear_proxy(fd);
+    // 6-Z271g: dropping the binder fd also tears down every per-thread
+    // proxy conn bound to it (fd-number recycling hygiene + no ghost
+    // registrations in the proxy).
+    bp_thread_conn_close_for_binder(fd);
     qemu_pipe_fd_clear_proxy(fd);
     fb_fd_clear(fd);
     if (real_close) return real_close(fd);
@@ -4695,6 +4878,11 @@ static int binder_open_fallback(const char *path, int real_fd, int saved_errno) 
     int pfd = binder_proxy_connect(path);
     if (pfd >= 0) {
         binder_fd_mark_proxy(pfd);
+        // 6-Z271g: the OPENING thread keeps pfd as its dedicated conn;
+        // every other binder thread lazily establishes its own (see the
+        // g_bp_thread_conns table). One conn per thread = real-binder
+        // parking semantics, no cross-thread wire lock.
+        bp_thread_conn_insert(pfd, bp_gettid(), pfd);
         return pfd;
     }
     // Proxy unreachable — open /dev/null as a virtual binder fd.

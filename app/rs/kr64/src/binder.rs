@@ -1580,9 +1580,19 @@ impl BusState {
     /// `BR_DEAD_BINDER` to death watchers.
     fn unregister_conn(&mut self, conn: ConnId) {
         // Resolve waiters whose transaction was queued on this connection
-        // (server died before the guest even saw the work).
+        // (server died before the guest even saw the work) — AND the one
+        // transaction this conn had DELIVERED but not yet answered with
+        // BC_REPLY (kernel semantics: the dying thread's transaction stack
+        // dies, the requester gets BR_DEAD_REPLY instead of hanging out
+        // its full REPLY_TIMEOUT).
         let dead_txns = match self.conns.remove(&conn) {
-            Some(bx) => bx.pending_in,
+            Some(bx) => {
+                let mut v = bx.pending_in;
+                if let Some(t) = bx.inflight_txn {
+                    v.push(t);
+                }
+                v
+            }
             None => Vec::new(),
         };
         for txn_id in dead_txns {
@@ -2117,6 +2127,47 @@ impl Drop for ThreadPool {
 // Per-connection handler.
 // ============================================================================
 
+/// Real peer credentials of an accepted unix-socket connection, via
+/// SO_PEERCRED (kernel truth — no guest cooperation involved).
+///
+/// 6-Z271f: the 6-Z271e IDENT announcement turned out to be blind —
+/// the tracer fakes every guest getpid() to 1 (load-bearing illusion),
+/// so ALL FOUR conns in run 33431538542 announced `pid=1` and conn
+/// ownership stayed unattributable exactly when it mattered (the futex
+/// stall analysis). SO_PEERCRED reads the credentials the kernel stored
+/// on the socket at connect time: the REAL host pid/uid/gid of the
+/// connecting guest process (`use_namespaces=false` ⇒ host pid == guest
+/// pid). This is what the real binder driver would stamp too. A local
+/// repr(C) struct + raw constants keep this independent of the libc
+/// crate's per-target feature surface (SO_PEERCRED=1 on Linux; `ucred`
+/// is 3×u32 on every Linux ABI).
+#[repr(C)]
+struct Ucred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+const SO_PEERCRED_RAW: i32 = 1;
+
+fn peer_credentials(stream: &UnixStream) -> (i32, u32, u32) {
+    let mut cred = Ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<Ucred>() as u32;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_PEERCRED_RAW,
+            &mut cred as *mut Ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        (cred.pid, cred.uid, cred.gid)
+    } else {
+        (0, 0, 0)
+    }
+}
+
 /// Handle one guest connection: read frames, dispatch, write responses.
 /// Returns when the guest disconnects (EOF) or an unrecoverable I/O
 /// error occurs.
@@ -2136,6 +2187,23 @@ fn handle_connection(
     info!(
         "[KR64][binder][vm{}] handling new connection (conn={})",
         vm_id, conn_id
+    );
+    // 6-Z271f: authoritative identity at accept time (see peer_credentials).
+    // Stamped BEFORE the IDENT frame arrives so the very first routed
+    // transaction already carries the real sender pid; the guest's
+    // IDENT announcement (getpid-faked) stays a fallback + cross-check.
+    let (peer_pid, peer_uid, peer_gid) = peer_credentials(&stream);
+    if peer_pid != 0 {
+        if let Ok(mut b) = bus.lock() {
+            if let Some(box_) = b.conns.get_mut(&conn_id) {
+                box_.sender_pid = peer_pid;
+                box_.sender_euid = peer_uid;
+            }
+        }
+    }
+    info!(
+        "[KR64][binder][vm{}] conn={} identity: SO_PEERCRED pid={} uid={} gid={}",
+        vm_id, conn_id, peer_pid, peer_uid, peer_gid
     );
     let result = connection_loop(&mut stream, vm_id, bus, conn_id);
     bus.lock()
@@ -2215,6 +2283,14 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
         // after connect): [u32 pid][u32 uid][u32 gid]. The kernel stamps
         // real sender identities into transactions; the wire cannot, so
         // the guest announces them once per connection.
+        //
+        // 6-Z271f: DEMOTED to fallback + cross-check. The announced pid
+        // comes from getpid(), which the tracer fakes to 1 — run
+        // 33431538542 showed all conns announcing pid=1. The connection
+        // is now stamped with kernel truth (SO_PEERCRED, see
+        // handle_connection) BEFORE this frame arrives; the announced
+        // values only fill the gap when SO_PEERCRED was unavailable,
+        // and the two are logged side by side to catch disagreements.
         WIRE_CMD_IDENT => {
             let (pid, uid) = if req.payload.len() >= 8 {
                 (
@@ -2224,19 +2300,27 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
             } else {
                 (0, 0)
             };
+            let mut stamped = false;
             if let Ok(mut b) = bus.lock() {
                 if let Some(box_) = b.conns.get_mut(&conn_id) {
-                    box_.sender_pid = pid;
-                    box_.sender_euid = uid;
+                    if box_.sender_pid == 0 && pid != 0 {
+                        box_.sender_pid = pid;
+                        box_.sender_euid = uid;
+                        stamped = true;
+                    }
                 }
             }
-            // 6-Z271e: log the identity — this is the ONLY per-connection
-            // attribution we have (run 33430336853's stall analysis was
-            // blinded: five guest processes share one socket path and the
-            // proxy could not say which conn was which).
             info!(
-                "[KR64][binder][vm{}] conn={} identity: guest pid={} uid={} (WIRE_CMD_IDENT)",
-                vm_id, conn_id, pid, uid
+                "[KR64][binder][vm{}] conn={} IDENT announced pid={} uid={} (getpid-faked) — {}",
+                vm_id,
+                conn_id,
+                pid,
+                uid,
+                if stamped {
+                    "stamped (no SO_PEERCRED available)"
+                } else {
+                    "ignored — SO_PEERCRED already stamped real pid"
+                }
             );
             Resp {
                 ret: 0,
@@ -2578,7 +2662,7 @@ fn handle_write_read(
             Tx(IncomingTx),
             Death(u64),
         }
-        let delivery = {
+        let mut delivery = {
             let mut b = bus.lock().expect("binder bus poisoned");
             match b.conns.get_mut(&conn_id) {
                 Some(bx) => match bx.inbox.pop_front() {
@@ -2599,6 +2683,75 @@ fn handle_write_read(
                 None => Delivery::None,
             }
         };
+        // 6-Z271g: PROCESS-POOL WORK STEALING — real binder queues incoming
+        // transactions on the PROCESS's todo list and any ready pool
+        // thread pops the next item, not only the thread that registered
+        // the node. With per-thread proxy conns (the shlib now opens one
+        // conn per guest thread) the REGISTERING conn may be busy — mid
+        // outgoing call, its next WRITE_READ parked in the proxy's reply
+        // wait — while a sibling thread idles. A parked sibling conn of
+        // the same guest PROCESS (same real sender_pid, thanks to
+        // SO_PEERCRED/procfs IDENT) steals the queued node work here.
+        // Death notifications are NOT stealable: they belong to the conn
+        // that requested them (handle+cookie watcher pairs).
+        if matches!(delivery, Delivery::None) {
+            let stolen = {
+                let mut b = bus.lock().expect("binder bus poisoned");
+                let my_pid = b
+                    .conns
+                    .get(&conn_id)
+                    .map(|bx| bx.sender_pid)
+                    .unwrap_or(0);
+                if my_pid == 0 {
+                    None
+                } else {
+                    let mut sibs: Vec<ConnId> = b
+                        .conns
+                        .iter()
+                        .filter(|(cid, bx)| **cid != conn_id && bx.sender_pid == my_pid)
+                        .map(|(cid, _)| *cid)
+                        .collect();
+                    sibs.sort();
+                    let mut item: Option<IncomingTx> = None;
+                    for sib in sibs {
+                        let has_tx = matches!(
+                            b.conns.get(&sib).and_then(|sbx| sbx.inbox.front()),
+                            Some(InboxItem::Tx(_))
+                        );
+                        if !has_tx {
+                            continue;
+                        }
+                        let sbx = b.conns.get_mut(&sib).expect("sibling vanished");
+                        match sbx.inbox.pop_front() {
+                            Some(InboxItem::Tx(tx)) => {
+                                if tx.txn_id != 0 {
+                                    sbx.pending_in.retain(|id| *id != tx.txn_id);
+                                }
+                                item = Some(tx);
+                                break;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    if let Some(tx) = &item {
+                        if tx.txn_id != 0 {
+                            if let Some(bx) = b.conns.get_mut(&conn_id) {
+                                bx.inflight_txn = Some(tx.txn_id);
+                                bx.pending_in.push(tx.txn_id);
+                            }
+                        }
+                    }
+                    item
+                }
+            };
+            if let Some(tx) = stolen {
+                info!(
+                    "[KR64][binder][vm{}] process-pool steal: conn={} takes tx #{} queued for a sibling (code={})",
+                    vm_id, conn_id, tx.txn_id, tx.code
+                );
+                delivery = Delivery::Tx(tx);
+            }
+        }
         match delivery {
             Delivery::Tx(tx) => {
                 let (ds, os) = match &tx.blob {
@@ -3645,6 +3798,49 @@ mod tests {
     // -------- ioctl number correctness --------------------------------
 
     #[test]
+    fn peer_credentials_reports_kernel_truth() {
+        // 6-Z271f: the SO_PEERCRED stamp must report the REAL pid of the
+        // peer — the whole point of the upgrade (the guest's own getpid
+        // announcement is faked to 1 by the tracer). A socketpair has no
+        // listen backlog involved; SO_PEERCRED on one end reports the
+        // OTHER end's credentials, which here is this same test process.
+        //
+        // Environment tolerance: some hardened kernels (this dev
+        // container's AlibabaCloud 5.10 among them) zero socket peer
+        // credentials entirely — SO_PEERCRED and SCM_CREDENTIALS both
+        // return zeros there. The proxy treats pid==0 as "no kernel
+        // truth available" and lets the guest's /proc/self/status
+        // announcement fill the gap, so the contract here is: pid is
+        // EITHER 0 (kernel stripped creds) OR our real pid. It must
+        // never be anything else.
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let (pid, uid, gid) = peer_credentials(&a);
+        assert!(
+            pid == 0 || pid as u32 == std::process::id(),
+            "peer pid must be 0 (creds stripped) or our own pid; got {}",
+            pid
+        );
+        if pid != 0 {
+            // Creds live: uid/gid must be populated too (all-zero pid
+            // with nonzero creds would be a struct-packing bug).
+            assert!(
+                uid != 0 || gid != 0 || nix_ish_root(),
+                "nonzero pid but all-zero uid/gid — ucred layout mismatch?"
+            );
+        }
+    }
+
+    fn nix_ish_root() -> bool {
+        // std has no getuid; checking /proc/self/status is fine for a test.
+        std::fs::read_to_string("/proc/self/status")
+            .map(|s| {
+                s.lines()
+                    .any(|l| l.starts_with("Uid:") && l.split_whitespace().nth(1) == Some("0"))
+            })
+            .unwrap_or(false)
+    }
+
+    #[test]
     fn ioctl_macros_match_kernel_values() {
         // These are the canonical values from <uapi/linux/android/binder.h>
         // on aarch64 / x86_64. If any of these change, the guest's
@@ -4587,7 +4783,7 @@ mod tests {
         tx_b[0..4].copy_from_slice(&routed_handle.to_ne_bytes());
         tx_b[16..20].copy_from_slice(&42u32.to_ne_bytes());
         let tx_data: &[u8] = b"ping-payload";
-        let mut tx_off = Vec::new();
+        let tx_off = Vec::new();
         let mut bc3 = Vec::with_capacity(4 + 64);
         bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
         bc3.extend_from_slice(&tx_b);
@@ -4670,6 +4866,146 @@ mod tests {
     }
 
     // -------- 6-Z271: virtual service handlers over the wire ---------
+
+    #[test]
+    fn z271g_process_pool_steal_sibling_conn_takes_queued_tx() {
+        // Real binder queues incoming transactions on the PROCESS's todo
+        // list: any ready pool thread may take them. With per-thread
+        // proxy conns the registering conn may be busy, so a sibling
+        // conn of the same guest PROCESS (same sender_pid) must be able
+        // to steal the queued node work. This test never lets conn A
+        // read — conn A2 (same pid) takes the delivery instead.
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let ident_payload = |pid: u32| {
+            let mut p = Vec::with_capacity(12);
+            p.extend_from_slice(&pid.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p
+        };
+
+        // ---- Conn A (pid 7777): addService("svc_a") ----
+        let mut stream_a = UnixStream::connect(&path).expect("connect A");
+        let (ret_i, _r) = exchange(
+            &mut stream_a,
+            WIRE_CMD_IDENT,
+            &ident_payload(7777),
+        );
+        assert_eq!(ret_i, 0, "IDENT A accepted");
+        let mut args = ParcelWriter::new();
+        args.write_string16("svc_a");
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0x1234,
+            cookie: 0x5678,
+        });
+        args.write_i32(0);
+        args.write_i32(0);
+        let (ad, ao) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &ad, &ao, 4096);
+        let (ret, resp) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0, "ADD_SERVICE ok");
+        assert_eq!(
+            u32::from_ne_bytes(resp[8..12].try_into().unwrap()),
+            BR_REPLY
+        );
+        // A now parks WITHOUT reading (its inbox is where the tx queues).
+
+        // ---- Conn B (pid 8888): getService → handle ----
+        let mut stream_b = UnixStream::connect(&path).expect("connect B");
+        let (ret_i2, _r2) = exchange(
+            &mut stream_b,
+            WIRE_CMD_IDENT,
+            &ident_payload(8888),
+        );
+        assert_eq!(ret_i2, 0);
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("svc_a");
+        let (bd, bo) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload2 = make_v2_write_read_payload(&bc2, &bd, &bo, 4096);
+        let (ret2, resp2) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0);
+        let read_size2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
+        let off2 = 4 + read_size2 + 8;
+        let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        let blob2 = &resp2[off2 + 8..off2 + 8 + dl2];
+        let routed_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+
+        // ---- Conn B: transact(code=42) on a thread (blocks) ----
+        let mut tx_b = [0u8; 64];
+        tx_b[0..4].copy_from_slice(&routed_handle.to_ne_bytes());
+        tx_b[16..20].copy_from_slice(&42u32.to_ne_bytes());
+        let tx_data: &[u8] = b"steal-payload";
+        let tx_off = Vec::new();
+        let mut bc3 = Vec::with_capacity(4 + 64);
+        bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc3.extend_from_slice(&tx_b);
+        let payload3 = make_v2_write_read_multi_payload(&bc3, &[(tx_data, &tx_off)], 4096);
+        let b_writer =
+            std::thread::spawn(move || exchange(&mut stream_b, BINDER_WRITE_READ, &payload3));
+        std::thread::sleep(Duration::from_millis(150));
+
+        // ---- Conn A2 (pid 7777, SIBLING): read-only ioctl STEALS ----
+        let mut stream_a2 = UnixStream::connect(&path).expect("connect A2");
+        let (ret_i3, _r3) = exchange(
+            &mut stream_a2,
+            WIRE_CMD_IDENT,
+            &ident_payload(7777),
+        );
+        assert_eq!(ret_i3, 0);
+        let mut wr_a2 = Vec::new();
+        wr_a2.extend_from_slice(&0u32.to_ne_bytes());
+        wr_a2.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_a2, resp_a2) = exchange(&mut stream_a2, BINDER_WRITE_READ, &wr_a2);
+        assert_eq!(ret_a2, 0);
+        let br = u32::from_ne_bytes(resp_a2[4..8].try_into().unwrap());
+        assert_eq!(
+            br, BR_TRANSACTION,
+            "sibling conn receives the transaction (steal)"
+        );
+        let tr = &resp_a2[8..8 + 64];
+        let code = u32::from_ne_bytes(tr[16..20].try_into().unwrap());
+        assert_eq!(code, 42, "stolen delivery carries the code");
+        let cookie = u64::from_ne_bytes(tr[8..16].try_into().unwrap());
+        assert_eq!(cookie, 0x5678, "owner cookie preserved across steal");
+
+        // ---- Conn A2: BC_REPLY → B resolves ----
+        let reply_data: &[u8] = b"stolen-reply";
+        let mut reply = [0u8; 64];
+        reply[16..20].copy_from_slice(&0u32.to_ne_bytes());
+        let mut bc4 = Vec::with_capacity(4 + 64);
+        bc4.extend_from_slice(&BC_REPLY.to_ne_bytes());
+        bc4.extend_from_slice(&reply);
+        let payload4 = make_v2_write_read_multi_payload(&bc4, &[(reply_data, &tx_off)], 0);
+        let (ret_r, _resp_r) = exchange(&mut stream_a2, BINDER_WRITE_READ, &payload4);
+        assert_eq!(ret_r, 0);
+
+        let (ret_b, resp_b) = b_writer.join().expect("B thread");
+        assert_eq!(ret_b, 0);
+        let read_b = u32::from_ne_bytes(resp_b[0..4].try_into().unwrap()) as usize;
+        let br2 = u32::from_ne_bytes(resp_b[8..12].try_into().unwrap());
+        assert_eq!(br2, BR_REPLY, "B gets the stolen conn's reply");
+        let off_b = 4 + read_b + 8;
+        let dl_b = u32::from_ne_bytes(resp_b[off_b..off_b + 4].try_into().unwrap()) as usize;
+        assert_eq!(dl_b, reply_data.len());
+        let got = &resp_b[off_b + 8..off_b + 8 + dl_b];
+        assert_eq!(got, reply_data, "reply bytes exact");
+
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
 
     #[test]
     fn z271_virtual_vibrator_gets_registered_and_answers_get_service() {
