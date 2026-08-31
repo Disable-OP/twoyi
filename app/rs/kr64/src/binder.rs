@@ -2152,6 +2152,11 @@ fn connection_loop(
     bus: &Arc<Mutex<BusState>>,
     conn_id: ConnId,
 ) -> io::Result<()> {
+    // 6-Z271e: bounded per-frame DIAG — the first 12 WRITE_READ exchanges
+    // per connection with their shape, plus every response. Run
+    // 33430336853 left a guest binder thread blocked in recvfrom with no
+    // proxy-side trace; this closes the observability gap.
+    let mut wr_diag_budget: u32 = 12;
     loop {
         let req = match read_frame(stream) {
             Ok(r) => r,
@@ -2164,7 +2169,35 @@ fn connection_loop(
             }
             Err(e) => return Err(e),
         };
+        if req.cmd == BINDER_WRITE_READ && wr_diag_budget > 0 {
+            wr_diag_budget -= 1;
+            let (ws, rc) = if req.payload.len() >= 8 {
+                (
+                    u32::from_ne_bytes(req.payload[0..4].try_into().unwrap()),
+                    u32::from_ne_bytes(req.payload[4..8].try_into().unwrap()),
+                )
+            } else {
+                (0, 0)
+            };
+            info!(
+                "[KR64][binder][vm{}] conn={} WRITE_READ ws={} rc={}",
+                vm_id, conn_id, ws, rc
+            );
+        }
         let resp = dispatch_request(&req, vm_id, bus, conn_id);
+        if req.cmd == BINDER_WRITE_READ && wr_diag_budget > 0 {
+            let (rs, blobs) = if resp.payload.len() >= 4 {
+                let rs = u32::from_ne_bytes(resp.payload[0..4].try_into().unwrap());
+                let tail = resp.payload.len() - 4 - rs as usize;
+                (rs, tail)
+            } else {
+                (0, resp.payload.len())
+            };
+            info!(
+                "[KR64][binder][vm{}] conn={} -> ret={} read_size={} trailer={}B",
+                vm_id, conn_id, resp.ret, rs, blobs
+            );
+        }
         write_frame(stream, &resp)?;
     }
 }
@@ -2197,6 +2230,14 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
                     box_.sender_euid = uid;
                 }
             }
+            // 6-Z271e: log the identity — this is the ONLY per-connection
+            // attribution we have (run 33430336853's stall analysis was
+            // blinded: five guest processes share one socket path and the
+            // proxy could not say which conn was which).
+            info!(
+                "[KR64][binder][vm{}] conn={} identity: guest pid={} uid={} (WIRE_CMD_IDENT)",
+                vm_id, conn_id, pid, uid
+            );
             Resp {
                 ret: 0,
                 payload: Vec::new(),
