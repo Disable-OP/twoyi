@@ -424,6 +424,7 @@ static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 // ---------------------------------------------------------------------------
 #define BP_WIRE_V2_MAGIC 0x30325657u   /* "WV20" little-endian */
 #define BP_BR_REPLY      0x80407203u   /* _IOR('r', 3, binder_transaction_data=64) */
+#define BP_BR_TRANSACTION 0x80407202u  /* _IOR('r', 2, 64) — 6-Z271 server delivery */
 #define BP_TR_DATA_PTR_OFF     48u     /* binder_transaction_data.data.ptr.buffer */
 #define BP_TR_OFFSETS_PTR_OFF  56u     /* binder_transaction_data.data.ptr.offsets */
 
@@ -490,7 +491,8 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
         uint32_t cmd;
         memcpy(&cmd, stream + pos, 4);
         uint32_t sz = (cmd >> 16) & 0x3fff;
-        if (cmd == BP_BR_REPLY && pos + 4 + 64 <= stream_len) {
+        if ((cmd == BP_BR_REPLY || cmd == BP_BR_TRANSACTION) &&
+            pos + 4 + 64 <= stream_len) {
             if (rem < 8) return;
             uint32_t dlen, olen;
             memcpy(&dlen, p, 4);
@@ -828,6 +830,37 @@ static int binder_proxy_connect(const char *guest_path) {
         socklen_t salen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + pl);
         long rc = syscall(SYS_connect, (long)sfd, &sa, (long)salen);
         if (rc == 0) {
+            // 6-Z271: announce the guest process identity so the proxy can
+            // stamp real sender_pid/sender_euid into routed transactions
+            // (the kernel would do this; the wire doesn't). Best-effort:
+            // a failed IDENT still leaves the connection usable (pid=0).
+            struct bp_ident { uint32_t pid; uint32_t uid; uint32_t gid; } ident;
+            ident.pid = (uint32_t)getpid();
+            ident.uid = (uint32_t)getuid();
+            ident.gid = (uint32_t)getgid();
+            unsigned char ihdr[8];
+            uint32_t icmd = 0x400462FFu;  // WIRE_CMD_IDENT (not a real binder ioctl)
+            uint32_t ilen = 12;
+            memcpy(ihdr + 0, &icmd, 4);
+            memcpy(ihdr + 4, &ilen, 4);
+            if (bp_send_all(sfd, ihdr, 8) == 0 &&
+                bp_send_all(sfd, &ident, sizeof(ident)) == 0) {
+                int32_t iret = 0;
+                uint32_t irlen = 0;
+                // Drain the ack ([i32 ret][u32 len]) — ignore content.
+                unsigned char idummy[8];
+                if (bp_recv_all(sfd, idummy, 8) == 0) {
+                    memcpy(&iret, idummy + 0, 4);
+                    memcpy(&irlen, idummy + 4, 4);
+                    (void)iret;
+                    while (irlen > 0) {
+                        unsigned char isink[64];
+                        uint32_t chunk = irlen > sizeof(isink) ? sizeof(isink) : irlen;
+                        if (bp_recv_all(sfd, isink, chunk) != 0) break;
+                        irlen -= chunk;
+                    }
+                }
+            }
             char msg[320];
             snprintf(msg, sizeof(msg),
                 "[twoyi_loader] binder proxy: %s -> CONNECTED %s (fd=%d)\n",
@@ -861,10 +894,139 @@ struct bp_binder_write_read {
     uint64_t read_buffer;    // guest pointer
 };
 
+// ---------------------------------------------------------------------------
+// 6-Z271: v2 REQUEST blob inlining.
+//
+// The proxy's servicemanager_proxy() only parses real AIDL parcels when the
+// WRITE_READ request carries the v2 trailer ([WIRE_V2_MAGIC][blob_count]
+// [blobs...], binder.rs handle_write_read). Without it every real-libbinder
+// transaction lands in servicemanager_legacy() where the service NAME is
+// DISCARDED — the registry stayed permanently empty, keystore2's addService
+// at +11.4s was consumed name-less (run 33411932921: single code=3, v2=false,
+// zero "addService(NAME)" lines), and OrangeFox R12's recovery main thread
+// polled checkService ~170x over 18.5 s waiting for a service that could
+// never appear. The hook runs IN the guest process, so the parcel bytes
+// behind each BC_TRANSACTION's data_ptr/offsets_ptr are directly
+// memcpy-able — collect one blob per transaction command (the proxy pairs
+// the i-th blob with the i-th BC_TRANSACTION/BC_TRANSACTION_SG in stream
+// order; BC_REPLY requests carry no blob on this wire) and append the
+// trailer. Total-frame safety: if header + stream + trailer would exceed
+// the proxy's 1 MiB read_frame cap the trailer is dropped (v1 fallback) —
+// recovery/keystore2 parcels are KBs, so this never fires in practice.
+// ---------------------------------------------------------------------------
+#define BP_BC_TRANSACTION    0x40406300u  // _IOW('c', 0, 64)
+#define BP_BC_REPLY          0x40406301u  // _IOW('c', 1, 64)
+#define BP_BC_TRANSACTION_SG 0x40486311u  // _IOW('c', 17, 72)
+#define BP_BC_REPLY_SG       0x40486312u  // _IOW('c', 18, 72)
+#define BP_BLOB_MAX          (512u * 1024u)  // per-buffer sanity cap
+#define BP_BLOB_MAX_CMDS     32u             // cap before falling back to v1
+
+struct bp_blob_desc {
+    uint64_t data_len;
+    uint64_t offsets_len;
+    uint64_t data_ptr;
+    uint64_t offsets_ptr;
+};
+
+// Scan a BC_* stream; fill one descriptor per BC_TRANSACTION[_SG]. Returns
+// the descriptor count, or 0 when the stream holds more transaction
+// commands than we are willing to inline (caller falls back to v1).
+static uint32_t bp_scan_tx_blobs(const uint8_t *stream, uint64_t len,
+                                 struct bp_blob_desc *descs) {
+    uint64_t pos = 0;
+    uint32_t n = 0;
+    uint32_t tx_cmds = 0;
+    while (pos + 4 <= len) {
+        uint32_t cmd;
+        memcpy(&cmd, stream + pos, 4);
+        pos += 4;
+        uint32_t psize = (cmd >> 16) & 0x3fffu;
+        if (pos + psize > len) break;
+        if (cmd == BP_BC_TRANSACTION || cmd == BP_BC_TRANSACTION_SG ||
+            cmd == BP_BC_REPLY || cmd == BP_BC_REPLY_SG) {
+            tx_cmds++;
+            if (n >= BP_BLOB_MAX_CMDS) return 0;  // too many — v1 fallback
+            const uint8_t *btd = stream + pos;
+            uint64_t data_size, offsets_size, data_ptr, offsets_ptr;
+            memcpy(&data_size, btd + 32, 8);
+            memcpy(&offsets_size, btd + 40, 8);
+            memcpy(&data_ptr, btd + 48, 8);
+            memcpy(&offsets_ptr, btd + 56, 8);
+            // Sanity caps: a zero pointer with nonzero size (or an
+            // oversized buffer) downgrades THIS blob to empty — the proxy
+            // treats an empty blob as no-parcel for that command.
+            if (data_size > BP_BLOB_MAX || (data_size > 0 && data_ptr == 0)) {
+                data_size = 0;
+                data_ptr = 0;
+            }
+            if (offsets_size > BP_BLOB_MAX ||
+                (offsets_size > 0 && offsets_ptr == 0)) {
+                offsets_size = 0;
+                offsets_ptr = 0;
+            }
+            descs[n].data_len = data_size;
+            descs[n].offsets_len = offsets_size;
+            descs[n].data_ptr = data_ptr;
+            descs[n].offsets_ptr = offsets_ptr;
+            n++;
+        }
+        pos += psize;
+    }
+    (void)tx_cmds;
+    return n;
+}
+
+// Build the v2 request trailer: [WIRE_V2_MAGIC][blob_count]
+// (per blob) [u32 data_len][u32 offsets_len][data][offsets].
+// Returns a malloc'd buffer (caller frees) and *out_len, or NULL when
+// there is nothing to inline. Grand total is capped so the FULL request
+// frame (8 + ws + trailer) stays under the proxy's 1 MiB cap.
+static unsigned char *bp_build_v2_request_trailer(
+        const uint8_t *stream, uint64_t ws, uint32_t *out_len) {
+    *out_len = 0;
+    if (ws < 4) return NULL;
+    struct bp_blob_desc descs[BP_BLOB_MAX_CMDS];
+    uint32_t n = bp_scan_tx_blobs(stream, ws, descs);
+    if (n == 0) return NULL;
+
+    uint64_t total = 8;
+    for (uint32_t i = 0; i < n; i++)
+        total += 8 + descs[i].data_len + descs[i].offsets_len;
+    // Frame budget: 8-byte wire header + stream + this trailer + slack.
+    if (total + 8 + ws + 64 > BP_MAX_FRAME) return NULL;
+
+    unsigned char *tr = (unsigned char *)malloc((size_t)total);
+    if (!tr) return NULL;
+    size_t off = 0;
+    memcpy(tr + off, &BP_WIRE_V2_MAGIC, 4);
+    off += 4;
+    memcpy(tr + off, &n, 4);
+    off += 4;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t dl = (uint32_t)descs[i].data_len;
+        uint32_t ol = (uint32_t)descs[i].offsets_len;
+        memcpy(tr + off, &dl, 4);
+        off += 4;
+        memcpy(tr + off, &ol, 4);
+        off += 4;
+        if (dl > 0) {
+            memcpy(tr + off, (const void *)(uintptr_t)descs[i].data_ptr, dl);
+            off += dl;
+        }
+        if (ol > 0) {
+            memcpy(tr + off, (const void *)(uintptr_t)descs[i].offsets_ptr, ol);
+            off += ol;
+        }
+    }
+    *out_len = (uint32_t)total;
+    return tr;
+}
+
 // BINDER_WRITE_READ marshalling (called with g_bp_wire_lock held).
-// Forwards the guest's BC_* write buffer verbatim; copies the proxy's BR_*
-// response bytes into the guest's read buffer; sets BOTH consumed fields
-// (the livelock fix). Returns 0 / -1 with errno like a real ioctl.
+// Forwards the guest's BC_* write buffer verbatim (plus the 6-Z271 v2
+// request trailer); copies the proxy's BR_* response bytes into the guest's
+// read buffer; sets BOTH consumed fields (the livelock fix). Returns 0 / -1
+// with errno like a real ioctl.
 static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
     static unsigned log_budget = 2;
 
@@ -888,9 +1050,9 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
         return -1;
     }
 
-    // Single frame: [u32 WRITE_READ][u32 8+ws][u32 ws][u32 read_cap][bytes]
+    // Single frame: [u32 WRITE_READ][u32 8+ws+trailer][u32 ws][u32 read_cap]
+    //               [stream bytes][v2 trailer (6-Z271)]
     uint64_t ws = bwr->write_size - bwr->write_consumed;
-    uint32_t req_len = (uint32_t)(8 + ws);
 
     // 6-Z265: peek the outgoing BC stream for BC_FREE_BUFFER commands and
     // release the backing allocations the guest is returning (kernel-true
@@ -900,8 +1062,23 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
         bp_free_returned_buffers(
             (const uint8_t *)(uintptr_t)(bwr->write_buffer + bwr->write_consumed), ws);
     }
+    // 6-Z271: inline parcel blobs for the request's BC_TRANSACTION commands
+    // so the proxy's registry sees real service names (v1 fallback = NULL).
+    uint32_t trailer_len = 0;
+    unsigned char *trailer = NULL;
+    if (ws > 0 && bwr->write_buffer != 0) {
+        trailer = bp_build_v2_request_trailer(
+            (const uint8_t *)(uintptr_t)(bwr->write_buffer + bwr->write_consumed),
+            ws, &trailer_len);
+    }
+    uint32_t req_len = (uint32_t)(8 + ws + trailer_len);
+
     unsigned char *req = (unsigned char *)malloc(req_len);
-    if (!req) { errno = ENOMEM; return -1; }
+    if (!req) {
+        free(trailer);
+        errno = ENOMEM;
+        return -1;
+    }
     uint32_t ws32 = (uint32_t)ws;
     uint32_t rc32 = (uint32_t)(bwr->read_size > 0xffffffffull
                                ? 0xffffffffull : bwr->read_size);
@@ -909,11 +1086,27 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
     memcpy(req + 4, &rc32, 4);
     if (ws > 0)
         memcpy(req + 8, (const void *)(uintptr_t)(bwr->write_buffer + bwr->write_consumed), ws);
+    uint32_t blob_count_logged = 0;
+    if (trailer != NULL) {
+        if (trailer_len >= 8) memcpy(&blob_count_logged, trailer + 4, 4);
+        memcpy(req + 8 + ws, trailer, trailer_len);
+        free(trailer);
+    }
 
     int32_t ret = 0;
     uint32_t rlen = 0;
     unsigned char *resp = bp_exchange(fd, BP_IOC_WRITE_READ, req, req_len,
                                       &ret, &rlen);
+    if (log_budget > 0) {
+        // 6-Z271 evidence: log whether the v2 trailer was attached and how
+        // many blobs it carried (first exchanges only — bounded logging).
+        log_budget--;
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] binder proxy WRITE_READ: ws=%llu blobs=%u -> "
+            "exchanged\n", (unsigned long long)ws, blob_count_logged);
+        write_str(2, msg);
+    }
     free(req);
     if (!resp) {
         char msg[192];
