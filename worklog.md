@@ -22824,3 +22824,34 @@ Work Log:
 
 Stage Summary:
 - Run 33386125966 in_progress at recording time. Continuing local work while it runs; will read frames manually on completion.
+
+---
+Task ID: 6-Z268 verification re-dispatch
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: first 6-Z268 verification run died at the image-download step; re-dispatch on a live image.
+
+Work Log:
+- Run 33386125966 (head 8072616): "Build arm64-v8a APK" job SUCCEEDED
+  (all 6-Z268 Rust compiles clean on aarch64), but the E2E job failed
+  at the download step: curl (22) HTTP 400 from
+  api.orangefox.download/release/69f5cec33ba4241ac1e095f/dl — the URL
+  every prior lavender wave used. Verified against the live OrangeFox
+  site: the R12.0 lavender builds are RETIRED from their CDN
+  (R12.0_1 69eb36944a1c3a7b3f7c1056 and R12.0_0 69b6c7b392ddd30a0d73361f
+  both → HTTP 404 on /dl; old release id → 400; not on Wayback). Not a
+  code failure — zero 6-Z268 signal either way.
+- Re-dispatched with the newest LIVE lavender build,
+  OrangeFox R11.1 (release 60990355e805649489f06abf, verified
+  downloadable, 47,650,892 bytes ZIP-wrapped, md5
+  7d4ac5b20e1766d69345be1dba89f706):
+  RUN 33387194667 (head d2ce96d), inputs recovery_name=orangefox-R11.1-lavender,
+  boot_wait_seconds=60. Same AOSP-layout OrangeFox boot path the
+  40 s R12.0 baseline exercised.
+- Caveat recorded: the run's boot timeline is comparable to the
+  6-Z267 R12.0 baseline (33371788724) at the mechanism level, but
+  the image version differs (R12.0 retired upstream). If the user
+  re-uploads an R12 lavender image anywhere, re-point the dispatch.
+
+Stage Summary:
+- 6-Z268 builds green on arm64; verification running on R11.1 lavender (run 33387194667).
