@@ -998,7 +998,8 @@ static unsigned char *bp_build_v2_request_trailer(
     unsigned char *tr = (unsigned char *)malloc((size_t)total);
     if (!tr) return NULL;
     size_t off = 0;
-    memcpy(tr + off, &BP_WIRE_V2_MAGIC, 4);
+    uint32_t magic = BP_WIRE_V2_MAGIC;
+    memcpy(tr + off, &magic, 4);
     off += 4;
     memcpy(tr + off, &n, 4);
     off += 4;
