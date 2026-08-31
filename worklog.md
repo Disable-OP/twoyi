@@ -22896,3 +22896,54 @@ Work Log:
 
 Stage Summary:
 - Hardened head ready for dispatch; next run either boots (placeholder saves the chain) or names the exact errno in the artifact.
+
+---
+Task ID: 6-Z268 verdict
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: read the hardened-head verification frames manually and deliver the boot-time verdict.
+
+Work Log:
+- Run 33390790061 (head 0109016, OrangeFox R11.1 lavender): SUCCESS.
+  Classifier: BOOT_OK / UI_READY / overall UI_READY / VFS CLEAN /
+  family_banner=[OrangeFox] / recovery_instances=0 / pages
+  [filemanagerlist, menu] x6 (deep interactive navigation).
+- FRAMES READ MANUALLY (native vision):
+  * screenshot-07_boot_5s.png — THE FIRST CAPTURE TICK ALREADY SHOWS
+    THE FULL INTERACTIVE ORANGEFOX UI (Unmodified System Partition
+    gate: theme, status bar, checkbox, Keep Read-Only button, swipe
+    slider — all rendered).
+  * screenshot-07_boot_20s_postg.png — same UI, stable.
+  * screenshot-term-01-main-menu.png — the gate slider handle
+    MID-SWIPE (the E2E's swipe gesture rendered live).
+  * screenshot-term-04f-fm-clean.png — "Never show this screen again"
+    CHECKBOX NOW CHECKED (tapped by the E2E; touch input + UI state
+    updates fully working).
+- TIMELINE (wall-clock logcat anchors):
+  * 12:19:23.346 — init_renderer (render init)
+  * 12:19:23.380 — kr64 spawned (+34 ms)
+  * 12:19:23.457 — FIRST GUEST FRAME BLITTED (+77 ms after spawn,
+    +111 ms after render init; vs 6-Z267's splash at the 20 s frame)
+  * <= 5 s — interactive UI on screen (first capture tick; vs the
+    6-Z267 baseline's 40 s interactive frame).
+- VERDICT: boot-to-interactive-UI is now UNDER 5 SECONDS on the E2E
+  capture cadence (conservatively; the true value is bounded by the
+  first-frame stamp at ~0.1 s + guest theme load) — THE <10 s TARGET
+  IS MET with margin. The 6-Z268 loader-segment win is confirmed by
+  the tracer stamps: guest execve chain at +38..59 ms (was +10.6 s).
+- CAVEAT: measured on OrangeFox R11.1 lavender because OrangeFox
+  RETIRED the R12.0 lavender builds from their CDN (release ids 404).
+  Same device (lavender), same AOSP-layout OrangeFox boot path, one
+  init-generation newer.
+- GUARD WAVE DISPATCHED on the hardened head 0109016:
+  * run 33391886763 — twrp-3.7.0_9-0-whyred (dl.twrp.me + referer)
+  * run 33391884534 — twrp-3.7.0_9-0-angler (default image, regression)
+  (daisy guard impossible this round: the OrangeFox daisy R12 build is
+  also retired — 404 — and dl.twrp.me has no daisy 3.7.0 image.)
+- kr64-tests on 0109016: run 33390775887 GREEN (fmt / clippy -D
+  warnings / 676 tests).
+
+Stage Summary:
+- 6-Z268 wave SHIPPED and VERIFIED: UI_READY under 5 s (8x faster than
+  the 6-Z267 baseline's 40 s), first frame at ~0.1 s, loader segment
+  10.6 s -> ~40 ms. Guard runs in flight.
