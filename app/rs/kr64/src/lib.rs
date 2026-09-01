@@ -2308,6 +2308,110 @@ pub fn strip_service_capabilities_options(rootfs_prefix: &str) -> usize {
     modified
 }
 
+/// 6-Z272c: enable the image's OWN health HAL service so the recovery's
+/// battery reader finds a live `android.hardware.health@2.x::IHealth/
+/// default` in hwservicemanager.
+///
+/// Evidence chain (R12 lavender + TWRP-12.1 sources):
+/// * The OF-R12 battery widget drew `battery_android_0.svg` (0%) while
+///   the whole-run open trace showed ZERO /sys/class/power_supply reads
+///   — the reader never touches sysfs directly.
+/// * TWRP-12.1's battery reader is `recovery_utils/battery_utils.cpp`
+///   `GetBatteryInfo()` → `get_health_service()` → HIDL hwservicemanager
+///   lookup; on a null result it logs "No health implementation is
+///   found; assuming defaults" and the capacity stays UNKNOWN (→ 0%).
+/// * The image SHIPS `android.hardware.health@2.0/2.1-service` with rcs
+///   marked `disabled`, and guest init never starts them (no exec in
+///   any run) — hwservicemanager's registry stays empty.
+/// * The service's own BatteryMonitor then reads /sys/class/power_supply
+///   — which lands in OUR 6-Z272c-pinned tree (host-honest values from
+///   the bridge) — so the values it publishes are the bridge's, no
+///   fabrication anywhere.
+///
+/// Patch (same import-time family as 6-Z225 / the fstab sanitizer):
+/// drop the `disabled` option line and append an `on late-init` start
+/// trigger (TWRP init.rc processes late-init AFTER init, so
+/// hwservicemanager — started `on init` — is up when the HAL registers).
+/// The 2.1 service is preferred and also serves the 2.0 interface; the
+/// 2.0 service is the fallback when only it exists. Idempotent via the
+/// marker line.
+pub fn enable_image_health_hal(rootfs_prefix: &str) -> usize {
+    const MARKER: &str = "# 6-Z272c: health HAL started for the recovery battery reader";
+    const CANDIDATES: &[(&str, &str, &str)] = &[
+        (
+            "system/etc/init/android.hardware.health@2.1-service.rc",
+            "system/bin/android.hardware.health@2.1-service",
+            "health-hal-2-1",
+        ),
+        (
+            "vendor/etc/init/android.hardware.health@2.1-service.rc",
+            "vendor/bin/hw/android.hardware.health@2.1-service",
+            "health-hal-2-1",
+        ),
+        (
+            "system/etc/init/android.hardware.health@2.0-service.rc",
+            "system/bin/android.hardware.health@2.0-service",
+            "health-hal-2-0",
+        ),
+    ];
+    let base = if rootfs_prefix.is_empty() {
+        "/"
+    } else {
+        rootfs_prefix
+    };
+    for (rc_rel, bin_rel, svc) in CANDIDATES {
+        let rc_path = format!("{}/{}", base, rc_rel);
+        let bin_path = format!("{}/{}", base, bin_rel);
+        // The binary must exist — we start the IMAGE's own HAL, never a
+        // synthetic one.
+        if !std::path::Path::new(&bin_path).exists() {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&rc_path) {
+            Ok(c) if c.len() <= 1 << 20 => c,
+            _ => continue,
+        };
+        if content.contains(MARKER) {
+            return 1; // already enabled
+        }
+        if !content.contains(svc) {
+            continue; // not the rc for this service
+        }
+        let mut out = String::with_capacity(content.len() + 96);
+        let mut had_disabled = false;
+        for line in content.lines() {
+            if line.trim() == "disabled" {
+                had_disabled = true;
+                continue; // drop the option line, init tolerates it
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(MARKER);
+        out.push_str("\non late-init\n    start ");
+        out.push_str(svc);
+        out.push('\n');
+        match std::fs::write(&rc_path, &out) {
+            Ok(()) => {
+                info!(
+                    "[KR64] PARENT: 6-Z272c: enabled image health HAL ({} — disabled dropped: {}, on late-init start appended)",
+                    rc_path, had_disabled
+                );
+                return 1;
+            }
+            Err(e) => {
+                warning!(
+                    "[KR64] PARENT: 6-Z272c: failed to rewrite {}: {}",
+                    rc_path,
+                    e
+                );
+                return 0;
+            }
+        }
+    }
+    0
+}
+
 /// Patch TWRP's init.rc to add `setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so`
 /// to the recovery service definition.
 ///
@@ -7495,6 +7599,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         );
     }
 
+    // 6-Z272c: start the image's OWN health HAL (rc patch: drop `disabled`,
+    // start `on late-init`) so the recovery's HIDL battery reader
+    // (GetBatteryInfo → get_health_service) finds a live IHealth/default;
+    // the HAL's BatteryMonitor then serves the 6-Z272c-pinned sysfs tree.
+    let health_enabled = enable_image_health_hal(&rootfs_prefix);
+    if health_enabled > 0 {
+        info!(
+            "[KR64] PARENT: 6-Z272c: image health HAL enabled ({} rc patched)",
+            health_enabled
+        );
+    }
+
     if cfg.boot_recovery {
         // TWRP BOOT: DELETE /property_contexts ENTIRELY.
         // The TWRP ramdisk's /property_contexts file has `#line 1 "..."`
@@ -12160,6 +12276,63 @@ pub fn join_hybrid_cmdline(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 6-Z272c: enable_image_health_hal ─────────────────────────────────
+    #[test]
+    fn z272c_health_hal_enable_drops_disabled_and_appends_late_init_start() {
+        let dir = std::env::temp_dir().join(format!("kr64_6z272c_hal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let init_dir = dir.join("system/etc/init");
+        std::fs::create_dir_all(&init_dir).unwrap();
+        let bin_dir = dir.join("system/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // The image's own rc + binary.
+        std::fs::write(bin_dir.join("android.hardware.health@2.1-service"), b"ELF").unwrap();
+        let rc = init_dir.join("android.hardware.health@2.1-service.rc");
+        std::fs::write(
+            &rc,
+            "service health-hal-2-1 /system/bin/android.hardware.health@2.1-service\n    disabled\n    user root\n    group root\n    file /dev/kmsg w\n    seclabel u:r:recovery:s0\n",
+        )
+        .unwrap();
+
+        let n = enable_image_health_hal(dir.to_str().unwrap());
+        assert_eq!(n, 1, "the 2.1 candidate should be patched");
+        let out = std::fs::read_to_string(&rc).unwrap();
+        assert!(
+            !out.lines().any(|l| l.trim() == "disabled"),
+            "the disabled option must be dropped: {out}"
+        );
+        assert!(
+            out.contains("# 6-Z272c:") && out.contains("on late-init\n    start health-hal-2-1"),
+            "the late-init start block must be appended: {out}"
+        );
+        // Service definition preserved byte-for-byte.
+        assert!(
+            out.contains("service health-hal-2-1 /system/bin/android.hardware.health@2.1-service")
+        );
+        assert!(out.contains("seclabel u:r:recovery:s0"));
+
+        // Idempotent: a second pass is a no-op returning 1.
+        let n2 = enable_image_health_hal(dir.to_str().unwrap());
+        assert_eq!(n2, 1, "second pass must detect the marker");
+        let out2 = std::fs::read_to_string(&rc).unwrap();
+        assert_eq!(out, out2, "second pass must not duplicate the block");
+
+        // Missing binary → no patch (we never start a synthetic service).
+        let dir2 = std::env::temp_dir().join(format!("kr64_6z272c_hal2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        let init2 = dir2.join("system/etc/init");
+        std::fs::create_dir_all(&init2).unwrap();
+        std::fs::write(
+            init2.join("android.hardware.health@2.1-service.rc"),
+            "service health-hal-2-1 /system/bin/android.hardware.health@2.1-service\n    disabled\n",
+        )
+        .unwrap();
+        let n3 = enable_image_health_hal(dir2.to_str().unwrap());
+        assert_eq!(n3, 0, "no binary → no patch");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
 
     // ── 6-Z270: sanitize_fstab_encryption_flags ─────────────────────────
     #[test]
