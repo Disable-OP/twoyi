@@ -917,6 +917,21 @@ const STABILITY_ANNOTATION_VINTF: i32 = 0b1111_11; // 63 = Stability::Level::VIN
 /// replies (null-binder flats).
 const STABILITY_ANNOTATION_NULL: i32 = 0;
 
+/// 6-Z272e: android-12/12L wire format. The A12 libbinder wraps the
+/// stability level in a `Category { u8 version; u8 reserved[2]; u8 level }`
+/// (Stability.h) — `level << 24 | version` as an i32 — and
+/// `Category::fromRepr(63)` decodes to version=63 / level=UNDECLARED(0)
+/// → "Can only set known stability, not 0." → BAD_TYPE → null binder
+/// (714 `V/Stability` lines in the R12-lavender run = every SM-reply
+/// parse). A12 accepts version >= 1 (kBinderWireFormatOldest) and the
+/// real A12 servicemanager writes `Category::currentFromLevel(level)` =
+/// version 1 + level — so VINTF = `0x3F000001`.
+const STABILITY_ANNOTATION_VINTF_A12: i32 = (0b1111_11 << 24) | 1; // 0x3F000001
+
+/// 6-Z272e: the android-12/12L null-binder Category (version 1, level
+/// UNDECLARED — setRepr(nullptr, level==UNDECLARED) returns OK).
+const STABILITY_ANNOTATION_NULL_A12: i32 = 1;
+
 // ============================================================================
 // Transaction flags (kernel `enum transaction_flags`).
 // ============================================================================
@@ -1520,6 +1535,17 @@ struct ConnBox {
     /// semantics. Zero until the (optional) IDENT frame arrives.
     sender_pid: i32,
     sender_euid: u32,
+    /// 6-Z272e: the stability-annotation wire format for THIS
+    /// connection. false (default) = the android-12/12L `Category` form
+    /// (level<<24 | version 1); true = the android-11/13+ plain-level
+    /// form. One VM mixes client generations (the A11 rootfs keystore2
+    /// AND the per-image recovery binary talk to the SAME proxy), so
+    /// the format self-tunes per connection: a same-service re-get
+    /// inside the window is the `waitForService` retry signature of a
+    /// reply the client failed to parse → flip (sticky).
+    sm_annotate_plain: bool,
+    /// The previous SM GET on this connection: (service name, at).
+    last_sm_get: Option<(String, std::time::Instant)>,
 }
 
 /// Shared per-VM bus state: the service registry with OWNER routing, the
@@ -3342,7 +3368,43 @@ fn servicemanager_proxy(
                 Some(Some(s)) => s,
                 _ => String::new(),
             };
-            let b = bus.lock().expect("binder bus poisoned");
+            let mut b = bus.lock().expect("binder bus poisoned");
+            // 6-Z272e: advance the per-connection annotation format BEFORE
+            // building the reply. A same-service re-get inside the window
+            // means the client's waitForService retry loop is re-asking
+            // for a service whose reply it FAILED to parse — flip to the
+            // plain form (sticky). A different name (or no retry) keeps
+            // the current format, so a working A12 client never breaks.
+            let (ann_hit, ann_null) = {
+                let now = std::time::Instant::now();
+                match b.conns.get_mut(&conn_id) {
+                    Some(bx) => {
+                        if !bx.sm_annotate_plain {
+                            if let Some((last, ts)) = &bx.last_sm_get {
+                                if *last == name
+                                    && now.duration_since(*ts) < std::time::Duration::from_secs(2)
+                                {
+                                    bx.sm_annotate_plain = true;
+                                    info!(
+                                        "[KR64][binder][svc] 6-Z272e: conn{} stability annotation → plain level (same-name retry observed)",
+                                        conn_id
+                                    );
+                                }
+                            }
+                        }
+                        bx.last_sm_get = Some((name.clone(), now));
+                        if bx.sm_annotate_plain {
+                            (STABILITY_ANNOTATION_VINTF, STABILITY_ANNOTATION_NULL)
+                        } else {
+                            (
+                                STABILITY_ANNOTATION_VINTF_A12,
+                                STABILITY_ANNOTATION_NULL_A12,
+                            )
+                        }
+                    }
+                    None => (STABILITY_ANNOTATION_VINTF, STABILITY_ANNOTATION_NULL),
+                }
+            };
             match b.services.get(&name).map(|e| e.handle) {
                 Some(handle) => {
                     let obj = FlatBinderObject {
@@ -3353,11 +3415,8 @@ fn servicemanager_proxy(
                     };
                     writer.write_flat_binder(&obj);
                     // 6-Z271x: android-12+ stability annotation follows the
-                    // flat. Without it the client's finishUnflattenBinder
-                    // readInt32 runs past the parcel end → null → the
-                    // NAME_NOT_FOUND chain of 6-Z271w (reply bytes were
-                    // byte-perfect android-11 shape but the client is 12+).
-                    writer.write_i32(STABILITY_ANNOTATION_VINTF);
+                    // flat; format per 6-Z272e.
+                    writer.write_i32(ann_hit);
                     info!(
                         "[KR64][binder][svc] getService({}) hit → handle 0x{:08x}",
                         name, handle
@@ -3372,9 +3431,9 @@ fn servicemanager_proxy(
                     };
                     writer.write_flat_binder(&obj);
                     // 6-Z271x: real flattenBinder(nullptr) annotates the
-                    // null flat with UNDECLARED(0); the client's
-                    // finishUnflattenBinder still reads the i32.
-                    writer.write_i32(STABILITY_ANNOTATION_NULL);
+                    // null flat; the client's finishUnflattenBinder still
+                    // reads the i32. Format per 6-Z272e.
+                    writer.write_i32(ann_null);
                     info!(
                         "[KR64][binder][svc] getService({}) miss → null binder",
                         name
@@ -4836,11 +4895,12 @@ mod tests {
             flat_type, BINDER_TYPE_HANDLE,
             "GET hit → BINDER_TYPE_HANDLE"
         );
-        // 6-Z271x: the android-12+ stability annotation follows the flat.
+        // 6-Z271x: the android-12+ stability annotation follows the flat;
+        // first get on this conn → A12 Category form (6-Z272e).
         let stability = i32::from_ne_bytes(blob2[28..32].try_into().unwrap());
         assert_eq!(
-            stability, STABILITY_ANNOTATION_VINTF,
-            "GET hit → VINTF stability annotation (android-12+)"
+            stability, STABILITY_ANNOTATION_VINTF_A12,
+            "GET hit → A12 Category annotation on a fresh connection"
         );
         // The proxy handle lives in the `binder` u64 field (low 32 bits on
         // remote refs — 6-Z114 §3.2).
@@ -4929,12 +4989,13 @@ mod tests {
         let cookie = u64::from_ne_bytes(blob[20..28].try_into().unwrap());
         assert_eq!(binder, 0, "null binder: binder field = 0");
         assert_eq!(cookie, 0, "null binder: cookie = 0");
-        // 6-Z271x: null binders are annotated UNDECLARED(0) — exactly what
-        // the real flattenBinder(nullptr) writes.
+        // 6-Z271x: null binders are annotated with the A12 Category null
+        // (version 1, level UNDECLARED) — the first get on a fresh conn
+        // uses the Category form (6-Z272e).
         let null_stability = i32::from_ne_bytes(blob[28..32].try_into().unwrap());
         assert_eq!(
-            null_stability, STABILITY_ANNOTATION_NULL,
-            "miss → null-binder stability annotation = UNDECLARED(0)"
+            null_stability, STABILITY_ANNOTATION_NULL_A12,
+            "miss → null-binder stability annotation = Category(version 1, level 0)"
         );
 
         drop(stream);
@@ -5864,23 +5925,22 @@ mod tests {
             PROXY_HANDLE_BASE + 1,
             "vibrator = first virtual"
         );
-        // Client walk 3: finishUnflattenBinder's readInt32 — the VINTF
-        // annotation. This is the read that ran past the parcel end in
-        // 6-Z271w and returned null for a byte-perfect android-11 reply.
+        // Client walk 3: finishUnflattenBinder's readInt32 — the A12
+        // Category form on the FIRST get of a connection (6-Z272e:
+        // level<<24 | version 1; the A12 client decodes level=VINTF,
+        // version=1 ≥ kBinderWireFormatOldest).
         let stability = i32::from_ne_bytes(blob[28..32].try_into().unwrap());
         assert_eq!(
-            stability, STABILITY_ANNOTATION_VINTF,
-            "VINTF(63): passes BpBinder::transact's Stability::check for \
-             BOTH system (12) and vendor (3) clients"
+            stability, STABILITY_ANNOTATION_VINTF_A12,
+            "first get → A12 Category form (0x3F000001)"
         );
-        // isDeclaredLevel semantics: VENDOR(3)/SYSTEM(12)/VINTF(63) only.
-        assert_ne!(
-            stability, 0,
-            "non-null binders must NOT be annotated UNDECLARED — \
-             BpBinder::transact would reject every user transaction"
-        );
+        // isDeclaredLevel semantics: the level byte must be VINTF (0x3F)
+        // and the version byte ≥ 1, or the A12 client rejects the reply.
+        assert_eq!(stability >> 24, 0b1111_11, "level byte = VINTF");
+        assert_eq!(stability & 0xFF, 1, "wire version byte = 1");
 
-        // ---- MISS: the null-binder reply carries annotation UNDECLARED(0).
+        // ---- MISS: the null-binder reply carries the Category null
+        // (different service name → no format flip on this fresh conn).
         let mut args2 = ParcelWriter::new();
         args2.write_string16("does_not_exist");
         let (d2, o2) = make_servicemanager_request_parcel(&mut args2);
@@ -5902,8 +5962,8 @@ mod tests {
         assert_eq!(flat_type2, BINDER_TYPE_BINDER, "miss → null binder");
         let null_stability = i32::from_ne_bytes(blob2[28..32].try_into().unwrap());
         assert_eq!(
-            null_stability, STABILITY_ANNOTATION_NULL,
-            "null binders carry UNDECLARED(0) — mirrors real flattenBinder(nullptr)"
+            null_stability, STABILITY_ANNOTATION_NULL_A12,
+            "null binders carry the Category null (version 1, level 0)"
         );
 
         drop(stream);
@@ -5970,5 +6030,96 @@ mod tests {
             }
             _ => panic!("getCapabilities must reply"),
         }
+    }
+
+    /// 6-Z272e: the per-connection annotation format SELF-TUNES. A
+    /// same-service re-get inside the window = the waitForService retry
+    /// signature of a reply the client failed to parse → the format
+    /// flips to the plain android-11/13+ level (sticky); a DIFFERENT
+    /// service name does NOT flip (a working A12 client must never see
+    /// the wrong format).
+    #[test]
+    fn z272e_annotation_flips_on_same_name_retry() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        let mut get = |name: &str| -> i32 {
+            let mut args = ParcelWriter::new();
+            args.write_string16(name);
+            let (d, o) = make_servicemanager_request_parcel(&mut args);
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_CHECK_SERVICE, 0));
+            let payload = make_v2_write_read_payload(&bc, &d, &o, 4096);
+            let (ret, resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
+            assert_eq!(ret, 0);
+            let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+            let off = 4 + read_size + 8;
+            let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+            assert_eq!(dlen, 32);
+            let blob = &resp[off + 8..off + 8 + dlen];
+            i32::from_ne_bytes(blob[28..32].try_into().unwrap())
+        };
+
+        // 1st get → A12 Category form.
+        assert_eq!(
+            get("android.hardware.vibrator.IVibrator/default"),
+            STABILITY_ANNOTATION_VINTF_A12,
+            "first get on a fresh conn = A12 Category"
+        );
+        // Real waitForService retry signature: the SAME service re-asked
+        // ~100 ms later after the reply failed to parse → flip to the
+        // plain android-11/13+ level.
+        assert_eq!(
+            get("android.hardware.vibrator.IVibrator/default"),
+            STABILITY_ANNOTATION_VINTF,
+            "same-name retry flips to the plain A11/A13+ level"
+        );
+        // The flip is sticky across different names (keystore2's compat
+        // get after the keymint retries must stay plain).
+        assert_eq!(
+            get("android.hardware.security.keymint.IKeyMintDevice/default"),
+            STABILITY_ANNOTATION_VINTF,
+            "the flip is sticky across different names"
+        );
+
+        // A SECOND connection (a fresh client) starts over at Category:
+        // different names must NOT flip a working A12 client.
+        let mut stream2 = UnixStream::connect(&path).expect("connect 2");
+        let mut get2 = |name: &str| -> i32 {
+            let mut args = ParcelWriter::new();
+            args.write_string16(name);
+            let (d, o) = make_servicemanager_request_parcel(&mut args);
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_CHECK_SERVICE, 0));
+            let payload = make_v2_write_read_payload(&bc, &d, &o, 4096);
+            let (ret, resp) = exchange(&mut stream2, BINDER_WRITE_READ, &payload);
+            assert_eq!(ret, 0);
+            let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+            let off = 4 + read_size + 8;
+            let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+            let blob = &resp[off + 8..off + 8 + dlen];
+            i32::from_ne_bytes(blob[28..32].try_into().unwrap())
+        };
+        assert_eq!(
+            get2("android.hardware.vibrator.IVibrator/default"),
+            STABILITY_ANNOTATION_VINTF_A12,
+            "fresh conn starts at the A12 Category form"
+        );
+        assert_eq!(
+            get2("android.hardware.security.keymint.IKeyMintDevice/default"),
+            STABILITY_ANNOTATION_VINTF_A12,
+            "different name does not flip the format"
+        );
+
+        drop(stream2);
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
     }
 }
