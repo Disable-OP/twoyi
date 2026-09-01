@@ -4865,7 +4865,47 @@ static int is_binder_device_path(const char *path) {
 // `real_fd` is the result of the real open; `saved_errno` is errno right
 // after the failed open (captured by the caller before any other syscall).
 static int binder_open_fallback(const char *path, int real_fd, int saved_errno) {
-    if (real_fd >= 0) return real_fd;           // real open succeeded — use it
+    if (real_fd >= 0) {
+        // 6-Z271p: a "successful" binder-device open can still be WRONG.
+        // The tracer materializes placeholder files at the translated
+        // socket paths (its own ENXIO fallback, 6-Z268), so an open that
+        // races behind that materialization returns a REGULAR-FILE fd.
+        // Such an fd is not marked as a proxy fd, the ioctl hook passes
+        // raw ioctls to it (ENOTTY), libhwbinder's ProcessState::open_
+        // driver() closes it and hits LOG_ALWAYS_FATAL("Binder driver
+        // could not be opened. Terminating.") — abort() → the §13 park
+        // → every mutex the aborting thread holds wedges the process
+        // (runs 33496750544/33498154781/33499415910: keystore2's
+        // negotiation thread died exactly there — pc in liblog
+        // __android_log_assert — right after the compat getService hit;
+        // its main thread futex-waited on one of the parked thread's
+        // mutexes forever, IKeystoreSecurity never registered).
+        // A binder-device fd MUST be a proxy fd or a REAL binder char
+        // device (root mode). A regular file is always the placeholder
+        // artifact — close it and connect to the proxy.
+        if (!binder_fd_is_proxy(real_fd)) {
+            struct stat st;
+            memset(&st, 0, sizeof(st));
+            int is_real_binder =
+                (fstat(real_fd, &st) == 0 && S_ISCHR(st.st_mode));
+            if (!is_real_binder) {
+                syscall(NR_close, real_fd);
+                int pfd = binder_proxy_connect(path);
+                if (pfd >= 0) {
+                    binder_fd_mark_proxy(pfd);
+                    // 6-Z271g: the opening thread keeps pfd as its
+                    // dedicated conn (same as the failed-open path).
+                    bp_thread_conn_insert(pfd, bp_gettid(), pfd);
+                    return pfd;
+                }
+                // Proxy unreachable — fall through to /dev/null below.
+                real_fd = -1;
+                saved_errno = ENXIO;
+            }
+        } else {
+            return real_fd;
+        }
+    }
     if (!is_binder_device_path(path)) return real_fd;  // not a binder device
     // 6-Z113 (z112 S1a): the real open failed — in non-root mode that is the
     // EXPECTED outcome (open(2) on the proxy's Unix-socket node returns
