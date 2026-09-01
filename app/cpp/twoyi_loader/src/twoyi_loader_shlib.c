@@ -440,6 +440,14 @@ static struct bp_reply_alloc g_bp_reply_allocs[BP_REPLY_ALLOC_MAX];
 static size_t g_bp_reply_alloc_next = 0;
 static pthread_mutex_t g_bp_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// 6-Z272d: the most recent SM-GET reply stash — the client's verdict
+// observer (BC_FREE_BUFFER = reply parcel CONSUMED; free-less re-transact
+// = transport-level failure). Single pending slot: the poll loop answers
+// one SM GET at a time, and the verdict fires before the next one.
+static pthread_mutex_t g_sm_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static uintptr_t g_sm_pending_stash = 0;
+static uint32_t g_sm_pending_stash_len = 0;
+
 static void bp_alloc_register(void *base, uint64_t size) {
     pthread_mutex_lock(&g_bp_alloc_lock);
     // Prefer a free slot; otherwise overwrite the oldest (round-robin).
@@ -473,6 +481,27 @@ static void bp_alloc_free(uintptr_t ptr) {
         }
     }
     pthread_mutex_unlock(&g_bp_alloc_lock);
+    // 6-Z272d: the client's own verdict on the SM reply. BC_FREE_BUFFER
+    // for the pending SM stash = the client's waitForResponse populated
+    // the reply Parcel and tore it down (the reply parcel was CONSUMED —
+    // a null still returned means the failure is inside the AIDL
+    // marshalling). No free + another handle-0 transact = the transact
+    // failed before Parcel teardown (transport-level).
+    pthread_mutex_lock(&g_sm_pending_lock);
+    if (g_sm_pending_stash != 0 && ptr == (uintptr_t)g_sm_pending_stash) {
+        static int sm_consumed_budget = 4;
+        if (sm_consumed_budget > 0) {
+            sm_consumed_budget--;
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                "[twoyi_loader] *** SM-REPLY-CONSUMED (client freed the reply "
+                "parcel; %u stash bytes)\n", (unsigned)g_sm_pending_stash_len);
+            write_str(2, msg);
+        }
+        g_sm_pending_stash = 0;
+        g_sm_pending_stash_len = 0;
+    }
+    pthread_mutex_unlock(&g_sm_pending_lock);
 }
 
 /// Walk the copied BR stream for BR_REPLY commands and give every one a
@@ -533,6 +562,61 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 uint64_t offsets_ptr = (uint64_t)(uintptr_t)(back + dlen);
                 memcpy(stream + pos + 4 + BP_TR_DATA_PTR_OFF, &data_ptr, 8);
                 memcpy(stream + pos + 4 + BP_TR_OFFSETS_PTR_OFF, &offsets_ptr, 8);
+                // 6-Z272d: the SM reply is now byte-identical to a real
+                // android-11/12/13 servicemanager reply ([EX_NONE][flat]
+                // [stability i32], offsets=[4] — verified against fetched
+                // Parcel.cpp/ServiceManager.cpp for all three) yet the
+                // client's ServiceManagerShim::getService STILL polls
+                // "Waiting for service ... didn't start. Returning NULL"
+                // 50× per 5 s budget. The bytes at the shlib are proven;
+                // the failure must sit in the LAST inch: the final
+                // client-visible tr fields / the client's parse-vs-
+                // transport boundary. This dump prints (a) the FINAL tr
+                // the client's mIn will read (after patching), (b) a
+                // re-read of the backing memory at the patched pointers
+                // (stale/corrupted stash detection), and (c) the client's
+                // OWN verdict observed at our boundary: a BC_FREE_BUFFER
+                // for this stash means the client's waitForResponse
+                // populated + tore down the reply Parcel (the null arose
+                // INSIDE the AIDL marshalling); a free-less re-transact
+                // to handle 0 means the transact itself failed before
+                // Parcel teardown.
+                {
+                    static int tr_dump_budget = 4;
+                    if (tr_dump_budget > 0 && dlen >= 28 && dlen <= 128 && olen >= 8) {
+                        tr_dump_budget--;
+                        uint32_t t_flags, t_dsize, t_osize;
+                        uint64_t t_dptr, t_optr;
+                        memcpy(&t_flags, stream + pos + 4 + 20, 4);
+                        memcpy(&t_dsize, stream + pos + 4 + 32, 4);
+                        memcpy(&t_osize, stream + pos + 4 + 40, 4);
+                        memcpy(&t_dptr, stream + pos + 4 + BP_TR_DATA_PTR_OFF, 8);
+                        memcpy(&t_optr, stream + pos + 4 + BP_TR_OFFSETS_PTR_OFF, 8);
+                        char msg[560];
+                        int off = snprintf(msg, sizeof(msg),
+                            "[twoyi_loader] *** SM-TR flags=0x%08x dsize=%u osize=%u "
+                            "dptr=%llx optr=%llx stash[d0]=%02x%02x%02x%02x "
+                            "stash[d+%u..]=%02x%02x%02x%02x stash[o0]=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                            t_flags, t_dsize, t_osize,
+                            (unsigned long long)t_dptr, (unsigned long long)t_optr,
+                            ((uint8_t *)t_dptr)[0], ((uint8_t *)t_dptr)[1],
+                            ((uint8_t *)t_dptr)[2], ((uint8_t *)t_dptr)[3],
+                            dlen - 4,
+                            ((uint8_t *)t_dptr)[dlen - 4], ((uint8_t *)t_dptr)[dlen - 3],
+                            ((uint8_t *)t_dptr)[dlen - 2], ((uint8_t *)t_dptr)[dlen - 1],
+                            ((uint8_t *)t_optr)[0], ((uint8_t *)t_optr)[1],
+                            ((uint8_t *)t_optr)[2], ((uint8_t *)t_optr)[3],
+                            ((uint8_t *)t_optr)[4], ((uint8_t *)t_optr)[5],
+                            ((uint8_t *)t_optr)[6], ((uint8_t *)t_optr)[7]);
+                        (void)off;
+                        write_str(2, msg);
+                        // Track the pending stash for the CONSUMED/NOFREE verdict.
+                        pthread_mutex_lock(&g_sm_pending_lock);
+                        g_sm_pending_stash = t_dptr;
+                        g_sm_pending_stash_len = dlen;
+                        pthread_mutex_unlock(&g_sm_pending_lock);
+                    }
+                }
             }
             // On malloc failure the tr keeps data_ptr=0 (the pre-6-Z265
             // behavior) — no worse than before.
