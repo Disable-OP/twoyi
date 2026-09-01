@@ -23472,3 +23472,22 @@ Work Log:
 
 Stage Summary:
 - Verdict: keystore2's main thread is NOT spinning in userspace (state S, not R/running) and is not wedged in an ioctl — it is blocked on a futex: FUTEX_WAIT_BITSET_PRIVATE on a bionic mutex held by its own binder pool thread Binder:1_1 (tid 2688), which is itself blocked in recvfrom() on the twoyi binder-proxy unix socket waiting for a reply the proxy never sent (conn=6 poll at +13446 ms got no ret). Holding the process-wide binder mutex across the blocking proxy read wedges the whole process: the main thread can never acquire the lock to issue the IKeyMintDevice transaction on handle 0xf0000002, so IKeystoreSecurity/IKeystoreService never registers — with zero crashes and everything else green. Next concrete fix: (1) guest-side binder shim must not hold the binder mutex across the blocking socket read — drop the lock before recvfrom or switch to a per-connection lock + condvar so other threads can proceed; (2) proxy side must guarantee exactly one reply per accepted WRITE_READ (reply-timeout guard + log why the +13446 reply was dropped); (3) instrument the virtual-handle routing ("routed transaction" / "virtual transaction" logs are empty — the 0xf0000002 path is currently invisible, so its reply shape cannot be trusted yet).
+
+---
+Task ID: 6-Z271o — thread-dump decode + fatal-marker gate
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-09-01
+Task: decode the keystore2 wedge via the new procfs thread dump; make the next run name the abort site.
+
+Work Log:
+- RUN 33493209875 (R12 lavender, 133bfad): SUCCESS / UI_READY / splash +31408 ms (parity); 0 fatal signals in logcat; 0 routed/virtual transactions (the 6-Z271n DIAGs prove NO client ever transacts on a getService-obtained handle — the class is client-side, not bus-side).
+- THREAD DUMP (new keystore2-threads-dump.txt artifact) — THE DECISIVE EVIDENCE:
+  * keystore2 tgid thread: parked in raw ppoll(0,0,0,0) — the §13 fb_hook abort-park signature (wchan poll_schedule_timeout, pc in libtwrp_fb_hook.so).
+  * keystore2 second thread: FUTEX_WAIT_BITSET_PRIVATE on a bionic mutex (word=0x2 = locked-with-waiters) — a sibling holds it and never unlocks (the parked thread!).
+  * Binder:1_1 pool thread: normal 250 ms proxy poll (healthy; the "13th unanswered poll" was the per-conn DIAG budget of 12 running out — not a proxy bug).
+- WEDGE MODEL: keystore2's first virtual-KeyMint call path (getInterfaceVersion/getHardwareInfo after the manifest-driven getService HIT) hits a FATAL (abort/assert/pure-virtual) somewhere in the guest; the fb_hook parks the aborting thread silently (by design, §13); the parked thread's held mutexes wedge the rest; IKeystoreSecurity never registers. The INTERCEPTED evidence was invisible because keystore2 burns the tracer's 800-write DIAG budget on property-area syncs before the abort, and >512-byte maps chunks are filtered.
+- FIX (417bb2f): content-gated fatal capture — any write whose buffer starts with "[twrp_fb_hook] ***" is captured REGARDLESS of the budget (the marker fires once per process via g_fatal_entered; cannot flood). Next run names the abort kind + caller_pc → the semantic fix targets the real site.
+- Open question parked deliberately: the parked thread's comm is "Binder:1_2" on the TGID — the rename source is unresolved and does not block the fix path.
+
+Stage Summary:
+- This round converted an invisible wedge into a precisely localized one with a diagnostic that will name the abort site. The binder bus itself is exonerated (0 failed paths, 0 timeouts, guards green across 4 runs). Boot timeline stable at ~+31.4 s splash through every wave — the keystore2 wedge is now the single remaining blocker between the current state and the projected ~15-20 s boot.
