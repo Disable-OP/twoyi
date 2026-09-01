@@ -631,6 +631,29 @@ jobs:
             > /tmp/ui-e2e-artifacts/logcat-dockerexec.txt 2>&1 || true
           sudo docker exec redroid /system/bin/sh -c "ps -A" \
             > /tmp/ui-e2e-artifacts/ps-dockerexec.txt 2>&1 || true
+          # 6-Z271n: per-thread state dump for the guest binder daemons.
+          # Decisive for the keystore2 stall class: /proc/<tid>/syscall
+          # shows the CURRENT syscall (or "running" for a userspace spin),
+          # wchan + stat show block-vs-run, /proc/<tid>/stack (kernel,
+          # best-effort) shows where a blocked thread parks. Container
+          # root can read every guest task's procfs.
+          sudo docker exec redroid sh -c '
+            for d in /proc/[0-9]*/task/[0-9]*; do
+              c=$(cat "$d/comm" 2>/dev/null) || continue
+              case "$c" in
+                *system_bin_key*|*keystore*|Binder:*|*servicemanager*|*hwservicemanager*|*vndservicemanager*)
+                  t=${d##*/}
+                  p=$(echo "$d" | sed -n "s|.*/proc/\\([0-9]*\\)/task/.*|\\1|p")
+                  echo "=== pid=$p tid=$t comm=$c ==="
+                  echo "stat:  $(cat $d/stat 2>/dev/null | cut -d" " -f1,3,30-40)"
+                  echo "state: $(grep -oE "^[^ ]+ [^ ]+ [A-Za-z]" $d/stat 2>/dev/null)"
+                  echo "wchan: $(cat $d/wchan 2>/dev/null)"
+                  echo "syscall: $(cat $d/syscall 2>/dev/null)"
+                  echo "stack: $(cat $d/stack 2>/dev/null | head -4 | tr "\n" "|")"
+                  ;;
+              esac
+            done' \
+            > /tmp/ui-e2e-artifacts/keystore2-threads-dump.txt 2>&1 || true
           # 6-Z181: FULL evidence via docker exec — run 33059345471 lost
           # the whole kr64-app-stderr.log (the new SIGSEGV/SIGFRAME/POKE
           # forensics!) because adb died at Launch Container and the
