@@ -5541,7 +5541,7 @@ mod tests {
         };
 
         // ---- (b) queued sync work resolved on server teardown ----
-        let mut conn_srv = add_service("doomed_svc", 0xdead);
+        let conn_srv = add_service("doomed_svc", 0xdead);
         let mut conn_cli = UnixStream::connect(&path).expect("connect cli");
         let h_doomed = get_service(&mut conn_cli, "doomed_svc");
         let mut tx = [0u8; 64];
@@ -5569,7 +5569,7 @@ mod tests {
         );
 
         // ---- (a) death notification for a watcher ----
-        let mut conn_srv2 = add_service("watched_svc", 0xcafe);
+        let conn_srv2 = add_service("watched_svc", 0xcafe);
         let mut conn_watch = UnixStream::connect(&path).expect("connect watcher");
         let h_watched = get_service(&mut conn_watch, "watched_svc");
         // BC_REQUEST_DEATH_NOTIFICATION: [cmd][handle u32][cookie u64].
