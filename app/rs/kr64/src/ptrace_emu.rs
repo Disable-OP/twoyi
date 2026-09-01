@@ -20475,8 +20475,25 @@ pub fn run_ptrace_loop(
                         // (e.g. property-area sync); ret <= 0 is a
                         // failed write (nothing to capture).
                         if ret > 0 && ret <= 512 {
+                            // 6-Z271o: FATAL-MARKER GATE — capture
+                            // fb_hook fatal evidence REGARDLESS of the
+                            // write budget. Run 33493209875: keystore2's
+                            // fb_hook-parked thread (the §13 abort-park)
+                            // produced ZERO INTERCEPTED lines because
+                            // keystore2's ~800-write budget was already
+                            // burned by property-area syncs before the
+                            // abort fired. The marker fires ONCE per
+                            // process (g_fatal_entered), so this cannot
+                            // flood; it makes every guest abort site
+                            // (kind + caller_pc) attributable in
+                            // artifacts.
+                            let probe =
+                                read_child_bytes(pid, get_syscall_arg(&regs, abi.reg_arg2), 24);
+                            let is_fatal_marker = probe
+                                .map(|b| b.starts_with(b"[twrp_fb_hook] ***"))
+                                .unwrap_or(false);
                             post_execve_write_count = post_execve_write_count.saturating_add(1);
-                            if post_execve_write_count <= 800 {
+                            if is_fatal_marker || post_execve_write_count <= 800 {
                                 // fd = arg1 (ebx on i386 / rdi on x86_64),
                                 // buf = arg2 (ecx on i386 / rsi on x86_64).
                                 // Both are preserved across the syscall
