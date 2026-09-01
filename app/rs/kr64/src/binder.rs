@@ -47,9 +47,17 @@
 //! * **A real name→handle registry with OWNER routing (6-Z271)** —
 //!   addService stores the owning connection + its local ptr/cookie;
 //!   getService answers with a `flat_binder_object{BINDER_TYPE_HANDLE}`
-//!   carrying a proxy-allocated fake handle (`0xF0000000 + n`); a miss
+//!   carrying a kernel-true dense handle (`6-Z271v`: `PROXY_HANDLE_BASE 0`
+//!   — real libbinder's `lookupHandleLocked` inserts `handle+1` entries
+//!   into its handle Vector, so sparse `0xF0000000-range` handles aborted
+//!   every client with the libutils "new_capacity overflow" fatal); a miss
 //!   answers with a null binder, exactly like the native servicemanager's
-//!   reply shape.
+//!   reply shape. Every reply that carries a binder object also carries
+//!   the android-12+ binder STABILITY ANNOTATION (`6-Z271x`):
+//!   `Parcel::finishFlattenBinder` writes `[flat][i32 Stability::Level]`
+//!   and `finishUnflattenBinder` reads the i32 back — an annotation-less
+//!   parcel makes the client's readInt32 run past the parcel end → null
+//!   binder → the honest-but-fatal NAME_NOT_FOUND chain of 6-Z271w.
 //! * **`BR_TRANSACTION` delivery + `BC_REPLY` correlation (6-Z271 bus)** —
 //!   transactions aimed at a registered handle are queued on the owning
 //!   guest connection and delivered (with the owner's ptr/cookie and the
@@ -878,6 +886,36 @@ pub const FLAT_BINDER_FLAG_ACCEPTS_FDS: u32 = 0x100;
 /// `unflattenBinder` ignores `flags`, so the value is cosmetic, but we
 /// reproduce the wire truth for byte-fidelity.
 pub const FLAT_FLAGS_LIBBINDER_DEFAULT: u32 = 0x13 | FLAT_BINDER_FLAG_ACCEPTS_FDS;
+
+/// 6-Z271x: the android-12+ binder stability annotation that follows EVERY
+/// `flat_binder_object` on the wire. Verified against android-13
+/// `framework/native/libs/binder/Parcel.cpp` + `Stability.{h,cpp}`:
+///
+/// * `Parcel::flattenBinder` ends with `finishFlattenBinder(binder)` =
+///   `writeInt32(Stability::getRepr(binder))` — a 4-byte annotation AFTER
+///   the 24-byte flat object.
+/// * `Parcel::unflattenBinder` → `finishUnflattenBinder` =
+///   `readInt32(&stability)` + `Stability::setRepr(binder, stability,
+///   /*log=*/true)`. `setRepr` rejects anything outside
+///   `isDeclaredLevel()` = {VENDOR 0b000011, SYSTEM 0b001100,
+///   VINTF 0b111111} with BAD_TYPE → the whole `readStrongBinder`
+///   returns null (the 6-Z271w NAME_NOT_FOUND class).
+/// * The annotation also feeds the later CALL-TIME gate
+///   (`BpBinder::transact`: `Stability::check(getRepr(this),
+///   getLocalLevel())`, where check is `(provided & required) ==
+///   required`). VINTF `0b111111` is the only declared level that passes
+///   for both system clients (`getLocalLevel()=SYSTEM`, system
+///   keystore2/recovery) and vendor clients (`VENDOR`), and it is exactly
+///   what real `@VintfStability` HALs (keymint/vibrator/sharedsecret)
+///   put on the wire — so VIRTUALLY-REGISTERED services are annotated
+///   VINTF.
+const STABILITY_ANNOTATION_VINTF: i32 = 0b1111_11; // 63 = Stability::Level::VINTF
+
+/// The annotation the real `flattenBinder(nullptr)` writes for a null
+/// binder: `getRepr(nullptr) = UNDECLARED (0)`, and
+/// `setRepr(nullptr, UNDECLARED)` returns OK. Used on the SM miss
+/// replies (null-binder flats).
+const STABILITY_ANNOTATION_NULL: i32 = 0;
 
 // ============================================================================
 // Transaction flags (kernel `enum transaction_flags`).
@@ -3314,6 +3352,12 @@ fn servicemanager_proxy(
                         cookie: 0,
                     };
                     writer.write_flat_binder(&obj);
+                    // 6-Z271x: android-12+ stability annotation follows the
+                    // flat. Without it the client's finishUnflattenBinder
+                    // readInt32 runs past the parcel end → null → the
+                    // NAME_NOT_FOUND chain of 6-Z271w (reply bytes were
+                    // byte-perfect android-11 shape but the client is 12+).
+                    writer.write_i32(STABILITY_ANNOTATION_VINTF);
                     info!(
                         "[KR64][binder][svc] getService({}) hit → handle 0x{:08x}",
                         name, handle
@@ -3327,6 +3371,10 @@ fn servicemanager_proxy(
                         cookie: 0,
                     };
                     writer.write_flat_binder(&obj);
+                    // 6-Z271x: real flattenBinder(nullptr) annotates the
+                    // null flat with UNDECLARED(0); the client's
+                    // finishUnflattenBinder still reads the i32.
+                    writer.write_i32(STABILITY_ANNOTATION_NULL);
                     info!(
                         "[KR64][binder][svc] getService({}) miss → null binder",
                         name
@@ -3522,6 +3570,9 @@ fn servicemanager_legacy(code: u32) -> TransactionResult {
                 binder: 0,
                 cookie: 0,
             });
+            // 6-Z271x: the client's finishUnflattenBinder reads the
+            // stability i32 after the flat even for a null binder.
+            writer.write_i32(STABILITY_ANNOTATION_NULL);
         }
         SVC_MGR_ADD_SERVICE
         | SVC_MGR_LIST_SERVICES
@@ -4395,7 +4446,8 @@ mod tests {
         assert_eq!(count, 1, "one reply blob");
         let dlen = u32::from_ne_bytes(tail[8..12].try_into().unwrap()) as usize;
         let olen = u32::from_ne_bytes(tail[12..16].try_into().unwrap()) as usize;
-        assert_eq!(dlen, 28, "status-ok (4) + flat_binder_object (24)");
+        // 6-Z271x: status-ok (4) + flat_binder_object (24) + stability (4)
+        assert_eq!(dlen, 32, "status-ok (4) + flat (24) + stability i32 (4)");
         assert_eq!(olen, 8, "one offsets entry (binder_size_t = u64)");
         assert!(
             tail.len() >= 16 + dlen + olen,
@@ -4758,8 +4810,8 @@ mod tests {
         let off_len2 = u32::from_ne_bytes(resp2[off2 + 4..off2 + 8].try_into().unwrap()) as usize;
         assert_eq!(
             data_len2,
-            4 + 24,
-            "GET reply = [i32 0 status] + 24-byte flat"
+            4 + 24 + 4,
+            "GET reply = [i32 0 status] + 24-byte flat + i32 stability (6-Z271x)"
         );
         assert_eq!(off_len2, 8, "GET reply offsets = one u64 offset");
         let blob2 = &resp2[off2 + 8..off2 + 8 + data_len2];
@@ -4770,6 +4822,12 @@ mod tests {
         assert_eq!(
             flat_type, BINDER_TYPE_HANDLE,
             "GET hit → BINDER_TYPE_HANDLE"
+        );
+        // 6-Z271x: the android-12+ stability annotation follows the flat.
+        let stability = i32::from_ne_bytes(blob2[28..32].try_into().unwrap());
+        assert_eq!(
+            stability, STABILITY_ANNOTATION_VINTF,
+            "GET hit → VINTF stability annotation (android-12+)"
         );
         // The proxy handle lives in the `binder` u64 field (low 32 bits on
         // remote refs — 6-Z114 §3.2).
@@ -4836,7 +4894,11 @@ mod tests {
         off += 8; // magic(4) + blob_count(4)
         let data_len = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
         let off_len = u32::from_ne_bytes(resp[off + 4..off + 8].try_into().unwrap()) as usize;
-        assert_eq!(data_len, 4 + 24, "miss reply = [i32 0] + 24-byte null flat");
+        assert_eq!(
+            data_len,
+            4 + 24 + 4,
+            "miss reply = [i32 0] + null flat + stability i32"
+        );
         assert_eq!(off_len, 8, "null flat object still listed in offsets");
         let blob = &resp[off + 8..off + 8 + data_len];
         let status = i32::from_ne_bytes(blob[0..4].try_into().unwrap());
@@ -4854,6 +4916,13 @@ mod tests {
         let cookie = u64::from_ne_bytes(blob[20..28].try_into().unwrap());
         assert_eq!(binder, 0, "null binder: binder field = 0");
         assert_eq!(cookie, 0, "null binder: cookie = 0");
+        // 6-Z271x: null binders are annotated UNDECLARED(0) — exactly what
+        // the real flattenBinder(nullptr) writes.
+        let null_stability = i32::from_ne_bytes(blob[28..32].try_into().unwrap());
+        assert_eq!(
+            null_stability, STABILITY_ANNOTATION_NULL,
+            "miss → null-binder stability annotation = UNDECLARED(0)"
+        );
 
         drop(stream);
         drop(handle);
@@ -5694,7 +5763,11 @@ mod tests {
         let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
         let off = 4 + read_size + 8;
         let dl = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
-        assert_eq!(dl, 4 + 24, "hit reply = status + flat handle");
+        assert_eq!(
+            dl,
+            4 + 24 + 4,
+            "hit reply = status + flat handle + stability (6-Z271x)"
+        );
         let blob = &resp[off + 8..off + 8 + dl];
         let flat_type = u32::from_ne_bytes(blob[4..8].try_into().unwrap());
         assert_eq!(flat_type, BINDER_TYPE_HANDLE, "virtual service HIT");
@@ -5721,6 +5794,104 @@ mod tests {
         let caps = i32::from_ne_bytes(blob2[4..8].try_into().unwrap());
         assert_eq!(status, 0, "EX_NONE");
         assert_eq!(caps, 0, "caps = 0 (plain on/off only)");
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    /// 6-Z271x: THE android-12+ binder stability annotation. The reply the
+    /// client's `unflattenBinder` walks must be
+    /// `[i32 EX_NONE][flat_binder_object @ off 4][i32 stability]` —
+    /// `finishUnflattenBinder` reads the i32 AFTER the flat and
+    /// `Stability::setRepr` aborts the parse (BAD_TYPE → null binder →
+    /// keystore2 NAME_NOT_FOUND, the 6-Z271w chain) when it is missing or
+    /// undeclared-for-non-null. Byte-verified here for the getService hit
+    /// (VINTF 63) and miss (UNDECLARED 0) shapes end-to-end over the v2
+    /// wire, mirroring the android-13 Parcel.cpp readObject walk (object
+    /// table entry at the read position, 24-byte flat, trailing i32).
+    #[test]
+    fn z271x_sm_reply_carries_binder_stability_annotation() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        // ---- HIT: getService a name the legacy-path proxy will answer.
+        // Use a virtual service name (always registered at proxy start).
+        let mut args = ParcelWriter::new();
+        args.write_string16("android.hardware.vibrator.IVibrator/default");
+        let (d, o) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_CHECK_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &d, &o, 4096);
+        let (ret, resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0);
+        let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+        let off = 4 + read_size + 8;
+        let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+        assert_eq!(dlen, 32, "hit blob = EX_NONE(4) + flat(24) + stability(4)");
+        let blob = &resp[off + 8..off + 8 + dlen];
+        // Client walk 1: Status::readFromParcel consumes EX_NONE at 0.
+        assert_eq!(
+            i32::from_ne_bytes(blob[0..4].try_into().unwrap()),
+            0,
+            "EX_NONE"
+        );
+        // Client walk 2: readObject(false) at DPOS=4 — flat must be listed
+        // in the offsets table AT the read position, and read 24 bytes.
+        let flat_type = u32::from_ne_bytes(blob[4..8].try_into().unwrap());
+        assert_eq!(flat_type, BINDER_TYPE_HANDLE);
+        let flat_handle = u64::from_ne_bytes(blob[12..20].try_into().unwrap()) as u32;
+        assert_eq!(
+            flat_handle,
+            PROXY_HANDLE_BASE + 1,
+            "vibrator = first virtual"
+        );
+        // Client walk 3: finishUnflattenBinder's readInt32 — the VINTF
+        // annotation. This is the read that ran past the parcel end in
+        // 6-Z271w and returned null for a byte-perfect android-11 reply.
+        let stability = i32::from_ne_bytes(blob[28..32].try_into().unwrap());
+        assert_eq!(
+            stability, STABILITY_ANNOTATION_VINTF,
+            "VINTF(63): passes BpBinder::transact's Stability::check for \
+             BOTH system (12) and vendor (3) clients"
+        );
+        // isDeclaredLevel semantics: VENDOR(3)/SYSTEM(12)/VINTF(63) only.
+        assert_ne!(
+            stability, 0,
+            "non-null binders must NOT be annotated UNDECLARED — \
+             BpBinder::transact would reject every user transaction"
+        );
+
+        // ---- MISS: the null-binder reply carries annotation UNDECLARED(0).
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("does_not_exist");
+        let (d2, o2) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload2 = make_v2_write_read_payload(&bc2, &d2, &o2, 4096);
+        let (ret2, resp2) = exchange(&mut stream, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0);
+        let read2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
+        let off2 = 4 + read2 + 8;
+        let dlen2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            dlen2, 32,
+            "miss blob = EX_NONE(4) + null flat(24) + stability(4)"
+        );
+        let blob2 = &resp2[off2 + 8..off2 + 8 + dlen2];
+        let flat_type2 = u32::from_ne_bytes(blob2[4..8].try_into().unwrap());
+        assert_eq!(flat_type2, BINDER_TYPE_BINDER, "miss → null binder");
+        let null_stability = i32::from_ne_bytes(blob2[28..32].try_into().unwrap());
+        assert_eq!(
+            null_stability, STABILITY_ANNOTATION_NULL,
+            "null binders carry UNDECLARED(0) — mirrors real flattenBinder(nullptr)"
+        );
 
         drop(stream);
         drop(handle);
