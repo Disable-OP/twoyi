@@ -841,6 +841,11 @@ pub const SVC_MGR_HANDLE: u32 = 0;
 /// The pre-6-Z271c `from_ne_bytes` spelling was byte-swapped, so the
 /// PING fast-path never matched a real ping.
 pub const PING_TRANSACTION: u32 = u32::from_be_bytes(*b"_PNG");
+/// `IBinder::INTERFACE_TRANSACTION` — `_NTF` (0x5f4e5446). The descriptor
+/// query every real client sends to a fresh proxy; answered with the
+/// BARE interface-descriptor string16 (no exception header — see the
+/// 6-Z272f branch in `handle_transaction`).
+pub const INTERFACE_TRANSACTION: u32 = u32::from_be_bytes(*b"_NTF");
 
 /// `android.hidl.manager.V1_0.IServiceManager` method codes (HIDL —
 /// declaration order, FIRST_CALL_TRANSACTION = 1): get = 1, add = 2.
@@ -1453,6 +1458,20 @@ pub enum VirtualService {
     /// `android.hardware.security.sharedsecret.ISharedSecret/default` —
     /// keystore2's shared-secret negotiation partner.
     SharedSecret,
+}
+
+impl VirtualService {
+    /// 6-Z272f: the AIDL interface descriptor — the reply body for
+    /// `IBinder::INTERFACE_TRANSACTION` (`BpBinder::getInterface-
+    /// Descriptor` reads a BARE string16 from the reply — no exception
+    /// header, exactly what `BBinder::onTransact`'s default case writes).
+    pub fn descriptor(self) -> &'static str {
+        match self {
+            VirtualService::Vibrator => "android.hardware.vibrator.IVibrator",
+            VirtualService::KeyMint => "android.hardware.security.keymint.IKeyMintDevice",
+            VirtualService::SharedSecret => "android.hardware.security.sharedsecret.ISharedSecret",
+        }
+    }
 }
 
 /// One registered service: name → handle + owner + the owner's local
@@ -3068,6 +3087,48 @@ fn handle_transaction(
         w.write_status_ok();
         let (data, offsets) = w.into_parts();
         return TransactionResult::Reply { data, offsets };
+    }
+
+    // 6-Z272f: `IBinder::INTERFACE_TRANSACTION` (0x5f4e5446, "_NTF") —
+    // the first transaction EVERY real client sends to a freshly-created
+    // proxy (`BpBinder::getInterfaceDescriptor` — the AIDL
+    // fromBinder/asInterface machinery reads the descriptor via
+    // INTERFACE_TRANSACTION when it is not cached). The R12-lavender run
+    // proved clients DO reach the services now — and got
+    // EX_UNSUPPORTED_OPERATION from the virtual catch-all, so the
+    // descriptor query failed, fromBinder failed, and keystore2's
+    // connect_keymint panicked one level deeper ("Failed to create
+    // service android.system.keystore2.IKeystoreService/default ←
+    // connect_keymint ..."). Kernel semantics: `BBinder::onTransact`'s
+    // default case answers with the BARE descriptor string16 (NO
+    // exception header). Guest-owned services ROUTE as usual (their own
+    // BBinder answers).
+    if code == INTERFACE_TRANSACTION {
+        if target_handle == SVC_MGR_HANDLE {
+            let mut w = ParcelWriter::new();
+            w.write_string16(SVC_MGR_IFACE_DESCRIPTOR);
+            let (data, offsets) = w.into_parts();
+            return TransactionResult::Reply { data, offsets };
+        }
+        let virtual_kind = {
+            let b = bus.lock().expect("binder bus poisoned");
+            b.by_handle
+                .get(&target_handle)
+                .and_then(|name| b.services.get(name))
+                .and_then(|e| e.virtual_kind)
+        };
+        if let Some(kind) = virtual_kind {
+            let mut w = ParcelWriter::new();
+            w.write_string16(kind.descriptor());
+            let (data, offsets) = w.into_parts();
+            info!(
+                "[KR64][binder][svc] INTERFACE_TRANSACTION → {} descriptor",
+                kind.descriptor()
+            );
+            return TransactionResult::Reply { data, offsets };
+        }
+        // Guest-owned service: fall through to the routing below — the
+        // owner's BBinder answers like any other transaction.
     }
 
     if target_handle == SVC_MGR_HANDLE {
@@ -6030,6 +6091,70 @@ mod tests {
             }
             _ => panic!("getCapabilities must reply"),
         }
+    }
+
+    /// 6-Z272f: `IBinder::INTERFACE_TRANSACTION` ('_NTF') — the FIRST
+    /// transaction every real client sends to a fresh proxy. The reply
+    /// must be the BARE descriptor string16 (BBinder::onTransact
+    /// default-case semantics — NO exception header), or the client's
+    /// fromBinder/asInterface machinery fails one level before its first
+    /// real call (keystore2's connect_keymint panic chain of run
+    /// 33539861041: clients reached the services and got
+    /// EX_UNSUPPORTED_OPERATION).
+    #[test]
+    fn z272f_interface_transaction_answers_descriptor() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        let mut iface_tx = |target: u32| -> (usize, Vec<u8>, usize, Vec<u8>) {
+            let mut tx = [0u8; 64];
+            tx[0..4].copy_from_slice(&target.to_ne_bytes());
+            tx[16..20].copy_from_slice(&INTERFACE_TRANSACTION.to_ne_bytes());
+            let tx_data: &[u8] = &[];
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&tx);
+            let payload = make_v2_write_read_multi_payload(&bc, &[(tx_data, &[])], 4096);
+            let (ret, resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
+            assert_eq!(ret, 0);
+            let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+            let off = 4 + read_size + 8;
+            let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+            let olen = u32::from_ne_bytes(resp[off + 4..off + 8].try_into().unwrap()) as usize;
+            let blob = resp[off + 8..off + 8 + dlen + olen].to_vec();
+            (dlen, blob[..dlen].to_vec(), olen, blob[dlen..].to_vec())
+        };
+
+        // Virtual vibrator handle: bare descriptor string16, no offsets.
+        let vh = PROXY_HANDLE_BASE + 1;
+        let (dlen, data, olen, _offs) = iface_tx(vh);
+        assert!(olen == 0, "descriptor reply has no binder objects");
+        let mut r = ParcelReader::new(&data);
+        let desc = r
+            .read_string16()
+            .expect("descriptor string16")
+            .expect("descriptor non-null");
+        assert_eq!(desc, "android.hardware.vibrator.IVibrator");
+        assert_eq!(r.remaining(), 0, "no trailing bytes (no EX_NONE header)");
+        let _ = dlen;
+
+        // The context manager answers its own descriptor.
+        let (_d2, data2, o2, _o2) = iface_tx(SVC_MGR_HANDLE);
+        assert_eq!(o2, 0);
+        let mut r2 = ParcelReader::new(&data2);
+        let desc2 = r2
+            .read_string16()
+            .expect("sm descriptor")
+            .expect("non-null");
+        assert_eq!(desc2, SVC_MGR_IFACE_DESCRIPTOR);
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
     }
 
     /// 6-Z272e: the per-connection annotation format SELF-TUNES. A
