@@ -20504,7 +20504,7 @@ pub fn run_ptrace_loop(
                                 .map(|b| b.starts_with(b"[twrp_fb_hook] ***"))
                                 .unwrap_or(false);
                             if is_fatal_marker {
-                                fatal_evidence_follow = 48;
+                                fatal_evidence_follow = 160;
                             }
                             in_follow = fatal_evidence_follow > 0;
                             if in_follow {
@@ -20533,7 +20533,21 @@ pub fn run_ptrace_loop(
                             // the return value).
                             let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
                             let buf_addr = get_syscall_arg(&regs, abi.reg_arg2);
-                            let to_read = std::cmp::min(ret as usize, 256);
+                            // 6-Z271o: inside the fatal follow window,
+                            // capture up to 2048 B per write — the maps
+                            // dump writes 2 KiB chunks and ~60 of them
+                            // cover the full module list; the 256 B cap
+                            // spread that over 480+ writes and the
+                            // window closed before the aborting pc's
+                            // module line (run 33498154781).
+                            let to_read = std::cmp::min(
+                                ret as usize,
+                                if in_follow || is_fatal_marker {
+                                    2048
+                                } else {
+                                    256
+                                },
+                            );
                             let captured = read_child_bytes(pid, buf_addr, to_read);
                             let is_klog = kmsg_fd == Some(fd);
                             let prefix = if is_klog { "DIAG KLOG" } else { "DIAG write" };
