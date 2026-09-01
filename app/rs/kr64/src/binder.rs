@@ -915,11 +915,27 @@ pub const BINDER_CURRENT_PROTOCOL_VERSION: u32 = 8;
 /// bounded by [`MAX_PROXY_CONNECTIONS`]).
 pub const BINDER_THREAD_POOL_SIZE: usize = 4;
 
-/// Base of the proxy-allocated fake service handles: `0xF0000000 + n`
-/// with `n >= 1`. Far above any real kernel handle (the kernel
-/// allocates handles densely from 1), so a fake handle can never alias
-/// a host handle on the [`forward_transaction_to_host`] path.
-pub const PROXY_HANDLE_BASE: u32 = 0xF000_0000;
+/// Base of the proxy-allocated service handles. 6-Z271v: handles are
+/// now KERNEL-TRUE — small dense integers from 1 (handle 0 stays the
+/// context manager), exactly like the real binder driver allocates them.
+///
+/// WHY THE OLD `0xF0000000` BASE WAS FATAL (the last piece of the ~18 s
+/// hole, runs 33496750544/33501057212/33509290359): a REAL libbinder
+/// client that receives a handle builds its handle table in
+/// `ProcessState::lookupHandleLocked` —
+///   mHandleToObject.insertAt(e, N, handle+1-N)
+/// — i.e. it inserts `handle+1` entries into an `android::Vector`. With
+/// handle 0xF0000004 (negative as int32 → ~4.29 billion as size_t) that
+/// is a FOUR-BILLION-ENTRY insert → libutils Vector capacity overflow →
+/// LOG_ALWAYS_FATAL("new_capacity overflow", tag "Vector") → abort() →
+/// the §13 park → every mutex the aborting thread holds wedges the
+/// process. Every client that ever received one of our handles died
+/// before its first transaction (0 routed/virtual transactions across
+/// all runs since the registry went live). The old base existed to keep
+/// fake handles from aliasing host handles on the retired
+/// `forward_transaction_to_host` skeleton — the bus routes everything
+/// locally now, so the constraint is gone.
+pub const PROXY_HANDLE_BASE: u32 = 0;
 
 /// Maximum concurrent guest connections (one thread each). The guest's
 /// `libbinder.so` opens one binder fd per process (`ProcessState`),
@@ -1283,8 +1299,9 @@ impl Clone for RequestBlob {
     }
 }
 
-/// Proxy-side servicemanager registry: service name → fake proxy handle
-/// (allocated from [`PROXY_HANDLE_BASE`] + 1). Per 6-Z114 §3.3 / §3.4 the
+/// Proxy-side servicemanager registry: service name → proxy handle
+/// (allocated from [`PROXY_HANDLE_BASE`] + 1 — 6-Z271v: dense
+/// kernel-true integers). Per 6-Z114 §3.3 / §3.4 the
 /// proxy stamps the proxy handle into the `BINDER_TYPE_HANDLE` flat
 /// object it returns to the requester; a subsequent `BC_TRANSACTION` to
 /// that handle would be routed back to the owning guest connection (the
