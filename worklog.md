@@ -23557,3 +23557,18 @@ Work Log:
 
 Stage Summary:
 - Reply bytes exonerated. The failure is in the client-side post-parse step (getStrongProxyForHandle/BpBinder::create/AIBinder class association/interface-version machinery) OR the shlib's delivery of this specific reply to the client (tr fields beyond the patched pointers). Next diagnostic: dump the FULL binder_transaction_data (all 64 B) the client receives for the SM GET reply + the client's own errno path — or add a BpBinder-side capture via the tracer at the moment the handle enters lookupHandleLocked.
+
+---
+Task ID: 6-Z272a — LineageOS 22.2 first boot (BOOT_FAIL, forensics open)
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-09-01
+Task: first LineageOS 22.2 (sailfish, Android 15/SDK 35) CI boot on the 6-Z271v head.
+
+Work Log:
+- Run 33511795481 (91240a9): workflow SUCCESS, image result BOOT_FAIL / ui NOT_REACHED / terminal N/A. 3 guest aborts.
+- Infrastructure checks that PASSED: androidboot.hardware = "sailfish" detected from the image (6-Z159), fstab sanitizer ran on first_stage_ramdisk/fstab.sailfish (1708→1669 B, 6-Z270), ramdisk import fine.
+- This is a NEW generation for the corpus: Android 15 init + linker, A/B recovery-in-boot, xz-compressed ramdisk — its failure modes are expected to be Android-15-specific (init/linker/AVB expectations), independent of the R12 wedge chain.
+- NEXT: kmsg-tail + abort-site decode for sailfish (the same fatal-marker + thread-dump diagnostics apply), then the Android-15 init virtualization gaps (likely: newer fstab flags, AVB vbmeta expectations, updated property contexts, init.rc service syntax).
+
+Stage Summary:
+- Corpus now spans Android 9→15. LineageOS 22.2 is a dedicated work stream; R12's wedge chain (dense handles landed) remains the primary verified thread. Both proceed under the webDevReview cron.
