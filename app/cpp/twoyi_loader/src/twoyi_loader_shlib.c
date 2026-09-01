@@ -583,8 +583,17 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 // Parcel teardown.
                 {
                     static int tr_dump_budget = 4;
-                    if (tr_dump_budget > 0 && dlen >= 28 && dlen <= 128 && olen >= 8) {
-                        tr_dump_budget--;
+                    static int vs_dump_budget = 6;
+                    /* 6-Z272g: the virtual-service METHOD replies
+                     * (getHardwareInfo etc.) have olen==0 — the SM gate
+                     * skipped them while the getHardwareInfo reply is the
+                     * current keystore2 TRANSACTION_FAILED site. Widen the
+                     * observation to every reply shape. */
+                    int is_sm = (dlen >= 28 && dlen <= 128 && olen >= 8);
+                    int is_vs = (dlen >= 8 && dlen <= 256 && olen == 0);
+                    if ((is_sm && tr_dump_budget > 0) || (is_vs && vs_dump_budget > 0)) {
+                        if (is_sm) tr_dump_budget--;
+                        if (is_vs) vs_dump_budget--;
                         uint32_t t_flags, t_dsize, t_osize;
                         uint64_t t_dptr, t_optr;
                         memcpy(&t_flags, stream + pos + 4 + 20, 4);
@@ -593,21 +602,39 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         memcpy(&t_dptr, stream + pos + 4 + BP_TR_DATA_PTR_OFF, 8);
                         memcpy(&t_optr, stream + pos + 4 + BP_TR_OFFSETS_PTR_OFF, 8);
                         char msg[560];
-                        int off = snprintf(msg, sizeof(msg),
-                            "[twoyi_loader] *** SM-TR flags=0x%08x dsize=%u osize=%u "
-                            "dptr=%llx optr=%llx stash[d0]=%02x%02x%02x%02x "
-                            "stash[d+%u..]=%02x%02x%02x%02x stash[o0]=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                            t_flags, t_dsize, t_osize,
-                            (unsigned long long)t_dptr, (unsigned long long)t_optr,
-                            ((uint8_t *)t_dptr)[0], ((uint8_t *)t_dptr)[1],
-                            ((uint8_t *)t_dptr)[2], ((uint8_t *)t_dptr)[3],
-                            dlen - 4,
-                            ((uint8_t *)t_dptr)[dlen - 4], ((uint8_t *)t_dptr)[dlen - 3],
-                            ((uint8_t *)t_dptr)[dlen - 2], ((uint8_t *)t_dptr)[dlen - 1],
-                            ((uint8_t *)t_optr)[0], ((uint8_t *)t_optr)[1],
-                            ((uint8_t *)t_optr)[2], ((uint8_t *)t_optr)[3],
-                            ((uint8_t *)t_optr)[4], ((uint8_t *)t_optr)[5],
-                            ((uint8_t *)t_optr)[6], ((uint8_t *)t_optr)[7]);
+                        int off;
+                        if (olen >= 8 && dlen >= 4) {
+                            off = snprintf(msg, sizeof(msg),
+                                "[twoyi_loader] *** SM-TR flags=0x%08x dsize=%u osize=%u "
+                                "dptr=%llx optr=%llx stash[d0]=%02x%02x%02x%02x "
+                                "stash[d+%u..]=%02x%02x%02x%02x stash[o0]=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                t_flags, t_dsize, t_osize,
+                                (unsigned long long)t_dptr, (unsigned long long)t_optr,
+                                ((uint8_t *)t_dptr)[0], ((uint8_t *)t_dptr)[1],
+                                ((uint8_t *)t_dptr)[2], ((uint8_t *)t_dptr)[3],
+                                dlen - 4,
+                                ((uint8_t *)t_dptr)[dlen - 4], ((uint8_t *)t_dptr)[dlen - 3],
+                                ((uint8_t *)t_dptr)[dlen - 2], ((uint8_t *)t_dptr)[dlen - 1],
+                                ((uint8_t *)t_optr)[0], ((uint8_t *)t_optr)[1],
+                                ((uint8_t *)t_optr)[2], ((uint8_t *)t_optr)[3],
+                                ((uint8_t *)t_optr)[4], ((uint8_t *)t_optr)[5],
+                                ((uint8_t *)t_optr)[6], ((uint8_t *)t_optr)[7]);
+                        } else {
+                            /* 6-Z272g: no offsets array — dump the reply's
+                             * head + tail words only (in-bounds). */
+                            uint32_t dlen4 = (dlen >= 16) ? dlen : 16;
+                            off = snprintf(msg, sizeof(msg),
+                                "[twoyi_loader] *** VS-TR flags=0x%08x dsize=%u osize=%u "
+                                "dptr=%llx optr=%llx stash[0..3]=%02x%02x%02x%02x "
+                                "stash[%u..]=%02x%02x%02x%02x\n",
+                                t_flags, t_dsize, t_osize,
+                                (unsigned long long)t_dptr, (unsigned long long)t_optr,
+                                ((uint8_t *)t_dptr)[0], ((uint8_t *)t_dptr)[1],
+                                ((uint8_t *)t_dptr)[2], ((uint8_t *)t_dptr)[3],
+                                dlen4 - 4,
+                                ((uint8_t *)t_dptr)[dlen4 - 4], ((uint8_t *)t_dptr)[dlen4 - 3],
+                                ((uint8_t *)t_dptr)[dlen4 - 2], ((uint8_t *)t_dptr)[dlen4 - 1]);
+                        }
                         (void)off;
                         write_str(2, msg);
                         // Track the pending stash for the CONSUMED/NOFREE verdict.
