@@ -23744,3 +23744,41 @@ Stage Summary:
   (getHardwareInfo etc.) against the virtual services, whose replies carry no binders
   and are already AIDL-correct. The hole collapse + IKeystoreSecurity verdicts land
   with the in-flight run.
+
+---
+Task ID: 6-Z272f-VERIFY + 6-Z272g — VIBRATION WORKS END-TO-END; getHardwareInfo stall observed
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-01
+Task: decode the 6-Z272f verification run; extend the observation.
+
+Work Log:
+- Run 33541720331 (R12, c7c366d) — MILESTONES:
+  * "_NTF answered" ×13 — every fresh proxy's descriptor handshake works;
+  * **"IVibrator.on(40 ms) → host" ×3 — THE VIBRATION CHAIN WORKS END-TO-END**
+    (recovery → virtual IVibrator → haptics → hostbridge → @TWOYI_SOCK → HostHalBridge);
+  * virtual Vibrator code=0x3 (the correct AIDL on() code post-_NTF) ×9;
+  * whyred green again; lineage still BOOT_FAIL (A15 init stream untouched — 6-Z272b next round);
+  * 0 Fatal signals.
+- keystore2 advanced AGAIN: connect_keymint now sends getHardwareInfo (code=1, the
+  first real KeyMint method call ever) and dies with "connect_keymint: Failed to get
+  hardware info. 3: Binder exception code TRANSACTION_FAILED, 0." Our proxy logged the
+  transaction and the reply shape is byte-verified against the real
+  KeyMintHardwareInfo.aidl ([EX_NONE][300][-2][keyMintName][keyMintAuthorName][0]);
+  the NDK string wire confirmed string16 (ndk/parcel.cpp AParcel_writeString converts
+  UTF-8 → UTF-16). 6-Z272g (2d73d2f): the shlib observer widened to olen==0 replies
+  (VS-TR dumps + the CONSUMED verdict) so the next run names marshalling vs transport.
+- Health HAL follow-up recorded as 6-Z272f-b: the rc patch fired ("starting service
+  health-hal-2-1", staged exec of the image's own 62 KB binary) but the recovery's
+  GetBatteryInfo still found nothing — the hwservicemanager registration/lookup path
+  (guest↔guest routed HIDL traffic) needs one decode round. battery_ok=True appeared on
+  whyred (TWRP sysfs path + the emulator's real battery served the reader).
+- Dispatched R12 on 2d73d2f with the widened observer.
+
+Stage Summary:
+- USER VISIBLE THIS ROUND: vibration actually works end-to-end on OrangeFox R12; the
+  binder chain advanced four layers (annotation → Category → _NTF → real method calls);
+  battery mechanism landed (pinned sysfs + image's own health HAL started); keystore2's
+  stall is now a single named reply whose client-side verdict the in-flight run will
+  give. Next round: read the VS-TR/CONSUMED verdict → fix getHardwareInfo delivery →
+  IKeystoreSecurity registration → the ~18 s hole collapse. Then the LineageOS 22.2
+  boot-to-menu stream (6-Z272b) and the health-HAL registration decode (6-Z272f-b).
