@@ -20588,36 +20588,61 @@ pub fn run_ptrace_loop(
                     // recovery_loader mode where boot_recovery=false, so
                     // the 6-Z110 block above never fires and the guest's
                     // LOG_ALWAYS_FATAL message was invisible). The logd
-                    // wire payload starts with the priority byte:
-                    // ANDROID_LOG_FATAL = 7. Capture the first 256 B of
-                    // any writev whose first payload byte is 7 — budget
-                    // 64 per process (fatals are rare; cannot flood).
+                    // SOCKET wire payload = logger_entry: [u8 buffer_id
+                    // (1=MAIN..5=CRASH)][u8 hdr_size (24/28)][...][u8
+                    // priority at hdr_size (=7 FATAL)][tag][msg].
+                    // Capture writevs matching that signature whose
+                    // priority byte is FATAL (budget 256/process —
+                    // bounded, and the signature makes false positives
+                    // negligible).
                     if past_first_execve && abi.writev_nr != -1 && syscall_num == abi.writev_nr {
                         static LOGFATAL_CAPTURE: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
-                        if LOGFATAL_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) < 64 {
+                        if LOGFATAL_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) < 256 {
                             let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                             let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                             if ret > 0 && iov_ptr != 0 {
                                 // aarch64/x86_64 iovec: 8-byte base + 8-byte len.
                                 let iov0_base = read_child_u64(pid, iov_ptr);
-                                if let Some(base) = iov0_base {
-                                    let prio = read_child_bytes(pid, base, 1);
-                                    if prio.map(|b| !b.is_empty() && b[0] == 7).unwrap_or(false) {
-                                        let n = LOGFATAL_CAPTURE
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if n < 64 {
-                                            let captured = read_child_bytes(pid, base, 256);
-                                            match captured {
-                                                Some(bytes) => {
-                                                    let s = String::from_utf8_lossy(&bytes);
-                                                    let s = crate::cap_log_line(&s, 2048);
-                                                    log(&format!(
-                                                        "DIAG LOGFATAL(ret={}): {:?}",
-                                                        ret, s
-                                                    ));
+                                let iov0_len = read_child_u64(pid, iov_ptr.wrapping_add(8));
+                                if let (Some(base), Some(len)) = (iov0_base, iov0_len) {
+                                    if len >= 32 {
+                                        let head = read_child_bytes(pid, base, 32);
+                                        let sig = head
+                                            .as_ref()
+                                            .map(|b| {
+                                                b.len() >= 32
+                                                    && b[0] >= 1
+                                                    && b[0] <= 5
+                                                    && (b[1] == 24 || b[1] == 28)
+                                            })
+                                            .unwrap_or(false);
+                                        let fatal = head
+                                            .as_ref()
+                                            .map(|b| {
+                                                let hs = b[1] as usize;
+                                                hs < b.len() && b[hs] == 7
+                                            })
+                                            .unwrap_or(false);
+                                        if sig && fatal {
+                                            let n = LOGFATAL_CAPTURE
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if n < 256 {
+                                                let cap_len = std::cmp::min(len as usize, 256);
+                                                let captured = read_child_bytes(pid, base, cap_len);
+                                                match captured {
+                                                    Some(bytes) => {
+                                                        let s = String::from_utf8_lossy(&bytes);
+                                                        let s = crate::cap_log_line(&s, 2048);
+                                                        log(&format!(
+                                                            "DIAG LOGFATAL(ret={}): {:?}",
+                                                            ret, s
+                                                        ));
+                                                    }
+                                                    None => {
+                                                        log("DIAG LOGFATAL: <buffer read failed>")
+                                                    }
                                                 }
-                                                None => log("DIAG LOGFATAL: <buffer read failed>"),
                                             }
                                         }
                                     }
