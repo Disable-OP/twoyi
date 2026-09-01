@@ -20605,7 +20605,7 @@ pub fn run_ptrace_loop(
                                 // aarch64/x86_64 iovec: 8-byte base + 8-byte len.
                                 let iov0_base = read_child_u64(pid, iov_ptr);
                                 let iov0_len = read_child_u64(pid, iov_ptr.wrapping_add(8));
-                                if let (Some(base), Some(len)) = (iov0_base, iov0_len) {
+                                if let (Some(base), Some(_len)) = (iov0_base, iov0_len) {
                                     // liblog writes the logd packet as TWO
                                     // iovecs: iov[0] = the logger_entry
                                     // header (24/28 B: buffer_id, hdr_size,
@@ -20639,13 +20639,12 @@ pub fn run_ptrace_loop(
                                             None
                                         }
                                     })();
-                                    if sig && fatal.is_some() {
+                                    if let (true, Some((b1, l1))) = (sig, fatal.as_ref()) {
                                         let n = LOGFATAL_CAPTURE
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         if n < 256 {
-                                            let (b1, l1) = fatal.expect("checked Some above");
-                                            let cap_len = std::cmp::min(l1 as usize, 256);
-                                            let captured = read_child_bytes(pid, b1, cap_len);
+                                            let cap_len = std::cmp::min(*l1 as usize, 256);
+                                            let captured = read_child_bytes(pid, *b1, cap_len);
                                             match captured {
                                                 Some(bytes) => {
                                                     let s = String::from_utf8_lossy(&bytes);
