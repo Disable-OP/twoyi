@@ -23508,3 +23508,18 @@ Work Log:
 
 Stage Summary:
 - The wedge class is now attributed to a LOG_ALWAYS_FATAL in the guest's C++ binder machinery right after receiving OUR getService reply; the 6-Z271p placeholder-fd fix removes one trigger; the LOGFATAL capture (two-iovec decode) will name the exact message on the next run. Both aborts (keystore2's discovery thread + the recovery's vibrator client at +52.6 s) share the same signature — the fix is likely ONE reply-shape detail in the SM path.
+
+---
+Task ID: 6-Z271t/u — THE FATAL IS NAMED: libutils Vector new_capacity overflow
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-09-01
+Task: decode the LOG_ALWAYS_FATAL message behind the keystore2/recovery client aborts.
+
+Work Log:
+- Diagnostic iterations (facedab → bfc8087 → 22d0a49 → 04391af → 2dbf710 → 3a6edb4 → 87b4ba8 → 7176200): the logd wire needed three decode steps — (1) the 6-Z110 writev gate was boot_recovery-only (this wave = recovery_loader); (2) the logger_entry single-iovec signature never matched (0 hits across two runs); (3) the 6-Z271r WRITEV-SAMPLE (first 40 writevs per process, verbatim) revealed the REAL liblog logd-socket layout: iov[0] = header fragment starting 0x00, iov[1] = the 1-byte PRIORITY, iov[2] = tag, iov[3] = message — with additional multi-iovec shapes. Final gate (7176200): if ANY of the first 6 iovecs is non-empty and starts with byte 7 (ANDROID_LOG_FATAL), dump the whole writev.
+- **THE FATAL MESSAGE (both aborts, identical): tag "Vector", message "new_capacity overflow"** — the C++ libutils android::Vector capacity-growth overflow LOG_ALWAYS_FATAL (VectorImpl::new_capacity — the 50%-growth arithmetic overflowed, i.e. a Vector grew to an absurd size).
+- Interpretation: after a client receives one of OUR getService handles (keystore2's negotiation thread fetching the compat service; the recovery's vibrator client), the C++ reply/service processing path grows an android::Vector unboundedly and aborts. ZERO routed/virtual transactions in every run proves the abort happens BEFORE the first transaction on the handle is ever issued — the wedge (and thus the remaining ~18 s hole) lives entirely in the client-side reply/namespace processing of OUR getService reply shape.
+- Open: the exact Vector site needs a guest backtrace from the park (next diagnostic: the fb_hook park could _Unwind-dump, or the tracer could walk the aborting thread's stack frames). Candidates: Parcel object-offset processing feeding an android::Vector, or libhwbinder/libhidlbase String16/Vector decode of OUR reply bytes.
+
+Stage Summary:
+- The 20-second-hole chain is now FULLY attributed: RECO tags (fixed) → registry (fixed) → manifest discovery (fixed) → placeholder-fd hwbinder FATAL (fixed) → **libutils Vector new_capacity overflow while processing our getService reply** (CURRENT — named, not yet fixed). Every wave is UI_READY with timeline parity and green TWRP guards; the quality gates (690/690, clippy -D warnings, fmt) held on every commit.
