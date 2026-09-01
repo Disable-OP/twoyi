@@ -20606,43 +20606,56 @@ pub fn run_ptrace_loop(
                                 let iov0_base = read_child_u64(pid, iov_ptr);
                                 let iov0_len = read_child_u64(pid, iov_ptr.wrapping_add(8));
                                 if let (Some(base), Some(len)) = (iov0_base, iov0_len) {
-                                    if len >= 32 {
-                                        let head = read_child_bytes(pid, base, 32);
-                                        let sig = head
-                                            .as_ref()
-                                            .map(|b| {
-                                                b.len() >= 32
-                                                    && b[0] >= 1
-                                                    && b[0] <= 5
-                                                    && (b[1] == 24 || b[1] == 28)
-                                            })
-                                            .unwrap_or(false);
-                                        let fatal = head
-                                            .as_ref()
-                                            .map(|b| {
-                                                let hs = b[1] as usize;
-                                                hs < b.len() && b[hs] == 7
-                                            })
-                                            .unwrap_or(false);
-                                        if sig && fatal {
-                                            let n = LOGFATAL_CAPTURE
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            if n < 256 {
-                                                let cap_len = std::cmp::min(len as usize, 256);
-                                                let captured = read_child_bytes(pid, base, cap_len);
-                                                match captured {
-                                                    Some(bytes) => {
-                                                        let s = String::from_utf8_lossy(&bytes);
-                                                        let s = crate::cap_log_line(&s, 2048);
-                                                        log(&format!(
-                                                            "DIAG LOGFATAL(ret={}): {:?}",
-                                                            ret, s
-                                                        ));
-                                                    }
-                                                    None => {
-                                                        log("DIAG LOGFATAL: <buffer read failed>")
-                                                    }
+                                    // liblog writes the logd packet as TWO
+                                    // iovecs: iov[0] = the logger_entry
+                                    // header (24/28 B: buffer_id, hdr_size,
+                                    // pid, tid, sec, nsec), iov[1] = [u8
+                                    // priority][tag][msg]. A FATAL entry has
+                                    // iov1[0] == 7. (A single-iovec check
+                                    // never matched: iov0_len is just 24/28,
+                                    // run 33503404749.)
+                                    let hdr = read_child_bytes(pid, base, 28);
+                                    let sig = hdr
+                                        .as_ref()
+                                        .map(|b| {
+                                            b.len() >= 8
+                                                && b[0] >= 1
+                                                && b[0] <= 5
+                                                && (b[1] == 24 || b[1] == 28)
+                                        })
+                                        .unwrap_or(false);
+                                    let iov1_base = read_child_u64(pid, iov_ptr.wrapping_add(16));
+                                    let iov1_len = read_child_u64(pid, iov_ptr.wrapping_add(24));
+                                    let fatal = (|| {
+                                        let b1 = iov1_base?;
+                                        let l1 = iov1_len?;
+                                        if l1 == 0 {
+                                            return None;
+                                        }
+                                        let first = read_child_bytes(pid, b1, 1)?;
+                                        if first.first() == Some(&7) {
+                                            Some((b1, l1))
+                                        } else {
+                                            None
+                                        }
+                                    })();
+                                    if sig && fatal.is_some() {
+                                        let n = LOGFATAL_CAPTURE
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if n < 256 {
+                                            let (b1, l1) = fatal.expect("checked Some above");
+                                            let cap_len = std::cmp::min(l1 as usize, 256);
+                                            let captured = read_child_bytes(pid, b1, cap_len);
+                                            match captured {
+                                                Some(bytes) => {
+                                                    let s = String::from_utf8_lossy(&bytes);
+                                                    let s = crate::cap_log_line(&s, 2048);
+                                                    log(&format!(
+                                                        "DIAG LOGFATAL(ret={}): {:?}",
+                                                        ret, s
+                                                    ));
                                                 }
+                                                None => log("DIAG LOGFATAL: <buffer read failed>"),
                                             }
                                         }
                                     }
