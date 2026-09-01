@@ -23704,3 +23704,43 @@ Stage Summary:
   shows the FIRST getService reply accepted (no Stability-0 logs, no poll storm), keystore2 transacting
   on IKeyMintDevice, IKeystoreSecurity registered, the ~18 s hole collapsed, and the vibrator client
   reaching IVibrator.on() → host. If a new failure appears beyond that, it is a DIFFERENT bug.
+
+---
+Task ID: 6-Z272e-VERIFY + 6-Z272f — the chain came alive; INTERFACE_TRANSACTION
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-01
+Task: decode the 6-Z272e verification run; fix the next layer.
+
+Work Log:
+- Run 33539861041 (R12 lavender, 2773cc3) — THE CHAIN CAME ALIVE:
+  * "Can only set known stability, not 0." = ZERO (the A12 Category form accepted);
+  * the poll storm GONE: 5 SM transactions total, 8 vibrator gets (was 357);
+  * FIRST-EVER real transactions on the services: virtual KeyMint (conn=3), virtual
+    Vibrator (conn=7, x5), and a guest↔guest SELF-ROUTED transaction DELIVERED
+    end-to-end (conn=5 → conn=5, code '_NTF' — the 6-Z271i bus machinery exercised);
+  * whyred guard (run 33539864694): UI_READY + battery_ok=True — and the
+    d04936a BOOT_FAIL_EARLY_INIT did NOT recur (flake confirmed, not a pinning regression).
+- keystore2 STILL panicked one level deeper: every client sent 0x5f4e5446 = '_NTF' =
+  IBinder::INTERFACE_TRANSACTION (verified android-13 IBinder.h) to every fresh proxy —
+  the fromBinder/asInterface descriptor query — and the virtual catch-all answered
+  EX_UNSUPPORTED_OPERATION.
+- 6-Z272f (c7c366d): INTERFACE_TRANSACTION handled in handle_transaction — SM answers
+  "android.os.IServiceManager", virtual services answer their AIDL descriptors (bare
+  string16, no exception header — BBinder::onTransact default-case semantics),
+  guest-owned services route as usual. Test z272f. 696/696 green, clippy, fmt.
+- The 6-Z272c health HAL rc patch WORKED mechanically: "init: starting service
+  'health-hal-2-1'..." + the staged exec of the image's own 62 KB binary fired
+  (on late-init processed). Open follow-up (6-Z272f-b): the service started but the
+  recovery's GetBatteryInfo still found nothing — the hwservicemanager registration /
+  HIDL client lookup path needs one decode round (zero "HIDL get" logs — the client→
+  hwservicemanager traffic should be guest↔guest routed; only ONE routed tx was logged).
+- Pushed c7c366d; dispatched R12 lavender (keystore2 registration + vibrator on()→host
+  verdicts) + lineage-22.2-sailfish (the A15 client now also answers _NTF).
+
+Stage Summary:
+- The binder chain has advanced four layers in one round: annotation present → A12
+  Category form → clients transacting → descriptor queries answered. The remaining
+  chain to keystore2 registration is now: (post-_NTF) the real method calls
+  (getHardwareInfo etc.) against the virtual services, whose replies carry no binders
+  and are already AIDL-correct. The hole collapse + IKeystoreSecurity verdicts land
+  with the in-flight run.
