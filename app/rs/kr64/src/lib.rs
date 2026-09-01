@@ -9075,6 +9075,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Runs AFTER 6-Z219's slotselect scan (slotselect lives on
         // system/vendor lines we never touch; ordering is belt-and-braces).
         sanitize_fstab_encryption_flags(&rootfs_prefix);
+        // 6-Z271j: declare the in-proxy VIRTUAL AIDL HALs in the guest's
+        // VINTF device manifest so keystore2's manifest-driven
+        // enumerators (libvintf getAidlInstances — NOT the servicemanager)
+        // can discover them. Without this, keystore2's connect_keymint
+        // finds no AIDL keymint instance, falls back to the HIDL-compat
+        // chain, and panics ("Failed to create service … IKeystoreSecurity")
+        // because the HIDL keymaster HAL genuinely does not exist.
+        augment_vintf_manifest_for_virtual_hals(&rootfs_prefix);
         // 6-Z219: guest-derived slot suffix ("" = A-only → key omitted —
         // an empty `androidboot.slot_suffix=` would poison
         // fs_mgr_get_boot_config: "found but empty" short-circuits the
@@ -11924,6 +11932,140 @@ pub fn sanitize_fstab_encryption_flags(rootfs_prefix: &str) {
     }
 }
 
+/// 6-Z271j: declare the in-proxy VIRTUAL AIDL HALs in the guest's VINTF
+/// device manifest.
+///
+/// WHY (run 33428365193 + AOSP android-13 keystore2 sources): keystore2's
+/// `connect_keymint()` does NOT ask the servicemanager for AIDL keymint —
+/// it enumerates instances with libvintf's `getAidlInstances(package,
+/// version, interface)` (keystore2/src/vintf/vintf.cpp →
+/// `VintfObject::GetDeviceHalManifest()`), and only falls back to the
+/// HIDL `android.security.compat` chain when the manifest lists NO AIDL
+/// keymint instance. A recovery ramdisk's manifest declares the legacy
+/// HIDL `android.hardware.keymaster@4.0` and never the AIDL interfaces,
+/// so the genuine lookup path found nothing, the compat fallback could
+/// not wrap a non-existent HIDL HAL, and keystore2 PANICKED before ever
+/// registering IKeystoreSecurity — the recovery-side client then burned
+/// its full service-wait budget (the ~20 s hole class).
+///
+/// FIX: inject `<hal>` entries for the two VIRTUAL services the proxy
+/// genuinely hosts (IKeyMintDevice/default, ISharedSecret/default) into
+/// the guest's vendor manifest, BEFORE any guest process runs (libvintf
+/// caches the device manifest per process). This is semantically correct
+/// virtualization — the manifest then describes what this virtual device
+/// actually provides — not a fake success path: the declared services
+/// really answer on the bus.
+///
+/// Injection rules: first existing manifest in the scan order wins
+/// (vendor before system — the merged device manifest prefers vendor);
+/// idempotent (skips files already declaring the hal name); only rewrites
+/// when a `</manifest>` close tag exists (never corrupt unknown XML);
+/// creates a minimal vendor manifest when none of the scanned files
+/// exists.
+pub fn augment_vintf_manifest_for_virtual_hals(rootfs_prefix: &str) {
+    const KEYMINT_BLOCK: &str = concat!(
+        "    <hal format=\"aidl\">\n",
+        "        <name>android.hardware.security.keymint</name>\n",
+        "        <version>1-3</version>\n",
+        "        <interface>\n",
+        "            <name>IKeyMintDevice</name>\n",
+        "            <instance>default</instance>\n",
+        "        </interface>\n",
+        "    </hal>\n",
+    );
+    const SHAREDSECRET_BLOCK: &str = concat!(
+        "    <hal format=\"aidl\">\n",
+        "        <name>android.hardware.security.sharedsecret</name>\n",
+        "        <version>1</version>\n",
+        "        <interface>\n",
+        "            <name>ISharedSecret</name>\n",
+        "            <instance>default</instance>\n",
+        "        </interface>\n",
+        "    </hal>\n",
+    );
+    // The `<version>1-3</version>` range on keymint is deliberate:
+    // keystore2's connect_keymint counts DOWN (2, then 1) and libvintf's
+    // getAidlInstances only returns instances whose declared range covers
+    // the queried version; a range covering both answers either query and
+    // yields hal_version=2 (no backlevel wrapper needed for our virtual
+    // device, whose getHardwareInfo reports KeyMint V3 semantics).
+
+    // Minimal-but-valid skeleton when the ramdisk ships no manifest at
+    // all (type="device" = vendor side; target-level omitted — optional).
+    const SKELETON_HEAD: &str = "<manifest version=\"6.0\" type=\"device\">\n";
+    const SKELETON_TAIL: &str = "</manifest>\n";
+
+    const SCAN_FILES: &[&str] = &[
+        "vendor/etc/vintf/manifest.xml",
+        "vendor/manifest.xml",
+        "system/etc/vintf/manifest.xml",
+    ];
+    let inject = |path: &str| -> Option<()> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let mut blocks = String::new();
+        if !content.contains("android.hardware.security.keymint") {
+            blocks.push_str(KEYMINT_BLOCK);
+        }
+        if !content.contains("android.hardware.security.sharedsecret") {
+            blocks.push_str(SHAREDSECRET_BLOCK);
+        }
+        if blocks.is_empty() {
+            // Already declaring everything — nothing to do.
+            return Some(());
+        }
+        let close = content.rfind("</manifest>")?;
+        let mut new_content = String::with_capacity(content.len() + blocks.len());
+        new_content.push_str(&content[..close]);
+        new_content.push_str(&blocks);
+        new_content.push_str(&content[close..]);
+        match std::fs::write(path, &new_content) {
+            Ok(_) => {
+                info!(
+                    "[KR64] PARENT: 6-Z271j: injected virtual AIDL HALs into VINTF manifest {} ({} -> {} bytes)",
+                    path,
+                    content.len(),
+                    new_content.len()
+                );
+                Some(())
+            }
+            Err(e) => {
+                warning!("[KR64] PARENT: 6-Z271j: FAILED to write {}: {}", path, e);
+                None
+            }
+        }
+    };
+
+    for rel in SCAN_FILES {
+        let path = format!("{}/{}", rootfs_prefix, rel);
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        if inject(&path).is_some() {
+            return;
+        }
+    }
+    // No manifest anywhere: create the canonical vendor one.
+    let path = format!("{}/vendor/etc/vintf/manifest.xml", rootfs_prefix);
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let fresh = format!(
+        "{}{}{}{}",
+        SKELETON_HEAD, KEYMINT_BLOCK, SHAREDSECRET_BLOCK, SKELETON_TAIL
+    );
+    match std::fs::write(&path, &fresh) {
+        Ok(_) => info!(
+            "[KR64] PARENT: 6-Z271j: created vendor VINTF manifest with virtual AIDL HALs at {} ({} bytes)",
+            path,
+            fresh.len()
+        ),
+        Err(e) => warning!(
+            "[KR64] PARENT: 6-Z271j: FAILED to create {}: {}",
+            path, e
+        ),
+    }
+}
+
 /// 6-Z223: build the ordered androidboot.* item list for the guest
 /// /proc/cmdline. `hw` is the detected androidboot.hardware (6-Z159);
 /// `slot_suffix` is 6-Z219's guest-derived value ("_a") or "" for A-only
@@ -12055,6 +12197,96 @@ mod tests {
         sanitize_fstab_encryption_flags(dir.to_str().unwrap());
         let out2 = std::fs::read_to_string(&path).unwrap();
         assert_eq!(out, out2, "second sanitize must be a no-op");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 6-Z271j: VINTF manifest augmentation for the virtual AIDL HALs ──
+
+    #[test]
+    fn vintf_manifest_augmentation_injects_virtual_aidl_hals_6z271j() {
+        let dir = std::env::temp_dir().join(format!("kr64_6z271j_test_{}", std::process::id()));
+        let vdir = dir.join("vendor/etc/vintf");
+        std::fs::create_dir_all(&vdir).unwrap();
+        let path = vdir.join("manifest.xml");
+        std::fs::write(
+            &path,
+            "<manifest version=\"6.0\" type=\"device\">\n\
+             \x20   <hal format=\"hidl\">\n\
+             \x20       <name>android.hardware.keymaster</name>\n\
+             \x20       <version>4.0</version>\n\
+             \x20   </hal>\n\
+             </manifest>\n",
+        )
+        .unwrap();
+        augment_vintf_manifest_for_virtual_hals(dir.to_str().unwrap());
+        let out = std::fs::read_to_string(&path).unwrap();
+        // HIDL keymaster entry preserved byte-for-byte (TWRP's version
+        // detection depends on it — do not regress other readers).
+        assert!(out.contains("android.hardware.keymaster"), "{out}");
+        assert!(out.contains("4.0"), "{out}");
+        // Both virtual AIDL HALs declared before </manifest>.
+        assert!(out.contains("android.hardware.security.keymint"), "{out}");
+        assert!(out.contains("<version>1-3</version>"), "{out}");
+        assert!(out.contains("IKeyMintDevice"), "{out}");
+        assert!(out.contains("<instance>default</instance>"), "{out}");
+        assert!(
+            out.contains("android.hardware.security.sharedsecret"),
+            "{out}"
+        );
+        assert!(out.contains("ISharedSecret"), "{out}");
+        // Well-formed structure: injected blocks land inside the root.
+        let close = out.rfind("</manifest>").unwrap();
+        assert!(
+            out[..close].contains("IKeyMintDevice"),
+            "hal blocks must precede the close tag"
+        );
+        // Idempotent second run: no double injection.
+        augment_vintf_manifest_for_virtual_hals(dir.to_str().unwrap());
+        let out2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(out, out2, "second augmentation must be a no-op");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vintf_manifest_augmentation_creates_skeleton_when_missing_6z271j() {
+        let dir = std::env::temp_dir().join(format!("kr64_6z271j_b_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        augment_vintf_manifest_for_virtual_hals(dir.to_str().unwrap());
+        let path = dir.join("vendor/etc/vintf/manifest.xml");
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.starts_with("<manifest"), "{out}");
+        assert!(out.contains("type=\"device\""), "{out}");
+        assert!(out.contains("IKeyMintDevice"), "{out}");
+        assert!(out.contains("ISharedSecret"), "{out}");
+        assert!(out.trim_end().ends_with("</manifest>"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vintf_manifest_augmentation_skips_already_declared_6z271j() {
+        let dir = std::env::temp_dir().join(format!("kr64_6z271j_c_test_{}", std::process::id()));
+        let vdir = dir.join("vendor/etc/vintf");
+        std::fs::create_dir_all(&vdir).unwrap();
+        let path = vdir.join("manifest.xml");
+        let original = "<manifest version=\"6.0\" type=\"device\">\n\
+             \x20   <hal format=\"aidl\">\n\
+             \x20       <name>android.hardware.security.keymint</name>\n\
+             \x20   </hal>\n\
+             </manifest>\n";
+        std::fs::write(&path, original).unwrap();
+        augment_vintf_manifest_for_virtual_hals(dir.to_str().unwrap());
+        let out = std::fs::read_to_string(&path).unwrap();
+        // keymint name already present → not duplicated…
+        assert_eq!(
+            out.matches("android.hardware.security.keymint").count(),
+            1,
+            "{out}"
+        );
+        // …but the missing sharedsecret entry IS added.
+        assert!(
+            out.contains("android.hardware.security.sharedsecret"),
+            "{out}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
