@@ -23357,3 +23357,18 @@ Work Log:
 
 Stage Summary:
 - Run 33428365193 verifies: registry live, vibrator waits 0, poll storm 0, dm wait absent, UI_READY. The residual ~18 s hole is keystore2's in-process IKeystoreCompatService chain stalling on the pre-per-thread-conn proxy plus the bus's non-kernel blocking/self-transaction semantics; 6-Z271i removes the semantic half. Expected next-run evidence: getSharedSecret routed (delivered transaction conn=N <- conn=M within keystore2), negotiation completes, IKeystoreSecurity registers ("Successfully registered Keystore 2.0 service" guest-side), and the +13.2→+31.2 s window collapses into sub-second work. Remaining known boot segments: startup-script execs (~5 s), theme parse (~11 s), recovery CPU work under the tracer tax.
+
+---
+Task ID: 6-Z271j — VINTF manifest declaration of the virtual AIDL HALs
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-09-01
+Task: close the keystore2 main-thread discovery gap decoded from the AOSP sources after 6-Z271i.
+
+Work Log:
+- AOSP decode (system/security keystore2 android-13): connect_keymint() enumerates AIDL keymint via libvintf getAidlInstances (VintfObject::GetDeviceHalManifest — keystore2/src/vintf/vintf.cpp), NOT via the servicemanager; only a manifest-less result falls back to the HIDL android.security.compat chain. Recovery manifests declare only HIDL keymaster@4.0 → genuine path empty → compat fallback cannot wrap a non-existent HIDL HAL → keystore2 PANICS before IKeystoreSecurity registration. This also explains why the artifact shows keystore2 NEVER querying getService(IKeyMintDevice): it never reached an SM query for it.
+- IMPLEMENTED augment_vintf_manifest_for_virtual_hals() (parent-side, pre-fork): injects <hal format="aidl"> entries for IKeyMintDevice/default (version range 1-3 — answers keystore2's 2-then-1 count-down, hal_version=2, no backlevel wrapper) and ISharedSecret/default into the guest's vendor manifest; scan order vendor/etc/vintf/manifest.xml → vendor/manifest.xml → system/etc/vintf/manifest.xml; idempotent; byte-preserving (TWRP's HIDL keymaster 4.0 detection untouched); creates a minimal valid vendor skeleton when no manifest exists. Wired next to the 6-Z270 fstab sanitizer in the parent device phase.
+- Guard runs: dispatched on 20d2fa3 (R12 lavender + whyred + angler) and on 1363083 (R12 lavender) — run IDs 33480488904/33480493545/33480498414 (+1 pending); the two superseded 01f7980 stragglers were cancelled (202). ARM64 runner starvation persists (0 starts for hours) — verification pending, do not idle-wait.
+- Tests: +3 manifest augmentation tests. 688/688 green, clippy/fmt clean.
+
+Stage Summary:
+- With 6-Z271i + 6-Z271j the keystore2 chain is unblocked at BOTH layers: the bus now implements the kernel-true transaction lifecycle (self/nested/deferred replies), and the manifest now makes the virtual AIDL HALs discoverable through the exact enumerator keystore2 uses. Expected next R12 run: keystore2 registers IKeystoreSecurity ("Successfully registered Keystore 2.0 service" guest-side), the +13.2→+31.2 s window collapses; TWRP's HIDL keymaster 4.0 detection and every other recovery flow unchanged.
