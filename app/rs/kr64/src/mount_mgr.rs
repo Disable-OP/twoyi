@@ -88,6 +88,25 @@ const MS_SHARED: c_ulong = 1 << 20;
 const MS_RELATIME: c_ulong = 1 << 21;
 const MS_STRICTATIME: c_ulong = 1 << 24;
 
+/// 6-Z272c: sysfs subtrees owned by the emulated HAL modules, relative
+/// to the rootfs. Each is self-bind-pinned before the real sysfs is
+/// mounted on /sys so the guest resolves these paths to OUR materialised
+/// trees (kernel mount stacking — submounts survive the overmount of
+/// the parent) instead of the shadowing host sysfs. Paths come from the
+/// owning modules so there is a single source of truth.
+const OWNED_SYSFS_SUBTREES: &[&str] = &[
+    // battery.rs — battery ABI + charger supplies (6-Z224/6-Z271h)
+    crate::battery::BATTERY_DIR_REL,
+    crate::battery::USB_CHARGER_DIR_REL,
+    crate::battery::AC_CHARGER_DIR_REL,
+    // haptics.rs — vibrator + backlight + torch (§13/§16/6-Z271k)
+    crate::haptics::TIMED_OUTPUT_DIR_REL,
+    crate::haptics::LEDS_VIBRATOR_DIR_REL,
+    crate::haptics::LEDS_BACKLIGHT_DIR_REL,
+    crate::haptics::BACKLIGHT_DIR_REL,
+    crate::haptics::TORCH_DIR_REL,
+];
+
 // umount2(2) flags.
 const MNT_FORCE: c_int = 1;
 const MNT_DETACH: c_int = 2;
@@ -432,6 +451,7 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
     // tmpfs on /apex, these symlinks become dangling and the dynamic
     // linker can't load — causing SIGSEGV at address 0x86 in linker64.
     //
+    //
     // Instead, BIND-MOUNT the HOST's /apex/ into the rootfs's /apex/.
     // This gives the rootfs access to the real APEX packages (libc.so,
     // linker64, libbase.so, etc.) with no version mismatches. The
@@ -464,6 +484,52 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
             "mode=755,gid=1000",
         ),
     ];
+
+    // 6-Z272c: PIN the emulated sysfs subtrees before the sysfs overmount.
+    //
+    // The guest's /sys is the REAL host sysfs (table above). Without a
+    // submount, everything battery.rs / haptics.rs materialise under the
+    // rootfs's sys/... is INVISIBLE to the guest — no recovery (any
+    // family/generation) could ever read the battery ABI, the charger
+    // supplies, the vibrator or the backlight trees (the R12-lavender
+    // run showed ZERO /sys/class/power_supply opens while the GUI drew
+    // its 0% battery icon; the battery_ok harness check stayed null on
+    // every run since the mirror shipped).
+    //
+    // Kernel mount stacking to the rescue: a self-bind of each owned
+    // leaf BEFORE the sysfs mount pins that directory as a submount,
+    // and submounts SURVIVE the overmount of the parent — the guest's
+    // /sys/class/power_supply/battery resolves to our materialised dir
+    // while every other /sys path stays the REAL host sysfs (correct on
+    // both the CI emulator and real-phone hosts; real siblings like the
+    // phone's other power supplies and LEDs remain visible).
+    //
+    // Bind mounts are LIVE views of the underlying dir tree, so the
+    // battery refresh thread's later writes (and the .host-managed
+    // takeover) stay visible through the pin regardless of order.
+    for rel in OWNED_SYSFS_SUBTREES {
+        let abs = format!("{}/{}", cfg.rootfs, rel);
+        if let Err(e) = std::fs::create_dir_all(&abs) {
+            warning!(
+                "[KR64][mount_mgr] 6-Z272c: mkdir {} failed: {} — subtree not pinned",
+                abs,
+                e
+            );
+            continue;
+        }
+        match mount(&abs, &abs, "none", MS_BIND, None::<&str>) {
+            Ok(()) => info!(
+                "[KR64][mount_mgr] 6-Z272c: pinned {} (self-bind submount — survives the sysfs overmount)",
+                abs
+            ),
+            Err(e) => warning!(
+                "[KR64][mount_mgr] 6-Z272c: self-bind {} failed: {} — the tree stays shadowed by the real sysfs",
+                abs,
+                e
+            ),
+        }
+    }
+
     for (path, fstype, flags, data) in fs_mounts {
         let abs = format!("{}{}", cfg.rootfs, path);
         // Make sure the mount point exists.

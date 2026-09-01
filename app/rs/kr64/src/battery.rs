@@ -62,7 +62,7 @@
 //! no inbound connection to accept. The thread is owned by
 //! [`BatteryDeviceHandle`] and is joined on drop.
 //!
-//! # Why no `uevent`?
+//! # Why no netlink (and why the `uevent` FILE exists)?
 //!
 //! A real Linux battery driver pushes a `CHANGE` uevent on
 //! `power_supply` sysfs writes; the guest's `health@2.0` HAL listens
@@ -71,6 +71,14 @@
 //! the guest polls the files directly. The 30 s refresh interval is
 //! comfortably within the guest's typical 1-minute poll cadence, so
 //! `dumpsys battery` reflects host changes within ~1 minute.
+//!
+//! The `uevent` FILE (6-Z272c) is a different surface: it is the
+//! read-only kobject-uevent dump every power_supply directory exposes
+//! on real kernels — newline-separated `POWER_SUPPLY_*` entries. The
+//! reader class that EXCLUSIVELY reads it (libhealthd charger parsing,
+//! minui battery monitors) rejects a supply without the file even when
+//! every per-attribute file exists, so the mirror carries it,
+//! refreshed from the same state as the attribute files.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -544,6 +552,23 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
     try_write!("temp", &temp.to_string());
     try_write!("technology", DEFAULT_TECHNOLOGY);
     try_write!("health", DEFAULT_HEALTH);
+    // 6-Z272c: the `uevent` ABI file. kernel kobject uevent content,
+    // newline-separated POWER_SUPPLY_* entries — the reader class that
+    // EXCLUSIVELY reads uevent (libhealthd charger parsing, minui battery
+    // monitors, several recovery UIs) rejects a supply without it even
+    // when every per-attribute file exists. Values mirror the exact same
+    // state the per-attribute files carry (honest, single source).
+    try_write!(
+        "uevent",
+        &format!(
+            "POWER_SUPPLY_NAME=battery\nPOWER_SUPPLY_TYPE=Battery\nPOWER_SUPPLY_STATUS={}\nPOWER_SUPPLY_CAPACITY={}\nPOWER_SUPPLY_HEALTH={}\nPOWER_SUPPLY_VOLTAGE_NOW={}\nPOWER_SUPPLY_TEMP={}",
+            status.as_str(),
+            level.min(100),
+            DEFAULT_HEALTH,
+            voltage.saturating_mul(1_000),
+            temp
+        )
+    );
 
     // 6-Z271h: charger nodes — siblings of `battery` under
     // /sys/class/power_supply. BatteryMonitor classifies them by `type`
@@ -563,8 +588,24 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
             "online",
             if status.is_charging() { "1" } else { "0" },
         );
+        // 6-Z272c: uevent ABI file for the charger supply too — charger
+        // enumeration via uevent sees usb/ac this way (POWER_SUPPLY_ONLINE
+        // drives the plug icon in the same reader class as above).
+        try_write_at(
+            &usb_dir,
+            "uevent",
+            &format!(
+                "POWER_SUPPLY_NAME=usb\nPOWER_SUPPLY_TYPE=USB\nPOWER_SUPPLY_ONLINE={}",
+                if status.is_charging() { "1" } else { "0" }
+            ),
+        );
         try_write_at(&ac_dir, "type", "Mains");
         try_write_at(&ac_dir, "online", "0");
+        try_write_at(
+            &ac_dir,
+            "uevent",
+            "POWER_SUPPLY_NAME=ac\nPOWER_SUPPLY_TYPE=Mains\nPOWER_SUPPLY_ONLINE=0",
+        );
     }
 
     match first_err {
@@ -807,6 +848,66 @@ mod tests {
         assert_eq!(usb_online, 0, "usb offline while discharging");
         let ac_type = fs::read_to_string(ps.join("ac/type")).unwrap();
         assert_eq!(ac_type.trim(), "Mains", "ac node type");
+
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z272c_uevent_abi_files_present_and_consistent() {
+        // 6-Z272c: the uevent ABI file is the ONLY surface the
+        // uevent-exclusive reader class (libhealthd charger parsing,
+        // minui battery monitors) consults; its POWER_SUPPLY_* entries
+        // must mirror the per-attribute files (single honest source).
+        let rootfs = tmpdir();
+        let dev = BatteryDevice::new(&rootfs).expect("BatteryDevice::new");
+
+        let uevent = fs::read_to_string(dev.dir().join("uevent")).unwrap();
+        let mut name = None;
+        let mut r#type = None;
+        let mut status = None;
+        let mut capacity = None;
+        for line in uevent.lines() {
+            let (k, v) = line.split_once('=').unwrap_or((line, ""));
+            match k {
+                "POWER_SUPPLY_NAME" => name = Some(v.to_string()),
+                "POWER_SUPPLY_TYPE" => r#type = Some(v.to_string()),
+                "POWER_SUPPLY_STATUS" => status = Some(v.to_string()),
+                "POWER_SUPPLY_CAPACITY" => capacity = Some(v.to_string()),
+                _ => {}
+            }
+        }
+        assert_eq!(name.as_deref(), Some("battery"));
+        assert_eq!(r#type.as_deref(), Some("Battery"));
+        assert_eq!(
+            status.as_deref(),
+            Some(fs::read_to_string(dev.dir().join("status")).unwrap().trim()),
+            "uevent status must mirror the status file"
+        );
+        assert_eq!(
+            capacity.as_deref(),
+            Some(
+                fs::read_to_string(dev.dir().join("capacity"))
+                    .unwrap()
+                    .trim()
+            ),
+            "uevent capacity must mirror the capacity file"
+        );
+
+        // Charger supplies carry their own uevent with ONLINE state.
+        let ps = dev.dir().parent().unwrap();
+        let usb_uevent = fs::read_to_string(ps.join("usb/uevent")).unwrap();
+        assert!(
+            usb_uevent.contains("POWER_SUPPLY_NAME=usb")
+                && usb_uevent.contains("POWER_SUPPLY_TYPE=USB")
+                && usb_uevent.contains(&format!(
+                    "POWER_SUPPLY_ONLINE={}",
+                    fs::read_to_string(ps.join("usb/online")).unwrap().trim()
+                )),
+            "usb uevent must mirror type/online"
+        );
+        let ac_uevent = fs::read_to_string(ps.join("ac/uevent")).unwrap();
+        assert!(ac_uevent.contains("POWER_SUPPLY_NAME=ac"));
+        assert!(ac_uevent.contains("POWER_SUPPLY_ONLINE=0"));
 
         let _ = fs::remove_dir_all(&rootfs);
     }
