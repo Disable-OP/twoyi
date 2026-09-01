@@ -1367,7 +1367,7 @@ pub const WIRE_CMD_IDENT: u32 = 0x4004_62FF;
 /// SEMANTICALLY CORRECT AIDL implementations (real parcel shapes, honest
 /// errors) — never fake-success: operations the container cannot satisfy
 /// return service-specific errors rather than bogus data.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum VirtualService {
     /// `android.hardware.vibrator.IVibrator/default` — kills the ~5 s
     /// per-tap waitForService on the recovery input thread; `on(ms)` is
@@ -3042,6 +3042,31 @@ fn handle_transaction(
     };
 
     if let Some(kind) = virtual_kind {
+        // 6-Z271n: bounded virtual-service transaction DIAG — this path
+        // was COMPLETELY silent, so a guest spinning on getHardwareInfo /
+        // the interface-version handshake was invisible in artifacts (the
+        // run-33486586515 keystore2 stall). First 16 per (vm, kind).
+        static VIRTUAL_TX_SEEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<(u32, VirtualService), u64>>,
+        > = std::sync::OnceLock::new();
+        let seen = match VIRTUAL_TX_SEEN
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+        {
+            Ok(mut m) => *m.entry((vm_id, kind)).and_modify(|c| *c += 1).or_insert(1),
+            Err(_) => 0,
+        };
+        if seen <= 16 || seen % 500 == 0 {
+            info!(
+                "[KR64][binder][vm{}] virtual {:?} transaction conn={} code=0x{:x} [tx #{}{}]",
+                vm_id,
+                kind,
+                conn_id,
+                code,
+                seen,
+                if seen <= 16 { "" } else { " sampled" }
+            );
+        }
         return virtual_service_transaction(kind, code, req_blob.as_ref());
     }
 
@@ -3117,6 +3142,34 @@ fn handle_transaction(
             if let Some(rbx) = b.conns.get_mut(&conn_id) {
                 rbx.out_sync.push_back((txn_id, std::time::Instant::now()));
             }
+        }
+        // 6-Z271n: bounded routed-transaction DIAG — the queue side was
+        // completely silent (only the delivery side logged), which made a
+        // spinning requester invisible in artifacts. First 16 per (vm,
+        // owner) prove the routing shape without flooding.
+        static ROUTED_TX_SEEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<(u32, ConnId), u64>>,
+        > = std::sync::OnceLock::new();
+        let seen = match ROUTED_TX_SEEN
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+        {
+            Ok(mut m) => *m.entry((vm_id, owner)).and_modify(|c| *c += 1).or_insert(1),
+            Err(_) => 0,
+        };
+        if seen <= 16 || seen % 500 == 0 {
+            info!(
+                "[KR64][binder][vm{}] routed transaction conn={} -> conn={} handle=0x{:08x} code={} oneway={} self={} [tx #{}{}]",
+                vm_id,
+                conn_id,
+                owner,
+                target_handle,
+                code,
+                one_way,
+                owner == conn_id,
+                seen,
+                if seen <= 16 { "" } else { " sampled" }
+            );
         }
     }
 
