@@ -20644,6 +20644,13 @@ pub fn run_ptrace_loop(
                     // priority byte is FATAL (budget 256/process —
                     // bounded, and the signature makes false positives
                     // negligible).
+                    // 6-Z271q/r: LOGD-FATAL capture — the logd socket
+                    // wire (from the 6-Z271r WRITEV-SAMPLE decode):
+                    // iov[0] = header fragment, iov[1] = THE PRIORITY
+                    // BYTE, iov[2] = tag, iov[3] = message. A FATAL entry
+                    // has iov1[0] == 7 (ANDROID_LOG_FATAL). Capture iov1
+                    // (prio + tag + message, first 256 B) — budget 256
+                    // per process.
                     if past_first_execve && abi.writev_nr != -1 && syscall_num == abi.writev_nr {
                         static LOGFATAL_CAPTURE: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
@@ -20651,59 +20658,34 @@ pub fn run_ptrace_loop(
                             let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                             let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                             if ret > 0 && iov_ptr != 0 {
-                                // aarch64/x86_64 iovec: 8-byte base + 8-byte len.
-                                let iov0_base = read_child_u64(pid, iov_ptr);
-                                let iov0_len = read_child_u64(pid, iov_ptr.wrapping_add(8));
-                                if let (Some(base), Some(_len)) = (iov0_base, iov0_len) {
-                                    // liblog writes the logd packet as TWO
-                                    // iovecs: iov[0] = the logger_entry
-                                    // header (24/28 B: buffer_id, hdr_size,
-                                    // pid, tid, sec, nsec), iov[1] = [u8
-                                    // priority][tag][msg]. A FATAL entry has
-                                    // iov1[0] == 7. (A single-iovec check
-                                    // never matched: iov0_len is just 24/28,
-                                    // run 33503404749.)
-                                    let hdr = read_child_bytes(pid, base, 28);
-                                    let sig = hdr
-                                        .as_ref()
-                                        .map(|b| {
-                                            b.len() >= 8
-                                                && b[0] >= 1
-                                                && b[0] <= 5
-                                                && (b[1] == 24 || b[1] == 28)
-                                        })
-                                        .unwrap_or(false);
-                                    let iov1_base = read_child_u64(pid, iov_ptr.wrapping_add(16));
-                                    let iov1_len = read_child_u64(pid, iov_ptr.wrapping_add(24));
-                                    let fatal = (|| {
-                                        let b1 = iov1_base?;
-                                        let l1 = iov1_len?;
-                                        if l1 == 0 {
-                                            return None;
-                                        }
-                                        let first = read_child_bytes(pid, b1, 1)?;
-                                        if first.first() == Some(&7) {
-                                            Some((b1, l1))
-                                        } else {
-                                            None
-                                        }
-                                    })();
-                                    if let (true, Some((b1, l1))) = (sig, fatal.as_ref()) {
-                                        let n = LOGFATAL_CAPTURE
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if n < 256 {
-                                            let cap_len = std::cmp::min(*l1 as usize, 256);
-                                            let captured = read_child_bytes(pid, *b1, cap_len);
-                                            match captured {
-                                                Some(bytes) => {
-                                                    let s = String::from_utf8_lossy(&bytes);
-                                                    let s = crate::cap_log_line(&s, 2048);
-                                                    log(&format!(
-                                                        "DIAG LOGFATAL(ret={}): {:?}",
-                                                        ret, s
-                                                    ));
+                                let iov1_base = read_child_u64(pid, iov_ptr.wrapping_add(16));
+                                let iov1_len = read_child_u64(pid, iov_ptr.wrapping_add(24));
+                                if let (Some(b1), Some(l1)) = (iov1_base, iov1_len) {
+                                    if l1 >= 1 && l1 <= 512 {
+                                        let first = read_child_bytes(pid, b1, 1);
+                                        if first
+                                            .as_ref()
+                                            .map(|b| b.first() == Some(&7))
+                                            .unwrap_or(false)
+                                        {
+                                            let n = LOGFATAL_CAPTURE
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if n < 256 {
+                                                let cap_len = std::cmp::min(l1 as usize, 256);
+                                                let captured = read_child_bytes(pid, b1, cap_len);
+                                                match captured {
+                                                    Some(bytes) => {
+                                                        let s = String::from_utf8_lossy(&bytes);
+                                                        let s = crate::cap_log_line(&s, 2048);
+                                                        log(&format!(
+                                                            "DIAG LOGFATAL(ret={}): {:?}",
+                                                            ret, s
+                                                        ));
+                                                    }
+                                                    None => {
+                                                        log("DIAG LOGFATAL: <buffer read failed>")
+                                                    }
                                                 }
-                                                None => log("DIAG LOGFATAL: <buffer read failed>"),
                                             }
                                         }
                                     }
