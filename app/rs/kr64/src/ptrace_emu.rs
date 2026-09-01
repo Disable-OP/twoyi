@@ -11263,6 +11263,11 @@ pub fn run_ptrace_loop(
     let mut kmsg_fd: Option<i32> = None;
     let mut pending_kmsg_open_pid: Option<libc::pid_t> = None; // 6-Z83: per-pid
     let mut post_execve_write_count: u64 = 0;
+    // 6-Z271o: fatal-evidence follow window — once a fb_hook fatal marker
+    // is seen, the next N writes bypass the DIAG budget (the fatal path
+    // logs kind, caller_pc and the maps in SEPARATE write() calls; a
+    // single-shot gate only captured the 19-byte marker prefix).
+    let mut fatal_evidence_follow: u32 = 0;
     // 6-Z147: per-pid record of children whose prctl ENTRY was rewritten to
     // getpid (the seccomp-safe skip — see the 6-Z147 ENTRY block for the
     // full rationale). Keyed by pid (not the Option<pid> of the other
@@ -20469,73 +20474,96 @@ pub fn run_ptrace_loop(
                     // writes are uninteresting setup noise).
                     if past_first_execve && syscall_num == abi.write {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        // Only capture successful writes with a
-                        // reasonable size (0 < ret <= 512). ret > 512
-                        // is almost certainly a non-KLOG bulk write
-                        // (e.g. property-area sync); ret <= 0 is a
-                        // failed write (nothing to capture).
-                        if ret > 0 && ret <= 512 {
-                            // 6-Z271o: FATAL-MARKER GATE — capture
-                            // fb_hook fatal evidence REGARDLESS of the
-                            // write budget. Run 33493209875: keystore2's
-                            // fb_hook-parked thread (the §13 abort-park)
-                            // produced ZERO INTERCEPTED lines because
-                            // keystore2's ~800-write budget was already
-                            // burned by property-area syncs before the
-                            // abort fired. The marker fires ONCE per
-                            // process (g_fatal_entered), so this cannot
-                            // flood; it makes every guest abort site
-                            // (kind + caller_pc) attributable in
-                            // artifacts.
+                        // 6-Z271o: FATAL-MARKER GATE — the fb_hook fatal
+                        // path (kind + caller_pc + maps) MUST be
+                        // attributable in artifacts regardless of the
+                        // write budget. Run 33493209875: keystore2's
+                        // fb_hook-parked thread (the §13 abort-park)
+                        // produced ZERO INTERCEPTED lines because
+                        // keystore2's ~800-write budget was burned by
+                        // property-area syncs before the abort, and the
+                        // maps chunks (2 KiB writes) were filtered by
+                        // the <=512 rule. The marker fires ONCE per
+                        // process (g_fatal_entered); the 48-write
+                        // follow window then captures the kind/pc
+                        // writes and the first map chunks for
+                        // pc→module attribution without flooding.
+                        //
+                        // Probe discipline: the 24-byte PEEK only runs
+                        // when it can matter — normal-budget writes
+                        // (ret <= 512, budget alive) or while the
+                        // follow window is open. Bulk writes outside
+                        // the window skip the probe.
+                        let probe_worthy = ret > 0 && (ret <= 512 || fatal_evidence_follow > 0);
+                        let mut is_fatal_marker = false;
+                        let mut in_follow = false;
+                        if probe_worthy {
                             let probe =
                                 read_child_bytes(pid, get_syscall_arg(&regs, abi.reg_arg2), 24);
-                            let is_fatal_marker = probe
+                            is_fatal_marker = probe
                                 .map(|b| b.starts_with(b"[twrp_fb_hook] ***"))
                                 .unwrap_or(false);
-                            post_execve_write_count = post_execve_write_count.saturating_add(1);
-                            if is_fatal_marker || post_execve_write_count <= 800 {
-                                // fd = arg1 (ebx on i386 / rdi on x86_64),
-                                // buf = arg2 (ecx on i386 / rsi on x86_64).
-                                // Both are preserved across the syscall
-                                // by the i386 + x86_64 calling convention
-                                // for syscalls (the kernel does NOT
-                                // clobber ebx/rcx/rdi/rsi in syscall
-                                // entry — only rax is overwritten with
-                                // the return value).
-                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
-                                let buf_addr = get_syscall_arg(&regs, abi.reg_arg2);
-                                let to_read = std::cmp::min(ret as usize, 256);
-                                let captured = read_child_bytes(pid, buf_addr, to_read);
-                                let is_klog = kmsg_fd == Some(fd);
-                                let prefix = if is_klog { "DIAG KLOG" } else { "DIAG write" };
-                                match captured {
-                                    Some(bytes) => {
-                                        // 6-Z131: cap the LOGGED capture at
-                                        // 2048 chars. The raw capture is
-                                        // already bounded (<= 256 bytes
-                                        // above), but the {:?} escaping
-                                        // below expands control chars ~6x,
-                                        // and the app-side FileLogger tee
-                                        // must never see another huge line
-                                        // (run 32786386000 OOM).
-                                        let captured_str = String::from_utf8_lossy(&bytes);
-                                        let captured_str = crate::cap_log_line(&captured_str, 2048);
-                                        log(&format!(
-                                            "{}(fd={}, ret={}): {:?}",
-                                            prefix, fd, ret, captured_str
-                                        ));
-                                    }
-                                    None => {
-                                        // PTRACE_PEEKDATA failed on the
-                                        // very first word (EIO / unmapped
-                                        // address). Log the failure
-                                        // explicitly so it is greppable
-                                        // but do NOT crash the loop.
-                                        log(&format!(
-                                            "{}(fd={}, ret={}): <buffer read failed: EIO>",
-                                            prefix, fd, ret
-                                        ));
-                                    }
+                            if is_fatal_marker {
+                                fatal_evidence_follow = 48;
+                            }
+                            in_follow = fatal_evidence_follow > 0;
+                            if in_follow {
+                                fatal_evidence_follow -= 1;
+                            }
+                        }
+                        // Capture when: fatal evidence (marker or the
+                        // follow window, any size), or the regular
+                        // budgeted path (ret <= 512).
+                        if ret > 0
+                            && (is_fatal_marker
+                                || in_follow
+                                || (ret <= 512 && {
+                                    post_execve_write_count =
+                                        post_execve_write_count.saturating_add(1);
+                                    post_execve_write_count <= 800
+                                }))
+                        {
+                            // fd = arg1 (ebx on i386 / rdi on x86_64),
+                            // buf = arg2 (ecx on i386 / rsi on x86_64).
+                            // Both are preserved across the syscall
+                            // by the i386 + x86_64 calling convention
+                            // for syscalls (the kernel does NOT
+                            // clobber ebx/rcx/rdi/rsi in syscall
+                            // entry — only rax is overwritten with
+                            // the return value).
+                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            let buf_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let to_read = std::cmp::min(ret as usize, 256);
+                            let captured = read_child_bytes(pid, buf_addr, to_read);
+                            let is_klog = kmsg_fd == Some(fd);
+                            let prefix = if is_klog { "DIAG KLOG" } else { "DIAG write" };
+                            match captured {
+                                Some(bytes) => {
+                                    // 6-Z131: cap the LOGGED capture at
+                                    // 2048 chars. The raw capture is
+                                    // already bounded (<= 256 bytes
+                                    // above), but the {:?} escaping
+                                    // below expands control chars ~6x,
+                                    // and the app-side FileLogger tee
+                                    // must never see another huge line
+                                    // (run 32786386000 OOM).
+                                    let captured_str = String::from_utf8_lossy(&bytes);
+                                    let captured_str = crate::cap_log_line(&captured_str, 2048);
+                                    log(&format!(
+                                        "{}(fd={}, ret={}): {:?}",
+                                        prefix, fd, ret, captured_str
+                                    ));
+                                }
+                                None => {
+                                    // PTRACE_PEEKDATA failed on the
+                                    // very first word (EIO / unmapped
+                                    // address). Log the failure
+                                    // explicitly so it is greppable
+                                    // but do NOT crash the loop.
+                                    log(&format!(
+                                        "{}(fd={}, ret={}): <buffer read failed: EIO>",
+                                        prefix, fd, ret
+                                    ));
                                 }
                             }
                         }
