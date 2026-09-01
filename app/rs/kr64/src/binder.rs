@@ -5481,6 +5481,127 @@ mod tests {
     }
 
     #[test]
+    fn z271i_death_notification_and_teardown_resolve_callers() {
+        // §15 death/teardown coverage:
+        //  (a) a watcher with BC_REQUEST_DEATH_NOTIFICATION receives
+        //      [BR_DEAD_BINDER][cookie] when the owning conn disconnects;
+        //  (b) a caller whose sync transaction is queued on a dying
+        //      server's inbox gets [BR_FAILED_REPLY] instead of hanging
+        //      out its full REPLY_TIMEOUT.
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let add_service = |name: &str, cookie: u64| -> UnixStream {
+            let mut s = UnixStream::connect(&path).expect("connect");
+            let mut w = ParcelWriter::new();
+            w.write_string16(name);
+            w.write_flat_binder(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0x4444,
+                cookie,
+            });
+            w.write_i32(0);
+            w.write_i32(0);
+            let (d, o) = make_servicemanager_request_parcel(&mut w);
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+            let p = make_v2_write_read_payload(&bc, &d, &o, 4096);
+            let (r, _) = exchange(&mut s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0);
+            s
+        };
+        let get_service = |s: &mut UnixStream, name: &str| -> u32 {
+            let mut w = ParcelWriter::new();
+            w.write_string16(name);
+            let (d, o) = make_servicemanager_request_parcel(&mut w);
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+            let p = make_v2_write_read_payload(&bc, &d, &o, 4096);
+            let (r, resp) = exchange(s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0);
+            let rs = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+            let off = 4 + rs + 8;
+            let dl = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+            let blob = &resp[off + 8..off + 8 + dl];
+            u64::from_ne_bytes(blob[12..20].try_into().unwrap()) as u32
+        };
+        let read_only = |s: &mut UnixStream| -> Vec<u8> {
+            let mut wr = Vec::new();
+            wr.extend_from_slice(&0u32.to_ne_bytes());
+            wr.extend_from_slice(&4096u32.to_ne_bytes());
+            let (r, resp) = exchange(s, BINDER_WRITE_READ, &wr);
+            assert_eq!(r, 0);
+            resp
+        };
+
+        // ---- (b) queued sync work resolved on server teardown ----
+        let mut conn_srv = add_service("doomed_svc", 0xdead);
+        let mut conn_cli = UnixStream::connect(&path).expect("connect cli");
+        let h_doomed = get_service(&mut conn_cli, "doomed_svc");
+        let mut tx = [0u8; 64];
+        tx[0..4].copy_from_slice(&h_doomed.to_ne_bytes());
+        tx[16..20].copy_from_slice(&3u32.to_ne_bytes());
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&tx);
+        let p_tx = make_v2_write_read_multi_payload(&bc, &[(&[], &[])], 4096);
+        let (r_tx, resp_tx) = exchange(&mut conn_cli, BINDER_WRITE_READ, &p_tx);
+        assert_eq!(r_tx, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp_tx[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE,
+            "sync call parked (queued on the doomed server's inbox)"
+        );
+        // Server dies WITHOUT reading the queued work.
+        drop(conn_srv);
+        std::thread::sleep(Duration::from_millis(120));
+        let resp_fail = read_only(&mut conn_cli);
+        assert_eq!(
+            u32::from_ne_bytes(resp_fail[4..8].try_into().unwrap()),
+            BR_FAILED_REPLY,
+            "teardown resolves the queued sync call as BR_FAILED_REPLY"
+        );
+
+        // ---- (a) death notification for a watcher ----
+        let mut conn_srv2 = add_service("watched_svc", 0xcafe);
+        let mut conn_watch = UnixStream::connect(&path).expect("connect watcher");
+        let h_watched = get_service(&mut conn_watch, "watched_svc");
+        // BC_REQUEST_DEATH_NOTIFICATION: [cmd][handle u32][cookie u64].
+        let mut dn = Vec::with_capacity(4 + 12);
+        dn.extend_from_slice(&BC_REQUEST_DEATH_NOTIFICATION.to_ne_bytes());
+        dn.extend_from_slice(&h_watched.to_ne_bytes());
+        dn.extend_from_slice(&0x1234_5678_9abc_def0u64.to_ne_bytes());
+        let p_dn = make_v2_write_read_multi_payload(&dn, &[], 4096);
+        let (r_dn, _resp_dn) = exchange(&mut conn_watch, BINDER_WRITE_READ, &p_dn);
+        assert_eq!(r_dn, 0, "death notification request accepted");
+        // Owner dies → watcher's next read gets [BR_DEAD_BINDER][cookie].
+        drop(conn_srv2);
+        std::thread::sleep(Duration::from_millis(120));
+        let resp_death = read_only(&mut conn_watch);
+        assert_eq!(
+            u32::from_ne_bytes(resp_death[4..8].try_into().unwrap()),
+            BR_DEAD_BINDER,
+            "watcher receives BR_DEAD_BINDER"
+        );
+        let cookie = u64::from_ne_bytes(resp_death[8..16].try_into().unwrap());
+        assert_eq!(
+            cookie, 0x1234_5678_9abc_def0,
+            "the requested death cookie comes back verbatim"
+        );
+
+        drop(conn_cli);
+        drop(conn_watch);
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
     fn z271_virtual_vibrator_gets_registered_and_answers_get_service() {
         let rootfs = tmpdir();
         let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
