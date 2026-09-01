@@ -20661,7 +20661,7 @@ pub fn run_ptrace_loop(
                                 let iov1_base = read_child_u64(pid, iov_ptr.wrapping_add(16));
                                 let iov1_len = read_child_u64(pid, iov_ptr.wrapping_add(24));
                                 if let (Some(b1), Some(l1)) = (iov1_base, iov1_len) {
-                                    if l1 >= 1 && l1 <= 512 {
+                                    if l1 >= 1 && l1 <= 8192 {
                                         let first = read_child_bytes(pid, b1, 1);
                                         if first
                                             .as_ref()
