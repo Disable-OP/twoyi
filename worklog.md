@@ -23667,3 +23667,40 @@ Stage Summary:
   (real) → GetBatteryInfo (real client) → BatteryMonitor (real) → pinned sysfs (host-honest bridge values).
   Vibration chain: AIDL on(ms) arg decode fixed; the remaining SM-reply null has a dedicated diagnostic in
   flight. Open: the SM null (6-Z272d verdict), whyred EARLY_INIT flake check, Lineage 22.2 boot-to-menu.
+
+---
+Task ID: 6-Z272e — THE SM NULL NAMED: android-12 Category annotation; per-connection self-tuning
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-01
+Task: the 6-Z272d verdict decode (SM-REPLY-CONSUMED + the client's own Stability log) and the fix.
+
+Work Log:
+- 6-Z272d verdict (run 33536388608): SM-TR showed the final client-visible tr CLEAN (flags=0, dsize=32,
+  osize=8, valid dptr/optr, stash bytes EX_NONE + 63 + offsets[4] verified in guest memory) AND
+  SM-REPLY-CONSUMED (the client BC_FREE_BUFFERed the stash = waitForResponse populated + tore down the
+  reply Parcel) — the transact was transport-clean, so the null arose INSIDE the client parse chain.
+- THE CLIENT'S OWN LOG NAMED IT: "[glog V/Stability] Can only set known stability, not 0." ×714 ≈
+  every SM-reply parse (2 processes × ~357 polls). From A12 Stability.cpp: setRepr
+  → Category::fromRepr(63) = { version=63, level=UNDECLARED(0) } → "not 0" → BAD_TYPE → null.
+- ANDROID-12/12L CHANGED THE WIRE: the annotation is Category { u8 version; u8 reserved[2]; u8 level }
+  = level<<24 | version (A12 Stability.h), version ≥ kBinderWireFormatOldest=1; a real A12 SM writes
+  Category::currentFromLevel(level) → VINTF = 0x3F000001. A11 (plain 63: isDeclaredStability) and
+  A13/A15 (plain int16 rep) verified from sources — A9/A10 ignore the field entirely. The four
+  generations are mutually incompatible on this one field.
+- One VM mixes generations (A11 rootfs keystore2 + the per-image recovery binary), so the format
+  SELF-TUNES PER CONNECTION (2773cc3): first get → A12 Category (0x3F000001 / null 0x00000001); a
+  same-service re-get inside 2 s = the waitForService retry signature of a failed parse → flip to
+  plain (63/0), sticky; different names never flip; fresh conns start over. A12 clients succeed on
+  the first reply; A11 clients converge on the second (their real pattern: keymint gets 100 ms apart);
+  A9/A10 unaffected.
+- Tests: z272e_annotation_flips_on_same_name_retry (flip, stickiness, fresh-conn reset, no-flip on
+  different names); reply-shape tests moved to the Category forms. 695/695 green, clippy, fmt.
+- Pushed 2773cc3; dispatched R12 lavender (the A12 client = the decisive test) + whyred (A11
+  convergence + the BOOT_FAIL_EARLY_INIT flake re-check).
+
+Stage Summary:
+- The entire 6-Z271w→x→272d→e chain is closed at the protocol level: annotation present (x), Category
+  form for A12 (e), per-connection convergence for the mixed-generation VM. Expectation: the R12 run
+  shows the FIRST getService reply accepted (no Stability-0 logs, no poll storm), keystore2 transacting
+  on IKeyMintDevice, IKeystoreSecurity registered, the ~18 s hole collapsed, and the vibrator client
+  reaching IVibrator.on() → host. If a new failure appears beyond that, it is a DIFFERENT bug.
