@@ -20583,6 +20583,49 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // 6-Z271q: LOGD-FATAL capture — independent of the
+                    // boot_recovery gate (this wave runs in
+                    // recovery_loader mode where boot_recovery=false, so
+                    // the 6-Z110 block above never fires and the guest's
+                    // LOG_ALWAYS_FATAL message was invisible). The logd
+                    // wire payload starts with the priority byte:
+                    // ANDROID_LOG_FATAL = 7. Capture the first 256 B of
+                    // any writev whose first payload byte is 7 — budget
+                    // 64 per process (fatals are rare; cannot flood).
+                    if past_first_execve && abi.writev_nr != -1 && syscall_num == abi.writev_nr {
+                        static LOGFATAL_CAPTURE: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if LOGFATAL_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) < 64 {
+                            let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                            if ret > 0 && iov_ptr != 0 {
+                                // aarch64/x86_64 iovec: 8-byte base + 8-byte len.
+                                let iov0_base = read_child_u64(pid, iov_ptr);
+                                if let Some(base) = iov0_base {
+                                    let prio = read_child_bytes(pid, base, 1);
+                                    if prio.map(|b| !b.is_empty() && b[0] == 7).unwrap_or(false) {
+                                        let n = LOGFATAL_CAPTURE
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if n < 64 {
+                                            let captured = read_child_bytes(pid, base, 256);
+                                            match captured {
+                                                Some(bytes) => {
+                                                    let s = String::from_utf8_lossy(&bytes);
+                                                    let s = crate::cap_log_line(&s, 2048);
+                                                    log(&format!(
+                                                        "DIAG LOGFATAL(ret={}): {:?}",
+                                                        ret, s
+                                                    ));
+                                                }
+                                                None => log("DIAG LOGFATAL: <buffer read failed>"),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // 6-Z110 TWRP gate fix3 diagnostic: capture writev content
                     // when boot_recovery=true AND writev return is in a reasonable
                     // range. This identifies the 89-byte abort message TWRP writes
