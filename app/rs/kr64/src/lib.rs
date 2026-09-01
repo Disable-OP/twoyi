@@ -11963,10 +11963,23 @@ pub fn sanitize_fstab_encryption_flags(rootfs_prefix: &str) {
 /// creates a minimal vendor manifest when none of the scanned files
 /// exists.
 pub fn augment_vintf_manifest_for_virtual_hals(rootfs_prefix: &str) {
+    // 6-Z271m FIX (run 33481635353): manifest <version> for format="aidl"
+    // is parsed by libvintf's AidlVersionConverter → parseAidlVersion — a
+    // SINGLE integer. Version RANGES ("1-3") are AidlVersionRangeConverter
+    // / matrix-only syntax: a range in a MANIFEST fails the whole
+    // <manifest> parse, VintfObject::GetDeviceHalManifest() returns
+    // nullptr, and keystore2_vintf's vintf.cpp dereferences it unchecked
+    // → SIGSEGV(0x0) in keystore2's negotiation thread ~170 ms after
+    // exec, crash-looping via init's 5 s restart budget. The single
+    // version 3 is correct on both ends: HalManifest::forEachInstanceOf-
+    // Version matches with minorAtLeast, so a declared 3 answers
+    // keystore2's connect_keymint count-down (V2 query first, then V1)
+    // with hal_version=2, and 3 is the KeyMint version the virtual
+    // device's getHardwareInfo actually reports.
     const KEYMINT_BLOCK: &str = concat!(
         "    <hal format=\"aidl\">\n",
         "        <name>android.hardware.security.keymint</name>\n",
-        "        <version>1-3</version>\n",
+        "        <version>3</version>\n",
         "        <interface>\n",
         "            <name>IKeyMintDevice</name>\n",
         "            <instance>default</instance>\n",
@@ -11983,12 +11996,6 @@ pub fn augment_vintf_manifest_for_virtual_hals(rootfs_prefix: &str) {
         "        </interface>\n",
         "    </hal>\n",
     );
-    // The `<version>1-3</version>` range on keymint is deliberate:
-    // keystore2's connect_keymint counts DOWN (2, then 1) and libvintf's
-    // getAidlInstances only returns instances whose declared range covers
-    // the queried version; a range covering both answers either query and
-    // yields hal_version=2 (no backlevel wrapper needed for our virtual
-    // device, whose getHardwareInfo reports KeyMint V3 semantics).
 
     // Minimal-but-valid skeleton when the ramdisk ships no manifest at
     // all (type="device" = vendor side; target-level omitted — optional).
@@ -12226,7 +12233,22 @@ mod tests {
         assert!(out.contains("4.0"), "{out}");
         // Both virtual AIDL HALs declared before </manifest>.
         assert!(out.contains("android.hardware.security.keymint"), "{out}");
-        assert!(out.contains("<version>1-3</version>"), "{out}");
+        // 6-Z271m: SINGLE version only — ranges ("1-3") are matrix-only
+        // libvintf syntax; in a manifest they fail the whole parse and
+        // keystore2's VintfObject returns nullptr → SIGSEGV (run
+        // 33481635353). HalManifest matching is minorAtLeast, so a single
+        // 3 answers keystore2's V2-then-V1 count-down.
+        assert!(out.contains("<version>3</version>"), "{out}");
+        let km_start = out.find("android.hardware.security.keymint").unwrap_or(0);
+        let km_end = out[km_start..]
+            .find("</hal>")
+            .map(|i| km_start + i + 6)
+            .unwrap_or(out.len());
+        let km_block = out[km_start..km_end].to_string();
+        assert!(
+            !km_block.contains('-'),
+            "injected keymint block must not carry range syntax: {km_block}"
+        );
         assert!(out.contains("IKeyMintDevice"), "{out}");
         assert!(out.contains("<instance>default</instance>"), "{out}");
         assert!(
