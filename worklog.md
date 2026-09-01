@@ -23572,3 +23572,98 @@ Work Log:
 
 Stage Summary:
 - Corpus now spans Android 9→15. LineageOS 22.2 is a dedicated work stream; R12's wedge chain (dense handles landed) remains the primary verified thread. Both proceed under the webDevReview cron.
+
+---
+Task ID: 6-Z271x — THE POST-PARSE DEFECT NAMED: the missing binder stability annotation
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-01
+Task: decode the 6-Z271w NAME_NOT_FOUND chain (byte-perfect SM reply → client-side null) and fix it.
+
+Work Log:
+- Fetched the REAL android-13 client sources (android.googlesource.com, tag android-13.0.0_r1 — the GitHub aosp-mirror stops before 13, which is why earlier waves were verified against android-11):
+  libs/binder/{Parcel,IPCThreadState,ProcessState,BpBinder,IServiceManager}.cpp + Stability.{h,cpp}.
+- ROOT CAUSE (Parcel.cpp): `flattenBinder` ends with `finishFlattenBinder(binder)` = `writeInt32(Stability::getRepr(binder))`
+  — since android-12, EVERY flattened binder on the wire is followed by a 4-byte stability annotation;
+  `unflattenBinder` → `finishUnflattenBinder` does `readInt32(&stability)` right after the flat object.
+  Our reply was the android-11 shape `[EX_NONE][flat 24B]` (dlen=28) — the client's readInt32 ran PAST the
+  parcel end → NOT_ENOUGH_DATA/BAD_TYPE → readStrongBinder null → ServiceManagerShim::checkService null →
+  waitForService ~5 s retry budget → keystore2 connect_keymint NAME_NOT_FOUND. Exactly the "post-parse"
+  signature of 6-Z271w (flat parse + proxy creation succeeded, the version/stability step failed).
+- Second gate confirmed: `BpBinder::transact` rejects user transactions when
+  `Stability::check(getRepr(this), getLocalLevel())` fails ((provided & required) == required) — an
+  UNDECLARED(0) annotation would still fail every later call. `isDeclaredLevel` accepts only
+  VENDOR 0b000011 / SYSTEM 0b001100 / VINTF 0b111111.
+- FIX (ba49a6b): annotate VINTF (63) on every binder object in OUR synthesized AIDL replies — the only
+  declared level passing BOTH system (12) and vendor (3) clients, and exactly what real @VintfStability
+  HALs (keymint/vibrator/sharedsecret) put on the wire; null binders (SM miss) annotated UNDECLARED(0)
+  mirroring real flattenBinder(nullptr) (setRepr(nullptr, 0) = OK). Sites: AIDL SM getService/checkService
+  hit + miss, legacy v1 null-binder reply. HIDL path intentionally unchanged (libhwbinder predates the
+  annotation; reads the flat at offsets[0] with no status header). New test
+  z271x_sm_reply_carries_binder_stability_annotation walks the full client parse for hit+miss shapes;
+  reply-shape tests updated 28→32-byte blobs. 691/691 green, clippy -D warnings, fmt.
+- Latent gap RECORDED (6-Z271y, next round): the routed BC_REPLY relay is byte-preserving — it does NOT
+  translate the server's BINDER_TYPE_BINDER flat (cookie = server-local pointer) into a
+  BINDER_TYPE_HANDLE for the requester like the kernel does, and the REQUEST direction does not translate
+  HANDLE→BINDER either. Unreachable today (0 completed routed transactions; the compat chain's replies
+  carry no binders) but becomes live the moment a guest server replies with a local-binder flat.
+- Pushed main f21c451..ba49a6b; dispatched CI: R12 lavender (wedge verification), whyred guard,
+  lineage-22.2-sailfish (Android-15 clients consume the same annotation — may already move its aborts).
+
+Stage Summary:
+- The entire wedge chain is now decoded end-to-end at the protocol level: RECO tags → registry → VINTF
+  manifest discovery → placeholder-fd FATAL → dense handles (Vector overflow) → STABILITY ANNOTATION
+  (post-parse null). Expectation for the R12 run: clients SURVIVE getService for the first time; keystore2
+  transacts on IKeyMintDevice (getHardwareInfo code=1), registers android.security.keystore2, and the
+  ~18 s hole collapses; the recovery vibrator client transacts on()/getCapabilities instead of dying at
+  +52.5 s. If a new failure appears beyond that, it is a DIFFERENT bug — no longer this chain.
+
+---
+Task ID: 6-Z272c/d — battery reader decoded (health HAL); sysfs pinning; header fix; client-verdict diagnostic
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-01
+Task: "battery doesn't get recognized in OrangeFox R12" + "make vibration actually work" + the post-annotation SM null.
+
+Work Log:
+- 6-Z271z (16cc066): the virtual-service arg decode now consumes the AIDL interface-token header first —
+  before it, IVibrator.on(ms) would read the token's strict-mode word as the timeout (real clients write
+  0/-1 → EX_UNSUPPORTED_OPERATION → the host vibration silently never fires). Unreachable until 6-Z271x,
+  so never observed in CI. Test z271z proves on(5000)→EX_NONE + on(0)→EX_UNSUPPORTED.
+- 6-Z272c STRUCTURAL (8b1e758): mount_mgr mounts the REAL host sysfs on the guest's /sys — the entire
+  battery/haptics tree under the rootfs sys/... was SHADOWED and invisible to every guest on every run
+  (battery_ok=null forever; zero power_supply opens even where the mirror "existed"). Fix: self-bind-pin
+  the 8 owned subtrees (battery/usb/ac, timed_output/vibrator, leds/{vibrator,lcd-backlight,torch_0},
+  backlight/panel) BEFORE the sysfs overmount — submounts survive the overmount, everything else stays
+  real host sysfs. Also added the uevent ABI file (battery/usb/ac) for the uevent-exclusive reader class.
+- R12 run on ba49a6b (run 33527646458, UI_READY): the client receives the SM reply BYTE-IDENTICAL to a
+  real android-11/12/13 SM reply (SM-REPLY dump: dlen=32, [EX_NONE][BINDER_TYPE_HANDLE][stability 63],
+  offsets=[4]; encodings verified identical across all three generations from fetched sources) — yet
+  ServiceManagerShim::getService still polls ("Waiting for service ... didn't start. Returning NULL",
+  357 vibrator polls) and keystore2 still never transacts (50 keymint + 51 compat gets, 0 virtual/routed
+  transactions, pool thread still wedged in recvfrom on the proxy socket). The failure is in the LAST
+  inch between the shlib stash and the client's Parcel.
+- R12 battery reader DECODED from TWRP-12.1 sources (recovery_utils/battery_utils.cpp): GetBatteryInfo()
+  → get_health_service() → HIDL hwservicemanager lookup; null → "No health implementation is found;
+  assuming defaults" → capacity UNKNOWN → battery_android_0.svg. The image SHIPS health@2.0/2.1-service
+  binaries with rcs marked disabled and NOTHING ever starts them. On real devices the service runs; in
+  Twoyi it never did.
+- 6-Z272c HAL (4f08d18): enable_image_health_hal() — import-time rc patch: drop `disabled` from the
+  image's own health@2.1-service.rc (2.0 fallback; binary existence REQUIRED — never synthetic), append
+  "on late-init / start health-hal-2-1" (late-init runs after init → hwservicemanager up first). The
+  HAL's internal BatteryMonitor reads the PINNED sysfs tree → host-honest values; it registers @2.1 AND
+  @2.0 IHealth/default → serves every HIDL client generation. Test: z272c_health_hal_enable... (694/694).
+- 6-Z272d (e2542fb): shlib client-verdict diagnostic — SM-TR dumps the FINAL client-visible tr
+  (flags/dsize/osize/dptr/optr) + stash re-read; SM-REPLY-CONSUMED fires when the client BC_FREE_BUFFERs
+  the stash (reply parcel populated + torn down → null would be INSIDE the AIDL marshalling); free-less
+  re-transact = transport-level failure. In flight.
+- CI watch: whyred on d04936a hit BOOT_FAIL_EARLY_INIT ("start_property_service socket creation failed")
+  — zero 6-Z272c log lines visible (mount_mgr logs never reach CI artifacts even pre-change), pinning
+  does not touch /dev — flake-vs-regression unresolved; whyred re-dispatched on 4f08d18.
+- Lineage 22.2 sailfish: BOOT_FAIL on ba49a6b and d04936a (expected — the Android-15 init/linker
+  forensics stream 6-Z272b is still open; subagent dispatch failed repeatedly at platform level this
+  round, work continues next round).
+
+Stage Summary:
+- Battery chain now has a complete, evidence-backed mechanism: image health HAL (started) → hwservicemanager
+  (real) → GetBatteryInfo (real client) → BatteryMonitor (real) → pinned sysfs (host-honest bridge values).
+  Vibration chain: AIDL on(ms) arg decode fixed; the remaining SM-reply null has a dedicated diagnostic in
+  flight. Open: the SM null (6-Z272d verdict), whyred EARLY_INIT flake check, Lineage 22.2 boot-to-menu.
