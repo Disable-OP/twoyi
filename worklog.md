@@ -23782,3 +23782,43 @@ Stage Summary:
   give. Next round: read the VS-TR/CONSUMED verdict → fix getHardwareInfo delivery →
   IKeystoreSecurity registration → the ~18 s hole collapse. Then the LineageOS 22.2
   boot-to-menu stream (6-Z272b) and the health-HAL registration decode (6-Z272f-b).
+
+---
+Task ID: 6-Z272h — THE getHardwareInfo STALL NAMED: reply correlation across multiplexed sync transactions
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-01
+Task: decode the 6-Z272g VS-TR/CONSUMED verdict.
+
+Work Log:
+- Run 33543923394 (R12, 2d73d2f): the widened observer caught the smoking gun —
+  VS-TR dsize=104 osize=0 stash[0..3]=30 00 00 00: the reply the client received for
+  its getHardwareInfo transact is the '_NTF' DESCRIPTOR reply (104 bytes = exactly
+  [len=48]["android.hardware.security.keymint.IKeyMintDevice" UTF-16]; the first word
+  0x30 = the string16 length 48), and SM-REPLY-CONSUMED confirms the client freed it.
+  keystore2's getHardwareInfo then failed with TRANSACTION_FAILED (a 48 as the
+  exception-code word is not EX_NONE).
+- ROOT CAUSE CLASS: reply CORRELATION across multiplexed sync transactions on ONE
+  connection. The real kernel correlates each BC_REPLY to the SENDING THREAD's
+  transaction stack; our proxy answers per-ioctl and — when more than one sync
+  BC_TRANSACTION rides one write stream (or replies queue on the connection) — a
+  later transact can receive an EARLIER reply. The _NTF + getHardwareInfo pair on
+  keystore2's fresh proxy hit it deterministically (both sent back-to-back).
+- FIX DESIGN (next round, 6-Z272h): per-transaction reply correlation — tag every
+  accepted sync BC_TRANSACTION with a proxy txn id, and deliver each BC_REPLY/expected
+  reply to its own transaction slot: in-ioctl replies attach to the transaction that
+  produced them; when multiple sync BCs arrive in ONE write stream, only the FIRST
+  reply may ride that ioctl's read buffer — subsequent replies go to the connection's
+  reply_queue and are picked up by the client's NEXT read of the SAME logical
+  transaction (kernel semantics: one BR_REPLY per transaction, in transaction order).
+  Also verify the client-side ordering: libbinder's per-thread mIn means a leftover
+  reply in one thread's mIn is consumed as the next transact's reply — the proxy must
+  never deliver two replies for different transactions into one read buffer unless
+  they are provably the same thread's transaction sequence.
+- Vibration re-verified in the same run (the chain keeps working; no regressions).
+
+Stage Summary:
+- getHardwareInfo is the LAST named stall before keystore2 registers IKeystoreSecurity.
+  The fix design is written and scoped; implement 6-Z272h first next round, then the
+  hole-collapse verdict run. After that: 6-Z272f-b (health HAL registration path) and
+  the LineageOS 22.2 boot-to-menu stream (6-Z272b — the recovery execs; A15 startup
+  forensics pending).
