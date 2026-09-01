@@ -20501,7 +20501,10 @@ pub fn run_ptrace_loop(
                             let probe =
                                 read_child_bytes(pid, get_syscall_arg(&regs, abi.reg_arg2), 24);
                             is_fatal_marker = probe
-                                .map(|b| b.starts_with(b"[twrp_fb_hook] ***"))
+                                .map(|b| {
+                                    b.starts_with(b"[twrp_fb_hook] ***")
+                                        || b.starts_with(b"[twoyi_loader] ***")
+                                })
                                 .unwrap_or(false);
                             if is_fatal_marker {
                                 fatal_evidence_follow = 160;
