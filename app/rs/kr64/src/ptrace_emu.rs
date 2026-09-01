@@ -20644,50 +20644,62 @@ pub fn run_ptrace_loop(
                     // priority byte is FATAL (budget 256/process —
                     // bounded, and the signature makes false positives
                     // negligible).
-                    // 6-Z271q/r: LOGD-FATAL capture — the logd socket
-                    // wire (from the 6-Z271r WRITEV-SAMPLE decode):
-                    // iov[0] = header fragment, iov[1] = THE PRIORITY
-                    // BYTE, iov[2] = tag, iov[3] = message. A FATAL entry
-                    // has iov1[0] == 7 (ANDROID_LOG_FATAL). Capture iov1
-                    // (prio + tag + message, first 256 B) — budget 256
+                    // 6-Z271t: LOGD-FATAL capture — FINAL shape. The
+                    // logd wire has MULTIPLE iovec layouts (decoded via
+                    // the 6-Z271r sampler): prio can be a standalone
+                    // 1-byte iovec or the first byte of a bigger one.
+                    // Rule: if ANY of the first 6 iovecs is non-empty and
+                    // starts with byte 7 (ANDROID_LOG_FATAL), dump the
+                    // whole writev (up to 6 iovecs x 512 B). Budget 64
                     // per process.
                     if past_first_execve && abi.writev_nr != -1 && syscall_num == abi.writev_nr {
                         static LOGFATAL_CAPTURE: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
-                        if LOGFATAL_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) < 256 {
+                        if LOGFATAL_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) < 64 {
                             let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                             let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
-                            if ret > 0 && iov_ptr != 0 {
-                                let iov1_base = read_child_u64(pid, iov_ptr.wrapping_add(16));
-                                let iov1_len = read_child_u64(pid, iov_ptr.wrapping_add(24));
-                                if let (Some(b1), Some(l1)) = (iov1_base, iov1_len) {
-                                    if l1 >= 1 && l1 <= 8192 {
-                                        let first = read_child_bytes(pid, b1, 1);
-                                        if first
-                                            .as_ref()
-                                            .map(|b| b.first() == Some(&7))
-                                            .unwrap_or(false)
-                                        {
-                                            let n = LOGFATAL_CAPTURE
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            if n < 256 {
-                                                let cap_len = std::cmp::min(l1 as usize, 256);
-                                                let captured = read_child_bytes(pid, b1, cap_len);
-                                                match captured {
-                                                    Some(bytes) => {
-                                                        let s = String::from_utf8_lossy(&bytes);
-                                                        let s = crate::cap_log_line(&s, 2048);
-                                                        log(&format!(
-                                                            "DIAG LOGFATAL(ret={}): {:?}",
-                                                            ret, s
-                                                        ));
-                                                    }
-                                                    None => {
-                                                        log("DIAG LOGFATAL: <buffer read failed>")
-                                                    }
+                            let iovcnt = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                            if ret > 0 && iov_ptr != 0 && iovcnt >= 2 {
+                                let mut pairs: Vec<(u64, u64)> = Vec::new();
+                                let mut is_fatal = false;
+                                for k in 0..iovcnt.min(6) {
+                                    let b =
+                                        read_child_u64(pid, iov_ptr.wrapping_add((k * 16) as u64));
+                                    let l = read_child_u64(
+                                        pid,
+                                        iov_ptr.wrapping_add((k * 16 + 8) as u64),
+                                    );
+                                    if let (Some(bb), Some(ll)) = (b, l) {
+                                        if ll >= 1 && ll <= 8192 {
+                                            if let Some(first) = read_child_bytes(pid, bb, 1) {
+                                                if first.first() == Some(&7) {
+                                                    is_fatal = true;
                                                 }
                                             }
+                                            pairs.push((bb, ll));
                                         }
+                                    }
+                                }
+                                if is_fatal {
+                                    let n = LOGFATAL_CAPTURE
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n < 64 {
+                                        let mut dump = format!(
+                                            "DIAG LOGFATAL(ret={} iovcnt={}):",
+                                            ret, iovcnt
+                                        );
+                                        for (bb, ll) in &pairs {
+                                            let cl = std::cmp::min(*ll as usize, 512);
+                                            if let Some(bytes) = read_child_bytes(pid, *bb, cl) {
+                                                let txt = String::from_utf8_lossy(&bytes);
+                                                dump.push_str(&format!(
+                                                    " [{}B] {:?}",
+                                                    ll,
+                                                    crate::cap_log_line(&txt, 1024)
+                                                ));
+                                            }
+                                        }
+                                        log(&dump);
                                     }
                                 }
                             }
