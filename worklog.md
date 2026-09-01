@@ -23433,3 +23433,42 @@ Work Log:
 
 Stage Summary:
 - Verdict: run SUCCESS on 96d7701. keystore2 SIGSEGV crash-loop from 33481635353 is FIXED (0 Fatal signals, 1 exec vs 49). keystore2 chain is PARTIAL/OPEN: virtual IKeyMintDevice discovery ✓ (0xf0000002) + android.security.compat registration ✓ (0xf0000004) + self-fetch ✓, but IKeystoreSecurity (android.security.keystore2) registration is NOT visible in logs through capture end (+52.6s) — keystore2 remains alive and idle, no crash, no restart. Timeline/hole and full UI chain match baselines; zero regressions and no new failure classes; UI verdicts all green (overall UI_READY, terminal/theme OK, vfs CLEAN).
+
+---
+Task ID: 6-Z271n — silent-path instrumentation
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-09-01
+Task: expose the paths that made the run-33486586515 keystore2 stall invisible.
+
+Work Log:
+- RUN 33486586515 (R12 lavender, 96d7701): SUCCESS / UI_READY / terminal OK / theme OK / vfs CLEAN; ZERO fatal signals (the 6-Z271m single-version fix eliminated the keystore2 SIGSEGV crash-loop — keystore2 exec'd ONCE and stays alive). KEY WIN: the manifest injection WORKS through keystore2's real enumerator — "getService(android.hardware.security.keymint.IKeyMintDevice/default) hit → 0xf0000002" at +10.69 s (libvintf getAidlInstances → binder::get_interface). keystore2's negotiation thread also registered android.security.compat (+10.69) and self-fetched it (+10.70).
+- REMAINING STALL: IKeystoreSecurity (android.security.keystore2...) still never registers by capture end (+52.6 s). Post-+10.7 s keystore2 activity is INVISIBLE to the artifact because (a) virtual-service transactions never logged at all, (b) routed-transaction QUEUE side never logged, (c) the 6-Z271e per-conn frame DIAG is bounded per conn. conn=6 = keystore2's hwbinder pool thread (BC_ENTER_LOOPER, 250 ms BR_NOOP parks — by design); the 6-Z271d stall dumps for Binder:1_2 are that design, not a hang.
+- IMPLEMENTED (23afd03): bounded routed-transaction DIAG (first 16 per (vm, owner): requester→owner conn, handle, code, oneway, SELF flag) + bounded virtual-service transaction DIAG (first 16 per (vm, kind): kind, code, conn). These expose the km_compat getSharedSecret self-transaction and any getHardwareInfo/version-handshake loop on the next run.
+- DISPATCHED: R12 lavender on 23afd03.
+
+Stage Summary:
+- Verified this round: SIGSEGV class extinct; VINTF-manifest-driven discovery of the virtual KeyMint works; TWRP guards green; timeline parity (splash +31419 ms). Open verdict: where keystore2's main thread stalls after the KeyMint discovery — next run's routed/virtual DIAG decides between (a) getHardwareInfo/version-handshake loop, (b) getSharedSecret self-transaction stall, (c) a genuine userspace spin in keystore2.
+---
+Task ID: 6-Z271p-CIWATCH
+Agent: CI verification agent
+Task: decode keystore2 thread states via the new procfs dump (run 33493209875).
+
+Work Log:
+- Run 33493209875 (head 133bfad, workflow 342357530 ui-e2e-test-arm64) completed SUCCESS; artifact ui-e2e-arm64-logs (id 9794929091) downloaded to /tmp/ciwatch4/, inner ui-e2e-logs.tar.xz extracted. NEW artifact keystore2-threads-dump.txt present (4 entries).
+- Thread dump decode (arm64 syscall numbers):
+  | pid | tid | comm | state | wchan | syscall | interpretation |
+  |-----|-----|------|-------|-------|---------|----------------|
+  | 19 | 19 | servicemanager | S | ep_poll | 22 = epoll_pwait | idle/healthy, waiting for binder requests |
+  | 2682 | 2682 | Binder:1_2 | S | poll_schedule_timeout | 73 = ppoll | pool thread parked in the by-design 250 ms proxy poll (pc in libtwrp_fb_hook.so) — matches expectation |
+  | 2682 | 2686 | _system_bin_key | S | futex_do_wait | 98 = futex | keystore2 MAIN thread (comm from staged exec path _system_bin_keystore2_…; note tid 2686 ≠ tgid 2682): FUTEX_WAIT_BITSET|PRIVATE (op=137, uaddr=0xb400f67d7ca04cc8, word=0x2) on a bionic mutex flagged "locked-WITH-WAITERS" → mutex held by a sibling |
+  | 2682 | 2688 | Binder:1_1 | S | unix_stream_data_wait | 207 = recvfrom | pool thread blocked reading the binder-proxy unix socket — waiting for a proxy reply that never arrives |
+- grep "routed transaction" kr64-app-stderr.log: 0 hits.
+- grep "virtual .* transaction" kr64-app-stderr.log: 0 hits.
+- grep "servicemanager transaction" kr64-app-stderr.log: 3 hits — +10695ms code=3 addService(android.security.compat) → handle 0xf0000004 (conn=5) [tx #1]; +10696ms code=2 getService(android.hardware.security.keymint.IKeyMintDevice/default) hit → handle 0xf0000002 (conn=3) [tx #1]; +10696ms code=2 getService(android.security.compat) hit → handle 0xf0000004 (conn=5) [tx #2].
+- splash.xml open timestamp: +31408 ms — "open twres /data/user/0/io.twoyi.debug/rootfs/twres/splash.xml -> fd 6 (occurrence 1)".
+- result.json: overall=UI_READY, ui=UI_READY, terminal=OK, theme=OK, vfs=CLEAN (also boot=BOOT_OK).
+- grep -c "Fatal signal" app-logs/log/logcat.log → 0.
+- Correlation from kr64-app-stderr.log: keystore2 = pid 2682, proxy connections conn=3 (+10660), conn=5 (+10686), conn=6 (+10686). conn=6 is the 250 ms poll loop (WRITE_READ ws=0 rc=256 → ret read_size=4): 12 clean cycles from +10686 to +13446, then the 13th poll at +13446ms was logged as received but NEVER answered — and the proxy emitted zero binder lines for the remaining ~33 s of log. conn=3's only transaction is the IKeyMintDevice getService; no transaction was ever issued to virtual handle 0xf0000002. The workflow's own STALL-DUMP at +17956ms corroborates: "pid=2686 futex uaddr=0xb400f67d7ca04cc8 op=137 word=0x2 — bionic mutex locked-WITH-WAITERS — a sibling thread holds it" (sibling = pid 2688 in recvfrom, nr at last ENTRY stop 207). "IKeystoreService" appears 0 times in the entire log.
+
+Stage Summary:
+- Verdict: keystore2's main thread is NOT spinning in userspace (state S, not R/running) and is not wedged in an ioctl — it is blocked on a futex: FUTEX_WAIT_BITSET_PRIVATE on a bionic mutex held by its own binder pool thread Binder:1_1 (tid 2688), which is itself blocked in recvfrom() on the twoyi binder-proxy unix socket waiting for a reply the proxy never sent (conn=6 poll at +13446 ms got no ret). Holding the process-wide binder mutex across the blocking proxy read wedges the whole process: the main thread can never acquire the lock to issue the IKeyMintDevice transaction on handle 0xf0000002, so IKeystoreSecurity/IKeystoreService never registers — with zero crashes and everything else green. Next concrete fix: (1) guest-side binder shim must not hold the binder mutex across the blocking socket read — drop the lock before recvfrom or switch to a per-connection lock + condvar so other threads can proceed; (2) proxy side must guarantee exactly one reply per accepted WRITE_READ (reply-timeout guard + log why the +13446 reply was dropped); (3) instrument the virtual-handle routing ("routed transaction" / "virtual transaction" logs are empty — the 0xf0000002 path is currently invisible, so its reply shape cannot be trusted yet).
