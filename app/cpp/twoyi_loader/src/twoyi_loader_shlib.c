@@ -510,7 +510,7 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
             // tracer's write-DIAG bypass captures it regardless of
             // budget (g_fatal_entered-style: once per process).
             static int reply_dump_done = 0;
-            if (!reply_dump_done && dlen > 0 && dlen <= 128) {
+            if (!reply_dump_done && dlen >= 28 && dlen <= 128 && olen >= 8) {
                 reply_dump_done = 1;
                 char dump[512];
                 int off = snprintf(dump, sizeof(dump),
