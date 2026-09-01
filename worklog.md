@@ -23395,3 +23395,41 @@ Work Log:
 
 Stage Summary:
 - Workflow verdict SUCCESS and every harness gate (a, f, g, i + result.json all OK) green; VINTF injection (6-Z271j) confirmed byte-level and vibrator first-try hit (6-Z271k) confirmed. BUT the keystore2 chain did NOT complete: no IKeystoreSecurity registered guest-side, no keymint getService, hole did not collapse (still ~19 s of restart backoff). New failure class vs baseline: keystore2 SIGSEGV (SEGV_MAPERR @0x0, thread _system_bin_key) ~170 ms after exec, correlated with VINTF-lib load under the 6-Z271j-injected manifest — previously it hung, now it crashes; end-to-end neutral (splash +201 ms, UI-ready ~+5 s, UI_READY/vfs CLEAN unchanged). Next: reproduce keystore2's VINTF read against the injected manifest.xml (36645→37133 bytes) and validate the injected <hal format="aidl"> shape with libvintf before the next wave run.
+
+---
+Task ID: 6-Z271m — manifest crash decode + single-version fix
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-09-01
+Task: decode run 33481635353's keystore2 SIGSEGV crash-loop and fix the injection.
+
+Work Log:
+- RUN 33481635353 (R12 lavender, head 99cdec5 = 6-Z271i+j+k): SUCCESS / UI_READY / terminal OK / theme OK / vfs CLEAN; TWRP guards whyred+angler on 20d2fa3 BOTH SUCCESS — no recovery regression from the wave. splash.xml at +31586 ms (baseline +31385 ms — parity). Vibrator waits 0; dm waits 0; binder timeout/failure warnings 0.
+- NEW FAILURE CLASS: keystore2 SIGSEGV crash-loop (49 execs, ~170 ms after start, SEGV_MAPERR addr 0x0, in the process's FIRST spawned thread) — BEFORE any binder transaction (0 guest↔guest deliveries the whole run). Crash time coincides with mapping libkeystore2_vintf_cpp.so: the negotiation thread's FIRST call is VintfObject::GetDeviceHalManifest() (list_participants) and vintf.cpp dereferences the returned manifest UNCHECKED.
+- ROOT CAUSE (6-Z271j injection): libvintf parses manifest <hal format="aidl"><version> with AidlVersionConverter/parseAidlVersion = SINGLE integer ONLY. "1-3" range syntax is AidlVersionRangeConverter = compatibility-MATRIX-only. The range failed the entire manifest parse → GetDeviceHalManifest() → nullptr → vintf.cpp manifest->getHidlInstances() → SIGSEGV(0x0). (AOSP's unchecked deref turned a parse error into a crash — the injection must never produce matrix-only syntax.)
+- FIX (commit 96d7701): inject <version>3</version>. HalManifest::forEachInstanceOfVersion matches with minorAtLeast, so a single declared 3 answers keystore2's connect_keymint count-down (V2 query first, then V1) with hal_version=2 — AND 3 is the KeyMint version the virtual device's getHardwareInfo genuinely reports. Regression test hardened (injected keymint block must never contain range syntax).
+- Verified gates: 690/690 tests, clippy -D warnings, fmt.
+- DISPATCHED: R12 lavender verification on 96d7701. Verdict greps: no keystore2 SIGSEGV; "getService(android.hardware.security.keymint.IKeyMintDevice/default) hit"; "addService(android.security.keystore2..."; guest-side "Successfully registered Keystore 2.0 service"; hole collapse (+13→+31 s window).
+
+Stage Summary:
+- 6-Z271i/j/k verified non-regressing on TWRP-class images; the manifest injection bug is fixed at the syntax level with the libvintf parser as the source of truth. Next run decides whether the keystore2 chain completes end-to-end; if it does, the remaining boot budget is TWRP's own partition work + theme parse + exec pipeline.
+---
+Task ID: 6-Z271n-CIWATCH
+Agent: CI verification agent
+Task: verify run 33486586515 (6-Z271m single-version manifest fix) through artifacts.
+
+Work Log:
+- Run 33486586515 (ui-e2e-test-arm64 #2423, head 96d7701, orangefox-R12.0-lavender): completed SUCCESS; jobs: Build arm64-v8a APK success (08:21:12→08:23:37Z), UI-only ARM64 E2E success (08:23:40→08:30:00Z). Artifact ui-e2e-arm64-logs (id 9792277834) downloaded to /tmp/ciwatch2/ and ui-e2e-logs.tar.xz extracted.
+- (a) marker: grep -c "6-Z271j: injected virtual AIDL HALs" kr64-app-stderr.log = 1, at [+23ms] PARENT: manifest.xml 36645 -> 37131 bytes (+486 B of HAL fragments).
+- (b) crash check: "Fatal signal 11" = 0, "Fatal signal" overall = 0 in app-logs/log/logcat.log; keystore2 exec'd exactly ONCE (execve at [+10464ms], single 6-Z238/6-Z101 pair) vs 49 execs crash-loop in run 33481635353. Zero restarts, zero panics/abort lines.
+- (c) keystore2 keymint discovery: HIT — [+10690ms] getService(android.hardware.security.keymint.IKeyMintDevice/default) hit → handle 0xf0000002 (conn=3, IDENT pid=2701 = keystore2).
+- (d) IKeystoreSecurity registration: NOT OBSERVED. addService(android.security.keystore2 = 0 hits; "Successfully registered" = 0 in dev-__kmsg__ and logcat.log; "IKeystoreSecurity" string absent everywhere. What did happen: [+10690ms] addService(android.security.compat) → 0xf0000004 (conn=5, ret=0) and [+10703ms] getService(android.security.compat) hit → 0xf0000004 (self round-trip OK). Only 4 servicemanager transactions in the whole run (keymint get, compat add, compat get, vibrator get). keystore2 stayed alive/idle: stall detector 6-Z271d shows its Binder:1_2 thread merely blocked in poll (wchan=poll_schedule_timeout) at +17.5s..+29.5s — normal idle service wait, not a hang failure; no crash, no init restart in kmsg.
+- (e) sharedsecret: getService(android.hardware.security.sharedsecret = 0 hits; host-registered virtual ISharedSecret/default (0xf0000003, +0ms) never fetched.
+- (f) guest↔guest routing: "delivered transaction" = 0 in kr64-app-stderr.log.
+- (g) timeline: VINTF injection +23ms; keystore2 exec +10464ms; keymint discovery +10690ms; quiet hole (largest log gap) +13.47s → +31.24s (17.8s) matching baseline hole +13.2→+31.2s; "find /vendor/etc/vintf/manifest" exec DIAG at [+31260ms]; splash.xml open (6-Z169) at [+31419ms] → +34ms vs 33428365193 baseline +31385ms, −167ms vs crash-loop 33481635353 +31586ms. Within noise of both baselines.
+- (h) vibrator waits: "Waiting for service 'android.hardware.vibrator" = 0 in both stderr and logcat.log; recovery (pid 2702, conn=7) instead got a HIT: [+52583ms] getService(android.hardware.vibrator.IVibrator/default) → 0xf0000001.
+- (i) result.json: boot BOOT_OK, overall UI_READY, ui UI_READY, terminal OK, theme OK, vfs CLEAN; sigsegv_count key absent (no crash counter emitted); markers: family_banner [OrangeFox], display_mode recovery_loader, presentation SINGLE_FRAME, pages main→clear_vars→ext_custom_status→clear_vars→navbar→filemanagerlist×2, backstop_denied 32, blit_frames_last 1; nav-done present.
+- (j) binder failure paths: "timed out|requester gone|owner mailbox full|no parcel bytes|self-transaction" = 0; all 4 servicemanager txs returned ret=0.
+- Note: manifest.xml content is not dumped in the artifact, so the literal "<version>3</version>" text couldn't be grepped; behavioral evidence (no SIGSEGV, keymint discovery OK, single exec) is the verification signal, plus 690/690 unit tests already cover the syntax.
+
+Stage Summary:
+- Verdict: run SUCCESS on 96d7701. keystore2 SIGSEGV crash-loop from 33481635353 is FIXED (0 Fatal signals, 1 exec vs 49). keystore2 chain is PARTIAL/OPEN: virtual IKeyMintDevice discovery ✓ (0xf0000002) + android.security.compat registration ✓ (0xf0000004) + self-fetch ✓, but IKeystoreSecurity (android.security.keystore2) registration is NOT visible in logs through capture end (+52.6s) — keystore2 remains alive and idle, no crash, no restart. Timeline/hole and full UI chain match baselines; zero regressions and no new failure classes; UI verdicts all green (overall UI_READY, terminal/theme OK, vfs CLEAN).
