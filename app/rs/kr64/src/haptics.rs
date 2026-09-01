@@ -176,13 +176,17 @@ impl HapticsDevice {
             .name("kr64-haptics".into())
             .spawn(move || {
                 let mut torch_on = false;
+                let mut vib_deadline: Option<std::time::Instant> = None;
+                let mut led_deadline: Option<std::time::Instant> = None;
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
                     // Read enable/duration; emulate the one-shot + notify.
-                    let _ = drain_one_shot_host(&timed_dir, "enable");
-                    let _ = drain_one_shot_host(&leds_dir, "activate");
+                    // Both are deadline-tracked (never sleep inline — the
+                    // torch edge detector shares this loop).
+                    let _ = drain_one_shot_host(&timed_dir, "enable", &mut vib_deadline);
+                    let _ = drain_one_shot_host(&leds_dir, "activate", &mut led_deadline);
                     // Torch: edge-triggered host notification.
                     let raw = fs::read_to_string(torch_dir.join("brightness"))
                         .unwrap_or_else(|_| "0".into());
@@ -227,40 +231,62 @@ fn write_file(dir: &Path, name: &str, value: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// One-shot emulation: read `name` as a duration; if non-zero, schedule
-/// the reset for after that duration (first tick past the deadline).
-fn drain_one_shot(dir: &Path, name: &str) -> io::Result<()> {
+/// One-shot emulation WITHOUT blocking the drain thread: if `name` holds
+/// a non-zero duration, note the reset deadline; the value is zeroed on
+/// the first tick past it. The 6-Z271 drain loop shares this thread with
+/// the torch edge detector — an inline sleep would stall torch forwarding
+/// for the whole vibration (up to the 60 s cap).
+fn drain_one_shot(
+    dir: &Path,
+    name: &str,
+    until: &mut Option<std::time::Instant>,
+) -> io::Result<()> {
     let p = dir.join(name);
-    let raw = fs::read_to_string(&p).unwrap_or_else(|_| "0".into());
-    let ms: u64 = raw.trim().parse().unwrap_or(0);
-    if ms > 0 {
-        // Busy-wait the duration (bounded: vibrates are ≤ a few seconds),
-        // then reset. Sleeping on the haptics thread is safe — no guest
-        // ever blocks on this file.
-        thread::sleep(Duration::from_millis(ms));
-        fs::write(&p, "0\n")?;
-        // The companion state file reads 0 when idle.
-        let state = dir.join("state");
-        if state.exists() {
-            fs::write(&state, "0\n")?;
+    let now = std::time::Instant::now();
+    let deadline = match *until {
+        Some(d) if now < d => return Ok(()), // one-shot still pending
+        Some(_) => {
+            // Deadline passed: reset to idle now.
+            fs::write(&p, "0\n")?;
+            let state = dir.join("state");
+            if state.exists() {
+                fs::write(&state, "0\n")?;
+            }
+            *until = None;
+            return Ok(());
         }
-    }
+        None => {
+            let raw = fs::read_to_string(&p).unwrap_or_else(|_| "0".into());
+            let ms: u64 = raw.trim().parse().unwrap_or(0);
+            if ms == 0 {
+                return Ok(());
+            }
+            now + Duration::from_millis(ms.min(60_000))
+        }
+    };
+    *until = Some(deadline);
     Ok(())
 }
 
 /// 6-Z271 host-backed variant: forward the vibration to the host app when
 /// a non-zero duration is detected (BEFORE the wait, so the phone buzzes
-/// immediately), then keep the ABI-true one-shot reset.
-fn drain_one_shot_host(dir: &Path, name: &str) -> io::Result<()> {
-    let p = dir.join(name);
-    let raw = fs::read_to_string(&p).unwrap_or_else(|_| "0".into());
-    let ms: u64 = raw.trim().parse().unwrap_or(0);
-    if ms > 0 {
-        // Cap at the hostbridge limit (60 s enforced on both sides).
-        crate::hostbridge::notify_vibrate(ms.min(60_000) as i32);
-        drain_one_shot(dir, name)?;
+/// immediately), then keep the ABI-true one-shot reset (deadline-tracked,
+/// non-blocking).
+fn drain_one_shot_host(
+    dir: &Path,
+    name: &str,
+    until: &mut Option<std::time::Instant>,
+) -> io::Result<()> {
+    if until.is_none() {
+        let p = dir.join(name);
+        let raw = fs::read_to_string(&p).unwrap_or_else(|_| "0".into());
+        let ms: u64 = raw.trim().parse().unwrap_or(0);
+        if ms > 0 {
+            // Cap at the hostbridge limit (60 s enforced on both sides).
+            crate::hostbridge::notify_vibrate(ms.min(60_000) as i32);
+        }
     }
-    Ok(())
+    drain_one_shot(dir, name, until)
 }
 
 // ============================================================================
@@ -322,9 +348,44 @@ mod tests {
         let root = tmpdir("drain");
         fs::create_dir_all(root.join("vib")).unwrap();
         fs::write(root.join("vib/enable"), "30\n").unwrap();
-        drain_one_shot(&root.join("vib"), "enable").unwrap();
+        let mut until = None;
+        // First tick: schedules the deadline, value NOT reset yet (a real
+        // timed_output reads back the programmed duration while active).
+        drain_one_shot(&root.join("vib"), "enable", &mut until).unwrap();
+        assert!(until.is_some(), "deadline scheduled");
+        assert_eq!(
+            fs::read_to_string(root.join("vib/enable")).unwrap(),
+            "30\n",
+            "value stays while the one-shot is active"
+        );
+        // Force the deadline into the past → next tick resets to idle.
+        until = Some(std::time::Instant::now() - Duration::from_millis(1));
+        drain_one_shot(&root.join("vib"), "enable", &mut until).unwrap();
+        assert!(until.is_none());
         let v = fs::read_to_string(root.join("vib/enable")).unwrap();
         assert_eq!(v, "0\n", "enable must reset after the duration");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drain_one_shot_does_not_retrigger_while_pending() {
+        // While a one-shot is pending the file is NOT re-parsed: a late
+        // guest write must not extend/restart the host vibration, and the
+        // loop never blocks (the torch edge detector shares the thread).
+        let root = tmpdir("pending");
+        fs::create_dir_all(root.join("vib")).unwrap();
+        fs::write(root.join("vib/enable"), "50\n").unwrap();
+        let mut until = None;
+        drain_one_shot(&root.join("vib"), "enable", &mut until).unwrap();
+        assert!(until.is_some());
+        // Guest rewrites while pending — ignored until the deadline fires.
+        fs::write(root.join("vib/enable"), "9999\n").unwrap();
+        drain_one_shot(&root.join("vib"), "enable", &mut until).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("vib/enable")).unwrap(),
+            "9999\n",
+            "pending one-shot does not zero a later write"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
