@@ -3657,6 +3657,19 @@ fn virtual_service_transaction(
         _ => {}
     }
 
+    // 6-Z271z: REAL AIDL request parcels open with the interface-token
+    // header `[i32 strict][i32 work][i32 tag][string16 descriptor]` —
+    // method args start AFTER it. Before 6-Z271x no client ever reached
+    // this dispatch (every getService reply parsed as null client-side),
+    // so the header was never consumed and e.g. IVibrator.on(ms) would
+    // have read the token's strict-mode word as the timeout (a real
+    // client writes strict=0/-1 there → EX_UNSUPPORTED_OPERATION → the
+    // vibration silently never fires). The empty legacy-v1 parcel (no
+    // blob) reads None here and leaves position 0 — harmless. HIDL-
+    // shaped parcels never reach virtual services (HIDL SM lookups miss
+    // — the services are registered under AIDL names only, §5 deferral).
+    let _ = reader.read_aidl_header();
+
     match kind {
         VirtualService::Vibrator => virtual_vibrator(code, &mut reader),
         VirtualService::KeyMint => virtual_keymint(code, &mut reader),
@@ -5896,5 +5909,66 @@ mod tests {
         drop(stream);
         drop(handle);
         let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    /// 6-Z271z: the virtual-service arg decode must consume the AIDL
+    /// interface-token header FIRST. A real android-13 client's
+    /// `IVibrator.on(5000)` request opens with
+    /// `[i32 strict][i32 work][i32 tag][string16 descriptor]` before the
+    /// `i32 timeoutMs` arg — before this fix the dispatch fed the raw
+    /// parcel to `virtual_vibrator`, which read the strict-mode word as
+    /// the timeout (real clients write 0/-1 → EX_UNSUPPORTED_OPERATION →
+    /// the host vibration silently never fired). Unreachable until
+    /// 6-Z271x (no client could parse our SM replies), so never observed
+    /// in CI. Observable via the reply: on(5000) → EX_NONE (+ host
+    /// forward), on(0) → EX_UNSUPPORTED_OPERATION.
+    #[test]
+    fn z271z_aidl_request_header_is_consumed_before_virtual_args() {
+        let build_on_request = |timeout_ms: i32| -> RequestBlob {
+            let mut req = ParcelWriter::new();
+            req.write_i32(0); // strict_mode_policy
+            req.write_i32(-1); // work_source_uid (kUnsetWorkSource)
+            req.write_u32(AIDL_HEADER_TAG_SYST);
+            req.write_string16("android.hardware.vibrator.IVibrator");
+            req.write_i32(timeout_ms); // on(in int timeoutMs)
+            let (data, offsets) = req.into_parts();
+            RequestBlob { data, offsets }
+        };
+        // on(5000) with the real client shape → forwarded to the host.
+        match virtual_service_transaction(
+            VirtualService::Vibrator,
+            3,
+            Some(&build_on_request(5000)),
+        ) {
+            TransactionResult::Reply { data, .. } => {
+                let status = i32::from_ne_bytes(data[0..4].try_into().unwrap());
+                assert_eq!(
+                    status, 0,
+                    "on(5000) with a real interface-token header must forward \
+                     the timeout (EX_NONE), not misread the header as args"
+                );
+            }
+            _ => panic!("on(5000) must reply"),
+        }
+        // Degenerate timeout still refuses honestly (arg decode intact).
+        match virtual_service_transaction(VirtualService::Vibrator, 3, Some(&build_on_request(0))) {
+            TransactionResult::Reply { data, .. } => {
+                let status = i32::from_ne_bytes(data[0..4].try_into().unwrap());
+                assert_eq!(
+                    status, EX_UNSUPPORTED_OPERATION,
+                    "on(0) → EX_UNSUPPORTED_OPERATION proves the arg decode \
+                     consumed the header (0 is no longer the header word)"
+                );
+            }
+            _ => panic!("on(0) must still reply"),
+        }
+        // Legacy v1 empty parcel (no blob): header read returns None,
+        // dispatch still answers getCapabilities (code 1, no args).
+        match virtual_service_transaction(VirtualService::Vibrator, 1, None) {
+            TransactionResult::Reply { data, .. } => {
+                assert_eq!(data.len(), 8, "getCapabilities reply = status + caps");
+            }
+            _ => panic!("getCapabilities must reply"),
+        }
     }
 }
