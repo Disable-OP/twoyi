@@ -23523,3 +23523,19 @@ Work Log:
 
 Stage Summary:
 - The 20-second-hole chain is now FULLY attributed: RECO tags (fixed) → registry (fixed) → manifest discovery (fixed) → placeholder-fd hwbinder FATAL (fixed) → **libutils Vector new_capacity overflow while processing our getService reply** (CURRENT — named, not yet fixed). Every wave is UI_READY with timeline parity and green TWRP guards; the quality gates (690/690, clippy -D warnings, fmt) held on every commit.
+
+---
+Task ID: 6-Z271v — THE ROOT CAUSE: kernel-true dense handles
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-09-01
+Task: fix the Vector-overflow wedge class; start the LineageOS 22.2 corpus image.
+
+Work Log:
+- THE ROOT CAUSE (the last piece of the 18 s hole, verified against AOSP android-13 ProcessState.cpp):
+  ProcessState::lookupHandleLocked does mHandleToObject.insertAt(e, N, handle+1-N) — a REAL libbinder client receiving handle 0xF0000004 (negative as int32 → ~4.29e9 as size_t) inserts ~4.29 BILLION entries into its android::Vector handle table → libutils capacity overflow → LOG_ALWAYS_FATAL("new_capacity overflow", tag "Vector") → abort() → §13 park → mutex wedge.
+  This single bug explains EVERY residual symptom: the ~18 s hole (keystore2's negotiation thread + the recovery's vibrator client both dying before their first transaction), 0 routed/virtual transactions across every run since the registry went live, the +52.5 s recovery vibrator-client abort, and likely the OrangeFox R12 touch latency (the input thread parks after its vibrator waitForService — §10).
+- FIX (91240a9): PROXY_HANDLE_BASE 0xF0000000 → 0 — handles are now kernel-true small dense integers from 1 (0 = context manager). The old base existed only to avoid aliasing host handles on the retired forward-to-host skeleton. All handle assertions in tests use the constant and pass unchanged.
+- CORPUS: lineage-22.2-sailfish (LineageOS 22.2 nightly, Android 15/SDK 35, A/B recovery-in-boot, sha256 be5fe3e3…) dispatched on the new head alongside R12 lavender + a whyred guard.
+
+Stage Summary:
+- Expectation for the verification runs: clients SURVIVE handle receipt for the first time since the registry went live → the getSharedSecret self-transaction + getHardwareInfo finally route ("routed transaction"/"virtual transaction" DIAG lines appear) → keystore2 registers IKeystoreSecurity → the +13.2→+31.2 s hole collapses → boot-to-UI well under 20 s. If a new failure class appears beyond that, it is a DIFFERENT bug, no longer this wedge.
