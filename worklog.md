@@ -23539,3 +23539,21 @@ Work Log:
 
 Stage Summary:
 - Expectation for the verification runs: clients SURVIVE handle receipt for the first time since the registry went live → the getSharedSecret self-transaction + getHardwareInfo finally route ("routed transaction"/"virtual transaction" DIAG lines appear) → keystore2 registers IKeystoreSecurity → the +13.2→+31.2 s hole collapses → boot-to-UI well under 20 s. If a new failure class appears beyond that, it is a DIFFERENT bug, no longer this wedge.
+
+---
+Task ID: 6-Z271w — SM reply bytes PROVEN correct; the failure is post-parse
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-09-01
+Task: byte-level verification of the SM getService reply as the guest client receives it.
+
+Work Log:
+- Shlib SM-REPLY dump (e98eeb7 first-per-process; 9ca8bca GET-shaped): the client receives EXACTLY
+  dlen=28 olen=8 data=00000000 852a6873 13010000 0200000000000000 0000000000000000 offsets=0400000000000000
+  = [i32 EX_NONE][flat: type=0x73682a85 (BINDER_TYPE_HANDLE incl. B_TYPE_LARGE), flags=0x113, union=handle 2 + pad 0, cookie 0][offsets=[4]] — byte-perfect kernel shape.
+- With 6-Z271v dense handles the behavior changed exactly as predicted: the Vector overflow abort is GONE; keystore2 now dies with an HONEST Rust error chain:
+  Failed to create service android.system.keystore2.IKeystoreService/default ← connect_keymint: Trying to connect to genuine KeyMint service ← Binder transaction error NAME_NOT_FOUND.
+- Timeline decode: keymint getService hits at +10.687 AND +10.790 (100 ms apart) = ServiceManagerShim::waitForService's re-check loop → the first checkService parse returned NULL → retries → ~5 s budget → NAME_NOT_FOUND → keystore2's panic → abort() → §13 park. (The negotiation thread's compat getSharedSecret self-tx also never issues — the same client-side NULL on its get_interface.)
+- STILL 0 routed/virtual transactions: the client never reaches the version query (code 0) on the handle — the NULL happens at/around proxy creation, not in the parcel bytes.
+
+Stage Summary:
+- Reply bytes exonerated. The failure is in the client-side post-parse step (getStrongProxyForHandle/BpBinder::create/AIBinder class association/interface-version machinery) OR the shlib's delivery of this specific reply to the client (tr fields beyond the patched pointers). Next diagnostic: dump the FULL binder_transaction_data (all 64 B) the client receives for the SM GET reply + the client's own errno path — or add a BpBinder-side capture via the tracer at the moment the handle enters lookupHandleLocked.
