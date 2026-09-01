@@ -23491,3 +23491,20 @@ Work Log:
 
 Stage Summary:
 - This round converted an invisible wedge into a precisely localized one with a diagnostic that will name the abort site. The binder bus itself is exonerated (0 failed paths, 0 timeouts, guards green across 4 runs). Boot timeline stable at ~+31.4 s splash through every wave — the keystore2 wedge is now the single remaining blocker between the current state and the projected ~15-20 s boot.
+
+---
+Task ID: 6-Z271p/q — the abort site + LOGFATAL message capture
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-09-01
+Task: name the keystore2 abort site and its fatal message; fix the first root cause.
+
+Work Log:
+- Fatal-marker gate iteration (417bb2f → 19e3be5 → f116a20): captured abort() with caller_pc — first the 19-byte marker only, then the kind/pc, then the maps window. PC attribution across runs: liblog.so +0x1318 = __android_log_assert = LOG_ALWAYS_FATAL.
+- THE ABORT TIMING (run 33498154781 + 33501057212): fires ~1 write after `getService(android.security.compat) hit → 0xf0000004` / `getService(keymint) hit` — the aborting thread is the one that just received a virtual-hal handle; a hwbinder ProcessState init (VERSION → 8, mmap → MAP_ANONYMOUS) interleaves right there.
+- 6-Z271p ROOT-CAUSE FIX (c14dd1b): libhwbinder ProcessState.cpp:421 LOG_ALWAYS_FATAL_IF(mDriverFD < 0, "Binder driver could not be opened. Terminating.") — the trigger: the tracer materializes placeholder FILES at translated socket paths (its own ENXIO fallback); a binder-device open racing behind that materialization returns a regular-file fd — unmarked, raw ioctls ENOTTY, driver closed, FATAL, abort → §13 park → mutex wedge. binder_open_fallback now verifies a successful binder-device open is a proxy fd; regular-file fds are closed and replaced by a proxy connection (real binderfs char devices kept for root mode). fstat-based, arch-safe.
+- 6-Z271q diagnostics (facedab → bfc8087 → 22d0a49/04391af): the LOG_ALWAYS_FATAL message rides a writev to /dev/socket/logdw — the 6-Z110 writev capture was gated on boot_recovery=true (this wave runs recovery_loader). New LOGFATAL gate: logd socket signature (iov0 = logger_entry header, buffer_id 1..5, hdr_size 24/28) + iov1[0] == ANDROID_LOG_FATAL(7) → capture the message. Iterations: single-iovec byte-7 missed; two-iovec decode was required (liblog writes header and payload as separate iovecs).
+- 6-Z271p result (run 33501057212): the abort STILL fires at the same spot (keystore2's +10.688 s abort; recovery's vibrator-path abort at +52.6 s — BOTH right after a getService hit — the common factor is OUR SM reply handling, not one code path). Splash parity +31.4 s, UI_READY throughout.
+- CI hygiene: 22d0a49 was committed with clippy unverified (2 errors) — fixed in 04391af immediately; lesson recorded: ALWAYS run clippy before git commit.
+
+Stage Summary:
+- The wedge class is now attributed to a LOG_ALWAYS_FATAL in the guest's C++ binder machinery right after receiving OUR getService reply; the 6-Z271p placeholder-fd fix removes one trigger; the LOGFATAL capture (two-iovec decode) will name the exact message on the next run. Both aborts (keystore2's discovery thread + the recovery's vibrator client at +52.6 s) share the same signature — the fix is likely ONE reply-shape detail in the SM path.
