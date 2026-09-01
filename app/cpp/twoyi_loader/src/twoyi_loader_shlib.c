@@ -502,6 +502,27 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
             memcpy(&olen, p + 4, 4);
             p += 8; rem -= 8;
             if (rem < (uint64_t)dlen + olen) return;
+            // 6-Z271w: first-REPLY-per-process blob dump — the client-side
+            // parse of our SM getService reply returned NULL (keystore2's
+            // NAME_NOT_FOUND panic chain) while the proxy-side parse was
+            // clean; this dumps the EXACT parcel bytes the guest client
+            // receives. Prefixed with the fb_hook fatal marker so the
+            // tracer's write-DIAG bypass captures it regardless of
+            // budget (g_fatal_entered-style: once per process).
+            static int reply_dump_done = 0;
+            if (!reply_dump_done && dlen > 0 && dlen <= 128) {
+                reply_dump_done = 1;
+                char dump[512];
+                int off = snprintf(dump, sizeof(dump),
+                    "[twoyi_loader] *** SM-REPLY dlen=%u olen=%u data=", dlen, olen);
+                for (uint32_t q = 0; q < dlen && off < (int)sizeof(dump) - 4; q++)
+                    off += snprintf(dump + off, sizeof(dump) - off, "%02x", p[q]);
+                off += snprintf(dump + off, sizeof(dump) - off, " offsets=");
+                for (uint32_t q = 0; q < olen && off < (int)sizeof(dump) - 4; q++)
+                    off += snprintf(dump + off, sizeof(dump) - off, "%02x", p[dlen + q]);
+                snprintf(dump + off, sizeof(dump) - off, "\n");
+                write_str(2, dump);
+            }
             // [data][offsets] in one allocation; offsets_ptr = base + dlen.
             uint8_t *back = (uint8_t *)malloc((size_t)(dlen + olen ? dlen + olen : 1));
             if (back) {
