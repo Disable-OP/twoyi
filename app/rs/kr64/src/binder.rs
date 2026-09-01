@@ -1404,6 +1404,19 @@ enum InboxItem {
     Death(u64),
 }
 
+/// A reply (or failure) that is waiting for the requester's NEXT
+/// `BINDER_WRITE_READ`. Kernel semantics: a sync `BC_TRANSACTION` returns
+/// `BR_TRANSACTION_COMPLETE` from the ioctl that carried it, and the
+/// `BR_REPLY` (or `BR_FAILED_REPLY` / `BR_DEAD_REPLY`) surfaces on a
+/// LATER read — possibly after the SAME thread serviced the transaction
+/// itself (self-transaction) or while it is mid-nested-call.
+enum DeferredReply {
+    /// `[BR_REPLY][binder_transaction_data]` + the blob trailer.
+    Reply { data: Vec<u8>, offsets: Vec<u8> },
+    /// `[BR_FAILED_REPLY]` (reply timeout / server died).
+    Failed,
+}
+
 /// An incoming transaction queued for delivery to a server connection.
 struct IncomingTx {
     requester: ConnId,
@@ -1425,21 +1438,6 @@ struct IncomingTx {
     cookie: u64,
 }
 
-/// The reply that resolves a pending sync transaction on the bus.
-enum BusReply {
-    Ok {
-        data: Vec<u8>,
-        offsets: Vec<u8>,
-    },
-    /// Target handle invalid / transaction could not be delivered.
-    /// (Currently resolved via timeout paths, but kept for callers that
-    /// want an immediate invalid-handle resolution.)
-    #[allow(dead_code)]
-    Failed,
-    /// Target connection died before replying.
-    Dead,
-}
-
 /// Per-connection mailbox state, held inside [`BusState`].
 #[derive(Default)]
 struct ConnBox {
@@ -1447,6 +1445,14 @@ struct ConnBox {
     /// Sync transactions queued in `inbox` but not yet delivered — used
     /// to resolve their waiters as `Dead` when the connection dies.
     pending_in: Vec<u64>,
+    /// Replies resolved by the bus but not yet consumed by this
+    /// connection's next read (kernel: the thread's reply lands on the
+    /// thread todo list — see [`DeferredReply`]).
+    reply_queue: std::collections::VecDeque<DeferredReply>,
+    /// Sync transactions this connection SENT and has not seen a reply
+    /// for: (txn id, queued-at). Used for the bounded reply timeout and
+    /// for waiter cleanup when the connection dies.
+    out_sync: std::collections::VecDeque<(u64, std::time::Instant)>,
     /// This connection currently holds a delivered transaction and owes
     /// its `BC_REPLY` (the requester's pending sync transaction id).
     inflight_txn: Option<u64>,
@@ -1479,8 +1485,10 @@ pub struct BusState {
     next_handle: u32,
     /// Active connection mailboxes.
     conns: HashMap<ConnId, ConnBox>,
-    /// Pending sync transactions: txn id → the requester's reply channel.
-    waiters: HashMap<u64, mpsc::Sender<BusReply>>,
+    /// Pending sync transactions: txn id → the requester connection. The
+    /// reply is pushed onto that connection's `reply_queue` (kernel
+    /// semantics — the requester picks it up on a later ioctl).
+    waiters: HashMap<u64, ConnId>,
     next_conn: u64,
     next_txn: u64,
 }
@@ -1584,21 +1592,30 @@ impl BusState {
         // transaction this conn had DELIVERED but not yet answered with
         // BC_REPLY (kernel semantics: the dying thread's transaction stack
         // dies, the requester gets BR_DEAD_REPLY instead of hanging out
-        // its full REPLY_TIMEOUT).
-        let dead_txns = match self.conns.remove(&conn) {
+        // its full REPLY_TIMEOUT). The resolution now lands on the
+        // REQUESTER's reply_queue — unless the requester IS the dying
+        // conn (its mailbox is gone; nobody to tell).
+        let (mut dead_txns, out_sync) = match self.conns.remove(&conn) {
             Some(bx) => {
                 let mut v = bx.pending_in;
                 if let Some(t) = bx.inflight_txn {
                     v.push(t);
                 }
-                v
+                (v, bx.out_sync)
             }
-            None => Vec::new(),
+            None => (Vec::new(), Default::default()),
         };
-        for txn_id in dead_txns {
-            if let Some(sender) = self.waiters.remove(&txn_id) {
-                let _ = sender.send(BusReply::Dead);
+        for txn_id in dead_txns.drain(..) {
+            if let Some(requester) = self.waiters.remove(&txn_id) {
+                if let Some(rb) = self.conns.get_mut(&requester) {
+                    rb.reply_queue.push_back(DeferredReply::Failed);
+                }
             }
+        }
+        // The dying conn's own outstanding sync calls: nobody is left to
+        // receive a resolution — just drop their waiters.
+        for (txn_id, _) in out_sync {
+            self.waiters.remove(&txn_id);
         }
         let dead: Vec<(String, u32)> = self
             .services
@@ -2429,12 +2446,18 @@ fn handle_version(vm_id: u32) -> Resp {
 ///
 /// 6-Z271 additions on top of the 6-Z114 shape:
 /// * `BC_TRANSACTION` to a registered (guest or virtual) handle is routed
-///   to the owning connection's mailbox and the requester blocks for the
-///   server's `BC_REPLY` (kernel semantics; one-way gets only
-///   `BR_TRANSACTION_COMPLETE`).
+///   to the owning connection's mailbox; the caller gets
+///   `BR_TRANSACTION_COMPLETE` from the same ioctl and the server's
+///   `BC_REPLY` surfaces on the requester's LATER read (kernel semantics
+///   — 6-Z271i; one-way likewise gets only `BR_TRANSACTION_COMPLETE`).
 /// * `BC_REPLY` from a server connection is correlated to the delivered
-///   transaction and routed back to the requester.
-/// * A read-only ioctl first drains the connection's mailbox (incoming
+///   transaction and pushed onto the requester's reply queue.
+/// * Self-transactions (a process transacting on its own service — the
+///   keystore2/km_compat chain) and nested transactions work: the same
+///   connection pops its own `BR_TRANSACTION`, services it, and its
+///   `BC_REPLY` resolves the original call.
+/// * A read-only ioctl first resolves timed-out sync calls and drained
+///   replies, then drains the connection's mailbox (incoming
 ///   transactions / death notifications) before falling back to the
 ///   250 ms `BR_NOOP` idle tick.
 /// * `BC_REQUEST_DEATH_NOTIFICATION` / `BC_CLEAR_DEATH_NOTIFICATION` are
@@ -2544,8 +2567,10 @@ fn handle_write_read(
                         push_br_failed_reply(&mut read_buf);
                     }
                     TransactionResult::CompleteOnly => {
-                        // One-way: the kernel returns only
-                        // BR_TRANSACTION_COMPLETE for the write half.
+                        // One-way, or a routed sync transaction (6-Z271i
+                        // deferred reply): the kernel returns only
+                        // BR_TRANSACTION_COMPLETE for the write half; the
+                        // reply/failure surfaces on a later read.
                         push_br_transaction_complete(&mut read_buf);
                     }
                     TransactionResult::Reply { data, offsets } => {
@@ -2581,19 +2606,44 @@ fn handle_write_read(
                             Some(rb) => (rb.data, rb.offsets),
                             None => (Vec::new(), Vec::new()),
                         };
-                        let waiter = {
+                        // 6-Z271i: kernel-true deferred resolution — the
+                        // requester is no longer blocked inside its ioctl;
+                        // the reply lands on ITS reply_queue and its next
+                        // BINDER_WRITE_READ returns [BR_REPLY].
+                        let requester = {
                             let mut b = bus.lock().expect("binder bus poisoned");
-                            b.waiters.remove(&txn_id)
+                            let requester = b.waiters.remove(&txn_id);
+                            if let Some(rc) = requester {
+                                if let Some(rbx) = b.conns.get_mut(&rc) {
+                                    rbx.out_sync.retain(|(t, _)| *t != txn_id);
+                                }
+                            }
+                            requester
                         };
-                        if let Some(sender) = waiter {
-                            let _ = sender.send(BusReply::Ok { data, offsets });
-                        } else {
-                            // Requester timed out and left. Drop the reply.
-                            warning!(
-                                "[KR64][binder][vm{}] BC_REPLY for txn {} — requester gone",
-                                vm_id,
-                                txn_id
-                            );
+                        match requester {
+                            Some(rc) => {
+                                let mut b = bus.lock().expect("binder bus poisoned");
+                                match b.conns.get_mut(&rc) {
+                                    Some(rbx) => {
+                                        rbx.reply_queue
+                                            .push_back(DeferredReply::Reply { data, offsets });
+                                    }
+                                    None => {
+                                        warning!(
+                                            "[KR64][binder][vm{}] BC_REPLY for txn {} — requester conn {} gone",
+                                            vm_id, txn_id, rc
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                // Requester timed out and left. Drop the reply.
+                                warning!(
+                                    "[KR64][binder][vm{}] BC_REPLY for txn {} — requester gone",
+                                    vm_id,
+                                    txn_id
+                                );
+                            }
                         }
                     }
                     None => {
@@ -2657,135 +2707,192 @@ fn handle_write_read(
     }
 
     // Read half. A guest that offered read capacity gets, in order of
-    // preference: a queued incoming transaction, a queued death
-    // notification, or (after the idle tick) BR_NOOP — mirroring the
-    // kernel's blocking `read_buffer`.
+    // preference: a resolved reply for one of its earlier sync calls, an
+    // incoming transaction, a queued death notification, or (after the
+    // idle tick) BR_NOOP — mirroring the kernel's blocking `read_buffer`.
     if read_buf.is_empty() && read_capacity > 0 {
-        enum Delivery {
-            None,
-            Tx(IncomingTx),
-            Death(u64),
-        }
-        let mut delivery = {
+        // 6-Z271i: resolve sync calls that exceeded the bounded reply
+        // budget — kernel has no timeout, but a hung server would
+        // otherwise wedge the requester forever (the budget this wave is
+        // eliminating). The failure is delivered as the requester's own
+        // [BR_FAILED_REPLY] on THIS ioctl; a late BC_REPLY finds no
+        // waiter and is dropped with a warning.
+        {
             let mut b = bus.lock().expect("binder bus poisoned");
-            match b.conns.get_mut(&conn_id) {
-                Some(bx) => match bx.inbox.pop_front() {
-                    Some(InboxItem::Tx(tx)) => {
-                        // Mark the delivered transaction as inflight so the
-                        // guest's BC_REPLY correlates (sync only — one-way
-                        // has txn_id 0 and expects no reply). Remove it
-                        // from pending_in: it's no longer "queued".
-                        if tx.txn_id != 0 {
-                            bx.inflight_txn = Some(tx.txn_id);
-                            bx.pending_in.retain(|id| *id != tx.txn_id);
+            let now = std::time::Instant::now();
+            let expired: Vec<u64> = match b.conns.get_mut(&conn_id) {
+                Some(bx) => {
+                    let mut v = Vec::new();
+                    while let Some((_t, at)) = bx.out_sync.front() {
+                        if now.duration_since(*at) < REPLY_TIMEOUT {
+                            break;
                         }
-                        Delivery::Tx(tx)
+                        let (t, _) = bx.out_sync.pop_front().expect("front checked");
+                        v.push(t);
                     }
-                    Some(InboxItem::Death(cookie)) => Delivery::Death(cookie),
-                    None => Delivery::None,
-                },
-                None => Delivery::None,
+                    v
+                }
+                None => Vec::new(),
+            };
+            for t in expired {
+                b.waiters.remove(&t);
+                if let Some(bx) = b.conns.get_mut(&conn_id) {
+                    bx.reply_queue.push_back(DeferredReply::Failed);
+                }
             }
-        };
-        // 6-Z271g: PROCESS-POOL WORK STEALING — real binder queues incoming
-        // transactions on the PROCESS's todo list and any ready pool
-        // thread pops the next item, not only the thread that registered
-        // the node. With per-thread proxy conns (the shlib now opens one
-        // conn per guest thread) the REGISTERING conn may be busy — mid
-        // outgoing call, its next WRITE_READ parked in the proxy's reply
-        // wait — while a sibling thread idles. A parked sibling conn of
-        // the same guest PROCESS (same real sender_pid, thanks to
-        // SO_PEERCRED/procfs IDENT) steals the queued node work here.
-        // Death notifications are NOT stealable: they belong to the conn
-        // that requested them (handle+cookie watcher pairs).
-        if matches!(delivery, Delivery::None) {
-            let stolen = {
+        }
+        // Deliver a resolved reply (BR_REPLY) if one is waiting. This is
+        // what completes a routed sync transaction: the reply was pushed
+        // here by the server's BC_REPLY — possibly by the SAME connection
+        // servicing its own request (self-transaction). When a reply was
+        // delivered the mailbox walk below is skipped: the guest's
+        // waitForResponse consumes ONE reply per ioctl (kernel order —
+        // thread todo before proc todo).
+        let mut reply_delivered = false;
+        if let Some(dr) = {
+            let mut b = bus.lock().expect("binder bus poisoned");
+            b.conns
+                .get_mut(&conn_id)
+                .and_then(|bx| bx.reply_queue.pop_front())
+        } {
+            match dr {
+                DeferredReply::Reply { data, offsets } => {
+                    push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
+                    resp_blobs.push((data, offsets));
+                }
+                DeferredReply::Failed => {
+                    push_br_failed_reply(&mut read_buf);
+                }
+            }
+            reply_delivered = true;
+        }
+        if !reply_delivered {
+            enum Delivery {
+                None,
+                Tx(IncomingTx),
+                Death(u64),
+            }
+            let mut delivery = {
                 let mut b = bus.lock().expect("binder bus poisoned");
-                let my_pid = b.conns.get(&conn_id).map(|bx| bx.sender_pid).unwrap_or(0);
-                if my_pid == 0 {
-                    None
-                } else {
-                    let mut sibs: Vec<ConnId> = b
-                        .conns
-                        .iter()
-                        .filter(|(cid, bx)| **cid != conn_id && bx.sender_pid == my_pid)
-                        .map(|(cid, _)| *cid)
-                        .collect();
-                    sibs.sort();
-                    let mut item: Option<IncomingTx> = None;
-                    for sib in sibs {
-                        let has_tx = matches!(
-                            b.conns.get(&sib).and_then(|sbx| sbx.inbox.front()),
-                            Some(InboxItem::Tx(_))
-                        );
-                        if !has_tx {
-                            continue;
-                        }
-                        let sbx = b.conns.get_mut(&sib).expect("sibling vanished");
-                        match sbx.inbox.pop_front() {
-                            Some(InboxItem::Tx(tx)) => {
-                                if tx.txn_id != 0 {
-                                    sbx.pending_in.retain(|id| *id != tx.txn_id);
-                                }
-                                item = Some(tx);
-                                break;
-                            }
-                            _ => continue,
-                        }
-                    }
-                    if let Some(tx) = &item {
-                        if tx.txn_id != 0 {
-                            if let Some(bx) = b.conns.get_mut(&conn_id) {
+                match b.conns.get_mut(&conn_id) {
+                    Some(bx) => match bx.inbox.pop_front() {
+                        Some(InboxItem::Tx(tx)) => {
+                            // Mark the delivered transaction as inflight so the
+                            // guest's BC_REPLY correlates (sync only — one-way
+                            // has txn_id 0 and expects no reply). Remove it
+                            // from pending_in: it's no longer "queued".
+                            if tx.txn_id != 0 {
                                 bx.inflight_txn = Some(tx.txn_id);
-                                bx.pending_in.push(tx.txn_id);
+                                bx.pending_in.retain(|id| *id != tx.txn_id);
                             }
+                            Delivery::Tx(tx)
                         }
-                    }
-                    item
+                        Some(InboxItem::Death(cookie)) => Delivery::Death(cookie),
+                        None => Delivery::None,
+                    },
+                    None => Delivery::None,
                 }
             };
-            if let Some(tx) = stolen {
-                info!(
+            // 6-Z271g: PROCESS-POOL WORK STEALING — real binder queues incoming
+            // transactions on the PROCESS's todo list and any ready pool
+            // thread pops the next item, not only the thread that registered
+            // the node. With per-thread proxy conns (the shlib now opens one
+            // conn per guest thread) the REGISTERING conn may be busy — mid
+            // outgoing call, its next WRITE_READ parked in the proxy's reply
+            // wait — while a sibling thread idles. A parked sibling conn of
+            // the same guest PROCESS (same real sender_pid, thanks to
+            // SO_PEERCRED/procfs IDENT) steals the queued node work here.
+            // Death notifications are NOT stealable: they belong to the conn
+            // that requested them (handle+cookie watcher pairs).
+            if matches!(delivery, Delivery::None) {
+                let stolen = {
+                    let mut b = bus.lock().expect("binder bus poisoned");
+                    let my_pid = b.conns.get(&conn_id).map(|bx| bx.sender_pid).unwrap_or(0);
+                    if my_pid == 0 {
+                        None
+                    } else {
+                        let mut sibs: Vec<ConnId> = b
+                            .conns
+                            .iter()
+                            .filter(|(cid, bx)| **cid != conn_id && bx.sender_pid == my_pid)
+                            .map(|(cid, _)| *cid)
+                            .collect();
+                        sibs.sort();
+                        let mut item: Option<IncomingTx> = None;
+                        for sib in sibs {
+                            let has_tx = matches!(
+                                b.conns.get(&sib).and_then(|sbx| sbx.inbox.front()),
+                                Some(InboxItem::Tx(_))
+                            );
+                            if !has_tx {
+                                continue;
+                            }
+                            let sbx = b.conns.get_mut(&sib).expect("sibling vanished");
+                            match sbx.inbox.pop_front() {
+                                Some(InboxItem::Tx(tx)) => {
+                                    if tx.txn_id != 0 {
+                                        sbx.pending_in.retain(|id| *id != tx.txn_id);
+                                    }
+                                    item = Some(tx);
+                                    break;
+                                }
+                                _ => continue,
+                            }
+                        }
+                        if let Some(tx) = &item {
+                            if tx.txn_id != 0 {
+                                if let Some(bx) = b.conns.get_mut(&conn_id) {
+                                    bx.inflight_txn = Some(tx.txn_id);
+                                    bx.pending_in.push(tx.txn_id);
+                                }
+                            }
+                        }
+                        item
+                    }
+                };
+                if let Some(tx) = stolen {
+                    info!(
                     "[KR64][binder][vm{}] process-pool steal: conn={} takes tx #{} queued for a sibling (code={})",
                     vm_id, conn_id, tx.txn_id, tx.code
                 );
-                delivery = Delivery::Tx(tx);
-            }
-        }
-        match delivery {
-            Delivery::Tx(tx) => {
-                let (ds, os) = match &tx.blob {
-                    Some(b) => (b.data.len() as u64, b.offsets.len() as u64),
-                    None => (0, 0),
-                };
-                push_br_transaction(
-                    &mut read_buf,
-                    tx.code,
-                    tx.flags,
-                    tx.sender_pid,
-                    tx.sender_euid,
-                    tx.ptr,
-                    tx.cookie,
-                    ds,
-                    os,
-                );
-                if let Some(blob) = tx.blob {
-                    resp_blobs.push((blob.data, blob.offsets));
+                    delivery = Delivery::Tx(tx);
                 }
-                info!(
+            }
+            match delivery {
+                Delivery::Tx(tx) => {
+                    let (ds, os) = match &tx.blob {
+                        Some(b) => (b.data.len() as u64, b.offsets.len() as u64),
+                        None => (0, 0),
+                    };
+                    push_br_transaction(
+                        &mut read_buf,
+                        tx.code,
+                        tx.flags,
+                        tx.sender_pid,
+                        tx.sender_euid,
+                        tx.ptr,
+                        tx.cookie,
+                        ds,
+                        os,
+                    );
+                    if let Some(blob) = tx.blob {
+                        resp_blobs.push((blob.data, blob.offsets));
+                    }
+                    info!(
                     "[KR64][binder][vm{}] delivered transaction conn={} <- conn={} code={} oneway={} (tx #{})",
                     vm_id, conn_id, tx.requester, tx.code, tx.one_way, tx.txn_id
                 );
-            }
-            Delivery::Death(cookie) => {
-                push_br_dead_binder(&mut read_buf, cookie);
-            }
-            Delivery::None => {
-                // 6-Z152: BLOCKING idle — sleep before BR_NOOP so a
-                // guest poll loop can't pin the tracer (see the 6-Z268
-                // analysis in the original comment history).
-                std::thread::sleep(IDLE_POLL_TICK);
-                push_br_noop(&mut read_buf);
+                }
+                Delivery::Death(cookie) => {
+                    push_br_dead_binder(&mut read_buf, cookie);
+                }
+                Delivery::None => {
+                    // 6-Z152: BLOCKING idle — sleep before BR_NOOP so a
+                    // guest poll loop can't pin the tracer (see the 6-Z268
+                    // analysis in the original comment history).
+                    std::thread::sleep(IDLE_POLL_TICK);
+                    push_br_noop(&mut read_buf);
+                }
             }
         }
     }
@@ -2830,9 +2937,12 @@ enum TransactionResult {
     /// with `tr.data_size = data.len()` / `tr.offsets_size = offsets.len()`.
     /// The `data`/`offsets` bytes ride the response trailer (both v2 and
     /// v1 real-libbinder requests — the hook backs tr.data_ptr with them).
+    /// Used only by the IN-IOCTL handlers (servicemanager, virtual
+    /// services, PING) — routed guest-owned transactions are deferred.
     Reply { data: Vec<u8>, offsets: Vec<u8> },
-    /// One-way transaction accepted: push only
-    /// `[BR_TRANSACTION_COMPLETE]` (kernel semantics — no reply).
+    /// Transaction accepted with no in-ioctl reply: one-way, or a routed
+    /// sync call whose `BC_REPLY` resolves on the requester's LATER read
+    /// (kernel semantics — 6-Z271i deferred resolution).
     CompleteOnly,
 }
 
@@ -2943,17 +3053,19 @@ fn handle_transaction(
         );
         return TransactionResult::Failed;
     };
-    if owner == conn_id {
-        // Self-transaction would deadlock: the server pops its inbox on
-        // its NEXT ioctl, which cannot happen until this one completes.
-        warning!(
-            "[KR64][binder][vm{}] self-transaction to handle 0x{:08x} — failing",
-            vm_id,
-            target_handle
-        );
-        return TransactionResult::Failed;
-    }
 
+    // 6-Z271i: SELF-TRANSACTIONS ARE LEGAL (kernel semantics). Real binder
+    // queues the request on the target node's process todo list even when
+    // that process is the caller's own: the requesting ioctl completes
+    // with BR_TRANSACTION_COMPLETE, the same thread (or a pool sibling —
+    // 6-Z271g work stealing) pops the BR_TRANSACTION on its NEXT ioctl,
+    // services it, and its BC_REPLY resolves the original call. This is
+    // exactly what keystore2's in-process keymaster-compat chain does
+    // (km_compat registers android.security.compat inside keystore2 and
+    // the negotiation thread then transacts on it — run 33428365193).
+    // The old hard-FAIL here deadlocked that class until the 8 s budget
+    // burned.
+    //
     // Stamp the sender identity (announced via WIRE_CMD_IDENT — kernel
     // would do this from the socket credentials).
     let (sender_pid, sender_euid) = {
@@ -2964,14 +3076,13 @@ fn handle_transaction(
             .unwrap_or((0, 0))
     };
 
-    let (tx, rx) = mpsc::channel();
     let txn_id;
     {
         let mut b = bus.lock().expect("binder bus poisoned");
         txn_id = b.next_txn;
         b.next_txn += 1;
         if !one_way {
-            b.waiters.insert(txn_id, tx);
+            b.waiters.insert(txn_id, conn_id);
         }
         let queued = b.queue_transaction(
             IncomingTx {
@@ -3000,30 +3111,19 @@ fn handle_transaction(
             );
             return TransactionResult::Failed;
         }
-    }
-
-    if one_way {
-        return TransactionResult::CompleteOnly;
-    }
-
-    match rx.recv_timeout(REPLY_TIMEOUT) {
-        Ok(BusReply::Ok { data, offsets }) => TransactionResult::Reply { data, offsets },
-        Ok(_) => TransactionResult::Failed,
-        Err(_) => {
-            // Timeout: deregister so a late BC_REPLY resolves nothing.
-            if let Ok(mut b) = bus.lock() {
-                b.waiters.remove(&txn_id);
+        if !one_way {
+            // Track the outstanding sync call on the requester's conn for
+            // the bounded reply timeout + teardown cleanup.
+            if let Some(rbx) = b.conns.get_mut(&conn_id) {
+                rbx.out_sync.push_back((txn_id, std::time::Instant::now()));
             }
-            warning!(
-                "[KR64][binder][vm{}] transaction to handle 0x{:08x} code={} timed out after {:?}",
-                vm_id,
-                target_handle,
-                code,
-                REPLY_TIMEOUT
-            );
-            TransactionResult::Failed
         }
     }
+
+    // Both one-way and (now) sync transactions return
+    // BR_TRANSACTION_COMPLETE from THIS ioctl; the sync reply surfaces on
+    // a later read (kernel semantics — no blocking inside the proxy).
+    TransactionResult::CompleteOnly
 }
 
 /// Intercept servicemanager transactions (target handle 0).
@@ -4778,7 +4878,9 @@ mod tests {
         );
 
         // ---- Connection B: transact(code=42) to the routed handle ----
-        // The requester blocks until A's reply (or the timeout).
+        // 6-Z271i: the transaction ioctl completes with ONLY
+        // BR_TRANSACTION_COMPLETE (kernel semantics — no blocking inside
+        // the proxy); B's reply arrives on its next read.
         let mut tx_b = [0u8; 64];
         tx_b[0..4].copy_from_slice(&routed_handle.to_ne_bytes());
         tx_b[16..20].copy_from_slice(&42u32.to_ne_bytes());
@@ -4788,13 +4890,18 @@ mod tests {
         bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
         bc3.extend_from_slice(&tx_b);
         let payload3 = make_v2_write_read_multi_payload(&bc3, &[(tx_data, &tx_off)], 4096);
-
-        // Run B's transaction on a thread (exchange blocks until the
-        // routed reply arrives).
-        let b_writer =
-            std::thread::spawn(move || exchange(&mut stream_b, BINDER_WRITE_READ, &payload3));
-        // Give B a moment to queue its transaction on A's mailbox.
-        std::thread::sleep(Duration::from_millis(150));
+        let (ret_t, resp_t) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload3);
+        assert_eq!(ret_t, 0, "B's transaction WRITE_READ ok");
+        assert_eq!(
+            u32::from_ne_bytes(resp_t[0..4].try_into().unwrap()) as usize,
+            4,
+            "B's sync transaction returns an empty-but-COMPLETE read buffer"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(resp_t[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE,
+            "6-Z271i: COMPLETE only in the transaction ioctl"
+        );
 
         // ---- Connection A: read-only ioctl → receives BR_TRANSACTION ----
         // write_size = 0, read_capacity = 4096.
@@ -4844,23 +4951,27 @@ mod tests {
             "BC_REPLY ioctl returns an empty read buffer"
         );
 
-        // ---- Connection B's blocked exchange resolves with the reply ----
-        let (ret_b, resp_b) = b_writer.join().expect("B thread");
+        // ---- Connection B: read-only ioctl → the deferred BR_REPLY ----
+        let mut wr_b = Vec::new();
+        wr_b.extend_from_slice(&0u32.to_ne_bytes());
+        wr_b.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_b, resp_b) = exchange(&mut stream_b, BINDER_WRITE_READ, &wr_b);
         assert_eq!(ret_b, 0);
         let read_b = u32::from_ne_bytes(resp_b[0..4].try_into().unwrap()) as usize;
-        let br1 = u32::from_ne_bytes(resp_b[4..8].try_into().unwrap());
-        assert_eq!(br1, BR_TRANSACTION_COMPLETE, "B sees COMPLETE first");
-        let br2 = u32::from_ne_bytes(resp_b[8..12].try_into().unwrap());
-        assert_eq!(br2, BR_REPLY, "then BR_REPLY");
-        assert_eq!(read_b, 4 + 4 + 64, "COMPLETE + REPLY + tr");
+        let br2 = u32::from_ne_bytes(resp_b[4..8].try_into().unwrap());
+        assert_eq!(
+            br2, BR_REPLY,
+            "B's deferred BR_REPLY lands on its next read"
+        );
+        assert_eq!(read_b, 4 + 64, "REPLY + tr");
         let off_b = 4 + read_b + 8;
         let dl_b = u32::from_ne_bytes(resp_b[off_b..off_b + 4].try_into().unwrap()) as usize;
         assert_eq!(dl_b, reply_data.len(), "reply blob = A's parcel bytes");
         let got = &resp_b[off_b + 8..off_b + 8 + dl_b];
         assert_eq!(got, reply_data, "B receives A's exact reply payload");
 
-        // stream_b was moved into the B thread; dropping it there is fine.
         drop(stream_a);
+        drop(stream_b);
         drop(handle);
         let _ = fs::remove_dir_all(&rootfs);
     }
@@ -4935,7 +5046,7 @@ mod tests {
         let blob2 = &resp2[off2 + 8..off2 + 8 + dl2];
         let routed_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
 
-        // ---- Conn B: transact(code=42) on a thread (blocks) ----
+        // ---- Conn B: transact(code=42) — completes in-ioctl, parks ----
         let mut tx_b = [0u8; 64];
         tx_b[0..4].copy_from_slice(&routed_handle.to_ne_bytes());
         tx_b[16..20].copy_from_slice(&42u32.to_ne_bytes());
@@ -4945,9 +5056,14 @@ mod tests {
         bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
         bc3.extend_from_slice(&tx_b);
         let payload3 = make_v2_write_read_multi_payload(&bc3, &[(tx_data, &tx_off)], 4096);
-        let b_writer =
-            std::thread::spawn(move || exchange(&mut stream_b, BINDER_WRITE_READ, &payload3));
-        std::thread::sleep(Duration::from_millis(150));
+        let (ret3, resp3) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload3);
+        assert_eq!(ret3, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp3[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE,
+            "6-Z271i: B's transaction ioctl completes with COMPLETE only"
+        );
+        // B now parks WITHOUT reading (its reply is pending).
 
         // ---- Conn A2 (pid 7777, SIBLING): read-only ioctl STEALS ----
         let mut stream_a2 = UnixStream::connect(&path).expect("connect A2");
@@ -4980,17 +5096,386 @@ mod tests {
         let (ret_r, _resp_r) = exchange(&mut stream_a2, BINDER_WRITE_READ, &payload4);
         assert_eq!(ret_r, 0);
 
-        let (ret_b, resp_b) = b_writer.join().expect("B thread");
+        // ---- Conn B: read-only ioctl → the deferred BR_REPLY ----
+        let mut wr_b = Vec::new();
+        wr_b.extend_from_slice(&0u32.to_ne_bytes());
+        wr_b.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_b, resp_b) = exchange(&mut stream_b, BINDER_WRITE_READ, &wr_b);
         assert_eq!(ret_b, 0);
         let read_b = u32::from_ne_bytes(resp_b[0..4].try_into().unwrap()) as usize;
-        let br2 = u32::from_ne_bytes(resp_b[8..12].try_into().unwrap());
-        assert_eq!(br2, BR_REPLY, "B gets the stolen conn's reply");
+        let br2 = u32::from_ne_bytes(resp_b[4..8].try_into().unwrap());
+        assert_eq!(
+            br2, BR_REPLY,
+            "B gets the stolen conn's reply on its own read"
+        );
         let off_b = 4 + read_b + 8;
         let dl_b = u32::from_ne_bytes(resp_b[off_b..off_b + 4].try_into().unwrap()) as usize;
         assert_eq!(dl_b, reply_data.len());
         let got = &resp_b[off_b + 8..off_b + 8 + dl_b];
         assert_eq!(got, reply_data, "reply bytes exact");
 
+        drop(stream_a);
+        drop(stream_b);
+        drop(stream_a2);
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z271i_self_transaction_same_conn_services_own_request() {
+        // keystore2's km_compat chain (run 33428365193 decode): a process
+        // registers android.security.compat and then transacts on it from
+        // ITS OWN process. Kernel semantics: the transaction ioctl
+        // returns BR_TRANSACTION_COMPLETE; the SAME connection pops the
+        // BR_TRANSACTION on its next ioctl, services it, and its
+        // BC_REPLY resolves the original call INTO ITS OWN reply queue.
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        // ---- addService("self_svc") + getService → own handle ----
+        let mut args = ParcelWriter::new();
+        args.write_string16("self_svc");
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0xaaaa,
+            cookie: 0xbeef,
+        });
+        args.write_i32(0);
+        args.write_i32(0);
+        let (ad, ao) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &ad, &ao, 4096);
+        let (ret, _resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0, "ADD_SERVICE ok");
+
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("self_svc");
+        let (gd, go) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload2 = make_v2_write_read_payload(&bc2, &gd, &go, 4096);
+        let (ret2, resp2) = exchange(&mut stream, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0);
+        let rs2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
+        let o2 = 4 + rs2 + 8;
+        let dl2 = u32::from_ne_bytes(resp2[o2..o2 + 4].try_into().unwrap()) as usize;
+        let blob2 = &resp2[o2 + 8..o2 + 8 + dl2];
+        let self_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+        assert_eq!(
+            self_handle,
+            PROXY_HANDLE_BASE + 4,
+            "own service handle (after virtual services)"
+        );
+
+        // ---- transact(code=7) on the OWN handle ----
+        let mut tx = [0u8; 64];
+        tx[0..4].copy_from_slice(&self_handle.to_ne_bytes());
+        tx[16..20].copy_from_slice(&7u32.to_ne_bytes());
+        let req: &[u8] = b"self-req";
+        let no_off: Vec<u8> = Vec::new();
+        let mut bc3 = Vec::with_capacity(4 + 64);
+        bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc3.extend_from_slice(&tx);
+        let payload3 = make_v2_write_read_multi_payload(&bc3, &[(req, &no_off)], 4096);
+        let (ret3, resp3) = exchange(&mut stream, BINDER_WRITE_READ, &payload3);
+        assert_eq!(ret3, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp3[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE,
+            "self-transaction is ACCEPTED (was a hard FAIL pre-6-Z271i)"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(resp3[0..4].try_into().unwrap()) as usize,
+            4
+        );
+
+        // ---- same conn: read-only ioctl → its OWN BR_TRANSACTION ----
+        let mut wr = Vec::new();
+        wr.extend_from_slice(&0u32.to_ne_bytes());
+        wr.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret4, resp4) = exchange(&mut stream, BINDER_WRITE_READ, &wr);
+        assert_eq!(ret4, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp4[4..8].try_into().unwrap()),
+            BR_TRANSACTION,
+            "the same connection receives its own request"
+        );
+        let tr = &resp4[8..8 + 64];
+        assert_eq!(
+            u32::from_ne_bytes(tr[16..20].try_into().unwrap()),
+            7,
+            "own code delivered"
+        );
+        assert_eq!(
+            u64::from_ne_bytes(tr[8..16].try_into().unwrap()),
+            0xbeef,
+            "own cookie delivered"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(tr[0..4].try_into().unwrap()),
+            0xaaaa,
+            "own ptr delivered"
+        );
+
+        // ---- same conn: BC_REPLY → resolved by the SAME ioctl ----
+        let rep: &[u8] = b"self-rep";
+        let reply = [0u8; 64];
+        let mut bc5 = Vec::with_capacity(4 + 64);
+        bc5.extend_from_slice(&BC_REPLY.to_ne_bytes());
+        bc5.extend_from_slice(&reply);
+        let payload5 = make_v2_write_read_multi_payload(&bc5, &[(rep, &no_off)], 4096);
+        let (ret5, resp5) = exchange(&mut stream, BINDER_WRITE_READ, &payload5);
+        assert_eq!(ret5, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp5[4..8].try_into().unwrap()),
+            BR_REPLY,
+            "self BC_REPLY answered in the same ioctl (reply queue drained)"
+        );
+        let rs5 = u32::from_ne_bytes(resp5[0..4].try_into().unwrap()) as usize;
+        let o5 = 4 + rs5 + 8;
+        let dl5 = u32::from_ne_bytes(resp5[o5..o5 + 4].try_into().unwrap()) as usize;
+        assert_eq!(dl5, rep.len());
+        assert_eq!(&resp5[o5 + 8..o5 + 8 + dl5], rep, "own reply bytes exact");
+
+        drop(stream);
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z271i_nested_transaction_does_not_clobber_outer_reply() {
+        // A services B's call; WHILE still owing B its BC_REPLY, A makes
+        // a nested sync call to C's service. The nested reply must not
+        // swallow A's outstanding outer transaction (its inflight_txn),
+        // and A's later BC_REPLY still resolves B's original call.
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Helper: register a service on its own connection.
+        let add_service = |name: &str, cookie: u64| -> UnixStream {
+            let mut s = UnixStream::connect(&path).expect("connect");
+            let mut w = ParcelWriter::new();
+            w.write_string16(name);
+            w.write_flat_binder(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0x1111,
+                cookie,
+            });
+            w.write_i32(0);
+            w.write_i32(0);
+            let (d, o) = make_servicemanager_request_parcel(&mut w);
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+            let p = make_v2_write_read_payload(&bc, &d, &o, 4096);
+            let (r, _) = exchange(&mut s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0, "addService({name})");
+            s
+        };
+        // Helper: getService from a connection, return the handle.
+        let get_service = |s: &mut UnixStream, name: &str| -> u32 {
+            let mut w = ParcelWriter::new();
+            w.write_string16(name);
+            let (d, o) = make_servicemanager_request_parcel(&mut w);
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+            let p = make_v2_write_read_payload(&bc, &d, &o, 4096);
+            let (r, resp) = exchange(s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0);
+            let rs = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+            let off = 4 + rs + 8;
+            let dl = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+            let blob = &resp[off + 8..off + 8 + dl];
+            u64::from_ne_bytes(blob[12..20].try_into().unwrap()) as u32
+        };
+        let read_only = |s: &mut UnixStream| -> Vec<u8> {
+            let mut wr = Vec::new();
+            wr.extend_from_slice(&0u32.to_ne_bytes());
+            wr.extend_from_slice(&4096u32.to_ne_bytes());
+            let (r, resp) = exchange(s, BINDER_WRITE_READ, &wr);
+            assert_eq!(r, 0);
+            resp
+        };
+        let transact = |s: &mut UnixStream, handle: u32, code: u32| -> Vec<u8> {
+            let mut tx = [0u8; 64];
+            tx[0..4].copy_from_slice(&handle.to_ne_bytes());
+            tx[16..20].copy_from_slice(&code.to_ne_bytes());
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&tx);
+            let p = make_v2_write_read_multi_payload(&bc, &[(&[], &[])], 4096);
+            let (r, resp) = exchange(s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0);
+            resp
+        };
+        let send_reply = |s: &mut UnixStream, payload: &[u8]| {
+            let reply = [0u8; 64];
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_REPLY.to_ne_bytes());
+            bc.extend_from_slice(&reply);
+            let p = make_v2_write_read_multi_payload(&bc, &[(payload, &[])], 0);
+            let (r, _) = exchange(s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0);
+        };
+
+        let mut conn_a = add_service("svc_a", 0xaaaa);
+        let mut conn_b = UnixStream::connect(&path).expect("connect B");
+        let mut conn_c = add_service("svc_c", 0xcccc);
+
+        // ---- B calls svc_a (code 9) — parks with COMPLETE ----
+        let h_a = get_service(&mut conn_b, "svc_a");
+        let resp_b1 = transact(&mut conn_b, h_a, 9);
+        assert_eq!(
+            u32::from_ne_bytes(resp_b1[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE
+        );
+
+        // ---- A pops the outer request (inflight = outer txn) ----
+        let resp_a1 = read_only(&mut conn_a);
+        assert_eq!(
+            u32::from_ne_bytes(resp_a1[4..8].try_into().unwrap()),
+            BR_TRANSACTION,
+            "A receives B's outer request"
+        );
+
+        // ---- A makes a NESTED call to svc_c (code 11) ----
+        let h_c = get_service(&mut conn_a, "svc_c");
+        let resp_a2 = transact(&mut conn_a, h_c, 11);
+        assert_eq!(
+            u32::from_ne_bytes(resp_a2[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE,
+            "nested call accepted while A still owes the outer reply"
+        );
+
+        // ---- C pops the nested request and replies ----
+        let resp_c1 = read_only(&mut conn_c);
+        assert_eq!(
+            u32::from_ne_bytes(resp_c1[4..8].try_into().unwrap()),
+            BR_TRANSACTION,
+            "C receives A's nested request"
+        );
+        let tr_c = &resp_c1[8..8 + 64];
+        assert_eq!(u32::from_ne_bytes(tr_c[16..20].try_into().unwrap()), 11);
+        send_reply(&mut conn_c, b"nested-rep");
+
+        // ---- A's next read: the NESTED reply, outer txn intact ----
+        let resp_a3 = read_only(&mut conn_a);
+        assert_eq!(
+            u32::from_ne_bytes(resp_a3[4..8].try_into().unwrap()),
+            BR_REPLY,
+            "A gets the nested reply"
+        );
+
+        // ---- A now answers the OUTER call — B resolves ----
+        send_reply(&mut conn_a, b"outer-rep");
+        let resp_b2 = read_only(&mut conn_b);
+        assert_eq!(
+            u32::from_ne_bytes(resp_b2[4..8].try_into().unwrap()),
+            BR_REPLY,
+            "B gets the outer reply after A's nested call round-trip"
+        );
+        let rs_b = u32::from_ne_bytes(resp_b2[0..4].try_into().unwrap()) as usize;
+        let o_b = 4 + rs_b + 8;
+        let dl_b = u32::from_ne_bytes(resp_b2[o_b..o_b + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            &resp_b2[o_b + 8..o_b + 8 + dl_b],
+            b"outer-rep",
+            "outer bytes exact"
+        );
+
+        drop(conn_a);
+        drop(conn_b);
+        drop(conn_c);
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z271i_reply_timeout_resolves_as_br_failed_reply() {
+        // A routed sync transaction whose owner never reads must resolve
+        // on the requester's read after the bounded REPLY_TIMEOUT — the
+        // requester is never wedged forever.
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Owner parks forever (never reads).
+        let mut stream_a = UnixStream::connect(&path).expect("connect A");
+        let mut w = ParcelWriter::new();
+        w.write_string16("dead_svc");
+        w.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0x2222,
+            cookie: 0x3333,
+        });
+        w.write_i32(0);
+        w.write_i32(0);
+        let (d, o) = make_servicemanager_request_parcel(&mut w);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let p = make_v2_write_read_payload(&bc, &d, &o, 4096);
+        let (r, _) = exchange(&mut stream_a, BINDER_WRITE_READ, &p);
+        assert_eq!(r, 0);
+
+        // Requester: getService + transact, then wait past the budget.
+        let mut stream_b = UnixStream::connect(&path).expect("connect B");
+        let mut w2 = ParcelWriter::new();
+        w2.write_string16("dead_svc");
+        let (d2, o2) = make_servicemanager_request_parcel(&mut w2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let p2 = make_v2_write_read_payload(&bc2, &d2, &o2, 4096);
+        let (r2, resp2) = exchange(&mut stream_b, BINDER_WRITE_READ, &p2);
+        assert_eq!(r2, 0);
+        let rs2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
+        let o3 = 4 + rs2 + 8;
+        let dl2 = u32::from_ne_bytes(resp2[o3..o3 + 4].try_into().unwrap()) as usize;
+        let blob2 = &resp2[o3 + 8..o3 + 8 + dl2];
+        let h = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+
+        let mut tx = [0u8; 64];
+        tx[0..4].copy_from_slice(&h.to_ne_bytes());
+        tx[16..20].copy_from_slice(&5u32.to_ne_bytes());
+        let mut bc3 = Vec::with_capacity(4 + 64);
+        bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc3.extend_from_slice(&tx);
+        let p3 = make_v2_write_read_multi_payload(&bc3, &[(&[], &[])], 4096);
+        let (r3, _resp3) = exchange(&mut stream_b, BINDER_WRITE_READ, &p3);
+        assert_eq!(r3, 0);
+
+        // Sleep past REPLY_TIMEOUT (with slack), then read.
+        std::thread::sleep(REPLY_TIMEOUT + Duration::from_millis(300));
+        let mut wr = Vec::new();
+        wr.extend_from_slice(&0u32.to_ne_bytes());
+        wr.extend_from_slice(&4096u32.to_ne_bytes());
+        let (r4, resp4) = exchange(&mut stream_b, BINDER_WRITE_READ, &wr);
+        assert_eq!(r4, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp4[4..8].try_into().unwrap()),
+            BR_FAILED_REPLY,
+            "the expired sync call resolves as BR_FAILED_REPLY"
+        );
+
+        drop(stream_a);
+        drop(stream_b);
         drop(_handle);
         let _ = fs::remove_dir_all(&rootfs);
     }
