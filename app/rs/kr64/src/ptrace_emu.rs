@@ -20583,6 +20583,55 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // 6-Z271r: WRITEV SAMPLE — the 6-Z271q logd-wire
+                    // signature never matched (0 captures across three
+                    // runs), so the assumed logger_entry shape is wrong.
+                    // Sample the first 40 writevs per process verbatim
+                    // (96 B each) to learn the real wire format; the
+                    // keystore2 LOG_ALWAYS_FATAL rides one of them.
+                    if past_first_execve && abi.writev_nr != -1 && syscall_num == abi.writev_nr {
+                        static WRITEV_SAMPLE: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if WRITEV_SAMPLE.load(std::sync::atomic::Ordering::Relaxed) < 40 {
+                            let n =
+                                WRITEV_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 40 {
+                                let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                                let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                let iovcnt = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                                let mut dump = format!(
+                                    "DIAG WRITEV-SAMPLE #{} ret={} iovcnt={}:",
+                                    n, ret, iovcnt
+                                );
+                                for k in 0..iovcnt.min(4) {
+                                    let b =
+                                        read_child_u64(pid, iov_ptr.wrapping_add((k * 16) as u64));
+                                    let l = read_child_u64(
+                                        pid,
+                                        iov_ptr.wrapping_add((k * 16 + 8) as u64),
+                                    );
+                                    match (b, l) {
+                                        (Some(bb), Some(ll)) => {
+                                            dump.push_str(&format!(
+                                                " iov{}[base={:#x} len={}]=",
+                                                k, bb, ll
+                                            ));
+                                            let cl = std::cmp::min(ll as usize, 64);
+                                            if let Some(bytes) = read_child_bytes(pid, bb, cl) {
+                                                let txt = String::from_utf8_lossy(&bytes);
+                                                dump.push_str(&format!("{:?}", txt));
+                                            } else {
+                                                dump.push_str("<unreadable>");
+                                            }
+                                        }
+                                        _ => dump.push_str(" iov?<unreadable>"),
+                                    }
+                                }
+                                log(&crate::cap_log_line(&dump, 2048));
+                            }
+                        }
+                    }
+
                     // 6-Z271q: LOGD-FATAL capture — independent of the
                     // boot_recovery gate (this wave runs in
                     // recovery_loader mode where boot_recovery=false, so
