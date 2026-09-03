@@ -107,6 +107,10 @@ typedef struct prop_info prop_info;
   // 6-Z272n: epoll/readlink for the /proc/mounts MountHandler neutralizer.
   #define NR_epoll_ctl 233
   #define NR_readlinkat 267
+  // 6-Z272m pt3: xattr syscalls for the selinux-label fake (x86_64).
+  #define NR_setxattr 188
+  #define NR_lsetxattr 189
+  #define NR_fsetxattr 190
 
   #define GET_ARG(ctx, n) ({ \
       unsigned long _a; \
@@ -148,6 +152,10 @@ typedef struct prop_info prop_info;
   // (aarch64 generic: epoll_ctl=21, readlinkat=78).
   #define NR_epoll_ctl 21
   #define NR_readlinkat 78
+  // 6-Z272m pt3: xattr syscalls for the selinux-label fake (asm-generic).
+  #define NR_setxattr 5
+  #define NR_lsetxattr 6
+  #define NR_fsetxattr 7
 
   #define GET_ARG(ctx, n) ((unsigned long)(ctx)->uc_mcontext.regs[n])
   #define SET_RET(ctx, val) (ctx)->uc_mcontext.regs[0] = (uint64_t)(val)
@@ -187,6 +195,10 @@ typedef struct prop_info prop_info;
   // (ARM EABI: epoll_ctl=251, readlinkat=332).
   #define NR_epoll_ctl 251
   #define NR_readlinkat 332
+  // 6-Z272m pt3: xattr syscalls for the selinux-label fake (ARM EABI).
+  #define NR_setxattr 226
+  #define NR_lsetxattr 227
+  #define NR_fsetxattr 228
   // 6-Z227: arm32 has NO newfstatat / SYS_mmap — the *64 variants are
   // the wired syscalls (fstatat64=327 fills struct stat64; mmap2=192
   // takes the file offset in page units). See twoyi_sys_fstatat and
@@ -5407,6 +5419,37 @@ int __open_2(const char *path, int flags) {
     return track_fb_fd(path, fd);
 }
 
+// 6-Z272m pt3: fake SUCCESS for security.selinux xattr writes on the
+// rootfs files. bionic's property area init (prop_area::map_prop_area_rw)
+// fsetxattrs "security.selinux" on every area file and
+// SystemProperties::AreaInit treats a failure as FATAL-false:
+// ContextsSerialized::Initialize leaves initialized_ = false → EVERY
+// __system_property_add fails for the whole boot ("properties not
+// initialized" — 192× in the walleye runs). The host filesystem in this
+// environment REJECTS selinux xattrs outright (no CAP_MAC_ADMIN — the
+// parent's own lsetxattr warnings prove it), and the guest's SELinux is
+// neutralized anyway (permissive stubs), so a fake success is exactly as
+// honest as the selinuxfs virtual files.
+static int twoyi_is_selinux_xattr(const char *name) {
+    return name != NULL && (strcmp(name, "security.selinux") == 0 ||
+                            strcmp(name, "security.SMACK64") == 0);
+}
+
+int fsetxattr(int fd, const char *name, const void *value, size_t size, int flags) {
+    if (twoyi_is_selinux_xattr(name)) return 0;
+    return (int)syscall(NR_fsetxattr, fd, name, value, size, flags);
+}
+
+int setxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    if (twoyi_is_selinux_xattr(name)) return 0;
+    return (int)syscall(NR_setxattr, path, name, value, size, flags);
+}
+
+int lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    if (twoyi_is_selinux_xattr(name)) return 0;
+    return (int)syscall(NR_lsetxattr, path, name, value, size, flags);
+}
+
 // 6-Z272n: A15+ init's MountHandler fopens /proc/mounts and registers the
 // fd with epoll_ctl(EPOLL_CTL_ADD, EPOLLERR|EPOLLPRI) — on real kernels
 // proc files are pollable, but our synthesized REGULAR FILE
@@ -5432,22 +5475,36 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) {
                          (int)(sizeof(target) - 1));
         if (n > 0) {
             target[n] = 0;
-            size_t rl = strlen(g_rootfs);
-            if (strncmp(target, g_rootfs, rl) == 0) {
-                const char *tail = target + rl;
-                if (strcmp(tail, "/proc/mounts") == 0 ||
-                    strcmp(tail, "/proc/self/mounts") == 0) {
+            // Match the path SUFFIX at a component boundary — the
+            // canonical /proc/self/fd target may carry symlink segments
+            // the g_rootfs env string lacks (the app data dir resolves
+            // through /profiles/default/, so the first walleye verdict
+            // run's readlink saw ".../io.twoyi.debug/profiles/default/
+            // rootfs/proc/self/mounts" while g_rootfs was
+            // "/data/user/0/io.twoyi.debug/rootfs" — the prefix match
+            // failed and the hook fell through to EPERM).
+            const char *tail = NULL;
+            const char *scan = target;
+            while ((scan = strstr(scan, "/proc/")) != NULL) {
+                if (strcmp(scan, "/proc/mounts") == 0 ||
+                    strcmp(scan, "/proc/self/mounts") == 0) {
+                    tail = scan;
+                    break;
+                }
+                scan++;
+            }
+            if (tail != NULL) {
                 static int mounts_epoll_diag = 4;
                 if (mounts_epoll_diag > 0) {
                     mounts_epoll_diag--;
-                    char msg[192];
+                    char msg[256];
                     snprintf(msg, sizeof(msg),
                         "[twoyi_loader] epoll_ctl ADD on the synthesized /proc/mounts fd=%d "
-                        "neutralized (EPERM — regular file; guest mounts are static)\n", fd);
+                        "neutralized (EPERM — regular file; guest mounts are static) target=%s\n",
+                        fd, target);
                     write_str(2, msg);
                 }
                 return 0;
-                }
             }
         }
     }
