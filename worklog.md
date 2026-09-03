@@ -23845,3 +23845,18 @@ Work Log:
 
 Stage Summary:
 - The keystore2 wire chain is complete to the last word (Status → null-flag → size → fields); the in-flight R12 run gives the IKeystoreSecurity + ~18 s hole verdict. The silent import stall (every large image) is fixed at both layers. Battery remains the open user stream: the health HAL stall gets named by the next diagnostic run; the alternative path (virtual HIDL IHealth synthesized in the proxy) is sketched and only needs the HIDL SM token discriminate (request word 2 = descriptor-length instead of SYST/VNDR).
+
+---
+Task ID: 6-Z272b (LineageOS recovery_loader class decode)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-03
+Task: decode the third sweep failure class (5× recovery_loader BOOT_FAIL).
+
+Work Log:
+- Run 33719637610 (lineage-walleye): init SURVIVES (unlike the EARLY_INIT class) — "First stage mount skipped (recovery mode)" — but burns "Wait for boot partition returned after 10002ms" (INIT_AVB_VERSION device poll, no boot partition in twoyi) before exec'ing /system/bin/recovery at +10.4s. perf target, not fatal.
+- The AOSP recovery (NOT TWRP — minui stack, no twres themes) retries /dev/block/platform/soc/1da4000.ufshc/by-name/misc 10× (no block devices), writes one final partial "recovery: " kmsg line, then parks: process alive, wchan=poll_schedule_timeout (its input/event poll), child 2709 reading a pipe.
+- screenshot-07_boot_60s.png = PURE BLACK: minui never drew the menu. The AOSP recovery rendering path (minui → fbdev/DRM) is unverified in twoyi — this is the real "LineageOS menu" bring-up class, separate from the TWRP theme stack.
+- No fatal signals; container alive; recovery_instances=0 (the harness's UI_READY detection is TWRP-theme based — an AOSP recovery menu would need its own markers).
+
+Stage Summary:
+- Three sweep classes now have named roots: import stall (FIXED+verified), EARLY_INIT fstab (FIXED, violet verdict in flight), recovery_loader/minui (decoded — bring-up wave pending). The LineageOS menu ask needs the minui→fb0 bridge wave (6-Z272l candidate) after the current verification round.
