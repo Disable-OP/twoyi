@@ -17138,7 +17138,8 @@ pub fn run_ptrace_loop(
                                     || translated.ends_with("__properties__")
                                 {
                                     prop_area_diag_count = prop_area_diag_count.saturating_add(1);
-                                    if prop_area_diag_count <= 40 {
+                                    if prop_area_diag_count <= 200 {
+                                        // 6-Z272m pt4: 40 ran out before the second-stage area creates
                                         let ex_flags = if syscall_num == abi.open
                                             || syscall_num == abi.openat
                                         {
@@ -19186,7 +19187,8 @@ pub fn run_ptrace_loop(
                                 // /dev/__properties__ (first 40).
                                 if is_property_metadata_file(&p) || p.ends_with("__properties__") {
                                     prop_area_diag_count += 1;
-                                    if prop_area_diag_count <= 40 {
+                                    if prop_area_diag_count <= 200 {
+                                        // 6-Z272m pt4: 40 ran out before the second-stage area creates
                                         log(&format!(
                                             "6-Z229: open(\"{}\") -> {} ({}) (occurrence {})",
                                             p,
@@ -19373,9 +19375,22 @@ pub fn run_ptrace_loop(
                                     property_area_fds.insert((pid, ret as i32));
                                     if prop_area_log_count < PROP_AREA_LOG_CAP {
                                         prop_area_log_count += 1;
+                                        // 6-Z272m pt4: the on-disk SIZE at
+                                        // open time decides between the
+                                        // failure classes the walleye
+                                        // runs left open: 131072 = the
+                                        // guest's own create+ftruncate
+                                        // worked (look at the context
+                                        // level next); 4096 or 0 = the
+                                        // create/truncate path is broken.
+                                        let sz =
+                                            std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
                                         log(&format!(
-                                            "6-Z111: property-area fd captured: open() returned fd={} for pid={} {} — fd registered for the area-write broadcaster",
-                                            ret, pid, p
+                                            "6-Z111: property-area fd captured: open() returned fd={} for pid={} {} size={} — fd registered for the area-write broadcaster",
+                                            ret,
+                                            pid,
+                                            p,
+                                            sz
                                         ));
                                     }
                                 }
@@ -19398,7 +19413,8 @@ pub fn run_ptrace_loop(
                             // PROVES the ENTRY arm ran and what it wrote).
                             if is_property_metadata_file(&p) || p.ends_with("__properties__") {
                                 prop_area_diag_count = prop_area_diag_count.saturating_add(1);
-                                if prop_area_diag_count <= 40 {
+                                if prop_area_diag_count <= 200 {
+                                    // 6-Z272m pt4: 40 ran out before the second-stage area creates
                                     let orig = pending_open_original_path
                                         .get(&pid)
                                         .cloned()
