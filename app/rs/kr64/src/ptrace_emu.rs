@@ -17112,6 +17112,73 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                 }
+                                // ── 6-Z272m (final): create-mode rewrite for
+                                // the new-format property-area files ──
+                                //
+                                // bionic's prop_area::map_prop_area_rw opens
+                                // EVERY area file with
+                                // O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC|O_EXCL
+                                // and mode 0444, and init's
+                                // CreateSerializedPropertyInfo
+                                // WriteStringToFiles the trie with mode 0444.
+                                // On a real device the kernel's create-time
+                                // permission check is satisfied by init's
+                                // CAP_DAC_OVERRIDE (real root). In the twoyi
+                                // container init runs with the app's REAL uid
+                                // (the tracer only virtualizes uid=0 in the
+                                // stat results) and NO capabilities, so a
+                                // 0444 create+O_RDWR fails EACCES: the serial
+                                // area and every per-context
+                                // properties_ctxt<N> file is never created,
+                                // and EVERY __system_property_add fails for
+                                // the whole boot (the walleye runs: 186×
+                                // PROP_ERROR_SET_FAILED, ZERO
+                                // properties_serial/properties_ctxt creates
+                                // in the trace, and the client mmap of the
+                                // trie file failing with len=0 — run
+                                // 33812647538). Rewrite the create mode to
+                                // 0666: invisible to the guest (bionic never
+                                // reads the mode back) and exactly the
+                                // EFFECT root+CAP_DAC_OVERRIDE has on a real
+                                // device.
+                                {
+                                    let is_open_family2 =
+                                        syscall_num == abi.open || syscall_num == abi.openat;
+                                    if is_open_family2
+                                        && (is_property_area_file(&translated)
+                                            || is_property_metadata_file(&translated))
+                                    {
+                                        let flags_reg2 = if syscall_num == abi.open {
+                                            abi.reg_arg2
+                                        } else {
+                                            abi.reg_arg3
+                                        };
+                                        let flags2 = get_syscall_arg(&regs, flags_reg2) as i32;
+                                        if flags2 & 0x40 != 0 {
+                                            // O_CREAT — mode is arg3 (open) /
+                                            // arg4 (openat).
+                                            let mode_reg = if syscall_num == abi.open {
+                                                abi.reg_arg3
+                                            } else {
+                                                abi.reg_arg4
+                                            };
+                                            let mode = get_syscall_arg(&regs, mode_reg);
+                                            if mode & 0o200 == 0 {
+                                                set_syscall_arg(&mut regs, mode_reg, 0o666);
+                                                match ptrace_setregs(pid, &regs, iov_len) {
+                                                    Ok(()) => log(&format!(
+                                                        "6-Z272m: property-area create mode 0{:o} → 0o666 ({} — no CAP_DAC_OVERRIDE in the container; real init relies on it)",
+                                                        mode, translated
+                                                    )),
+                                                    Err(e) => log(&format!(
+                                                        "6-Z272m: mode rewrite FAILED (setregs): {}",
+                                                        e
+                                                    )),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 // ── 6-Z231: property-area ENTRY diagnostics +
                                 // fresh-create guarantee ──
                                 //
