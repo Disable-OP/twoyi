@@ -8428,17 +8428,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // any recovery family, any generation — the binary is the truth.
     let guest_new_prop_format: bool =
         probe_init_new_property_format(&format!("{}/init", rootfs_prefix));
-    if cfg.boot_recovery {
-        info!(
-            "[KR64] PARENT: guest init property-format probe: {} ({} format)",
-            if guest_new_prop_format {
-                "NEW (Android 8+ subdirectory)"
-            } else {
-                "OLD (single file)"
-            },
+    // 6-Z272m: log the probe for EVERY boot — the normal (AOSP) path boots
+    // recovery images too (the LineageOS recovery-in-boot cohort), and the
+    // property-area class below is format-driven, not boot-flag-driven.
+    info!(
+        "[KR64] PARENT: guest init property-format probe: {} ({} format)",
+        if guest_new_prop_format {
+            "NEW (Android 8+ subdirectory)"
+        } else {
+            "OLD (single file)"
+        },
+        if cfg.boot_recovery {
             "boot_recovery=true — 6-Z192"
-        );
-    }
+        } else {
+            "boot_recovery=false — 6-Z272m"
+        }
+    );
 
     // Pre-create /dev/__properties__/property_info on the HOST and in the
     // rootfs BEFORE forking. This is a defensive measure: even if our
@@ -8567,8 +8572,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 );
                 }
             }
-        } else if cfg.boot_recovery {
-            // ----- 6-Z196: NEW-format RECOVERY (Android 8+ init) -----
+        } else if cfg.boot_recovery || guest_new_prop_format {
+            // ----- 6-Z196 / 6-Z272m: NEW-format GUEST (Android 8+ init) -----
             // The guest init OWNS the property area: it parses property
             // contexts, serializes the trie, writes property_info itself
             // (open O_CREAT|O_TRUNC) and — critically — opens
@@ -10462,20 +10467,29 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // find_property binary patch (worklog 1-A F.1 + 1-B Task 3).
             let vfs = if cfg.boot_recovery && !guest_new_prop_format {
                 vfs::Vfs::new_twrp()
-            } else if cfg.boot_recovery {
-                // 6-Z192: a recovery whose init speaks the NEW Android 8+
-                // property-area format (properties_serial/property_info in
-                // the init binary — e.g. twrp-3.7.0_9-0-whyred). Such an
+            } else if guest_new_prop_format {
+                // 6-Z192 / 6-Z272m: a guest whose init speaks the NEW
+                // Android 8+ property-area format (properties_serial/
+                // property_info in the init binary — e.g.
+                // twrp-3.7.0_9-0-whyred, and EVERY LineageOS/AOSP-13+
+                // recovery image booted through the normal path). Such an
                 // init OWNS the property area: it writes property_info and
-                // creates properties_serial itself. new_twrp()'s
-                // old-format FILE would ENOTDIR it, and new_android()'s
-                // Dynamic properties_serial node would CLOBBER the
-                // freshly-written area on every open (materialize-on-open)
-                // → the empty/garbage area fails LoadPath's size check →
-                // "Failed to initialize property area" → init exit. The
+                // creates properties_serial + the per-context
+                // properties_ctxt<N> files itself (each with O_EXCL).
+                // new_twrp()'s old-format FILE would ENOTDIR it, and
+                // new_android()'s Dynamic properties_serial node would
+                // CLOBBER the guest-written area on every open
+                // (materialize-on-open): the walleye run 33799577389 shows
+                // the end state — properties_serial mapped read-only at
+                // 4096 bytes (the minimal node) instead of the guest's own
+                // 128 KiB area, ZERO properties_ctxt<N> maps, and 186
+                // PROP_ERROR_SET_FAILED (0x24) property adds — which kept
+                // sys.usb.config unset and the A13+ recovery blocked in
+                // SetUsbConfig forever (the 6-Z272l mirror rc can't fire
+                // without working property adds). The
                 // new_recovery_new_format() VFS registers NO property
                 // entries: plain rootfs files, guest-owned end to end.
-                info!("[KR64] PARENT: recovery boot with NEW-format init — using Vfs::new_recovery_new_format(pid={}) (Task 6-Z192)", pid);
+                info!("[KR64] PARENT: NEW-format init — using Vfs::new_recovery_new_format(pid={}) (Task 6-Z192/6-Z272m)", pid);
                 vfs::Vfs::new_recovery_new_format(pid as u32)
             } else {
                 info!("[KR64] PARENT: normal (AOSP) boot — using Vfs::new_android(pid={}) (Task 6-Z88)", pid);
