@@ -4519,6 +4519,20 @@ static int should_translate(const char *path) {
     // rootfs (see ensure_proc_sys_files for the full rationale). Checked
     // BEFORE the blanket /proc rejection below.
     if (is_proc_sys_virtual_file(path)) return 1;
+    // 6-Z272n: virtualize /proc/mounts (+ /proc/self/mounts) to the
+    // rootfs. A15 debuggable inits scan /proc/mounts for "overlay" lines
+    // (init/selinux.cpp SetupOverlays, gated on ALLOW_REMOUNT_OVERLAYS =
+    // product_variable("debuggable") — the overlay_remounter copy): on a
+    // docker/redroid host the REAL /proc/mounts is full of the host's
+    // overlayfs mounts, so has_overlays=true and init LOG(FATAL)s
+    // "Failed to copy /system/xbin/overlay_remounter" (recovery images
+    // don't ship that debug-only binary) → InitFatalReboot before any UI
+    // (zippo run 33800240705). The synthesized rootfs/proc/mounts
+    // (proc_emu.rs write_proc_mounts) is guest-scoped and carries exactly
+    // the pseudo-mounts this container provides. Both spellings exist in
+    // the synthesized tree (/proc/mounts is a symlink to self/mounts).
+    if (strcmp(path, "/proc/mounts") == 0) return 1;
+    if (strcmp(path, "/proc/self/mounts") == 0) return 1;
     if (strncmp(path, "/proc", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 0;
     if (strncmp(path, "/sys", 4) == 0 && (path[4] == 0 || path[4] == '/')) return 0;
     if (strncmp(path, "/data", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 0;
