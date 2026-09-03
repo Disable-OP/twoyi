@@ -8367,6 +8367,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             info!("[KR64] PARENT: overwrote fstab.ranchu with comment-only stub (0 entries)");
         }
     }
+    // 6-Z272j: runs AFTER the 6-Z99 stub — when the image ships real fstab
+    // content (fstab.default / fstab.<device> / fstab.emmc …), the alias
+    // OVERWRITES the comment-only stub with it (first_stage_mount flags
+    // dropped). A13+ first-stage inits treat a 0-entry default fstab as
+    // fatal ("Failed to create FirstStageMount" → exit, run 33719631084
+    // lineage-violet and 12 siblings in the LineageOS 22.2 sweep).
+    materialize_guest_device_fstab(&rootfs_prefix);
 
     // ── 6-Z192: guest property-area FORMAT PROBE ──
     //
@@ -11937,6 +11944,131 @@ pub fn detect_guest_slot_suffix(rootfs_prefix: &str) -> String {
 /// untouched lines are preserved byte-for-byte (only rewritten lines are
 /// re-joined, single-space separated — fstab parsing is
 /// whitespace-agnostic).
+/// 6-Z272j: the guest's ro.hardware is always `ranchu` (twoyi's kernel
+/// cmdline), so Android 10+ inits look for `fstab.ranchu` — while
+/// recovery images ship their fstab under the REAL device name
+/// (fstab.violet / fstab.vermeer / fstab.default / fstab.emmc …) or as
+/// recovery.fstab. This function finds the first content-bearing fstab
+/// in the image (same location census as the 6-Z270 sanitizer), drops
+/// `first_stage_mount` flags from every row (FirstStageMount must
+/// construct but mount nothing — the path translation provides the
+/// trees), and writes the result over `/vendor/etc/fstab.ranchu`.
+/// Runs after the 6-Z99 stub write and before the 6-Z270 crypto strip
+/// (which then processes the alias like any other fstab).
+fn materialize_guest_device_fstab(rootfs_prefix: &str) {
+    const SCAN_DIRS: &[&str] = &[
+        "",
+        "etc",
+        "system/etc",
+        "system/system_ext/etc",
+        "vendor/etc",
+        "odm/etc",
+        "first_stage_ramdisk",
+        "first_stage_ramdisk/etc",
+    ];
+    let mut source_content: Option<String> = None;
+    let mut source_path = String::new();
+    'outer: for dir in SCAN_DIRS {
+        let full = if dir.is_empty() {
+            rootfs_prefix.to_string()
+        } else {
+            format!("{}/{}", rootfs_prefix, dir)
+        };
+        let rd = match std::fs::read_dir(&full) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        // Deterministic order (directory iteration isn't).
+        let mut names: Vec<String> = rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n == "recovery.fstab" || n.starts_with("fstab"))
+            .collect();
+        names.sort();
+        for name in names {
+            // Skip the target itself and non-fstab variants.
+            if name == "fstab.ranchu" {
+                continue;
+            }
+            let path = format!("{}/{}", full, name);
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // Content-bearing: at least one active (non-comment,
+            // non-empty) row. fstab.default in some images is a symlink
+            // target with real rows; recovery.fstab counts too.
+            let has_rows = content.lines().any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            });
+            if has_rows {
+                source_content = Some(content);
+                source_path = path;
+                break 'outer;
+            }
+        }
+    }
+    let Some(content) = source_content else {
+        info!(
+            "[KR64] PARENT: 6-Z272j: no content-bearing image fstab found — keeping the 6-Z99 stub"
+        );
+        return;
+    };
+    // Drop first_stage_mount from every row (any surviving flag would
+    // make A10+ FirstStageMount attempt real block-device mounts — the
+    // 6-Z101 EBUSY/InitFatalReboot class). All other rows preserved.
+    let mut out: Vec<String> = Vec::new();
+    let mut dropped = 0usize;
+    for line in content.split_inclusive('\n') {
+        let t = line.trim_end_matches('\n');
+        if t.trim().is_empty() || t.trim().starts_with('#') {
+            out.push(t.to_string());
+            continue;
+        }
+        let fields: Vec<&str> = t.split_whitespace().collect();
+        if fields.len() >= 5 {
+            let fs_mgr_flags = fields[4];
+            let kept: Vec<&str> = fs_mgr_flags
+                .split(',')
+                .filter(|tok| {
+                    if *tok == "first_stage_mount" || *tok == "earlymount" {
+                        dropped += 1;
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+            if kept.len() != fs_mgr_flags.split(',').count() {
+                let mut row = fields.clone();
+                let joined = kept.join(",");
+                row[4] = &joined;
+                out.push(row.join(" "));
+                continue;
+            }
+        }
+        out.push(t.to_string());
+    }
+    let mut new_content = out.join("\n");
+    if content.ends_with('\n') && !new_content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    let dst = format!("{}/vendor/etc/fstab.ranchu", rootfs_prefix);
+    let _ = std::fs::create_dir_all(format!("{}/vendor/etc", rootfs_prefix));
+    match std::fs::write(&dst, &new_content) {
+        Ok(_) => info!(
+            "[KR64] PARENT: 6-Z272j: materialized /vendor/etc/fstab.ranchu from {} ({} bytes, {} first_stage_mount flag(s) dropped)",
+            source_path,
+            new_content.len(),
+            dropped
+        ),
+        Err(e) => warning!(
+            "[KR64] PARENT: 6-Z272j: FAILED to write {}: {}",
+            dst, e
+        ),
+    }
+}
+
 pub fn sanitize_fstab_encryption_flags(rootfs_prefix: &str) {
     // Same location census as detect_guest_slot_suffix — fstab files
     // live in any of these across Android generations/ramdisk layouts.
@@ -12482,6 +12614,79 @@ mod tests {
             out.contains("android.hardware.security.sharedsecret"),
             "{out}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 6-Z272j: materialize_guest_device_fstab ─────────────────────────
+
+    /// The LineageOS 22.2 EARLY_INIT class: the image ships
+    /// fstab.default/fstab.<device> (content-bearing) but A15 init reads
+    /// fstab.$(ro.hardware=ranchu) — the materialized alias must carry the
+    /// real rows with first_stage_mount dropped so FirstStageMount
+    /// constructs and mounts nothing.
+    #[test]
+    fn fstab_ranchu_alias_materialized_from_image_fstab_6z272j() {
+        let dir = std::env::temp_dir().join(format!("kr64_6z272j_a_test_{}", std::process::id()));
+        let ramdisk = dir.join("first_stage_ramdisk");
+        std::fs::create_dir_all(&ramdisk).unwrap();
+        std::fs::write(
+            ramdisk.join("fstab.default"),
+            "# device fstab\n\
+             /dev/block/by-name/system /system ext4 ro,barrier=1 first_stage_mount,avb=vbmeta\n\
+             /dev/block/by-name/vendor /vendor ext4 ro,barrier=1 first_stage_mount\n\
+             /dev/block/by-name/userdata /data f2fs noatime,fileencryption=ice\n\
+             /dev/block/zram none swap swap zramsize=1073741824\n",
+        )
+        .unwrap();
+        materialize_guest_device_fstab(dir.to_str().unwrap());
+
+        let alias = dir.join("vendor/etc/fstab.ranchu");
+        let out = std::fs::read_to_string(&alias).unwrap();
+        assert!(out.contains("/system ext4"), "system row preserved: {out}");
+        assert!(out.contains("/data f2fs"), "data row preserved: {out}");
+        assert!(
+            !out.contains("first_stage_mount"),
+            "first_stage_mount must be dropped: {out}"
+        );
+        assert!(out.contains("avb=vbmeta"), "other flags untouched: {out}");
+        assert!(out.contains("zramsize"), "swap row untouched: {out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No image fstab anywhere → the 6-Z99 comment-only stub stays (the
+    /// TWRP/A11 shape that already boots).
+    #[test]
+    fn fstab_ranchu_stub_kept_when_image_has_no_fstab_6z272j() {
+        let dir = std::env::temp_dir().join(format!("kr64_6z272j_b_test_{}", std::process::id()));
+        let vend = dir.join("vendor/etc");
+        std::fs::create_dir_all(&vend).unwrap();
+        let stub = "# Minimal fstab for twoyi virtualization (comment-only)\n";
+        std::fs::write(vend.join("fstab.ranchu"), stub).unwrap();
+        materialize_guest_device_fstab(dir.to_str().unwrap());
+        let out = std::fs::read_to_string(vend.join("fstab.ranchu")).unwrap();
+        assert_eq!(out, stub, "no sources → stub untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An image fstab.ranchu that ALREADY has content must not shadow the
+    /// search (the function skips it as a source) — but a real image fstab
+    /// (fstab.emmc) takes precedence as a source only in scan order.
+    #[test]
+    fn fstab_ranchu_alias_uses_first_content_bearing_source_6z272j() {
+        let dir = std::env::temp_dir().join(format!("kr64_6z272j_c_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("fstab.emmc"),
+            "/dev/block/by-name/boot /boot emmc defaults first_stage_mount\n",
+        )
+        .unwrap();
+        materialize_guest_device_fstab(dir.to_str().unwrap());
+        let out = std::fs::read_to_string(dir.join("vendor/etc/fstab.ranchu")).unwrap();
+        assert!(
+            out.contains("/boot emmc"),
+            "fstab.emmc (sorted first in the ramdisk root) is the source: {out}"
+        );
+        assert!(!out.contains("first_stage_mount"), "{out}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
