@@ -61,6 +61,7 @@ typedef struct prop_info prop_info;
 #include <linux/fb.h>
 #include <ucontext.h>
 #include <pthread.h>
+#include <sys/epoll.h>
 
 // _GNU_SOURCE needed for RTLD_NEXT
 #ifndef _GNU_SOURCE
@@ -103,6 +104,9 @@ typedef struct prop_info prop_info;
   // could never fire.
   #define NR_rt_sigaction 13
   #define NR_sched_yield 24
+  // 6-Z272n: epoll/readlink for the /proc/mounts MountHandler neutralizer.
+  #define NR_epoll_ctl 233
+  #define NR_readlinkat 267
 
   #define GET_ARG(ctx, n) ({ \
       unsigned long _a; \
@@ -140,6 +144,10 @@ typedef struct prop_info prop_info;
   #define NR_unshare  97
   #define NR_rt_sigaction 134
   #define NR_sched_yield 124
+  // 6-Z272n: epoll/readlink for the /proc/mounts MountHandler neutralizer
+  // (aarch64 generic: epoll_ctl=21, readlinkat=78).
+  #define NR_epoll_ctl 21
+  #define NR_readlinkat 78
 
   #define GET_ARG(ctx, n) ((unsigned long)(ctx)->uc_mcontext.regs[n])
   #define SET_RET(ctx, val) (ctx)->uc_mcontext.regs[0] = (uint64_t)(val)
@@ -175,6 +183,10 @@ typedef struct prop_info prop_info;
   #define NR_unshare  337
   #define NR_rt_sigaction 174
   #define NR_sched_yield 158
+  // 6-Z272n: epoll/readlink for the /proc/mounts MountHandler neutralizer
+  // (ARM EABI: epoll_ctl=251, readlinkat=332).
+  #define NR_epoll_ctl 251
+  #define NR_readlinkat 332
   // 6-Z227: arm32 has NO newfstatat / SYS_mmap — the *64 variants are
   // the wired syscalls (fstatat64=327 fills struct stat64; mmap2=192
   // takes the file offset in page units). See twoyi_sys_fstatat and
@@ -5393,6 +5405,53 @@ int __open_2(const char *path, int flags) {
         return qemu_pipe_open_fallback(path, fd, saved_errno);
     }
     return track_fb_fd(path, fd);
+}
+
+// 6-Z272n: A15+ init's MountHandler fopens /proc/mounts and registers the
+// fd with epoll_ctl(EPOLL_CTL_ADD, EPOLLERR|EPOLLPRI) — on real kernels
+// proc files are pollable, but our synthesized REGULAR FILE
+// ({rootfs}/proc/self/mounts, the 6-Z272n translation target that keeps
+// the host's docker overlayfs lines out of the guest) is NOT, so
+// epoll_ctl fails EPERM and init LOG(FATAL)s "epoll_ctl failed to add
+// fd" → InitFatalReboot before any UI (zippo run 33803918612).
+//
+// Neutralize: when an EPOLL_CTL_ADD fails EPERM and the target fd is the
+// synthesized mounts file (resolved via the raw /proc/self/fd/N link),
+// report success WITHOUT registering. The guest mounts are static for
+// the lifetime of the container, so the change-notification the callback
+// waits for would never legitimately fire anyway; the fd stays a plain
+// seekable file for fopen/rewind/getline, which is all MountHandler's
+// parse path needs.
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) {
+    long ret = syscall(NR_epoll_ctl, epfd, op, fd, event);
+    if (ret == -1 && errno == EPERM && op == EPOLL_CTL_ADD && fd >= 0 && g_rootfs) {
+        char link_path[64];
+        char target[600];
+        snprintf(link_path, sizeof(link_path), "/proc/self/fd/%d", fd);
+        long n = syscall(NR_readlinkat, AT_FDCWD, link_path, target,
+                         (int)(sizeof(target) - 1));
+        if (n > 0) {
+            target[n] = 0;
+            size_t rl = strlen(g_rootfs);
+            if (strncmp(target, g_rootfs, rl) == 0) {
+                const char *tail = target + rl;
+                if (strcmp(tail, "/proc/mounts") == 0 ||
+                    strcmp(tail, "/proc/self/mounts") == 0) {
+                static int mounts_epoll_diag = 4;
+                if (mounts_epoll_diag > 0) {
+                    mounts_epoll_diag--;
+                    char msg[192];
+                    snprintf(msg, sizeof(msg),
+                        "[twoyi_loader] epoll_ctl ADD on the synthesized /proc/mounts fd=%d "
+                        "neutralized (EPERM — regular file; guest mounts are static)\n", fd);
+                    write_str(2, msg);
+                }
+                return 0;
+                }
+            }
+        }
+    }
+    return (int)ret;
 }
 
 // Hook __open_real (bionic's internal open — all open variants call this)
