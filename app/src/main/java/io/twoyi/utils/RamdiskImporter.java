@@ -16,6 +16,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PushbackInputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
@@ -216,7 +217,37 @@ public class RamdiskImporter {
      * Pure Java: parses header, reads ramdisk, decompresses (gzip/LZMA/uncompressed),
      * extracts cpio to targetDir.
      */
-    private static boolean importBootImage(File imgFile, File targetDir) throws IOException {
+    static boolean importBootImage(File imgFile, File targetDir) throws IOException {
+        //
+        // 6-Z272i: TWO structural fixes on the boot-image path, both decoded
+        // from the 2026-09-03 corpus sweep (runs 33719629464 / 33719636334 /
+        // 33719646419 — LineageOS 22.2 sailfish 192 MiB; plus the 59 MiB
+        // trio that never booted either):
+        //
+        // (1) Boot-image v3/v4 ramdisk_size lives at OFFSET 12, not 16.
+        //     The v0/v1/v2 header has kernel_size@8, kernel_addr@12,
+        //     ramdisk_size@16; the v3/v4 header is
+        //     kernel_size@8, ramdisk_size@12, os_version@16,
+        //     header_size@20, reserved@24..40, header_version@40.
+        //     6-Z208 added the v3/v4 page_size+ramdiskOffset handling but
+        //     kept reading ramdisk_size@16 — for sailfish that decoded
+        //     os_version-shaped garbage 536871336 (512 MiB + 24) and the
+        //     importer tried to allocate a 512 MiB byte[].
+        //
+        // (2) NO FULL-BUFFER ALLOCATION ANYMORE. The old code read the
+        //     whole ramdisk into `new byte[ramdiskSize]` before
+        //     decompressing. Even with a CORRECT size, a ~146 MiB ramdisk
+        //     allocation on a 512 MiB heap (run 33719629464: "Failed to
+        //     allocate a 536871352 byte allocation … growth limit
+        //     536870912") throws OutOfMemoryError — which is an ERROR,
+        //     not an Exception, so SettingsActivity's `catch (Exception)`
+        //     never saw it and the executor swallowed the thread whole:
+        //     the boot.log just ends at ramdisk_import_format_detected.
+        //     Now the ramdisk streams from the image file through a
+        //     bounded positioned stream straight into the decompressor
+        //     and out to the cpio temp file, with per-chunk progress
+        //     logging for every compression container.
+        //
         try (FileInputStream fis = new FileInputStream(imgFile)) {
             byte[] header = new byte[16384];
             int headerSize = fis.read(header);
@@ -224,173 +255,160 @@ public class RamdiskImporter {
 
             ByteBuffer bb = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
             int kernelSize = bb.getInt(8);
-            int ramdiskSize = bb.getInt(16);
             int pageSize = bb.getInt(36);
 
-            // 6-Z208: boot-image v3/v4 detection.
-            //
-            // Android 10+ A/B devices ship recovery-in-boot images in
-            // the v3/v4 boot-image format (boot_signature + 4KiB page
-            // + no dt_size field + different header layout). The v0/v1/
-            // v2 layout — which this importer was written against —
-            // has page_size at offset 36; v3/v4's offset 36 holds
-            // part of os_version/header_size, which decodes to a non-
-            // power-of-2 page_size and triggers the "Invalid boot
-            // image" IOException at line 230 — the LineageOS-22.2
-            // failure mode (run 33202601022 lineage-r0s: pageSize=0
-            // ramdiskSize=536871336 — the importer read header_size +
-            // reserved[0] in place of pageSize + dt_size).
-            //
-            // Detection (mirrors scripts/recovery-corpus/
-            // inspect_image.py): if the page_size at offset 36 isn't
-            // in {512, 1024, 2048, 4096}, read the header_version at
-            // offset 40; if it's 3 or 4, switch to v3/v4 layout:
-            //   page_size = 4096 (hardcoded by spec)
-            //   ramdisk_offset = page_size + ceil(kernel_size / page_size) * page_size
-            // (no dt_size + no second_size field; the kernel_size and
-            // ramdisk_size fields at offsets 8/16 are COMMON across
-            // all versions).
+            // 6-Z208: boot-image v3/v4 detection (comment history: the
+            // v0/v1/v2 page_size@36 is os_version/header_size territory in
+            // v3/v4, decoding to a non-power-of-2 page size).
+            int ramdiskSize;
+            boolean v3v4;
             if (pageSize != 512 && pageSize != 1024
                     && pageSize != 2048 && pageSize != 4096) {
-                // Candidate v3/v4 — verify header_version.
                 int headerVersion = bb.getInt(40);
                 if (headerVersion == 3 || headerVersion == 4) {
-                    pageSize = 4096;
+                    v3v4 = true;
+                    pageSize = 4096; // hardcoded by the v3/v4 spec
+                    // 6-Z272i: ramdisk_size@12 — the v3/v4 layout moved it
+                    // (offset 16 holds os_version; reading it gave the
+                    // 0x20000018-shaped garbage that OOMed the importer).
+                    ramdiskSize = bb.getInt(12);
                     Log.i(TAG, "Boot image: v" + headerVersion
-                        + " layout detected (page_size=4096 hardcoded)");
+                        + " layout detected (page_size=4096 hardcoded,"
+                        + " ramdisk_size@12=" + ramdiskSize + ")");
                 } else {
                     throw new IOException("Invalid boot image: pageSize="
-                        + pageSize + " ramdiskSize=" + ramdiskSize
-                        + " header_version=" + headerVersion
+                        + pageSize + " header_version=" + headerVersion
                         + " (not v0/v1/v2/v3/v4 — unrecognized format)");
                 }
+            } else {
+                v3v4 = false;
+                ramdiskSize = bb.getInt(16);
             }
 
             if (pageSize == 0 || ramdiskSize == 0) {
-                throw new IOException("Invalid boot image: pageSize=" + pageSize + " ramdiskSize=" + ramdiskSize);
+                throw new IOException("Invalid boot image: pageSize=" + pageSize
+                    + " ramdiskSize=" + ramdiskSize);
             }
 
             int kernelPages = (kernelSize + pageSize - 1) / pageSize;
             int ramdiskOffset = pageSize + kernelPages * pageSize;
 
-            Log.i(TAG, "Boot image: kernel=" + kernelSize + " ramdisk=" + ramdiskSize +
-                  " page=" + pageSize + " ramdiskOffset=" + ramdiskOffset);
+            Log.i(TAG, "Boot image: kernel=" + kernelSize + " ramdisk=" + ramdiskSize
+                + " page=" + pageSize + " ramdiskOffset=" + ramdiskOffset
+                + " layout=" + (v3v4 ? "v3/v4" : "v0/v1/v2"));
 
-            fis.getChannel().position(ramdiskOffset);
-            byte[] ramdiskCompressed = new byte[ramdiskSize];
-            int read = 0;
-            while (read < ramdiskSize) {
-                int n = fis.read(ramdiskCompressed, read, ramdiskSize - read);
-                if (n < 0) break;
-                read += n;
-            }
-            if (read != ramdiskSize) {
-                // A short read here used to feed a truncated ramdisk to the
-                // decompressor, which may not always fail loudly. Fail here.
-                throw new IOException("Boot image ramdisk short read: got " + read
-                    + " of " + ramdiskSize + " bytes (corrupt source or I/O failure)");
+            if (ramdiskSize < 0 || ramdiskOffset + (long) ramdiskSize > imgFile.length()) {
+                throw new IOException("Boot image ramdisk out of bounds: size="
+                    + ramdiskSize + " offset=" + ramdiskOffset + " file=" + imgFile.length());
             }
 
-            // Decompress ramdisk -> cpio temp file
+            // 6-Z272i: stream [ramdiskOffset, ramdiskOffset + ramdiskSize)
+            // out of the image — no ramdisk-sized allocation.
             File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
-            if ((ramdiskCompressed[0] & 0xFF) == 0x1f && (ramdiskCompressed[1] & 0xFF) == 0x8b) {
-                // GZIP
-                Log.i(TAG, "Ramdisk is gzip-compressed");
-                try (GZIPInputStream gzis = new GZIPInputStream(new java.io.ByteArrayInputStream(ramdiskCompressed));
-                     FileOutputStream fos = new FileOutputStream(cpioTemp)) {
-                    byte[] buf = new byte[8192];
-                    int n;
-                    while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
+            long decodeStart = System.currentTimeMillis();
+            long decodeTotal = 0;
+            try (FileOutputStream fos = new FileOutputStream(cpioTemp)) {
+                // Seek to the ramdisk: the 16 KiB header read left the
+                // stream positioned there, and the bounded wrapper below
+                // must start EXACTLY at ramdiskOffset.
+                fis.getChannel().position(ramdiskOffset);
+                // Peek the container magic (6 bytes covers the XZ header),
+                // then push it back so the decompressor sees the complete
+                // stream.
+                PushbackInputStream peek = new PushbackInputStream(
+                        new BoundedPositionedInputStream(fis, ramdiskSize), 8);
+                byte[] magic = new byte[6];
+                int magicRead = 0;
+                while (magicRead < 6) {
+                    int n = peek.read(magic, magicRead, 6 - magicRead);
+                    if (n < 0) break;
+                    magicRead += n;
                 }
-            } else if ((ramdiskCompressed[0] & 0xFF) == 0x5d) {
-                // LZMA — use Apache Commons Compress (pure Java)
-                Log.i(TAG, "Ramdisk is LZMA-compressed");
-                try (LZMACompressorInputStream lzis = new LZMACompressorInputStream(
-                         new java.io.ByteArrayInputStream(ramdiskCompressed));
-                     FileOutputStream fos = new FileOutputStream(cpioTemp)) {
-                    byte[] buf = new byte[8192];
-                    int n;
-                    while ((n = lzis.read(buf)) > 0) fos.write(buf, 0, n);
+                if (magicRead < 2) {
+                    throw new IOException("Boot image ramdisk truncated in magic read: got "
+                        + magicRead + " of 2 bytes");
                 }
-            } else if (ramdiskCompressed.length >= 6
-                    && (ramdiskCompressed[0] & 0xFF) == 0xfd
-                    && (ramdiskCompressed[1] & 0xFF) == 0x37
-                    && (ramdiskCompressed[2] & 0xFF) == 0x7a
-                    && (ramdiskCompressed[3] & 0xFF) == 0x58
-                    && (ramdiskCompressed[4] & 0xFF) == 0x5a
-                    && (ramdiskCompressed[5] & 0xFF) == 0x00) {
-                // 6-Z208: XZ container (magic FD 37 7A 58 5A 00) — the
-                // standard format for Android 11+ boot-image ramdisks
-                // (LineageOS 22.2 nightly + AOSP mainline both default
-                // to it). Apache Commons Compress's XZCompressorInputStream
-                // handles the container → raw LZMA2 stream decode.
-                //
-                // 6-Z209a: The previous run (33206201353) showed the
-                // importer hanging silently after "Ramdisk is XZ-compressed"
-                // with no further log lines. Local reproduction with the
-                // same XZ stream + Apache Commons Compress 1.21 + xz 1.9
-                // completes in 967ms producing 35090944 bytes — so the
-                // XZ stream is valid + the library works. The CI hang
-                // is either (a) a real environment-specific slowdown on
-                // redroid/ARM64 ART, or (b) an exception being silently
-                // swallowed by the thread pool executor. To surface the
-                // truth: add diagnostic logging (per-MB progress + total
-                // bytes + wall-clock time) + use `!= -1` loop condition
-                // (defensive against InputStream contract violations) +
-                // wrap the block in a try/catch that re-throws as
-                // IOException with the cause chain intact.
-                Log.i(TAG, "Ramdisk is XZ-compressed (input=" + ramdiskCompressed.length + " bytes)");
-                long xzStart = System.currentTimeMillis();
-                long xzTotal = 0;
-                int xzChunks = 0;
-                try {
-                    try (XZCompressorInputStream xzis = new XZCompressorInputStream(
-                             new java.io.ByteArrayInputStream(ramdiskCompressed));
-                         FileOutputStream fos = new FileOutputStream(cpioTemp)) {
-                        byte[] buf = new byte[8192];
-                        int n;
-                        // 6-Z209a: `!= -1` is the canonical InputStream
-                        // contract — `> 0` exits prematurely if read()
-                        // ever returns 0 (which is technically only
-                        // valid for zero-length buffers, but defensive
-                        // against non-conforming InputStream wrappers).
-                        while ((n = xzis.read(buf)) != -1) {
-                            if (n > 0) {
-                                fos.write(buf, 0, n);
-                                xzTotal += n;
-                                xzChunks++;
-                                if (xzChunks % 512 == 0) {
-                                    Log.i(TAG, "XZ decode progress: " + xzTotal
-                                        + " bytes (" + (System.currentTimeMillis() - xzStart) + "ms)");
-                                }
-                            }
+                peek.unread(magic, 0, magicRead);
+                Log.i(TAG, "Ramdisk container magic: 0x"
+                    + Integer.toHexString(magic[0] & 0xFF)
+                    + Integer.toHexString(magic[1] & 0xFF));
+
+                InputStream decompressor;
+                String container;
+                if ((magic[0] & 0xFF) == 0x1f && (magic[1] & 0xFF) == 0x8b) {
+                    container = "gzip";
+                    decompressor = new GZIPInputStream(peek, 65536);
+                } else if ((magic[0] & 0xFF) == 0xfd && magic[1] == '7'
+                        && magic[2] == 'z' && magic[3] == 'X'
+                        && magic[4] == 'Z' && magic[5] == 0x00) {
+                    container = "xz";
+                    decompressor = new XZCompressorInputStream(peek);
+                } else if ((magic[0] & 0xFF) == 0x5d) {
+                    container = "lzma";
+                    decompressor = new LZMACompressorInputStream(peek);
+                } else if (magic[0] == '0' && magic[1] == '7') {
+                    container = "cpio(uncompressed)";
+                    decompressor = peek;
+                } else {
+                    throw new IOException("Unknown ramdisk compression: 0x"
+                        + Integer.toHexString(magic[0] & 0xFF)
+                        + Integer.toHexString(magic[1] & 0xFF));
+                }
+                Log.i(TAG, "Ramdisk is " + container + "-encoded ("
+                    + ramdiskSize + " bytes on disk)");
+
+                byte[] buf = new byte[65536];
+                int n;
+                int chunks = 0;
+                while ((n = decompressor.read(buf)) != -1) {
+                    if (n > 0) {
+                        fos.write(buf, 0, n);
+                        decodeTotal += n;
+                        chunks++;
+                        if (chunks % 256 == 0) {
+                            Log.i(TAG, "ramdisk decode progress: " + decodeTotal
+                                + " bytes out of " + container + " stream ("
+                                + (System.currentTimeMillis() - decodeStart) + "ms)");
                         }
                     }
-                    Log.i(TAG, "XZ decode done: " + xzTotal + " bytes in "
-                        + (System.currentTimeMillis() - xzStart) + "ms ("
-                        + xzChunks + " chunks)");
-                } catch (Throwable t) {
-                    Log.e(TAG, "XZ decode FAILED at " + xzTotal + " bytes ("
-                        + (System.currentTimeMillis() - xzStart) + "ms): "
-                        + t.getClass().getName() + ": " + t.getMessage(), t);
-                    throw new IOException("XZ ramdisk decode failed at "
-                        + xzTotal + " bytes: " + t.getMessage(), t);
                 }
-            } else if (ramdiskCompressed[0] == '0' && ramdiskCompressed[1] == '7') {
-                // Uncompressed cpio
-                Log.i(TAG, "Ramdisk is uncompressed cpio");
-                try (FileOutputStream fos = new FileOutputStream(cpioTemp)) {
-                    fos.write(ramdiskCompressed);
-                }
-            } else {
-                throw new IOException("Unknown ramdisk compression: 0x" +
-                    Integer.toHexString(ramdiskCompressed[0] & 0xFF) +
-                    Integer.toHexString(ramdiskCompressed[1] & 0xFF));
+                decompressor.close();
             }
+            Log.i(TAG, "ramdisk decode done: " + decodeTotal + " bytes in "
+                + (System.currentTimeMillis() - decodeStart) + "ms");
 
             boolean result = extractCpioStreaming(cpioTemp, targetDir);
             cpioTemp.delete();
             return result;
+        }
+    }
+
+    /** Bounded, non-marking stream wrapper: serves at most `limit` bytes
+     * from the underlying (already positioned) stream and never more —
+     * the ramdisk region of the boot image.
+     */
+    private static final class BoundedPositionedInputStream extends java.io.FilterInputStream {
+        private long remaining;
+
+        BoundedPositionedInputStream(java.io.InputStream in, long limit) {
+            super(in);
+            this.remaining = limit;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (remaining <= 0) return -1;
+            int v = super.read();
+            if (v >= 0) remaining--;
+            return v;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (remaining <= 0) return -1;
+            int n = super.read(b, off, (int) Math.min(len, remaining));
+            if (n > 0) remaining -= n;
+            return n;
         }
     }
 

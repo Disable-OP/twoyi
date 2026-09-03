@@ -180,6 +180,14 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
 
+      # 6-Z272i: JVM unit tests — the boot-image importer regression
+      # suite (v3/v4 ramdisk_size@12, streaming bounds) runs on the host
+      # JVM; `returnDefaultValues` covers android.util.Log.
+      - name: JVM unit tests (importer regression suite)
+        run: ./gradlew testDebugUnitTest -Pabis=${{ steps.abis.outputs.abis }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+
       - name: Build with Gradle
         run: ./gradlew assembleRelease -Pabis=${{ steps.abis.outputs.abis }}
         env:

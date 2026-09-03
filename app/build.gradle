@@ -14,6 +14,15 @@ android {
     compileSdkVersion 31
     buildToolsVersion "30.0.3"
 
+    // 6-Z272i: JVM unit tests (RamdiskImporterTest) call android.util.Log
+    // through the importer — return the default values instead of
+    // "not mocked" so the import pipeline is host-testable.
+    testOptions {
+        unitTests {
+            returnDefaultValues = true
+        }
+    }
+
     def buildSerial = new SimpleDateFormat("MMddHHmm").format(new Date())
 
     defaultConfig {
