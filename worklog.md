@@ -23822,3 +23822,26 @@ Stage Summary:
   hole-collapse verdict run. After that: 6-Z272f-b (health HAL registration path) and
   the LineageOS 22.2 boot-to-menu stream (6-Z272b — the recovery execs; A15 startup
   forensics pending).
+
+---
+Task ID: 6-Z272h final + 6-Z272i (sandbox-reset round)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-03
+Task: recover the reset sandbox; close the getHardwareInfo wire; fix the corpus-wide silent import stall.
+
+Work Log:
+- Sandbox was fully reset (repo/PAT/toolchain/worklog gone). Re-cloned @75279ee, restored the worklog from /tmp, user re-supplied the PAT (b64 at /home/z/.gitcred/b64 + askpass), rustup reinstalled, cron recreated (356333, priority 15).
+- 6-Z272h, run 33543923394 RE-READ: the reply-correlation verdict was WRONG — the client received AND freed both the descriptor and the 80-byte getHardwareInfo reply. The defect is the reply CONTENT.
+- android-13 source decode (googlesource, tag android-13.0.0_r1):
+  * KeyMintHardwareInfo is a STRUCTURED parcelable; the AIDL Rust backend deserializes via sized_read (generate_rust.cpp) = leading self-inclusive size i32.
+  * SecurityLevel = {SOFTWARE=0, TRUSTED_ENVIRONMENT=1, STRONGBOX=2, KEYSTORE=100} — the synthesized -2 was an invalid variant.
+  * The Status error wire = [code][string16 message][i32 stack][i32 code] (Status.cpp writeToParcel/readFromParcel); EX_TRANSACTION_FAILED is never parcel content.
+  * keystore2 globals.rs: TEE → IKeyMintDevice/default; map_km_error turns any unknown exception into Error::Binder(TRANSACTION_FAILED, 0) — the exact observed message.
+- 95cc87c: sized reply + TEE level + full error wire (700/700). Run 33776470629: the new 84-byte reply was delivered + freed — STILL TRANSACTION_FAILED.
+- FINAL decode: impl_deserialize_for_parcelable! (libs/binder/rust/src/parcel/parcelable.rs) reads a NULL-FLAG i32 (NON_NULL=1/NULL=0) BEFORE read_from_parcel's sized_read; C++ NDK reads the same via AParcel_readParcelable. Without the flag, keystore2 read our size as the flag and versionNumber=300 as the size → NOT_ENOUGH_DATA → EX_TRANSACTION_FAILED. 25716f3: write_structured_parcelable = [flag=1][size][fields] for getHardwareInfo + SharedSecretParameters. 700/700 + clippy + fmt.
+- 6-Z272i (new failure class, the 05:37 28-run sweep on 75279ee): 7+ images (3× LineageOS 22.2 sailfish 192 MiB, 3× 59 MiB, 1× 96 MiB) died silently at ramdisk_import_format_detected (display_mode=gl, boot=UNKNOWN, kr64 never started). Byte-exact from 33719629464 logcat: v4 layout detected but ramdisk=536871336 (os_version read at offset 16; v3/v4 ramdisk_size is at OFFSET 12) → `new byte[536871336]` → OutOfMemoryError → swallowed by catch(Exception)/executor. 68d9fa4: v3/v4 ramdisk_size@12 + fully streaming import (bounded positioned channel → pushback peek → gzip/xz/lzma/raw) + loud bounds check + catch(Throwable) + JVM regression tests wired into build.yml. Verified locally against the real classes (Temurin 21 + commons-compress + xz + stubs): v4@12, v0@16, bounds — ALL PASS.
+- 6-Z272f-b DIAG pushed (03dd585): focused per-pid syscall DIAG for android.hardware.health@* execs (first 150 syscalls verbatim + all failures to a 400 cap) — run 33776470629 showed the health HAL pid never connected to the proxy and hwservicemanager (conn=4) idled after BC_ENTER_LOOPER, so the battery chain needs the HAL's stall named first.
+- Dispatched on 25716f3: R12 33780708260, whyred 33780721750 (previous guard failed at the download step — missing Referer; dispatch2.sh now sends it), lineage-22.2-sailfish 33780753629.
+
+Stage Summary:
+- The keystore2 wire chain is complete to the last word (Status → null-flag → size → fields); the in-flight R12 run gives the IKeystoreSecurity + ~18 s hole verdict. The silent import stall (every large image) is fixed at both layers. Battery remains the open user stream: the health HAL stall gets named by the next diagnostic run; the alternative path (virtual HIDL IHealth synthesized in the proxy) is sketched and only needs the HIDL SM token discriminate (request word 2 = descriptor-length instead of SYST/VNDR).
