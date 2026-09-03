@@ -2736,7 +2736,26 @@ pub fn patch_twrp_init_rc_recovery_service_full(
         {
             continue;
         }
-        result.push_str(line);
+        // 6-Z272o: append --show_text to the AOSP-layout recovery COMMAND.
+        // AOSP recovery draws a BLACK screen until a key press or
+        // --show_text (recovery_main.cpp: `if (show_text)
+        // ui->ShowText(true);` — show_text comes from the -t getopt
+        // option and defaults false; the walleye verdict runs show the
+        // binary healthy in its poll loop with a fully black fb0 — the
+        // menu simply never rendered). TWRP's /sbin/recovery is left
+        // untouched: its UI is text-first and the option is a no-op
+        // there at best. Idempotent via the --show_text contains-check.
+        {
+            let base = line.trim_end();
+            if base.starts_with("service recovery ")
+                && base.ends_with("/system/bin/recovery")
+                && !base.contains("--show_text")
+            {
+                result.push_str(&format!("{} --show_text", base));
+            } else {
+                result.push_str(line);
+            }
+        }
         // Check if this line starts the recovery service definition.
         // We check the trimmed start to handle leading whitespace (shouldn't
         // happen for service definitions, but be defensive).
@@ -3105,8 +3124,14 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(
     // -----------------------------------------------------------------
     for path in &candidate_files {
         if let Ok(content) = std::fs::read_to_string(path) {
+            // 6-Z272o: the AOSP-layout service must carry --show_text —
+            // a file patched by an older boot (preload present, no
+            // --show_text) must NOT be treated as idempotent.
+            let needs_show_text = content.contains("service recovery /system/bin/recovery")
+                && !content.contains("--show_text");
             if content.contains(&preload_line)
                 && (stdio_line.is_empty() || content.contains("stdio_to_kmsg"))
+                && !needs_show_text
             {
                 info!(
                     "[KR64] PARENT: {} already patched with {:?} for recovery service (idempotent skip)",
@@ -3192,6 +3217,13 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(
             "/sbin/recovery",
             "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so".to_string(),
         ),
+    };
+    // 6-Z272o: the AOSP-layout fallback binary gets --show_text too
+    // (same black-screen-until-key semantics as the patched services).
+    let svc_binary = if svc_binary == "/system/bin/recovery" {
+        "/system/bin/recovery --show_text"
+    } else {
+        svc_binary
     };
     let twoyi_rc_content = format!(
         concat!(
@@ -13965,6 +13997,39 @@ mod tests {
         assert!(
             !dir.join("init.twoyi.rc").exists(),
             "init.twoyi.rc should NOT be created when the hw init.rc has the service"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 6-Z272o: the patcher must append `--show_text` to the AOSP-layout
+    /// recovery command (AOSP recovery draws a black screen until a key
+    /// press or --show_text) and leave TWRP's /sbin/recovery untouched;
+    /// the append must be idempotent.
+    #[test]
+    fn rootfs_patcher_appends_show_text_to_aosp_recovery_command() {
+        let dir = make_test_rootfs("service ueventd /system/bin/ueventd\n");
+        let hw_dir = dir.join("system/etc/init/hw");
+        std::fs::create_dir_all(&hw_dir).unwrap();
+        std::fs::write(
+            hw_dir.join("init.rc"),
+            "service recovery /system/bin/recovery\n    seclabel u:r:recovery:s0\n",
+        )
+        .unwrap();
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
+        let hw_init_rc = std::fs::read_to_string(hw_dir.join("init.rc")).unwrap();
+        assert!(
+            hw_init_rc.contains("service recovery /system/bin/recovery --show_text"),
+            "the AOSP recovery command must carry --show_text. Got:\n{}",
+            hw_init_rc
+        );
+        // Idempotence: re-running must not duplicate the flag.
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
+        let hw_init_rc2 = std::fs::read_to_string(hw_dir.join("init.rc")).unwrap();
+        assert_eq!(
+            hw_init_rc.matches("--show_text").count(),
+            hw_init_rc2.matches("--show_text").count(),
+            "re-patching must not duplicate --show_text"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
