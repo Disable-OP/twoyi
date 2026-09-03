@@ -1280,26 +1280,32 @@ impl ParcelWriter {
         self.data.extend_from_slice(&v.to_ne_bytes());
     }
 
-    /// Begin an AIDL "structured parcelable" region (android-T wire).
+    /// Write an AIDL "structured parcelable" region — the android-12/13
+    /// wire shape a REAL AIDL client deserializes:
     ///
-    /// REAL android-12+ AIDL backends serialize structured parcelables
-    /// (declared with the `parcelable X { type field; }` form) with a
-    /// leading i32 size word that INCLUDES itself (`Parcel::writeInt32`
-    /// placeholder patched at the end — verified against android-13.0.0_r1
-    /// AIDL compiler `generate_rust.cpp` → `sized_write`, and
-    /// `generate_cpp.cpp` → `_aidl_parcelable_size` — both backends
-    /// consume it through `sized_read` / the `_aidl_parcelable_size`
-    /// positional skip). Readers do `parcelable_size = read_i32()` then
-    /// bound the field region at `start + parcelable_size`, so a reply
-    /// without the prefix is parsed with the FIRST FIELD as the size —
-    /// run 33543923394: keystore2 read our `versionNumber=300` as the
-    /// size, bounded past the 80-byte reply, and `getHardwareInfo` died
-    /// with NOT_ENOUGH_DATA → EX_TRANSACTION_FAILED ("Binder exception
-    /// code TRANSACTION_FAILED, 0.").
-    fn write_sized_parcelable<T>(&mut self, fields: T) -> &mut Self
+    /// ```text
+    ///   [i32 1]      null-flag word — NON_NULL_PARCELABLE_FLAG (0 = null)
+    ///   [i32 size]   self-inclusive size word (covers itself + fields)
+    ///   [fields…]
+    /// ```
+    ///
+    /// Verified against android-13.0.0_r1: the AIDL Rust backend's
+    /// `impl_deserialize_for_parcelable!` → `DeserializeOption::
+    /// deserialize_option_from` reads the flag word FIRST, then
+    /// `Parcelable::read_from_parcel` → `sized_read` consumes the size
+    /// word (generate_rust.cpp); the C++ NDK backend reads the same
+    /// shape via `AParcel_readParcelable` (null_flag i32) +
+    /// `_aidl_readFromParcel` (size i32). Run 33776470629 proved the
+    /// flag word is real: with only the size word present keystore2
+    /// read our `size` as the flag, then read versionNumber=300 as the
+    /// size → bounded past the reply → NOT_ENOUGH_DATA →
+    /// EX_TRANSACTION_FAILED ("Binder exception code TRANSACTION_
+    /// FAILED, 0.") — the LAST keystore2 stall.
+    fn write_structured_parcelable<T>(&mut self, fields: T) -> &mut Self
     where
         T: FnOnce(&mut ParcelWriter),
     {
+        self.data.extend_from_slice(&1i32.to_ne_bytes()); // NON_NULL_PARCELABLE_FLAG
         let start = self.data.len();
         self.data.extend_from_slice(&0i32.to_ne_bytes()); // size placeholder
         fields(self);
@@ -3956,7 +3962,7 @@ fn virtual_keymint(code: u32, _reader: &mut ParcelReader) -> TransactionResult {
             // key OPERATIONS fail with KM_ERROR_HARDWARE_TYPE_UNAVAILABLE.
             let mut w = ParcelWriter::new();
             w.write_status_ok();
-            w.write_sized_parcelable(|w| {
+            w.write_structured_parcelable(|w| {
                 w.write_i32(300); // versionNumber: KeyMint V3 (Android 13)
                 w.write_i32(SECURITY_LEVEL_TRUSTED_ENVIRONMENT);
                 w.write_string16("TwoyiSoftwareKeyMint");
@@ -4013,7 +4019,7 @@ fn virtual_sharedsecret(code: u32, _reader: &mut ParcelReader) -> TransactionRes
             // i32 as KeyMintHardwareInfo (see `write_sized_parcelable`).
             let mut w = ParcelWriter::new();
             w.write_status_ok();
-            w.write_sized_parcelable(|w| {
+            w.write_structured_parcelable(|w| {
                 let seed: Vec<u8> = (0..32u32)
                     .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
                     .collect();
@@ -6388,6 +6394,12 @@ mod tests {
 
         let mut r = ParcelReader::new(&data);
         assert_eq!(r.read_i32(), Some(0), "EX_NONE status word");
+        assert_eq!(
+            r.read_i32(),
+            Some(1),
+            "parcelable null-flag word = NON_NULL_PARCELABLE_FLAG (read by \
+             DeserializeOption::deserialize_option_from BEFORE read_from_parcel)"
+        );
         let size = r.read_i32().expect("sized-parcelable size word");
         assert!(
             size >= 4,
@@ -6395,8 +6407,8 @@ mod tests {
         );
         assert_eq!(
             size as usize,
-            data.len() - 4,
-            "size word spans itself + fields, nothing more"
+            data.len() - 8,
+            "size word spans itself + fields (flag word excluded), nothing more"
         );
         assert_eq!(r.read_i32(), Some(300), "versionNumber = KeyMint V3");
         assert_eq!(
@@ -6436,9 +6448,10 @@ mod tests {
 
         let mut r = ParcelReader::new(&data);
         assert_eq!(r.read_i32(), Some(0), "EX_NONE");
+        assert_eq!(r.read_i32(), Some(1), "NON_NULL_PARCELABLE_FLAG word");
         let size = r.read_i32().expect("size word");
         assert!(size >= 4);
-        assert_eq!(size as usize, data.len() - 4, "size spans itself+fields");
+        assert_eq!(size as usize, data.len() - 8, "size spans itself+fields");
         let seed_len = r.read_i32().expect("seed length");
         assert_eq!(seed_len, 32, "deterministic 32-byte seed");
         let seed: Vec<u8> = r.buf[r.pos..r.pos + 32].to_vec();
@@ -6488,25 +6501,31 @@ mod tests {
         assert_eq!(ok, vec![0, 0, 0, 0], "EX_NONE = bare i32 0");
     }
 
-    /// 6-Z272h: the sized-parcelable writer patches a self-inclusive
-    /// size word (the exact contract of android's sized_write).
+    /// 6-Z272h: the structured-parcelable writer emits the null-flag
+    /// word then patches a self-inclusive size word (the exact contract
+    /// of android's DeserializeOption + sized_write pair).
     #[test]
-    fn z272h_sized_parcelable_writer_patches_self_inclusive_size() {
+    fn z272h_structured_parcelable_writer_flag_and_size() {
         let mut w = ParcelWriter::new();
         w.write_i32(7); // pre-existing word (e.g. EX_NONE) — offsets shift
-        w.write_sized_parcelable(|w| {
+        w.write_structured_parcelable(|w| {
             w.write_i32(1);
             w.write_i32(2);
             w.write_i32(3);
         });
         let (data, _) = w.into_parts();
-        // [7][size=16][1][2][3] = 20 bytes total.
-        assert_eq!(data.len(), 20);
+        // [7][flag=1][size=16][1][2][3] = 24 bytes total.
+        assert_eq!(data.len(), 24);
         assert_eq!(i32::from_ne_bytes(data[0..4].try_into().unwrap()), 7);
-        let size = i32::from_ne_bytes(data[4..8].try_into().unwrap());
-        assert_eq!(size, 16, "size = 4 (itself) + 12 (fields)");
         assert_eq!(
-            i32::from_ne_bytes(data[8..12].try_into().unwrap()),
+            i32::from_ne_bytes(data[4..8].try_into().unwrap()),
+            1,
+            "NON_NULL_PARCELABLE_FLAG"
+        );
+        let size = i32::from_ne_bytes(data[8..12].try_into().unwrap());
+        assert_eq!(size, 16, "size = 4 (itself) + 12 (fields); flag excluded");
+        assert_eq!(
+            i32::from_ne_bytes(data[12..16].try_into().unwrap()),
             1,
             "first field survives unshifted"
         );
