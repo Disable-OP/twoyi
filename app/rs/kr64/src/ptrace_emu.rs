@@ -19189,8 +19189,25 @@ pub fn run_ptrace_loop(
                                     prop_area_diag_count += 1;
                                     if prop_area_diag_count <= 200 {
                                         // 6-Z272m pt4: 40 ran out before the second-stage area creates
+                                        // 6-Z272m pt5: log the on-disk size for
+                                        // metadata files too — the walleye
+                                        // runs show a client mmap of
+                                        // property_info FAILING with len=0
+                                        // (an EMPTY trie file) while the
+                                        // 0x88241 write reported success, so
+                                        // the size at every open is the
+                                        // decisive trace.
+                                        let szlog = if is_property_metadata_file(&p) {
+                                            std::fs::metadata(&p)
+                                                .map(|m| format!(" size={}", m.len()))
+                                                .unwrap_or_else(|_| {
+                                                    " size=<unreadable>".to_string()
+                                                })
+                                        } else {
+                                            String::new()
+                                        };
                                         log(&format!(
-                                            "6-Z229: open(\"{}\") -> {} ({}) (occurrence {})",
+                                            "6-Z229: open(\"{}\") -> {} ({}) (occurrence {}{})",
                                             p,
                                             ret,
                                             if ret < 0 {
@@ -19198,7 +19215,8 @@ pub fn run_ptrace_loop(
                                             } else {
                                                 "fd".to_string()
                                             },
-                                            prop_area_diag_count
+                                            prop_area_diag_count,
+                                            szlog
                                         ));
                                     }
                                 }
