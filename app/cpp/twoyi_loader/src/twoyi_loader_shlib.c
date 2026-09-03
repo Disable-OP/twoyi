@@ -4584,6 +4584,16 @@ static int should_translate(const char *path) {
     if (strncmp(path, "/dev/socket", 11) == 0) return 1;  // guest sockets
     if (strncmp(path, "/dev/__properties__", 19) == 0) return 1;
     if (strncmp(path, "/dev/__null__", 13) == 0) return 1;
+    // 6-Z272o pt2: /dev/dri must NOT leak to the host. AOSP minui's
+    // gr_init prefers the DRM backend (/dev/dri/card0 | renderD128) and
+    // falls back to fbdev only when DRM init fails. On a redroid host
+    // those nodes exist, so the walleye --show_text run drew the menu to
+    // the HOST's DRM display — invisible to the fb0 SurfaceView reader
+    // (the recovery stayed healthy in its poll loop over one blank
+    // frame). Translating to the rootfs (no dri there) makes the open
+    // ENOENT and minui deterministically falls back to
+    // /dev/graphics/fb0, which the fb_hook serves.
+    if (strncmp(path, "/dev/dri", 8) == 0 && (path[8] == 0 || path[8] == '/')) return 1;
     // Translate binder devices to rootfs — kr64 mounts binderfs there
     // so the guest has its own binder domain separate from the host.
     if (strcmp(path, "/dev/binder") == 0 ||
