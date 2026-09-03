@@ -11263,6 +11263,18 @@ pub fn run_ptrace_loop(
     let mut kmsg_fd: Option<i32> = None;
     let mut pending_kmsg_open_pid: Option<libc::pid_t> = None; // 6-Z83: per-pid
     let mut post_execve_write_count: u64 = 0;
+    // 6-Z272f-b: focused per-pid syscall DIAG — the corpus's health HAL
+    // (android.hardware.health@2.1-service, started via the 6-Z272c rc
+    // patch) execs, opens 3 property-area files, and then goes SILENT for
+    // the rest of the run: no /dev/hwbinder open, no hwservicemanager
+    // registration, no exit — the recovery's battery lookup therefore
+    // finds nothing (battery_ok=null in every R12 result.json). This map
+    // holds pids of focused service binaries; the syscall-EXIT block
+    // logs their first N syscall results (nr + ret) and EVERY failure
+    // (ret < 0) up to a global cap, naming the stall site without
+    // flooding the DIAG budget for the whole system.
+    let mut focused_diag_pids: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
     // 6-Z271o: fatal-evidence follow window — once a fb_hook fatal marker
     // is seen, the next N writes bypass the DIAG budget (the fatal path
     // logs kind, caller_pc and the maps in SEPARATE write() calls; a
@@ -14489,6 +14501,18 @@ pub fn run_ptrace_loop(
                                         STD_VARS.len(),
                                         std_hits,
                                         total_entries
+                                    ));
+                                }
+                                // 6-Z272f-b: focus the per-pid syscall DIAG on
+                                // the battery-critical services (the health
+                                // HAL started by the 6-Z272c rc patch stalls
+                                // BEFORE its first /dev/hwbinder open — this
+                                // trace names the site).
+                                if exec_path.contains("android.hardware.health@") {
+                                    focused_diag_pids.insert(pid, 0);
+                                    log(&format!(
+                                        "6-Z272f-b: focused syscall DIAG armed for pid={} ({})",
+                                        pid, exec_path
                                     ));
                                 }
                             }
@@ -18964,6 +18988,37 @@ pub fn run_ptrace_loop(
                                 "DIAG fork-family EXIT: nr={} returned {} (0=child, >0=parent's-child-pid, <0=error)",
                                 syscall_num, ret
                             ));
+                        }
+                    }
+
+                    // ── 6-Z272f-b: focused per-pid syscall DIAG ──
+                    //
+                    // For pids armed at the 6-Z238 execve scan (the health
+                    // HAL): log the FIRST 150 syscall results verbatim
+                    // (nr + ret) and — beyond that window — every FAILED
+                    // syscall up to a global 400-line cap. The health HAL
+                    // currently runs silent after ~3 property opens; this
+                    // names the exact syscall it stalls/fails on without
+                    // burning the shared DIAG budget.
+                    if let Some(seen) = focused_diag_pids.get_mut(&pid) {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if *seen < 150 {
+                            *seen += 1;
+                            log(&format!(
+                                "6-Z272f-b: pid={} syscall #{} nr={} ret={}",
+                                pid, seen, syscall_num, ret
+                            ));
+                        } else if ret < 0 {
+                            static FOCUSED_FAIL_DIAG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if FOCUSED_FAIL_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                < 400
+                            {
+                                log(&format!(
+                                    "6-Z272f-b: pid={} FAILED syscall nr={} ret={} (post-window)",
+                                    pid, syscall_num, ret
+                                ));
+                            }
                         }
                     }
 
