@@ -525,6 +525,28 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
         uint32_t sz = (cmd >> 16) & 0x3fff;
         if ((cmd == BP_BR_REPLY || cmd == BP_BR_TRANSACTION) &&
             pos + 4 + 64 <= stream_len) {
+            // 6-Z272k: bounded per-side delivery DIAG — the keystore2
+            // compat chain deadlock needed the CLIENT-side view: did the
+            // guest's waitForResponse actually receive the
+            // BR_TRANSACTION that the proxy's steal delivered (tx #2),
+            // and what code/target did it carry. First 12 deliveries per
+            // process.
+            {
+                static int br_tx_diag = 12;
+                if (br_tx_diag > 0) {
+                    br_tx_diag--;
+                    uint32_t t_code, t_target;
+                    memcpy(&t_code, stream + pos + 4 + 16, 4);
+                    memcpy(&t_target, stream + pos + 4, 4);
+                    char m[160];
+                    snprintf(m, sizeof(m),
+                             "[twoyi_loader] *** 6-Z272k %s to client: target=%u code=0x%x "
+                             "(pid=%d)\n",
+                             (cmd == BP_BR_TRANSACTION) ? "BR-TX" : "BR-RPY",
+                             t_target, t_code, g_real_pid);
+                    write_str(2, m);
+                }
+            }
             if (rem < 8) return;
             uint32_t dlen, olen;
             memcpy(&dlen, p, 4);
@@ -1248,6 +1270,31 @@ static uint32_t bp_scan_tx_blobs(const uint8_t *stream, uint64_t len,
         if (pos + psize > len) break;
         if (cmd == BP_BC_TRANSACTION || cmd == BP_BC_TRANSACTION_SG ||
             cmd == BP_BC_REPLY || cmd == BP_BC_REPLY_SG) {
+            // 6-Z272k: bounded outgoing-side DIAG — the keystore2 compat
+            // chain needed the guest's REPLY bytes (the self-_NTF on
+            // handle 4 was answered with a 4-byte void parcel — if the
+            // guest's own BBinder replies like that the descriptor never
+            // reaches asInterface). First 12 transaction/reply commands
+            // per process.
+            {
+                static int bc_diag = 12;
+                if (bc_diag > 0) {
+                    bc_diag--;
+                    const uint8_t *btd = stream + pos;
+                    uint32_t t_code, t_target;
+                    uint64_t t_ds;
+                    memcpy(&t_target, btd, 4);
+                    memcpy(&t_code, btd + 16, 4);
+                    memcpy(&t_ds, btd + 32, 8);
+                    char m[160];
+                    snprintf(m, sizeof(m),
+                             "[twoyi_loader] *** 6-Z272k BC to proxy: cmd=%s target=%u "
+                             "code=0x%x dsize=%llu (pid=%d)\n",
+                             (cmd == BP_BC_REPLY || cmd == BP_BC_REPLY_SG) ? "REPLY" : "TX",
+                             t_target, t_code, (unsigned long long)t_ds, g_real_pid);
+                    write_str(2, m);
+                }
+            }
             tx_cmds++;
             if (n >= BP_BLOB_MAX_CMDS) return 0;  // too many — v1 fallback
             const uint8_t *btd = stream + pos;
