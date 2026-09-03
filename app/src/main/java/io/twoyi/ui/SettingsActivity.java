@@ -608,9 +608,19 @@ public class SettingsActivity extends AppCompatActivity {
 
                         try {
                             success = io.twoyi.utils.RamdiskImporter.importRamdisk(activity, uri, stagingDir);
-                        } catch (Exception e) {
-                            errorMsg = e.getMessage();
-                            Log.e("SettingsActivity", "Import attempt " + attempt + "/" + MAX_IMPORT_ATTEMPTS + " failed", e);
+                        } catch (Throwable t) {
+                            // 6-Z272i: Throwable, NOT Exception. The corpus
+                            // sweep (2026-09-03, run 33719629464 et al) showed
+                            // a ramdisk-sized `new byte[]` throwing
+                            // OutOfMemoryError — an ERROR, which the old
+                            // `catch (Exception)` let escape into the
+                            // executor thread, killing the import with ZERO
+                            // log output (boot.log just stopped at
+                            // ramdisk_import_format_detected). The importer
+                            // now streams (no big allocation), but any
+                            // future Error class must still surface here.
+                            errorMsg = t.getMessage();
+                            Log.e("SettingsActivity", "Import attempt " + attempt + "/" + MAX_IMPORT_ATTEMPTS + " failed", t);
                         }
                         if (!success && attempt < MAX_IMPORT_ATTEMPTS) {
                             Log.w("SettingsActivity", "Import attempt " + attempt + " failed ("
