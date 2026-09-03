@@ -2379,7 +2379,11 @@ fn connection_loop(
     // per connection with their shape, plus every response. Run
     // 33430336853 left a guest binder thread blocked in recvfrom with no
     // proxy-side trace; this closes the observability gap.
-    let mut wr_diag_budget: u32 = 12;
+    // 6-Z272k: 12 → 200 — the keystore2 compat chain (self-routed _NTF +
+    // steal + nested BC_REPLY reentrancy) burns the 12-frame budget before
+    // the deadlock window, leaving the exact stopping frame invisible.
+    // 200/con × a handful of conns stays bounded (~2 KB).
+    let mut wr_diag_budget: u32 = 200;
     loop {
         let req = match read_frame(stream) {
             Ok(r) => r,
