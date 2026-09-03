@@ -3656,41 +3656,59 @@ long keyctl(int cmd, ...) {
 // Minimal in-memory property system
 // We can't use the real bionic property area (it corrupts the host).
 // Instead, we fake all property functions with a simple key-value store.
-#define MAX_PROPS 256
+// 6-Z272m (final): the table GROWS — the fixed 256-entry array was the
+// root cause of the A13+ recovery property storm: a full LineageOS
+// build.prop set is ~2-3k properties, so every __system_property_add
+// past entry 256 returned -1 ("__system_property_add failed", 186×/boot
+// in the walleye runs) and init's property area never came up, which
+// kept sys.usb.config unset and the A13+ recovery blocked in
+// SetUsbConfig's WaitForProperty forever (6-Z272l context).
+#define PROPS_INITIAL_CAP 512
+#define PROPS_MAX_CAP 16384
 struct prop_entry {
     char key[128];
     char value[128];
     int used;
 };
-static struct prop_entry g_props[MAX_PROPS];
+static struct prop_entry *g_props = NULL;
+static int g_props_count = 0;
+static int g_props_cap = 0;
 
 static int prop_set(const char *key, const char *value) {
     if (!key || !value) return -1;
     // Find existing
-    for (int i = 0; i < MAX_PROPS; i++) {
+    for (int i = 0; i < g_props_count; i++) {
         if (g_props[i].used && strcmp(g_props[i].key, key) == 0) {
             strncpy(g_props[i].value, value, 127);
             g_props[i].value[127] = 0;
             return 0;
         }
     }
-    // Find free slot
-    for (int i = 0; i < MAX_PROPS; i++) {
-        if (!g_props[i].used) {
-            strncpy(g_props[i].key, key, 127);
-            g_props[i].key[127] = 0;
-            strncpy(g_props[i].value, value, 127);
-            g_props[i].value[127] = 0;
-            g_props[i].used = 1;
-            return 0;
-        }
+    // Grow the table — 6-Z272m (final): the boot prop set of a modern
+    // image far exceeds the old fixed 256 slots.
+    if (g_props_count >= g_props_cap) {
+        int new_cap = g_props_cap ? g_props_cap * 2 : PROPS_INITIAL_CAP;
+        if (new_cap > PROPS_MAX_CAP) return -1; // table hard cap
+        struct prop_entry *np = (struct prop_entry *)realloc(
+            g_props, (size_t)new_cap * sizeof(struct prop_entry));
+        if (!np) return -1;
+        g_props = np;
+        memset(g_props + g_props_count, 0,
+               (size_t)(new_cap - g_props_count) * sizeof(struct prop_entry));
+        g_props_cap = new_cap;
     }
-    return -1; // table full
+    strncpy(g_props[g_props_count].key, key, 127);
+    g_props[g_props_count].key[127] = 0;
+    strncpy(g_props[g_props_count].value, value, 127);
+    g_props[g_props_count].value[127] = 0;
+    g_props[g_props_count].used = 1;
+    g_props_count++;
+    return 0;
 }
 
 static int prop_get(const char *key, char *value) {
     if (!key || !value) return 0;
-    for (int i = 0; i < MAX_PROPS; i++) {
+    for (int i = 0; i < g_props_count; i++) {
         if (g_props[i].used && strcmp(g_props[i].key, key) == 0) {
             // 6-Z184 AUDIT FIX (agent 1): callers pass a
             // PROP_VALUE_MAX (92) byte buffer; the old strncpy(…, 128)
@@ -3781,7 +3799,7 @@ int __system_property_get(const char *name, char *value) {
 static char g_dummy_prop_info[1] = {0};
 const void *__system_property_find(const char *name) {
     if (!name) return NULL;
-    for (int i = 0; i < MAX_PROPS; i++) {
+    for (int i = 0; i < g_props_count; i++) {
         if (g_props[i].used && strcmp(g_props[i].key, name) == 0) {
             return &g_props[i]; // return pointer to entry as fake prop_info
         }
@@ -3807,7 +3825,7 @@ uint32_t __system_property_serial(const void *pi) {
 // Hook __system_property_foreach — iterate our table
 int __system_property_foreach(void (*propfn)(const void *pi, void *cookie), void *cookie) {
     if (!propfn) return 0;
-    for (int i = 0; i < MAX_PROPS; i++) {
+    for (int i = 0; i < g_props_count; i++) {
         if (g_props[i].used) {
             propfn(&g_props[i], cookie);
         }
@@ -3822,7 +3840,8 @@ const void *__system_property_wait_any(const void *pi) {
     // Return a non-NULL pointer to indicate "a property changed"
     // This causes init's WaitForProperty to re-read the property and check
     // if it matches the expected value.
-    return &g_props[0];
+    static struct prop_entry wait_any_dummy;
+    return g_props ? (const void *)&g_props[0] : (const void *)&wait_any_dummy;
 }
 
 // Hook __system_property_wait — return 1 (property changed)
