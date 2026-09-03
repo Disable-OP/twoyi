@@ -4115,7 +4115,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/a21s/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/a21s/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4129,7 +4129,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/a52q/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/a52q/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4157,7 +4157,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/a71/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/a71/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4185,7 +4185,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/a73xq/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/a73xq/20260827/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4241,7 +4241,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/akita/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/akita/20260826/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4255,7 +4255,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/alioth/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/alioth/20260826/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4269,7 +4269,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/apollon/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/apollon/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4283,7 +4283,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/aston/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/aston/20260828/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4311,7 +4311,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/audi/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/audi/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4353,7 +4353,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/avalon/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/avalon/20260822/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4381,7 +4381,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/axolotl/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/axolotl/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4395,7 +4395,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/b0s/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/b0s/20260822/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4409,7 +4409,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/bale/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/bale/20260828/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4437,7 +4437,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/baracus/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/baracus/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4451,7 +4451,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/baracus_tab/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/baracus_tab/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4479,7 +4479,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/bathena/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/bathena/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4507,7 +4507,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/benz/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/benz/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4521,7 +4521,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/berlin/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/berlin/20260822/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4535,7 +4535,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/berlna/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/berlna/20260826/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4549,7 +4549,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/beryllium/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/beryllium/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4563,7 +4563,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/beyond0lte/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/beyond0lte/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4605,7 +4605,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/beyondx/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/beyondx/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4619,7 +4619,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/bluejay/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/bluejay/20260822/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4745,7 +4745,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/caprip/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/caprip/20260826/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4759,7 +4759,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/cas/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/cas/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4773,7 +4773,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/casuarina/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/casuarina/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4787,7 +4787,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/caymanslm/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/caymanslm/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4801,7 +4801,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/cebu/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/cebu/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4829,7 +4829,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/cheeseburger/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/cheeseburger/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4843,7 +4843,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/cheetah/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/cheetah/20260825/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4871,7 +4871,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/chiron/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/chiron/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4885,7 +4885,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/cmi/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/cmi/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4927,7 +4927,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/corvette/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/corvette/20260824/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4955,7 +4955,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/cupid/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/cupid/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4969,7 +4969,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/d1/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/d1/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4983,7 +4983,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/d1x/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/d1x/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -4997,7 +4997,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/d2s/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/d2s/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5025,7 +5025,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/davinci/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/davinci/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5039,7 +5039,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/deadpool/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/deadpool/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5123,7 +5123,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/dm1q/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/dm1q/20260827/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5179,7 +5179,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/dubai/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/dubai/20260828/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5193,7 +5193,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/dumpling/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/dumpling/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5249,7 +5249,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/equuleus/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/equuleus/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5291,7 +5291,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/f62/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/f62/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5319,7 +5319,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/felix/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/felix/20260827/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5347,7 +5347,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/fogo/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/fogo/20260827/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5361,7 +5361,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/fogos/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/fogos/20260822/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5375,7 +5375,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/foster/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/foster/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5403,7 +5403,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/fuxi/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/fuxi/20260824/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5417,7 +5417,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/g0s/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/g0s/20260825/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5459,7 +5459,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/garnet/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/garnet/20260826/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5473,7 +5473,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/gauguin/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/gauguin/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5515,7 +5515,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/ginkgo/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/ginkgo/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5529,7 +5529,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/giulia/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/giulia/20260825/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5543,7 +5543,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/giuliac/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/giuliac/20260825/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5557,7 +5557,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/grus/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/grus/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5571,7 +5571,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/gta4l/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/gta4l/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5627,7 +5627,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/gta4xlwifi/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/gta4xlwifi/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5641,7 +5641,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/gtowifi/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/gtowifi/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5655,7 +5655,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/gts4lv/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/gts4lv/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5697,7 +5697,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/gts7lwifi/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/gts7lwifi/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5739,7 +5739,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/guam/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/guam/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5753,7 +5753,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/guamp/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/guamp/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5781,7 +5781,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/h830/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/h830/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5795,7 +5795,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/h850/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/h850/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5809,7 +5809,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/h870/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/h870/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5823,7 +5823,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/h870d/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/h870d/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5837,7 +5837,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/h872/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/h872/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5865,7 +5865,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/h910/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/h910/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5935,7 +5935,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/heart/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/heart/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5963,7 +5963,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/hotdogb/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/hotdogb/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5977,7 +5977,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/husky/20260821/boot.img
+    url: https://mirrorbits.lineageos.org/full/husky/20260821/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -5991,7 +5991,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/ibiza/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/ibiza/20260823/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6033,7 +6033,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/instantnoodlep/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/instantnoodlep/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6173,7 +6173,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/l01k/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/l01k/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6229,7 +6229,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/lemonade/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/lemonade/20260824/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6243,7 +6243,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/lemonadep/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/lemonadep/20260824/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6257,7 +6257,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/lemonades/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/lemonades/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6383,7 +6383,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/m5_tab/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/m5_tab/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6411,7 +6411,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/marble/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/marble/20260825/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6453,7 +6453,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/martini/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/martini/20260824/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6523,7 +6523,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/miami/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/miami/20260823/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6537,7 +6537,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/miatoll/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/miatoll/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6551,7 +6551,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/milanf/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/milanf/20260827/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6565,7 +6565,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/mondrian/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/mondrian/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6593,7 +6593,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nairo/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/nairo/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6621,7 +6621,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/natrium/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/natrium/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6635,7 +6635,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nicepool/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/nicepool/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6649,7 +6649,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nicepool_rtk/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/nicepool_rtk/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6677,7 +6677,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nio/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/nio/20260824/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6691,7 +6691,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nuwa/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/nuwa/20260823/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6705,7 +6705,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nx/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/nx/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6733,7 +6733,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nx606j/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/nx606j/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6747,7 +6747,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nx616j/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/nx616j/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6761,7 +6761,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nx619j/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/nx619j/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6775,7 +6775,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nx659j/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/nx659j/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -6789,7 +6789,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nx_tab/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/nx_tab/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7013,7 +7013,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pdx215/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/pdx215/20260825/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7027,7 +7027,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pdx223/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/pdx223/20260827/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7041,7 +7041,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pdx224/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/pdx224/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7055,7 +7055,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pdx225/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/pdx225/20260827/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7069,7 +7069,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pdx234/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/pdx234/20260823/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7097,7 +7097,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pdx237/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/pdx237/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7125,7 +7125,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pdx257/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/pdx257/20260823/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7139,7 +7139,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/peridot/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/peridot/20260828/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7153,7 +7153,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/perseus/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/perseus/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7181,7 +7181,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/polaris/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/polaris/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7195,7 +7195,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/porg/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/porg/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7209,7 +7209,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/porg_tab/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/porg_tab/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7237,7 +7237,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pro1x/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/pro1x/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7251,7 +7251,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pstar/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/pstar/20260824/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7265,7 +7265,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pyrite/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/pyrite/20260828/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7321,7 +7321,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/r0s/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/r0s/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7335,7 +7335,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/r8q/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/r8q/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7349,7 +7349,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/r8s/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/r8s/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7377,7 +7377,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/radxa0/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/radxa0/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7419,7 +7419,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/radxa0_tab/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/radxa0_tab/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7433,7 +7433,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/raven/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/raven/20260824/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7461,7 +7461,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/renoir/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/renoir/20260822/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7475,7 +7475,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/rhode/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/rhode/20260822/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7489,7 +7489,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/rhodep/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/rhodep/20260823/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7531,7 +7531,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/rs988/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/rs988/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7601,7 +7601,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/sake/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/sake/20260825/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7615,7 +7615,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/salami/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/salami/20260828/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7643,7 +7643,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/scorpio/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/scorpio/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7671,7 +7671,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/shiba/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/shiba/20260823/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7699,7 +7699,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/socrates/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/socrates/20260822/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7741,7 +7741,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/surya/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/surya/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7755,7 +7755,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/sweet/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/sweet/20260827/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7811,7 +7811,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/thor/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/thor/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7839,7 +7839,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/timelm/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/timelm/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7853,7 +7853,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/tokay/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/tokay/20260824/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7923,7 +7923,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/umi/20260823/boot.img
+    url: https://mirrorbits.lineageos.org/full/umi/20260823/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7937,7 +7937,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/unicorn/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/unicorn/20260828/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7951,7 +7951,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/ursa/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/ursa/20260825/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7965,7 +7965,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/us996/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/us996/20260822/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -7979,7 +7979,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/us996d/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/us996d/20260824/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -8021,7 +8021,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/vela/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/vela/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -8063,7 +8063,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/violet/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/violet/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -8119,7 +8119,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/waffle/20260827/boot.img
+    url: https://mirrorbits.lineageos.org/full/waffle/20260827/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -8147,7 +8147,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/x1s/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/x1s/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -8161,7 +8161,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/xpeng/20260822/boot.img
+    url: https://mirrorbits.lineageos.org/full/xpeng/20260822/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
@@ -8231,7 +8231,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/zippo/20260828/boot.img
+    url: https://mirrorbits.lineageos.org/full/zippo/20260828/recovery.img
     referer: ""
     md5: ""
     sha256: ""
@@ -8245,7 +8245,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/zizhan/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/zizhan/20260826/recovery.img
     referer: ""
     md5: ""
     sha256: ""
