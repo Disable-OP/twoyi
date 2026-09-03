@@ -3066,6 +3066,33 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(
         candidate_files.push(p);
     }
 
+    // (6) 6-Z272l: {rootfs}/system/etc/init/hw/*.rc — system-as-root
+    // layouts. AOSP-13 recovery images (walleye + the AOSP-recovery sweep
+    // members) define `service recovery` in system/etc/init/hw/init.rc;
+    // without this candidate the patcher fell back to init.twoyi.rc
+    // whose import injection targets rootfs/init.rc — a file that does
+    // NOT exist in system-as-root layouts (the fallback warned "failed
+    // to read init.rc for import injection: No such file or directory"
+    // and the image's own un-patched service started). The hw dir is
+    // also the directory the RUNNING init.rc parses its actions from
+    // (walleye kmsg: "processing action (late-init) from
+    // (/system/etc/init/hw/init.rc:80)").
+    let hw_dir = format!("{}/system/etc/init/hw", rootfs_prefix);
+    if let Ok(entries) = std::fs::read_dir(&hw_dir) {
+        let mut hw_matches: Vec<String> = entries
+            .flatten()
+            .map(|e| e.path().to_string_lossy().into_owned())
+            .filter(|p| p.ends_with(".rc"))
+            .collect();
+        // Deterministic order (directory iteration isn't).
+        hw_matches.sort();
+        for m in hw_matches {
+            if seen.insert(m.clone()) {
+                candidate_files.push(m);
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // Step 2: idempotence check. If ANY candidate already contains the
     // CURRENT patch marker (the exact preload chain we would write, plus
@@ -8375,6 +8402,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // lineage-violet and 12 siblings in the LineageOS 22.2 sweep).
     materialize_guest_device_fstab(&rootfs_prefix);
 
+    // 6-Z272l: ship the sys.usb.config → sys.usb.state mirror that real
+    // devices get from init.usb.rc. Without it AOSP-13+ recovery blocks
+    // in SetUsbConfig's WaitForProperty BEFORE any UI init (black screen).
+    write_usb_state_mirror_rc(&rootfs_prefix);
+
     // ── 6-Z192: guest property-area FORMAT PROBE ──
     //
     // The pre-creation below used to hardcode "boot_recovery ⇒ OLD
@@ -11918,6 +11950,103 @@ pub fn detect_guest_slot_suffix(rootfs_prefix: &str) -> String {
     String::new()
 }
 
+/// 6-Z272l: ship the `sys.usb.config` → `sys.usb.state` mirror that real
+/// devices get from init.usb.rc.
+///
+/// AOSP-13+ recovery `main()` (bootable/recovery/recovery_main.cpp) runs
+/// SetUsbConfig BEFORE any UI init:
+///
+/// ```text
+/// while (true) {
+///   std::string usb_config = fastboot ? "fastboot"
+///       : IsRoDebuggable() || IsDeviceUnlocked() ? "adb" : "none";
+///   std::string usb_state = GetProperty("sys.usb.state", "none");
+///   if (usb_config != usb_state) {
+///     SetUsbConfig("none");       // SetProperty + WaitForProperty(state, "none")
+///     SetUsbConfig(usb_config);   // WaitForProperty(state, "adb") — INFINITE timeout
+///   }
+///   start_recovery(device, args); // UI draws only AFTER this
+/// }
+/// ```
+///
+/// On real devices init.usb.rc's property triggers transition
+/// sys.usb.state; the twoyi container has no USB stack, so the wait
+/// never completes and recovery nanosleeps forever BEFORE opening fb0 —
+/// the AOSP-recovery black-screen class (walleye run 33785263812: the
+/// recovery pid parked in nr=101 nanosleep for minutes, its forked
+/// stdio log-pump child parked on anon_pipe_read, ZERO graphics
+/// syscalls, no fb0/dri openat).
+///
+/// Fix: a drop-in rc the guest's own init evaluates. Second-stage init
+/// hardcodes ParseConfig("/system/etc/init"), so
+/// `{rootfs}/system/etc/init/twoyi_usb.rc` is imported for every
+/// A8+ layout without touching any image file. Property triggers are
+/// universal init syntax (no binary probing needed). The mirror is
+/// honest: it reproduces exactly what init.usb.rc does when a config is
+/// requested (the adb/sideload/fastboot flows then proceed the same way
+/// they would on a device where the usb daemon acks the state).
+///
+/// Idempotent: the file is written at most once per content (a marker
+/// line is checked before rewriting).
+fn write_usb_state_mirror_rc(rootfs_prefix: &str) {
+    const RC_BODY: &str = concat!(
+        "# 6-Z272l: sys.usb.config → sys.usb.state mirror (twoyi).\n",
+        "# AOSP-13+ recovery main() runs SetUsbConfig BEFORE any UI init:\n",
+        "# WaitForProperty(sys.usb.state) has an infinite default timeout\n",
+        "# and the container has no USB stack, so without this mirror the\n",
+        "# recovery binary sleeps forever before drawing (black screen).\n",
+        "on property:sys.usb.config=none\n",
+        "    setprop sys.usb.state none\n",
+        "\n",
+        "on property:sys.usb.config=adb\n",
+        "    setprop sys.usb.state adb\n",
+        "\n",
+        "on property:sys.usb.config=fastboot\n",
+        "    setprop sys.usb.state fastboot\n",
+        "\n",
+        "on property:sys.usb.config=sideload\n",
+        "    setprop sys.usb.state sideload\n",
+        "\n",
+        "on property:sys.usb.config=mtp\n",
+        "    setprop sys.usb.state mtp\n",
+        "\n",
+        "on property:sys.usb.config=mtp,adb\n",
+        "    setprop sys.usb.state mtp,adb\n",
+    );
+    const MARKER: &str = "# 6-Z272l: sys.usb.config";
+
+    let rc_dir = format!("{}/system/etc/init", rootfs_prefix);
+    let rc_path = format!("{}/twoyi_usb.rc", rc_dir);
+    if let Ok(existing) = std::fs::read_to_string(&rc_path) {
+        if existing.contains(MARKER) {
+            info!(
+                "[KR64] PARENT: 6-Z272l: {} already present (idempotent skip)",
+                rc_path
+            );
+            return;
+        }
+    }
+    if let Err(e) = std::fs::create_dir_all(&rc_dir) {
+        warning!(
+            "[KR64] PARENT: 6-Z272l: cannot create {}: {} — the AOSP-recovery SetUsbConfig stall will remain",
+            rc_dir,
+            e
+        );
+        return;
+    }
+    match std::fs::write(&rc_path, RC_BODY) {
+        Ok(()) => info!(
+            "[KR64] PARENT: 6-Z272l: wrote {} — sys.usb.config→state mirror active (recovery SetUsbConfig unblocked)",
+            rc_path
+        ),
+        Err(e) => warning!(
+            "[KR64] PARENT: 6-Z272l: failed to write {}: {} — the AOSP-recovery SetUsbConfig stall will remain",
+            rc_path,
+            e
+        ),
+    }
+}
+
 /// 6-Z270: strip FBE/FDE fs_mgr flags from the guest's /data fstab entries.
 ///
 /// WHY (run 33409396151, OrangeFox R12.0 lavender — boot-to-UI 47 s): the
@@ -13789,6 +13918,72 @@ mod tests {
         assert!(
             !dir.join("init.twoyi.rc").exists(),
             "init.twoyi.rc should NOT be created when init.recovery.rc has the service"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 6-Z272l: `patch_twrp_init_rc_recovery_service_in_rootfs` must scan
+    /// `system/etc/init/hw/*.rc` — the system-as-root layout (AOSP-13
+    /// recovery images, walleye run 33785263812) defines
+    /// `service recovery` in system/etc/init/hw/init.rc and has NO
+    /// rootfs/init.rc. Previously the patcher fell back to
+    /// init.twoyi.rc + an import injection into the nonexistent
+    /// rootfs/init.rc, so the image's own un-patched service started.
+    #[test]
+    fn rootfs_patcher_patches_system_etc_init_hw_layout() {
+        let dir = make_test_rootfs("service ueventd /system/bin/ueventd\n");
+        let hw_dir = dir.join("system/etc/init/hw");
+        std::fs::create_dir_all(&hw_dir).unwrap();
+        std::fs::write(
+            hw_dir.join("init.rc"),
+            "service recovery /system/bin/recovery\n    seclabel u:r:recovery:s0\n",
+        )
+        .unwrap();
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
+        let hw_init_rc = std::fs::read_to_string(hw_dir.join("init.rc")).unwrap();
+        assert!(
+            hw_init_rc.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
+            "system/etc/init/hw/init.rc should be patched. Got:\n{}",
+            hw_init_rc
+        );
+        // No fallback file should be created.
+        assert!(
+            !dir.join("init.twoyi.rc").exists(),
+            "init.twoyi.rc should NOT be created when the hw init.rc has the service"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 6-Z272l: `write_usb_state_mirror_rc` must create
+    /// `system/etc/init/twoyi_usb.rc` with the config→state triggers
+    /// (the AOSP-13 recovery SetUsbConfig unblock) and be idempotent.
+    #[test]
+    fn z272l_usb_mirror_rc_written_and_idempotent() {
+        let dir = make_test_rootfs("service ueventd /system/bin/ueventd\n");
+        let rootfs = dir.to_string_lossy().into_owned();
+        write_usb_state_mirror_rc(&rootfs);
+        let rc_path = dir.join("system/etc/init/twoyi_usb.rc");
+        let content = std::fs::read_to_string(&rc_path).unwrap();
+        for trigger in [
+            "on property:sys.usb.config=none",
+            "on property:sys.usb.config=adb",
+            "on property:sys.usb.config=fastboot",
+            "on property:sys.usb.config=sideload",
+        ] {
+            assert!(
+                content.contains(trigger),
+                "twoyi_usb.rc should contain `{}`. Got:\n{}",
+                trigger,
+                content
+            );
+        }
+        // Idempotence: a second call must not duplicate the triggers.
+        write_usb_state_mirror_rc(&rootfs);
+        let content2 = std::fs::read_to_string(&rc_path).unwrap();
+        assert_eq!(
+            content, content2,
+            "second write_usb_state_mirror_rc call must be a no-op (idempotent skip)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
