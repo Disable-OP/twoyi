@@ -5894,15 +5894,22 @@ static void twoyi_init(void) {
         char prop_dir[512];
         snprintf(prop_dir, sizeof(prop_dir), "%s/dev/__properties__", g_rootfs);
         mkdir_p(prop_dir, 0777);
-        // Pre-create in rootfs
-        const char *files[] = {"property_info", "properties_serial", NULL};
-        for (int i = 0; files[i]; i++) {
-            char fpath[600];
-            snprintf(fpath, sizeof(fpath), "%s/%s", prop_dir, files[i]);
-            int fd = twoyi_sys_open(fpath, O_WRONLY | O_CREAT, 0666);
-            if (fd >= 0) syscall(NR_close, fd);
-        }
-        // Also create on HOST (WriteStringToFile bypasses PLT hooks)
+        // 6-Z272m: create the DIRECTORY only. Do NOT pre-create
+        // property_info / properties_serial in the ROOTFS — every
+        // Android-8+ guest init creates the serial area with
+        // O_CREAT|O_EXCL (bionic prop_area::map_prop_area_rw), and
+        // ContextsSerialized::Initialize FreeAndUnmap()s the ENTIRE area
+        // when the serial create fails EEXIST → every
+        // __system_property_add fails for the whole boot (walleye run
+        // 33803292025: 186× PROP_ERROR_SET_FAILED even with the parent's
+        // clean slate, because THIS bootstrap ran inside init and
+        // re-created the files after it). property_info is written by
+        // init itself (CreateSerializedPropertyInfo, O_CREAT) — a
+        // pre-created empty file is at best redundant.
+        // The HOST-side property_info create stays: WriteStringToFile
+        // bypasses PLT hooks (direct openat syscalls), and the host
+        // /dev/__properties__/property_info existence is the legacy
+        // guard for the pre-tracer-translation boot path.
         struct stat st;
         if (stat("/dev/__properties__", &st) == 0) {
             // Only create property_info (NOT properties_serial — host uses that)
