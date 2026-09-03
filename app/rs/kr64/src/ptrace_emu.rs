@@ -14507,11 +14507,23 @@ pub fn run_ptrace_loop(
                                 // the battery-critical services (the health
                                 // HAL started by the 6-Z272c rc patch stalls
                                 // BEFORE its first /dev/hwbinder open — this
-                                // trace names the site).
+                                // trace names the site). 6-Z272b: ALSO focus
+                                // the AOSP recovery binary (LineageOS
+                                // recovery_loader class: the process parks in
+                                // poll_schedule_timeout with a pipe-reading
+                                // child and NEVER opens /dev/graphics/fb0 —
+                                // minui's graphics init never ran; a 50-call
+                                // window names the syscall it stalls behind).
                                 if exec_path.contains("android.hardware.health@") {
                                     focused_diag_pids.insert(pid, 0);
                                     log(&format!(
                                         "6-Z272f-b: focused syscall DIAG armed for pid={} ({})",
+                                        pid, exec_path
+                                    ));
+                                } else if exec_path.ends_with("/system/bin/recovery") {
+                                    focused_diag_pids.insert(pid, 0);
+                                    log(&format!(
+                                        "6-Z272b: focused syscall DIAG armed for pid={} ({})",
                                         pid, exec_path
                                     ));
                                 }
