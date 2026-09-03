@@ -1280,6 +1280,34 @@ impl ParcelWriter {
         self.data.extend_from_slice(&v.to_ne_bytes());
     }
 
+    /// Begin an AIDL "structured parcelable" region (android-T wire).
+    ///
+    /// REAL android-12+ AIDL backends serialize structured parcelables
+    /// (declared with the `parcelable X { type field; }` form) with a
+    /// leading i32 size word that INCLUDES itself (`Parcel::writeInt32`
+    /// placeholder patched at the end — verified against android-13.0.0_r1
+    /// AIDL compiler `generate_rust.cpp` → `sized_write`, and
+    /// `generate_cpp.cpp` → `_aidl_parcelable_size` — both backends
+    /// consume it through `sized_read` / the `_aidl_parcelable_size`
+    /// positional skip). Readers do `parcelable_size = read_i32()` then
+    /// bound the field region at `start + parcelable_size`, so a reply
+    /// without the prefix is parsed with the FIRST FIELD as the size —
+    /// run 33543923394: keystore2 read our `versionNumber=300` as the
+    /// size, bounded past the 80-byte reply, and `getHardwareInfo` died
+    /// with NOT_ENOUGH_DATA → EX_TRANSACTION_FAILED ("Binder exception
+    /// code TRANSACTION_FAILED, 0.").
+    fn write_sized_parcelable<T>(&mut self, fields: T) -> &mut Self
+    where
+        T: FnOnce(&mut ParcelWriter),
+    {
+        let start = self.data.len();
+        self.data.extend_from_slice(&0i32.to_ne_bytes()); // size placeholder
+        fields(self);
+        let size = (self.data.len() - start) as i32;
+        self.data[start..start + 4].copy_from_slice(&size.to_ne_bytes());
+        self
+    }
+
     /// Write a UTF-16LE string16 with the always-written trailing NUL and
     /// 4-byte pad (`Parcel::writeString16` android-11).
     fn write_string16(&mut self, s: &str) {
@@ -3729,16 +3757,42 @@ const EX_SERVICE_SPECIFIC: i32 = -8;
 /// specific error: -68").
 const KM_ERROR_HARDWARE_TYPE_UNAVAILABLE: i32 = -68;
 
-/// `android.hardware.security.keymint.SecurityLevel.SOFTWARE`.
-const SECURITY_LEVEL_SOFTWARE: i32 = -2;
+/// `android.hardware.security.keymint.SecurityLevel` (android-13.0.0_r1
+/// SecurityLevel.aidl): SOFTWARE=0, TRUSTED_ENVIRONMENT=1, STRONGBOX=2,
+/// KEYSTORE=100. Our virtual device claims TRUSTED_ENVIRONMENT because
+/// keystore2 constructs the MANDATORY TEE level and would refuse the
+/// software level before ever registering IKeystoreSecurity; honesty is
+/// preserved at the operation level (key ops fail
+/// KM_ERROR_HARDWARE_TYPE_UNAVAILABLE).
+const SECURITY_LEVEL_TRUSTED_ENVIRONMENT: i32 = 1;
 
-/// Reply with an AIDL exception (no payload). `EX_SERVICE_SPECIFIC`
-/// carries the service-specific error code after the exception code.
+/// Reply with an AIDL exception (no payload).
+///
+/// 6-Z272h: the REAL Status wire (android-13.0.0_r1 Status.cpp
+/// `writeToParcel`/`readFromParcel` — identical for the C++ and Rust
+/// clients) is:
+/// ```text
+///   [i32 exception]
+///   [string16 message]              — for every exception != EX_NONE
+///   [i32 0 (remote stack trace)]    — for every exception != EX_NONE
+///   [i32 service code]              — EX_SERVICE_SPECIFIC only
+/// ```
+/// The previous shape wrote the service code directly after the
+/// exception word, so the client's `readString16` consumed the CODE as
+/// the message length (negative → UNEXPECTED_NULL → the whole status
+/// mangled). EX_NONE stays a bare 4-byte word.
+/// NOTE: EX_TRANSACTION_FAILED must never be written as parcel content —
+/// real `Status::writeToParcel` turns it into a transport error; use
+/// `TransactionResult::Failed` (BR_FAILED_REPLY) for that class.
 fn virtual_error_reply(exception: i32, service_code: i32) -> TransactionResult {
     let mut w = ParcelWriter::new();
     w.write_i32(exception);
-    if exception == EX_SERVICE_SPECIFIC {
-        w.write_i32(service_code);
+    if exception != EX_NONE {
+        w.write_string16(""); // empty error message (len 0 + NUL + pad = 8 B)
+        w.write_i32(0); // empty remote stack trace header
+        if exception == EX_SERVICE_SPECIFIC {
+            w.write_i32(service_code);
+        }
     }
     let (data, offsets) = w.into_parts();
     TransactionResult::Reply { data, offsets }
@@ -3880,18 +3934,35 @@ fn virtual_vibrator(code: u32, reader: &mut ParcelReader) -> TransactionResult {
 fn virtual_keymint(code: u32, _reader: &mut ParcelReader) -> TransactionResult {
     match code {
         1 => {
-            // getHardwareInfo → KeyMintHardwareInfo parcel (field order
-            // verified against KeyMintHardwareInfo.aidl):
+            // getHardwareInfo → KeyMintHardwareInfo parcel. Field order
+            // verified against android-13.0.0_r1 KeyMintHardwareInfo.aidl:
             //   int versionNumber; SecurityLevel securityLevel;
             //   @utf8InCpp String keyMintName; @utf8InCpp String keyMintAuthorName;
             //   boolean timestampTokenRequired;
+            //
+            // 6-Z272h: KeyMintHardwareInfo is a STRUCTURED parcelable —
+            // the android-12+ wire carries a leading size i32 (see
+            // `write_sized_parcelable`). Without it keystore2's
+            // `sized_read` consumed versionNumber as the size and the
+            // whole chain died with TRANSACTION_FAILED (run 33543923394
+            // — the last stall before IKeystoreSecurity registration).
+            //
+            // securityLevel is TRUSTED_ENVIRONMENT (1): keystore2 builds
+            // the MANDATORY TEE level (globals.rs new_native_binder —
+            // "Trying to construct mandatory security level TEE") and
+            // android-13 SecurityLevel = {SOFTWARE=0, TRUSTED_ENVIRONMENT=1,
+            // STRONGBOX=2, KEYSTORE=100} — the previous -2 was not a valid
+            // variant at all. The device stays honest where it counts:
+            // key OPERATIONS fail with KM_ERROR_HARDWARE_TYPE_UNAVAILABLE.
             let mut w = ParcelWriter::new();
             w.write_status_ok();
-            w.write_i32(300); // versionNumber: KeyMint V3 (Android 13)
-            w.write_i32(SECURITY_LEVEL_SOFTWARE);
-            w.write_string16("TwoyiSoftwareKeyMint");
-            w.write_string16("twoyi");
-            w.write_i32(0); // timestampTokenRequired = false
+            w.write_sized_parcelable(|w| {
+                w.write_i32(300); // versionNumber: KeyMint V3 (Android 13)
+                w.write_i32(SECURITY_LEVEL_TRUSTED_ENVIRONMENT);
+                w.write_string16("TwoyiSoftwareKeyMint");
+                w.write_string16("twoyi");
+                w.write_i32(0); // timestampTokenRequired = false
+            });
             let (data, offsets) = w.into_parts();
             TransactionResult::Reply { data, offsets }
         }
@@ -3935,17 +4006,27 @@ fn virtual_keymint(code: u32, _reader: &mut ParcelReader) -> TransactionResult {
 fn virtual_sharedsecret(code: u32, _reader: &mut ParcelReader) -> TransactionResult {
     match code {
         1 => {
+            // getSharedSecretParameters → SharedSecretParameters parcel
+            // (android-13.0.0_r1 SharedSecretParameters.aidl:
+            //   byte[] seed; byte[] nonce;
+            // ). 6-Z272h: a STRUCTURED parcelable — same leading size
+            // i32 as KeyMintHardwareInfo (see `write_sized_parcelable`).
             let mut w = ParcelWriter::new();
             w.write_status_ok();
-            let seed: Vec<u8> = (0..32u32)
-                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
-                .collect();
-            w.write_i32(seed.len() as i32);
-            w.data.extend_from_slice(&seed);
-            while w.data.len() % 4 != 0 {
-                w.data.push(0);
-            }
-            w.write_i32(0); // nonce: empty byte[]
+            w.write_sized_parcelable(|w| {
+                let seed: Vec<u8> = (0..32u32)
+                    .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                    .collect();
+                w.write_i32(seed.len() as i32);
+                w.data.extend_from_slice(&seed);
+                while w.data.len() % 4 != 0 {
+                    w.data.push(0);
+                }
+                w.write_i32(0); // nonce: empty byte[]
+                while w.data.len() % 4 != 0 {
+                    w.data.push(0);
+                }
+            });
             let (data, offsets) = w.into_parts();
             TransactionResult::Reply { data, offsets }
         }
@@ -6246,5 +6327,188 @@ mod tests {
         drop(stream);
         drop(handle);
         let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    // ------------------------------------------------------------------
+    // 6-Z272h — synthesized structured-parcelable + Status reply wires.
+    //
+    // Run 33543923394 (R12 lavender) pinned the last keystore2 stall:
+    // the client RECEIVED the getHardwareInfo reply (80 B, freed via
+    // BC_FREE_BUFFER) yet failed with "Binder exception code
+    // TRANSACTION_FAILED, 0." — the reply violated the android-12+
+    // STRUCTURED parcelable wire (no leading size i32, so keystore2's
+    // `sized_read` read versionNumber=300 as the parcelable size and
+    // bounded past the buffer → NOT_ENOUGH_DATA → EX_TRANSACTION_FAILED
+    // via parse_exception_code/Status::from(status_t)). The
+    // EX_SERVICE_SPECIFIC error replies were equally off-wire (the
+    // message string16 + stack-trace word were missing entirely).
+    // ------------------------------------------------------------------
+
+    /// One sync transaction against a virtual service handle through a
+    /// live proxy; returns the reply blob (data, offsets).
+    fn z272h_virtual_tx(stream: &mut UnixStream, target: u32, code: u32) -> (Vec<u8>, Vec<u8>) {
+        // Real AIDL request parcel: interface-token header (no args).
+        let mut w = ParcelWriter::new();
+        w.write_i32(0); // strict
+        w.write_i32(-1); // work source
+        w.write_u32(AIDL_HEADER_TAG_SYST);
+        w.write_string16("android.hardware.security.keymint.IKeyMintDevice");
+        let (d, o) = w.into_parts();
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        let mut tx = make_bc_transaction_payload(code, 0x10);
+        tx[0..4].copy_from_slice(&target.to_ne_bytes());
+        bc.extend_from_slice(&tx);
+        let payload = make_v2_write_read_payload(&bc, &d, &o, 4096);
+        let (ret, resp) = exchange(stream, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0);
+        let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+        let off = 4 + read_size + 8;
+        let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+        let olen = u32::from_ne_bytes(resp[off + 4..off + 8].try_into().unwrap()) as usize;
+        let blob = resp[off + 8..off + 8 + dlen + olen].to_vec();
+        (blob[..dlen].to_vec(), blob[dlen..].to_vec())
+    }
+
+    /// 6-Z272h: getHardwareInfo must be a SIZED structured parcelable —
+    /// [EX_NONE][size (self-inclusive)][version=300][level=TEE][name][author][false]
+    /// — exactly what keystore2's generated `sized_read` consumes.
+    #[test]
+    fn z272h_get_hardware_info_is_sized_structured_parcelable() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        let keymint = PROXY_HANDLE_BASE + 2;
+        let (data, offsets) = z272h_virtual_tx(&mut stream, keymint, 1);
+        assert!(offsets.is_empty(), "no binder objects in the info reply");
+
+        let mut r = ParcelReader::new(&data);
+        assert_eq!(r.read_i32(), Some(0), "EX_NONE status word");
+        let size = r.read_i32().expect("sized-parcelable size word");
+        assert!(
+            size >= 4,
+            "size must cover itself (android sized_read contract)"
+        );
+        assert_eq!(
+            size as usize,
+            data.len() - 4,
+            "size word spans itself + fields, nothing more"
+        );
+        assert_eq!(r.read_i32(), Some(300), "versionNumber = KeyMint V3");
+        assert_eq!(
+            r.read_i32(),
+            Some(SECURITY_LEVEL_TRUSTED_ENVIRONMENT),
+            "securityLevel = TRUSTED_ENVIRONMENT (the android-13 variant \
+             keystore2's mandatory-TEE construction accepts; -2 is not a \
+             valid SecurityLevel at all)"
+        );
+        let name = r.read_string16().expect("name string").expect("non-null");
+        assert_eq!(name, "TwoyiSoftwareKeyMint");
+        let author = r.read_string16().expect("author").expect("non-null");
+        assert_eq!(author, "twoyi");
+        assert_eq!(r.read_i32(), Some(0), "timestampTokenRequired = false");
+        assert_eq!(r.remaining(), 0, "reply fully consumed");
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    /// 6-Z272h: SharedSecretParameters must carry the structured
+    /// parcelable size word too (keystore2's negotiation reads it with
+    /// the same `sized_read`).
+    #[test]
+    fn z272h_sharedsecret_parameters_is_sized_structured_parcelable() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        let shared = PROXY_HANDLE_BASE + 3;
+        let (data, offsets) = z272h_virtual_tx(&mut stream, shared, 1);
+        assert!(offsets.is_empty());
+
+        let mut r = ParcelReader::new(&data);
+        assert_eq!(r.read_i32(), Some(0), "EX_NONE");
+        let size = r.read_i32().expect("size word");
+        assert!(size >= 4);
+        assert_eq!(size as usize, data.len() - 4, "size spans itself+fields");
+        let seed_len = r.read_i32().expect("seed length");
+        assert_eq!(seed_len, 32, "deterministic 32-byte seed");
+        let seed: Vec<u8> = r.buf[r.pos..r.pos + 32].to_vec();
+        r.pos += 32;
+        assert_eq!(seed[0], 7u8, "seed[0] = (0*31+7)");
+        assert_eq!(seed[1], 38u8, "seed[1] = (1*31+7)");
+        assert_eq!(r.read_i32(), Some(0), "empty nonce");
+        assert_eq!(r.remaining(), 0);
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    /// 6-Z272h: EX_SERVICE_SPECIFIC error replies follow the REAL
+    /// Status wire — [code][string16 message][i32 0 stack-trace][i32
+    /// service code] — so the client's readFromParcel lands on the
+    /// service code instead of consuming it as a message length.
+    #[test]
+    fn z272h_service_specific_error_full_status_wire() {
+        let result = virtual_error_reply(EX_SERVICE_SPECIFIC, KM_ERROR_HARDWARE_TYPE_UNAVAILABLE);
+        let TransactionResult::Reply { data, offsets } = result else {
+            panic!("error reply must be a Reply");
+        };
+        assert!(offsets.is_empty());
+        // [EX_SERVICE_SPECIFIC 4][message string16 8][stack 4][code 4] = 20 B
+        assert_eq!(data.len(), 20, "full status wire shape");
+        let mut r = ParcelReader::new(&data);
+        assert_eq!(r.read_i32(), Some(EX_SERVICE_SPECIFIC), "exception word");
+        let msg = r
+            .read_string16()
+            .expect("message present")
+            .expect("empty message, not null");
+        assert_eq!(msg, "", "empty message string16");
+        assert_eq!(r.read_i32(), Some(0), "empty remote stack trace header");
+        assert_eq!(
+            r.read_i32(),
+            Some(KM_ERROR_HARDWARE_TYPE_UNAVAILABLE),
+            "service-specific code is the LAST word"
+        );
+        assert_eq!(r.remaining(), 0);
+
+        // EX_NONE stays the bare 4-byte word (write_status_ok shape).
+        let TransactionResult::Reply { data: ok, .. } = virtual_error_reply(EX_NONE, 0) else {
+            panic!("EX_NONE reply must be a Reply");
+        };
+        assert_eq!(ok, vec![0, 0, 0, 0], "EX_NONE = bare i32 0");
+    }
+
+    /// 6-Z272h: the sized-parcelable writer patches a self-inclusive
+    /// size word (the exact contract of android's sized_write).
+    #[test]
+    fn z272h_sized_parcelable_writer_patches_self_inclusive_size() {
+        let mut w = ParcelWriter::new();
+        w.write_i32(7); // pre-existing word (e.g. EX_NONE) — offsets shift
+        w.write_sized_parcelable(|w| {
+            w.write_i32(1);
+            w.write_i32(2);
+            w.write_i32(3);
+        });
+        let (data, _) = w.into_parts();
+        // [7][size=16][1][2][3] = 20 bytes total.
+        assert_eq!(data.len(), 20);
+        assert_eq!(i32::from_ne_bytes(data[0..4].try_into().unwrap()), 7);
+        let size = i32::from_ne_bytes(data[4..8].try_into().unwrap());
+        assert_eq!(size, 16, "size = 4 (itself) + 12 (fields)");
+        assert_eq!(
+            i32::from_ne_bytes(data[8..12].try_into().unwrap()),
+            1,
+            "first field survives unshifted"
+        );
     }
 }
