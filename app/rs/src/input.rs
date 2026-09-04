@@ -405,7 +405,26 @@ pub fn handle_touch(ev: MotionEvent) {
             // hasn't been accepted yet. Silently drop the event (the
             // next MotionEvent will see `None` and bail at the top of
             // this function).
-            let _ = tx.send(msg);
+            if let Err(e) = tx.send(msg) {
+                // 6-Z289f: dead worker (its rx was dropped after a write
+                // failure) — this was the LAST silent drop: name it.
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last = LAST_LOG_MS.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) >= 1000 {
+                        LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+                        log::error!(
+                            "[INPUT] handle_touch DROP: touch channel send failed ({}) —                              the abstract/path worker is gone; events discarded",
+                            e
+                        );
+                    }
+                }
+            }
         }
         // ACTION_MOVE: emit one TouchMessage per active pointer in
         // this batched MotionEvent. kr64's `encode_touch_move` writes
@@ -472,7 +491,26 @@ pub fn handle_touch(ev: MotionEvent) {
                 y: 0,
                 pressure: 0,
             };
-            let _ = tx.send(msg);
+            if let Err(e) = tx.send(msg) {
+                // 6-Z289f: dead worker (its rx was dropped after a write
+                // failure) — this was the LAST silent drop: name it.
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last = LAST_LOG_MS.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) >= 1000 {
+                        LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+                        log::error!(
+                            "[INPUT] handle_touch DROP: touch channel send failed ({}) —                              the abstract/path worker is gone; events discarded",
+                            e
+                        );
+                    }
+                }
+            }
         }
         // Outside / Hover / ButtonPress / Scroll / etc. — not
         // relevant to a Type-B multi-touch touchscreen. Silently
@@ -717,6 +755,30 @@ fn touch_server_abstract() {
                             off += n as usize;
                         }
                         if dead {
+                            // 6-Z289f: this exit is the last silent link in
+                            // the touch chain — after it, INPUT_SENDER keeps
+                            // a DEAD sender and handle_touch's tx.send fails
+                            // silently forever (runs 33917738821/33915900634:
+                            // taps delivered at +23/+34 s, everything later
+                            // vanished with no log line anywhere). Name the
+                            // failure + the errno (rate-limited to 1/s).
+                            {
+                                use std::sync::atomic::{AtomicU64, Ordering};
+                                static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let last = LAST_LOG_MS.load(Ordering::Relaxed);
+                                if now_ms.saturating_sub(last) >= 1000 {
+                                    LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+                                    let errno = std::io::Error::last_os_error().raw_os_error();
+                                    log::error!(
+                                        "[INPUT] abstract touch worker DEAD: write to                                          the hook bridge failed (last errno={:?}) —                                          client fd {} closed; ALL further guest touch                                          input is dropped until a reconnect",
+                                        errno, client
+                                    );
+                                }
+                            }
                             while rx.recv().is_ok() {}
                             close(client);
                             return;
