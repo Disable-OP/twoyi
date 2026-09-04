@@ -1424,6 +1424,12 @@ static int rootfs_retry_open(const char *path, int abs_fd, int flags, int mode) 
 struct inbr_slot {
     int fd;                     /* the socket fd; -1 = free slot */
     int connected;              /* 0 once the host socket EOFs/errors */
+    int raw;                    /* 6-Z293: 1 = the app writes FINAL evdev
+                                 * records (negotiated hello) — read/poll
+                                 * pass through untouched; the ioctl
+                                 * faking still applies. 0 = legacy
+                                 * TouchMessage stream this hook decodes. */
+    unsigned ev_size;           /* 6-Z293: negotiated sizeof(input_event) */
     int next_tid;               /* monotonic Type-B tracking-id counter */
     int active_tid;             /* 0 = finger up */
     unsigned ring_len;          /* synthesized input_event bytes pending */
@@ -1902,9 +1908,46 @@ static int try_open_input_bridge(const char *path) {
     slot->fd = fd;
     slot->connected = 1;
     slot->next_tid = 0;
+    /* 6-Z293: negotiate the RAW-EVDEV protocol with the app. The hello
+     * announces THIS guest's native struct input_event size (24 on
+     * aarch64 — 2×i64 timeval; 16 on arm32/i386 — 2×i32); the app
+     * worker then writes final evdev records of exactly that size and
+     * this hook stops touching the byte stream (read/poll pass
+     * through; ioctl faking stays).
+     *
+     * WHY (the 6-Z289 probe verdicts were honest — touch never worked
+     * on the loader path): this hook's read() interposer never fired on
+     * any loader-path image (zero "INPUT read" logs in runs
+     * 33919636462..33924122082 + the R12 comparison), so the legacy
+     * TouchMessage stream reached minui raw — 20 bytes where
+     * ev_get_input demands exactly sizeof(struct input_event) — and
+     * every tap was silently discarded. Writing the final records on
+     * the app side removes the guest-side decode dependency entirely:
+     * whichever read path the guest uses (hooked or real), the bytes
+     * are already in the guest's native evdev format. */
+    {
+        unsigned char hello[5];
+        hello[0] = 0xA5;
+        hello[1] = 'T';
+        hello[2] = 'W';
+        hello[3] = 'I';
+        hello[4] = (unsigned char)INBR_EV_SIZE;
+        (void)raw_syscall3(SYS_write, fd, (long)hello, (long)sizeof(hello));
+        slot->raw = 1;
+        slot->ev_size = (unsigned)INBR_EV_SIZE;
+        if (g_inbr_log_open < 8) {
+            g_inbr_log_open++;
+            write_str(2, "[twrp_fb_hook] INPUT bridge: hello sent (raw evdev, ev_size=");
+            write_num(2, (int)INBR_EV_SIZE);
+            write_str(2, ")\n");
+        }
+    }
     {
         unsigned j;
-        for (j = 0; j < init_len; j++) {
+        /* 6-Z293: raw mode — the byte stream is the APP's final evdev
+         * output and must stay untouched. Skip the legacy staging (the
+         * connect-time peek bytes are meaningless in raw mode). */
+        for (j = 0; !slot->raw && j < init_len; j++) {
             if (slot->stage_len < INBR_MSG_SIZE) {
                 slot->stage[slot->stage_len++] = init_bytes[j];
             }
@@ -1938,6 +1981,20 @@ ssize_t read(int fd, void *buf, size_t count) {
     struct inbr_slot *s = inbr_slot_for(fd);
     static ssize_t (*real_read)(int, void *, size_t) = NULL;
     long n;
+
+    /* 6-Z293: RAW-EVDEV slot — the app already writes the guest's
+     * native struct input_event records; pass through untouched (both
+     * the dlsym'd libc read and the raw-syscall fallback below are
+     * real reads — the socket is a REAL kernel socket, so the kernel
+     * delivers the bytes as-is). */
+    if (s && s->raw) {
+        if (!real_read && dlsym) {
+            real_read = (ssize_t (*)(int, void *, size_t))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "read"), "read"); /* 6-Z246 */
+        }
+        if (real_read) return real_read(fd, buf, count);
+        return (ssize_t)raw_syscall3(SYS_read, fd, (long)buf, (long)count);
+    }
 
     if (!s) {
         if (!real_read && dlsym) {
@@ -2014,7 +2071,13 @@ int poll(struct pollfd *fds, unsigned long nfds, int timeout_ms) {
     unsigned waited = 0;
 
     for (i = 0; i < nfds; i++) {
-        if (in_fd_is_tracked(fds[i].fd)) { has_input = 1; break; }
+        struct inbr_slot *s = inbr_slot_for(fds[i].fd);
+        /* 6-Z293: raw slots are NOT userspace-decided — the kernel
+         * reports their readiness (the app writes final evdev bytes;
+         * a real poll reports POLLIN exactly when a record is queued).
+         * If EVERY fd in the set is raw/untracked this loop leaves
+         * has_input=0 and the real poll runs below. */
+        if (s && !s->raw) { has_input = 1; break; }
     }
     if (!has_input) {
         if (!real_poll && dlsym) {
@@ -2039,6 +2102,7 @@ int poll(struct pollfd *fds, unsigned long nfds, int timeout_ms) {
         for (i = 0; i < nfds; i++) {
             struct inbr_slot *s = inbr_slot_for(fds[i].fd);
             if (!s) continue;
+            if (s->raw) continue;               /* 6-Z293: kernel-owned */
             (void)inbr_drain(s);
             if (s->ring_len > 0) {
                 fds[i].revents = (short)INBR_POLLIN;

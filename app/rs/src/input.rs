@@ -155,6 +155,174 @@ impl TouchMessage {
     }
 }
 
+// ============================================================================
+// 6-Z293: negotiated EVDEV bridge protocol (abstract socket).
+//
+// ROOT CAUSE THIS REPLACES (runs 33919636462/33921156904/33922637471/
+// 33924122082 + the R12 comparison run): the abstract bridge carried raw
+// 20-byte TouchMessage records, and the fb hook's read() interposer was
+// expected to re-encode them into `struct input_event` records on the
+// guest side. It never fired — not once, on ANY loader-path image (zero
+// "INPUT read"/"INPUT poll" hook logs in every run; the app socket's
+// Send-Q drained to 0 while the guest consumed the raw 20-byte records
+// through its REAL read path). Lineage-22.2's minui `ev_get_input`
+// (disassembled from librecovery_ui.so: read(fd, ev, 24); ret != 24 →
+// fail) demands EXACTLY sizeof(struct input_event) bytes per read — a
+// 20-byte TouchMessage is permanently rejected, so every tap was
+// silently discarded and the menu probe measured frame_delta=0.
+//
+// FIX: the APP now encodes the final evdev stream itself. The guest's
+// fb hook announces its native `struct input_event` size (24 on
+// aarch64 — 2×i64 timeval — 16 on arm32/i386 — 2×i32) in a hello
+// written right after connect; the app worker encodes each touch
+// frame directly into evdev records of that size. The fb hook marks
+// the slot RAW and never touches the byte stream again (read/poll
+// pass through; ioctl faking stays). One protocol, zero guest-side
+// byte decoding, and the guest's `read(fd, buf, sizeof(input_event))`
+// gets exactly one complete record per read.
+//
+// Hello (guest → app, 5 bytes, written immediately after connect):
+//   [0xA5, 'T', 'W', 'I', ev_size]
+//   ev_size ∈ {16, 24} — sizeof(struct input_event) of the GUEST arch.
+// No hello within the timeout (legacy hook): fall back to the legacy
+// TouchMessage stream (previous behaviour).
+// ============================================================================
+
+/// Hello magic byte 0.
+const EVDEV_HELLO_MAGIC: [u8; 4] = [0xA5, b'T', b'W', b'I'];
+/// Hello size (magic + ev_size byte).
+const EVDEV_HELLO_LEN: usize = 5;
+/// `struct input_event` size on a 64-bit-timeval architecture (aarch64).
+const EVDEV_SIZE_64: usize = 24;
+/// `struct input_event` size on a 32-bit-timeval architecture (arm32/i386).
+const EVDEV_SIZE_32: usize = 16;
+/// How long the accept-side worker waits for the guest hello before
+/// falling back to the legacy TouchMessage stream.
+const EVDEV_HELLO_TIMEOUT_MS: i32 = 500;
+
+/// Negotiated per-connection write mode for the abstract bridge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeMode {
+    /// Legacy: forward 20-byte TouchMessage records (the fb hook's
+    /// read interposer was supposed to decode these — see the 6-Z293
+    /// root-cause note for why that never worked).
+    LegacyTouchMessage,
+    /// 6-Z293: write final evdev records of the guest's native
+    /// `struct input_event` size (the negotiated byte count).
+    RawEvdev(usize),
+}
+
+/// Encode ONE `struct input_event` record (little-endian) of exactly
+/// `ev_size` bytes: `{timeval, u16 type, u16 code, i32 value}`.
+///
+/// The timeval is zeroed (the guest's minui ignores timestamps and the
+/// fb hook's legacy encoder zeroed it too). `ev_size` is the guest's
+/// negotiated `sizeof(struct input_event)`: 24 = aarch64 timeval
+/// (2×i64), 16 = arm32/i386 timeval (2×i32). Any other size is refused
+/// (the hello only advertises these two).
+fn encode_evdev_record(ev_size: usize, kind: u16, code: u16, value: i32) -> Option<Vec<u8>> {
+    let time_size = ev_size.checked_sub(8)?;
+    let mut out = vec![0u8; ev_size];
+    match time_size {
+        16 => {} // aarch64: 2×i64, zeroed
+        8 => {}  // arm32/i386: 2×i32, zeroed
+        _ => return None,
+    }
+    out[time_size..time_size + 2].copy_from_slice(&kind.to_le_bytes());
+    out[time_size + 2..time_size + 4].copy_from_slice(&code.to_le_bytes());
+    out[time_size + 4..time_size + 8].copy_from_slice(&value.to_le_bytes());
+    Some(out)
+}
+
+/// Encode the full multi-touch DOWN frame (9 evdev records) — the
+/// sequence the guest's input driver expects when a finger first
+/// touches the screen. Byte-for-byte the same protocol as kr64's
+/// `devices::encode_touch_down` (which additionally serves the
+/// /dev/input/touch path), plus the legacy ABS_X/ABS_Y single-touch
+/// records the fb hook's encoder also emitted (harmless for Type-B
+/// readers, required by Type-A ones):
+///
+/// 1. `EV_ABS / ABS_MT_SLOT(slot)`
+/// 2. `EV_ABS / ABS_MT_TRACKING_ID(tracking_id)`
+/// 3. `EV_KEY / BTN_TOUCH(1)`
+/// 4. `EV_KEY / BTN_TOOL_FINGER(1)`
+/// 5. `EV_ABS / ABS_MT_POSITION_X(x)`
+/// 6. `EV_ABS / ABS_MT_POSITION_Y(y)`
+/// 7. `EV_ABS / ABS_MT_PRESSURE(pressure)`
+/// 8. `EV_ABS / ABS_X(x)`
+/// 9. `EV_ABS / ABS_Y(y)`
+/// 10. `EV_SYN / SYN_REPORT(0)`
+fn encode_evdev_touch_down(
+    ev_size: usize,
+    slot: i32,
+    tracking_id: i32,
+    x: i32,
+    y: i32,
+    pressure: i32,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(ev_size * 10);
+    for (kind, code, value) in [
+        (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, slot),
+        (
+            ev::EV_ABS as u16,
+            abs::ABS_MT_TRACKING_ID as u16,
+            tracking_id,
+        ),
+        (ev::EV_KEY as u16, btn::BTN_TOUCH as u16, 1),
+        (ev::EV_KEY as u16, btn::BTN_TOOL_FINGER as u16, 1),
+        (ev::EV_ABS as u16, abs::ABS_MT_POSITION_X as u16, x),
+        (ev::EV_ABS as u16, abs::ABS_MT_POSITION_Y as u16, y),
+        (ev::EV_ABS as u16, abs::ABS_MT_PRESSURE as u16, pressure),
+        (ev::EV_ABS as u16, abs::ABS_X as u16, x),
+        (ev::EV_ABS as u16, abs::ABS_Y as u16, y),
+        (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+    ] {
+        out.extend(encode_evdev_record(ev_size, kind, code, value)?);
+    }
+    Some(out)
+}
+
+/// Encode a multi-touch MOVE frame (7 records) — BTN_TOUCH /
+/// BTN_TOOL_FINGER stay pressed from DOWN.
+fn encode_evdev_touch_move(
+    ev_size: usize,
+    slot: i32,
+    x: i32,
+    y: i32,
+    pressure: i32,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(ev_size * 7);
+    for (kind, code, value) in [
+        (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, slot),
+        (ev::EV_ABS as u16, abs::ABS_MT_POSITION_X as u16, x),
+        (ev::EV_ABS as u16, abs::ABS_MT_POSITION_Y as u16, y),
+        (ev::EV_ABS as u16, abs::ABS_MT_PRESSURE as u16, pressure),
+        (ev::EV_ABS as u16, abs::ABS_X as u16, x),
+        (ev::EV_ABS as u16, abs::ABS_Y as u16, y),
+        (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+    ] {
+        out.extend(encode_evdev_record(ev_size, kind, code, value)?);
+    }
+    Some(out)
+}
+
+/// Encode the multi-touch RELEASE frame (5 records) — BTN_TOUCH=0 /
+/// BTN_TOOL_FINGER=0 on release so the guest's InputReader never stays
+/// stuck-pressed (same improvement kr64's encoder made over Nogitsune).
+fn encode_evdev_touch_release(ev_size: usize, slot: i32) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(ev_size * 5);
+    for (kind, code, value) in [
+        (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, slot),
+        (ev::EV_ABS as u16, abs::ABS_MT_TRACKING_ID as u16, -1),
+        (ev::EV_KEY as u16, btn::BTN_TOUCH as u16, 0),
+        (ev::EV_KEY as u16, btn::BTN_TOOL_FINGER as u16, 0),
+        (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+    ] {
+        out.extend(encode_evdev_record(ev_size, kind, code, value)?);
+    }
+    Some(out)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct device_info {
@@ -724,73 +892,204 @@ fn touch_server_abstract() {
             *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
             // Mirror the fs-listener worker: drain the channel into the
             // client fd; exit (releasing INPUT_SENDER) on write error.
-            thread::spawn(move || loop {
-                match rx.recv() {
-                    Ok(msg) => {
-                        let bytes = msg.to_bytes();
-                        let mut off = 0usize;
-                        let mut dead = false;
-                        while off < bytes.len() {
-                            let n = write(
-                                client,
-                                bytes[off..].as_ptr() as *const c_void,
-                                bytes.len() - off,
-                            );
-                            if n < 0 {
-                                // EINTR before any byte was written: retry,
-                                // don't kill a healthy connection over a
-                                // spurious signal.
-                                if std::io::Error::last_os_error().raw_os_error() == Some(EINTR)
-                                    && off == 0
+            //
+            // 6-Z293: the worker first waits for the guest's hello
+            // ([0xA5,'T','W','I', ev_size]) to pick the write mode. The
+            // hello is read HERE — inside the worker — so a client that
+            // never speaks (legacy hook) only delays this connection's
+            // first delivery by the timeout, never the accept loop
+            // (connections keep accepting; INPUT_SENDER points at the
+            // latest worker; early TouchMessages buffer in `rx` until
+            // the negotiation resolves).
+            thread::spawn(move || {
+                let mode = negotiate_bridge_mode(client);
+                if let BridgeMode::RawEvdev(sz) = mode {
+                    info!(
+                        "[INPUT] abstract bridge negotiated evdev mode (ev_size={} bytes, fd {})",
+                        sz, client
+                    );
+                }
+                let mut finger: Option<(i32, i32)> = None; // (slot, tracking_id)
+                loop {
+                    match rx.recv() {
+                        Ok(msg) => {
+                            let bytes = match mode {
+                                BridgeMode::LegacyTouchMessage => msg.to_bytes().to_vec(),
+                                BridgeMode::RawEvdev(sz) => {
+                                    match encode_evdev(sz, &mut finger, msg) {
+                                        Some(b) => b,
+                                        // Defensive drop (MOVE/UP without
+                                        // DOWN, unknown slot, bad size) —
+                                        // same semantics kr64's dispatcher
+                                        // applies on this path.
+                                        None => continue,
+                                    }
+                                }
+                            };
+                            let mut off = 0usize;
+                            let mut dead = false;
+                            while off < bytes.len() {
+                                let n = write(
+                                    client,
+                                    bytes[off..].as_ptr() as *const c_void,
+                                    bytes.len() - off,
+                                );
+                                if n < 0 {
+                                    // EINTR before any byte was written: retry,
+                                    // don't kill a healthy connection over a
+                                    // spurious signal.
+                                    if std::io::Error::last_os_error().raw_os_error() == Some(EINTR)
+                                        && off == 0
+                                    {
+                                        continue;
+                                    }
+                                    dead = true;
+                                    break;
+                                }
+                                if n == 0 {
+                                    dead = true;
+                                    break;
+                                }
+                                off += n as usize;
+                            }
+                            if dead {
+                                // 6-Z289f: this exit is the last silent link in
+                                // the touch chain — after it, INPUT_SENDER keeps
+                                // a DEAD sender and handle_touch's tx.send fails
+                                // silently forever (runs 33917738821/33915900634:
+                                // taps delivered at +23/+34 s, everything later
+                                // vanished with no log line anywhere). Name the
+                                // failure + the errno (rate-limited to 1/s).
                                 {
-                                    continue;
+                                    use std::sync::atomic::{AtomicU64, Ordering};
+                                    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+                                    let now_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    let last = LAST_LOG_MS.load(Ordering::Relaxed);
+                                    if now_ms.saturating_sub(last) >= 1000 {
+                                        LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+                                        let errno = std::io::Error::last_os_error().raw_os_error();
+                                        log::error!(
+                                            "[INPUT] abstract touch worker DEAD: write to                                          the hook bridge failed (last errno={:?}) —                                          client fd {} closed; ALL further guest touch                                          input is dropped until a reconnect",
+                                            errno, client
+                                        );
+                                    }
                                 }
-                                dead = true;
-                                break;
+                                while rx.recv().is_ok() {}
+                                close(client);
+                                return;
                             }
-                            if n == 0 {
-                                dead = true;
-                                break;
-                            }
-                            off += n as usize;
                         }
-                        if dead {
-                            // 6-Z289f: this exit is the last silent link in
-                            // the touch chain — after it, INPUT_SENDER keeps
-                            // a DEAD sender and handle_touch's tx.send fails
-                            // silently forever (runs 33917738821/33915900634:
-                            // taps delivered at +23/+34 s, everything later
-                            // vanished with no log line anywhere). Name the
-                            // failure + the errno (rate-limited to 1/s).
-                            {
-                                use std::sync::atomic::{AtomicU64, Ordering};
-                                static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
-                                let now_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
-                                let last = LAST_LOG_MS.load(Ordering::Relaxed);
-                                if now_ms.saturating_sub(last) >= 1000 {
-                                    LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
-                                    let errno = std::io::Error::last_os_error().raw_os_error();
-                                    log::error!(
-                                        "[INPUT] abstract touch worker DEAD: write to                                          the hook bridge failed (last errno={:?}) —                                          client fd {} closed; ALL further guest touch                                          input is dropped until a reconnect",
-                                        errno, client
-                                    );
-                                }
-                            }
-                            while rx.recv().is_ok() {}
+                        Err(_) => {
                             close(client);
                             return;
                         }
                     }
-                    Err(_) => {
-                        close(client);
-                        return;
-                    }
                 }
             });
         }
+    }
+}
+
+/// Read the guest's 6-Z293 hello from a freshly accepted abstract-bridge
+/// connection and pick the write mode.
+///
+/// `EVDEV_HELLO_TIMEOUT_MS` bound via `SO_RCVTIMEO` on a THROWAWAY dup
+/// of the socket fd: the timeout must only affect THIS read, not the
+/// socket's lifetime (the worker later writes touch frames through the
+/// original fd with no timeout — a 500 ms write timeout would corrupt
+/// the frame stream under load). If the peer closes before the hello,
+/// the dup read returns 0 — also legacy mode (the worker's next write
+/// will fail and take the normal dead-worker path).
+fn negotiate_bridge_mode(client: c_int) -> BridgeMode {
+    unsafe {
+        let dup_fd = dup(client);
+        if dup_fd < 0 {
+            return BridgeMode::LegacyTouchMessage;
+        }
+        let timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: (EVDEV_HELLO_TIMEOUT_MS as i64) * 1000,
+        };
+        setsockopt(
+            dup_fd,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout as *const libc::timeval as *const c_void,
+            std::mem::size_of::<libc::timeval>() as u32,
+        );
+        let mut hello = [0u8; EVDEV_HELLO_LEN];
+        let mut got = 0usize;
+        while got < EVDEV_HELLO_LEN {
+            let n = read(
+                dup_fd,
+                hello[got..].as_mut_ptr() as *mut c_void,
+                EVDEV_HELLO_LEN - got,
+            );
+            if n < 0 {
+                let e = std::io::Error::last_os_error().raw_os_error();
+                if e == Some(EINTR) {
+                    continue;
+                }
+                break; // timeout (EAGAIN) or error — legacy mode
+            }
+            if n == 0 {
+                break; // peer hung up — legacy mode (dead-worker path later)
+            }
+            got += n as usize;
+        }
+        close(dup_fd);
+        if got == EVDEV_HELLO_LEN && hello[0..4] == EVDEV_HELLO_MAGIC {
+            let ev_size = hello[4] as usize;
+            if ev_size == EVDEV_SIZE_64 || ev_size == EVDEV_SIZE_32 {
+                return BridgeMode::RawEvdev(ev_size);
+            }
+            log::warn!(
+                "[INPUT] abstract bridge hello advertised unsupported ev_size={} — legacy mode",
+                ev_size
+            );
+        }
+        BridgeMode::LegacyTouchMessage
+    }
+}
+
+/// Encode one guest-bound `TouchMessage` into the negotiated evdev
+/// stream. `finger` carries the per-connection active-finger state:
+/// `None` = finger up; `Some((slot, tracking_id))` = pressed.
+///
+/// Semantics mirror kr64's touch dispatcher: DOWN assigns a fresh
+/// tracking id; MOVE/UP for a slot other than the active one are
+/// dropped (single-finger virtual screen); UP for the active slot
+/// emits ONE release frame (handle_touch's ACTION_UP fans out a
+/// record per slot — only the active one produces bytes here).
+fn encode_evdev(
+    ev_size: usize,
+    finger: &mut Option<(i32, i32)>,
+    msg: TouchMessage,
+) -> Option<Vec<u8>> {
+    static NEXT_TRACKING_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+    match msg.action {
+        touch_action::DOWN => {
+            let tid = NEXT_TRACKING_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *finger = Some((msg.pointer_id, tid));
+            encode_evdev_touch_down(ev_size, msg.pointer_id, tid, msg.x, msg.y, msg.pressure)
+        }
+        touch_action::MOVE => match *finger {
+            Some((slot, _)) if slot == msg.pointer_id => {
+                encode_evdev_touch_move(ev_size, slot, msg.x, msg.y, msg.pressure)
+            }
+            _ => None,
+        },
+        touch_action::UP | touch_action::CANCEL => match *finger {
+            Some((slot, _)) if slot == msg.pointer_id => {
+                *finger = None;
+                encode_evdev_touch_release(ev_size, slot)
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1029,6 +1328,170 @@ mod tests {
         let mut buf = msg.to_bytes().to_vec();
         buf.push(0xff);
         assert!(TouchMessage::parse(&buf).is_some());
+    }
+
+    // ── 6-Z293: negotiated evdev bridge ─────────────────────────────
+    //
+    // The guest's minui reads ONE sizeof(struct input_event) record per
+    // read() and rejects anything else (lineage-22.2's ev_get_input:
+    // read(fd, ev, 24); ret != 24 → fail). These tests pin the exact
+    // record layout for both negotiated sizes.
+
+    /// Decode the (type, code, value) of record `i` in an encoded
+    /// evdev frame of `ev_size` bytes.
+    fn evdev_rec(bytes: &[u8], i: usize, ev_size: usize) -> (u16, u16, i32) {
+        let time_size = ev_size - 8;
+        let b = &bytes[i * ev_size..(i + 1) * ev_size];
+        assert!(
+            b[0..time_size].iter().all(|&x| x == 0),
+            "timeval must be zeroed"
+        );
+        (
+            u16::from_le_bytes([b[time_size], b[time_size + 1]]),
+            u16::from_le_bytes([b[time_size + 2], b[time_size + 3]]),
+            i32::from_le_bytes([
+                b[time_size + 4],
+                b[time_size + 5],
+                b[time_size + 6],
+                b[time_size + 7],
+            ]),
+        )
+    }
+
+    /// aarch64 (24-byte) DOWN frame: 10 records in the documented
+    /// order — MT slot/tracking-id, BTN_TOUCH + BTN_TOOL_FINGER press,
+    /// MT position + pressure, legacy ABS_X/ABS_Y, SYN_REPORT.
+    #[test]
+    fn evdev_down_frame_24_byte_layout() {
+        let d = encode_evdev_touch_down(24, 0, 7, 360, 769, 42).unwrap();
+        assert_eq!(d.len(), 240);
+        let expect: [(u16, u16, i32); 10] = [
+            (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, 0),
+            (ev::EV_ABS as u16, abs::ABS_MT_TRACKING_ID as u16, 7),
+            (ev::EV_KEY as u16, btn::BTN_TOUCH as u16, 1),
+            (ev::EV_KEY as u16, btn::BTN_TOOL_FINGER as u16, 1),
+            (ev::EV_ABS as u16, abs::ABS_MT_POSITION_X as u16, 360),
+            (ev::EV_ABS as u16, abs::ABS_MT_POSITION_Y as u16, 769),
+            (ev::EV_ABS as u16, abs::ABS_MT_PRESSURE as u16, 42),
+            (ev::EV_ABS as u16, abs::ABS_X as u16, 360),
+            (ev::EV_ABS as u16, abs::ABS_Y as u16, 769),
+            (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+        ];
+        for (i, e) in expect.iter().enumerate() {
+            assert_eq!(evdev_rec(&d, i, 24), *e, "DOWN24 record {i}");
+        }
+    }
+
+    /// arm32 (16-byte) MOVE frame: 7 records, type/code/value at
+    /// offset 8..16 (2×i32 timeval).
+    #[test]
+    fn evdev_move_frame_16_byte_layout() {
+        let m = encode_evdev_touch_move(16, 0, 150, 250, 200).unwrap();
+        assert_eq!(m.len(), 112);
+        let expect: [(u16, u16, i32); 7] = [
+            (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, 0),
+            (ev::EV_ABS as u16, abs::ABS_MT_POSITION_X as u16, 150),
+            (ev::EV_ABS as u16, abs::ABS_MT_POSITION_Y as u16, 250),
+            (ev::EV_ABS as u16, abs::ABS_MT_PRESSURE as u16, 200),
+            (ev::EV_ABS as u16, abs::ABS_X as u16, 150),
+            (ev::EV_ABS as u16, abs::ABS_Y as u16, 250),
+            (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+        ];
+        for (i, e) in expect.iter().enumerate() {
+            assert_eq!(evdev_rec(&m, i, 16), *e, "MOVE16 record {i}");
+        }
+    }
+
+    /// RELEASE frame: BTN_TOUCH=0 / BTN_TOOL_FINGER=0 present (the
+    /// stuck-press fix), tracking id −1, 5 records in both sizes.
+    #[test]
+    fn evdev_release_frame_layout() {
+        for ev_size in [24usize, 16] {
+            let r = encode_evdev_touch_release(ev_size, 0).unwrap();
+            assert_eq!(r.len(), ev_size * 5);
+            assert_eq!(
+                evdev_rec(&r, 1, ev_size),
+                (ev::EV_ABS as u16, abs::ABS_MT_TRACKING_ID as u16, -1)
+            );
+            assert_eq!(
+                evdev_rec(&r, 2, ev_size),
+                (ev::EV_KEY as u16, btn::BTN_TOUCH as u16, 0)
+            );
+            assert_eq!(
+                evdev_rec(&r, 3, ev_size),
+                (ev::EV_KEY as u16, btn::BTN_TOOL_FINGER as u16, 0)
+            );
+            assert_eq!(
+                evdev_rec(&r, 4, ev_size),
+                (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0)
+            );
+        }
+    }
+
+    /// Only 24 (aarch64) and 16 (arm32/i386) byte records are legal —
+    /// anything else must be refused (the hello only advertises these).
+    #[test]
+    fn evdev_record_rejects_unknown_sizes() {
+        assert!(encode_evdev_record(20, ev::EV_SYN as u16, 0, 0).is_none());
+        assert!(encode_evdev_record(0, ev::EV_SYN as u16, 0, 0).is_none());
+        assert!(encode_evdev_touch_down(20, 0, 1, 1, 1, 1).is_none());
+        assert!(encode_evdev_touch_move(32, 0, 1, 1, 1).is_none());
+        assert!(encode_evdev_touch_release(20, 0).is_none());
+    }
+
+    /// The full per-connection state machine: DOWN assigns a fresh
+    /// tracking id and emits the DOWN frame; MOVE for the active slot
+    /// encodes; UP emits exactly ONE release frame (handle_touch fans
+    /// out a UP record per slot — the rest must be dropped); MOVE/UP
+    /// without DOWN are dropped; a new DOWN re-arms.
+    #[test]
+    fn evdev_state_machine_single_finger() {
+        let mut finger: Option<(i32, i32)> = None;
+
+        // UP before any DOWN → dropped.
+        assert!(encode_evdev(24, &mut finger, touch_msg(touch_action::UP, 0, 0, 0, 0)).is_none());
+        assert!(finger.is_none());
+
+        // DOWN → DOWN frame, finger armed with tracking id 1.
+        let b = encode_evdev(
+            24,
+            &mut finger,
+            touch_msg(touch_action::DOWN, 0, 360, 769, 42),
+        )
+        .expect("DOWN must encode");
+        assert_eq!(b.len(), 240);
+        assert_eq!(finger, Some((0, 1)));
+
+        // MOVE for the active slot → MOVE frame.
+        let b = encode_evdev(
+            24,
+            &mut finger,
+            touch_msg(touch_action::MOVE, 0, 361, 770, 42),
+        )
+        .expect("MOVE must encode");
+        assert_eq!(b.len(), 168); // 7 × 24
+        assert_eq!(finger, Some((0, 1)));
+
+        // UP fan-out: slot 0 releases; the other 9 slots are dropped.
+        let mut releases = 0;
+        for slot in 0..10 {
+            if encode_evdev(24, &mut finger, touch_msg(touch_action::UP, slot, 0, 0, 0)).is_some() {
+                releases += 1;
+            }
+        }
+        assert_eq!(releases, 1, "exactly one release frame for the active slot");
+        assert!(finger.is_none());
+
+        // New DOWN gets a NEW tracking id.
+        let b = encode_evdev(24, &mut finger, touch_msg(touch_action::DOWN, 2, 10, 20, 5))
+            .expect("re-DOWN must encode");
+        assert_eq!(b.len(), 240);
+        assert_eq!(finger, Some((2, 2)));
+        // CANCEL for the active slot releases too.
+        assert!(
+            encode_evdev(24, &mut finger, touch_msg(touch_action::CANCEL, 2, 0, 0, 0)).is_some()
+        );
+        assert!(finger.is_none());
     }
 
     /// Verify the on-wire byte layout of a `TouchMessage` (little-endian,
