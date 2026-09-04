@@ -19540,9 +19540,18 @@ pub fn run_ptrace_loop(
                                             target = format!(" path={}", got);
                                         }
                                     }
-                                } else if syscall_num == 34 {
+                                } else if syscall_num == 34 || syscall_num == 79 {
                                     // 6-Z275: mkdir(path, mode) on aarch64 —
                                     // arg1 = path (from the ENTRY stash).
+                                    // 6-Z290: ALSO fstatat/newfstatat
+                                    // (aarch64 nr=79) — arg1 = pathname,
+                                    // arg0 = dirfd. The 6-Z285 lineage
+                                    // diagnosis measured an unnamed 1Hz
+                                    // fstatat-ENOENT loop (~8-10s of boot
+                                    // budget) whose path this diag never
+                                    // named (openat-only naming); if the
+                                    // 6-Z287 misc-node fix doesn't kill
+                                    // the loop, the next run names it.
                                     let path_ptr = stashed_a1;
                                     if path_ptr > 0 {
                                         let mut buf = [0u8; 128];
