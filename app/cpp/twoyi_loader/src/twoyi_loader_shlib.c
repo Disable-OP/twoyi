@@ -4639,6 +4639,16 @@ static int should_translate(const char *path) {
     // ENOENT and minui deterministically falls back to
     // /dev/graphics/fb0, which the fb_hook serves.
     if (strncmp(path, "/dev/dri", 8) == 0 && (path[8] == 0 || path[8] == '/')) return 1;
+    // 6-Z287: /dev/block maps into the GUEST rootfs — kr64 stages the
+    // image's by-name nodes there (devices.rs create_by_name_block_nodes,
+    // parsed from the guest's own fstabs). The /dev/ catch-all below used
+    // to pass block paths through to the HOST: the sandbox has no host
+    // /dev/block, so the guest's misc BCB access ENOENT'd for ~10s of
+    // retries plus an on-screen "Failed to clear BCB message" error
+    // (lineage run 33900850051) — and a real-device host would LEAK its
+    // own partitions into the guest (6-Z187 guests-only). Must sit before
+    // the /dev/ catch-all.
+    if (strncmp(path, "/dev/block", 10) == 0 && (path[10] == 0 || path[10] == '/')) return 1;
     // Translate binder devices to rootfs — kr64 mounts binderfs there
     // so the guest has its own binder domain separate from the host.
     if (strcmp(path, "/dev/binder") == 0 ||
