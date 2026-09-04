@@ -40,7 +40,14 @@ SCREEN_H = 640
 
 def adb(*args, timeout=30):
     try:
+        # 6-Z281: errors="replace" — `run-as ... cat <file>` pulls guest
+        # files that are frequently BINARY (partial fb0 snapshots, kmsg
+        # rings, staging dirs). The default strict UTF-8 decode crashed
+        # the whole harness AFTER the E2E itself had run (lineage run
+        # 33851414641: "UnicodeDecodeError: 'utf-8' codec can't decode
+        # byte 0x9d" at 11:25 — the boot verdict was never written).
         r = subprocess.run(ADB + list(args), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
                            timeout=timeout)
         return r.stdout.strip()
     except subprocess.TimeoutExpired:
