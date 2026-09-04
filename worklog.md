@@ -24147,3 +24147,68 @@ Stage Summary:
   service-registration wait (6-Z276 callbacks), an HIDL get to the zombie
   hwservicemanager, or a parent/child pipe handshake. One more diagnostic
   round (4c9b830+) closes it.
+
+---
+Task ID: 6-Z284 — THE LINEAGE MINUI ROOT CAUSE: the hook's EVIOCGBIT emulation overwrote the caller's stack
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: decode the 4c9b830 lineage artifacts; find and fix why the recovery aborts before UI init.
+
+Work Log:
+- 4c9b830 run (33871924782) verdict: BOOT_FAIL, display_mode=recovery_loader,
+  SINGLE_FRAME, ui=NOT_REACHED — but kmsg shows init reached late-init and
+  started service 'recovery' (pid 2581).
+- THE ABORT: at +10.614s the recovery logged
+  "[glog F/abort] bad_function_call was thrown in -fno-exceptions mode" →
+  abort() INTERCEPTED (6-Z park held: no CPU burn) → maps-at-fatal → parked
+  forever → no gr_init, no input threads → SINGLE_FRAME.
+- caller_pc 0xf433290d32fc resolved (via the maps stream in the DIAG log) to
+  the guest's system/lib64/libc++.so; disassembly + string extraction
+  confirmed the libc++ __throw_bad_function_call tail (adr "libc++", fmt
+  "%s", abort, udf trap).
+- Timeline: open event1/event0 (hook INPUT bridge → touch sockets fd 9/10) →
+  EVIOCGNAME(64)=0 + EVIOCGBIT(0,8)=4 per device (ev_init /
+  should_add_input_device) → EVIOCGBIT(0,8)=4 on fd 9 → EVIOCGBIT(EV_KEY,
+  KEY_MAX=767)=96 on fd 9 → FIRST key_detected() → abort. That is exactly
+  ev_iterate_available_keys (LOS 22.2 minui, linked into librecovery_ui.so).
+- Binary proof: downloaded lineage-22.2-sailfish boot.img from the corpus
+  URL, XZ ramdisk, extracted system/bin/recovery + librecovery_ui.so. The
+  EVIOCGBIT(EV_KEY, KEY_MAX) request is built at RUNTIME (movz/movk
+  0x4521/0x82ff) ONLY inside librecovery_ui.so's exported
+  _Z25ev_iterate_available_keysRKNSt3__18functionIFviEEE (0x37880), twin in
+  ev_iterate_touch_inputs.
+- Invocation path reads [param+0x20] (libc++ std::function __f_): cbz x0 →
+  __throw_bad_function_call (0x379a8 → 0x2d17c). The ONLY caller:
+  RecoveryUI::Init+0xac via PLT stub 0x58b00 — and the disassembly there
+  shows the function object PROPERLY constructed (vtable+0x10, member ptr,
+  (0,this), __f_=self). So __f_ was valid at call time and read NULL one
+  ioctl later.
+- ROOT CAUSE: twrp_fb_hook.c input_ioctl() EVIOCGBIT path did
+  my_memset(argp, 0, size) with size=_IOC_SIZE. For EVIOCGBIT(EV_KEY,
+  KEY_MAX) size=767, but the guest's key_bits buffer is
+  BITS_TO_LONGS(KEY_MAX)*8=96 bytes at sp+0x10 inside a 0xd0 frame
+  (ev_iterate_available_keys). The 767-byte memset overwrote ~575 bytes of
+  RecoveryUI::Init's stack ABOVE the buffer, zeroing the std::function
+  object (its __f_ at obj+0x20). The real kernel's bits_to_user() writes at
+  most (maxbit+7)/8 bytes — 96 for EV_KEY — whatever len is requested.
+- Why other recoveries were immune: TWRP-era minui passes
+  len=sizeof(bits)=96 → memset(96) fits the 96-byte buffer. Only new-gen
+  minui (AOSP 12+/LOS 20+ ev_iterate_*) passes len=KEY_MAX with a 96-byte
+  buffer.
+- FIX (1fa9515): kernel-faithful write bound — need = (maxbit+7)/8 for ev
+  (KEY 96, ABS 8, SYN 4, REL 2, MSC/SND/REP/SW 1, LED 2, FF 16), capped to
+  len; memset ONLY need bytes; bits set within cap as before; return need
+  (identical to the old min(size,need) contract). NAME/ID/ABS paths
+  untouched.
+- 6-Z283 REATTRIBUTION: the "main thread parks in the binder pool forever"
+  stall-dump reading was a single-sample snapshot. The recovery actually
+  PROGRESSES to input init (+10.6s) and dies at the bad_function_call
+  abort. The binder looper registration (BC_ENTER_LOOPER, SET_MAX_THREADS
+  15→0) is the recovery's legitimate pre-UI ProcessState wiring on the main
+  thread. No binder change is needed for this blocker.
+
+Stage Summary:
+- lineage-22.2-sailfish UI blocker root-caused to a hook stack-overwrite and
+  fixed (twrp_fb_hook.c EVIOCGBIT kernel-faithful write bound). Dispatched
+  E2E on 1fa9515: lineage (expect BOOT_OK + UI + touch), R12 lavender +
+  TWRP angler (regression: must stay instant).
