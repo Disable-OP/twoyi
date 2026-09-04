@@ -23904,3 +23904,57 @@ Stage Summary:
   R12 reaches full interactive UI by ~40s. TWRP whyred green. Lineage minui bring-up
   wave awaits a dispatch on the repaired HEAD. Next: commit + push this fix, dispatch
   lineage (AOSP) verification, then the health-HAL/battery stream (6-Z272f-b).
+
+---
+Task ID: 6-Z274 + 6-Z275 (same session, continued) — the 10 s boot-partition hole CLOSED; minui single-frame diagnostic upgraded
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: kill the deterministic 10 s LineageOS boot wait; un-blind the focused syscall DIAG.
+
+Work Log:
+- 6-Z273 pt1 (34ac43a): HEAD build repair (android21-safe process_vm_readv). CI 33846141478 green; the three 34ac43a dispatches completed SUCCESS.
+- 6-Z273 pt2 (30f7a5c): the 6-Z272f-b/recovery diag ARMING moved out of the 6-Z238 scan budget (R12 run 33780708260 produced ZERO armed lines — budget exhausted by early execs before the health HAL exec'd at +10490 ms).
+- 6-Z274 (0ff659f): THE 10 s BOOT-PARTITION HOLE FULLY DECODED AND FIXED.
+  * AOSP chain: SetInitAvbVersionInRecovery → FirstStageMountVBootV2::InitDevices →
+    BlockDevInitializer::InitBootDevicesFromPartUuid → RegenerateUevents (found ZERO
+    events) → uevent_listener_.Poll(callback, 10 s) on NETLINK_KOBJECT_UEVENT.
+  * Guest cmdline has NO androidboot.boot_part_uuid → CheckUeventForBootPartUuid
+    returns true on the FIRST uevent — the wait only survived because NO uevent ever
+    passed libcutils' uevent_kernel_recv() validation (SCM_CREDENTIALS cmsg required,
+    nl_pid==0, nl_groups!=0; anything else → bzero + EIO + -1).
+  * The 6-Z271b synthetic delivery was a SILENT NO-OP for recvmsg: it read arg2/arg3 as
+    (buf,len) but recvmsg's arg2 is the struct msghdr* and arg3 is flags(=0) — the
+    buflen>0 guard failed, nothing written, return -EAGAIN. ZERO "DELIVERED" lines in
+    every artifact. (The dm wait resolved via the pre-created fake /sys uevent FILE
+    instead — RegenerateUeventsForPath.)
+  * FIX: synthetic_uevent_recvmsg_side_effects() materialises the FULL kernel side
+    effects for a 64-bit guest: payload via msg_iov[0], sockaddr_nl{AF_NETLINK,
+    nl_pid=0, nl_groups=1}, SCM_CREDENTIALS cmsg (ucred uid=0), msg_flags=0.
+    recvmsg vs recvfrom arg shapes distinguished at ENTRY + both EXIT sites; the
+    recvfrom sockaddr now carries groups=1 (old groups=0 was itself a guaranteed
+    rejection). New test z274_uevent_netlink_metadata_is_kernel_abi (caught a real
+    groups byte-order bug pre-push). 707/707.
+- VERDICTS on 34ac43a (all three dispatches SUCCESS):
+  * lineage-22.2-sailfish 33846196526: BOOT_FAIL but ADVANCED — display_mode
+    recovery_loader, blit_digest_count=1 (ONE frame — the app's initial fb0 file —
+    then never again), recovery ALIVE at 55 s in its main-loop ppoll, touch IPC
+    connected at +10.5 s, ZERO fatal signals. The 6-Z272b diag armed (+408 ms) and
+    the first 150 syscalls are clean; the named failures (bootstrap-lib ENOENT
+    fallbacks, proc/sys EACCES) are benign — but the flat 400 FAILED cap died at
+    +497 ms, so minui's actual graphics attempts (1-10 s) were invisible.
+  * orangefox-R12.0-lavender 33846194567: BOOT_OK — full page navigation
+    (main→advanced→filemanagerlist→menu→filemanageroptions). Battery still null
+    (health-HAL stream open).
+  * twrp-3.2.3-0-angler 33846192912 (Android 8-era): BOOT_OK, battery_ok=TRUE,
+    TWRP theme pages rendered. Old-generation genericity CONFIRMED.
+- 6-Z275 (42093e7): the focused-DIAG FAILED budget is now TIME-WINDOWED
+  (120 per rolling 5 s per pid — bounded 24 lines/s, whole-boot coverage) and
+  mkdir failures name their target path (arg1). focused_diag_pids value is now
+  (seen, window, used).
+
+Stage Summary:
+- keystore2 hole CLOSED (verified), old-gen TWRP verified, R12 verified green on the
+  repaired HEAD, and the last deterministic 10 s hole (boot-partition poll) has a
+  kernel-semantics-correct fix in flight. Next: dispatch lineage + R12 on 42093e7 —
+  the lineage run now names minui's graphics syscalls for the whole boot; the R12 run
+  finally carries the ARMED health-HAL trace (battery stream 6-Z272f-b).
