@@ -1992,8 +1992,26 @@ ssize_t read(int fd, void *buf, size_t count) {
             real_read = (ssize_t (*)(int, void *, size_t))hook_de_self(
                 (void *)dlsym(RTLD_NEXT, "read"), "read"); /* 6-Z246 */
         }
-        if (real_read) return real_read(fd, buf, count);
-        return (ssize_t)raw_syscall3(SYS_read, fd, (long)buf, (long)count);
+        n = real_read ? (long)real_read(fd, buf, count)
+                      : raw_syscall3(SYS_read, fd, (long)buf, (long)count);
+        /* 6-Z293b: make the raw delivery OBSERVABLE — the whole point
+         * of raw mode is that the guest's REAL read path consumes the
+         * records, so the legacy "INPUT read" logs never fire and the
+         * artifacts can't tell delivered-but-ignored from
+         * never-delivered. Log the first 8 raw input-fd reads (fd,
+         * requested count, actual return — for lineage's ev_get_input
+         * the contract is ret == count == sizeof(input_event)). */
+        if (g_inbr_log_read < 8) {
+            g_inbr_log_read++;
+            write_str(2, "[twrp_fb_hook] INPUT raw read(fd=");
+            write_num(2, fd);
+            write_str(2, ", count=");
+            write_num(2, (int)count);
+            write_str(2, ") -> ");
+            write_num(2, (int)n);
+            write_str(2, "\n");
+        }
+        return (ssize_t)n;
     }
 
     if (!s) {
