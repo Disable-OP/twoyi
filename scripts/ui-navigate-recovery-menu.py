@@ -47,6 +47,7 @@ _spec = importlib.util.spec_from_file_location(
 nav = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(nav)  # module main() is __main__-guarded
 
+TAG = chr(91) + "menu-probe" + chr(93)
 ART = "/tmp/ui-e2e-artifacts"
 PROBE_JSON = os.path.join(ART, "menu-probe.json")
 
@@ -136,6 +137,18 @@ def screencap_bytes():
     return data
 
 
+
+def adb_out(cmd, timeout=20):
+    """Run a shell command via adb and return its combined output (the
+    probe needs RAW results — `input tap` failures print usage/error text
+    that the effect check alone would silently bury)."""
+    try:
+        r = subprocess.run(nav.ADB + ["shell", cmd],
+                           capture_output=True, text=True, timeout=timeout)
+        return ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        return f"<threw {e!r}>"
+
 INPUT_READS_RE = re.compile(r"INPUT read\(fd=\d+\) -> \d+ bytes")
 
 
@@ -155,6 +168,7 @@ def tap_with_effect(x, y):
     proof the events crossed the bridge. Returns the channel name that
     worked (or None if no channel produced events)."""
     channels = [
+        ("adb-input", lambda: adb_out(f"input tap {x} {y}")),
         ("broadcast", lambda: nav._broadcast_cmd(f"input tap {x} {y}")),
         ("sendevent", lambda: nav._sendevent_cmd(f"input tap {x} {y}")),
         ("ladder", lambda: nav.input_cmd(f"input tap {x} {y}")),
@@ -162,16 +176,18 @@ def tap_with_effect(x, y):
     for name, fn in channels:
         before = count_input_reads()
         try:
-            fn()
+            out = fn()
         except Exception as e:
-            print(f"  [menu-probe] tap channel {name} threw {e!r}")
+            print(TAG, "tap channel", name, "threw", repr(e))
             continue
+        if out:
+            print(TAG, "tap channel", name, "raw out:", repr(str(out)[:200]))
         for _ in range(6):  # up to ~3 s for the events to cross
             time.sleep(0.5)
             if count_input_reads() > before:
-                print(f"  [menu-probe] tap via {name}: events REACHED the guest")
+                print(TAG, "tap via", name, "- events REACHED the guest")
                 return name
-        print(f"  [menu-probe] tap via {name}: no guest events — next channel")
+        print(TAG, "tap via", name, "- no guest events, next channel")
     return None
 
 
@@ -196,13 +212,13 @@ def main():
             "pages present) — probe skipped, ui-navigate owns TWRP runs")
         with open(PROBE_JSON, "w") as f:
             json.dump(probe, f, indent=2)
-        print(f"  [menu-probe] skip: {probe['reason']}")
+        print(TAG, "skip:", probe["reason"])
         return
 
     W, H = screen_size()
     probe["ran"] = True
     probe["screen"] = [W, H]
-    print(f"  [menu-probe] AOSP menu candidate — screen {W}x{H}")
+    print(TAG, f"AOSP menu candidate — screen {W}x{H}")
 
     # Stability baseline: two captures ~4s apart of the untouched menu.
     c0 = screencap_bytes()
@@ -217,6 +233,29 @@ def main():
 
     frame_before = blit_frame_counter(logcat_dump())
     probe["frame_before"] = frame_before
+
+    # 6-Z289d: capture the INPUT/FOCUS ground truth for this exact moment.
+    # Run 33914083301: adb was ALIVE at probe time (screenshots rode it),
+    # system_server alive at teardown, yet adb `input tap`, am broadcast
+    # and sendevent ALL failed to produce a single guest INPUT read.
+    # These dumps name the focused window, the InputDispatcher's view of
+    # the touch, and the resumed activity — no more guessing.
+    for label, cmd in (
+        ("focused-window", "dumpsys window windows | grep -E "
+         "'mCurrentFocus|mFocusedWindow|mAwakened|mHasSurface' | head -12"),
+        ("input-dispatch", "dumpsys input | grep -A 8 "
+         "'InputStreamState|FocusedWindow|dispatch' | head -40"),
+        ("resumed-activity", "dumpsys activity activities | grep -E "
+         "'mResumedActivity|topResumedActivity' | head -6"),
+    ):
+        out = adb_out(cmd, timeout=25)
+        path = os.path.join(ART, f"menu-probe-{label}.txt")
+        try:
+            with open(path, "w") as f:
+                f.write(out or "<empty>")
+        except OSError:
+            pass
+    print(TAG, label + ":", (out or "<empty>")[:200])
 
     # Safe tap ladder with REAL menu geometry, measured from the
     # lineage-22.2-sailfish final screenshot (720x1600): rows are
