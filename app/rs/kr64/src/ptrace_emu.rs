@@ -11382,6 +11382,11 @@ pub fn run_ptrace_loop(
     // flooding the DIAG budget for the whole system.
     let mut focused_diag_pids: std::collections::HashMap<libc::pid_t, (u64, u64, u64)> =
         std::collections::HashMap::new();
+    // 6-Z278: per-pid ENTRY-arg stash for the focused diag — the arg
+    // registers are clobbered at the EXIT stop, so the EXIT-side target
+    // naming reads (nr, arg1, arg2) snapshotted at the ENTRY stop.
+    let mut focused_diag_entry_args: std::collections::HashMap<libc::pid_t, (i64, u64, u64)> =
+        std::collections::HashMap::new();
     // 6-Z271o: fatal-evidence follow window — once a fb_hook fatal marker
     // is seen, the next N writes bypass the DIAG budget (the fatal path
     // logs kind, caller_pc and the maps in SEPARATE write() calls; a
@@ -14329,6 +14334,24 @@ pub fn run_ptrace_loop(
                     },
                     nr: syscall_num,
                 });
+
+                // 6-Z278: focused-diag ENTRY-arg stash — arg registers are
+                // CLOBBERED at the EXIT stop (aarch64 x0 = return value,
+                // x1-x5 undefined), which is why the 6-Z275 mkdir target
+                // names printed empty (arg1 read at EXIT = garbage) while
+                // openat names (arg2 at EXIT) only sometimes survived.
+                // Armed pids snapshot (nr, arg1, arg2) HERE; the EXIT-side
+                // focused diag reads the stash.
+                if focused_diag_pids.contains_key(&pid) && is_entry {
+                    focused_diag_entry_args.insert(
+                        pid,
+                        (
+                            syscall_num,
+                            get_syscall_arg(&regs, abi.reg_arg1),
+                            get_syscall_arg(&regs, abi.reg_arg2),
+                        ),
+                    );
+                }
 
                 // Task 6-Z57: ENOSYS early override (6-Z68: EXIT stops ONLY —
                 // writing rax at an ENTRY stop is a no-op that the syscall
@@ -19260,6 +19283,12 @@ pub fn run_ptrace_loop(
                     // covers the whole boot).
                     if let Some(seen) = focused_diag_pids.get_mut(&pid) {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // 6-Z278: the ENTRY-arg stash (see the write site at
+                        // the recent_stops ring) — EXIT regs are clobbered.
+                        let (_stashed_nr, stashed_a1, stashed_a2) = focused_diag_entry_args
+                            .get(&pid)
+                            .copied()
+                            .unwrap_or((0, 0, 0));
                         if seen.0 < 150 {
                             seen.0 += 1;
                             log(&format!(
@@ -19278,9 +19307,17 @@ pub fn run_ptrace_loop(
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
                             let window = now_ms / FAIL_WINDOW_MS;
+                            // 6-Z278: mkdir-EEXIST is a benign churn class
+                            // (84 events in 10 ms ate the whole R12 health-HAL
+                            // budget — run 33848916173) — it gets a small
+                            // reserved slice and never crowds out the
+                            // interesting failures.
+                            let benign_eexist = syscall_num == 34 && ret == -17;
                             let allowed = {
                                 let (_, w, u) = *seen;
-                                if w != window {
+                                if benign_eexist {
+                                    u < 16
+                                } else if w != window {
                                     // New window: reset (store back below).
                                     true
                                 } else {
@@ -19301,9 +19338,11 @@ pub fn run_ptrace_loop(
                                 // 33846196526 run.
                                 let mut target = String::new();
                                 if syscall_num == 66 {
-                                    // writev: arg1 = fd (aarch64/x86_64 both
-                                    // keep fd in the first arg register).
-                                    let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                    // writev: arg1 = fd (from the ENTRY
+                                    // stash — the EXIT x0/x1 are clobbered;
+                                    // 33848916173 logged "fd-107" which was
+                                    // just the ENOTCONN return value).
+                                    let fd = stashed_a1 as i32;
                                     let link = format!("/proc/{}/fd/{}", pid, fd);
                                     if let Ok(dest) = std::fs::read_link(&link) {
                                         target = format!(" fd{} -> {}", fd, dest.display());
@@ -19311,7 +19350,7 @@ pub fn run_ptrace_loop(
                                         target = format!(" fd{} -> <gone>", fd);
                                     }
                                 } else if syscall_num == abi.openat {
-                                    let path_ptr = get_syscall_arg(&regs, abi.reg_arg2) as u64;
+                                    let path_ptr = stashed_a2;
                                     if path_ptr > 0 {
                                         let mut buf = [0u8; 128];
                                         let mut got = String::new();
@@ -19339,9 +19378,8 @@ pub fn run_ptrace_loop(
                                     }
                                 } else if syscall_num == 34 {
                                     // 6-Z275: mkdir(path, mode) on aarch64 —
-                                    // arg1 = path. (x86_64 mkdir is 83; the
-                                    // corpus guests are arm64.)
-                                    let path_ptr = get_syscall_arg(&regs, abi.reg_arg1) as u64;
+                                    // arg1 = path (from the ENTRY stash).
+                                    let path_ptr = stashed_a1;
                                     if path_ptr > 0 {
                                         let mut buf = [0u8; 128];
                                         let n = process_vm_readv_chunk(pid, path_ptr, &mut buf);

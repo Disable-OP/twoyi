@@ -3108,7 +3108,26 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
                     "(no logd in recovery images — liblog would block)\n");
                 write_str(2, msg);
             }
-            return (int)syscall(NR_openat, AT_FDCWD, kmsg_path, O_WRONLY, 0);
+            // 6-Z279 FIX: the caller KEEPS writing to ITS OWN sockfd after
+            // connect() — the previous code returned a FRESH openat() fd
+            // number from connect(), which is neither 0 (success) nor -1
+            // (failure), so liblog treated the connect as FAILED and its
+            // socket fd stayed UNCONNECTED → every log writev returned
+            // ENOTCONN in a retry loop (the health-HAL run 33848916173:
+            // 26+ "FAILED syscall nr=66 ret=-107" events at +10550ms, the
+            // battery stream's stall site). Put the kmsg fd IN PLACE OF
+            // the socket fd (raw syscalls — no hook recursion), then
+            // return 0 (real connect success). Subsequent writev(sockfd)
+            // lands in /dev/__kmsg__: unbounded, non-blocking, and the
+            // log lines still land in the kmsg artifacts.
+            int kmsg_fd = (int)syscall(NR_openat, AT_FDCWD, kmsg_path, O_WRONLY, 0);
+            if (kmsg_fd >= 0) {
+                syscall(SYS_dup3, kmsg_fd, sockfd, 0);
+                syscall(SYS_close, kmsg_fd);
+                return 0;
+            }
+            // kmsg open failed — fall through to the real connect so the
+            // caller sees the honest error instead of a fake success.
         }
         if (un->sun_path[0] == '/' && should_translate(un->sun_path)) {
             char translated[600];
