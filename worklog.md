@@ -24212,3 +24212,58 @@ Stage Summary:
   fixed (twrp_fb_hook.c EVIOCGBIT kernel-faithful write bound). Dispatched
   E2E on 1fa9515: lineage (expect BOOT_OK + UI + touch), R12 lavender +
   TWRP angler (regression: must stay instant).
+
+---
+Task ID: 6-Z285 — verification wave decoded: 6-Z284 WORKS (lineage boots, splash hang named next); R12 BOOT_FAIL bisected to pre-6-Z284
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: decode the 1fa9515 verification wave; bisect the R12 verdict; arm the next diagnostic.
+
+Work Log:
+- lineage-22.2-sailfish on 5ce5d09 (33897170000): **THE 6-Z284 FIX WORKS** —
+  no bad_function_call anywhere, the recovery BOOTS (recovery_instances=1,
+  aosp_minui_fb marker = gr_init ran, fb0 tracked), draws its splash frame
+  and stays alive with the normal 5s battery poll
+  (/sys/class/power_supply/battery/{status,capacity}). Verdict
+  boot=BOOT_OK / ui=SPLASH_HANG — the blocker MOVED from "recovery aborts
+  before UI init" to "menu never draws".
+- SPLASH_HANG forensics: main (2617) parks in FUTEX_WAIT_BITSET_PRIVATE
+  val=0 (a libc++ cv wait — consistent with the menu key-queue
+  WaitKey()) after spawning its worker threads at +10.6-10.8s; thread 2719
+  ppolls [pipe fd 12, netlink fd 11 (unnamed — NOT unix, so the 6-Z283
+  resolver prints empty)]. Only ONE frame ever blitted — the menu draw
+  never happened. Touch bridge connects (2× io.twoyi.touch) at ev_init.
+- NEW dead time named: between +1.5s and +9.5s the recovery main runs a
+  SILENT 1Hz fstatat-ENOENT loop (nr=79, path not named — the 6-Z272f-b
+  diag only names openat paths). The misc BCB stat retry ("try 1..10",
+  /dev/block/platform/soc/624000.ufshc/by-name/misc) fires µs-apart at
+  10.04s — NOT the 1Hz loop's source; the 1Hz loop's path is still
+  unnamed and costs ~8s of the boot budget. NEXT: name nr=79 paths in the
+  6-Z272f-b diag.
+- R12 lavender on 5ce5d09 (33897176830): BOOT_FAIL / recovery_loader /
+  SINGLE_FRAME. The guest REACHED main→filemanagerlist→advanced→
+  modules_mount, then an OrangeFox ORS flow opened /system/bin/orsin
+  (O_WRONLY) and RETRIED ~570k+ times (the hook logs each attempt —
+  850k-line recovery log) at ~2.8kHz, starving rendering. The 6-Z185
+  backstop had FAKED mknodat("/system/bin/orsin") success — fox then acts
+  on the lie. NOT a 6-Z284 regression: bisect run on e0361bf
+  (33899474659) fails IDENTICALLY (523k orsin opens, same pages, ZERO
+  EVIOCGBIT(EV_KEY) ioctls in EITHER R12 run — R12's minui never issues
+  them). R12 fix candidate for the next round: make the guest rootfs VFS
+  actually CREATE the fifo (rootfs-first mknodat translation, like the
+  open path's "rootfs retry") or otherwise stop the faked-success lie;
+  the O_WRONLY-then-block semantics need fox's reader protocol
+  understood first.
+- TWRP 3.7.0_9-0 angler on 5ce5d09 (33897183306): BOOT_OK, battery_ok=TRUE
+  (the 6-Z272f-b battery stream verified again), pages advanced+
+  terminalcommand — REGRESSION GUARD PASSED.
+- Diag armed (2964817): 6-Z285 AArch64 FP-chain backtrace in the stall
+  dump (scan 512 bytes above sp for a frame record whose [fp+8] is
+  executable, walk x29 up to 24 frames, resolve via one maps parse). The
+  next lineage run names the exact splash-futex caller.
+
+Stage Summary:
+- lineage: abort fixed → boots → splash hang (next: decode via 6-Z285 BT +
+  unnamed 1Hz fstatat path). R12: pre-existing orsin flood, bisected
+  clean from 6-Z284 (fix candidate queued). TWRP: still green with real
+  battery. Pushed 1fa9515, 5ce5d09, 2964817.
