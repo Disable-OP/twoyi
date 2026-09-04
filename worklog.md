@@ -24045,3 +24045,30 @@ Stage Summary:
   shows whether the health HAL now reaches its hwbinder registration with the
   6-Z276 onRegistration callbacks available. Minui single-frame decode gets
   its UI-thread trace from the same wave.
+
+---
+Task ID: 6-Z280 (CI capacity) — stale-head run flood cancelled; runner pool unblocked
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: unblock the ARM64 verification queue.
+
+Work Log:
+- INFRASTRUCTURE FINDING: the Recovery Corpus (Nightly) dispatches 592 runs
+  (every manifest entry × every push-queued nightly) on a tiny ARM64 runner
+  pool — the 2026-09-03 nightly's aggregate poll expired with ZERO completed
+  results ("Tested: 0"). Today's nightly (queued on the stale eb09775 head)
+  dispatched ~97 E2E runs that starved the targeted 33a66c5 verification
+  dispatches (queue: 49 runs, none started for 35+ min).
+- ACTION: cancelled the stale nightly (33850085523) + all 97 queued E2E runs
+  on stale heads (eb09775/e23fa37 — both ancestors of 33a66c5; their verdicts
+  would be pre-6-Z278/279 anyway). The queue now holds ONLY the two current
+  verification runs (R12 + lineage on 33a66c5). Tomorrow's 03:00 UTC nightly
+  will dispatch on the new head with the fixes in.
+- NOTE for future rounds: the ui-e2e-test-arm64 workflow is dispatch-only;
+  plain pushes only cost the x86 kr64-tests job. The flood source is the
+  NIGHTLY's dispatch job — a tier=pr cap or a "latest-head-only" guard for
+  the nightly would prevent a repeat.
+
+Stage Summary:
+- Verification of 6-Z278/279 (battery stream + minui UI-thread trace) is the
+  only thing pending CI; everything else this round is committed and pushed.
