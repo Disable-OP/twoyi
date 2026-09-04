@@ -24072,3 +24072,38 @@ Work Log:
 Stage Summary:
 - Verification of 6-Z278/279 (battery stream + minui UI-thread trace) is the
   only thing pending CI; everything else this round is committed and pushed.
+
+---
+Task ID: 6-Z281 + 6-Z282 — harness binary-decode crash fixed; ppoll fd-set diagnostic; 6-Z279 VERIFIED
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: decode the 4d6846c verdict runs; fix the harness; arm the decisive minui diagnostic.
+
+Work Log:
+- R12 on 4d6846c (33868856651, SUCCESS): **6-Z279 VERIFIED IN PRODUCTION** —
+  the armed health HAL (pid 2697) shows ZERO writev-ENOTCONN spins (was 26+),
+  the shlib logged "connect(/dev/socket/logdw) -> /dev/__kmsg__" and liblog's
+  writes now land on kmsg. BOOT_OK with full page navigation (main→advanced→
+  filemanagerlist), Vibrator transactions live (conn=7 code=0x3). Battery still
+  null — the HAL is up and healthy but its hwbinder registration delivery is
+  the remaining link; the next round names it.
+- lineage on 4d6846c (33868066820): run "success" but the E2E harness CRASHED
+  pulling binary rootfs evidence (UnicodeDecodeError byte 0x9d via strict
+  text=True) AFTER the container ran — verdict never written. 6-Z281 (4d6846c):
+  adb() now decodes with errors="replace".
+- minui decode progress: the recovery spawns exactly ONE child (PTRACE_EVENT_FORK
+  pid 2606) — the 6-Z277 thread inheritance armed it; ZERO /dev/dri or fb0 opens
+  traced anywhere → gr_init NEVER RAN. The main loop ppolls forever. To answer
+  "what is the main loop waiting on", 6-Z282 (ac29043) reads the guest's pollfd
+  array at stall-dump time and names every fd via /proc/<pid>/fd.
+- CI capacity: the nightly's 592-run dispatch + repeated pushes produced a
+  100+-run queue that starved verification for ~2 h; cancelled the stale-head
+  backlog (22 in-flight + ~100 queued) — targeted runs now start in minutes.
+- Final wave dispatched on ac29043: lineage (ppoll fd names), R12, whyred.
+
+Stage Summary:
+- VERIFIED this session: keystore2 registration (20ms), R12 full UI, TWRP
+  3.2.3 old-gen boot + battery TRUE, boot-partition 10s hole gone, uevent
+  recvmsg delivery, logdw dup3 redirect, haptic chain ~3ms. Remaining: the
+  lineage minui single-frame (ppoll fd set next round) and the health-HAL →
+  battery delivery chain.
