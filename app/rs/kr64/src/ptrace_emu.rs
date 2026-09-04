@@ -8919,6 +8919,40 @@ fn stall_forensic_dump(pid: libc::pid_t) {
         pid, nr, a0, a1, a2, sp, pc, region
     ));
 
+    // 6-Z282: ppoll/poll fd-array naming — the LineageOS recovery's main
+    // loop parks in ppoll for its whole life with a SINGLE drawn frame and
+    // ZERO named graphics opens (runs 33846196526/33848918462/33868066820:
+    // no /dev/dri or fb0 open ever traced, the UI never initializes). The
+    // pollfd set answers "what is the main loop actually waiting on"
+    // outright (input fd? the pipe to the forked child? an eventfd?).
+    // aarch64 ppoll=73, x86_64 ppoll=271, x86_64 poll=7 (same pollfd
+    // layout: {i32 fd; i16 events; i16 revents} = 8 bytes).
+    if nr == 73 || nr == 271 || nr == 7 {
+        let nfds = (a1 as usize).min(16);
+        if a0 != 0 && nfds > 0 {
+            if let Some(buf) = read_child_bytes(pid, a0, nfds * 8) {
+                for i in 0..nfds {
+                    let fd = i32::from_ne_bytes(buf[i * 8..i * 8 + 4].try_into().unwrap());
+                    if fd < 0 {
+                        continue;
+                    }
+                    let dest = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| "<gone>".to_string());
+                    crate::trace_log_line(&format!(
+                        "6-Z282 STALL-DUMP: pid={} pollfds[{}]={} -> {}",
+                        pid, i, fd, dest
+                    ));
+                }
+            } else {
+                crate::trace_log_line(&format!(
+                    "6-Z282 STALL-DUMP: pid={} pollfd array at {:#x} UNREADABLE",
+                    pid, a0
+                ));
+            }
+        }
+    }
+
     // Futex word interpretation (see doc above for the nr set + masking).
     // NOTE on bionic: a NORMAL (non-PI) bionic pthread mutex state word is
     // NOT the holder tid (that's glibc) — 0=unlocked, 1=locked, 2=locked
