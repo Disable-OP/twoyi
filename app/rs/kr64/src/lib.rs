@@ -7269,6 +7269,30 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         );
     }
 
+    // 6-Z287: virtualize the image's by-name block nodes
+    // (/dev/block[/platform/<soc>/<ctrl>]/by-name/<part>), parsed from the
+    // guest's OWN fstabs. The lineage recovery's bootloader_message stack
+    // stats/opens the misc partition via the platform-qualified path from
+    // the image fstab — ENOENT there cost a ~10s retry loop plus an
+    // on-screen "Failed to clear BCB message" error. The loader maps
+    // /dev/block into the rootfs (should_translate) so the guest lands on
+    // these nodes. Unconditional: harmless for full-Android guests too
+    // (their synthesized fstab references by-name paths as well).
+    match devices::create_by_name_block_nodes(&rootfs_prefix) {
+        Ok(n) => {
+            if n > 0 {
+                info!(
+                    "[KR64] PARENT: by-name block nodes staged ({} new, 6-Z287)",
+                    n
+                );
+            }
+        }
+        Err(e) => warning!(
+            "[KR64] PARENT: failed to stage by-name block nodes: {} (BCB access stays ENOENT; 6-Z287)",
+            e
+        ),
+    }
+
     // RECOVERY INPUT: pre-create {rootfs}/dev/input/event0 + event1 as
     // EMPTY regular files (0644). minui's /dev/input scan (readdir +
     // fstatat probes) needs openable "event*" names to exist; when one
