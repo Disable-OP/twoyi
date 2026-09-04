@@ -11380,7 +11380,7 @@ pub fn run_ptrace_loop(
     // logs their first N syscall results (nr + ret) and EVERY failure
     // (ret < 0) up to a global cap, naming the stall site without
     // flooding the DIAG budget for the whole system.
-    let mut focused_diag_pids: std::collections::HashMap<libc::pid_t, u64> =
+    let mut focused_diag_pids: std::collections::HashMap<libc::pid_t, (u64, u64, u64)> =
         std::collections::HashMap::new();
     // 6-Z271o: fatal-evidence follow window — once a fb_hook fatal marker
     // is seen, the next N writes bypass the DIAG budget (the fatal path
@@ -14635,13 +14635,13 @@ pub fn run_ptrace_loop(
                             // minui's graphics init never ran; a 50-call
                             // window names the syscall it stalls behind).
                             if exec_path.contains("android.hardware.health@") {
-                                focused_diag_pids.insert(pid, 0);
+                                focused_diag_pids.insert(pid, (0, 0, 0));
                                 log(&format!(
                                     "6-Z272f-b: focused syscall DIAG armed for pid={} ({})",
                                     pid, exec_path
                                 ));
                             } else if exec_path.ends_with("/system/bin/recovery") {
-                                focused_diag_pids.insert(pid, 0);
+                                focused_diag_pids.insert(pid, (0, 0, 0));
                                 log(&format!(
                                     "6-Z272b: focused syscall DIAG armed for pid={} ({})",
                                     pid, exec_path
@@ -19224,30 +19224,58 @@ pub fn run_ptrace_loop(
                     // For pids armed at the 6-Z238 execve scan (the health
                     // HAL): log the FIRST 150 syscall results verbatim
                     // (nr + ret) and — beyond that window — every FAILED
-                    // syscall up to a global 400-line cap. The health HAL
-                    // currently runs silent after ~3 property opens; this
-                    // names the exact syscall it stalls/fails on without
-                    // burning the shared DIAG budget.
+                    // syscall under a TIME-WINDOWED budget.
+                    //
+                    // 6-Z275: the flat 400-line cap was exhausted ~500 ms
+                    // into the LineageOS recovery boot (benign
+                    // mkdir-EEXIST entries), so minui's graphics attempts
+                    // seconds later were INVISIBLE (v1 run 33846196526:
+                    // the last named failure is at +497 ms, the UI draw
+                    // happens at +1-10 s). Budget: 120 failures per
+                    // rolling 5 s window per armed pid (bounded worst
+                    // case 24 lines/s — still far under a storm, but
+                    // covers the whole boot).
                     if let Some(seen) = focused_diag_pids.get_mut(&pid) {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        if *seen < 150 {
-                            *seen += 1;
+                        if seen.0 < 150 {
+                            seen.0 += 1;
                             log(&format!(
                                 "6-Z272f-b: pid={} syscall #{} nr={} ret={}",
-                                pid, seen, syscall_num, ret
+                                pid, seen.0, syscall_num, ret
                             ));
                         } else if ret < 0 {
-                            static FOCUSED_FAIL_DIAG: std::sync::atomic::AtomicU64 =
-                                std::sync::atomic::AtomicU64::new(0);
-                            if FOCUSED_FAIL_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                < 400
-                            {
-                                // 6-Z272p: for the recovery's ENOTCONN writev
-                                // spin + EEXIST/ENOENT openat spins, the raw
-                                // nr/ret is not enough — name the TARGET: the
-                                // fd's /proc/<pid>/fd/<n> link for fd-taking
-                                // syscalls (writev arg1=fd), and the pathname
-                                // for openat (arg2).
+                            // 6-Z275: per-pid (window_index, used) budget in
+                            // the map value position — the armed map stores
+                            // (seen, fail_window, fail_used). Refill the
+                            // used budget every 5 s.
+                            const FAIL_WINDOW_MS: u64 = 5000;
+                            const FAIL_PER_WINDOW: u64 = 120;
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let window = now_ms / FAIL_WINDOW_MS;
+                            let allowed = {
+                                let (_, w, u) = *seen;
+                                if w != window {
+                                    // New window: reset (store back below).
+                                    true
+                                } else {
+                                    u < FAIL_PER_WINDOW
+                                }
+                            };
+                            // Store (seen, window, used) — mutate in place.
+                            let (_, w_old, u_old) = *seen;
+                            let u_new = if w_old != window { 1 } else { u_old + 1 };
+                            *seen = (w_old, window, u_new);
+                            if allowed {
+                                // 6-Z272p: name the TARGET: the fd's
+                                // /proc/<pid>/fd/<n> link for fd-taking
+                                // syscalls (writev arg1=fd), the pathname
+                                // for openat (arg2), and the pathname for
+                                // mkdir (arg1) — the LineageOS recovery's
+                                // mkdir-EEXIST churn was unnamed in the
+                                // 33846196526 run.
                                 let mut target = String::new();
                                 if syscall_num == 66 {
                                     // writev: arg1 = fd (aarch64/x86_64 both
@@ -19284,6 +19312,26 @@ pub fn run_ptrace_loop(
                                         }
                                         if !got.is_empty() {
                                             target = format!(" path={}", got);
+                                        }
+                                    }
+                                } else if syscall_num == 34 {
+                                    // 6-Z275: mkdir(path, mode) on aarch64 —
+                                    // arg1 = path. (x86_64 mkdir is 83; the
+                                    // corpus guests are arm64.)
+                                    let path_ptr = get_syscall_arg(&regs, abi.reg_arg1) as u64;
+                                    if path_ptr > 0 {
+                                        let mut buf = [0u8; 128];
+                                        let n = process_vm_readv_chunk(pid, path_ptr, &mut buf);
+                                        if n > 0 {
+                                            let end = buf[..n as usize]
+                                                .iter()
+                                                .position(|&c| c == 0)
+                                                .unwrap_or(n as usize);
+                                            let got =
+                                                String::from_utf8_lossy(&buf[..end]).into_owned();
+                                            if !got.is_empty() {
+                                                target = format!(" path={}", got);
+                                            }
                                         }
                                     }
                                 }
