@@ -136,8 +136,43 @@ def screencap_bytes():
     return data
 
 
-def tap(x, y):
-    nav.input_cmd(f"input tap {x} {y}")
+INPUT_READS_RE = re.compile(r"INPUT read\(fd=\d+\) -> \d+ bytes")
+
+
+def count_input_reads():
+    """Number of 'INPUT read' deliveries in the GUEST recovery log — the
+    ground truth that a tap's events reached the guest's EventHub
+    (run 33912338135: the probe's docker `input tap` channel silently
+    no-oped late-run — ZERO new reads after +22s while ui-navigate's
+    early taps had produced 7)."""
+    grec = guest_recovery_log()
+    return len(INPUT_READS_RE.findall(grec))
+
+
+def tap_with_effect(x, y):
+    """Tap via an EFFECT-VERIFIED channel ladder. After each attempt wait
+    and re-count the guest's INPUT-read deliveries; a delivery is the
+    proof the events crossed the bridge. Returns the channel name that
+    worked (or None if no channel produced events)."""
+    channels = [
+        ("broadcast", lambda: nav._broadcast_cmd(f"input tap {x} {y}")),
+        ("sendevent", lambda: nav._sendevent_cmd(f"input tap {x} {y}")),
+        ("ladder", lambda: nav.input_cmd(f"input tap {x} {y}")),
+    ]
+    for name, fn in channels:
+        before = count_input_reads()
+        try:
+            fn()
+        except Exception as e:
+            print(f"  [menu-probe] tap channel {name} threw {e!r}")
+            continue
+        for _ in range(6):  # up to ~3 s for the events to cross
+            time.sleep(0.5)
+            if count_input_reads() > before:
+                print(f"  [menu-probe] tap via {name}: events REACHED the guest")
+                return name
+        print(f"  [menu-probe] tap via {name}: no guest events — next channel")
+    return None
 
 
 def main():
@@ -183,21 +218,26 @@ def main():
     frame_before = blit_frame_counter(logcat_dump())
     probe["frame_before"] = frame_before
 
-    # Safe tap ladder. AOSP recovery lays menu rows out below the header
-    # + battery block; rows sit roughly at y ≈ 0.32H with ≈0.07H pitch,
-    # horizontally centered. Row 1 ("Reboot system now" on lineage) is
-    # PRE-HIGHLIGHTED — activating a highlighted row is destructive, so
-    # the ladder only ever taps NON-highlighted rows, moving the
-    # selection down and back up. Each tap forces a minui redraw of the
-    # changed highlight.
-    row_y = [int(H * f) for f in (0.33, 0.40, 0.47)]
+    # Safe tap ladder with REAL menu geometry, measured from the
+    # lineage-22.2-sailfish final screenshot (720x1600): rows are
+    #   Reboot system now  y = 555-690  (pre-highlighted — NEVER tapped)
+    #   Apply update       y = 700-840  (center ~770 = 0.481H)
+    #   Factory reset      y = 850-990  (center ~920 = 0.575H)
+    #   Advanced           y = 1000-1140 (center ~1070 = 0.669H)
+    # Tapping a NON-highlighted row moves the selection (a redraw);
+    # tapping the highlighted row would ACTIVATE it — the destructive
+    # case this probe must never hit.
     cx = W // 2
-    ladder = [row_y[1], row_y[2], row_y[1]]  # row2 -> row3 -> row2
+    ladder = [int(H * 0.481), int(H * 0.575), int(H * 0.481)]
+    channels_used = []
     for i, y in enumerate(ladder):
-        tap(cx, y)
-        probe["taps"].append([cx, y])
+        ch = tap_with_effect(cx, y)
+        probe["taps"].append([cx, y, ch])
+        if ch:
+            channels_used.append(ch)
         nav.screenshot(f"menu-{i+1:02d}-after-tap{i+1}")
-        time.sleep(3)
+        time.sleep(2)
+    probe["channels_used"] = channels_used
 
     frame_after = blit_frame_counter(logcat_dump())
     probe["frame_after"] = frame_after
@@ -212,6 +252,9 @@ def main():
                             if frame_after is not None and
                             frame_before is not None else None)
     probe["interactive"] = bool(probe["frame_delta"] and probe["frame_delta"] > 0)
+    # Verdict policy: events REACHING the guest (channels_used non-empty)
+    # is the touch-delivery truth; the frame rise is the menu-redraw
+    # truth. Both together = a fully interactive AOSP menu.
 
     with open(PROBE_JSON, "w") as f:
         json.dump(probe, f, indent=2)
