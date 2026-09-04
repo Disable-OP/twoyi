@@ -19094,9 +19094,63 @@ pub fn run_ptrace_loop(
                             if FOCUSED_FAIL_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                 < 400
                             {
+                                // 6-Z272p: for the recovery's ENOTCONN writev
+                                // spin + EEXIST/ENOENT openat spins, the raw
+                                // nr/ret is not enough — name the TARGET: the
+                                // fd's /proc/<pid>/fd/<n> link for fd-taking
+                                // syscalls (writev arg1=fd), and the pathname
+                                // for openat (arg2).
+                                let mut target = String::new();
+                                if syscall_num == 66 {
+                                    // writev: arg1 = fd (aarch64/x86_64 both
+                                    // keep fd in the first arg register).
+                                    let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                    let link = format!("/proc/{}/fd/{}", pid, fd);
+                                    if let Ok(dest) = std::fs::read_link(&link) {
+                                        target = format!(" fd{} -> {}", fd, dest.display());
+                                    } else {
+                                        target = format!(" fd{} -> <gone>", fd);
+                                    }
+                                } else if syscall_num == abi.openat {
+                                    let path_ptr = get_syscall_arg(&regs, abi.reg_arg2) as u64;
+                                    if path_ptr > 0 {
+                                        let mut buf = [0u8; 128];
+                                        let mut got = String::new();
+                                        unsafe {
+                                            let local = &mut buf;
+                                            let iov = libc::iovec {
+                                                iov_base: local.as_mut_ptr() as *mut libc::c_void,
+                                                iov_len: buf.len(),
+                                            };
+                                            let remote = libc::iovec {
+                                                iov_base: path_ptr as *mut libc::c_void,
+                                                iov_len: buf.len(),
+                                            };
+                                            let n = libc::process_vm_readv(
+                                                pid,
+                                                &iov as *const libc::iovec,
+                                                1,
+                                                &remote as *const libc::iovec,
+                                                1,
+                                                0,
+                                            );
+                                            if n > 0 {
+                                                let end = buf
+                                                    .iter()
+                                                    .position(|&c| c == 0)
+                                                    .unwrap_or(buf.len());
+                                                got = String::from_utf8_lossy(&buf[..end])
+                                                    .into_owned();
+                                            }
+                                        }
+                                        if !got.is_empty() {
+                                            target = format!(" path={}", got);
+                                        }
+                                    }
+                                }
                                 log(&format!(
-                                    "6-Z272f-b: pid={} FAILED syscall nr={} ret={} (post-window)",
-                                    pid, syscall_num, ret
+                                    "6-Z272f-b: pid={} FAILED syscall nr={} ret={} (post-window){}",
+                                    pid, syscall_num, ret, target
                                 ));
                             }
                         }
