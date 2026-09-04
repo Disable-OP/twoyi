@@ -346,11 +346,27 @@ pub fn input_event_write(
 pub fn handle_touch(ev: MotionEvent) {
     let opt = INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner());
     let Some(tx) = opt.as_ref() else {
-        // No kr64 connection yet — silently drop the event. This is
-        // the same behaviour as the original code (which dropped
-        // events until the guest's EventHub connected). The Java side
-        // doesn't know the difference — it just calls handleTouch on
-        // every MotionEvent.
+        // No kr64 connection yet (or the previous kr64 client
+        // disconnected and the worker drained) — the event is dropped
+        // here. 6-Z289d: this silent drop blinded the menu probe
+        // (run 33915900634: taps at +22.8/+34.3 s reached the guest,
+        // taps at +120 s vanished) — rate-limit-log the drop so the
+        // artifacts name it (1/s max; a full tap stream is ~10 ev/s).
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last = LAST_LOG_MS.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last) >= 1000 {
+                LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+                log::warn!(
+                    "[INPUT] handle_touch DROP: no kr64 touch client connected                      (INPUT_SENDER is None) — touch events are being discarded"
+                );
+            }
+        }
         return;
     };
 
