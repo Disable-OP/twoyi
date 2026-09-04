@@ -24002,3 +24002,46 @@ Stage Summary:
   gaps: fd passing (BINDER_TYPE_FD), host-driver refcount forwarding.
   In-flight: lineage + R12 runs on 0bb6a0f carry the 6-Z274 uevent fix
   (boot-partition 10s hole) + the 6-Z275 whole-boot diag window.
+
+---
+Task ID: 6-Z277 + 6-Z278 + 6-Z279 — the battery stream stall NAMED and FIXED; minui diag armed on threads
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: decode the 0bb6a0f verdict runs; fix the health-HAL stall; keep the minui decode moving.
+
+Work Log:
+- VERDICTS on 0bb6a0f (both dispatches SUCCESS):
+  * lineage-22.2-sailfish 33848918462: **THE 10s BOOT-PARTITION HOLE IS GONE** —
+    "init: Skipped setting INIT_AVB_VERSION (not vbmeta compatible)" at +124ms
+    (was "Wait for boot partition returned after 10002ms" at +10113ms). AND the
+    6-Z274 recvmsg uevent delivery WORKS in production for the first time:
+    "6-Z274: synthetic device-mapper uevent via recvmsg fd 0x23 pid=2591 ret=162
+    (delivered)". Recovery still single-frame (minui graphics init runs on the
+    CLONED UI THREAD — the diag never armed it).
+  * orangefox-R12.0-lavender 33848916173: BOOT_OK again (regression guard green
+    through 6-Z274/275).
+- 6-Z277 (e23fa37): focused-diag INHERITANCE at fork/clone — threads of an armed
+  process get the diag (fresh 150 window + own budget). The next lineage run
+  names minui's /dev/dri + fb0 attempts on the UI thread.
+- 6-Z278 (33a66c5 pt2): focused-diag ENTRY-arg stash — the EXIT arg registers are
+  clobbered (aarch64 x0=ret), which produced the bogus "fd-107" (the ENOTCONN
+  return read as fd) and empty mkdir names. mkdir-EEXIST gets a small reserved
+  budget slice (84 events in 10ms ate the whole window and blinded the
+  interesting failures).
+- **6-Z279 (33a66c5): THE BATTERY STREAM STALL NAMED AND FIXED.** The armed
+  health-HAL trace named it: writev → ENOTCONN (-107) ×26 at +10550ms — the
+  6-Z272p connect() hook returned a FRESH openat() fd as connect's return
+  (neither 0 nor -1), so liblog treated connect as FAILED and spun writing to
+  its unconnected socket fd. The kmsg fd leaked; the socket stayed dead. FIX:
+  dup3(kmsg_fd, sockfd) + close + return 0 — writev(sockfd) now lands in
+  /dev/__kmsg__ (unbounded, non-blocking), the HAL's log path returns
+  immediately, and liblog's poll-retry freeze class is closed for every
+  recovery process.
+
+Stage Summary:
+- Three boot-timeout classes now closed or named: keystore2 (verified fixed),
+  boot-partition 10s poll (verified gone on lineage), logdw ENOTCONN
+  (fix in flight). Battery (6-Z272f-b) verdict next: the R12 run on 33a66c5
+  shows whether the health HAL now reaches its hwbinder registration with the
+  6-Z276 onRegistration callbacks available. Minui single-frame decode gets
+  its UI-thread trace from the same wave.
