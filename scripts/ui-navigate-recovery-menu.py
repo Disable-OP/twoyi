@@ -294,32 +294,42 @@ def main():
     frame_after = blit_frame_counter(logcat_dump())
     probe["frame_after"] = frame_after
 
-    # 6-Z289g: the host chain is PROVEN healthy by the 6-Z289e/f
-    # instrumentation (receiver fires, no drops, worker write succeeds) —
-    # when taps still produce no guest INPUT reads, dump the GUEST
-    # recovery's per-thread park state so the input thread's blocking
-    # point (epoll_wait? futex? read?) is visible in the artifacts.
-    # v7 lesson: adb-shell runs as the SHELL user and CANNOT read app
-    # /proc (empty dump) — use docker exec (root), the workflow's
-    # proven keystore2-dump pattern.
-    dump = ""
-    for _root in ("/data/user/0/io.twoyi.debug", "/data/data/io.twoyi.debug"):
-        dump = adb_docker_out(
-            "for d in /proc/[0-9]*/task/[0-9]*; do "
-            "c=$(cat $d/comm 2>/dev/null); "
-            "case $c in *recovery*) "
-            "p=$(echo $d | sed -n 's|^/proc/\\([0-9]*\\)/task/.*|\\1|p'); "
-            "echo \"=== pid=$p tid=$(basename $d) comm=$c wchan=$(cat $d/wchan 2>/dev/null)\"; "
-            "echo \"syscall: $(cat $d/syscall 2>/dev/null | head -c 100)\";; esac; done",
-            timeout=35)
-        if dump and "recovery" in dump:
-            break
+    # 6-Z289g/h: the host chain is PROVEN healthy by the 6-Z289e/f
+    # instrumentation (receiver fires, no drops, worker write succeeds).
+    # v8's dump was empty (sed escaping through shell layers) and lineage
+    # turned out to be EPOLL-based (zero poll-hook lines ever). This
+    # diagnostic block answers the remaining questions with ROOT access:
+    #   1. guest input-thread park state (epoll_wait? dead? futex?),
+    #   2. the abstract-socket QUEUE states (ss -xp: a stuck Send-Q on
+    #      the app's worker fd = worker blocked; data in the guest's
+    #      Recv-Q = the guest never reads),
+    #   3. which app fds still hold the two hook connections.
+    app_pid = adb_docker_out("pgrep -f 'io.twoyi' | head -1", timeout=10).strip()
+    dump = adb_docker_out(
+        "for d in /proc/[0-9]*/task/[0-9]*; do "
+        "c=$(cat $d/comm 2>/dev/null) || continue; "
+        "case $c in *recovery*) "
+        "pp=${d#/proc/}; pid=${pp%%/*}; "
+        "echo \"pid=$pid tid=${d##*/} comm=$c wchan=$(cat $d/wchan 2>/dev/null)\"; "
+        "echo \"  syscall: $(cat $d/syscall 2>/dev/null | cut -c1-80)\";; "
+        "esac; done",
+        timeout=35)
+    sock = adb_docker_out("ss -xp 2>/dev/null | grep -iE 'twoyi|touch' | head -12", timeout=15)
+    fds = ""
+    if app_pid:
+        fds = adb_docker_out(
+            f"ls -l /proc/{app_pid}/fd 2>/dev/null | grep -c socket; "
+            f"ls -l /proc/{app_pid}/fd 2>/dev/null | tail -40 | grep -E '114|129' || true",
+            timeout=15)
     try:
         with open(os.path.join(ART, "menu-probe-guest-threads.txt"), "w") as f:
-            f.write(dump or "<empty>")
+            f.write("== threads ==\n" + (dump or "<empty>") +
+                    "\n== sockets ==\n" + (sock or "<empty>") +
+                    "\n== app fds (pid " + (app_pid or "?") + ") ==\n" + (fds or "<empty>"))
     except OSError:
         pass
-    print(TAG, "guest thread dump lines:", len((dump or "").splitlines()))
+    print(TAG, "guest threads lines:", len((dump or "").splitlines()),
+          "| sock lines:", len((sock or "").splitlines()))
 
     c2 = screencap_bytes()
     probe["cap_hashes"].append(
