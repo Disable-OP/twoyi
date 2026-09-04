@@ -2635,8 +2635,29 @@ int socket(int domain, int type, int protocol) {
         type = SOCK_DGRAM;
     }
     
-    if (real_socket) return real_socket(domain, type, protocol);
-    return syscall(SYS_socket, domain, type, protocol);
+    // 6-Z291: log every socket() failure with its TRUE errno. The
+    // lineage menu screen prints "ERROR: recovery: Failed to open
+    // recovery socket: Success" (AOSP StartRecoveryServer PLOG over
+    // socket(PF_UNIX, SOCK_STREAM|CLOEXEC)) — errno read back as 0,
+    // impossible for a real kernel socket(2) failure: either errno was
+    // clobbered between the failure and the PLOG capture, or a hook
+    // returned -1 without setting it. The diag names the actual cause
+    // in the next lineage run (write_str clobbers errno → save/restore).
+    {
+        int fd;
+        if (real_socket) fd = real_socket(domain, type, protocol);
+        else fd = (int)syscall(SYS_socket, domain, type, protocol);
+        if (fd < 0) {
+            int e = errno; // capture BEFORE write() clobbers it
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] socket(domain=%d type=%d proto=%d) -> -1 errno=%d\n",
+                     domain, type, protocol, e);
+            write_str(2, msg);
+            errno = e;
+        }
+        return fd;
+    }
 }
 
 // Hook bind — for AF_NETLINK binds (vold only), return success
