@@ -24422,3 +24422,49 @@ Stage Summary:
   (vibrator: fox's IVibrator/default wait is visible in the R12 log),
   touch/key delivery proof for the AOSP menu (6-Z289 probe's first
   lineage run), recovery-socket cosmetic fix once 6-Z291 names the errno.
+
+---
+Task ID: 6-Z292 + 6-Z289b/c/d/e — recovery socket FIXED (namespace honesty); the AOSP-menu touch chain cornered with instrumentation
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: kill the last lineage on-screen error; drive the 6-Z289 menu probe to a real touch-delivery verdict.
+
+Work Log:
+- 6-Z292 (0a457e4) ROOT CAUSE of "ERROR: recovery: Failed to open recovery socket: Success", fully decoded:
+  * AOSP recovery_main.cpp ListenRecoverySocket() = android_get_control_socket("recovery") — the INIT
+    socket-activation contract (init.rc: "socket recovery stream 422 system system"; kmsg PROVES init
+    created + published it: "bind: translated /dev/socket/recovery" + the property_service sockets work).
+  * libcutils sockets_unix.cpp VALIDATES the inherited fd: getsockname() must equal "/dev/socket/<name>"
+    exactly. Our bind hook translates into the rootfs → the kernel-side name carries the host prefix →
+    check fails → -1 with errno untouched → "Success".
+  * FIX: getsockname/getpeername hooks rewrite AF_UNIX rootfs-prefixed addresses back to the guest
+    namespace (memmove + addrlen adjust). Abstract names / non-rootfs / boundary lookalikes untouched.
+    Host-verified against the verbatim libcutils check.
+- 6-Z289b (42383af): the menu probe read HOST logcat for AOSP detection — the minui "framebuffer:" marker
+  lives in the GUEST recovery log (kmsg), so the first probe run (33911283769) skipped itself. Fixed to
+  the docker-exec guest log source.
+- 6-Z289c (c122024): probe v3 (33912338135) tapped but the guest saw ZERO events (frame 1→1, caps
+  identical); v3's coordinates were also mis-estimated (0.33/0.40/0.47H — one landed on the HIGHLIGHTED
+  "Reboot system now"). Rewrote: geometry from the real screenshot (Apply≈0.481H, Factory≈0.575H,
+  Advanced≈0.669H; row 1 NEVER tapped) + effect-verified channel ladder (broadcast → sendevent → ladder,
+  each verified by new "INPUT read" deliveries in the guest log).
+- 6-Z289d (2a59b40): probe v4 (33915900634) — ALL channels produced no guest events (broadcast raw out:
+  "Broadcast completed: result=0" — DELIVERED but no guest effect), while adb was ALIVE (screenshots),
+  system_server + app + guest healthy at teardown, topResumedActivity = Render2Activity. Added dumpsys
+  focused-window/input-dispatch/resumed-activity artifacts + raw per-channel outputs + an adb-input
+  channel.
+- 6-Z289e (f254e6e): instrumented the three SILENT drop sites in the host chain — input.rs handle_touch
+  (INPUT_SENDER None → rate-limit-logged DROP — the prime suspect: the kr64 touch client may disconnect
+  after early nav and events are dropped forever), Render2Activity.onReceive (logs receipt — separates
+  "AM delivered but receiver dead" from "receiver fired"), sendDebugTouch (surface-not-ready early-return
+  logged with live dims). Probe v5 (f254e6e) in flight will name the broken link.
+- 6-Z291 verified in passing: the socket() diag fired on the "0" errno case (no hook-level lie found —
+  the failing call was never socket(); 6-Z292 closed the real cause).
+- The vibrator HAL bridge is CONFIRMED WORKING end-to-end in the R12 run (33908394127): getService hit →
+  INTERFACE_TRANSACTION → IVibrator.on(40ms) → host on every nav tap (real phone vibrator).
+
+Stage Summary:
+- lineage boot is now CLEAN of every known error but one cosmetic class; the recovery command server
+  ('f'/'r' sideload channel) is restored by 6-Z292. The AOSP-menu touch verdict is cornered to a
+  specific silent drop inside the host chain — probe v5 decodes it. All core priorities remain closed;
+  TWRP + R12 + lineage all BOOT_OK/UI_READY or better.
