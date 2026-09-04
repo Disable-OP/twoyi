@@ -3082,8 +3082,34 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     static int (*real_connect)(int, const struct sockaddr *, socklen_t) = NULL;
     if (!real_connect) real_connect = dlsym(RTLD_NEXT, "connect");
 
+    // 6-Z272p: /dev/socket/logdw has NO reader in recovery images (they
+    // don't run logd — unlike the full OrangeFox/TWRP ramdisks, which is
+    // exactly why those worked while the AOSP-recovery cohort stalled).
+    // liblog writes log lines to that socket SYNCHRONOUSLY; once the
+    // socket buffer fills, every write blocks in liblog's poll-retry
+    // loop and the whole process freezes BEFORE any UI draw (the walleye
+    // runs: the recovery alive in poll_schedule_timeout for 300+ s,
+    // zero draws, no kmsg output past the BCB retries). Redirect the
+    // connect to /dev/__kmsg__ instead: the fd accepts unbounded
+    // non-blocking writes, the log lines land in the kmsg artifacts,
+    // and liblog's write path returns immediately.
     if (addr && addr->sa_family == AF_UNIX && g_rootfs) {
         struct sockaddr_un *un = (struct sockaddr_un *)addr;
+        if (un->sun_path[0] == '/' &&
+            strncmp(un->sun_path, "/dev/socket/logdw", 17) == 0) {
+            char kmsg_path[600];
+            snprintf(kmsg_path, sizeof(kmsg_path), "%s/dev/__kmsg__", g_rootfs);
+            static int logdw_redirect_diag = 2;
+            if (logdw_redirect_diag > 0) {
+                logdw_redirect_diag--;
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                    "[twoyi_loader] connect(/dev/socket/logdw) -> /dev/__kmsg__ "
+                    "(no logd in recovery images — liblog would block)\n");
+                write_str(2, msg);
+            }
+            return (int)syscall(NR_openat, AT_FDCWD, kmsg_path, O_WRONLY, 0);
+        }
         if (un->sun_path[0] == '/' && should_translate(un->sun_path)) {
             char translated[600];
             snprintf(translated, sizeof(translated), "%s%s", g_rootfs, un->sun_path);
