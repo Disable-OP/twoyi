@@ -24321,3 +24321,59 @@ Stage Summary:
   TWRP angler remains green (BOOT_OK + battery TRUE). R12 BOOT_FAIL
   bisected to pre-6-Z284 (orsin flood) with a queued fix candidate.
   Pushed: 1fa9515 (fix), 5ce5d09+57da331 (worklogs), 2964817 (BT diag).
+
+---
+Task ID: 6-Z287/288 — by-name block nodes virtualized (BCB) + honest mkfifo/mknod materialisation (R12 orsin flood)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: execute the two queued fixes from 6-Z286: (1) virtualize platform-qualified by-name block nodes from the guest fstab, (2) stop the R12 orsin ENOENT flood.
+
+Work Log:
+- Reconstructed the orsin protocol from the R12 image itself (first image-based
+  analysis of this blocker): downloaded orangefox-R12.0-lavender per the corpus
+  manifest, unpacked the boot.img ramdisk. system/bin/recovery's rodata holds
+  "/system/bin/orsin" + "I:Command '%s' received\n" + the command vocabulary
+  ("object", "unmapsuperdevices", "refreshsizes") — the READER side is fox's own
+  recovery; the writer is the /sbin/sh child seen in run 33897176830. fox's
+  dynsym imports mkfifo AND mknod → PLT-visible.
+- Decoded the flood from the run-33897176830 recovery log: after
+  "Set page: 'modules_mount'" fox execs /sbin/sh; the child loops
+  open("/system/bin/orsin", O_WRONLY) (fl=0x1, NO O_CREAT — it expects the fifo
+  to exist) at ~2.8kHz, 423k opens. The old hooks could not satisfy this:
+  CHR/BLK faked success creating nothing on arm64 (6-Z185 lie), FIFO fell
+  through to real_mknodat on the UNTRANSLATED host path (host /system is
+  read-only), and bionic's internal mkfifo→mknod chain was never PLT-visible.
+- 6-Z287 (6810d99): kr64 devices.rs create_by_name_block_nodes — parses the
+  guest's OWN fstabs out of the extracted rootfs (etc/, system/etc/,
+  vendor/etc/, first_stage_ramdisk/, odm/etc/, root) for
+  /dev/block/.../by-name/<part> sources and materialises each as a regular
+  file (misc: 2KiB zeros re-created fresh every boot — the app is the
+  bootloader, stale BCB must not re-arm; others: 2MiB sparse create-once) plus
+  a baseline set for the synthesized fstab. Verified the parser against the
+  REAL lineage-22.2-sailfish system/etc/recovery.fstab (extracted from the
+  mirrored boot.img; contains both /dev/block/by-name/* and the platform-
+  qualified .../soc/624000.ufshc/by-name/{modem,userdata,misc}). Loader
+  should_translate: /dev/block → rootfs (before the /dev/ catch-all; also
+  closes the host-partition leak on real-device hosts).
+- 6-Z288 (58346e9): new mkfifo/mkfifoat PLT hooks + twoyi_materialise_node —
+  resolve through translate(), create the REAL node type in the rootfs (real
+  fifo = true ORS pipe semantics; fox's reader and the sh writer meet on the
+  same host fifo), fall back to a regular-file backing when host policy
+  refuses; CHR/BLK carry dev_t (VM-documented behavior) on arm64 too;
+  existing nodes = idempotent success. emu_mknodat (SIGSYS path) mirrors the
+  model without dlsym/nested trapped syscalls.
+- Host verification: 4 new kr64 unit tests (parser vs real sailfish fstab
+  shapes, staging, misc-reset-every-boot idempotence); 692/692 pass, clippy
+  -D warnings clean, cargo fmt clean. Materialisation logic compiled and run
+  standalone on x86_64 Linux: mkfifo creates a REAL fifo, a writer+reader
+  pass 'refreshsizes' through it, CHR file carries dev_t, re-runs idempotent.
+  shlib syntax check: only pre-existing bionic/glibc statfs64 diffs remain.
+
+Stage Summary:
+- Pushed 6810d99 (6-Z287) + 58346e9 (6-Z288). Expected next wave: lineage BCB
+  errors gone + ~10s boot budget recovered (menu must still render — 6-Z284
+  regression guard); R12 orsin flood gone (open succeeds via real fifo or
+  backing file; ORS commands may actually flow); TWRP angler must stay green.
+- NOT done this round (queued): touch delivery verification into the AOSP
+  menu, harness AOSP-menu verdict honesty (SPLASH_HANG artifact), the unnamed
+  nr=79 fstatat paths if the 1Hz loop survives the misc fix.
