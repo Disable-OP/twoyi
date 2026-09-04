@@ -2049,11 +2049,18 @@ int poll(struct pollfd *fds, unsigned long nfds, int timeout_ms) {
              * minui busy-read -EAGAIN forever. */
         }
         if (ready) {
-            if (g_inbr_log_poll < 8) {
-                g_inbr_log_poll++;
+            /* 6-Z289g: heartbeat — the first-8 cap made the poll state
+             * invisible exactly when it mattered (runs 33914…33921: the
+             * guest stops reading input after ~+34 s and the artifacts
+             * could not tell a dead poll loop from a starved one). Log
+             * the first 8 AND every 256th delivery thereafter. */
+            g_inbr_log_poll++;
+            if (g_inbr_log_poll <= 8 || (g_inbr_log_poll % 256) == 0) {
                 write_str(2, "[twrp_fb_hook] INPUT poll -> ");
                 write_num(2, ready);
-                write_str(2, " ready (userspace, no raw poll syscall)\n");
+                write_str(2, " ready (userspace, no raw poll syscall) #");
+                write_num(2, g_inbr_log_poll);
+                write_str(2, "\n");
             }
             return ready;
         }
