@@ -51,6 +51,25 @@ ART = "/tmp/ui-e2e-artifacts"
 PROBE_JSON = os.path.join(ART, "menu-probe.json")
 
 
+def guest_recovery_log():
+    """Best-effort GUEST recovery log (the classifier's `rec` source — the
+    minui 'framebuffer: <fd> (<W> x <H>)' marker lives HERE, not in host
+    logcat: the guest's stderr goes to /dev/__kmsg__, not the logd
+    buffer; run 33911283769's probe skipped itself for exactly this)."""
+    for root in ("/data/user/0/io.twoyi.debug", "/data/data/io.twoyi.debug"):
+        try:
+            r = subprocess.run(
+                ["sudo", "docker", "exec", "redroid", "sh", "-c",
+                 f"tail -n 4000 {root}/rootfs/tmp/recovery.log"],
+                capture_output=True, text=True, timeout=20)
+            out = (r.stdout or "")
+            if len(out) > 200:
+                return out
+        except Exception:
+            continue
+    return ""
+
+
 def logcat_dump():
     """Best-effort logcat snapshot text (adb first, docker exec fallback)."""
     out = ""
@@ -78,10 +97,12 @@ def blit_frame_counter(text):
     return max((int(n) for n in frames), default=0)
 
 
-def is_aosp_menu_candidate(logcat_text):
-    """AOSP-layout recovery: minui fbdev marker present, no TWRP pages."""
-    has_minui_fb = bool(re.search(r"framebuffer: \d+ \(\d+ x \d+\)", logcat_text))
-    has_twrp_pages = bool(re.findall(r"Set page: '([^']+)'", logcat_text))
+def is_aosp_menu_candidate(recovery_log_text, logcat_text):
+    """AOSP-layout recovery: minui fbdev marker present in the GUEST
+    recovery log, no TWRP pages anywhere."""
+    both = recovery_log_text + "\n" + logcat_text
+    has_minui_fb = bool(re.search(r"framebuffer: \d+ \(\d+ x \d+\)", both))
+    has_twrp_pages = bool(re.findall(r"Set page: '([^']+)'", both))
     return has_minui_fb and not has_twrp_pages
 
 
@@ -133,7 +154,8 @@ def main():
     }
 
     lc = logcat_dump()
-    if not is_aosp_menu_candidate(lc):
+    grec = guest_recovery_log()
+    if not is_aosp_menu_candidate(grec, lc):
         probe["reason"] = (
             "not an AOSP-layout recovery (minui fb marker missing or TWRP "
             "pages present) — probe skipped, ui-navigate owns TWRP runs")
