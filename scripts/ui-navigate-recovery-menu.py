@@ -305,10 +305,14 @@ def main():
     #      Recv-Q = the guest never reads),
     #   3. which app fds still hold the two hook connections.
     app_pid = adb_docker_out("pgrep -f 'io.twoyi' | head -1", timeout=10).strip()
+    # 6-Z293b: the tracer truncates guest comms to 15 chars — the recovery
+    # shows up as "_system_bin_rec", so a "*recovery*" glob NEVER matched
+    # and v8/v9's dump came back empty. Match the truncated shape + the
+    # loader shlib's threads (which carry the hook's input work).
     dump = adb_docker_out(
         "for d in /proc/[0-9]*/task/[0-9]*; do "
         "c=$(cat $d/comm 2>/dev/null) || continue; "
-        "case $c in *recovery*) "
+        "case $c in *rec*|*recovery*|*twoyi*|*loader*) "
         "pp=${d#/proc/}; pid=${pp%%/*}; "
         "echo \"pid=$pid tid=${d##*/} comm=$c wchan=$(cat $d/wchan 2>/dev/null)\"; "
         "echo \"  syscall: $(cat $d/syscall 2>/dev/null | cut -c1-80)\";; "
