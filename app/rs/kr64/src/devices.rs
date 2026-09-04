@@ -1412,6 +1412,196 @@ fn create_hwrng_device(rootfs: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 6-Z287: virtualize the image's by-name block nodes
+/// (`/dev/block[/platform/<soc>/<ctrl>]/by-name/<part>`).
+///
+/// PROBLEM (lineage-22.2-sailfish run 33900850051, 6-Z286): the AOSP
+/// recovery's bootloader_message stack stats/opens the misc partition via
+/// the PLATFORM-QUALIFIED by-name path taken from the image's own fstab —
+/// for sailfish `/dev/block/platform/soc/624000.ufshc/by-name/misc`:
+///   (a) a 10-try misc probe loop burns ~10s of boot budget (the unnamed
+///       1 Hz fstatat-ENOENT loop 6-Z285 measured between +1.5s and +9.5s),
+///   (b) "Failed to clear BCB message: failed to open .../by-name/misc:
+///       No such file or directory" is printed ON SCREEN at menu entry,
+///   (c) BCB read-back (boot-recovery command chaining) always fails.
+/// The rootfs's `dev/block/by-name` directory was staged EMPTY and the
+/// loader passed `/dev/block/**` through to the HOST (the `/dev/`
+/// catch-all): the sandbox has no host /dev/block, and a real-device host
+/// would have LEAKED its own partitions into the guest (6-Z187
+/// guests-only). The `<soc>/<ctrl>` segments are image-specific, so
+/// nothing inside twoyi could hard-code them — they must come from the
+/// image itself.
+///
+/// FIX (this half): parse the guest's OWN fstabs out of the extracted
+/// rootfs (recovery.fstab / twrp.fstab / fstab.*, wherever the image put
+/// them) for `/dev/block/.../by-name/<part>` sources and materialise each
+/// referenced node inside the rootfs as a REGULAR FILE:
+///   * `.../by-name/misc` — 2 KiB of zeros, RE-CREATED fresh every boot
+///     (the app is the "bootloader": a fresh boot means a cleared BCB;
+///     a stale "boot-recovery" command from a crashed run must never
+///     re-arm on the next boot), and
+///   * everything else — 2 MiB SPARSE files created only when missing
+///     (sparse: zero disk cost, zero content reads as "empty partition").
+/// Plus a baseline set for the synthesized fstab lib.rs writes for
+/// full-Android boots (`by-name/{...}` and `bootdevice/by-name/{...}`).
+///
+/// The loader half (should_translate `/dev/block` → rootfs) makes every
+/// guest open/stat of these paths land on the staged files.
+///
+/// HONESTY: a zero-filled misc reads as "no BCB command" (magic
+/// mismatch) — exactly what a freshly-wiped misc partition reads. Reads
+/// and writes hit a real file, so BCB write/clear round-trips work.
+/// BLK* ioctls stay ENOTTY (regular file), so size/mount probing keeps
+/// failing honestly instead of fabricating geometry.
+pub fn create_by_name_block_nodes(rootfs: &str) -> std::io::Result<usize> {
+    let mut wanted: Vec<String> = Vec::new();
+
+    // Baseline partitions every Android-style guest may reference. The
+    // synthesized fstab (lib.rs) names /dev/block/by-name/{system,cache}
+    // and /dev/block/bootdevice/by-name/userdata; boot/recovery/misc are
+    // the classic BCB/update targets.
+    let baseline = [
+        "system", "vendor", "product", "odm", "cache", "userdata", "misc", "boot", "recovery",
+        "metadata", "persist",
+    ];
+    for p in baseline {
+        wanted.push(format!("/dev/block/by-name/{}", p));
+        wanted.push(format!("/dev/block/bootdevice/by-name/{}", p));
+    }
+
+    // Image fstabs — scan the usual locations (symlinked dirs like
+    // etc -> system/etc are resolved by the fs calls themselves).
+    for dir in [
+        "etc",
+        "system/etc",
+        "vendor/etc",
+        "first_stage_ramdisk",
+        "odm/etc",
+        "",
+    ] {
+        let abs_dir = if dir.is_empty() {
+            rootfs.to_string()
+        } else {
+            format!("{}/{}", rootfs, dir)
+        };
+        let entries = match fs::read_dir(&abs_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for ent in entries.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if !name.contains("fstab") {
+                continue;
+            }
+            let path = ent.path();
+            // Only regular files (or symlinks resolving to them); cap size
+            // to guard against surprise huge files.
+            let meta = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.is_file() || meta.len() > 1_048_576 {
+                continue;
+            }
+            match fs::read_to_string(&path) {
+                Ok(text) => collect_by_name_paths(&text, &mut wanted),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    wanted.sort();
+    wanted.dedup();
+
+    let mut created = 0usize;
+    for dev_path in &wanted {
+        // One unwritable node (stale directory from an older layout, EACCES
+        // …) must not abort the staging of the others — log and continue.
+        match materialise_block_node(rootfs, dev_path) {
+            Ok(true) => created += 1,
+            Ok(false) => {}
+            Err(e) => warning!(
+                "[KR64][devices] by-name node {} staging failed: {} (continuing)",
+                dev_path,
+                e
+            ),
+        }
+    }
+    info!(
+        "[KR64][devices] by-name block nodes: {} staged ({} new) under {}/dev/block (6-Z287)",
+        wanted.len(),
+        created,
+        rootfs
+    );
+    Ok(created)
+}
+
+/// Extract every `/dev/block/.../by-name/<part>` token from fstab text.
+/// fstab format (v1 and v2 both): the source block device is the FIRST
+/// whitespace-delimited token of a non-comment line.
+fn collect_by_name_paths(text: &str, out: &mut Vec<String>) {
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let tok = t.split_whitespace().next().unwrap_or("");
+        if tok.starts_with("/dev/block/") && tok.contains("/by-name/") {
+            out.push(tok.to_string());
+        }
+    }
+}
+
+/// Create `{rootfs}{dev_path}` as a regular file (sparse) standing in for
+/// the block node. Returns true if this call CREATED it.
+fn materialise_block_node(rootfs: &str, dev_path: &str) -> std::io::Result<bool> {
+    let rel = dev_path.trim_start_matches('/');
+    let path = format!("{}/{}", rootfs, rel);
+    let p = Path::new(&path);
+    if p.exists() {
+        // Already there (previous boot, or kr64 staged it). One exception:
+        // misc must be RESET every boot — a stale BCB ("boot-recovery"
+        // written by a crashed previous run) would otherwise re-arm on
+        // the next boot; on a real device the bootloader owns that
+        // lifecycle, and here the app is the bootloader.
+        if dev_path.ends_with("/misc") {
+            let f = fs::OpenOptions::new().write(true).open(&path)?;
+            f.set_len(0)?;
+            f.sync_all()?;
+            let f = fs::OpenOptions::new().write(true).open(&path)?;
+            f.set_len(BCB_MISC_SIZE as u64)?;
+            f.sync_all()?;
+        }
+        return Ok(false);
+    }
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let size: u64 = if dev_path.ends_with("/misc") {
+        BCB_MISC_SIZE as u64
+    } else {
+        BLOCK_NODE_SIZE
+    };
+    f.set_len(size)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o660));
+    }
+    Ok(true)
+}
+
+/// BCB region size (bootloader_message): the first 2 KiB of misc.
+const BCB_MISC_SIZE: usize = 2048;
+/// Sparse stand-in size for non-misc by-name nodes. Sparse, so it costs
+/// no disk until written; 2 MiB covers any BCB-adjacent metadata reads
+/// without pretending to be a full partition image.
+const BLOCK_NODE_SIZE: u64 = 2 * 1024 * 1024;
+
 // ============================================================================
 // Tests — pure-Rust, no Android deps, so they run on the host too.
 // (cargo test --lib)
@@ -1887,6 +2077,122 @@ mod tests {
         assert_eq!(
             i32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]),
             128
+        );
+    }
+
+    // ── 6-Z287: by-name block-node virtualization ─────────────────────
+
+    /// The parser picks every `/dev/block/.../by-name/<part>` source token
+    /// (plain, bootdevice- and platform-qualified), skips comments, and
+    /// ignores non-by-name devices (zram0, mmcblk0pN, /devices/*).
+    #[test]
+    fn collect_by_name_paths_parses_real_fstab_shapes() {
+        let sailfish = "# Android fstab file.\n\
+#<src>                    <mnt_point>  <type>  <mnt_flags>  <fs_mgr_flags>\n\
+/dev/block/by-name/system    /system     ext4    ro,barrier=1  wait,slotselect,verify,first_stage_mount\n\
+/dev/block/by-name/vendor    /vendor     ext4    ro,barrier=1  wait,slotselect,first_stage_mount\n\
+/dev/block/by-name/persist   /persist    ext4    nosuid        wait\n\
+/dev/block/platform/soc/624000.ufshc/by-name/modem     /firmware/radio  vfat  ro  wait,slotselect\n\
+/dev/block/platform/soc/624000.ufshc/by-name/userdata  /data  ext4  errors=panic  latemount,wait,check\n\
+/dev/block/zram0             none        swap    defaults      zramsize=2147483648\n\
+/dev/block/platform/soc/624000.ufshc/by-name/misc      /misc  emmc  defaults  defaults\n\
+/devices/*/xhci-hcd.0.auto/usb*  auto    vfat    defaults      voldmanaged=usb:auto\n";
+        let mut out = Vec::new();
+        collect_by_name_paths(sailfish, &mut out);
+        out.sort();
+        let expect = vec![
+            "/dev/block/by-name/persist",
+            "/dev/block/by-name/system",
+            "/dev/block/by-name/vendor",
+            "/dev/block/platform/soc/624000.ufshc/by-name/misc",
+            "/dev/block/platform/soc/624000.ufshc/by-name/modem",
+            "/dev/block/platform/soc/624000.ufshc/by-name/userdata",
+        ];
+        let mut expect = expect;
+        expect.sort();
+        assert_eq!(out, expect, "parser must match exactly the by-name set");
+    }
+
+    #[test]
+    fn collect_by_name_paths_skips_comments_and_blanks() {
+        let text = "\n# /dev/block/by-name/fake should NOT be collected\n\
+\t \n/dev/block/bootdevice/by-name/userdata\t/data\text4\tro\twait\n";
+        let mut out = Vec::new();
+        collect_by_name_paths(text, &mut out);
+        assert_eq!(
+            out,
+            vec!["/dev/block/bootdevice/by-name/userdata"],
+            "comments must be skipped even when they mention by-name paths"
+        );
+    }
+
+    /// Full run on an empty rootfs: baseline set + fstab-derived nodes
+    /// (including the platform-qualified misc) exist as regular files;
+    /// misc is exactly BCB_MISC_SIZE.
+    #[test]
+    fn create_by_name_block_nodes_stages_fstab_and_baseline() {
+        let rootfs = tmpdir();
+        // The image's recovery.fstab (lineage-22.2-sailfish shape).
+        let etc = format!("{}/system/etc", rootfs);
+        fs::create_dir_all(&etc).unwrap();
+        fs::write(
+            format!("{}/recovery.fstab", etc),
+            "/dev/block/platform/soc/624000.ufshc/by-name/misc   /misc  emmc  defaults  defaults\n\
+             /dev/block/by-name/system   /system  ext4  ro  wait\n",
+        )
+        .unwrap();
+
+        let created = create_by_name_block_nodes(&rootfs).expect("staging works");
+        assert!(created > 0, "must create at least the baseline set");
+
+        // Platform-qualified misc from the image fstab.
+        let misc = format!(
+            "{}/dev/block/platform/soc/624000.ufshc/by-name/misc",
+            rootfs
+        );
+        let meta = fs::metadata(&misc).expect("platform misc node must exist");
+        assert!(meta.is_file(), "misc stands in as a regular file");
+        assert_eq!(
+            meta.len(),
+            BCB_MISC_SIZE as u64,
+            "misc must be exactly the BCB region size"
+        );
+
+        // Baseline nodes exist even without an fstab mentioning them.
+        for rel in [
+            "dev/block/by-name/misc",
+            "dev/block/by-name/boot",
+            "dev/block/bootdevice/by-name/userdata",
+        ] {
+            let p = format!("{}/{}", rootfs, rel);
+            assert!(fs::metadata(&p).is_ok(), "{} must exist", rel);
+        }
+
+        // Non-misc nodes are sparse 2MiB.
+        let boot = fs::metadata(format!("{}/dev/block/by-name/boot", rootfs)).unwrap();
+        assert_eq!(boot.len(), BLOCK_NODE_SIZE, "non-misc nodes are 2MiB");
+    }
+
+    /// Re-running is idempotent (already-staged nodes are kept), but misc
+    /// is RESET to all-zero BCB size on every call (fresh-boot semantics:
+    /// a stale "boot-recovery" command must never re-arm).
+    #[test]
+    fn create_by_name_block_nodes_resets_misc_every_boot() {
+        let rootfs = tmpdir();
+        create_by_name_block_nodes(&rootfs).expect("first run");
+
+        // Simulate a crashed previous run writing a BCB command.
+        let misc = format!("{}/dev/block/by-name/misc", rootfs);
+        fs::write(&misc, b"boot-recovery").unwrap();
+
+        let second = create_by_name_block_nodes(&rootfs).expect("second run");
+        assert_eq!(second, 0, "second run must create nothing new (idempotent)");
+
+        let content = fs::read(&misc).unwrap();
+        assert_eq!(content.len(), BCB_MISC_SIZE, "misc restored to BCB size");
+        assert!(
+            content.iter().all(|&b| b == 0),
+            "misc must read as NO BCB command after a fresh boot"
         );
     }
 }
