@@ -8931,6 +8931,24 @@ fn stall_forensic_dump(pid: libc::pid_t) {
         let nfds = (a1 as usize).min(16);
         if a0 != 0 && nfds > 0 {
             if let Some(buf) = read_child_bytes(pid, a0, nfds * 8) {
+                // 6-Z283: socket inodes → names. The LineageOS main loop
+                // ppolls fd 19 = socket:[inode] — the readlink can't say
+                // WHICH socket that is. /proc/<pid>/net/unix lists every
+                // socket in the netns with its inode + path (abstract
+                // sockets render with a leading '@'). Match the inodes
+                // once per dump and name the fd set precisely.
+                let unix_table =
+                    std::fs::read_to_string(format!("/proc/{}/net/unix", pid)).unwrap_or_default();
+                let inode_name = |inode: &str| -> Option<String> {
+                    for line in unix_table.lines().skip(1) {
+                        // NumUsers RefCount Protocol Flags Type St Inode Path
+                        let cols: Vec<&str> = line.split_whitespace().collect();
+                        if cols.len() >= 7 && cols[6] == inode {
+                            return Some(cols[7..].join(" "));
+                        }
+                    }
+                    None
+                };
                 for i in 0..nfds {
                     let fd = i32::from_ne_bytes(buf[i * 8..i * 8 + 4].try_into().unwrap());
                     if fd < 0 {
@@ -8939,9 +8957,21 @@ fn stall_forensic_dump(pid: libc::pid_t) {
                     let dest = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
                         .map(|d| d.to_string_lossy().into_owned())
                         .unwrap_or_else(|_| "<gone>".to_string());
+                    // socket:[12345] → append the socket's unix-table name.
+                    let named = if let Some(inode) = dest
+                        .strip_prefix("socket:[")
+                        .and_then(|s| s.strip_suffix(']'))
+                    {
+                        match inode_name(inode) {
+                            Some(name) => format!("{} = {}", dest, name),
+                            None => format!("{} (unnamed/peerside)", dest),
+                        }
+                    } else {
+                        dest
+                    };
                     crate::trace_log_line(&format!(
                         "6-Z282 STALL-DUMP: pid={} pollfds[{}]={} -> {}",
-                        pid, i, fd, dest
+                        pid, i, fd, named
                     ));
                 }
             } else {
