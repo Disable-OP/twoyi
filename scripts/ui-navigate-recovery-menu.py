@@ -138,6 +138,19 @@ def screencap_bytes():
 
 
 
+def adb_docker_out(cmd, timeout=25):
+    """Run a shell command as CONTAINER ROOT via docker exec (adb shell
+    is the shell user — its /proc reads of app processes return nothing;
+    the workflow's keystore2-threads dump uses exactly this channel)."""
+    try:
+        r = subprocess.run(
+            ["sudo", "docker", "exec", "redroid", "sh", "-c", cmd],
+            capture_output=True, text=True, timeout=timeout)
+        return ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        return f"<threw {e!r}>"
+
+
 def adb_out(cmd, timeout=20):
     """Run a shell command via adb and return its combined output (the
     probe needs RAW results — `input tap` failures print usage/error text
@@ -286,13 +299,21 @@ def main():
     # when taps still produce no guest INPUT reads, dump the GUEST
     # recovery's per-thread park state so the input thread's blocking
     # point (epoll_wait? futex? read?) is visible in the artifacts.
-    dump = adb_out(
-        "for d in /proc/[0-9]*/task/[0-9]*; do "
-        "c=$(cat $d/comm 2>/dev/null); "
-        "case $c in *recovery*) "
-        "echo \"=== tid=$(basename $d) comm=$c wchan=$(cat $d/wchan 2>/dev/null)\"; "
-        "echo \"syscall: $(cat $d/syscall 2>/dev/null | head -c 80)\";; esac; done",
-        timeout=30)
+    # v7 lesson: adb-shell runs as the SHELL user and CANNOT read app
+    # /proc (empty dump) — use docker exec (root), the workflow's
+    # proven keystore2-dump pattern.
+    dump = ""
+    for _root in ("/data/user/0/io.twoyi.debug", "/data/data/io.twoyi.debug"):
+        dump = adb_docker_out(
+            "for d in /proc/[0-9]*/task/[0-9]*; do "
+            "c=$(cat $d/comm 2>/dev/null); "
+            "case $c in *recovery*) "
+            "p=$(echo $d | sed -n 's|^/proc/\\([0-9]*\\)/task/.*|\\1|p'); "
+            "echo \"=== pid=$p tid=$(basename $d) comm=$c wchan=$(cat $d/wchan 2>/dev/null)\"; "
+            "echo \"syscall: $(cat $d/syscall 2>/dev/null | head -c 100)\";; esac; done",
+            timeout=35)
+        if dump and "recovery" in dump:
+            break
     try:
         with open(os.path.join(ART, "menu-probe-guest-threads.txt"), "w") as f:
             f.write(dump or "<empty>")
