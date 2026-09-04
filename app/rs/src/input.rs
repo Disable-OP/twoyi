@@ -262,20 +262,16 @@ fn encode_evdev_touch_down(
 ) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(ev_size * 10);
     for (kind, code, value) in [
-        (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, slot),
-        (
-            ev::EV_ABS as u16,
-            abs::ABS_MT_TRACKING_ID as u16,
-            tracking_id,
-        ),
-        (ev::EV_KEY as u16, btn::BTN_TOUCH as u16, 1),
-        (ev::EV_KEY as u16, btn::BTN_TOOL_FINGER as u16, 1),
-        (ev::EV_ABS as u16, abs::ABS_MT_POSITION_X as u16, x),
-        (ev::EV_ABS as u16, abs::ABS_MT_POSITION_Y as u16, y),
-        (ev::EV_ABS as u16, abs::ABS_MT_PRESSURE as u16, pressure),
-        (ev::EV_ABS as u16, abs::ABS_X as u16, x),
-        (ev::EV_ABS as u16, abs::ABS_Y as u16, y),
-        (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+        (EV_ABS as u16, ABS_MT_SLOT as u16, slot),
+        (EV_ABS as u16, ABS_MT_TRACKING_ID as u16, tracking_id),
+        (EV_KEY as u16, BTN_TOUCH as u16, 1),
+        (EV_KEY as u16, BTN_TOOL_FINGER as u16, 1),
+        (EV_ABS as u16, ABS_MT_POSITION_X as u16, x),
+        (EV_ABS as u16, ABS_MT_POSITION_Y as u16, y),
+        (EV_ABS as u16, ABS_MT_PRESSURE as u16, pressure),
+        (EV_ABS as u16, ABS_X as u16, x),
+        (EV_ABS as u16, ABS_Y as u16, y),
+        (EV_SYN as u16, SYN_REPORT as u16, 0),
     ] {
         out.extend(encode_evdev_record(ev_size, kind, code, value)?);
     }
@@ -293,13 +289,13 @@ fn encode_evdev_touch_move(
 ) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(ev_size * 7);
     for (kind, code, value) in [
-        (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, slot),
-        (ev::EV_ABS as u16, abs::ABS_MT_POSITION_X as u16, x),
-        (ev::EV_ABS as u16, abs::ABS_MT_POSITION_Y as u16, y),
-        (ev::EV_ABS as u16, abs::ABS_MT_PRESSURE as u16, pressure),
-        (ev::EV_ABS as u16, abs::ABS_X as u16, x),
-        (ev::EV_ABS as u16, abs::ABS_Y as u16, y),
-        (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+        (EV_ABS as u16, ABS_MT_SLOT as u16, slot),
+        (EV_ABS as u16, ABS_MT_POSITION_X as u16, x),
+        (EV_ABS as u16, ABS_MT_POSITION_Y as u16, y),
+        (EV_ABS as u16, ABS_MT_PRESSURE as u16, pressure),
+        (EV_ABS as u16, ABS_X as u16, x),
+        (EV_ABS as u16, ABS_Y as u16, y),
+        (EV_SYN as u16, SYN_REPORT as u16, 0),
     ] {
         out.extend(encode_evdev_record(ev_size, kind, code, value)?);
     }
@@ -312,11 +308,11 @@ fn encode_evdev_touch_move(
 fn encode_evdev_touch_release(ev_size: usize, slot: i32) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(ev_size * 5);
     for (kind, code, value) in [
-        (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, slot),
-        (ev::EV_ABS as u16, abs::ABS_MT_TRACKING_ID as u16, -1),
-        (ev::EV_KEY as u16, btn::BTN_TOUCH as u16, 0),
-        (ev::EV_KEY as u16, btn::BTN_TOOL_FINGER as u16, 0),
-        (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+        (EV_ABS as u16, ABS_MT_SLOT as u16, slot),
+        (EV_ABS as u16, ABS_MT_TRACKING_ID as u16, -1),
+        (EV_KEY as u16, BTN_TOUCH as u16, 0),
+        (EV_KEY as u16, BTN_TOOL_FINGER as u16, 0),
+        (EV_SYN as u16, SYN_REPORT as u16, 0),
     ] {
         out.extend(encode_evdev_record(ev_size, kind, code, value)?);
     }
@@ -1366,16 +1362,16 @@ mod tests {
         let d = encode_evdev_touch_down(24, 0, 7, 360, 769, 42).unwrap();
         assert_eq!(d.len(), 240);
         let expect: [(u16, u16, i32); 10] = [
-            (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, 0),
-            (ev::EV_ABS as u16, abs::ABS_MT_TRACKING_ID as u16, 7),
-            (ev::EV_KEY as u16, btn::BTN_TOUCH as u16, 1),
-            (ev::EV_KEY as u16, btn::BTN_TOOL_FINGER as u16, 1),
-            (ev::EV_ABS as u16, abs::ABS_MT_POSITION_X as u16, 360),
-            (ev::EV_ABS as u16, abs::ABS_MT_POSITION_Y as u16, 769),
-            (ev::EV_ABS as u16, abs::ABS_MT_PRESSURE as u16, 42),
-            (ev::EV_ABS as u16, abs::ABS_X as u16, 360),
-            (ev::EV_ABS as u16, abs::ABS_Y as u16, 769),
-            (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+            (EV_ABS as u16, ABS_MT_SLOT as u16, 0),
+            (EV_ABS as u16, ABS_MT_TRACKING_ID as u16, 7),
+            (EV_KEY as u16, BTN_TOUCH as u16, 1),
+            (EV_KEY as u16, BTN_TOOL_FINGER as u16, 1),
+            (EV_ABS as u16, ABS_MT_POSITION_X as u16, 360),
+            (EV_ABS as u16, ABS_MT_POSITION_Y as u16, 769),
+            (EV_ABS as u16, ABS_MT_PRESSURE as u16, 42),
+            (EV_ABS as u16, ABS_X as u16, 360),
+            (EV_ABS as u16, ABS_Y as u16, 769),
+            (EV_SYN as u16, SYN_REPORT as u16, 0),
         ];
         for (i, e) in expect.iter().enumerate() {
             assert_eq!(evdev_rec(&d, i, 24), *e, "DOWN24 record {i}");
@@ -1389,13 +1385,13 @@ mod tests {
         let m = encode_evdev_touch_move(16, 0, 150, 250, 200).unwrap();
         assert_eq!(m.len(), 112);
         let expect: [(u16, u16, i32); 7] = [
-            (ev::EV_ABS as u16, abs::ABS_MT_SLOT as u16, 0),
-            (ev::EV_ABS as u16, abs::ABS_MT_POSITION_X as u16, 150),
-            (ev::EV_ABS as u16, abs::ABS_MT_POSITION_Y as u16, 250),
-            (ev::EV_ABS as u16, abs::ABS_MT_PRESSURE as u16, 200),
-            (ev::EV_ABS as u16, abs::ABS_X as u16, 150),
-            (ev::EV_ABS as u16, abs::ABS_Y as u16, 250),
-            (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0),
+            (EV_ABS as u16, ABS_MT_SLOT as u16, 0),
+            (EV_ABS as u16, ABS_MT_POSITION_X as u16, 150),
+            (EV_ABS as u16, ABS_MT_POSITION_Y as u16, 250),
+            (EV_ABS as u16, ABS_MT_PRESSURE as u16, 200),
+            (EV_ABS as u16, ABS_X as u16, 150),
+            (EV_ABS as u16, ABS_Y as u16, 250),
+            (EV_SYN as u16, SYN_REPORT as u16, 0),
         ];
         for (i, e) in expect.iter().enumerate() {
             assert_eq!(evdev_rec(&m, i, 16), *e, "MOVE16 record {i}");
@@ -1411,19 +1407,19 @@ mod tests {
             assert_eq!(r.len(), ev_size * 5);
             assert_eq!(
                 evdev_rec(&r, 1, ev_size),
-                (ev::EV_ABS as u16, abs::ABS_MT_TRACKING_ID as u16, -1)
+                (EV_ABS as u16, ABS_MT_TRACKING_ID as u16, -1)
             );
             assert_eq!(
                 evdev_rec(&r, 2, ev_size),
-                (ev::EV_KEY as u16, btn::BTN_TOUCH as u16, 0)
+                (EV_KEY as u16, BTN_TOUCH as u16, 0)
             );
             assert_eq!(
                 evdev_rec(&r, 3, ev_size),
-                (ev::EV_KEY as u16, btn::BTN_TOOL_FINGER as u16, 0)
+                (EV_KEY as u16, BTN_TOOL_FINGER as u16, 0)
             );
             assert_eq!(
                 evdev_rec(&r, 4, ev_size),
-                (ev::EV_SYN as u16, syn::SYN_REPORT as u16, 0)
+                (EV_SYN as u16, SYN_REPORT as u16, 0)
             );
         }
     }
@@ -1432,8 +1428,8 @@ mod tests {
     /// anything else must be refused (the hello only advertises these).
     #[test]
     fn evdev_record_rejects_unknown_sizes() {
-        assert!(encode_evdev_record(20, ev::EV_SYN as u16, 0, 0).is_none());
-        assert!(encode_evdev_record(0, ev::EV_SYN as u16, 0, 0).is_none());
+        assert!(encode_evdev_record(20, EV_SYN as u16, 0, 0).is_none());
+        assert!(encode_evdev_record(0, EV_SYN as u16, 0, 0).is_none());
         assert!(encode_evdev_touch_down(20, 0, 1, 1, 1, 1).is_none());
         assert!(encode_evdev_touch_move(32, 0, 1, 1, 1).is_none());
         assert!(encode_evdev_touch_release(20, 0).is_none());
