@@ -9017,6 +9017,106 @@ fn stall_forensic_dump(pid: libc::pid_t) {
             )),
         }
     }
+
+    // 6-Z285: AArch64 frame-pointer chain walk. /proc/<pid>/syscall only
+    // exposes the SYSCALL wrapper's sp/pc — the decisive datum ("which
+    // caller is waiting on this futex? which library scheduled this
+    // ppoll?") lives in the C++ caller frames above. bionic/libc++ AArch64
+    // frames keep x29 (fp) at [fp] and x30 (return) at [fp+8]. The
+    // wrapper frame itself is probed heuristically: scan the first 512
+    // bytes above sp for a word that is stack-resident AND whose
+    // [word+8] lands in an executable mapping — that pair is a frame
+    // record with very high probability. Bounded: one candidate scan,
+    // <=24 frames, monotonically increasing fp (callers live at higher
+    // addresses), all reads through read_child_bytes.
+    if sp != 0 {
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).unwrap_or_default();
+        let regions: Vec<(u64, u64, bool, String)> = maps
+            .lines()
+            .filter_map(|l| {
+                let mut r = l.splitn(2, ' ');
+                let range = r.next()?;
+                let mut b = range.split('-');
+                let lo = u64::from_str_radix(b.next()?, 16).ok()?;
+                let hi = u64::from_str_radix(b.next()?, 16).ok()?;
+                let perms = r.next().unwrap_or("");
+                Some((lo, hi, perms.contains('x'), l.to_string()))
+            })
+            .collect();
+        let name_of = |pc: u64| -> String {
+            for (lo, hi, _, line) in &regions {
+                if pc >= *lo && pc < *hi {
+                    // Shorten "lo-hi perms off dev inode /path/lib.so" to
+                    // the last two path components + offset — full maps
+                    // lines are already printed by the pc attribution above.
+                    let path = line.split_whitespace().last().unwrap_or("?");
+                    if path.starts_with('[') {
+                        return path.to_string();
+                    }
+                    let comps: Vec<&str> = path.rsplitn(3, '/').collect();
+                    let short = if comps.len() >= 2 {
+                        format!("{}/{}", comps[1], comps[0])
+                    } else {
+                        path.to_string()
+                    };
+                    return format!("{}+{:#x}", short, pc - lo);
+                }
+            }
+            "?".to_string()
+        };
+
+        if let Some(win) = read_child_bytes(pid, sp, 512) {
+            let mut chain = None;
+            for i in 0..win.len() / 8 {
+                let v = u64::from_ne_bytes(win[i * 8..i * 8 + 8].try_into().unwrap());
+                // stack-resident fp above sp (caller frames grow upward),
+                // 8-byte aligned, within 1 MiB of sp.
+                if v <= sp || v >= sp + 0x100000 || v & 7 != 0 {
+                    continue;
+                }
+                if let Some(rec) = read_child_bytes(pid, v, 16) {
+                    let next = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+                    let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+                    let ret_exec = regions
+                        .iter()
+                        .any(|(lo, hi, x, _)| *x && ret >= *lo && ret < *hi);
+                    let next_stack = next > sp && next < sp + 0x100000 && next & 7 == 0;
+                    if ret_exec && (next_stack || ret != 0 && next == 0) {
+                        chain = Some(v);
+                        break;
+                    }
+                }
+            }
+            if let Some(mut fp) = chain {
+                for depth in 0..24 {
+                    let Some(rec) = read_child_bytes(pid, fp, 16) else {
+                        break;
+                    };
+                    let next = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+                    let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+                    if ret == 0 {
+                        break;
+                    }
+                    crate::trace_log_line(&format!(
+                        "6-Z285 BT: pid={} frame={} ret={:#x} {}",
+                        pid,
+                        depth,
+                        ret,
+                        name_of(ret)
+                    ));
+                    if next <= fp || next >= sp + 0x100000 {
+                        break;
+                    }
+                    fp = next;
+                }
+            } else {
+                crate::trace_log_line(&format!(
+                    "6-Z285 BT: pid={} no frame record found in the first 512 bytes above sp={:#x}",
+                    pid, sp
+                ));
+            }
+        }
+    }
 }
 
 /// 6-Z190: coverage watchdog sweep — heal UNTRACED guest-tree processes.
