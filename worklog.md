@@ -24107,3 +24107,43 @@ Stage Summary:
   recvmsg delivery, logdw dup3 redirect, haptic chain ~3ms. Remaining: the
   lineage minui single-frame (ppoll fd set next round) and the health-HAL →
   battery delivery chain.
+
+---
+Task ID: 6-Z283 + THE LINEAGE MINUI ROOT DECODE — the recovery main thread is parked IN THE BINDER POOL
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: decode the w1 lineage artifacts (ac29043 run 33869969602); name the ppoll fd.
+
+Work Log:
+- 6-Z282 results (w1): the recovery MAIN thread (2602) ppolls EXACTLY ONE fd:
+  fd 19 = socket:[44380]. The forked child ppolls fd 4 = socket:[45238]
+  (registered fake-uevent at +534ms).
+- fd 19 IDENTIFIED from the connect-path diag: pid 2604 connected to
+  /data/user/0/io.twoyi.debug/rootfs/vm0/dev/binder at +530ms — **fd 19 IS
+  THE VIRTUAL BINDER SOCKET**.
+- conn=1 traffic: VERSION → SET_MAX_THREADS(15, then 0) → ONE WRITE_READ with
+  ws=4 rc=0 + "looper state change 0x0000630c" = **BC_ENTER_LOOPER** — the
+  recovery registered a binder looper at +574ms and then BLOCKED ON READ
+  FOREVER. ZERO getService/addService/_NTF/VS-TR lines in the whole run: the
+  recovery NEVER made an SM lookup, NEVER sent a transaction. Its main thread
+  is executing joinThreadPool semantics — waiting for INCOMING transactions
+  that nobody sends.
+- THE UI NEVER DRAWS BECAUSE THE RECOVERY MAIN() NEVER PROGRESSED PAST THIS
+  PARKED BINDER WAIT — no gr_init, no input threads (ZERO clone events from
+  the main pid — RecoveryUI::Init never spawned its input threads either).
+- Next-run answers (6-Z283 pushed, 4c9b830): the stall dump now resolves
+  socket inodes against /proc/net/unix — fd 19 will print its path (the
+  binder pathname socket) and fd 4 its (uevent) name, in-lieu-of doubt.
+  The fork-child (2603/2606) pipe protocol + the recovery's argv are the
+  remaining unknowns: if the parked wait is a SPECIFIC service-notification
+  wait (the 6-Z276 onRegistration machinery is the candidate fix), the
+  next trace's conn=1 read-block context will name it.
+
+Stage Summary:
+- minui never ran: the "menu bring-up" class is NOT a graphics-stack problem
+  at all — it is a BINDER-blocking problem in the recovery's own startup
+  path. The binder pool parking + the fork/pipe child = the recovery is
+  waiting for SOMETHING through IPC before initing its UI. Candidates: a
+  service-registration wait (6-Z276 callbacks), an HIDL get to the zombie
+  hwservicemanager, or a parent/child pipe handshake. One more diagnostic
+  round (4c9b830+) closes it.
