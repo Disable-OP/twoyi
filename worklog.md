@@ -23958,3 +23958,47 @@ Stage Summary:
   kernel-semantics-correct fix in flight. Next: dispatch lineage + R12 on 42093e7 —
   the lineage run now names minui's graphics syscalls for the whole boot; the R12 run
   finally carries the ARMED health-HAL trace (battery stream 6-Z272f-b).
+
+---
+Task ID: 6-Z276 — Binder registration callbacks (the top honest-gap item CLOSED)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: implement registerForNotifications → onRegistration delivery in the virtual binder bus.
+
+Work Log:
+- Touch/haptic latency stream VERIFIED FIXED on 34ac43a (R12 lavender run
+  33846194567): tap at +70332ms → getService(IVibrator) HIT at +70332 →
+  _NTF descriptor +70334 → IVibrator.on(40ms)→host at +70335. The whole
+  haptic chain resolves in ~3ms; the old input-thread stall class is gone.
+- 6-Z276 (2b14abf): the top entry of binder.rs's honest NOT-here list is
+  now implemented:
+  * BusState.watchers: name → Vec<ServiceWatcher{conn, ptr, cookie, hidl}>.
+  * AIDL SM registerForNotifications(5)/unregister(6) + HIDL SM
+    registerForNotifications(4)/unregister(5) store/drop watchers keyed on
+    the service name (HIDL: "fqName/instance"); the flat the watcher
+    passed is its LOCAL callback identity.
+  * fire_registration_callbacks(): one-way onRegistration BR_TRANSACTION
+    queued via queue_transaction (txn_id=0 → no inflight/reply
+    bookkeeping — both callback interfaces are oneway; the process-pool
+    work-stealing path serves them like any queued node work).
+    AIDL shape: [strict][worksource]['SYST'][IServiceCallback s16][name
+    s16][flat HANDLE][stability i32]. HIDL shape: [fqName hstr][instance
+    hstr][preexisting i32].
+  * ALREADY-registered services fire the callback IMMEDIATELY
+    (preexisting=true) — the real-SM waitForService contract.
+  * unregister_conn drops the dead conn's watchers.
+  * ParcelWriter::write_hidl_string added (inverse of read_hidl_string).
+  * Module honest list updated; new test z276_registration_callbacks_fire_oneway
+    (one-way delivery, local-cb targeting, SYST token, UTF-16 string16
+    decode, HIDL hidl_string shape, cleanup). 708/708 host tests.
+- Why it matters: HIDL-service clients (health HAL consumers, other HAL
+  watchers) registerForNotifications and BLOCK until onRegistration —
+  this closes the last structural "wait forever" class in the proxy SM.
+
+Stage Summary:
+- Binder bus now has: real registry + owner routing, BR_TRANSACTION/
+  BC_REPLY correlation, process-pool work stealing, blocking idle,
+  death notifications, and NOW registration callbacks. Remaining honest
+  gaps: fd passing (BINDER_TYPE_FD), host-driver refcount forwarding.
+  In-flight: lineage + R12 runs on 0bb6a0f carry the 6-Z274 uevent fix
+  (boot-partition 10s hole) + the 6-Z275 whole-boot diag window.
