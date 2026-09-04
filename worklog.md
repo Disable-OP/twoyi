@@ -24377,3 +24377,48 @@ Stage Summary:
 - NOT done this round (queued): touch delivery verification into the AOSP
   menu, harness AOSP-menu verdict honesty (SPLASH_HANG artifact), the unnamed
   nr=79 fstatat paths if the 1Hz loop survives the misc fix.
+
+---
+Task ID: 6-Z287/288 VERIFIED — lineage BCB-clean + boot budget recovered; OrangeFox R12 BOOT_FAIL → UI_READY; 6-Z289/290/291 queued in
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: decode the 6-Z287 (by-name nodes) + 6-Z288 (mkfifo/mknod) verification runs; land the queued touch/harness/diag work.
+
+Work Log:
+- lineage-22.2-sailfish on 9de006a (run 33906573024): **6-Z287 VERIFIED** —
+  kr64 staged 25 by-name nodes at +13ms ("by-name block nodes: 25 staged"),
+  the guest's FIRST misc open succeeds instantly (t=0.02s, fd=4), "I:Clearing
+  BCB" completes at t=0.257s, the 10-try retry loop and the ~10s 1Hz
+  fstatat dead zone are GONE (framebuffer init now +0.105s; the old run
+  spent 0–10.6s in the misc retry loop before input init), and the final
+  screenshot shows the FULL MENU with NO BCB error. The only remaining
+  on-screen message is the cosmetic "Failed to open recovery socket:
+  Success" (AOSP StartRecoveryServer socket(2) — errno read back as 0).
+- OrangeFox R12.0 lavender on 4bd275b (run 33908394127): **6-Z288 VERIFIED,
+  BLOCKER CLEARED** — boot BOOT_FAIL → BOOT_OK, ui → UI_READY, terminal →
+  OK. The recovery log shrank 856,944 → 5,331 lines; the orsin flood is
+  exactly ONE successful open now: "__open_2('/system/bin/orsin',
+  fl=0x800) -> fd=43" (O_NONBLOCK writer open of the REAL fifo created by
+  the new mkfifo hook in the app-writable rootfs). fox navigated
+  main → advanced → menu → filemanageroptions → archive_confirm and the
+  final screenshot shows fox's modern Files/Backups/Wipe/Menu UI browsing
+  /sdcard/Fox/logs — a fully interactive session (was: black screen +
+  570k ENOENT opens).
+- 6-Z289 (c39a643): AOSP-menu interactivity probe
+  (scripts/ui-navigate-recovery-menu.py) + classifier honesty — taps SAFE
+  menu rows (never the pre-highlighted "Reboot system now"), verdict =
+  fb0 blit frame-counter rise; ui=UI_READY/ui_source=aosp_menu_interactive.
+  Self-gates to minui-era recoveries; TWRP runs untouched.
+- 6-Z290 (4bd275b): the 6-Z272f-b focused diag now names fstatat(79)
+  paths (arg1 stash slot) in case the unnamed 1Hz loop ever resurfaces.
+- 6-Z291 (6ae1b95): socket() failures log their TRUE errno (names the
+  "recovery socket: Success" cosmetic error next run).
+
+Stage Summary:
+- ALL THREE corpus families green on the new head: lineage boots to a
+  clean rendered menu (no BCB error, ~10s faster), OrangeFox R12 goes
+  BOOT_FAIL → full interactive UI_READY, TWRP regression guard
+  dispatched on 6ae1b95 (run 33910178457). Next queue: host HAL bridge
+  (vibrator: fox's IVibrator/default wait is visible in the R12 log),
+  touch/key delivery proof for the AOSP menu (6-Z289 probe's first
+  lineage run), recovery-socket cosmetic fix once 6-Z291 names the errno.
