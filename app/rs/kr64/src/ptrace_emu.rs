@@ -19116,32 +19116,23 @@ pub fn run_ptrace_loop(
                                     if path_ptr > 0 {
                                         let mut buf = [0u8; 128];
                                         let mut got = String::new();
-                                        unsafe {
-                                            let local = &mut buf;
-                                            let iov = libc::iovec {
-                                                iov_base: local.as_mut_ptr() as *mut libc::c_void,
-                                                iov_len: buf.len(),
-                                            };
-                                            let remote = libc::iovec {
-                                                iov_base: path_ptr as *mut libc::c_void,
-                                                iov_len: buf.len(),
-                                            };
-                                            let n = libc::process_vm_readv(
-                                                pid,
-                                                &iov as *const libc::iovec,
-                                                1,
-                                                &remote as *const libc::iovec,
-                                                1,
-                                                0,
-                                            );
-                                            if n > 0 {
-                                                let end = buf
-                                                    .iter()
-                                                    .position(|&c| c == 0)
-                                                    .unwrap_or(buf.len());
-                                                got = String::from_utf8_lossy(&buf[..end])
-                                                    .into_owned();
-                                            }
+                                        // 6-Z272p pt3: use the shared
+                                        // android21-safe raw-syscall helper.
+                                        // 2ef2a18 called libc::process_vm_readv
+                                        // directly — bionic at android21
+                                        // exports no such symbol and the kr64
+                                        // arm64 link failed (ld.lld: undefined
+                                        // symbol: process_vm_readv, CI run
+                                        // 33822342947). process_vm_readv_chunk
+                                        // exists for exactly this reason (see
+                                        // its block comment at 6-Z267).
+                                        let n = process_vm_readv_chunk(pid, path_ptr, &mut buf);
+                                        if n > 0 {
+                                            let end = buf[..n as usize]
+                                                .iter()
+                                                .position(|&c| c == 0)
+                                                .unwrap_or(n as usize);
+                                            got = String::from_utf8_lossy(&buf[..end]).into_owned();
                                         }
                                         if !got.is_empty() {
                                             target = format!(" path={}", got);
