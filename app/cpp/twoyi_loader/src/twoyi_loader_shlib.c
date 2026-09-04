@@ -2703,6 +2703,68 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return syscall(SYS_bind, sockfd, addr, addrlen);
 }
 
+// =========================================================================
+// 6-Z292: getsockname/getpeername namespace honesty.
+//
+// init binds guest sockets at /dev/socket/<name> (init.rc `socket ...`
+// declarations); the bind hook above translates the path into the
+// app-writable rootfs, so the KERNEL-side address carries the HOST
+// prefix. libcutils' android_get_control_socket() then validates the
+// inherited fd with getsockname() against "/dev/socket/<name>" EXACTLY:
+//   strncmp(addr.sun_path, "/dev/socket/", 12) == 0 &&
+//   strcmp(addr.sun_path + 12, name) == 0
+// and fails with -1 when the host prefix is present. lineage's
+// ListenRecoverySocket printed "ERROR: recovery: Failed to open
+// recovery socket: Success" and the recovery command server (the
+// 'f'=fastboot / 'r'=recovery sideload channel, AOSP
+// recovery_main.cpp) never started (run 33911283769 — init DID create
+// and publish the socket: "bind: translated /dev/socket/recovery" is
+// in kmsg; the env var reached the child; only the name check broke).
+//
+// FIX: rewrite AF_UNIX addresses that carry the rootfs prefix back to
+// the GUEST namespace (memmove the prefix away) — the guest sees its
+// OWN name, the same honesty contract as the open/stat translation.
+// Abstract-namespace names (sun_path[0] == 0) and non-rootfs paths are
+// untouched. getpeername gets the same treatment for accepted
+// connections (a peer bound through the hook presents the guest name).
+// =========================================================================
+static void untranslate_sockaddr_ns(struct sockaddr *addr, socklen_t *addrlen) {
+    if (!addr || !addrlen || !g_rootfs) return;
+    if (addr->sa_family != AF_UNIX) return;
+    struct sockaddr_un *un = (struct sockaddr_un *)addr;
+    size_t path_off = offsetof(struct sockaddr_un, sun_path);
+    size_t used = *addrlen; // bytes the kernel wrote
+    if (used <= path_off + 2) return; // no room for a path
+    if (un->sun_path[0] != '/') return; // abstract name — untouched
+    size_t rl = strlen(g_rootfs);
+    if (rl == 0 || used < path_off + rl + 2) return; // prefix can't fit
+    if (strncmp(un->sun_path, g_rootfs, rl) != 0) return;
+    if (un->sun_path[rl] != '/') return; // boundary: /data/.../rootfs + /dev/...
+    size_t path_bytes = used - path_off; // includes the trailing NUL
+    memmove(un->sun_path, un->sun_path + rl, path_bytes - rl);
+    *addrlen = used - rl;
+}
+
+int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+    static int (*real_fn)(int, struct sockaddr *, socklen_t *) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "getsockname");
+    int ret;
+    if (real_fn) ret = real_fn(fd, addr, addrlen);
+    else ret = (int)syscall(SYS_getsockname, fd, addr, addrlen);
+    if (ret == 0) untranslate_sockaddr_ns(addr, addrlen);
+    return ret;
+}
+
+int getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+    static int (*real_fn)(int, struct sockaddr *, socklen_t *) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "getpeername");
+    int ret;
+    if (real_fn) ret = real_fn(fd, addr, addrlen);
+    else ret = (int)syscall(SYS_getpeername, fd, addr, addrlen);
+    if (ret == 0) untranslate_sockaddr_ns(addr, addrlen);
+    return ret;
+}
+
 // Hook ioctl — intercept binder ioctls.
 //
 // Three kinds of binder fds reach this hook:
