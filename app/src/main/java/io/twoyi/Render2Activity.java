@@ -126,6 +126,10 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     private void sendDebugTouch(int action, float sx, float sy) {
         if (mSurfaceWidth <= 0 || mSurfaceHeight <= 0) {
+            // 6-Z289d: the silent drop that blinded the menu probe —
+            // name the surface state when a debug touch is discarded.
+            Log.w(TAG, "debug touch DROPPED: surface not ready ("
+                    + mSurfaceWidth + "x" + mSurfaceHeight + ")");
             return;
         }
         long now = SystemClock.uptimeMillis();
@@ -147,6 +151,8 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             public void onReceive(Context context, Intent intent) {
                 int px = intent.getIntExtra("x", -1);
                 int py = intent.getIntExtra("y", -1);
+                Log.i(TAG, "debug touch broadcast received: x=" + px + " y=" + py
+                        + " action=" + intent.getStringExtra("action"));
                 if (px < 0 || py < 0) {
                     return;
                 }
