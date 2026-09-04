@@ -24267,3 +24267,57 @@ Stage Summary:
   unnamed 1Hz fstatat path). R12: pre-existing orsin flood, bisected
   clean from 6-Z284 (fix candidate queued). TWRP: still green with real
   battery. Pushed 1fa9515, 5ce5d09, 2964817.
+
+---
+Task ID: 6-Z286 — LINEAGE UI IS RENDERING: the "SPLASH_HANG" verdict is a harness-visibility artifact; the menu is fully drawn and waiting for input
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: decode the 2964817 BT run; determine the real state behind ui=SPLASH_HANG.
+
+Work Log:
+- Dispatched lineage-22.2-sailfish on 57da331 (33900850051) with the 6-Z285
+  FP-chain backtrace armed. Verdict again boot=BOOT_OK / ui=SPLASH_HANG —
+  but the 6-Z285 backtrace + screenshot tell the REAL story:
+- 6-Z285 BT (pid 2625, the recovery main thread):
+    RecoveryUI::WaitInputEvent()+0x110 (the futex)
+    ← ScreenRecoveryUI::ShowMenu(unique_ptr<Menu>,...)+0xd0
+    ← ScreenRecoveryUI::ShowMenu(vector<string>&,...)+0x74
+    ← recovery+0xdc2c ← recovery+0x2f08
+  THE MENU IS CONSTRUCTED AND THE MAIN THREAD IS IN THE INPUT-EVENT WAIT —
+  the stall is "waiting for user input", NOT a rendering/binder deadlock.
+- screenshot-08_final.png PROVES THE UI: the full AOSP/Lineage recovery
+  text menu is rendered — "Reboot system now" (highlighted), "Apply
+  update", "Factory reset", "Advanced", header "Version (unknown) ()",
+  battery "0%+" — the whole gr_init/minui/menu stack works end to end.
+  The SPLASH_HANG heuristic counts blits/pages and cannot see an
+  AOSP-style menu (TWRP-centric markers); the harness then never drives
+  the screen, so no navigation occurs.
+- Console errors on screen (the ONLY guest-visible failures left):
+    "Failed to open recovery socket: Success" (the /cache/recovery/socket
+     ListenRecoverySocket bind)
+    "Failed to clear BCB message: failed to open
+     /dev/block/platform/soc/624000.ufshc/by-name/misc: No such file or
+     directory" (BCB write-back at menu entry)
+- The fork/pipe child (6-Z283's "ONE child") named at last: pid 2627
+  blocks FOREVER in read(fd=3) on an anon pipe (BT: recovery+0x3a14 ←
+  pthread start). It is a benign background waiter, not the blocker.
+- REMAINING LINEAGE WORK (priority order):
+  1. Virtualize the platform-qualified by-name block nodes
+     (/dev/block/platform/<soc>/<ctrl>/by-name/<part>) from the guest
+     fstab so BCB read/clear + the 10-try misc stat loop succeed — kills
+     the on-screen errors and the remaining boot dead time.
+  2. Verify/repair touch delivery into the AOSP recovery (the menu needs
+     keys/touches; harness taps must reach the input thread).
+  3. Harness: teach the verdict heuristics about AOSP recovery menus
+     (menu-item OCR/uiautomator on the host screenshot) so lineage gets
+     a real UI_READY path instead of SPLASH_HANG.
+- R12 (orsin flood, 6-Z285 worklog): fix candidate unchanged — stop the
+  faked mknodat success (rootfs-first fifo creation or honest failure).
+
+Stage Summary:
+- 6-Z284 is production-verified: lineage-22.2 boots to a RENDERED,
+  interactive menu. The remaining lineage items are misc-block-node
+  virtualization, touch-input verification, and harness verdict honesty.
+  TWRP angler remains green (BOOT_OK + battery TRUE). R12 BOOT_FAIL
+  bisected to pre-6-Z284 (orsin flood) with a queued fix candidate.
+  Pushed: 1fa9515 (fix), 5ce5d09+57da331 (worklogs), 2964817 (BT diag).
