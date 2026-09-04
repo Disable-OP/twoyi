@@ -14503,30 +14503,42 @@ pub fn run_ptrace_loop(
                                         total_entries
                                     ));
                                 }
-                                // 6-Z272f-b: focus the per-pid syscall DIAG on
-                                // the battery-critical services (the health
-                                // HAL started by the 6-Z272c rc patch stalls
-                                // BEFORE its first /dev/hwbinder open — this
-                                // trace names the site). 6-Z272b: ALSO focus
-                                // the AOSP recovery binary (LineageOS
-                                // recovery_loader class: the process parks in
-                                // poll_schedule_timeout with a pipe-reading
-                                // child and NEVER opens /dev/graphics/fb0 —
-                                // minui's graphics init never ran; a 50-call
-                                // window names the syscall it stalls behind).
-                                if exec_path.contains("android.hardware.health@") {
-                                    focused_diag_pids.insert(pid, 0);
-                                    log(&format!(
-                                        "6-Z272f-b: focused syscall DIAG armed for pid={} ({})",
-                                        pid, exec_path
-                                    ));
-                                } else if exec_path.ends_with("/system/bin/recovery") {
-                                    focused_diag_pids.insert(pid, 0);
-                                    log(&format!(
-                                        "6-Z272b: focused syscall DIAG armed for pid={} ({})",
-                                        pid, exec_path
-                                    ));
-                                }
+                            }
+                            // 6-Z273: focused-diag ARMING moved OUT of the
+                            // 6-Z238 scan budget (`exec_env_scans <= 24`).
+                            // In the R12 run 33780708260 the budget was
+                            // exhausted by early-boot service execs long
+                            // before the health HAL exec'd at +10490ms, so
+                            // ZERO "6-Z272f-b: focused syscall DIAG armed"
+                            // lines ever fired and the battery stall stayed
+                            // unnamed for another round. The arming is a
+                            // string compare + map insert on the exec path
+                            // (already read unconditionally above) — it must
+                            // not inherit the envp-scan budget.
+                            //
+                            // 6-Z272f-b: focus the per-pid syscall DIAG on
+                            // the battery-critical services (the health
+                            // HAL started by the 6-Z272c rc patch stalls
+                            // BEFORE its first /dev/hwbinder open — this
+                            // trace names the site). 6-Z272b: ALSO focus
+                            // the AOSP recovery binary (LineageOS
+                            // recovery_loader class: the process parks in
+                            // poll_schedule_timeout with a pipe-reading
+                            // child and NEVER opens /dev/graphics/fb0 —
+                            // minui's graphics init never ran; a 50-call
+                            // window names the syscall it stalls behind).
+                            if exec_path.contains("android.hardware.health@") {
+                                focused_diag_pids.insert(pid, 0);
+                                log(&format!(
+                                    "6-Z272f-b: focused syscall DIAG armed for pid={} ({})",
+                                    pid, exec_path
+                                ));
+                            } else if exec_path.ends_with("/system/bin/recovery") {
+                                focused_diag_pids.insert(pid, 0);
+                                log(&format!(
+                                    "6-Z272b: focused syscall DIAG armed for pid={} ({})",
+                                    pid, exec_path
+                                ));
                             }
                         }
 
