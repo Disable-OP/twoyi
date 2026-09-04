@@ -13251,6 +13251,29 @@ pub fn run_ptrace_loop(
                                     event_name, new_child_pid, tracked_pids.len()
                                 ));
                             }
+                            // ── 6-Z277: focused-diag INHERITANCE at
+                            // fork/clone ──
+                            //
+                            // The LineageOS AOSP recovery execs and THEN
+                            // spawns its UI thread (minui's graphics init
+                            // — /dev/dri and fb0 opens — runs on the
+                            // CLONED thread, a NEW pid in the tracer's
+                            // eyes). The 6-Z272b arming covered only the
+                            // exec'd main thread, so every run showed the
+                            // recovery parking in its main-loop ppoll with
+                            // ZERO named graphics attempts (the single
+                            // app-side blit stayed unexplained). Threads
+                            // of an armed process inherit the focused
+                            // diag (fresh 150-syscall window + own 5 s
+                            // fail budget), which names the exact syscall
+                            // minui stalls or fails on.
+                            if focused_diag_pids.contains_key(&pid) && new_child_pid > 0 {
+                                focused_diag_pids.entry(new_child_pid).or_insert((0, 0, 0));
+                                log(&format!(
+                                    "6-Z277: focused syscall DIAG inherited by pid={} (thread of armed pid={})",
+                                    new_child_pid, pid
+                                ));
+                            }
                             // ── 6-Z111: fork-like children INHERIT the
                             // parent's property-area registrations ──
                             //
