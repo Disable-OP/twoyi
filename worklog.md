@@ -23860,3 +23860,47 @@ Work Log:
 
 Stage Summary:
 - Three sweep classes now have named roots: import stall (FIXED+verified), EARLY_INIT fstab (FIXED, violet verdict in flight), recovery_loader/minui (decoded — bring-up wave pending). The LineageOS menu ask needs the minui→fb0 bridge wave (6-Z272l candidate) after the current verification round.
+
+---
+Task ID: 6-Z273 (fresh-sandbox round 1) — HEAD build repair + overnight verdict decode
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-04
+Task: reconstruct the sandbox (fresh reset), create the webDevReview cron, decode the
+in-flight 25716f3 verdict runs, and repair the HEAD build break.
+
+Work Log:
+- Fresh sandbox: re-cloned @2ef2a18 via PAT (credential store at /home/z/.twoyi-auth,
+  0600). HEAD 2ef2a18 = 66 commits past the known-good 01f7980. Cron recreated:
+  job 357935, webDevReview, fixed_rate 3600s, priority 15, prompt "Continue".
+- VERDICT RUNS DECODED (all three dispatched on 25716f3 = the null-flag + streaming
+  import commits):
+  * R12 33780708260 — **KEYSTORE2 REGISTRATION SUCCEEDED**:
+    "Add emulation wrapper around Keymaster device for security level: TRUSTED_ENVIRONMENT"
+    → "Successfully registered Keystore 2.0 service." 20ms after start (the hole was
+    ~18-20s). earlyBootEnded(TEE) OK, DB created, boot_level_keys + super_key alive;
+    the only remaining error is STRONGBOX HARDWARE_TYPE_UNAVAILABLE (-68) — honest,
+    expected, non-fatal (no strongbox exists in this environment).
+  * R12 timeline: black through 20s → OrangeFox splash at 25s → FULL INTERACTIVE UI
+    (file manager browsing /sdcard, theme rendered, battery widget) by 40s.
+  * whyred 33780721750 — TWRP 3.7.0_9-0 full UI at 60s ("Keep System Read only?"
+    screen rendered).
+  * lineage-22.2-sailfish 33780753629 — still the 6-Z272b class: AOSP recovery up but
+    minui BLACK at 40s+ (this run PREDATES the 272o/p fbdev-fallback fix wave, which
+    is therefore still UNVERIFIED on lineage; overnight push runs only used the TWRP
+    default image).
+  * Battery widget still shows "!%" in R12 — the 6-Z272f-b health-HAL stream remains
+    the open battery blocker.
+- **HEAD BUILD BROKEN FOUND**: CI 33822342947 (2ef2a18) failed at kr64Build:
+  ld.lld: undefined symbol: process_vm_readv — 2ef2a18's 6-Z272p openat diagnostic
+  called libc::process_vm_readv directly, but bionic at android21 exports no such
+  symbol (the codebase convention since 6-Z267 is the raw libc::SYS_process_vm_readv
+  helper process_vm_readv_chunk for exactly this reason).
+- FIX (this round): replaced the direct libc symbol call with
+  process_vm_readv_chunk(pid, path_ptr, &mut buf) + honest comment naming the CI run.
+  Zero direct process_vm_readv/writev symbol references remain in app/rs.
+
+Stage Summary:
+- keystore2 ~20s hole is CLOSED (registered in 20ms, verified in production CI).
+  R12 reaches full interactive UI by ~40s. TWRP whyred green. Lineage minui bring-up
+  wave awaits a dispatch on the repaired HEAD. Next: commit + push this fix, dispatch
+  lineage (AOSP) verification, then the health-HAL/battery stream (6-Z272f-b).
