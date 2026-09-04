@@ -24468,3 +24468,45 @@ Stage Summary:
   ('f'/'r' sideload channel) is restored by 6-Z292. The AOSP-menu touch verdict is cornered to a
   specific silent drop inside the host chain — probe v5 decodes it. All core priorities remain closed;
   TWRP + R12 + lineage all BOOT_OK/UI_READY or better.
+
+---
+Task ID: 6-Z293 — the abstract touch bridge speaks the guest's native evdev (loader-path touch root-caused + fixed)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: decode the 6-Z289e/f/g/h-instrumented probe run on HEAD ad97567 (run 33924122082), name the silent touch-drop link, fix it.
+
+Work Log:
+- Run 33924122082 verdict: BOOT_OK but UI_HANG, menu probe interactive=false frame_delta=0 taps=3. The 6-Z289h socket-queue
+  ground truth was decisive: @io.twoyi.touch is ESTAB with ONLY the app end (pid 2009 fd=129) — the guest peer socket is gone.
+- Reconstructed the app-side truth from logcat (tag CLIENT_EGL / Render2Activity): the 6-Z289e receiver instrumentation fired
+  (92 "debug touch broadcast received" incl. the probe ladder x=360 y=810/930/1050), both jail bridge connections accepted at
+  22:12:16.341/.342 (fd 125 = event1, fd 129 = event0), and ZERO handle_touch DROP logs of either kind — the chain up to the
+  socket WORKED. Guest stderr: the fb hook bridged event1→fd 9 and event0→fd 10 at +562/563ms with successful EVIOCG* ioctls.
+- 6-Z161 epoll_pwait EXIT: the input thread's (pid 2617) shared epoll reported events=0x1 on the second bridge fd in 9-bursts at
+  +23.4/+34.8/+46.2s — EXACTLY the popup-dismiss tap times. Touch data flowed app→guest and the guest's epoll WOKE.
+- But ZERO "INPUT read"/"INPUT poll" hook logs — and the same is true for the R12 fox run (33908394127): the fb hook's read()
+  interposer has NEVER served a single record on the loader path, on ANY image (fox's "navigation" was its own UI refresh, not
+  touch). Send-Q=0 + no EPIPE + no DROP logs ⇒ the guest consumed every byte via its REAL read path.
+- Disassembled lineage-22.2's librecovery_ui.so (extracted from the corpus boot.img ramdisk): minui's ev engine lives there
+  (ev_get_input @0x37594, ev_get_epollfd, inotify + epoll + /dev/input). ev_get_input = read(fd, ev, 0x18); ret != 0x18 →
+  fail; fail + EPOLLHUP → epoll_ctl(EPOLL_CTL_DEL). It demands EXACTLY sizeof(struct input_event) = 24 bytes (aarch64) per
+  read. A raw 20-byte TouchMessage is permanently rejected → every tap silently discarded → frame_delta=0. (Why the read PLT
+  never bound to the hook — while open/ioctl did — remains open; the fix removes the dependency on it entirely.)
+- FIX bc4c345 (6-Z293): the APP now encodes the final evdev stream.
+  * hello handshake: the fb hook writes [0xA5,'T','W','I',ev_size] (guest-native sizeof(input_event): 24 aarch64, 16
+    arm32/i386) right after connect; the app worker reads it on a throwaway dup with 500ms SO_RCVTIMEO and picks the mode;
+    no hello = legacy TouchMessage fallback (old behaviour, only delayed 500ms).
+  * input.rs encode_evdev_record/down/move/release: final LE evdev records of the negotiated size — byte-for-byte kr64's
+    devices::encode_touch_* protocol (plus legacy ABS_X/ABS_Y); per-connection single-finger state (fresh tracking id per
+    DOWN, ONE release frame per UP fan-out, MOVE/UP without DOWN dropped).
+  * twrp_fb_hook.c: slot->raw — read()/poll() pass raw slots through untouched (hooked or real read path, bytes are already
+    final evdev); ioctl EVIOCG* faking stays; legacy staging skipped; hello logged.
+- Host-verified the encoder standalone (24B DOWN=10 records w/ type/code/value at 16..24, 16B MOVE=7/RELEASE=5, timeval
+  zeroed, bad sizes refused); 5 new unit tests in input.rs. rustfmt parses clean; gcc -fsyntax-only shows no new C errors
+  (only the pre-existing glibc/bionic decl diffs); dispatches: lineage + R12 + TWRP angler on bc4c345.
+
+Stage Summary:
+- Loader-path touch was NEVER functional and the probe verdicts were honest; root cause named and fixed at the correct layer
+  (the app owns the wire format now; the guest's read path is format-agnostic). Verification wave in flight on bc4c345:
+  lineage-22.2-sailfish (expect interactive=true), R12 + TWRP regression guards. Open follow-ups: why read@LIBC skipped the
+  interposer (tracer-level GOT probe if ever needed); fox IVibrator host-bridge coverage; lineage header battery (power_supply).
