@@ -7040,7 +7040,7 @@ fn forget_dead_pid_state(
     accept4_einval_streak: &mut std::collections::HashMap<libc::pid_t, u64>,
     esrch_streak: &mut std::collections::HashMap<libc::pid_t, u32>,
     pending_getpid: &mut std::collections::HashSet<libc::pid_t>,
-    pending_uevent_recv: &mut std::collections::HashMap<libc::pid_t, (u64, u64, u64, u64, i64)>,
+    pending_uevent_recv: &mut std::collections::HashMap<libc::pid_t, PendingUeventRecv>,
 ) {
     // 6-Z184 AUDIT FIX (agent 11): the death hygiene missed ~10 per-pid
     // maps — a pid-RECYCLED successor inherited stale state (e.g. a
@@ -9112,6 +9112,113 @@ ACTION=add\0DEVPATH=/devices/virtual/misc/device-mapper\0\
 SUBSYSTEM=misc\0MAJOR=254\0MINOR=0\0DEVNAME=device-mapper\0\
 SEQNUM=2001\0";
 
+/// 6-Z274: the `sockaddr_nl` the kernel attaches to a multicast uevent:
+/// family=AF_NETLINK(16), nl_pid=0 (kernel sender), nl_groups=1
+/// (kobject-uevent multicast group 1). libcutils' `uevent_kernel_recv()`
+/// REJECTS a message whose source has nl_pid != 0 ("non-kernel") or
+/// nl_groups == 0 ("unicast when requested"). The 6-Z271b delivery wrote
+/// groups=0 — guaranteed rejection even when it was written at all.
+const NETLINK_UEVENT_SOCKADDR_NL: [u8; 12] = [16, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+
+/// 6-Z274: the SCM_CREDENTIALS control message a real kernel recvmsg()
+/// attaches when SO_PASSCRED is set (init's UeventListener and ueventd
+/// both create the socket with passcred=true): cmsghdr{len=28,
+/// level=SOL_SOCKET(1), type=SCM_CREDENTIALS(2)} + ucred{pid=0, uid=0,
+/// gid=0}, padded to CMSG_SPACE(sizeof(struct ucred)) = 32 bytes.
+/// `uevent_kernel_recv()` discards the message ("no sender credentials")
+/// and bzero()s the buffer when this cmsg is absent.
+const NETLINK_UEVENT_CMSG: [u8; 32] = [
+    28, 0, 0, 0, 0, 0, 0, 0, // cmsg_len = CMSG_LEN(12) = 28
+    1, 0, 0, 0, // cmsg_level = SOL_SOCKET
+    2, 0, 0, 0, // cmsg_type = SCM_CREDENTIALS
+    0, 0, 0, 0, // ucred.pid = 0 (kernel)
+    0, 0, 0, 0, // ucred.uid = 0
+    0, 0, 0, 0, // ucred.gid = 0
+    0, 0, 0, 0, // padding to CMSG_SPACE
+];
+
+/// 6-Z274: in-flight ENTRY-rewritten recv on a fake-uevent fd. 6-Z271b
+/// stored the raw (arg2, arg3, arg5, arg6) tuple — for recvmsg that
+/// MISREPRESENTS the syscall: recvmsg's arg2 is the guest's
+/// `struct msghdr *` and arg3 is FLAGS (not buf/len), so the EXIT-side
+/// delivery wrote nothing and returned -EAGAIN for every init/ueventd
+/// recvmsg (they all pass flags=0 → the `buflen > 0` guard failed).
+#[derive(Clone, Copy)]
+struct PendingUeventRecv {
+    fd: i64,
+    /// true = recvmsg(2): `arg2` is the guest `struct msghdr *`.
+    /// false = recvfrom(2): `arg2` is the payload buffer.
+    is_recvmsg: bool,
+    /// recvmsg: the msghdr pointer. recvfrom: the payload buffer.
+    arg2: u64,
+    /// recvfrom only: payload buffer length (recvmsg stores flags=0).
+    buflen: u64,
+    /// recvfrom only: src_addr / addrlen_p out-params (0 for recvmsg).
+    src_addr: u64,
+    addrlen_p: u64,
+}
+
+/// 6-Z274: materialise a synthetic kernel uevent through a 64-bit
+/// guest `struct msghdr` — the FULL set of side effects a real kernel
+/// recvmsg() on a uevent netlink socket produces:
+///   1. the uevent payload into msg_iov[0].iov_base (capped by iov_len),
+///   2. sockaddr_nl{nl_pid=0, nl_groups=1} into msg_name, msg_namelen=12,
+///   3. the SCM_CREDENTIALS cmsg into msg_control,
+///      msg_controllen=CMSG_SPACE(sizeof(struct ucred))=32,
+///   4. msg_flags = 0.
+///
+/// libcutils' `uevent_kernel_recv()` (init's UeventListener, ueventd,
+/// healthd) validates ALL of these and bzero()s the buffer + returns
+/// -EIO when any is missing — a payload-only delivery is a silent
+/// no-op (the 6-Z271b defect: init's
+/// `BlockDevInitializer::InitBootDevicesFromPartUuid()` polled its full
+/// 10 s for the boot partition because EVERY synthetic delivery was
+/// rejected, and the pre-fix code never even wrote the payload).
+///
+/// Returns the synthetic recvmsg return value: n (payload bytes
+/// delivered) or -EAGAIN (-11) when the msghdr/iov could not be read
+/// or written.
+fn synthetic_uevent_recvmsg_side_effects(pid: libc::pid_t, msghdr_ptr: u64) -> i64 {
+    // user_msghdr (64-bit): name@0, namelen(i32)@8, iov@16, iovlen@24,
+    // control@32, controllen@40, flags(u32)@48; sizeof = 56.
+    let Some(hdr) = read_child_bytes(pid, msghdr_ptr, 56) else {
+        return -11;
+    };
+    let rd64 = |off: usize| -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&hdr[off..off + 8]);
+        u64::from_le_bytes(b)
+    };
+    let msg_name = rd64(0);
+    let msg_iov = rd64(16);
+    let msg_control = rd64(32);
+    if msg_iov == 0 {
+        return -11;
+    }
+    let Some(iov) = read_child_bytes(pid, msg_iov, 16) else {
+        return -11;
+    };
+    let iov_base = u64::from_le_bytes(iov[0..8].try_into().unwrap());
+    let iov_len = u64::from_le_bytes(iov[8..16].try_into().unwrap());
+    if iov_base == 0 || iov_len == 0 {
+        return -11;
+    }
+    let n = (DM_UEVENT_MSG.len() as u64).min(iov_len) as usize;
+    if write_child_bytes_pokedata(pid, iov_base, &DM_UEVENT_MSG[..n]) != n {
+        return -11;
+    }
+    if msg_name != 0 {
+        let _ = write_child_bytes_pokedata(pid, msg_name, &NETLINK_UEVENT_SOCKADDR_NL);
+        let _ = write_child_bytes_pokedata(pid, msghdr_ptr + 8, &12u32.to_ne_bytes());
+    }
+    if msg_control != 0 {
+        let _ = write_child_bytes_pokedata(pid, msg_control, &NETLINK_UEVENT_CMSG);
+        let _ = write_child_bytes_pokedata(pid, msghdr_ptr + 40, &32u64.to_ne_bytes());
+    }
+    let _ = write_child_bytes_pokedata(pid, msghdr_ptr + 48, &0u32.to_ne_bytes());
+    n as i64
+}
+
 /// Task 6-Z89 FIX 1a: REALLY reap a (presumed-dead) traced child.
 ///
 /// Run 32634683464 spent 590 s in the 6-Z67 ESRCH ping-pong
@@ -11099,7 +11206,7 @@ pub fn run_ptrace_loop(
     // fd — the syscall was turned into getpid (proven 6-Z257 pattern) and
     // the EXIT stop must materialise the synthetic uevent instead. Value:
     // (buf, buflen, src_addr, addrlen_p, fd).
-    let mut pending_uevent_recv: std::collections::HashMap<libc::pid_t, (u64, u64, u64, u64, i64)> =
+    let mut pending_uevent_recv: std::collections::HashMap<libc::pid_t, PendingUeventRecv> =
         std::collections::HashMap::new();
     // 6-Z271/T31: memoized getdents64 fd-origin verdicts per (pid, fd).
     // Cleared at every execve EXIT (the deferred-reset block) so an fd
@@ -16707,10 +16814,27 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                             if in_set && !netlink_dm_uevent_served.contains(&(pid, fd)) {
-                                let buf = get_syscall_arg(&regs, abi.reg_arg2);
-                                let buflen = get_syscall_arg(&regs, abi.reg_arg3);
-                                let src = get_syscall_arg(&regs, abi.reg_arg5);
-                                let addrlen_p = get_syscall_arg(&regs, abi.reg_arg6);
+                                // 6-Z274: recvmsg and recvfrom have
+                                // DIFFERENT argument shapes. recvmsg:
+                                // (fd, struct msghdr *, flags) — arg2 is
+                                // the msghdr POINTER and arg3 is flags
+                                // (init passes 0 → the old (buf, buflen)
+                                // interpretation made buflen=0 and the
+                                // EXIT delivery silently became -EAGAIN).
+                                // recvfrom: (fd, buf, len, flags, src_addr,
+                                // addrlen_p) — the old interpretation holds.
+                                let is_recvmsg =
+                                    abi.recvmsg_nr != -1 && syscall_num == abi.recvmsg_nr;
+                                let arg2 = get_syscall_arg(&regs, abi.reg_arg2);
+                                let arg3 = get_syscall_arg(&regs, abi.reg_arg3);
+                                let (src, addrlen_p) = if is_recvmsg {
+                                    (0, 0)
+                                } else {
+                                    (
+                                        get_syscall_arg(&regs, abi.reg_arg5),
+                                        get_syscall_arg(&regs, abi.reg_arg6),
+                                    )
+                                };
                                 set_syscall_num(&mut regs, &abi, abi.getpid);
                                 match ptrace_setregs(pid, &regs, iov_len) {
                                     Ok(()) => {
@@ -16720,11 +16844,23 @@ pub fn run_ptrace_loop(
                                         netlink_dm_uevent_served.insert((pid, fd));
                                         pending_uevent_recv.insert(
                                             pid,
-                                            (buf, buflen, src, addrlen_p, fd),
+                                            PendingUeventRecv {
+                                                fd,
+                                                is_recvmsg,
+                                                arg2,
+                                                buflen: arg3,
+                                                src_addr: src,
+                                                addrlen_p,
+                                            },
                                         );
                                         log(&format!(
-                                            "6-Z271b: recv(fd={:#x}) ENTRY → rewritten to getpid — EXIT will deliver the synthetic device-mapper uevent ({} bytes)",
+                                            "6-Z271b: recv(fd={:#x}, {}) ENTRY → rewritten to getpid — EXIT will deliver the synthetic device-mapper uevent ({} bytes)",
                                             fd,
+                                            if is_recvmsg {
+                                                "recvmsg msghdr"
+                                            } else {
+                                                "recvfrom buffer"
+                                            },
                                             DM_UEVENT_MSG.len()
                                         ));
                                     }
@@ -21602,39 +21738,61 @@ pub fn run_ptrace_loop(
                         }
                     }
 
-                    if let Some((buf, buflen, src_addr, addrlen_p, fd)) =
-                        pending_uevent_recv.remove(&pid)
-                    {
-                        // ── 6-Z271b: materialise the synthetic device-mapper
-                        // uevent for the recvmsg we rewrote to getpid at
-                        // ENTRY. Runs BEFORE the pending_getpid fake below
-                        // (that fake would overwrite our return with 1).
+                    if let Some(pend) = pending_uevent_recv.remove(&pid) {
+                        // ── 6-Z271b/6-Z274: materialise the synthetic
+                        // device-mapper uevent for the recv we rewrote to
+                        // getpid at ENTRY. Runs BEFORE the pending_getpid
+                        // fake below (that fake would overwrite our return
+                        // with 1). 6-Z274: recvmsg goes through the full
+                        // kernel-side-effect helper (payload via msg_iov,
+                        // sockaddr_nl{groups=1}, SCM_CREDENTIALS cmsg) —
+                        // libcutils' uevent_kernel_recv() rejects anything
+                        // less, which is why the 6-Z271b deliveries never
+                        // landed and init's boot-partition poll burned 10 s.
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                         if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
-                            if buf != 0 && buflen > 0 {
-                                let n = DM_UEVENT_MSG.len().min(buflen as usize);
-                                let wrote =
-                                    write_child_bytes_pokedata(pid, buf, &DM_UEVENT_MSG[..n]);
-                                let new_ret: i64 = if wrote == n { n as i64 } else { -11 };
-                                if new_ret > 0 && src_addr != 0 && addrlen_p != 0 {
-                                    let sal: [u8; 12] = [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-                                    let _ = write_child_bytes_pokedata(pid, src_addr, &sal);
-                                    let _ = write_child_bytes_pokedata(
-                                        pid,
-                                        addrlen_p,
-                                        &12u32.to_ne_bytes(),
-                                    );
+                            let new_ret: i64 = if pend.is_recvmsg {
+                                if detect_child_is_64bit(pid) == Some(true) {
+                                    synthetic_uevent_recvmsg_side_effects(pid, pend.arg2)
+                                } else {
+                                    // 32-bit msghdr layout unimplemented —
+                                    // keep the honest native -EAGAIN.
+                                    -11
                                 }
-                                set_syscall_ret(&mut regs2, &abi, new_ret);
-                                let _ = ptrace_setregs(pid, &regs2, len);
-                                log(&format!(
-                                    "6-Z271b: synthetic device-mapper uevent DELIVERED to fd {:#x} pid={} ({} bytes, ret={}) — init's dm wait satisfied",
-                                    fd, pid, n, new_ret
-                                ));
+                            } else if pend.arg2 != 0 && pend.buflen > 0 {
+                                let n = DM_UEVENT_MSG.len().min(pend.buflen as usize);
+                                let wrote =
+                                    write_child_bytes_pokedata(pid, pend.arg2, &DM_UEVENT_MSG[..n]);
+                                if wrote == n {
+                                    if pend.src_addr != 0 && pend.addrlen_p != 0 {
+                                        let _ = write_child_bytes_pokedata(
+                                            pid,
+                                            pend.src_addr,
+                                            &NETLINK_UEVENT_SOCKADDR_NL,
+                                        );
+                                        let _ = write_child_bytes_pokedata(
+                                            pid,
+                                            pend.addrlen_p,
+                                            &12u32.to_ne_bytes(),
+                                        );
+                                    }
+                                    n as i64
+                                } else {
+                                    -11
+                                }
                             } else {
-                                set_syscall_ret(&mut regs2, &abi, -11);
-                                let _ = ptrace_setregs(pid, &regs2, len);
-                            }
+                                -11
+                            };
+                            set_syscall_ret(&mut regs2, &abi, new_ret);
+                            let _ = ptrace_setregs(pid, &regs2, len);
+                            log(&format!(
+                                "6-Z274: synthetic device-mapper uevent via {} fd {:#x} pid={} ret={} ({})",
+                                if pend.is_recvmsg { "recvmsg" } else { "recvfrom" },
+                                pend.fd,
+                                pid,
+                                new_ret,
+                                if new_ret > 0 { "delivered" } else { "EAGAIN (inject failed)" }
+                            ));
                         }
                     }
 
@@ -23142,52 +23300,64 @@ pub fn run_ptrace_loop(
                                         }
                                         netlink_dm_uevent_served.insert(key);
 
-                                        let buf = get_syscall_arg(&regs, abi.reg_arg2);
-                                        let buflen = get_syscall_arg(&regs, abi.reg_arg3) as usize;
-                                        let src_addr = get_syscall_arg(&regs, abi.reg_arg5);
-                                        let addrlen_p = get_syscall_arg(&regs, abi.reg_arg6);
-                                        if buf != 0 && buflen > 0 {
-                                            let n = DM_UEVENT_MSG.len().min(buflen);
+                                        // 6-Z274: the native recv ran and found
+                                        // no kernel data (the container has no
+                                        // real uevent source). Materialise the
+                                        // synthetic uevent with the FULL kernel
+                                        // side effects. recvmsg: arg2 is the
+                                        // guest's struct msghdr * — the old code
+                                        // misread it as a buffer and every
+                                        // delivery was a silent no-op.
+                                        let arg2 = get_syscall_arg(&regs, abi.reg_arg2);
+                                        let arg3 = get_syscall_arg(&regs, abi.reg_arg3);
+                                        let new_ret: i64 = if op == NetlinkOp::RecvMsg {
+                                            if detect_child_is_64bit(pid) == Some(true) {
+                                                synthetic_uevent_recvmsg_side_effects(pid, arg2)
+                                            } else {
+                                                -11
+                                            }
+                                        } else if arg2 != 0 && arg3 > 0 {
+                                            let n = DM_UEVENT_MSG.len().min(arg3 as usize);
                                             let wrote = write_child_bytes_pokedata(
                                                 pid,
-                                                buf,
+                                                arg2,
                                                 &DM_UEVENT_MSG[..n],
                                             );
-                                            let new_ret: i64 = if wrote == n {
+                                            if wrote == n {
+                                                // 6-Z274: fill the source with
+                                                // groups=1 — libcutils rejects
+                                                // nl_groups==0 as "unicast".
+                                                let src_addr = get_syscall_arg(&regs, abi.reg_arg5);
+                                                let addrlen_p =
+                                                    get_syscall_arg(&regs, abi.reg_arg6);
+                                                if src_addr != 0 && addrlen_p != 0 {
+                                                    let _ = write_child_bytes_pokedata(
+                                                        pid,
+                                                        src_addr,
+                                                        &NETLINK_UEVENT_SOCKADDR_NL,
+                                                    );
+                                                    let _ = write_child_bytes_pokedata(
+                                                        pid,
+                                                        addrlen_p,
+                                                        &12u32.to_ne_bytes(),
+                                                    );
+                                                }
                                                 n as i64
                                             } else {
                                                 -11 // EAGAIN — couldn't inject
-                                            };
-                                            // Fill a sockaddr_nl {nl_family=16,
-                                            // pad, nl_pid=0, nl_groups=0} when
-                                            // the caller asked for the source.
-                                            if new_ret > 0 && src_addr != 0 && addrlen_p != 0 {
-                                                let sal: [u8; 12] =
-                                                    [16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-                                                let _ =
-                                                    write_child_bytes_pokedata(pid, src_addr, &sal);
-                                                let _ = write_child_bytes_pokedata(
-                                                    pid,
-                                                    addrlen_p,
-                                                    &12u32.to_ne_bytes(),
-                                                );
                                             }
-                                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                            if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
-                                                set_syscall_ret(&mut regs2, &abi, new_ret);
-                                                let _ = ptrace_setregs(pid, &regs2, len);
-                                            }
-                                            log(&format!(
-                                                "6-Z271: synthetic device-mapper uevent delivered to fake-uevent fd {:#x} ({} bytes, ret={}) — kills init's 10 s dm wait",
-                                                fd, n, new_ret
-                                            ));
                                         } else {
-                                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                            if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
-                                                set_syscall_ret(&mut regs2, &abi, -11);
-                                                let _ = ptrace_setregs(pid, &regs2, len);
-                                            }
+                                            -11
+                                        };
+                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                        if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
+                                            set_syscall_ret(&mut regs2, &abi, new_ret);
+                                            let _ = ptrace_setregs(pid, &regs2, len);
                                         }
+                                        log(&format!(
+                                            "6-Z274: synthetic device-mapper uevent via {:?} fd {:#x} ret={} — kills the init 10 s waits",
+                                            op, fd, new_ret
+                                        ));
                                     } else {
                                         // -EAGAIN = "nothing yet": consistent with
                                         // the SOCK_NONBLOCK the socket was created
@@ -30968,13 +31138,21 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             std::collections::HashMap::new();
         let mut pending_getpid: std::collections::HashSet<libc::pid_t> =
             std::collections::HashSet::new();
-        let mut pending_uevent_recv: std::collections::HashMap<
-            libc::pid_t,
-            (u64, u64, u64, u64, i64),
-        > = std::collections::HashMap::new();
+        let mut pending_uevent_recv: std::collections::HashMap<libc::pid_t, PendingUeventRecv> =
+            std::collections::HashMap::new();
         let pid: libc::pid_t = 4242;
         in_syscall_map.insert(pid, true);
-        pending_uevent_recv.insert(pid, (0x5000, 4096, 0, 0, 6));
+        pending_uevent_recv.insert(
+            pid,
+            PendingUeventRecv {
+                fd: 6,
+                is_recvmsg: true,
+                arg2: 0x5000,
+                buflen: 0,
+                src_addr: 0,
+                addrlen_p: 0,
+            },
+        );
         prctl_rewritten_args.insert(pid, (0x1000, 0x2000));
         pending_epoll_readback.insert(pid, (0, 0, 0));
         pending_mount_enodev.insert(pid);
@@ -32269,5 +32447,65 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         );
         assert!(resolve_addr_in_maps(maps, 0x2000).contains("rw-p"));
         assert!(resolve_addr_in_maps(maps, 0x1fff).contains("/lib.so"));
+    }
+
+    #[test]
+    fn z274_uevent_netlink_metadata_is_kernel_abi() {
+        // 6-Z274: the synthetic recvmsg side-effect metadata must be
+        // byte-exact against what a real kernel uevent delivery carries —
+        // libcutils' uevent_kernel_recv() rejects anything else and
+        // bzero()s the buffer, silently no-op-ing the delivery.
+        // sockaddr_nl {family=AF_NETLINK=16, pad=0, nl_pid=0, nl_groups=1}
+        assert_eq!(NETLINK_UEVENT_SOCKADDR_NL.len(), 12);
+        assert_eq!(
+            u16::from_le_bytes(NETLINK_UEVENT_SOCKADDR_NL[0..2].try_into().unwrap()),
+            16 // AF_NETLINK
+        );
+        assert_eq!(
+            u32::from_le_bytes(NETLINK_UEVENT_SOCKADDR_NL[4..8].try_into().unwrap()),
+            0 // nl_pid = kernel
+        );
+        assert_eq!(
+            u32::from_le_bytes(NETLINK_UEVENT_SOCKADDR_NL[8..12].try_into().unwrap()),
+            1 // nl_groups = kobject-uevent multicast — require_group check
+        );
+        // cmsghdr {len=CMSG_LEN(12)=28, level=SOL_SOCKET=1,
+        // type=SCM_CREDENTIALS=2} + ucred{0,0,0}, padded to 32.
+        assert_eq!(NETLINK_UEVENT_CMSG.len(), 32);
+        assert_eq!(
+            usize::from_le_bytes(NETLINK_UEVENT_CMSG[0..8].try_into().unwrap()),
+            28 // CMSG_LEN(sizeof(ucred))
+        );
+        assert_eq!(
+            i32::from_le_bytes(NETLINK_UEVENT_CMSG[8..12].try_into().unwrap()),
+            1 // SOL_SOCKET
+        );
+        assert_eq!(
+            i32::from_le_bytes(NETLINK_UEVENT_CMSG[12..16].try_into().unwrap()),
+            2 // SCM_CREDENTIALS — the cmsg==NULL / wrong-type rejection
+        );
+        assert!(NETLINK_UEVENT_CMSG[16..28].iter().all(|&b| b == 0));
+        // The uevent payload parses as action@devpath + KEY=VALUE pairs
+        // (init's ParseEvent contract).
+        let s = std::str::from_utf8(DM_UEVENT_MSG).unwrap();
+        let mut parts = s.split('\0');
+        assert_eq!(
+            parts.next().unwrap(),
+            "add@/devices/virtual/misc/device-mapper"
+        );
+        let mut subsystem = false;
+        let mut action = false;
+        for kv in parts.by_ref() {
+            if kv.is_empty() {
+                continue;
+            }
+            if kv == "SUBSYSTEM=misc" {
+                subsystem = true;
+            }
+            if kv == "ACTION=add" {
+                action = true;
+            }
+        }
+        assert!(subsystem && action, "uevent keys malformed: {}", s);
     }
 }
