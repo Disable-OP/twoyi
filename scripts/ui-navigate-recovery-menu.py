@@ -281,6 +281,25 @@ def main():
     frame_after = blit_frame_counter(logcat_dump())
     probe["frame_after"] = frame_after
 
+    # 6-Z289g: the host chain is PROVEN healthy by the 6-Z289e/f
+    # instrumentation (receiver fires, no drops, worker write succeeds) —
+    # when taps still produce no guest INPUT reads, dump the GUEST
+    # recovery's per-thread park state so the input thread's blocking
+    # point (epoll_wait? futex? read?) is visible in the artifacts.
+    dump = adb_out(
+        "for d in /proc/[0-9]*/task/[0-9]*; do "
+        "c=$(cat $d/comm 2>/dev/null); "
+        "case $c in *recovery*) "
+        "echo \"=== tid=$(basename $d) comm=$c wchan=$(cat $d/wchan 2>/dev/null)\"; "
+        "echo \"syscall: $(cat $d/syscall 2>/dev/null | head -c 80)\";; esac; done",
+        timeout=30)
+    try:
+        with open(os.path.join(ART, "menu-probe-guest-threads.txt"), "w") as f:
+            f.write(dump or "<empty>")
+    except OSError:
+        pass
+    print(TAG, "guest thread dump lines:", len((dump or "").splitlines()))
+
     c2 = screencap_bytes()
     probe["cap_hashes"].append(
         [hashlib.sha256(c2).hexdigest()[:16] if c2 else None])
