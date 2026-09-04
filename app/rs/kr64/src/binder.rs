@@ -89,11 +89,6 @@
 //!
 //! # What is still NOT here (the honest list)
 //!
-//! * **Registration callbacks are not delivered** —
-//!   `REGISTER_FOR_NOTIFICATIONS` is acked but no callback
-//!   transactions fire when a service later registers. Clients fall back
-//!   to their poll/deadline paths, which now terminate fast because the
-//!   services they want DO register.
 //! * **No fd passing** (BINDER_TYPE_FD objects are not translated); no
 //!   refcount forwarding to a host driver; sender identity comes from the
 //!   loader's WIRE_CMD_IDENT announcement (one gid is ignored).
@@ -101,6 +96,23 @@
 //!   proxy acks their BINDER_SET_CONTEXT_MGR and remains the context
 //!   manager; with the 6-Z271 bus this is now harmless (their clients'
 //!   lookups are served by the proxy registry directly).
+//!
+//! # Registration callbacks (6-Z276 — WAS the top of this list)
+//!
+//! `REGISTER_FOR_NOTIFICATIONS` (AIDL SM code 5) and HIDL SM code 4 store
+//! the watcher (connection + LOCAL callback ptr/cookie + dialect). When
+//! the watched service later registers — guest `addService`, HIDL `add`
+//! — every watcher gets a ONE-WAY `onRegistration` `BR_TRANSACTION`
+//! queued on its mailbox, targeted at its own callback object:
+//! * AIDL: `android.os.IServiceCallback.onRegistration(name, binder)` —
+//!   `[strict][worksource]['SYST'][string16 descriptor][string16 name]
+//!   [flat HANDLE][i32 stability]`.
+//! * HIDL: `IServiceNotification.onRegistration(fqName, instance,
+//!   preexisting)` — `[hidl_string][hidl_string][i32]`.
+//! An already-registered service fires the callback IMMEDIATELY
+//! (`preexisting=true`) — the real servicemanagers' behaviour that
+//! `waitForService`-style clients depend on. Dying connections drop their
+//! watchers.
 //!
 //! # Wire framing
 //!
@@ -851,6 +863,11 @@ pub const INTERFACE_TRANSACTION: u32 = u32::from_be_bytes(*b"_NTF");
 /// declaration order, FIRST_CALL_TRANSACTION = 1): get = 1, add = 2.
 pub const HIDL_SM_GET: u32 = 1;
 pub const HIDL_SM_ADD: u32 = 2;
+/// 6-Z276: `android.hidl.manager.V1_0.IServiceManager` method codes
+/// (hidl-generated order: get, add, getTransport,
+/// registerForNotifications, unregisterForNotifications, …).
+pub const HIDL_SM_REGISTER_FOR_NOTIFICATIONS: u32 = 4;
+pub const HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS: u32 = 5;
 
 // ============================================================================
 // Flat-binder-object type constants (kernel `B_PACK_CHARS(c1,c2,c3,0x85)`).
@@ -1280,6 +1297,18 @@ impl ParcelWriter {
         self.data.extend_from_slice(&v.to_ne_bytes());
     }
 
+    /// 6-Z276: write a HIDL `hidl_string` (libhwbinder `writeHidlString`):
+    /// `[i32 len][len bytes][NUL][zero-pad to 4-byte alignment]` — the
+    /// exact inverse of [`ParcelReader::read_hidl_string`].
+    fn write_hidl_string(&mut self, s: &str) {
+        self.write_i32(s.len() as i32);
+        self.data.extend_from_slice(s.as_bytes());
+        self.data.push(0); // trailing NUL
+        while self.data.len() % 4 != 0 {
+            self.data.push(0);
+        }
+    }
+
     /// Write an AIDL "structured parcelable" region — the android-12/13
     /// wire shape a REAL AIDL client deserializes:
     ///
@@ -1519,6 +1548,21 @@ struct ServiceEntry {
     virtual_kind: Option<VirtualService>,
 }
 
+/// 6-Z276: a `registerForNotifications` watcher — the connection, the
+/// LOCAL identity of its callback object (the `flat_binder_object` the
+/// watcher passed: `BINDER_TYPE_BINDER` carries the watcher's own
+/// ptr/cookie), and which SM dialect it registered through (AIDL
+/// `android.os.IServiceManager` / HIDL
+/// `android.hidl.manager.V1_0.IServiceManager` — the callback parcel
+/// shapes differ).
+#[derive(Clone, Copy)]
+struct ServiceWatcher {
+    conn: ConnId,
+    ptr: u64,
+    cookie: u64,
+    hidl: bool,
+}
+
 /// An item queued for delivery on a server connection's mailbox.
 enum InboxItem {
     /// An incoming transaction (kernel `BR_TRANSACTION` analogue).
@@ -1623,6 +1667,12 @@ pub struct BusState {
     /// reply is pushed onto that connection's `reply_queue` (kernel
     /// semantics — the requester picks it up on a later ioctl).
     waiters: HashMap<u64, ConnId>,
+    /// 6-Z276: `registerForNotifications` watchers per service name.
+    /// When a service registers, every watcher gets a one-way
+    /// `onRegistration` callback transaction queued on its connection
+    /// (the real servicemanagers' `ServiceCallback::onRegistration` /
+    /// HIDL `IServiceNotification::onRegistration` analogue).
+    watchers: HashMap<String, Vec<ServiceWatcher>>,
     next_conn: u64,
     next_txn: u64,
 }
@@ -1635,6 +1685,7 @@ impl BusState {
             next_handle: PROXY_HANDLE_BASE + 1,
             conns: HashMap::new(),
             waiters: HashMap::new(),
+            watchers: HashMap::new(),
             next_conn: PROXY_CONN_ID + 1,
             next_txn: 1,
         };
@@ -1709,6 +1760,116 @@ impl BusState {
         h
     }
 
+    /// 6-Z276: record a `registerForNotifications` watcher for `name`.
+    /// Duplicate (conn, ptr) registrations are ignored (libbinder dedupes
+    /// too — one callback object per service).
+    fn add_watcher(&mut self, name: &str, w: ServiceWatcher) {
+        let list = self.watchers.entry(name.to_string()).or_default();
+        if !list.iter().any(|x| x.conn == w.conn && x.ptr == w.ptr) {
+            list.push(w);
+        }
+    }
+
+    /// 6-Z276: drop a watcher (libbinder `unregisterForNotifications`).
+    fn remove_watcher(&mut self, name: &str, conn: ConnId, ptr: u64) {
+        if let Some(list) = self.watchers.get_mut(name) {
+            list.retain(|x| !(x.conn == conn && x.ptr == ptr));
+            if list.is_empty() {
+                self.watchers.remove(name);
+            }
+        }
+    }
+
+    /// 6-Z276: drop every watcher registered by a dying connection.
+    fn remove_watchers_of_conn(&mut self, conn: ConnId) {
+        self.watchers.retain(|_, list| {
+            list.retain(|w| w.conn != conn);
+            !list.is_empty()
+        });
+    }
+
+    /// 6-Z276: deliver one-way `onRegistration` callbacks for `name` to
+    /// every watcher, then drop the watcher list (real servicemanagers
+    /// fire each registration once; libbinder re-registers on demand).
+    ///
+    /// The callback rides the same `BR_TRANSACTION` mailbox a routed
+    /// guest→guest transaction uses, targeted at the watcher's LOCAL
+    /// callback ptr/cookie, one-way (both `IServiceCallback.onRegistration`
+    /// and HIDL `IServiceNotification.onRegistration` are `oneway`).
+    fn fire_registration_callbacks(&mut self, name: &str, handle: u32, preexisting: bool) {
+        let Some(watchers) = self.watchers.remove(name) else {
+            return;
+        };
+        for w in watchers {
+            // Build the callback parcel in the watcher's own dialect.
+            let mut writer = ParcelWriter::new();
+            if w.hidl {
+                // HIDL `IServiceNotification.onRegistration(fqName,
+                // instance, preexisting)` — NO interface-token header
+                // (libhwbinder parcels carry none), args are hidl_strings.
+                // fqName = the name before the '/' split the guest used at
+                // register time; our registry key is the FULL
+                // "fqName/instance" string, so send it as both halves of
+                // what we have (libhwbinder clients match on the
+                // descriptor + instance pair they registered).
+                let (fq, inst) = match name.rfind('/') {
+                    Some(i) => (&name[..i], &name[i + 1..]),
+                    None => (name, "default"),
+                };
+                writer.write_hidl_string(fq);
+                writer.write_hidl_string(inst);
+                writer.write_i32(preexisting as i32);
+            } else {
+                // AIDL `android.os.IServiceCallback.onRegistration(name,
+                // binder)` — standard writeInterfaceToken header + the
+                // service name + the HANDLE flat + the stability i32
+                // (6-Z271x: finishUnflattenBinder reads it back).
+                writer.write_i32(0); // strict-mode policy
+                writer.write_i32(-1); // kUnsetWorkSource
+                writer.write_u32(AIDL_HEADER_TAG_SYST);
+                writer.write_string16("android.os.IServiceCallback");
+                writer.write_string16(name);
+                writer.write_flat_binder(&FlatBinderObject {
+                    r#type: BINDER_TYPE_HANDLE,
+                    flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                    binder: handle as u64,
+                    cookie: 0,
+                });
+                writer.write_i32(STABILITY_ANNOTATION_VINTF);
+            }
+            let (data, offsets) = writer.into_parts();
+            let tx = IncomingTx {
+                // The proxy itself is the "sender" (kernel semantics: the
+                // context manager initiated this callback).
+                requester: PROXY_CONN_ID,
+                // One-way: txn_id 0 = no inflight/reply bookkeeping (both
+                // callback interfaces are declared oneway).
+                txn_id: 0,
+                code: 1, // onRegistration
+                flags: TF_ONE_WAY,
+                one_way: true,
+                sender_pid: 0,
+                sender_euid: 0,
+                blob: Some(RequestBlob { data, offsets }),
+                ptr: w.ptr,
+                cookie: w.cookie,
+            };
+            if !self.queue_transaction(tx, w.conn) {
+                warning!(
+                    "[KR64][binder][svc] 6-Z276: onRegistration({}) callback dropped (conn={} mailbox full/gone)",
+                    name, w.conn
+                );
+            } else {
+                info!(
+                    "[KR64][binder][svc] 6-Z276: onRegistration({}) queued for conn={} ({} dialect)",
+                    name,
+                    w.conn,
+                    if w.hidl { "HIDL" } else { "AIDL" }
+                );
+            }
+        }
+    }
+
     /// Allocate the next connection id and create its mailbox.
     fn register_conn(&mut self) -> ConnId {
         let id = self.next_conn;
@@ -1771,6 +1932,9 @@ impl BusState {
                 }
             }
         }
+        // 6-Z276: a dying connection's registerForNotifications watchers
+        // are gone with it — no callback may target a dead conn's mailbox.
+        self.remove_watchers_of_conn(conn);
     }
 
     /// Route a transaction to its owner's mailbox. Returns false when the
@@ -3563,6 +3727,10 @@ fn servicemanager_proxy(
                 "[KR64][binder][svc] addService({}) → handle 0x{:08x} (conn={}, ptr=0x{:x})",
                 name, handle, conn_id, ptr
             );
+            // 6-Z276: a registered watcher now gets its one-way
+            // `onRegistration` callback (the real servicemanager fires
+            // IServiceCallback.onRegistration on every later addService).
+            b.fire_registration_callbacks(&name, handle, false);
             // Reply body: void (header only) per 6-Z114 §3.3.
         }
         SVC_MGR_LIST_SERVICES => {
@@ -3578,13 +3746,71 @@ fn servicemanager_proxy(
             info!("[KR64][binder][svc] listServices → {} entries", names.len());
         }
         SVC_MGR_REGISTER_FOR_NOTIFICATIONS => {
-            // Args: string16 name + flat_binder (callback) — consumed.
-            // Registration callbacks are still not delivered; clients
-            // (libbinder waitForService) fall back to their poll/deadline
-            // paths, which now terminate fast because the services they
-            // want DO register (keystore2, virtual HALs).
-            let _ = reader.read_string16();
-            let _ = reader.read_flat_binder();
+            // 6-Z276: args = [string16 name][flat_binder callback][i32
+            // stability]. The callback flat is the WATCHER's local
+            // IServiceCallback (BINDER_TYPE_BINDER, ptr/cookie as the
+            // guest wrote them) — a later addService(name) fires a one-way
+            // `onRegistration` BR_TRANSACTION targeted at that local
+            // object. If the service is ALREADY registered, the real SM
+            // fires the callback immediately (preexisting=true) — mirror
+            // that by queueing it right away.
+            let name = match reader.read_string16() {
+                Some(Some(s)) => s,
+                _ => String::new(),
+            };
+            let flat = reader.read_flat_binder();
+            if let Some(f) = flat {
+                let w = ServiceWatcher {
+                    conn: conn_id,
+                    ptr: f.binder,
+                    cookie: f.cookie,
+                    hidl: false,
+                };
+                let already = {
+                    let mut b = bus.lock().expect("binder bus poisoned");
+                    let handle = b.services.get(&name).map(|e| e.handle);
+                    match handle {
+                        Some(h) => {
+                            drop(b);
+                            // Already registered: immediate preexisting callback.
+                            let mut b2 = bus.lock().expect("binder bus poisoned");
+                            b2.fire_registration_callbacks(&name, h, true);
+                            true
+                        }
+                        None => {
+                            b.add_watcher(&name, w);
+                            false
+                        }
+                    }
+                };
+                info!(
+                    "[KR64][binder][svc] 6-Z276: registerForNotifications({}) conn={} — {}",
+                    name,
+                    conn_id,
+                    if already {
+                        "already registered → immediate callback"
+                    } else {
+                        "watching"
+                    }
+                );
+            }
+        }
+        SVC_MGR_UNREGISTER_FOR_NOTIFICATIONS => {
+            // 6-Z276: args = [string16 name][flat_binder callback]. Drop
+            // the watcher (match on conn + local ptr).
+            let name = match reader.read_string16() {
+                Some(Some(s)) => s,
+                _ => String::new(),
+            };
+            let flat = reader.read_flat_binder();
+            if let Some(f) = flat {
+                let mut b = bus.lock().expect("binder bus poisoned");
+                b.remove_watcher(&name, conn_id, f.binder);
+                info!(
+                    "[KR64][binder][svc] 6-Z276: unregisterForNotifications({}) conn={} — dropped",
+                    name, conn_id
+                );
+            }
         }
         SVC_MGR_IS_DECLARED => {
             // Arg: string16 name. Reply body: i32 0|1.
@@ -3690,12 +3916,97 @@ fn servicemanager_hidl(
                 Some(f) => (f.binder, f.cookie),
                 None => (0, 0),
             };
-            let mut b = bus.lock().expect("binder bus poisoned");
-            let handle = b.add_guest_service(&name, conn_id, ptr, cookie);
+            let handle = {
+                let mut b = bus.lock().expect("binder bus poisoned");
+                let h = b.add_guest_service(&name, conn_id, ptr, cookie);
+                info!(
+                    "[KR64][binder][svc] HIDL add({}) → handle 0x{:08x} (conn={})",
+                    name, h, conn_id
+                );
+                // 6-Z276: fire the HIDL IServiceNotification.onRegistration
+                // callbacks BEFORE releasing the bus lock (the fire helper
+                // re-locks internally in the AIDL path — here we hold the
+                // lock, so call the same method on the guard's target).
+                b.fire_registration_callbacks(&name, h, false);
+                h
+            };
+            // Reply: bool success = true.
+            writer.write_i32(1);
+            let _ = handle;
+        }
+        HIDL_SM_REGISTER_FOR_NOTIFICATIONS => {
+            // 6-Z276: args = [hidl_string fqName][hidl_string name][flat
+            // callback]. The HIDL registry key is "fqName/instance". The
+            // flat is the watcher's local IServiceNotification object.
+            let fq = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let inst = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let flat = reader.read_flat_binder();
+            let key = format!("{}/{}", fq, inst);
+            let registered = if let Some(f) = flat {
+                let mut b = bus.lock().expect("binder bus poisoned");
+                match b.services.get(&key).map(|e| e.handle) {
+                    Some(h) => {
+                        drop(b);
+                        // Already registered: immediate preexisting callback
+                        // (the real hwservicemanager behaviour).
+                        let mut b2 = bus.lock().expect("binder bus poisoned");
+                        b2.fire_registration_callbacks(&key, h, true);
+                        true
+                    }
+                    None => {
+                        b.add_watcher(
+                            &key,
+                            ServiceWatcher {
+                                conn: conn_id,
+                                ptr: f.binder,
+                                cookie: f.cookie,
+                                hidl: true,
+                            },
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            // Reply: bool registered = true (the registration itself took).
+            writer.write_i32(1);
             info!(
-                "[KR64][binder][svc] HIDL add({}) → handle 0x{:08x} (conn={})",
-                name, handle, conn_id
+                "[KR64][binder][svc] 6-Z276: HIDL registerForNotifications({}) conn={} — {}",
+                key,
+                conn_id,
+                if registered {
+                    "already registered → immediate callback"
+                } else {
+                    "watching"
+                }
             );
+        }
+        HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS => {
+            let fq = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let inst = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let flat = reader.read_flat_binder();
+            if let Some(f) = flat {
+                let key = format!("{}/{}", fq, inst);
+                let mut b = bus.lock().expect("binder bus poisoned");
+                b.remove_watcher(&key, conn_id, f.binder);
+                info!(
+                    "[KR64][binder][svc] 6-Z276: HIDL unregisterForNotifications({}) conn={} — dropped",
+                    key, conn_id
+                );
+            }
             // Reply: bool success = true.
             writer.write_i32(1);
         }
@@ -6533,5 +6844,141 @@ mod tests {
             1,
             "first field survives unshifted"
         );
+    }
+
+    /// 6-Z276: registerForNotifications → later addService fires a one-way
+    /// onRegistration BR_TRANSACTION targeted at the watcher's local
+    /// callback object, in BOTH dialects; unregister drops the watcher;
+    /// conn death drops the watcher.
+    #[test]
+    fn z276_registration_callbacks_fire_oneway() {
+        let mut bus = BusState::new();
+        let watcher = bus.register_conn();
+        let w_ptr: u64 = 0xABCD_0001;
+        let w_cookie: u64 = 0xDEAD_BEEF;
+
+        // Watch a service that does NOT exist yet (AIDL dialect).
+        bus.add_watcher(
+            "some.hal.IFoo/default",
+            ServiceWatcher {
+                conn: watcher,
+                ptr: w_ptr,
+                cookie: w_cookie,
+                hidl: false,
+            },
+        );
+
+        // The service registers — the watcher's mailbox gets exactly one
+        // one-way callback transaction.
+        let h = bus.add_guest_service("some.hal.IFoo/default", PROXY_CONN_ID, 0, 0);
+        bus.fire_registration_callbacks("some.hal.IFoo/default", h, false);
+
+        let bx = bus.conns.get(&watcher).expect("watcher conn");
+        assert_eq!(bx.inbox.len(), 1, "exactly one onRegistration queued");
+        let fired = match bx.inbox.front() {
+            Some(InboxItem::Tx(tx)) => {
+                assert_eq!(tx.code, 1, "onRegistration code");
+                assert!(tx.one_way, "callback is one-way");
+                assert_eq!(tx.txn_id, 0, "no reply bookkeeping for one-way");
+                assert_eq!(tx.ptr, w_ptr, "targeted at the watcher's local cb");
+                assert_eq!(tx.cookie, w_cookie);
+                assert_eq!(tx.flags, TF_ONE_WAY);
+                let blob = tx.blob.as_ref().expect("AIDL callback carries a parcel");
+                // Decode the parcel's UTF-16 string16 regions to check the
+                // AIDL token + name (string16 = [i32 len][len × u16le][NUL]).
+                let decode_string16_at = |data: &[u8], off: usize| -> Option<String> {
+                    let len = i32::from_ne_bytes(data[off..off + 4].try_into().ok()?) as usize;
+                    let mut u: Vec<u16> = Vec::with_capacity(len);
+                    for i in 0..len {
+                        let b = data[off + 4 + i * 2..off + 6 + i * 2].try_into().ok()?;
+                        u.push(u16::from_le_bytes(b));
+                    }
+                    Some(String::from_utf16_lossy(&u))
+                };
+                let _ = decode_string16_at;
+                // Walk: [strict][work][tag] then string16s.
+                assert_eq!(
+                    u32::from_ne_bytes(blob.data[8..12].try_into().unwrap()),
+                    AIDL_HEADER_TAG_SYST,
+                    "SYST header tag"
+                );
+                let desc = decode_string16_at(&blob.data, 12).expect("descriptor string16");
+                assert_eq!(desc, "android.os.IServiceCallback");
+                // The name string16 follows (12 + 4 + 2*(len+1) + pad).
+                let desc_len = i32::from_ne_bytes(blob.data[12..16].try_into().unwrap()) as usize;
+                let name_off = 12 + 4 + 2 * (desc_len as usize + 1);
+                let name_off = (name_off + 3) & !3; // 4-byte pad
+                let name = decode_string16_at(&blob.data, name_off).expect("name string16");
+                assert_eq!(name, "some.hal.IFoo/default");
+                true
+            }
+            other => panic!("expected Tx, got {:?}", other.is_some()),
+        };
+        assert!(fired);
+        // Fired once → the watcher list is consumed (fire-once semantics).
+        assert!(!bus.watchers.contains_key("some.hal.IFoo/default"));
+
+        // unregister + conn-death cleanup paths.
+        bus.add_watcher(
+            "another.hal.IBar/default",
+            ServiceWatcher {
+                conn: watcher,
+                ptr: 0x1111,
+                cookie: 0,
+                hidl: false,
+            },
+        );
+        bus.add_watcher(
+            "hidl.vendor.IBaz/default",
+            ServiceWatcher {
+                conn: watcher,
+                ptr: 0x2222,
+                cookie: 0,
+                hidl: true,
+            },
+        );
+        bus.remove_watcher("another.hal.IBar/default", watcher, 0x1111);
+        assert!(!bus.watchers.contains_key("another.hal.IBar/default"));
+        bus.remove_watchers_of_conn(watcher);
+        assert!(!bus.watchers.contains_key("hidl.vendor.IBaz/default"));
+
+        // HIDL watcher parcel shape: registration + fire.
+        let w2 = bus.register_conn();
+        bus.add_watcher(
+            "android.hardware.health@2.1::IHealth/default",
+            ServiceWatcher {
+                conn: w2,
+                ptr: 0x4444,
+                cookie: 0x5555,
+                hidl: true,
+            },
+        );
+        let h2 = bus.add_guest_service(
+            "android.hardware.health@2.1::IHealth/default",
+            PROXY_CONN_ID,
+            0,
+            0,
+        );
+        bus.fire_registration_callbacks("android.hardware.health@2.1::IHealth/default", h2, false);
+        let bx2 = bus.conns.get(&w2).expect("hidl watcher conn");
+        match bx2.inbox.front() {
+            Some(InboxItem::Tx(tx)) => {
+                let blob = tx.blob.as_ref().expect("HIDL callback carries a parcel");
+                // HIDL data = [i32 len]["android.hardware.health@2.1::IHealth"]
+                // + NUL + pad, [i32 len]["default"] + NUL + pad, [i32 0].
+                let fq_len = i32::from_ne_bytes(blob.data[0..4].try_into().unwrap());
+                assert_eq!(
+                    fq_len as usize,
+                    "android.hardware.health@2.1::IHealth".len()
+                );
+                let s = String::from_utf8_lossy(&blob.data);
+                assert!(s.contains("default"), "instance hidl_string present");
+                assert!(
+                    s.contains("android.hardware.health@2.1::IHealth"),
+                    "fqName hidl_string present"
+                );
+            }
+            _ => panic!("HIDL onRegistration not queued"),
+        }
     }
 }
