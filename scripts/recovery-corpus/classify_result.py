@@ -230,11 +230,38 @@ aosp_ui_live = bool(fb_lines) \
     and len(brightness_vals) >= 2 \
     and len({pid for _, pid in banners}) <= 1 \
     and "Rebooting..." not in rec.split("framebuffer:")[-1]
+# ── 6-Z289: AOSP-menu interactivity ground truth ────────────────────
+# The aosp_minui signal (framebuffer marker + dim cycle) stays the
+# passive liveness check; this probe supplies the ACTIVE one: the
+# menu-probe tapped SAFE rows and the guest's fb0 blit frame counter
+# ROSE — host input reached the AOSP recovery and minui redrew the
+# highlight. That is end-to-end touch delivery + a live menu, which the
+# passive dim-cycle heuristic missed on the fully-rendered lineage menu
+# (run 33900850051 was ui=SPLASH_HANG with the whole menu on screen).
+menu_probe = {}
+try:
+    with open(os.path.join(ART, "menu-probe.json")) as _f:
+        menu_probe = json.load(_f)
+except Exception:
+    pass
+if menu_probe.get("ran"):
+    result["markers"]["menu_probe"] = {
+        "interactive": bool(menu_probe.get("interactive")),
+        "frame_delta": menu_probe.get("frame_delta"),
+        "taps": len(menu_probe.get("taps") or []),
+        "baseline_stable": menu_probe.get("baseline_stable"),
+        "cap_differs": menu_probe.get("cap_differs_after_taps"),
+    }
+menu_interactive = bool(menu_probe.get("ran")) and bool(menu_probe.get("interactive"))
+
 if any(p in menu_pages for p in pages):
     result["ui"] = "UI_READY"
 elif aosp_ui_live:
     result["ui"] = "UI_READY"
     result["markers"]["ui_source"] = "aosp_minui"
+elif menu_interactive:
+    result["ui"] = "UI_READY"
+    result["markers"]["ui_source"] = "aosp_menu_interactive"
 elif "system_readonly" in rec and "Set page:" not in rec:
     result["ui"] = "UI_HANG"
 elif banners:

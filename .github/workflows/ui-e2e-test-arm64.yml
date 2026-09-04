@@ -620,6 +620,14 @@ jobs:
           # they're needed). Capture the RC; exit it at the end.
           RC=0
           python3 scripts/ui-navigate.py || RC=$?
+          # 6-Z289: AOSP-menu interactivity probe. For minui-era
+          # recoveries (Lineage/AOSP — no TWRP "Set page:" system, the
+          # classifier's menu detector can never fire) tap SAFE menu rows
+          # (never the pre-highlighted first row) and record whether the
+          # guest REDRAWS (fb0 blit frame counter rises + screencap hash
+          # change). Self-gating: skips TWRP-family runs untouched.
+          # Failures here must never fail the run — evidence only.
+          python3 scripts/ui-navigate-recovery-menu.py || true
           touch /tmp/ui-e2e-artifacts/nav-done
           kill $WATCHER 2>/dev/null || true
 
