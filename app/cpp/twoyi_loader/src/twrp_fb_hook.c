@@ -2139,21 +2139,53 @@ static int input_ioctl(int fd, unsigned req, void *argp) {
     if (nr >= 0x20u && nr <= 0x3fu) {            /* EVIOCGBIT(ev, len) */
         unsigned ev = nr - 0x20u;
         unsigned cap = size;
-        unsigned need = 8;                       /* bytes actually set */
+        unsigned need = 1;                       /* kernel bitmap size for this ev */
         if (cap > 64) cap = 64;                  /* our bitmap budget */
         if (size > 4096) return -2;
-        my_memset(argp, 0, size);
+        /* Kernel-faithful WRITE BOUND (task 6-Z284): the kernel's
+         * bits_to_user() writes at most (maxbit+7)/8 bytes for the
+         * requested bitmap, whatever len the caller passed. New-gen minui
+         * (AOSP 12+ / LOS 20+) calls EVIOCGBIT(EV_KEY, KEY_MAX) with a
+         * 96-byte stack buffer — ev_iterate_available_keys passes
+         * len=KEY_MAX=767 but allocates only BITS_TO_LONGS(KEY_MAX)*8=96
+         * bytes. Memsetting the full len zeroed ~575 bytes of the
+         * caller's stack ABOVE the buffer, which nulled the std::function
+         * object living in RecoveryUI::Init's frame — its __f_ pointer
+         * then read as NULL on the first key_detected() callback ->
+         * "__throw_bad_function_call" -> abort() -> recovery parked
+         * BEFORE UI init (lineage-22.2 SINGLE_FRAME, ui=NOT_REACHED).
+         * TWRP-era callers pass len=sizeof(bits)=96 and never hit it. */
+        if (ev == 0u) {                          /* EV_SYN bitmap: EV_MAX=0x1f */
+            need = (0x1fu + 7) / 8;              /* = 4  */
+        } else if (ev == INBR_EV_KEY) {
+            need = (0x2ffu /*KEY_MAX*/ + 7) / 8; /* = 96 */
+        } else if (ev == INBR_EV_ABS) {
+            need = (0x3fu /*ABS_MAX*/ + 7) / 8;  /* = 8  */
+        } else if (ev == 2u) {                   /* EV_REL: REL_MAX=0x0f */
+            need = (0x0fu + 7) / 8;              /* = 2  */
+        } else if (ev == 4u) {                   /* EV_MSC: MSC_MAX=0x07 */
+            need = (0x07u + 7) / 8;              /* = 1  */
+        } else if (ev == 5u) {                   /* EV_SW: SW_MAX=0x07 */
+            need = (0x07u + 7) / 8;              /* = 1  */
+        } else if (ev == 0x11u) {                /* EV_LED: LED_MAX=0x0f */
+            need = (0x0fu + 7) / 8;              /* = 2  */
+        } else if (ev == 0x12u) {                /* EV_SND: SND_MAX=0x07 */
+            need = (0x07u + 7) / 8;              /* = 1  */
+        } else if (ev == 0x14u) {                /* EV_REP: REP_MAX=0x01 */
+            need = (0x01u + 7) / 8;              /* = 1  */
+        } else if (ev == 0x15u) {                /* EV_FF: FF_MAX=0x7f */
+            need = (0x7fu + 7) / 8;              /* = 16 */
+        }
+        if (need > size) need = size;            /* kernel: min(len, bitmap) */
+        my_memset(argp, 0, need);                /* touch ONLY what the kernel would */
         if (ev == 0) {                           /* event-type bits */
-            need = (0x1f /*EV_MAX*/ + 7) / 8;    /* = 4 */
             inbr_set_bit((unsigned char *)argp, cap, INBR_EV_SYN);
             inbr_set_bit((unsigned char *)argp, cap, INBR_EV_KEY);
             inbr_set_bit((unsigned char *)argp, cap, INBR_EV_ABS);
         } else if (ev == INBR_EV_KEY) {
-            need = (0x2ff /*KEY_MAX*/ + 7) / 8;  /* = 96 */
             inbr_set_bit((unsigned char *)argp, cap, INBR_BTN_TOUCH);
             inbr_set_bit((unsigned char *)argp, cap, INBR_BTN_TOOL_FINGER);
         } else if (ev == INBR_EV_ABS) {
-            need = (0x3f /*ABS_MAX*/ + 7) / 8;   /* = 8 */
             inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_X);
             inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_Y);
             inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_SLOT);
@@ -2165,7 +2197,7 @@ static int input_ioctl(int fd, unsigned req, void *argp) {
         /* Kernel-faithful: EVIOCGBIT returns the number of bytes copied
          * (min(len, bits-map size)), not 0 — callers that check > 0 (the
          * documented kernel contract) must see a positive count. */
-        return (int)(size < need ? size : need);
+        return (int)need;
     }
     if (nr >= 0x40u && nr <= 0x7fu && size >= 24) { /* EVIOCGABS(abs) */
         unsigned abs = nr - 0x40u;
