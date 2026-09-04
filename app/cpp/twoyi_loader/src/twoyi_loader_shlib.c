@@ -32,6 +32,9 @@ extern char **environ;
 // Forward declarations
 static int mkdir_p(const char *path, mode_t mode);
 static int should_translate(const char *path);
+// Path translation (rootfs prefixing) — defined with should_translate;
+// needed earlier by the 6-Z288 node-materialisation hooks.
+static const char *translate(const char *path);
 static void unsetenv_internal(const char *name);
 // Binder device open fallback (defined later, before __open_2 hook)
 static int is_binder_device_path(const char *path);
@@ -2188,35 +2191,107 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
 
 static int (*real_mknod)(const char *, mode_t, dev_t) = NULL;
 static int (*real_mknodat)(int, const char *, mode_t, dev_t) = NULL;
+static int (*real_mkfifo)(const char *, mode_t) = NULL;
+static int (*real_mkfifoat)(int, const char *, mode_t) = NULL;
+
+// 6-Z288: materialise a node request inside the GUEST rootfs.
+//
+// The guest cannot mknod on the host (app sandbox), and the previous
+// hooks lied or misfired: CHR/BLK returned 0 creating NOTHING on arm64
+// (the 6-Z185 lie), and FIFO fell through to real_mknodat on the
+// UNTRANSLATED host path — OrangeFox's mkfifo("/system/bin/orsin")
+// failed on the host's read-only /system, and its ORS writer child then
+// spun a ~2.8kHz open("/system/bin/orsin", O_WRONLY) ENOENT retry loop
+// (423k opens, run 33897176830) that starved the render loop → BOOT_FAIL.
+//
+// HONEST MODEL: the node is materialised in the rootfs at the TRANSLATED
+// path —
+//   * FIFO/SOCK: try the REAL node type first (a real fifo in the app-
+//     writable rootfs gives true ORS pipe semantics: fox's reader and the
+//     sh writer meet on the same host fifo). If the host refuses, back it
+//     with a regular file — the writer's open/write then SUCCEED and the
+//     reader's read returns EOF/empty ("command recorded, no daemon
+//     answers") instead of an ENOENT storm.
+//   * CHR/BLK: regular file carrying dev_t (the documented VM behavior —
+//     emu_mknodat "creates regular file with dev_t"; the arm64 branch
+//     simply never implemented it, now fixed for both arches).
+//   * Anything already at the translated path: idempotent success.
+// Returns 0 on success, -1 with honest errno when even the backing file
+// cannot be created.
+static int twoyi_materialise_node(const char *path, mode_t mode, dev_t dev) {
+    if (!path || !g_rootfs) return -1;
+    mode_t fmt = mode & S_IFMT;
+    const char *t = should_translate(path) ? translate(path) : path;
+    if (!t || t[0] != '/') return -1;
+
+    // Already there? Idempotent success (EEXIST would break callers that
+    // legitimately tolerate re-creation).
+    struct stat st;
+    if (twoyi_sys_fstatat(AT_FDCWD, t, &st, AT_SYMLINK_NOFOLLOW) == 0) return 0;
+
+    if (fmt == S_IFCHR || fmt == S_IFBLK) {
+        int fd = (int)twoyi_sys_open(t, O_RDWR | O_CREAT | O_EXCL, 0666);
+        if (fd < 0) return -1;
+        syscall(NR_write, fd, &dev, sizeof(dev_t));
+        syscall(NR_close, fd);
+        return 0;
+    }
+
+    // FIFO / SOCK / REG: real node type first (PLT-only mode — no seccomp
+    // filter is installed in this process, so the raw syscall is safe).
+    if (fmt == S_IFIFO || fmt == S_IFREG) {
+        if (syscall(NR_mknodat, AT_FDCWD, t, mode, dev) == 0) return 0;
+    }
+    // Fallback: regular-file backing — kills the retry storm with honest
+    // (if degenerate) read/write semantics.
+    int fd = (int)twoyi_sys_open(t, O_RDWR | O_CREAT | O_EXCL, 0666);
+    if (fd >= 0) { syscall(NR_close, fd); return 0; }
+    return -1; // errno from the open — honest failure
+}
 
 int mknod(const char *path, mode_t mode, dev_t dev) {
     if (!real_mknod) real_mknod = dlsym(RTLD_NEXT, "mknod");
-    // For device nodes, create a regular file containing dev_t
+    if (path && should_translate(path))
+        return twoyi_materialise_node(path, mode, dev);
+    // Host paths: keep the legacy behavior (device nodes are not ours to
+    // create on the host; other types pass through honestly).
     mode_t fmt = mode & S_IFMT;
-    if (fmt == S_IFCHR || fmt == S_IFBLK) {
-#if defined(__x86_64__)
-        int fd = twoyi_sys_open(path, O_RDWR|O_CREAT, 0666);
-        if (fd >= 0) {
-            syscall(NR_write, fd, &dev, sizeof(dev_t));
-            syscall(NR_close, fd);
-        }
-#endif
-        return 0;
-    }
-    // For non-device nodes, call real mknod
+    if (fmt == S_IFCHR || fmt == S_IFBLK) return 0;
     if (real_mknod) return real_mknod(path, mode, dev);
     return 0;
 }
 
 int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
     if (!real_mknodat) real_mknodat = dlsym(RTLD_NEXT, "mknodat");
+    // Absolute guest paths materialise in the rootfs (6-Z288).
+    if (path && path[0] == '/' && should_translate(path))
+        return twoyi_materialise_node(path, mode, dev);
     mode_t fmt = mode & S_IFMT;
-    if (fmt == S_IFCHR || fmt == S_IFBLK) {
-        // Create regular file
-        return 0;
-    }
+    if (fmt == S_IFCHR || fmt == S_IFBLK) return 0;
+    // Relative path + dirfd: the dirfd (from a translated open) already
+    // points into the rootfs — try the real syscall honestly.
     if (real_mknodat) return real_mknodat(dirfd, path, mode, dev);
     return 0;
+}
+
+// 6-Z288: mkfifo/mkfifoat hooks. OrangeFox imports mkfifo in its dynsym
+// (verified in orangefox-R12.0-lavender's system/bin/recovery) and calls
+// it via PLT; bionic's internal mkfifo→mknod chain is NOT PLT-visible,
+// so hooking mknod/mknodat alone never saw it.
+int mkfifo(const char *path, mode_t mode) {
+    if (!real_mkfifo) real_mkfifo = dlsym(RTLD_NEXT, "mkfifo");
+    if (path && should_translate(path))
+        return twoyi_materialise_node(path, (mode & ~S_IFMT) | S_IFIFO, 0);
+    if (real_mkfifo) return real_mkfifo(path, mode);
+    return -1;
+}
+
+int mkfifoat(int dirfd, const char *path, mode_t mode) {
+    if (!real_mkfifoat) real_mkfifoat = dlsym(RTLD_NEXT, "mkfifoat");
+    if (path && path[0] == '/' && should_translate(path))
+        return twoyi_materialise_node(path, (mode & ~S_IFMT) | S_IFIFO, 0);
+    if (real_mkfifoat) return real_mkfifoat(dirfd, path, mode);
+    return -1;
 }
 
 // =========================================================================
@@ -4354,23 +4429,32 @@ static long emu_umount2(const char *tgt, int flags) {
 // =========================================================================
 static long emu_mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
     // wait_ready() removed — runtime is always ready when handler runs
+    (void)dirfd;
     if(!path) return -EFAULT;
     mode_t fmt = mode & S_IFMT;
-    if (fmt != S_IFCHR && fmt != S_IFBLK) {
-        // Not a device node — return 0 (fake success).
-        // Can't call real mknodat (trapped by seccomp, would recurse).
+    // 6-Z288: honest rootfs materialisation, mirroring the PLT
+    // twoyi_materialise_node but WITHOUT dlsym or re-issuing mknodat
+    // (both unsafe from a SIGSYS context under a TRAP filter — a nested
+    // trapped syscall would recurse into this handler). The node is
+    // backed by a regular file at the TRANSLATED path: CHR/BLK carry
+    // dev_t (the documented VM behavior), FIFO/SOCK/REG start empty.
+    // Previously: CHR/BLK created a file at the UNTRANSLATED path on
+    // x86_64 only, and arm64 returned fake success creating nothing —
+    // the 6-Z185 lie that fed OrangeFox's orsin retry storm.
+    if (!should_translate(path)) {
+        // Host paths are not ours to materialise.
         return 0;
     }
-    // Create regular file containing dev_t (use open() not openat() to avoid seccomp recursion)
-#if defined(__x86_64__)
-    int fd = twoyi_sys_open(path, O_RDWR|O_CREAT, 0666);
-    if(fd<0) return -errno;
-    syscall(NR_write, fd, &dev, sizeof(dev_t));
+    const char *t = translate(path);
+    if (!t || t[0] != '/') return 0;
+    struct stat st;
+    if (twoyi_sys_fstatat(AT_FDCWD, t, &st, AT_SYMLINK_NOFOLLOW) == 0) return 0;
+    int fd = (int)twoyi_sys_open(t, O_RDWR | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) return 0; // lost a creation race — the node exists now
+    if (fmt == S_IFCHR || fmt == S_IFBLK) {
+        syscall(NR_write, fd, &dev, sizeof(dev_t));
+    }
     syscall(NR_close, fd);
-#else
-    // arm64: no open() syscall, return 0 for now (TODO: use internal flag)
-    (void)dev;
-#endif
     return 0;
 }
 
