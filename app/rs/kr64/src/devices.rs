@@ -1537,6 +1537,48 @@ pub fn create_by_name_block_nodes(rootfs: &str) -> std::io::Result<usize> {
     Ok(created)
 }
 
+/// 6-Z303: stage `/dev/block/loop0..loop7` as regular files.
+///
+/// PROBLEM (SHRP v3.1 starlte, first SHRP corpus wave, run 33975058163):
+/// the guest never reached its UI — after brightness init it opened
+/// `/dev/block/loop0`, then `loop1`, `loop2`, … monotonically upward,
+/// forever (4369 opens at run end and still climbing; zero page
+/// switches, zero input reads). That is a find-first-free-loop-device
+/// scan (`open("/dev/block/loopN", O_RDWR)` until one succeeds, N
+/// unbounded) — on a real device ueventd/kernel have loop0..7 there, so
+/// the scan stops at loop0; in the twoyi sandbox `/dev/block` had NO
+/// loop nodes, so the scan never terminated and the UI never started.
+/// (Not a TWRP-family universal: the same wave's PBRP vayu/surya runs
+/// did zero loop opens and reached UI_READY — this is SHRP-era storage
+/// init code.)
+///
+/// FIX: stage loop0..loop7 through the same materialise_block_node
+/// path as the 6-Z287 by-name nodes (sparse regular files). The scan
+/// then succeeds on loop0 and boot proceeds; any subsequent LOOP_*
+/// ioctls fail ENOTTY (honest: a regular file is not a loop device),
+/// which is exactly the failure shape a missing kernel loop driver
+/// would give — bounded, logged, non-fatal for the UI.
+pub fn create_loop_block_nodes(rootfs: &str) -> std::io::Result<usize> {
+    const LOOP_DEVICE_COUNT: usize = 8;
+    let mut created = 0usize;
+    for i in 0..LOOP_DEVICE_COUNT {
+        match materialise_block_node(rootfs, &format!("/dev/block/loop{}", i)) {
+            Ok(true) => created += 1,
+            Ok(false) => {}
+            Err(e) => warning!(
+                "[KR64][devices] loop node /dev/block/loop{} staging failed: {} (continuing)",
+                i,
+                e
+            ),
+        }
+    }
+    info!(
+        "[KR64][devices] loop block nodes: {}/{} staged under {}/dev/block (6-Z303)",
+        created, LOOP_DEVICE_COUNT, rootfs
+    );
+    Ok(created)
+}
+
 /// The VINTF manifest fragment we stage for the in-proxy virtualized AIDL
 /// HALs (6-Z302). Shape copied from AOSP's own
 /// `android.hardware.security.keymint-service.xml` (android-12.1.0_r1):
@@ -2307,6 +2349,34 @@ mod tests {
             content.iter().all(|&b| b == 0),
             "misc must read as NO BCB command after a fresh boot"
         );
+    }
+
+    // ── 6-Z303: loop-device staging (SHRP find-free-loop scan) ──────────
+
+    /// loop0..loop7 must exist as regular (sparse 2MiB) files so a
+    /// find-first-free-loop-device scan terminates at loop0; re-running
+    /// is idempotent.
+    #[test]
+    fn create_loop_block_nodes_stages_loop0_to_7_idempotently() {
+        let rootfs = tmpdir();
+
+        let first = create_loop_block_nodes(&rootfs).expect("staging works");
+        assert_eq!(first, 8, "must stage loop0..loop7");
+
+        for i in 0..8 {
+            let p = format!("{}/dev/block/loop{}", rootfs, i);
+            let meta = fs::metadata(&p).unwrap_or_else(|e| panic!("loop{} must exist: {}", i, e));
+            assert!(meta.is_file(), "loop{} is a regular-file stand-in", i);
+            assert_eq!(
+                meta.len(),
+                BLOCK_NODE_SIZE,
+                "loop{} is sparse 2MiB like other block stand-ins",
+                i
+            );
+        }
+
+        let second = create_loop_block_nodes(&rootfs).expect("second run");
+        assert_eq!(second, 0, "re-staging must be idempotent");
     }
 
     // ── 6-Z302: VINTF virtual-HAL manifest staging ──────────────────────

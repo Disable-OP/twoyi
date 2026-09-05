@@ -7293,6 +7293,26 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         ),
     }
 
+    // 6-Z303: stage /dev/block/loop0..loop7 so find-first-free-loop-device
+    // scans (SHRP v3.1 storage init — run 33975058163 burned the whole run
+    // scanning loopN upward with zero UI progress) terminate on loop0.
+    // Same regular-file honesty contract as the by-name nodes: LOOP_*
+    // ioctls stay ENOTTY.
+    match devices::create_loop_block_nodes(&rootfs_prefix) {
+        Ok(n) => {
+            if n > 0 {
+                info!(
+                    "[KR64] PARENT: loop block nodes staged ({} new, 6-Z303)",
+                    n
+                );
+            }
+        }
+        Err(e) => warning!(
+            "[KR64] PARENT: failed to stage loop block nodes: {} (loop scans stay unbounded; 6-Z303)",
+            e
+        ),
+    }
+
     // 6-Z302: declare the in-proxy virtual AIDL HALs in the guest's VINTF
     // manifest set, so keystore2's connect_keymint() (get_aidl_instances —
     // libvintf GetDeviceHalManifest) resolves IKeyMintDevice/default and

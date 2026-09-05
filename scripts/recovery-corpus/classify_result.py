@@ -89,6 +89,22 @@ banners += [
         rec)
     if (fam, pid) not in banners
 ]
+# 6-Z303: PitchBlack banner form. PBRP 4.0 builds print
+#   "Starting PitchBlackRecovery 4.0-UNOFFICIAL (pid Sat Sep  5 15:36:17 2026
+#    )"
+# — the format string passes the DATE as the pid argument, so there are
+# NO pid digits anywhere. Capture the parenthesized blob as the instance
+# key (unique per boot since it embeds the boot date) and normalize the
+# family to the manifest's PitchBlack naming. Verified on pbrp-4.0-vayu
+# (4.0-OFFICIAL) + pbrp-4.0-ginkgo (4.0-UNOFFICIAL), wave a50b815.
+banners += [
+    ("PitchBlack" if fam in ("PitchBlackRecovery", "PitchBlack", "PBRP")
+     else fam, blob)
+    for fam, blob in re.findall(
+        r"Starting (PitchBlackRecovery|PitchBlack|PBRP)[^\n]*\(pid ([^\n)]*)",
+        rec)
+    if (fam, blob) not in banners
+]
 result["recovery_instances"] = len({pid for _, pid in banners})
 if banners:
     result["markers"]["family_banner"] = sorted({f for f, _ in banners})
