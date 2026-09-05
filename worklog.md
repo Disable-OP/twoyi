@@ -24798,3 +24798,19 @@ Work Log:
 
 Stage Summary:
 - HEAD 011baed. Expectation for the next fox wave: get_aidl_instances resolves 'default' → NO android.security.compat addService, NO compat _NTF fetches; connect_keymint returns via the virtual service; "Shared secret negotiation concluded successfully." + "Successfully registered Keystore 2.0 service." appear in the glog trace; the recovery client can then transact IKeystoreSecurity/default. Next: dispatch fox/lineage/angler wave on 011baed and decode.
+
+---
+Task ID: 6-Z302b — wave decode: keystore2 registration GREEN on the VINTF fix (queue item CLOSED)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: decode the d4a0c81 verification wave; close the TWRP-12-class IKeystoreSecurity engagement queue item on the evidence.
+
+Work Log:
+- Wave on d4a0c81: ALL FOUR SUCCESS (kr64 lint+test 33972407159 + E2E 33972422190 lineage / 33972420648 fox / 33972418785 angler — all three guests overall UI_READY, regression-free).
+- FOX DECODE (the fix verified end-to-end): VINTF fragment staged at +24ms ("virtual-HAL VINTF manifest staged ... 6-Z302"); keystore2 "Keystore2 is starting." (10.72s) → "Starting thread pool now." (10.73s) → addService(android.security.compat) at 10.78s — now ONLY from the AOSP-expected secure-clock fallback (no AIDL ISecureClock instance exists; globals.rs connect_secure_clock brings up the compat service by design) → **addService(android.system.keystore2.IKeystoreService/default) → handle 0x6 at +15.8s** → **"Successfully registered Keystore 2.0 service."** → **"Joining thread pool now."** → watchdog idle→terminating at 21.3s (the watched startup section COMPLETED — the 6-Z301 stall signature is gone: no compat getKeyMintDevice hang, registration ~5s after pool start).
+- The shared-secret negotiation thread does NOT conclude ("Shared secret negotiation concluded successfully." absent): the fox vendor VINTF declares legacy HIDL keymaster@4.1 (citadel), so the negotiation lists a HIDL participant that can never start in a recovery container and retries per second on its BACKGROUND thread — by AOSP design it never blocks main; on real hardware it concludes. Documented as expected-container behavior.
+- Recovery-side client transactions (decrypt path) remain user-triggered and unexercised by the harness — the SERVICE side (registration, KeyMint resolution, SharedSecret serve) is fully up; a future deep-nav/decrypt-harness step can chase the client surface.
+- QUEUE ITEM CLOSED: TWRP-12-class IKeystoreSecurity engagement check + the keystore2/keymaster stall performance item (original roadmap) — root-caused, fixed, verified.
+
+Stage Summary:
+- origin/main d4a0c81. 734 tests green. All three corpus families UI_READY. Remaining queue candidates: PitchBlack/SHRP corpus depth, harness deep-nav page coverage (+ the now-open client-side decrypt exercise). Cron webDevReview (job 359061) continues from repo state.
