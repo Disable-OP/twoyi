@@ -2963,6 +2963,40 @@ fn handle_write_read(
             );
             break;
         }
+        // 6-Z301: bounded BC-command stream log — per (vm, conn) the first
+        // 64 commands + every 500th afterwards. The fox R12 engagement
+        // wave (33964129056) showed the guest keystore2 issuing NOTHING
+        // after its 2nd android.security.compat descriptor fetch: with
+        // this stream the next wave distinguishes "the guest stopped
+        // issuing" (silence after the last logged command) from "the
+        // proxy lost it mid-command" (a truncated/unknown cmd pairs with
+        // the truncated-BC warning above).
+        static BC_STREAM_SEEN: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<(u32, ConnId), u64>>,
+        > = std::sync::OnceLock::new();
+        {
+            let seen = match BC_STREAM_SEEN
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+            {
+                Ok(mut m) => *m
+                    .entry((vm_id, conn_id))
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1),
+                Err(_) => 0,
+            };
+            if seen <= 64 || seen % 500 == 0 {
+                info!(
+                    "[KR64][binder][vm{}] BC stream conn={} cmd=0x{:08x} payload={} [cmd #{}{}]",
+                    vm_id,
+                    conn_id,
+                    cmd,
+                    psize,
+                    seen,
+                    if seen <= 64 { "" } else { " sampled" }
+                );
+            }
+        }
         let cmd_payload = &write_buf[consumed..consumed + psize];
         consumed += psize;
 
