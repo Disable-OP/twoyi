@@ -7322,6 +7322,8 @@ static BOOT_COMPLETED_SENDER_STARTED: std::sync::atomic::AtomicBool =
 /// bounded while the failing leg names itself).
 static Z305C_OPEN_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static Z305C_RL_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static Z305C_RL2_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static Z305C_ST_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 6-Z305: spawn the detached BOOT_COMPLETED delivery thread.
 ///
@@ -18277,6 +18279,29 @@ pub fn run_ptrace_loop(
                                         host_exists,
                                     ));
                                 }
+                                // ── 6-Z305c: ROOTFS-PREFIXED stat leak ──
+                                // A stat whose GUEST path already starts
+                                // with the host rootfs prefix is the
+                                // unrewritten-readlink leak: bionic realpath
+                                // stat(dst) with dst = the raw host fd-link
+                                // target → translate via the /data/* rule →
+                                // {rootfs}/data/... → ENOENT → libselinux
+                                // realpatherr → InitFatalReboot. Detect the
+                                // leak at the source (first 40).
+                                if path.starts_with(rootfs)
+                                    && Z305C_ST_DIAG.load(std::sync::atomic::Ordering::Relaxed) < 40
+                                {
+                                    let n = Z305C_ST_DIAG
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        + 1;
+                                    log(&format!(
+                                        "6-Z305c realpath-trace: stat of ROOTFS-PREFIXED path (unrewritten leak) pid={} guest_path={:?} → translated={:?} (occurrence {})",
+                                        pid,
+                                        path,
+                                        translated,
+                                        n,
+                                    ));
+                                }
                                 // ── Task 6-Z71: arm the EXIT-side
                                 // stat64/lstat64 EMULATION record ──
                                 //
@@ -20522,10 +20547,14 @@ pub fn run_ptrace_loop(
                                         .get(&pid)
                                         .cloned()
                                         .unwrap_or_default();
+                                    // 6-Z305c v2: failures ALWAYS matter
+                                    // (the realpath leg-1 O_PATH open);
+                                    // successes only for the first 10.
+                                    let force = ret < 0;
                                     let n = Z305C_OPEN_DIAG
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                         + 1;
-                                    if n <= 40 {
+                                    if force || n <= 10 {
                                         log(&format!(
                                             "6-Z305c realpath-trace: open orig={:?} translated={:?} -> {} ({}) (occurrence {})",
                                             orig,
@@ -21094,13 +21123,15 @@ pub fn run_ptrace_loop(
                         || (abi.readlinkat != -1 && syscall_num == abi.readlinkat)
                     {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        // ── 6-Z305c: realpath-trace readlink DIAG ──
-                        // bionic realpath leg 2 = readlink(/proc/self/fd/N).
-                        // The 6-Z200b rewrite below logs only SUCCESSFUL
-                        // rewrites — a -1 (or a non-rewritten success) was
-                        // invisible in run 33987046990's log. Log every
-                        // fd/cwd readlink with its raw result (first 40).
-                        if Z305C_RL_DIAG.load(std::sync::atomic::Ordering::Relaxed) < 40 {
+                        // ── 6-Z305c: realpath-trace readlink DIAG v2 ──
+                        // The blanket request-path log burned its cap on
+                        // linker fd bookkeeping before init's restorecon
+                        // window (+122ms). Log only the signal: FAILED
+                        // fd/cwd readlinks, and (inside the rewrite block
+                        // below) the raw target + rewrite decision for
+                        // rootfs-prefixed results.
+                        if ret < 0 && Z305C_RL_DIAG.load(std::sync::atomic::Ordering::Relaxed) < 40
+                        {
                             // readlink(path, buf, siz): path = arg1.
                             // readlinkat(dirfd, path, buf, flags): path = arg2.
                             let path_addr = if syscall_num == abi.readlinkat {
@@ -21117,14 +21148,10 @@ pub fn run_ptrace_loop(
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                             + 1;
                                         log(&format!(
-                                            "6-Z305c realpath-trace: readlink {:?} -> {} ({}) (occurrence {})",
+                                            "6-Z305c realpath-trace: readlink {:?} FAILED -> {} (-errno {}) (occurrence {})",
                                             rl_path,
                                             ret,
-                                            if ret < 0 {
-                                                format!("-errno {}", -ret)
-                                            } else {
-                                                "ok".to_string()
-                                            },
+                                            -ret,
                                             n,
                                         ));
                                     }
@@ -21141,12 +21168,32 @@ pub fn run_ptrace_loop(
                             if buf != 0 {
                                 if let Some(bytes) = read_child_bytes(pid, buf, ret as usize) {
                                     let target = String::from_utf8_lossy(&bytes).into_owned();
-                                    if let Some(guest) = guest_readlink_target(
+                                    // ── 6-Z305c: the DECISION POINT trace ──
+                                    // For rootfs-prefixed raw results the
+                                    // class-2 rewrite MUST fire (bionic
+                                    // realpath's next stat(dst) ENOENTs on
+                                    // the unrewritten host path — run
+                                    // 33989721659's evidence). Log the raw
+                                    // target + verdict directly.
+                                    let z305c_guest = guest_readlink_target(
                                         &target,
                                         rootfs,
                                         data_dir,
                                         staged_exes.as_ref(),
-                                    ) {
+                                    );
+                                    if target.starts_with(rootfs)
+                                        && Z305C_RL2_DIAG.load(std::sync::atomic::Ordering::Relaxed)
+                                            < 60
+                                    {
+                                        let n = Z305C_RL2_DIAG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
+                                        log(&format!(
+                                            "6-Z305c realpath-trace: fd-readlink raw={:?} ret={} rewrite={:?} (occurrence {})",
+                                            target, ret, &z305c_guest, n,
+                                        ));
+                                    }
+                                    if let Some(guest) = z305c_guest {
                                         log(&format!(
                                             "6-Z200b: readlink target {} rewritten to guest path {} (host-path illusion)",
                                             target, guest
