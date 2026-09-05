@@ -24864,3 +24864,20 @@ Work Log:
 
 Stage Summary:
 - origin/main c468bba. 735 tests green. Remaining queue: harness deep-nav coverage (PBRP/SHRP system_readonly prompt pages block tap-walks — ginkgo's honest UI_HANG), client-side decrypt exercise, PitchBlack/SHRP pr-tier promotion candidate. Cron webDevReview (job 359061) continues from repo state.
+
+---
+Task ID: 6-Z304 — gate-dismissal ladder verified: all four families UI_READY (deep-nav queue item CLOSED)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-06
+Task: run + decode the 6-Z304 gate-ladder wave (ginkgo + SHRP targets, vayu + angler guards).
+
+Work Log:
+- Wave on 99ea97c: ALL FOUR SUCCESS + lint+test green (33978303700 shrp / 33978302381 vayu / 33978301137 ginkgo / 33978299697 angler).
+- ginkgo (was the 6-Z303 honest UI_HANG): UI_READY with a DEEP walk — clear_vars→main2→main→…→restore→main→main2; theme OK, terminal OK. The PBRP "Keep Read Only" button rung dismissed the gate.
+- SHRP: UI_READY; system_readonly appeared MID-walk and the ladder dismissed it (main pages after it); battery_ok=True; terminal OK. The SHRP ✓-button rung works.
+- vayu guard: UI_READY, same deep wipe/formatdata/backup walk — PBRP-ladder reorder regression-free.
+- angler guard (classic-slider path): UI_READY, walked advanced→terminalcommand (TERMINAL REACHED, terminal OK)→filemanager deep chain→main/main2 — the classic y-0.88 slider rung still dismisses after the three no-op cross-layout rungs. The _back_off_danger safety net fired correctly on the walked-into 'restore' page (restore→main). recovery_instances=2 on this run (double banner capture) — verdict unaffected.
+- QUEUE ITEM CLOSED: harness deep-nav coverage — the gate page was the only family-specific blocker; PBRP/SHRP now walk as deep as TWRP/fox.
+
+Stage Summary:
+- origin/main 99ea97c + worklog commit. FIVE families UI_READY with deep nav. Remaining queue: client-side decrypt exercise (IKeystoreSecurity client transactions), pr-tier promotion candidate for pbrp/shrp entries. Cron webDevReview (job 359061) continues from repo state.
