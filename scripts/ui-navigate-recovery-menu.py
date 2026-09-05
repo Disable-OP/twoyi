@@ -282,6 +282,28 @@ def main():
     cx = W // 2
     ladder = [int(H * 0.481), int(H * 0.575), int(H * 0.481)]
     channels_used = []
+
+    # 6-Z293c: KEY discriminator FIRST. The transport is now proven
+    # (run 82e2ecb: "INPUT raw read(fd=10, count=24) -> 24" — ev_get_input
+    # consumed exact records) yet the touch UI never reacted. A synthetic
+    # KEY_VOLUMEUP rides the SAME bridge past the touch state machine:
+    #   - frame moves  -> bridge + callback + key handling all work; the
+    #     problem is RecoveryUI's touch classification/calibration.
+    #   - frame frozen -> the callback/queue path itself drops records.
+    # KEYCODE_VOLUME_UP (Android 24) maps to linux KEY_VOLUMEUP (114).
+    key_results = []
+    for i in range(2):
+        r = subprocess.run(
+            nav.ADB + ["shell",
+                       "am broadcast -a io.twoyi.debug.TOUCH "
+                       "--es action key --ei key 24"],
+            capture_output=True, text=True, timeout=20)
+        key_results.append((r.returncode, (r.stdout or "")[:80]))
+        time.sleep(2)
+    probe["key_broadcasts"] = key_results
+    nav.screenshot("menu-00b-after-key")
+    print(TAG, "key discriminator:", key_results)
+
     for i, y in enumerate(ladder):
         ch = tap_with_effect(cx, y)
         probe["taps"].append([cx, y, ch])
