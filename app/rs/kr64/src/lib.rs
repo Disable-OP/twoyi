@@ -7293,6 +7293,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         ),
     }
 
+    // 6-Z302: declare the in-proxy virtual AIDL HALs in the guest's VINTF
+    // manifest set, so keystore2's connect_keymint() (get_aidl_instances —
+    // libvintf GetDeviceHalManifest) resolves IKeyMintDevice/default and
+    // takes the GENUINE service path instead of the android.security.compat
+    // legacy chain that stalls TWRP-12-class guests before registration
+    // (the fox R12 wave decode). No-op when the guest already declares
+    // keymint itself. Harmless for guests that never run keystore2.
+    match devices::create_vintf_virtual_hal_manifest(&rootfs_prefix) {
+        Ok(true) => {
+            info!("[KR64] PARENT: virtual-HAL VINTF manifest staged (6-Z302)");
+        }
+        Ok(false) => {}
+        Err(e) => warning!(
+            "[KR64] PARENT: failed to stage virtual-HAL VINTF manifest: {} (keystore2 keeps the compat path; 6-Z302)",
+            e
+        ),
+    }
+
     // RECOVERY INPUT: pre-create {rootfs}/dev/input/event0 + event1 as
     // EMPTY regular files (0644). minui's /dev/input scan (readdir +
     // fstatat probes) needs openable "event*" names to exist; when one
