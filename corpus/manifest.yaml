@@ -172,9 +172,90 @@ images:
       PT_INTERP=/system/bin/linker64). The newest generation in the
       corpus — exercises the Android-15 init + linker expectations.
 
+  # ── PitchBlack Recovery Project (TWRP fork, SourceForge /pbrp) ──
+  # 6-Z303: first PitchBlack entries; URLs verified live from the dev box
+  # (sourceforge.net reachable; the 6-Z28x-era "SF unreachable" note is
+  # stale). PBRP builds self-identify ONLY via twres theme assets
+  # (main_button_pbrp_*.png) — the inspector's detect_family handles that.
+  - name: pbrp-4.0-ginkgo
+    family: PitchBlack
+    device: ginkgo
+    arch: arm64
+    generation: "12.1"
+    tier: nightly
+    url: https://sourceforge.net/projects/pbrp/files/ginkgo/recovery.img/download
+    referer: ""
+    md5: 55507353ea584c5476b224fd9516ee49
+    sha256: d6ec92f7dacd4887a4efd415567e93e23298ee62b6f88684d2f1a40fa7d28678
+    notes: >-
+      PitchBlack 4.0 OFFICIAL (direct recovery.img, 64MiB, gzip ramdisk,
+      869 cpio files). FIRST PitchBlack family entry. Same device as the
+      corpus's TWRP ginkgo entries — clean family A/B on known hardware.
+      A12.1-style rootfs (apex, data_mirror, debug_ramdisk) with symlink
+      init -> /system/bin/init (dynamic, PT_INTERP=/system/bin/linker64 —
+      the OrangeFox-R12 shape proven since 6-Z196). SourceForge
+      /files/<dev>/recovery.img is a ROLLING file (content moves without a
+      name change, like the fox corpus): md5+sha256 pin the verified build;
+      CI drift is possible and means re-verification, not failure.
+
+  - name: pbrp-4.0-vayu
+    family: PitchBlack
+    device: vayu
+    arch: arm64
+    generation: "12.1"
+    tier: nightly
+    url: https://sourceforge.net/projects/pbrp/files/vayu/PBRP-vayu-4.0-20251016-0805-OFFICIAL.zip/download
+    referer: ""
+    md5: 36e15129d5558055008834f24c95787d
+    sha256: ""
+    notes: >-
+      PitchBlack 4.0 OFFICIAL 20251016 (zip, 62MB; recovery.img at the
+      TOP LEVEL of the zip — 128MiB uncompressed ANDROID! image, gzip
+      ramdisk, 3755 files). Poco X3 Pro (SM8150, already in corpus via
+      TWRP). Exercises the workflow's zip-extraction path on the
+      top-level layout (OrangeFox nests elsewhere; the TWRP/recovery
+      subdir fallback stays unexercised by PBRP).
+
+  - name: pbrp-4.0-surya
+    family: PitchBlack
+    device: surya
+    arch: arm64
+    generation: "12.1"
+    tier: nightly
+    url: https://sourceforge.net/projects/pbrp/files/surya/PBRP-surya-4.0-20250803-0709-OFFICIAL.zip/download
+    referer: ""
+    md5: def34603fe471df367c1ea039808e7a9
+    sha256: ""
+    notes: >-
+      PitchBlack 4.0 OFFICIAL 20250803 (zip, 68MB; top-level recovery.img,
+      128MiB, gzip ramdisk, 3968 files). Poco X3 NFC (SM7125) — NEW device
+      codename for the corpus; vayu's Snapdragon sibling for SoC diversity
+      inside the PitchBlack family.
+
+  # ── SHRP / SkyHawk Recovery (TWRP fork, SourceForge /shrp) ──
+  # 6-Z303: first SHRP entry. LZMA-compressed ramdisk — a ramdisk
+  # compression format no other corpus entry uses (TWRP angler=gzip,
+  # fox R12=gzip, lineage=xz); RamdiskImporter auto-detects it via
+  # commons-compress and this entry is its first CI exercise.
+  - name: shrp-3.1-starlte
+    family: SHRP
+    device: starlte
+    arch: arm64
+    generation: "12.1"
+    tier: nightly
+    url: https://sourceforge.net/projects/shrp/files/starlte/SHRP_v3.1_stable-Official_starlte-1675556822.img/download
+    referer: ""
+    md5: d15161709e4b5f9849b9589f9427300a
+    sha256: 1b4d7b71a6535579646f4335b8cf735516ec1f02ec5d3749fa8f96ca827500c0
+    notes: >-
+      SkyHawk Recovery v3.1 stable (Feb 2023 build; direct .img, 42MB,
+      LZMA ramdisk, 5391 files, header v1). Samsung Galaxy S9
+      (Exynos 9810) — the SAME device as twrp-3.7.0_9-0-starlte, so a
+      clean SHRP-vs-TWRP family A/B on known hardware. Static init +
+      dynamic /sbin/linker64 userland (sbin/{twrp,sh,busybox,recovery}
+      all dynamic against /sbin/linker64).
+
   # ── future expansions (URLs verified as CI proves them) ──
-  # SHRP / SkyHawk:  sourceforge.net/projects/shrp-project (SF unreachable from the dev box — verify from the CI runner)
-  # PitchBlack:      sourceforge.net/projects/pitchblack-twrp (same)
   # AOSP recovery:   built from source or extracted from factory images
   # OEM/stock:       factory images (angler N6P: developers.google.com)
 
