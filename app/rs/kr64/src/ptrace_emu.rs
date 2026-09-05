@@ -19722,7 +19722,17 @@ pub fn run_ptrace_loop(
                                         *hits = hits.saturating_add(1);
                                         *hits
                                     };
-                                    if z296_occ <= 24 {
+                                    // 6-Z297: the gate rises 24 -> 64. Run
+                                    // 33950490970 exhausted the old cap on
+                                    // LEAK-THROUGH taps (the harness's own
+                                    // app-phase uiautomator taps ride the
+                                    // bridge while recovery is already up)
+                                    // BEFORE the probe's real taps ran. The
+                                    // heavy dumps below stay capped at 24
+                                    // (identical shapes dedup anyway); only
+                                    // the per-hit state line rides the
+                                    // raised gate.
+                                    if z296_occ <= 64 {
                                         let z296_sp = get_syscall_arg(&regs, abi.reg_sp);
                                         let z296_pc = get_syscall_arg(&regs, 32);
                                         let z296_lr = get_syscall_arg(&regs, 30);
@@ -19754,7 +19764,7 @@ pub fn run_ptrace_loop(
                                         // burn the cap before the probe window).
                                         let z296_hdr =
                                             (z296_sp, z296_pc, z296_lr, z296_fp, z296_fd);
-                                        if z296_seen_headers.insert(z296_hdr) {
+                                        if z296_occ <= 24 && z296_seen_headers.insert(z296_hdr) {
                                             let z296_comm = std::fs::read_to_string(format!(
                                                 "/proc/{}/comm",
                                                 pid
@@ -19902,7 +19912,8 @@ pub fn run_ptrace_loop(
                                                             if z296_vp > 0x1000 {
                                                                 let z296_vslots = [
                                                                     0x50u64, 0x58, 0xc8, 0xd0,
-                                                                    0x110,
+                                                                    0x110, 0x80, 0x150, 0x158,
+                                                                    0x1d8, 0x1e0,
                                                                 ];
                                                                 let mut z296_vs: Vec<String> =
                                                                     Vec::new();
@@ -19927,7 +19938,7 @@ pub fn run_ptrace_loop(
                                                                     }
                                                                 }
                                                                 log(&format!(
-                                                                    "6-Z296 vtable@{:#x} (slots 0x50/58/c8/d0/110): {}",
+                                                                    "6-Z296 vtable@{:#x} (slots 0x50/58/c8/d0/110/80/150/158/1d8/1e0): {}",
                                                                     z296_vp,
                                                                     z296_vs.join(" ")
                                                                 ));
@@ -19961,11 +19972,29 @@ pub fn run_ptrace_loop(
                                                         ("touch_latch", 0x1000),
                                                         ("touch_x", 0x1004),
                                                         ("touch_y", 0x1008),
+                                                        // 6-Z297: OnTouchRelease's
+                                                        // TAP gate is last_x==start_x
+                                                        // && last_y==start_y (else the
+                                                        // release is treated as a swipe
+                                                        // and DROPPED). Dump the quad.
+                                                        ("start_x", 0x100c),
+                                                        ("start_y", 0x1010),
+                                                        ("last_x", 0x1014),
+                                                        ("last_y", 0x1018),
                                                         ("absx_max", 0x101c),
                                                         ("absy_max", 0x1020),
                                                         ("absx_min", 0x1024),
                                                         ("absy_min", 0x1028),
                                                         ("ss_state", 0x105c),
+                                                        // 6-Z297: OnTouchRelease's FIRST
+                                                        // gate — [rui+0x1048] == 1
+                                                        // (/proc/cmdline contains
+                                                        // "bootreason=recovery_ui")
+                                                        // turns a tap into
+                                                        // ShowText(true) when the text
+                                                        // view is not visible: the tap
+                                                        // NEVER reaches the menu queue.
+                                                        ("gate1048", 0x1048),
                                                     ] {
                                                         match read_child_u32(
                                                             pid,
@@ -19998,6 +20027,39 @@ pub fn run_ptrace_loop(
                                                         read_child_u32(pid, z296_base + 0x5d188);
                                                     let z296_class =
                                                         read_child_u32(pid, z296_rui + 0x40);
+                                                    // 6-Z297: SelectMenu(Point)'s
+                                                    // coordinate mapping + hit-test
+                                                    // globals (all librecovery_ui
+                                                    // .bss). rot: the touch-rotation
+                                                    // stage SelectMenu applies BEFORE
+                                                    // the hit-test (0..=3 — a nonzero
+                                                    // stage remaps tap coords!);
+                                                    // menu_left/width/top/height: the
+                                                    // row hit-test rectangle; yoff and
+                                                    // scroll: menu origin + first
+                                                    // visible item.
+                                                    let mut z296_g: Vec<String> = Vec::new();
+                                                    for (z296_gn, z296_go) in [
+                                                        ("rot", 0x5dcf0u64),
+                                                        ("menu_left", 0x5d168),
+                                                        ("menu_w", 0x5d138),
+                                                        ("menu_top", 0x5d178),
+                                                        ("menu_h", 0x5d148),
+                                                        ("menu_yoff", 0x5dccc),
+                                                        ("menu_scroll", 0x5dcd0),
+                                                    ] {
+                                                        match read_child_u32(
+                                                            pid,
+                                                            z296_base + z296_go,
+                                                        ) {
+                                                            Some(z296_v) => z296_g.push(format!(
+                                                                "{}={}",
+                                                                z296_gn, z296_v
+                                                            )),
+                                                            None => z296_g
+                                                                .push(format!("{}=<gap>", z296_gn)),
+                                                        }
+                                                    }
                                                     let mut z296_rec = String::from("<none>");
                                                     if let Some(&(_, z296_buf)) =
                                                         z296_read_bufs.get(&pid)
@@ -20033,10 +20095,11 @@ pub fn run_ptrace_loop(
                                                         }
                                                     }
                                                     log(&format!(
-                                                        "6-Z296 hit#{} state rui@{:#x}: {} abs_init={:?} class40={:?} record: {}",
+                                                        "6-Z296 hit#{} state rui@{:#x}: {} {} abs_init={:?} class40={:?} record: {}",
                                                         z296_occ,
                                                         z296_rui,
                                                         z296_st.join(" "),
+                                                        z296_g.join(" "),
                                                         z296_qflag,
                                                         z296_class,
                                                         z296_rec
