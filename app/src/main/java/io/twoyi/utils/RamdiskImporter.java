@@ -621,7 +621,9 @@ public class RamdiskImporter {
     /**
      * Extract a TAR archive using pure Java (Apache Commons Compress TarArchiveInputStream).
      */
-    private static boolean extractTarJava(File tarFile, File targetDir) throws IOException {
+    // 6-Z305: package-private (was private) — the host-side unit tests
+    // exercise the tar importer directly (same pattern as importBootImage).
+    static boolean extractTarJava(File tarFile, File targetDir) throws IOException {
         try (org.apache.commons.compress.archivers.tar.TarArchiveInputStream tais =
                  new org.apache.commons.compress.archivers.tar.TarArchiveInputStream(
                      new FileInputStream(tarFile))) {
@@ -635,6 +637,57 @@ public class RamdiskImporter {
                 if (entry.isDirectory()) {
                     dest.mkdirs();
                     count++;
+                } else if (entry.isSymbolicLink()) {
+                    // 6-Z305: symlink entries. The old code fell into the
+                    // regular-file arm where TarArchiveInputStream returns
+                    // ZERO data bytes for a symlink → every symlink became
+                    // an EMPTY REGULAR FILE. The Android 8.1 rootfs (and
+                    // every GSI rootfs) ships hundreds of symlinks
+                    // (system/bin/sh, system/lib64/... → linker, /etc →
+                    // /system/etc, ...) — a tar import silently produced a
+                    // corrupt rootfs. Write the SAME `.symlink` sidecar file
+                    // (containing the raw link target) the cpio importer
+                    // has always used; kr64's symlinks.rs materializes the
+                    // sidecars into real symlinks at boot. This is a
+                    // structural convention fix — no ROM special-casing.
+                    File linkFile = new File(dest.getPath() + ".symlink");
+                    linkFile.getParentFile().mkdirs();
+                    try (FileOutputStream fos = new FileOutputStream(linkFile)) {
+                        byte[] target = entry.getLinkName().getBytes(
+                                java.nio.charset.StandardCharsets.UTF_8);
+                        fos.write(target);
+                    }
+                    count++;
+                } else if (entry.isLink()) {
+                    // 6-Z305: hardlink entries (tar typeflag '1'). No data
+                    // follows the header; resolve the source path the same
+                    // way the kernel extractor would (relative to the
+                    // extraction root) and copy the already-extracted
+                    // content. A missing/unextracted source keeps the old
+                    // empty-file behavior but LOGS it — the post-import
+                    // verifyCriticalPayload scan catches anything critical.
+                    String linkName = entry.getLinkName();
+                    File source = linkName != null
+                            ? safeTargetFile(targetDir, linkName) : null;
+                    if (source != null && source.isFile() && source.length() > 0) {
+                        dest.getParentFile().mkdirs();
+                        Files.copy(source.toPath(), dest.toPath(),
+                                StandardCopyOption.REPLACE_EXISTING);
+                        int mode = entry.getMode();
+                        if ((mode & 0100) != 0) {
+                            dest.setExecutable(true, false);
+                        }
+                        count++;
+                    } else {
+                        Log.w(TAG, "tar hardlink entry '" + entry.getName()
+                                + "' -> '" + linkName + "': source not extracted;"
+                                + " writing empty file");
+                        dest.getParentFile().mkdirs();
+                        if (!dest.createNewFile() && !dest.exists()) {
+                            throw new IOException("cannot create " + dest);
+                        }
+                        count++;
+                    }
                 } else {
                     File f = dest;
                     f.getParentFile().mkdirs();
