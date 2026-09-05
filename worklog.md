@@ -24510,3 +24510,53 @@ Stage Summary:
   (the app owns the wire format now; the guest's read path is format-agnostic). Verification wave in flight on bc4c345:
   lineage-22.2-sailfish (expect interactive=true), R12 + TWRP regression guards. Open follow-ups: why read@LIBC skipped the
   interposer (tracer-level GOT probe if ever needed); fox IVibrator host-bridge coverage; lineage header battery (power_supply).
+
+---
+Task ID: 6-Z293/294 — loader-path touch: transport SOLVED and proven; guest keyboard-device wiring localized as the last blocker
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: continue from ad97567 — decode the instrumented probe runs, fix the touch chain.
+
+Work Log:
+- TRANSPORT ROOT CAUSE (6-Z293, bc4c345+506dd43): the app wrote raw 20-byte TouchMessage records over the abstract bridge and the
+  fb hook's read() interposer was supposed to decode them — it never fired on ANY loader-path image (zero "INPUT read" logs in
+  33919636462..33924122082 + the R12 run). Lineage's minui ev_get_input demands EXACTLY sizeof(input_event)=24 per read. FIX: the
+  app now encodes final evdev records behind a negotiated hello ([0xA5,'T','W','I',ev_size]; 24 aarch64 / 16 arm32); the hook marks
+  the slot raw (read/poll pass through, ioctl faking stays). PROVEN in run 82e2ecb: "INPUT raw read(fd=10, count=24) -> 24" across
+  the whole run (first-16 + every-64th logging), input thread healthy in epoll_wait.
+- 6-Z293c (3ce3e03): synthetic KEY records through the bridge (KEY_DOWN/KEY_UP actions; send_key_code dual-write; receiver
+  action=key; probe key ladder) — the transport-vs-UI discriminator.
+- 6-Z293d (ad3d1c6): observability — periodic raw-read log, post-probe logcat persisted (menu-probe-final-logcat.txt; the artifact
+  logcat had been dumped BEFORE the probe), effect-check accepts "INPUT raw read".
+- KEYBOARD CLASSIFIER ROOT CAUSE (6-Z294, 894d841): disassembled librecovery_ui.so ev_init (0x36524) + its device classifier
+  (0x36a90): class is picked SOLELY from EVIOCGID's input_id.bustype (byte0 & 0x22 → touch; BUS_I2C 0x18 needs the allow flag; a
+  ZEROED id → keyboard). Our memset-0 EVIOCGID classified BOTH bridge fds as keyboards; the keyboard path drops records whose
+  codes are absent from the device's EVIOCGBIT(EV_KEY) — we faked only BTN_TOUCH. FIX: two-device topology mirroring real phones —
+  hello v2 carries the class; event1 = gpio-keys mirror (EVIOCGID BUS_HOST 0x19; EVIOCGBIT(EV_KEY) = exactly
+  VOLUMEUP(114)/VOLUMEDOWN(115)/POWER(116); no ABS); event0 = BUS_I2C(0x18) touchscreen. App: per-class registration at
+  negotiation time (INPUT_SENDER = touch, KEY_BRIDGE_SENDER = keys); send_key_code → KEY_BRIDGE_SENDER; detach on death.
+- 6-Z294a (3324339): Sender::same_channel → generation-tagged registrations (CI toolchain predates same_channel).
+- 6-Z294b (0a2b766) TWRP REGRESSION FIXED: raw mode exposed EOF to the guest (legacy inbr_drain swallowed it behind -EAGAIN); the
+  single-consumer replacement closed the older touch connection and TWRP's reader BUSY-SPUN on read()->0 (thousands of
+  "INPUT raw read(fd=6) -> 0"), starving init → property_area BOOT_FAIL. RULE: the app NEVER closes an accepted bridge connection —
+  replaced/dead workers park holding the fd. TWRP back to UI_READY.
+- 6-Z294c (da3c9ed): three-key ladder (VOLUMEDOWN/VOLUMEUP/POWER). RESULT: keys delivered to the receiver and queued to the keys
+  device, but the guest NEVER read fd 9 in this run (while v294c DID read it at +131s with ret=24 — same binary!). Nondeterministic.
+
+REMAINING BLOCKER (next round, precisely localized):
+- ev_init's keyboard branch (0x36820-0x36868) CLOSES keyboard-classified fds WITHOUT epoll_ctl(ADD) — only touch-class devices
+  enter the epoll; the key MAP is built from their EVIOCGBIT(EV_KEY) at classification time. v294c vs v294e fd-9-read
+  nondeterminism points at a race/conditional in that close path (x28 global FILE* at 0x36570).
+- ev_get_input (0x37594) is called only INDIRECTLY (self-import PLT stub 0x58b30, zero BL callers — the caller takes its address
+  as data or it is inlined somewhere not yet found; read@plt callers 0x375c0/0x3d39c/0x3f2b4/0x45fb0 — 0x3d39c is a DIFFERENT
+  custom-format reader, type@0+size@4, NOT our path).
+- Next experiments queued: (1) route KEY records to the TOUCH device too (touch fd IS epoll-registered; if the callback's
+  type-switch handles EV_KEY, keys work without the keys device); (2) decode the keyboard-branch close condition (x28) and the
+  ev_get_input indirect caller; (3) consider advertising the keys device as BUS_I2C-classified-touch with key bits so it enters
+  the epoll.
+
+Stage Summary:
+- HEAD da3c9ed. Corpus: TWRP UI_READY ✓ (regression fixed), R12 UI_READY ✓ (guard held all round), lineage BOOT_OK/SPLASH_HANG —
+  no worse than round start, with the transport layer now provably byte-perfect end to end. Touch on the loader path moved from
+  "silently dead at 4 layers" to "records delivered + parsed; guest keyboard-device wiring is the last inert layer". All commits
+  pushed; cron webDevReview (job 359061, fixed_rate 3600s, priority 15) continues from repo state.
