@@ -21253,20 +21253,24 @@ pub fn run_ptrace_loop(
                             if buf != 0 {
                                 if let Some(bytes) = read_child_bytes(pid, buf, ret as usize) {
                                     let target = String::from_utf8_lossy(&bytes).into_owned();
-                                    // ── 6-Z305c: the DECISION POINT trace ──
-                                    // For rootfs-prefixed raw results the
-                                    // class-2 rewrite MUST fire (bionic
-                                    // realpath's next stat(dst) ENOENTs on
-                                    // the unrewritten host path — run
-                                    // 33989721659's evidence). Log the raw
-                                    // target + verdict directly.
+                                    // ── 6-Z305c: the DECISION POINT trace v3 ──
+                                    // The 62-byte results never matched the
+                                    // rootfs prefix — log REQUEST + RESULT for
+                                    // every /proc/self/fd|cwd readlink that
+                                    // reaches this arm (the request string
+                                    // comes from the ENTRY stash pointer; the
+                                    // result from the buffer), with the class-2
+                                    // verdict (cap 60).
                                     let z305c_guest = guest_readlink_target(
                                         &target,
                                         rootfs,
                                         data_dir,
                                         staged_exes.as_ref(),
                                     );
-                                    if target.starts_with(rootfs)
+                                    let z305c_req =
+                                        read_child_string(pid, path_addr).unwrap_or_default();
+                                    if (z305c_req.starts_with("/proc/self/fd")
+                                        || z305c_req.starts_with("/proc/self/cwd"))
                                         && Z305C_RL2_DIAG.load(std::sync::atomic::Ordering::Relaxed)
                                             < 60
                                     {
@@ -21274,8 +21278,8 @@ pub fn run_ptrace_loop(
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                             + 1;
                                         log(&format!(
-                                            "6-Z305c realpath-trace: fd-readlink raw={:?} ret={} rewrite={:?} (occurrence {})",
-                                            target, ret, z305c_guest, n,
+                                            "6-Z305c realpath-trace: fd-readlink req={:?} ret={} raw={:?} rewrite={:?} (occurrence {})",
+                                            z305c_req, ret, target, z305c_guest, n,
                                         ));
                                     }
                                     if let Some(guest) = z305c_guest {
