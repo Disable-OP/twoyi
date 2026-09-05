@@ -7041,9 +7041,10 @@ fn forget_dead_pid_state(
     esrch_streak: &mut std::collections::HashMap<libc::pid_t, u32>,
     pending_getpid: &mut std::collections::HashSet<libc::pid_t>,
     pending_uevent_recv: &mut std::collections::HashMap<libc::pid_t, PendingUeventRecv>,
-    // 6-Z296: input-read probe state — a recycled pid must not inherit
+    // 6-Z296: probe state — a recycled pid must not inherit
     // a stale epoll membership (false probe hits) or hit caps.
     z296_epoll_members: &mut std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
+    z296_tgid_cache: &mut std::collections::HashMap<libc::pid_t, libc::pid_t>,
     z296_epoll_add_logged: &mut std::collections::HashMap<libc::pid_t, u32>,
     z296_read_hits: &mut std::collections::HashMap<libc::pid_t, u32>,
     z296_maps_dumped: &mut std::collections::HashSet<libc::pid_t>,
@@ -7069,6 +7070,7 @@ fn forget_dead_pid_state(
     // 6-Z296: probe state must go with the process (a recycled pid
     // inheriting a stale epoll membership would get false probe hits).
     z296_epoll_members.remove(&pid);
+    z296_tgid_cache.remove(&pid);
     z296_epoll_add_logged.remove(&pid);
     z296_read_hits.remove(&pid);
     z296_maps_dumped.remove(&pid);
@@ -8564,6 +8566,34 @@ fn z296_dump_words(
         }
     }
     out
+}
+
+/// 6-Z296: resolve (and cache) a tid's thread-group id for the
+/// tgid-keyed epoll-membership map. minui registers input fds from the
+/// main thread but reads from the InputLoop thread — membership must
+/// match across tids of one process. Falls back to the tid itself when
+/// /proc/<tid>/status is unreadable (group leaders read tgid == tid,
+/// so the fallback is correct for exactly the common single-thread
+/// case; a cache entry short-circuits the file read).
+fn z296_tgid_of(
+    pid: libc::pid_t,
+    cache: &mut std::collections::HashMap<libc::pid_t, libc::pid_t>,
+) -> libc::pid_t {
+    if let Some(t) = cache.get(&pid) {
+        return *t;
+    }
+    let tgid = std::fs::read_to_string(format!("/proc/{}/status", pid))
+        .ok()
+        .and_then(|s| {
+            s.lines().find(|l| l.starts_with("Tgid:")).and_then(|l| {
+                l.split(':')
+                    .nth(1)
+                    .and_then(|v| v.trim().parse::<libc::pid_t>().ok())
+            })
+        })
+        .unwrap_or(pid);
+    cache.insert(pid, tgid);
+    tgid
 }
 
 /// 6-Z231: pure decision core of the fresh-create guarantee — should the
@@ -12091,11 +12121,20 @@ pub fn run_ptrace_loop(
     // ── 6-Z296: input-read CALLER identification probe state ──
     // (rationale + gates live with the runtime arms; per-pid, all
     // cleaned in forget_dead_pid_state — zero behaviour change)
-    // fds this pid epoll_ctl(ADD)'d — the input-reader signature gate.
+    // fds this pid's THREAD GROUP epoll_ctl(ADD)'d — the input-reader
+    // signature gate. KEYED BY TGID: minui's ev_init runs on the main
+    // thread while the reads happen on the InputLoop std::thread — a
+    // per-tid map would never match (evidence run 33943907003: TWRP's
+    // fds 7/8 registered by pid 2641 with pointer payloads, ZERO probe
+    // hits because the reader was another tid).
     let mut z296_epoll_members: std::collections::HashMap<
         libc::pid_t,
         std::collections::HashSet<i64>,
     > = std::collections::HashMap::new();
+    // tid → tgid cache for the membership keying (one /proc read per
+    // new tid; the tracer's children are long-lived threads).
+    let mut z296_tgid_cache: std::collections::HashMap<libc::pid_t, libc::pid_t> =
+        std::collections::HashMap::new();
     // per-pid logged epoll_ctl ADD count (cap 24 — recoveries add ~2-6).
     let mut z296_epoll_add_logged: std::collections::HashMap<libc::pid_t, u32> =
         std::collections::HashMap::new();
@@ -13121,6 +13160,7 @@ pub fn run_ptrace_loop(
                 &mut pending_getpid,
                 &mut pending_uevent_recv,
                 &mut z296_epoll_members,
+                &mut z296_tgid_cache,
                 &mut z296_epoll_add_logged,
                 &mut z296_read_hits,
                 &mut z296_maps_dumped,
@@ -13313,6 +13353,7 @@ pub fn run_ptrace_loop(
                 &mut pending_getpid,
                 &mut pending_uevent_recv,
                 &mut z296_epoll_members,
+                &mut z296_tgid_cache,
                 &mut z296_epoll_add_logged,
                 &mut z296_read_hits,
                 &mut z296_maps_dumped,
@@ -16051,14 +16092,16 @@ pub fn run_ptrace_loop(
                                         None
                                     };
                                     if op == 1 {
-                                        z296_epoll_members.entry(pid).or_default().insert(add_fd);
+                                        let tgid = z296_tgid_of(pid, &mut z296_tgid_cache);
+                                        z296_epoll_members.entry(tgid).or_default().insert(add_fd);
                                     }
                                     let logged = z296_epoll_add_logged.entry(pid).or_insert(0);
                                     *logged = logged.saturating_add(1);
                                     if *logged <= 24 {
+                                        let tgid = z296_tgid_of(pid, &mut z296_tgid_cache);
                                         log(&format!(
-                                            "6-Z296 epoll_ctl {} pid={} epfd={} fd={} events={:?} data={:?}",
-                                            op_name, pid, epfd, add_fd, events, data
+                                            "6-Z296 epoll_ctl {} pid={} tgid={} epfd={} fd={} events={:?} data={:?}",
+                                            op_name, pid, tgid, epfd, add_fd, events, data
                                         ));
                                         // fd identity, once per (pid, fd) — names
                                         // which /dev/input/eventN each registration
@@ -16073,12 +16116,13 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                                 3 => {
-                                    if let Some(set) = z296_epoll_members.get_mut(&pid) {
+                                    let tgid = z296_tgid_of(pid, &mut z296_tgid_cache);
+                                    if let Some(set) = z296_epoll_members.get_mut(&tgid) {
                                         set.remove(&add_fd);
                                     }
                                     log(&format!(
-                                        "6-Z296 epoll_ctl DEL pid={} epfd={} fd={}",
-                                        pid, epfd, add_fd
+                                        "6-Z296 epoll_ctl DEL pid={} tgid={} epfd={} fd={}",
+                                        pid, tgid, epfd, add_fd
                                     ));
                                 }
                                 _ => {}
@@ -19624,9 +19668,10 @@ pub fn run_ptrace_loop(
                         let z296_ev_sz: i64 = if z296_is_arm32 { 16 } else { 24 };
                         if z296_ret == z296_ev_sz {
                             if let Some(&(z296_nr, z296_fd)) = pending_entry_fd.get(&pid) {
+                                let z296_tgid = z296_tgid_of(pid, &mut z296_tgid_cache);
                                 if z296_nr == abi.read
                                     && z296_epoll_members
-                                        .get(&pid)
+                                        .get(&z296_tgid)
                                         .map(|set| set.contains(&z296_fd))
                                         .unwrap_or(false)
                                 {
@@ -31781,6 +31826,8 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             libc::pid_t,
             std::collections::HashSet<i64>,
         > = std::collections::HashMap::new();
+        let mut z296_tgid_cache: std::collections::HashMap<libc::pid_t, libc::pid_t> =
+            std::collections::HashMap::new();
         let mut z296_epoll_add_logged: std::collections::HashMap<libc::pid_t, u32> =
             std::collections::HashMap::new();
         let mut z296_read_hits: std::collections::HashMap<libc::pid_t, u32> =
@@ -31811,6 +31858,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         fake_netlink_fds.entry(pid).or_default().insert(0x6b00_0000);
         netlink_fd_next.insert(pid, 0x6b00_0001);
         z296_epoll_members.entry(pid).or_default().insert(9);
+        z296_tgid_cache.insert(pid, pid);
         z296_epoll_add_logged.insert(pid, 1);
         z296_read_hits.insert(pid, 3);
         z296_maps_dumped.insert(pid);
@@ -31838,6 +31886,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             &mut pending_getpid,
             &mut pending_uevent_recv,
             &mut z296_epoll_members,
+            &mut z296_tgid_cache,
             &mut z296_epoll_add_logged,
             &mut z296_read_hits,
             &mut z296_maps_dumped,
@@ -31858,6 +31907,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!esrch_streak.contains_key(&pid));
         // 6-Z296: probe state is part of the death-hygiene contract.
         assert!(!z296_epoll_members.contains_key(&pid));
+        assert!(!z296_tgid_cache.contains_key(&pid));
         assert!(!z296_epoll_add_logged.contains_key(&pid));
         assert!(!z296_read_hits.contains_key(&pid));
         assert!(!z296_maps_dumped.contains(&pid));
@@ -33248,5 +33298,20 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             gaps,
             vec!["+0x0:<gap>".to_string(), "+0x8:<gap>".to_string()]
         );
+    }
+
+    #[test]
+    fn z296_tgid_of_locks_the_cache_and_fallback_contract() {
+        let mut cache: std::collections::HashMap<libc::pid_t, libc::pid_t> =
+            std::collections::HashMap::new();
+        // Cache hit: the entry short-circuits any /proc read (pid 4242
+        // does not exist on the test host — the returned value proves
+        // the cache path).
+        cache.insert(4242, 7);
+        assert_eq!(z296_tgid_of(4242, &mut cache), 7);
+        // Fallback: an unreadable /proc/<pid>/status yields the tid
+        // itself (correct for group leaders) and the result is cached.
+        assert_eq!(z296_tgid_of(4243, &mut cache), 4243);
+        assert_eq!(cache.get(&4243), Some(&4243));
     }
 }
