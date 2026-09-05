@@ -2253,7 +2253,12 @@ static int input_ioctl(int fd, unsigned req, void *argp) {
          * phone hardware: the touch device = BUS_I2C (0x18), the keys
          * device = BUS_HOST (0x19, gpio-keys). */
         unsigned short *id = (unsigned short *)argp;
-        id[0] = is_keys ? 0x19u /*BUS_HOST*/ : 0x18u /*BUS_I2C*/;
+        /* 6-Z295a: bustype 0x22 sets BOTH unconditional-touch bits of
+         * the classifier's mask (byte0 & 0x22 -> touch) so the touch
+         * device classifies correctly EVEN IF RecoveryUI passes the
+         * allow-flag as false (BUS_I2C 0x18 only classifies as touch
+         * when the flag is set — disassembled 0x36c78: tbz w19,#0). */
+        id[0] = is_keys ? 0x19u /*BUS_HOST*/ : 0x22u /*unconditional-touch*/;
         id[1] = 0x1234u;                         /* product */
         id[2] = 0x5678u;                         /* vendor */
         id[3] = 0x0100u;                         /* version */
