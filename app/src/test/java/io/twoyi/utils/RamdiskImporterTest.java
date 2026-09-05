@@ -7,6 +7,7 @@
 package io.twoyi.utils;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -210,5 +211,143 @@ public class RamdiskImporterTest {
             assertNotNull(expected.getMessage());
             assertTrue(expected.getMessage().contains("out of bounds"));
         }
+    }
+
+    // ── 6-Z305: TAR symlink + hardlink fidelity ─────────────────────
+    //
+    // The full-Android rootfs packages (the 8.1 twoyi rootfs today, GSIs
+    // later) ship as TAR/tar.gz with hundreds of symlinks
+    // (system/bin/sh → mksh, system/lib64/*.so → linker, etc.). The old
+    // tar importer had NO symlink arm — every symlink landed as an EMPTY
+    // REGULAR FILE, silently corrupting the rootfs (boot failure at the
+    // guest linker, not at import). These tests pin the .symlink-sidecar
+    // convention the cpio importer has always used.
+
+    /** Write one tar entry (any type) into the stream with 0644/0755 modes. */
+    private static void tarEntry(org.apache.commons.compress.archivers.tar.TarArchiveOutputStream out,
+                                 String name, byte typeFlag, byte[] data, String linkName,
+                                 boolean executable) throws Exception {
+        org.apache.commons.compress.archivers.tar.TarArchiveEntry e =
+                new org.apache.commons.compress.archivers.tar.TarArchiveEntry(name, typeFlag);
+        e.setMode(executable ? 0755 : 0644);
+        if (linkName != null) {
+            e.setLinkName(linkName);
+        }
+        out.putArchiveEntry(e);
+        if (data != null && data.length > 0) {
+            out.write(data);
+        }
+        out.closeArchiveEntry();
+    }
+
+    @Test
+    public void tarImport_symlinks_become_sidecar_files() throws Exception {
+        File tar = tmp.newFile("rootfs.tar");
+        try (org.apache.commons.compress.archivers.tar.TarArchiveOutputStream out =
+                     new org.apache.commons.compress.archivers.tar.TarArchiveOutputStream(
+                             new java.io.FileOutputStream(tar))) {
+            out.setLongFileMode(org.apache.commons.compress.archivers.tar.TarArchiveOutputStream.LONGFILE_POSIX);
+            // regular file
+            tarEntry(out, "init", org.apache.commons.compress.archivers.tar.TarConstants.LF_NORMAL,
+                    "static-init-elf".getBytes(StandardCharsets.UTF_8), null, true);
+            // symlink: the classic Android shell link
+            tarEntry(out, "system/bin/sh", org.apache.commons.compress.archivers.tar.TarConstants.LF_SYMLINK,
+                    null, "/system/bin/mksh", true);
+            // symlink: /etc → /system/etc (absolute, rootfs-style)
+            tarEntry(out, "etc", org.apache.commons.compress.archivers.tar.TarConstants.LF_SYMLINK,
+                    null, "/system/etc", false);
+            out.finish();
+        }
+
+        File staging = tmp.newFolder("tarsym");
+        boolean ok = RamdiskImporter.extractTarJava(tar, staging);
+        assertTrue("tar import must succeed", ok);
+
+        // the regular file extracted with its content
+        assertEquals("static-init-elf",
+                new String(Files.readAllBytes(new File(staging, "init").toPath()),
+                        StandardCharsets.UTF_8));
+
+        // the symlinks became .symlink sidecars (cpio-convention), NOT
+        // empty regular files at the link path
+        File shSidecar = new File(staging, "system/bin/sh.symlink");
+        assertTrue("system/bin/sh must materialize as a .symlink sidecar", shSidecar.isFile());
+        assertEquals("/system/bin/mksh",
+                new String(Files.readAllBytes(shSidecar.toPath()), StandardCharsets.UTF_8).trim());
+
+        File etcSidecar = new File(staging, "etc.symlink");
+        assertTrue("etc must materialize as a .symlink sidecar", etcSidecar.isFile());
+        assertEquals("/system/etc",
+                new String(Files.readAllBytes(etcSidecar.toPath()), StandardCharsets.UTF_8).trim());
+    }
+
+    @Test
+    public void tarImport_hardlinks_materialize_from_source() throws Exception {
+        File tar = tmp.newFile("hardlinks.tar");
+        byte[] payload = "libc-real-bytes".getBytes(StandardCharsets.UTF_8);
+        try (org.apache.commons.compress.archivers.tar.TarArchiveOutputStream out =
+                     new org.apache.commons.compress.archivers.tar.TarArchiveOutputStream(
+                             new java.io.FileOutputStream(tar))) {
+            out.setLongFileMode(org.apache.commons.compress.archivers.tar.TarArchiveOutputStream.LONGFILE_POSIX);
+            tarEntry(out, "system/lib64/libc.so",
+                    org.apache.commons.compress.archivers.tar.TarConstants.LF_NORMAL,
+                    payload, null, false);
+            // hardlink: system/bin/linker64 shares libc.so's payload
+            tarEntry(out, "system/bin/linker64",
+                    org.apache.commons.compress.archivers.tar.TarConstants.LF_LINK,
+                    null, "system/lib64/libc.so", true);
+            out.finish();
+        }
+
+        File staging = tmp.newFolder("tarlink");
+        boolean ok = RamdiskImporter.extractTarJava(tar, staging);
+        assertTrue("tar import must succeed", ok);
+
+        File link = new File(staging, "system/bin/linker64");
+        assertTrue("hardlink target must exist as a real file", link.isFile());
+        assertTrue("hardlink must NOT be an empty file", link.length() > 0);
+        assertEquals("hardlink content must equal the source entry's content",
+                new String(payload, StandardCharsets.UTF_8),
+                new String(Files.readAllBytes(link.toPath()), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    public void tarImport_full_android_rootfs_shape_is_detectable() throws Exception {
+        // The 6-Z305 structural contract end-to-end: a tar with the
+        // full-Android payload shape (static /init + framework.jar +
+        // app_process64, NO recovery binary anywhere) must import into
+        // exactly the layout isFullAndroidLayout() keys on.
+        File tar = tmp.newFile("android-rootfs.tar");
+        try (org.apache.commons.compress.archivers.tar.TarArchiveOutputStream out =
+                     new org.apache.commons.compress.archivers.tar.TarArchiveOutputStream(
+                             new java.io.FileOutputStream(tar))) {
+            out.setLongFileMode(org.apache.commons.compress.archivers.tar.TarArchiveOutputStream.LONGFILE_POSIX);
+            tarEntry(out, "init", org.apache.commons.compress.archivers.tar.TarConstants.LF_NORMAL,
+                    "static-init".getBytes(StandardCharsets.UTF_8), null, true);
+            tarEntry(out, "system/framework/framework.jar",
+                    org.apache.commons.compress.archivers.tar.TarConstants.LF_NORMAL,
+                    "framework-dex".getBytes(StandardCharsets.UTF_8), null, false);
+            tarEntry(out, "system/bin/app_process64",
+                    org.apache.commons.compress.archivers.tar.TarConstants.LF_NORMAL,
+                    "app-process-elf".getBytes(StandardCharsets.UTF_8), null, true);
+            tarEntry(out, "system/bin/sh",
+                    org.apache.commons.compress.archivers.tar.TarConstants.LF_SYMLINK,
+                    null, "/system/bin/mksh", true);
+            out.finish();
+        }
+
+        File staging = tmp.newFolder("tarandroid");
+        assertTrue(RamdiskImporter.extractTarJava(tar, staging));
+
+        // the structural markers the boot-path router needs
+        assertTrue(new File(staging, "init").isFile());
+        assertTrue(new File(staging, "system/framework/framework.jar").isFile());
+        assertTrue(new File(staging, "system/bin/app_process64").isFile());
+        assertTrue(new File(staging, "system/bin/sh.symlink").isFile());
+        assertFalse("no recovery binary may exist",
+                new File(staging, "sbin/recovery").exists()
+                        || new File(staging, "sbin/recovery.symlink").exists()
+                        || new File(staging, "system/bin/recovery").exists()
+                        || new File(staging, "system/bin/recovery.symlink").exists());
     }
 }
