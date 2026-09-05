@@ -20522,9 +20522,9 @@ pub fn run_ptrace_loop(
                                         .get(&pid)
                                         .cloned()
                                         .unwrap_or_default();
-                                    let n =
-                                        Z305C_OPEN_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                            + 1;
+                                    let n = Z305C_OPEN_DIAG
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        + 1;
                                     if n <= 40 {
                                         log(&format!(
                                             "6-Z305c realpath-trace: open orig={:?} translated={:?} -> {} ({}) (occurrence {})",
