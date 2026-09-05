@@ -24589,3 +24589,22 @@ Stage Summary:
   HandleEvents implementations without more objdump archaeology); (2) decode x28/the keyboard-branch close; (3) check whether
   RecoveryUI::Init's ev_init bool arg (w23&1 at 0x36634: and w26, w23, #1) is FALSE — if the allow-flag is false, BUS_I2C
   (0x18) classifies as KEYBOARD even with our fix — try bustype 0x22 (bit5 unconditional-touch) for the touch device.
+
+---
+Task ID: 6-Z295a — bustype 0x22 experiment: not the blocker either
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: rule out the classifier's allow-flag path (BUS_I2C only classifies touch when the flag is set).
+
+Work Log:
+- 7b52870: touch-device EVIOCGID bustype 0x18 → 0x22 (sets BOTH unconditional-touch bits of the classifier mask, byte0 & 0x22).
+- Run 33940911968: probe keys read on fd 10 at +119.4/+120.9 (ret=24), frame_delta=0 — identical outcome. The allow-flag path was
+  not the blocker; the classification per se is working (the fd stays open and is read).
+- R12 guard dispatched on 7b52870 (the input path changed substantially since R12's last green at 506dd43: hello v2, per-class
+  ioctls, park-not-close, both-device key routing).
+
+Stage Summary:
+- The transport + delivery + classification layers are all verified live; the inert layer is definitively the guest's
+  caller-of-ev_get_input → RecoveryUI wiring. NEXT: the kr64 dynamic memory probe (dump the ctx array at 0x5d1f0 + vtable slots +
+  the epoll set at probe time) to identify the real HandleEvents implementations, then either route around or reproduce the
+  missing wiring. Corpus: TWRP UI_READY ✓, R12 (guard in flight), lineage BOOT_OK/SPLASH_HANG.
