@@ -1583,6 +1583,17 @@ struct ServiceEntry {
     ptr: u64,
     cookie: u64,
     virtual_kind: Option<VirtualService>,
+    /// 6-Z299: the virtual service this name BELONGS to when a guest has
+    /// taken it over via addService (native last-wins semantics). While
+    /// the guest owner lives, transactions route to it; if it dies, the
+    /// connection teardown RESTORES the platform (in-proxy) service under
+    /// the same handle instead of unregistering the name. Without this,
+    /// a guest HAL that registers over the virtual name and then crashes
+    /// (fox's vendor.qti.vibrator: same AIDL name, hardware it cannot
+    /// open in the container) would remove the name from the registry
+    /// entirely — every later getService misses and the client-side
+    /// poll storms return.
+    virtual_fallback: Option<VirtualService>,
 }
 
 /// 6-Z276: a `registerForNotifications` watcher — the connection, the
@@ -1769,6 +1780,7 @@ impl BusState {
                     ptr: 0,
                     cookie: 0,
                     virtual_kind: Some(*kind),
+                    virtual_fallback: None,
                 },
             );
             self.by_handle.insert(h, name.to_string());
@@ -1782,20 +1794,19 @@ impl BusState {
     /// Register (or overwrite) a guest-owned service. Returns the handle.
     fn add_guest_service(&mut self, name: &str, owner: ConnId, ptr: u64, cookie: u64) -> u32 {
         if let Some(entry) = self.services.get_mut(name) {
-            // 6-Z298: a guest addService OVER a virtual-service name
-            // takes ownership (native servicemanager "overwrite"
-            // semantics: same name → same handle, new owner). The
-            // in-proxy handler must stop answering transactions for the
-            // name — from now on they are delivered to the guest owner
-            // as BR_TRANSACTION (clearing virtual_kind routes the
-            // dispatch into the guest-delivery path below).
-            if entry.virtual_kind.is_some() {
+            // 6-Z298/6-Z299: a guest addService OVER a virtual-service
+            // name takes ownership (native servicemanager "overwrite"
+            // semantics: same name → same handle, new owner) — but the
+            // platform implementation is remembered so the teardown of
+            // the guest owner can restore it (virtual_fallback). The
+            // in-proxy handler stands down while the guest owner lives.
+            if let Some(kind) = entry.virtual_kind {
                 info!(
-                    "[KR64][binder][svc] guest addService({}) overrides the in-proxy virtual \
-                     implementation — routing now goes to the guest owner (conn={})",
+                    "[KR64][binder][svc] guest addService({}) takes over the in-proxy virtual implementation (conn={}) — restored automatically if the guest owner dies",
                     name, owner
                 );
                 entry.virtual_kind = None;
+                entry.virtual_fallback = Some(kind);
             }
             // Native servicemanager "overwrite" semantics: same name →
             // same handle, new owner.
@@ -1814,6 +1825,7 @@ impl BusState {
                 ptr,
                 cookie,
                 virtual_kind: None,
+                virtual_fallback: None,
             },
         );
         self.by_handle.insert(h, name.to_string());
@@ -1975,7 +1987,7 @@ impl BusState {
         let dead: Vec<(String, u32)> = self
             .services
             .iter()
-            .filter(|(_, e)| e.owner == conn)
+            .filter(|(_, e)| e.owner == conn && e.virtual_fallback.is_none())
             .map(|(n, e)| (n.clone(), e.handle))
             .collect();
         for (name, handle) in &dead {
@@ -1986,6 +1998,44 @@ impl BusState {
                 .iter()
                 .filter_map(|(id, b)| b.death_watch.get(handle).map(|c| (*id, *c)))
                 .collect();
+            for (watcher, cookie) in watchers {
+                if let Some(wb) = self.conns.get_mut(&watcher) {
+                    wb.inbox.push_back(InboxItem::Death(cookie));
+                }
+            }
+        }
+        // 6-Z299: names the dying connection had TAKEN OVER from the
+        // platform restore to the in-proxy virtual implementation under
+        // the same handle — the name never disappears from the registry.
+        // Death notifications for the (guest) node still fire: the
+        // client's reference to the guest binder IS dead; a re-lookup —
+        // or a plain transact on the still-valid handle — lands on the
+        // restored platform service.
+        let restored: Vec<(String, u32)> = self
+            .services
+            .iter()
+            .filter(|(_, e)| e.owner == conn && e.virtual_fallback.is_some())
+            .map(|(n, e)| (n.clone(), e.handle))
+            .collect();
+        for (name, handle) in &restored {
+            let (fb, watchers) = {
+                let entry = self.services.get_mut(name).expect("entry just filtered");
+                let fb = entry.virtual_fallback.take().expect("fallback");
+                entry.owner = PROXY_CONN_ID;
+                entry.ptr = 0;
+                entry.cookie = 0;
+                entry.virtual_kind = Some(fb);
+                let watchers: Vec<(ConnId, u64)> = self
+                    .conns
+                    .iter()
+                    .filter_map(|(id, b)| b.death_watch.get(handle).map(|c| (*id, *c)))
+                    .collect();
+                (fb, watchers)
+            };
+            info!(
+                "[KR64][binder][svc] guest owner of {} died — platform (in-proxy) service restored under handle 0x{:08x} ({:?})",
+                name, handle, fb
+            );
             for (watcher, cookie) in watchers {
                 if let Some(wb) = self.conns.get_mut(&watcher) {
                     wb.inbox.push_back(InboxItem::Death(cookie));
@@ -7528,7 +7578,7 @@ mod tests {
         let mut b = BusState::new();
         let name = "android.hardware.health.IHealth/default";
         let virtual_handle = b.services.get(name).unwrap().handle;
-        let conn = PROXY_CONN_ID + 7;
+        let conn = b.register_conn();
         let h = b.add_guest_service(name, conn, 0xdead, 0x1234);
         assert_eq!(h, virtual_handle, "same name → same handle");
         let entry = b.services.get(name).unwrap();
@@ -7538,5 +7588,68 @@ mod tests {
             entry.virtual_kind, None,
             "the in-proxy handler must stand down"
         );
+        assert_eq!(
+            entry.virtual_fallback,
+            Some(VirtualService::Health),
+            "6-Z299: the platform implementation is remembered for restore"
+        );
+    }
+
+    #[test]
+    fn z299_guest_takeover_restores_virtual_service_on_owner_death() {
+        // THE fox scenario: vendor.qti.vibrator (a real guest HAL binary,
+        // same AIDL name android.hardware.vibrator.IVibrator/default)
+        // registers over the platform service and later dies because its
+        // hardware doesn't exist in the container. The name must KEEP
+        // resolving (restored in-proxy service) — never vanish.
+        let mut b = BusState::new();
+        let name = "android.hardware.vibrator.IVibrator/default";
+        let virtual_handle = b.services.get(name).unwrap().handle;
+
+        let hal = b.register_conn();
+        let h = b.add_guest_service(name, hal, 0xbeef, 42);
+        assert_eq!(h, virtual_handle, "takeover keeps the handle");
+
+        // A client requested death notification on the (now guest) node.
+        let client = b.register_conn();
+        b.conns
+            .get_mut(&client)
+            .unwrap()
+            .death_watch
+            .insert(h, 0x7777);
+
+        // The guest HAL dies → the platform service is restored under the
+        // same handle, and the death notification still fires (the client's
+        // reference to the GUEST node is dead — honest kernel semantics).
+        b.unregister_conn(hal);
+        let entry = b.services.get(name).expect("name must keep resolving");
+        assert_eq!(entry.owner, PROXY_CONN_ID, "back to the platform");
+        assert_eq!(
+            entry.virtual_kind,
+            Some(VirtualService::Vibrator),
+            "the in-proxy handler answers again"
+        );
+        assert_eq!(entry.virtual_fallback, None, "restore consumed");
+        assert!(
+            b.by_handle.contains_key(&virtual_handle),
+            "handle mapping survives the restore"
+        );
+        match b.conns.get(&client).unwrap().inbox.front() {
+            Some(InboxItem::Death(cookie)) => {
+                assert_eq!(*cookie, 0x7777, "the guest node's death is still notified");
+            }
+            other => panic!("expected death notification, got {:?}", other.is_some()),
+        }
+
+        // And a pure guest service (no virtual origin) is still REMOVED
+        // on its owner's death — the 6-Z299 filter didn't overreach.
+        let other = b.register_conn();
+        let svc_handle = b.add_guest_service("com.some.guest.Svc/other", other, 0x11, 0x22);
+        b.unregister_conn(other);
+        assert!(
+            !b.services.contains_key("com.some.guest.Svc/other"),
+            "pure guest services die with their owner"
+        );
+        assert!(!b.by_handle.contains_key(&svc_handle));
     }
 }
