@@ -21190,7 +21190,7 @@ pub fn run_ptrace_loop(
                                             + 1;
                                         log(&format!(
                                             "6-Z305c realpath-trace: fd-readlink raw={:?} ret={} rewrite={:?} (occurrence {})",
-                                            target, ret, &z305c_guest, n,
+                                            target, ret, z305c_guest, n,
                                         ));
                                     }
                                     if let Some(guest) = z305c_guest {
