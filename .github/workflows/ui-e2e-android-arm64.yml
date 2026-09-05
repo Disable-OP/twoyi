@@ -213,15 +213,33 @@ jobs:
           API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$RELEASE_TAG"
           URL=$(curl -sf -H "Authorization: token $GH_TOKEN" "$API" \
                 | python3 -c "import json,sys,os; d=json.load(sys.stdin); print(next(a['url'] for a in d['assets'] if a['name']==os.environ['ASSET_NAME']))")
-          curl -fL --retry 3 -H "Authorization: token $GH_TOKEN" -o "$ASSET_NAME" "$URL"
+          # Accept: application/octet-stream is REQUIRED on the asset API
+          # URL — without it GitHub returns the asset METADATA JSON
+          # (~1.7KB) and every later step silently corrupts (run
+          # 33986501536 died on KeyError sdk_zip_sha256 from the
+          # metadata-JSON masquerading as the manifest).
+          curl -fL --retry 3 -H "Authorization: token $GH_TOKEN" \
+               -H "Accept: application/octet-stream" -o "$ASSET_NAME" "$URL"
           # provenance gate: fetch the manifest and require the official
           # SDK zip sha256 — refuse to boot an unverified rootfs.
           MAN_URL=$(curl -sf -H "Authorization: token $GH_TOKEN" "$API" \
                 | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(a['url'] for a in d['assets'] if a['name']=='ROOTFS_MANIFEST.json'))")
-          curl -sfL -H "Authorization: token $GH_TOKEN" -o ROOTFS_MANIFEST.json "$MAN_URL"
+          curl -sfL -H "Authorization: token $GH_TOKEN" \
+               -H "Accept: application/octet-stream" -o ROOTFS_MANIFEST.json "$MAN_URL"
           ZSHA=$(python3 -c "import json; print(json.load(open('ROOTFS_MANIFEST.json'))['sdk_zip_sha256'])")
           if [ "$ZSHA" != "$OFFICIAL_SDK_ZIP_SHA256" ]; then
               echo "✗ rootfs provenance mismatch: manifest sdk_zip_sha256=$ZSHA expected=$OFFICIAL_SDK_ZIP_SHA256"
+              exit 1
+          fi
+          # binary sanity gate: must be a real gzip stream of ~494MB
+          MAGIC=$(head -c 2 "$ASSET_NAME" | od -A n -t x1 | tr -d ' ')
+          if [ "$MAGIC" != "1f8b" ]; then
+              echo "✗ downloaded asset is not gzip (magic $MAGIC) — asset download broken"
+              exit 1
+          fi
+          SZ=$(stat -c%s "$ASSET_NAME")
+          if [ "$SZ" -lt 400000000 ]; then
+              echo "✗ rootfs asset too small ($SZ bytes) — truncated download"
               exit 1
           fi
           echo "  ✓ provenance verified: built from OFFICIAL arm64-v8a-30_r02.zip ($ZSHA)"
