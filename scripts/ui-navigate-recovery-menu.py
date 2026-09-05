@@ -283,31 +283,18 @@ def main():
     ladder = [int(H * 0.481), int(H * 0.575), int(H * 0.481)]
     channels_used = []
 
-    # 6-Z293c: KEY discriminator FIRST. The transport is now proven
-    # (run 82e2ecb: "INPUT raw read(fd=10, count=24) -> 24" — ev_get_input
-    # consumed exact records) yet the touch UI never reacted. A synthetic
-    # KEY_VOLUMEUP rides the SAME bridge past the touch state machine:
-    #   - frame moves  -> bridge + callback + key handling all work; the
-    #     problem is RecoveryUI's touch classification/calibration.
-    #   - frame frozen -> the callback/queue path itself drops records.
-    # KEYCODE_VOLUME_UP (Android 24) maps to linux KEY_VOLUMEUP (114).
-    # 6-Z294c: three-key ladder — VOLUMEDOWN (25), VOLUMEUP (24), POWER
-    # (26 Android = 116 linux). Different UI paths: the volume keys move
-    # the menu selection, POWER selects / opens the power menu. Whichever
-    # reacts proves the key path and narrows the inert layer.
-    key_results = []
-    for android_key in (25, 24, 26):
-        r = subprocess.run(
-            nav.ADB + ["shell",
-                       f"am broadcast -a io.twoyi.debug.TOUCH "
-                       f"--es action key --ei key {android_key}"],
-            capture_output=True, text=True, timeout=20)
-        key_results.append((android_key, r.returncode, (r.stdout or "")[:60]))
-        time.sleep(2)
-    probe["key_broadcasts"] = key_results
-    nav.screenshot("menu-00b-after-key")
-    print(TAG, "key discriminator:", key_results)
-
+    # ── 6-Z297 ORDER FIX: TAPS FIRST, KEY LADDER LAST ──
+    # Run 33950490970 (kr64 Z296g wave) proved the key path END-TO-END:
+    # the OLD order fired the 3-key ladder (25=VOLUMEDOWN, 24=VOLUMEUP,
+    # 26=POWER) BEFORE the taps, and on the AOSP menu POWER ACTIVATES
+    # the pre-highlighted row "Reboot system now" — the guest logged
+    # "Rebooting..." at t=113.8 s and every later tap hit a DEAD menu
+    # (frame_delta=0 → false SPLASH_HANG). Meanwhile the old cap-24
+    # kr64 probe was exhausted by app-phase leak-through taps.
+    # New order: taps on the LIVE menu decide `interactive` (a tap on a
+    # non-highlighted row moves the selection = a redraw); the key
+    # ladder runs AFTER the tap verdict as a separate recorded
+    # experiment, POWER (26) dead last because it may reboot the guest.
     for i, y in enumerate(ladder):
         ch = tap_with_effect(cx, y)
         probe["taps"].append([cx, y, ch])
@@ -383,6 +370,27 @@ def main():
     # Verdict policy: events REACHING the guest (channels_used non-empty)
     # is the touch-delivery truth; the frame rise is the menu-redraw
     # truth. Both together = a fully interactive AOSP menu.
+
+    # ── 6-Z297 post-verdict key ladder ──
+    # Runs AFTER `interactive` is decided so a key-driven redraw can
+    # never contaminate the tap verdict. 25=VOLUMEDOWN and 24=VOLUMEUP
+    # move the menu selection (each a redraw — recorded separately);
+    # 26=POWER is dead LAST: on the AOSP menu it ACTIVATES the
+    # highlighted row ("Reboot system now") and the guest reboots —
+    # run 33950490970 proved this path works end-to-end, which is
+    # exactly why it must not precede the taps.
+    key_results = []
+    for android_key in (25, 24, 26):
+        r = subprocess.run(
+            nav.ADB + ["shell",
+                       f"am broadcast -a io.twoyi.debug.TOUCH "
+                       f"--es action key --ei key {android_key}"],
+            capture_output=True, text=True, timeout=20)
+        key_results.append((android_key, r.returncode, (r.stdout or "")[:60]))
+        time.sleep(2)
+    probe["key_broadcasts"] = key_results
+    nav.screenshot("menu-99-after-keys")
+    print(TAG, "key ladder (post-verdict):", key_results)
 
     with open(PROBE_JSON, "w") as f:
         json.dump(probe, f, indent=2)
