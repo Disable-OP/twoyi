@@ -16341,10 +16341,22 @@ pub fn run_ptrace_loop(
                         // socket fchmodat ENOENT killed init. Name the
                         // failing condition (first 12) so the next run
                         // closes the question.
-                        if abi.bind_nr != -1
+                        // 6-Z305d: the bind sun_path rewrite applies to BOTH
+                        // boot paths — recovery (TWRP-era 6-Z163) AND the
+                        // normal Android path: pure-stock init binds
+                        // /dev/socket/property_service itself, and an
+                        // untranslated bind hits the HOST's /dev/socket
+                        // (redroid's own init owns property_service there)
+                        // → EADDRINUSE → InitFatalReboot (run 33996277598:
+                        // 'start_property_service socket creation failed').
+                        // The rewrite is PATH-driven (absolute FS sun_path,
+                        // or the abstract property-service spelling) — the
+                        // sandbox boundary, not a recovery special-case.
+                        let z305d_bind_gate = abi.bind_nr != -1
                             && syscall_num == abi.bind_nr
-                            && !(boot_recovery && abi.socketcall_nr == -1 && scratch_addr != 0)
-                        {
+                            && abi.socketcall_nr == -1
+                            && scratch_addr != 0;
+                        if abi.bind_nr != -1 && syscall_num == abi.bind_nr && !z305d_bind_gate {
                             spin_diag_bind_skip_count = spin_diag_bind_skip_count.saturating_add(1);
                             if spin_diag_bind_skip_count <= 12 {
                                 log(&format!(
@@ -16366,12 +16378,7 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
-                        if boot_recovery
-                            && abi.bind_nr != -1
-                            && syscall_num == abi.bind_nr
-                            && abi.socketcall_nr == -1
-                            && scratch_addr != 0
-                        {
+                        if z305d_bind_gate {
                             let sa_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                             let sa_len = get_syscall_arg(&regs, abi.reg_arg3) as i64;
                             // 6-Z163c: NO silent branches. Run 32992050112
