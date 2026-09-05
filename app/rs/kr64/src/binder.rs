@@ -74,8 +74,14 @@
 //!   vibration), `android.hardware.security.keymint.IKeyMintDevice/default`
 //!   (lets keystore2 obtain its backend and register IKeystoreSecurity —
 //!   kills the ~20 s recovery wait; key ops return honest
-//!   `HARDWARE_TYPE_UNAVAILABLE` errors, no fake crypto), and
-//!   `android.hardware.security.sharedsecret.ISharedSecret/default`.
+//!   `HARDWARE_TYPE_UNAVAILABLE` errors, no fake crypto),
+//!   `android.hardware.security.sharedsecret.ISharedSecret/default`, and
+//!   `android.hardware.health.IHealth/default` (6-Z298: serves the AIDL
+//!   battery chain of AOSP/Lineage recovery ≥ A12 —
+//!   `GetBatteryInfo()`'s isDeclared/waitForService/getCapacity/
+//!   getChargeStatus — with host-honest values from the pinned battery
+//!   sysfs tree, so the IsBatteryOk sideload gate stops falling back to
+//!   the fake "capacity 100, charging" defaults).
 //! * **HIDL-aware servicemanager (6-Z271)** — libhwbinder parcels (no SYST
 //!   header tag) are parsed as `android.hidl.manager.V1_0.IServiceManager`
 //!   get/add; `IBase::PING` is answered for every handle.
