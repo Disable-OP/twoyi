@@ -24560,3 +24560,32 @@ Stage Summary:
   no worse than round start, with the transport layer now provably byte-perfect end to end. Touch on the loader path moved from
   "silently dead at 4 layers" to "records delivered + parsed; guest keyboard-device wiring is the last inert layer". All commits
   pushed; cron webDevReview (job 359061, fixed_rate 3600s, priority 15) continues from repo state.
+
+---
+Task ID: 6-Z295 — keys routed to both bridge devices; UI-side consumption remains the inert layer
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: the v294e run showed the keys device fd NEVER read (keyboard branch closes fds without epoll ADD); make the epoll-registered touch fd carry EV_KEY records too.
+
+Work Log:
+- 6-Z295 (5d74f9e): the touch device's EVIOCGBIT(EV_KEY) now ALSO advertises VOLUMEUP/VOLUMEDOWN/POWER (legal composite evdev
+  device) and send_key_code writes KEY records to BOTH senders (KEY_BRIDGE_SENDER + INPUT_SENDER).
+- Run 33939887649: probe keys (25/24/26) received by the receiver, read on fd 10 (touch, epoll-registered) at +119.5/+121.0 AND
+  once on fd 9 at +128.4 — all ret=24 — and STILL frame_delta=0. The reader (ev_get_input — the ONLY count=0x18 read site in the
+  image) consumes every record; its CALLER drops them.
+- Static search exhausted: ev_get_input has a self-JUMP_SLOT (0x5c9c0) + PLT stub 0x58b30 but ZERO BL callers, no GLOB_DAT
+  (address-taken) loads, no vtable slots (file values + RELATIVE relocs scanned), no &plt-stub materializations — yet it runs
+  (the count=24 signature exists nowhere else; the recovery binary's own __read_chk call sites checked — none use 24 bytes).
+  The call must route through a runtime-computed pointer (stack-stored fn ptr / nested std::function) that objdump-grade
+  scanning cannot follow. ev_init's keyboard branch (0x36820) closes keyboard-class fds WITHOUT epoll_ctl(ADD) — condition on
+  the x28 global FILE* (0x36570) — explaining the v294c-vs-v294e fd-9-read nondeterminism.
+
+Stage Summary:
+- HEAD 5d74f9e + worklog. Corpus: TWRP UI_READY, R12 UI_READY, lineage BOOT_OK (SPLASH_HANG, probe frame_delta=0 — unchanged
+  externally, but the input path is now provably: app frames byte-perfect → bridge → guest read(fd,ev,24)==24 success on the
+  epoll-registered fd. The ONLY remaining inert layer is the guest's caller-of-ev_get_input → RecoveryUI state machine wiring.
+- NEXT ROUND (queued, in priority): (1) dynamic memory probe — have kr64 dump the guest's epoll set + the ctx objects
+  (0x5d1f0 array, 64-byte stride) + vtable slots at probe time (the tracer CAN read guest memory; this identifies the actual
+  HandleEvents implementations without more objdump archaeology); (2) decode x28/the keyboard-branch close; (3) check whether
+  RecoveryUI::Init's ev_init bool arg (w23&1 at 0x36634: and w26, w23, #1) is FALSE — if the allow-flag is false, BUS_I2C
+  (0x18) classifies as KEYBOARD even with our fix — try bustype 0x22 (bit5 unconditional-touch) for the touch device.
