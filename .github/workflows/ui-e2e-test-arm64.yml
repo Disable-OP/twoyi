@@ -678,8 +678,16 @@ jobs:
           # 6-Z181: TWRP's own recovery log (/tmp/recovery.log in the
           # jail's rootfs) + the per-pid socket dir (the 6-Z181 per-pid
           # bind files land here — verifies the EADDRINUSE fix fired).
+          # 6-Z300c: keep BOTH ends — the startup banner ("Starting
+          # TWRP/OrangeFox ... (pid N)") sits at the very head, while a
+          # chatty guest can flood the tail (fox R12's libbinder glog-V
+          # "Can only set known stability, not 0." spam fired ~1.9k times
+          # in run 33963411361 and pushed the banner out of the old
+          # tail-only window → banner regex empty → BOOT_FAIL on a
+          # live, interactive guest). head keeps the boot evidence,
+          # tail keeps the deepest run progress.
           sudo docker exec redroid sh -c \
-            "tail -n 4000 /data/user/0/io.twoyi.debug/rootfs/tmp/recovery.log 2>/dev/null" \
+            "{ head -n 250 /data/user/0/io.twoyi.debug/rootfs/tmp/recovery.log 2>/dev/null; echo '──── 6-Z300c: tail window ────'; tail -n 3750 /data/user/0/io.twoyi.debug/rootfs/tmp/recovery.log 2>/dev/null; }" \
             > /tmp/ui-e2e-artifacts/twrp-recovery-log-dockerexec.log 2>&1 || true
           sudo docker exec redroid sh -c \
             "ls -la /data/user/0/io.twoyi.debug/rootfs/dev/socket/ 2>/dev/null" \

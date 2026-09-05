@@ -351,6 +351,48 @@ z190 = kr.count("6-Z190: coverage watchdog ATTACHED")
 if z190:
     result["markers"]["z190_attached"] = z190
 
+# ── 6-Z300c: flooded-log boot fallback (live-ps corroboration) ───────
+# A chatty guest can push the startup banner out of the recovery.log
+# capture window entirely: fox R12's libbinder glog-V "Can only set
+# known stability, not 0." spam fired once per getService hit — 1853
+# getService(android.hardware.vibrator.IVibrator/default) calls in run
+# 33963411361 — and the old tail-only capture kept 4000 identical spam
+# lines instead of the head where "Starting TWRP/OrangeFox ... (pid N)"
+# lives. The banner regex then finds nothing and a LIVE, interactive
+# guest misclassifies as BOOT_FAIL (the same run showed 13 navigated
+# pages + UI_READY + a recovery pid in ps).
+#
+# Ground truth accepted here: the final process table still contains a
+# live recovery process AND the UI reached UI_READY (pages / probe) —
+# that is honest boot evidence in its own right, independent of any
+# textual banner. The head+tail capture (workflow 6-Z300c) prevents the
+# flood in the first place; this fallback covers already-captured runs
+# and any future flooding source.
+if result["boot"] == "BOOT_FAIL" and result["recovery_instances"] == 0:
+    live_pids = set()
+    for _line in ps.splitlines():
+        _cols = _line.split()
+        if len(_cols) < 2:
+            continue
+        _name = _cols[-1].rstrip(":")
+        if _name in ("recovery", "recovery.bin") or _name.endswith("/recovery"):
+            try:
+                live_pids.add(int(_cols[1]))
+            except ValueError:
+                continue
+    ui_corroborated = (
+        result["ui"] == "UI_READY"
+        or bool(result["markers"].get("pages"))
+        or menu_interactive
+    )
+    if live_pids and ui_corroborated:
+        result["boot"] = "BOOT_OK"
+        result["recovery_instances"] = len(live_pids)
+        _fam = "OrangeFox" if "orangefox" in (rec + kmsg).lower() else "recovery"
+        result["markers"]["family_banner"] = sorted(
+            set(result["markers"].get("family_banner", [])) | {_fam})
+        result["markers"]["boot_evidence"] = "ps_live_recovery_log_flooded"
+
 # ── overall verdict (§27) ────────────────────────────────────────────
 if result["boot"] == "BOOT_OK" and result["ui"] == "UI_READY":
     overall = "UI_READY"
