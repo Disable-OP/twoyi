@@ -1380,6 +1380,22 @@ impl ParcelWriter {
         self.write_i32(0);
     }
 
+    /// Write a native-endian i64 (Parcel's 64-bit integer encoding;
+    /// the writer only ever emits aligned 4-byte blocks so no explicit
+    /// padding is needed before/after).
+    fn write_i64(&mut self, v: i64) {
+        self.data.extend_from_slice(&v.to_ne_bytes());
+    }
+
+    /// Write a `@nullable String` field as NULL — the AIDL wire encoding
+    /// is a single i32 -1 length word (`AParcel_writeNullableString` →
+    /// `AParcel_writeString(nullptr)`; libbinder `writeString16` with a
+    /// null String16 writes -1 too). The reader-side (`readNullableString`)
+    /// sees a negative length and yields std::nullopt/None.
+    fn write_nullable_string16_none(&mut self) {
+        self.write_i32(-1);
+    }
+
     /// The current data buffer length (for offsets bookkeeping / assertions).
     #[allow(dead_code)]
     fn data_len(&self) -> usize {
@@ -1521,6 +1537,20 @@ pub enum VirtualService {
     /// `android.hardware.security.sharedsecret.ISharedSecret/default` —
     /// keystore2's shared-secret negotiation partner.
     SharedSecret,
+    /// `android.hardware.health.IHealth/default` (6-Z298) — serves the
+    /// AIDL battery chain of AOSP/Lineage recovery ≥ A12
+    /// (`GetBatteryInfo()` → `AServiceManager_isDeclared` +
+    /// `waitForService` + `getCapacity`/`getChargeStatus`/`getHealthInfo`,
+    /// verified from android-15.0.0_r1 `recovery_utils/battery_utils.cpp`).
+    /// Without it, recovery's battery gate falls back to the HIDL shim
+    /// and — finding nothing — assumes fake defaults (capacity 100,
+    /// charging=true), so a REAL phone's low-battery sideload gate is
+    /// silently bypassed. Values come from the pinned battery sysfs tree
+    /// (`crate::battery::read_guest_battery_values`) — the SAME tree the
+    /// sysfs-reader class (BatteryMonitor) reads: one source of truth.
+    /// Missing sysfs files translate to the interface's documented
+    /// `EX_UNSUPPORTED_OPERATION`, never fabricated data.
+    Health,
 }
 
 impl VirtualService {
@@ -1533,6 +1563,7 @@ impl VirtualService {
             VirtualService::Vibrator => "android.hardware.vibrator.IVibrator",
             VirtualService::KeyMint => "android.hardware.security.keymint.IKeyMintDevice",
             VirtualService::SharedSecret => "android.hardware.security.sharedsecret.ISharedSecret",
+            VirtualService::Health => "android.hardware.health.IHealth",
         }
     }
 }
@@ -1709,6 +1740,14 @@ impl BusState {
                 "android.hardware.security.sharedsecret.ISharedSecret/default",
                 VirtualService::SharedSecret,
             ),
+            (
+                // 6-Z298: makes AServiceManager_isDeclared("android.
+                // hardware.health.IHealth/default") → true and
+                // waitForService resolve immediately for every AIDL
+                // battery client (lineage recovery's GetBatteryInfo).
+                "android.hardware.health.IHealth/default",
+                VirtualService::Health,
+            ),
         ];
         for (name, kind) in VIRTUALS {
             if self.services.contains_key(*name) {
@@ -1737,6 +1776,21 @@ impl BusState {
     /// Register (or overwrite) a guest-owned service. Returns the handle.
     fn add_guest_service(&mut self, name: &str, owner: ConnId, ptr: u64, cookie: u64) -> u32 {
         if let Some(entry) = self.services.get_mut(name) {
+            // 6-Z298: a guest addService OVER a virtual-service name
+            // takes ownership (native servicemanager "overwrite"
+            // semantics: same name → same handle, new owner). The
+            // in-proxy handler must stop answering transactions for the
+            // name — from now on they are delivered to the guest owner
+            // as BR_TRANSACTION (clearing virtual_kind routes the
+            // dispatch into the guest-delivery path below).
+            if entry.virtual_kind.is_some() {
+                info!(
+                    "[KR64][binder][svc] guest addService({}) overrides the in-proxy virtual \
+                     implementation — routing now goes to the guest owner (conn={})",
+                    name, owner
+                );
+                entry.virtual_kind = None;
+            }
             // Native servicemanager "overwrite" semantics: same name →
             // same handle, new owner.
             entry.owner = owner;
@@ -4138,6 +4192,11 @@ fn virtual_service_transaction(
                 VirtualService::Vibrator => 3, // IVibrator V3 (Android 13)
                 VirtualService::KeyMint => 3,  // IKeyMintDevice V3
                 VirtualService::SharedSecret => 1,
+                // IHealth V4 (Android 15; the V4 additions are
+                // batteryHealthData / getBatteryHealthData — verified
+                // from android-15.0.0_r1 IHealth.aidl; the interface
+                // library ships as android.hardware.health-V4-ndk.so).
+                VirtualService::Health => 4,
             });
             let (data, offsets) = w.into_parts();
             return TransactionResult::Reply { data, offsets };
@@ -4169,7 +4228,204 @@ fn virtual_service_transaction(
         VirtualService::Vibrator => virtual_vibrator(code, &mut reader),
         VirtualService::KeyMint => virtual_keymint(code, &mut reader),
         VirtualService::SharedSecret => virtual_sharedsecret(code, &mut reader),
+        VirtualService::Health => virtual_health(code, &mut reader),
     }
+}
+
+/// `android.hardware.health.IHealth/default` — method codes VERIFIED
+/// against android-15.0.0_r1 `health/aidl/android/hardware/health/
+/// IHealth.aidl` (declaration order, codes from FIRST_CALL_TRANSACTION=1):
+///   1  registerCallback(IHealthInfoCallback) → void
+///   2  unregisterCallback(IHealthInfoCallback) → void
+///   3  update() → void
+///   4  getChargeCounterUah → int (µAh)
+///   5  getCurrentNowMicroamps → int (µA)
+///   6  getCurrentAverageMicroamps → int (µA)
+///   7  getCapacity → int (percent)
+///   8  getEnergyCounterNwh → long (nWh)
+///   9  getChargeStatus → BatteryStatus
+///   10 getStorageInfo → StorageInfo[]
+///   11 getDiskStats → DiskStats[]
+///   12 getHealthInfo → HealthInfo
+///   13 setChargingPolicy(BatteryChargingPolicy) → void
+///   14 getChargingPolicy → BatteryChargingPolicy
+///   15 getBatteryHealthData → BatteryHealthData
+///
+/// Every .aidl comment documents `EX_UNSUPPORTED_OPERATION` as the
+/// response "if the file that stores this property does not exist" —
+/// so a missing sysfs file maps to that exception (honest: a device
+/// without that sensor reports the same). Value reads go through
+/// [`crate::battery::read_guest_battery_values`] — the pinned sysfs
+/// tree the sysfs-reader class sees, host-honest by construction.
+fn virtual_health(code: u32, reader: &mut ParcelReader) -> TransactionResult {
+    // Snapshot once per transaction: the refresh thread may rewrite the
+    // files mid-transaction; a single coherent snapshot is what the
+    // real HAL's own HealthInfo mutex gives clients.
+    virtual_health_with_values(code, reader, &crate::battery::read_guest_battery_values())
+}
+
+/// The full IHealth dispatch, parameterised over the value snapshot so
+/// tests can feed synthetic sysfs states without touching the
+/// process-global battery directory (one shared test process).
+fn virtual_health_with_values(
+    code: u32,
+    _reader: &mut ParcelReader,
+    vals: &crate::battery::GuestBatteryValues,
+) -> TransactionResult {
+    use crate::battery::sysfs_status_to_aidl;
+
+    let int_reply = |v: i32| {
+        let mut w = ParcelWriter::new();
+        w.write_status_ok();
+        w.write_i32(v);
+        let (data, offsets) = w.into_parts();
+        TransactionResult::Reply { data, offsets }
+    };
+
+    match code {
+        // register/unregisterCallback + update() → OK. We never push
+        // health-info change events (no guest health HAL thread polls
+        // sysfs in the proxy yet); recovery's callers re-poll every
+        // IsBatteryOk/battery-header cycle anyway, and lineage's
+        // BattMonitorThreadLoop polls sysfs directly, not via callbacks.
+        1 | 2 | 3 => virtual_error_reply(EX_NONE, 0),
+        4 => match vals.charge_counter_uah {
+            Some(v) => int_reply(v),
+            None => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
+        },
+        5 => match vals.current_now_ua {
+            Some(v) => int_reply(v),
+            None => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
+        },
+        6 => match vals.current_avg_ua {
+            Some(v) => int_reply(v),
+            None => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
+        },
+        // THE method IsBatteryOk gates on (sideload battery check).
+        7 => match vals.capacity_pct {
+            Some(v) => int_reply(v),
+            None => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
+        },
+        8 => {
+            // getEnergyCounterNwh → long. No energy-counter file is
+            // materialised (real drivers rarely expose it) → UNSUPPORTED,
+            // exactly what the .aidl documents.
+            virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0)
+        }
+        // THE method battery_utils.cpp checks FIRST (charging →
+        // `+` in the header, sideload charger threshold).
+        9 => match vals.status_str.as_deref().and_then(sysfs_status_to_aidl) {
+            Some(v) => int_reply(v),
+            None => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
+        },
+        // getStorageInfo / getDiskStats → EMPTY arrays (a recovery
+        // environment has no usable storage statistics; empty is the
+        // honest wire shape: [EX_NONE][i32 0]).
+        10 | 11 => int_reply(0),
+        // getHealthInfo → the full parcelable (field order VERIFIED
+        // against android-15.0.0_r1 HealthInfo.aidl).
+        12 => virtual_health_info(vals),
+        // setChargingPolicy(in value) → OK, accepted and ignored (a
+        // policy change is a power-user knob no recovery exercises;
+        // a real HAL without long-life support returns OK too).
+        13 => virtual_error_reply(EX_NONE, 0),
+        14 => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
+        15 => {
+            // getBatteryHealthData → manufacturing/first-usage dates 0,
+            // state-of-health 0 (documented: "must be 0 if batteryStatus
+            // is UNKNOWN" — we don't know it), serial null, part status
+            // UNSUPPORTED(0). All honest no-knowledge values.
+            let mut w = ParcelWriter::new();
+            w.write_status_ok();
+            w.write_i64(0); // batteryManufacturingDateSeconds
+            w.write_i64(0); // batteryFirstUsageSeconds
+            w.write_i64(0); // batteryStateOfHealth
+            w.write_nullable_string16_none(); // batterySerialNumber
+            w.write_i32(0); // batteryPartStatus = UNSUPPORTED
+            let (data, offsets) = w.into_parts();
+            TransactionResult::Reply { data, offsets }
+        }
+        _ => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
+    }
+}
+
+/// Build the `HealthInfo` AIDL reply parcel (android-15.0.0_r1
+/// `HealthInfo.aidl` field order — enums are `int`-backed on the wire,
+/// booleans are `int` 0/1, arrays are length-prefixed, the only string
+/// is `batteryTechnology`):
+///   1  boolean chargerAcOnline
+///   2  boolean chargerUsbOnline
+///   3  boolean chargerWirelessOnline
+///   4  boolean chargerDockOnline
+///   5  int    maxChargingCurrentMicroamps
+///   6  int    maxChargingVoltageMicrovolts
+///   7  BatteryStatus batteryStatus (int)
+///   8  BatteryHealth batteryHealth (int)
+///   9  boolean batteryPresent
+///   10 int    batteryLevel
+///   11 int    batteryVoltageMillivolts
+///   12 int    batteryTemperatureTenthsCelsius
+///   13 int    batteryCurrentMicroamps
+///   14 int    batteryCycleCount
+///   15 int    batteryFullChargeUah
+///   16 int    batteryChargeCounterUah
+///   17 String batteryTechnology
+///   18 int    batteryCurrentAverageMicroamps
+///   19 DiskStats[] diskStats
+///   20 StorageInfo[] storageInfos
+///   21 BatteryCapacityLevel batteryCapacityLevel (int; UNSUPPORTED=-1)
+///   22 long   batteryChargeTimeToFullNowSeconds
+///   23 int    batteryFullChargeDesignCapacityUah
+///   24 BatteryChargingState chargingState (int; NORMAL=1 default)
+///   25 BatteryChargingPolicy chargingPolicy (int; DEFAULT=1 default)
+fn virtual_health_info(vals: &crate::battery::GuestBatteryValues) -> TransactionResult {
+    use crate::battery::sysfs_status_to_aidl;
+    let status = vals
+        .status_str
+        .as_deref()
+        .and_then(sysfs_status_to_aidl)
+        .unwrap_or(1); // BatteryStatus.UNKNOWN when the driver is silent
+    let health = vals
+        .health_str
+        .as_deref()
+        .and_then(crate::battery::sysfs_health_to_aidl)
+        .unwrap_or(1); // BatteryHealth.UNKNOWN
+    let charging = matches!(status, 2); // CHARGING
+    let usb_online = if charging { 1 } else { 0 };
+    let voltage_mv = vals.voltage_uv.unwrap_or(0) / 1000;
+    let level = vals.capacity_pct.unwrap_or(0);
+
+    let mut w = ParcelWriter::new();
+    w.write_status_ok();
+    w.write_i32(0); // chargerAcOnline (the host charges over USB — 6-Z271h)
+    w.write_i32(usb_online); // chargerUsbOnline
+    w.write_i32(0); // chargerWirelessOnline
+    w.write_i32(0); // chargerDockOnline
+    w.write_i32(0); // maxChargingCurrentMicroamps (unknown)
+    w.write_i32(0); // maxChargingVoltageMicrovolts (unknown)
+    w.write_i32(status); // batteryStatus
+    w.write_i32(health); // batteryHealth
+    w.write_i32(if vals.present { 1 } else { 0 }); // batteryPresent
+    w.write_i32(level); // batteryLevel (0..100, clamped by the reader)
+    w.write_i32(voltage_mv); // batteryVoltageMillivolts
+    w.write_i32(vals.temp_decic.unwrap_or(0)); // batteryTemperatureTenthsCelsius
+    w.write_i32(vals.current_now_ua.unwrap_or(0)); // batteryCurrentMicroamps
+    w.write_i32(vals.cycle_count.unwrap_or(0)); // batteryCycleCount
+    w.write_i32(0); // batteryFullChargeUah (unknown)
+    w.write_i32(vals.charge_counter_uah.unwrap_or(0)); // batteryChargeCounterUah
+    w.write_string16(vals.technology.as_deref().unwrap_or("")); // batteryTechnology
+    w.write_i32(vals.current_avg_ua.unwrap_or(0)); // batteryCurrentAverageMicroamps
+    w.write_i32(0); // diskStats: empty array
+    w.write_i32(0); // storageInfos: empty array
+    w.write_i32(-1); // batteryCapacityLevel = UNSUPPORTED: we report the raw
+                     // percentage but no fuel-gauge classification (UNSAFE to guess —
+                     // CRITICAL makes the framework schedule a shutdown).
+    w.write_i64(0); // batteryChargeTimeToFullNowSeconds (unknown)
+    w.write_i32(0); // batteryFullChargeDesignCapacityUah (unknown)
+    w.write_i32(1); // chargingState = NORMAL
+    w.write_i32(1); // chargingPolicy = DEFAULT
+    let (data, offsets) = w.into_parts();
+    TransactionResult::Reply { data, offsets }
 }
 
 /// `android.hardware.vibrator.IVibrator` — method codes VERIFIED against
@@ -5368,13 +5624,14 @@ mod tests {
         // The proxy handle lives in the `binder` u64 field (low 32 bits on
         // remote refs — 6-Z114 §3.2).
         let flat_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
-        // 6-Z271: the three in-proxy virtual services are registered at
-        // proxy construction (handles 0xF0000001-3), so the first GUEST
-        // service allocates 0xF0000004.
+        // 6-Z271/6-Z298: the four in-proxy virtual services are
+        // registered at proxy construction (handles 0xF0000001-4 — the
+        // 6-Z298 health service is the fourth), so the first GUEST
+        // service allocates 0xF0000005.
         assert_eq!(
             flat_handle,
-            PROXY_HANDLE_BASE + 4,
-            "proxy handle = 0xF0000000 + 4 (after the 3 virtual services)"
+            PROXY_HANDLE_BASE + 5,
+            "proxy handle = 0xF0000000 + 5 (after the 4 virtual services)"
         );
         // The reply offsets array must list the flat object's offset (= 4,
         // after the i32 status prefix).
@@ -5549,8 +5806,8 @@ mod tests {
         let routed_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
         assert_eq!(
             routed_handle,
-            PROXY_HANDLE_BASE + 4,
-            "svc_a handle = 0xF0000004 (after virtual services)"
+            PROXY_HANDLE_BASE + 5,
+            "svc_a handle = 0xF0000005 (after the 4 virtual services)"
         );
 
         // ---- Connection B: transact(code=42) to the routed handle ----
@@ -5847,8 +6104,8 @@ mod tests {
         let self_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
         assert_eq!(
             self_handle,
-            PROXY_HANDLE_BASE + 4,
-            "own service handle (after virtual services)"
+            PROXY_HANDLE_BASE + 5,
+            "own service handle (after the 4 virtual services)"
         );
 
         // ---- transact(code=7) on the OWN handle ----
@@ -6980,5 +7237,300 @@ mod tests {
             }
             _ => panic!("HIDL onRegistration not queued"),
         }
+    }
+
+    // ====================================================================
+    // 6-Z298: the in-proxy virtual `android.hardware.health.IHealth/default`
+    // ====================================================================
+
+    /// Synthetic sysfs snapshot: the "full tree" a materialised +
+    /// host-managed battery directory produces.
+    fn z298_full_battery_values() -> crate::battery::GuestBatteryValues {
+        crate::battery::GuestBatteryValues {
+            capacity_pct: Some(75),
+            status_str: Some("Discharging".into()),
+            voltage_uv: Some(4_200_000),
+            temp_decic: Some(280),
+            charge_counter_uah: Some(262_500),
+            current_now_ua: Some(-300_000),
+            current_avg_ua: Some(-290_000),
+            cycle_count: Some(3),
+            present: true,
+            technology: Some("Li-ion".into()),
+            health_str: Some("Good".into()),
+        }
+    }
+
+    fn z298_reply_words(data: &[u8]) -> Vec<i32> {
+        data.chunks_exact(4)
+            .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn z298_health_service_registered_under_its_aidl_name() {
+        let b = BusState::new();
+        let name = "android.hardware.health.IHealth/default";
+        let entry = b
+            .services
+            .get(name)
+            .expect("virtual IHealth/default must be registered at proxy start");
+        assert_eq!(
+            entry.virtual_kind,
+            Some(VirtualService::Health),
+            "the registry entry must carry the virtual kind"
+        );
+        // The descriptor (INTERFACE_TRANSACTION reply body) matches the
+        // AIDL name — verified against android-15.0.0_r1 (the descriptor
+        // string lives in android.hardware.health-V4-ndk.so, which ships
+        // in the lineage-22.2 recovery ramdisk).
+        assert_eq!(
+            VirtualService::Health.descriptor(),
+            "android.hardware.health.IHealth"
+        );
+        // Interface version: V4 (the A15 additions getBatteryHealthData /
+        // BatteryHealthData; the corpus's own client library is -V4-ndk).
+        match virtual_service_transaction(VirtualService::Health, 0, None) {
+            TransactionResult::Reply { data, .. } => {
+                assert_eq!(z298_reply_words(&data), vec![0, 4], "[EX_NONE][4]");
+            }
+            _ => panic!("interface-version must reply"),
+        }
+    }
+
+    #[test]
+    fn z298_get_capacity_and_charge_status_follow_the_sysfs_snapshot() {
+        // The two methods battery_utils.cpp consumes (IsBatteryOk → the
+        // sideload battery gate). Full tree → honest values.
+        match virtual_health_with_values(
+            7,
+            &mut ParcelReader::new(&[]),
+            &z298_full_battery_values(),
+        ) {
+            TransactionResult::Reply { data, .. } => {
+                assert_eq!(
+                    z298_reply_words(&data),
+                    vec![0, 75],
+                    "getCapacity → [EX_NONE][75]"
+                );
+            }
+            _ => panic!("getCapacity must reply"),
+        }
+        match virtual_health_with_values(
+            9,
+            &mut ParcelReader::new(&[]),
+            &z298_full_battery_values(),
+        ) {
+            TransactionResult::Reply { data, .. } => {
+                // "Discharging" → BatteryStatus.DISCHARGING = 3 — the
+                // value that makes recovery render the header WITHOUT
+                // the charging "+".
+                assert_eq!(
+                    z298_reply_words(&data),
+                    vec![0, 3],
+                    "getChargeStatus → [EX_NONE][DISCHARGING]"
+                );
+            }
+            _ => panic!("getChargeStatus must reply"),
+        }
+        // Battery-less / absent tree → the .aidl-documented
+        // EX_UNSUPPORTED_OPERATION (never fabricated data). The exception
+        // wire shape is the 6-Z272h one: [i32 exc][string16 msg][i32 trace]
+        // = 16 bytes for a non-EX_NONE exception.
+        let empty = crate::battery::GuestBatteryValues::default();
+        for code in [4, 5, 6, 7, 9] {
+            match virtual_health_with_values(code, &mut ParcelReader::new(&[]), &empty) {
+                TransactionResult::Reply { data, .. } => {
+                    assert_eq!(
+                        z298_reply_words(&data),
+                        vec![EX_UNSUPPORTED_OPERATION, 0, 0, 0],
+                        "code {} with no sysfs → UNSUPPORTED (16-byte exception shape)",
+                        code
+                    );
+                }
+                _ => panic!("code {} must reply", code),
+            }
+        }
+    }
+
+    #[test]
+    fn z298_health_info_parcel_matches_the_aidl_field_order() {
+        // HealthInfo has 25 fields after the status word: 16×i32, one
+        // string16 ("Li-ion" = 4 + 7×2 = 18 → pad 20), 3×i32 (current
+        // avg + the two empty arrays), i64, 3×i32 → 4 + 64 + 20 + 4 +
+        // 4 + 4 + 4 + 8 + 4 + 4 + 4 = 124 bytes.
+        match virtual_health_with_values(
+            12,
+            &mut ParcelReader::new(&[]),
+            &z298_full_battery_values(),
+        ) {
+            TransactionResult::Reply { data, .. } => {
+                assert_eq!(data.len(), 124, "HealthInfo wire size");
+                let w = z298_reply_words(&data);
+                assert_eq!(w[0], 0, "EX_NONE");
+                assert_eq!(w[1], 0, "chargerAcOnline (host charges over USB)");
+                assert_eq!(w[2], 0, "chargerUsbOnline (Discharging → offline)");
+                assert_eq!(w[5], 0, "maxChargingCurrentMicroamps (unknown)");
+                assert_eq!(w[6], 0, "maxChargingVoltageMicrovolts (unknown)");
+                assert_eq!(w[7], 3, "batteryStatus = DISCHARGING");
+                assert_eq!(w[8], 2, "batteryHealth = GOOD");
+                assert_eq!(w[9], 1, "batteryPresent");
+                assert_eq!(w[10], 75, "batteryLevel");
+                assert_eq!(w[11], 4200, "batteryVoltageMillivolts (uV→mV)");
+                assert_eq!(w[12], 280, "batteryTemperatureTenthsCelsius");
+                assert_eq!(w[13], -300_000, "batteryCurrentMicroamps");
+                assert_eq!(w[14], 3, "batteryCycleCount");
+                assert_eq!(w[16], 262_500, "batteryChargeCounterUah");
+                // batteryTechnology string16 at word offset 17 (byte 68):
+                // [len=6][3 words of UTF-16 + NUL/pad].
+                assert_eq!(w[17], 6, "batteryTechnology utf16 length");
+                assert_eq!(
+                    &data[72..84],
+                    "Li-ion"
+                        .encode_utf16()
+                        .flat_map(u16::to_ne_bytes)
+                        .collect::<Vec<u8>>(),
+                    "batteryTechnology utf16 payload"
+                );
+                assert_eq!(w[22], -290_000, "batteryCurrentAverageMicroamps");
+                assert_eq!(w[23], 0, "diskStats: empty array");
+                assert_eq!(w[24], 0, "storageInfos: empty array");
+                assert_eq!(w[25], -1, "batteryCapacityLevel: UNSUPPORTED");
+                // batteryChargeTimeToFullNowSeconds is the only i64 —
+                // at byte offset 104 (word offsets 26+27).
+                let secs = i64::from_ne_bytes(data[104..112].try_into().unwrap());
+                assert_eq!(secs, 0, "batteryChargeTimeToFullNowSeconds");
+                assert_eq!(w[28], 0, "batteryFullChargeDesignCapacityUah");
+                assert_eq!(w[29], 1, "chargingState = NORMAL");
+                assert_eq!(w[30], 1, "chargingPolicy = DEFAULT");
+                assert_eq!(data.len(), 31 * 4, "all fields accounted for");
+            }
+            _ => panic!("getHealthInfo must reply"),
+        }
+        // Charging → the USB charger flips online + capacityLevel of a
+        // zero-capacity battery renders UNSUPPORTED (-1), never a fake.
+        let mut charging = z298_full_battery_values();
+        charging.status_str = Some("Charging".into());
+        charging.capacity_pct = Some(0);
+        match virtual_health_with_values(12, &mut ParcelReader::new(&[]), &charging) {
+            TransactionResult::Reply { data, .. } => {
+                let w = z298_reply_words(&data);
+                assert_eq!(w[2], 1, "chargerUsbOnline (Charging)");
+                assert_eq!(w[7], 2, "batteryStatus = CHARGING");
+                assert_eq!(w[10], 0, "batteryLevel = 0 (host-honest 0%)");
+                assert_eq!(w[25], -1, "capacityLevel UNSUPPORTED (raw % only)");
+            }
+            _ => panic!("getHealthInfo(charging) must reply"),
+        }
+    }
+
+    #[test]
+    fn z298_get_battery_health_data_shape() {
+        // [EX_NONE][3×i64 zeros][nullable serial = -1][partStatus=0].
+        match virtual_health_with_values(
+            15,
+            &mut ParcelReader::new(&[]),
+            &z298_full_battery_values(),
+        ) {
+            TransactionResult::Reply { data, .. } => {
+                assert_eq!(data.len(), 4 + 8 + 8 + 8 + 4 + 4, "BatteryHealthData size");
+                let words = z298_reply_words(&data);
+                assert_eq!(words[0], 0);
+                // The three i64s occupy word slots 1..=6.
+                assert_eq!(words[1], 0, "manufacturing date unknown");
+                assert_eq!(words[6], 0, "state of health (high word)");
+                assert_eq!(words[7], -1, "batterySerialNumber = NULL (i32 -1)");
+                assert_eq!(words[8], 0, "batteryPartStatus = UNSUPPORTED");
+            }
+            _ => panic!("getBatteryHealthData must reply"),
+        }
+    }
+
+    #[test]
+    fn z298_void_methods_and_arrays_reply_ok() {
+        // registerCallback(1) / unregisterCallback(2) / update(3) /
+        // setChargingPolicy(13) → bare EX_NONE.
+        for code in [1, 2, 3, 13] {
+            match virtual_health_with_values(
+                code,
+                &mut ParcelReader::new(&[]),
+                &z298_full_battery_values(),
+            ) {
+                TransactionResult::Reply { data, .. } => {
+                    assert_eq!(z298_reply_words(&data), vec![0], "code {}", code);
+                }
+                _ => panic!("code {} must reply", code),
+            }
+        }
+        // getStorageInfo(10) / getDiskStats(11) → [EX_NONE][empty].
+        for code in [10, 11] {
+            match virtual_health_with_values(
+                code,
+                &mut ParcelReader::new(&[]),
+                &z298_full_battery_values(),
+            ) {
+                TransactionResult::Reply { data, .. } => {
+                    assert_eq!(z298_reply_words(&data), vec![0, 0], "code {}", code);
+                }
+                _ => panic!("code {} must reply", code),
+            }
+        }
+        // getEnergyCounterNwh(8) / getChargingPolicy(14) → UNSUPPORTED
+        // (no backing file, exactly the .aidl's documented semantic;
+        // 16-byte 6-Z272h exception shape).
+        for code in [8, 14] {
+            match virtual_health_with_values(
+                code,
+                &mut ParcelReader::new(&[]),
+                &z298_full_battery_values(),
+            ) {
+                TransactionResult::Reply { data, .. } => {
+                    assert_eq!(
+                        z298_reply_words(&data),
+                        vec![EX_UNSUPPORTED_OPERATION, 0, 0, 0],
+                        "code {}",
+                        code
+                    );
+                }
+                _ => panic!("code {} must reply", code),
+            }
+        }
+        // Unknown codes → UNSUPPORTED (never BR_FAILED_REPLY: a failed
+        // reply on a live service handle wedges the client's waitFor-
+        // Response the same way an unimplemented method does on a real
+        // device).
+        match virtual_health_with_values(
+            99,
+            &mut ParcelReader::new(&[]),
+            &z298_full_battery_values(),
+        ) {
+            TransactionResult::Reply { data, .. } => {
+                assert_eq!(
+                    z298_reply_words(&data),
+                    vec![EX_UNSUPPORTED_OPERATION, 0, 0, 0]
+                );
+            }
+            _ => panic!("unknown code must still reply"),
+        }
+    }
+
+    #[test]
+    fn z298_guest_addservice_overrides_the_virtual_health_service() {
+        // If a guest ever ships its own health HAL it must win — native
+        // servicemanager overwrite semantics, and the proxy handler
+        // stands down (transactions route to the guest owner).
+        let mut b = BusState::new();
+        let name = "android.hardware.health.IHealth/default";
+        let virtual_handle = b.services.get(name).unwrap().handle;
+        let conn = PROXY_CONN_ID + 7;
+        let h = b.add_guest_service(name, conn, 0xdead, 0x1234);
+        assert_eq!(h, virtual_handle, "same name → same handle");
+        let entry = b.services.get(name).unwrap();
+        assert_eq!(entry.owner, conn, "owner switched to the guest");
+        assert_eq!(entry.ptr, 0xdead);
+        assert_eq!(
+            entry.virtual_kind, None,
+            "the in-proxy handler must stand down"
+        );
     }
 }
