@@ -162,7 +162,9 @@ def adb_out(cmd, timeout=20):
     except Exception as e:
         return f"<threw {e!r}>"
 
-INPUT_READS_RE = re.compile(r"INPUT (raw )?read\(fd=\d+\)( -> \d+)?")
+# 6-Z297c: the hook line is "INPUT raw read(fd=10, count=24) -> 24" — the
+# old pattern required \) right after fd=\d+ and matched nothing.
+INPUT_READS_RE = re.compile(r"INPUT (raw )?read\(fd=\d+[^)]*\)(\s*->\s*\d+)?")
 
 
 def count_input_reads():
@@ -370,7 +372,14 @@ def main():
     probe["frame_delta"] = (frame_after - frame_before
                             if frame_after is not None and
                             frame_before is not None else None)
-    probe["interactive"] = bool(probe["frame_delta"] and probe["frame_delta"] > 0)
+    # 6-Z297c: run 33957458252 — the tap on "Apply update" ACTIVATED it
+    # (guest entered adb-sideload; cap_differs=true) yet frame_delta=0
+    # (the blit counter source was unavailable) and channels_used=[] (the
+    # stale reads regex matched nothing). The SCREENCAP HASH is ground
+    # truth: a changed screen after taps IS interactivity.
+    probe["interactive"] = bool(
+        (probe["frame_delta"] and probe["frame_delta"] > 0)
+        or probe["cap_differs_after_taps"])
     # Verdict policy: events REACHING the guest (channels_used non-empty)
     # is the touch-delivery truth; the frame rise is the menu-redraw
     # truth. Both together = a fully interactive AOSP menu.
