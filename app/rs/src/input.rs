@@ -200,7 +200,11 @@ impl TouchMessage {
 /// Hello magic byte 0.
 const EVDEV_HELLO_MAGIC: [u8; 4] = [0xA5, b'T', b'W', b'I'];
 /// Hello size (magic + ev_size byte).
-const EVDEV_HELLO_LEN: usize = 5;
+const EVDEV_HELLO_LEN: usize = 6;
+/// Hello byte 5 — the DEVICE CLASS this connection mimics (6-Z294):
+/// 0 = the i2c touchscreen mirror, 1 = the gpio-keys keyboard.
+const EVDEV_HELLO_CLASS_TOUCH: u8 = 0;
+const EVDEV_HELLO_CLASS_KEYS: u8 = 1;
 /// `struct input_event` size on a 64-bit-timeval architecture (aarch64).
 const EVDEV_SIZE_64: usize = 24;
 /// `struct input_event` size on a 32-bit-timeval architecture (arm32/i386).
@@ -216,9 +220,10 @@ enum BridgeMode {
     /// read interposer was supposed to decode these — see the 6-Z293
     /// root-cause note for why that never worked).
     LegacyTouchMessage,
-    /// 6-Z293: write final evdev records of the guest's native
-    /// `struct input_event` size (the negotiated byte count).
-    RawEvdev(usize),
+    /// 6-Z293/6-Z294: write final evdev records of the guest's native
+    /// `struct input_event` size (the negotiated byte count), on the
+    /// negotiated DEVICE CLASS (touchscreen vs gpio-keys mirror).
+    RawEvdev { ev_size: usize, keys: bool },
 }
 
 /// Encode ONE `struct input_event` record (little-endian) of exactly
@@ -432,6 +437,16 @@ const MAX_POINTERS: usize = 5;
 // longer needs to know about `EV_ABS`/`ABS_MT_*`/`BTN_*` constants for
 // the touch path (the key path still does, so `KEY_SENDER` is unchanged).
 static INPUT_SENDER: Lazy<Mutex<Option<Sender<TouchMessage>>>> = Lazy::new(|| Mutex::new(None));
+
+/// 6-Z294: the gpio-keys-mirror connection of the abstract bridge.
+/// minui's ev_init classifies devices by EVIOCGID's bustype — a zeroed
+/// id made BOTH bridge fds keyboards and dropped every record; the hook
+/// now presents event0 as BUS_I2C touchscreen + event1 as BUS_HOST
+/// gpio-keys, and the app routes touch frames and key records to the
+/// matching connections. Keys sent only through INPUT_SENDER would land
+/// on the touchscreen device whose handler ignores EV_KEY.
+static KEY_BRIDGE_SENDER: Lazy<Mutex<Option<Sender<TouchMessage>>>> =
+    Lazy::new(|| Mutex::new(None));
 static KEY_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| Mutex::new(None));
 
 pub fn start_input_system(width: i32, height: i32) {
@@ -894,25 +909,56 @@ fn touch_server_abstract() {
                 client
             );
             let (tx, rx) = channel::<TouchMessage>();
-            *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
             // Mirror the fs-listener worker: drain the channel into the
-            // client fd; exit (releasing INPUT_SENDER) on write error.
+            // client fd; exit (releasing the bridge sender) on write
+            // error.
             //
             // 6-Z293: the worker first waits for the guest's hello
-            // ([0xA5,'T','W','I', ev_size]) to pick the write mode. The
-            // hello is read HERE — inside the worker — so a client that
-            // never speaks (legacy hook) only delays this connection's
-            // first delivery by the timeout, never the accept loop
-            // (connections keep accepting; INPUT_SENDER points at the
-            // latest worker; early TouchMessages buffer in `rx` until
-            // the negotiation resolves).
+            // ([0xA5,'T','W','I', ev_size, class]) to pick the write
+            // mode. The hello is read HERE — inside the worker — so a
+            // client that never speaks (legacy hook) only delays this
+            // connection's first delivery by the timeout, never the
+            // accept loop (connections keep accepting; early
+            // TouchMessages buffer in `rx` until the negotiation
+            // resolves).
             thread::spawn(move || {
                 let mode = negotiate_bridge_mode(client);
-                if let BridgeMode::RawEvdev(sz) = mode {
-                    info!(
-                        "[INPUT] abstract bridge negotiated evdev mode (ev_size={} bytes, fd {})",
-                        sz, client
-                    );
+                match mode {
+                    BridgeMode::RawEvdev {
+                        ev_size,
+                        keys: false,
+                    } => info!(
+                        "[INPUT] abstract bridge negotiated evdev mode (touch device, ev_size={}, fd {})",
+                        ev_size, client
+                    ),
+                    BridgeMode::RawEvdev {
+                        ev_size,
+                        keys: true,
+                    } => info!(
+                        "[INPUT] abstract bridge negotiated evdev mode (gpio-keys device, ev_size={}, fd {})",
+                        ev_size, client
+                    ),
+                    BridgeMode::LegacyTouchMessage => {}
+                }
+                // 6-Z294: register the connection under its negotiated
+                // class — last negotiation per class wins (the class is
+                // only knowable AFTER the hello, so registration happens
+                // here, not at accept time; minui opens both devices
+                // within ~1 ms and the first touch arrives seconds later,
+                // so the pre-registration window is theoretical).
+                // Touchscreen connections serve INPUT_SENDER (MotionEvent
+                // frames); gpio-keys connections serve KEY_BRIDGE_SENDER
+                // (the send_key_code EV_KEY records) — the guest's
+                // touchscreen handler ignores EV_KEY records and the
+                // keyboard dispatch drops codes absent from its bitmap.
+                match mode {
+                    BridgeMode::RawEvdev { keys: true, .. } => {
+                        *KEY_BRIDGE_SENDER.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(tx.clone());
+                    }
+                    BridgeMode::RawEvdev { keys: false, .. } | BridgeMode::LegacyTouchMessage => {
+                        *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
+                    }
                 }
                 let mut finger: Option<(i32, i32)> = None; // (slot, tracking_id)
                 loop {
@@ -920,8 +966,8 @@ fn touch_server_abstract() {
                         Ok(msg) => {
                             let bytes = match mode {
                                 BridgeMode::LegacyTouchMessage => msg.to_bytes().to_vec(),
-                                BridgeMode::RawEvdev(sz) => {
-                                    match encode_evdev(sz, &mut finger, msg) {
+                                BridgeMode::RawEvdev { ev_size, .. } => {
+                                    match encode_evdev(ev_size, &mut finger, msg) {
                                         Some(b) => b,
                                         // Defensive drop (MOVE/UP without
                                         // DOWN, unknown slot, bad size) —
@@ -983,11 +1029,13 @@ fn touch_server_abstract() {
                                     }
                                 }
                                 while rx.recv().is_ok() {}
+                                detach_bridge_sender(&tx);
                                 close(client);
                                 return;
                             }
                         }
                         Err(_) => {
+                            detach_bridge_sender(&tx);
                             close(client);
                             return;
                         }
@@ -1048,8 +1096,9 @@ fn negotiate_bridge_mode(client: c_int) -> BridgeMode {
         close(dup_fd);
         if got == EVDEV_HELLO_LEN && hello[0..4] == EVDEV_HELLO_MAGIC {
             let ev_size = hello[4] as usize;
+            let keys = hello[5] == EVDEV_HELLO_CLASS_KEYS;
             if ev_size == EVDEV_SIZE_64 || ev_size == EVDEV_SIZE_32 {
-                return BridgeMode::RawEvdev(ev_size);
+                return BridgeMode::RawEvdev { ev_size, keys };
             }
             log::warn!(
                 "[INPUT] abstract bridge hello advertised unsupported ev_size={} — legacy mode",
@@ -1117,6 +1166,22 @@ fn encode_evdev(
             Some(out)
         }
         _ => None,
+    }
+}
+
+/// 6-Z294: drop `tx` from whichever bridge registration currently holds
+/// it (INPUT_SENDER for touch connections, KEY_BRIDGE_SENDER for the
+/// gpio-keys mirror) so a dead connection never keeps a stale sender.
+/// `Sender::same_channel` keeps the identity check exact.
+fn detach_bridge_sender(tx: &Sender<TouchMessage>) {
+    let mut input = INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner());
+    if input.as_ref().is_some_and(|s| s.same_channel(tx)) {
+        *input = None;
+    }
+    drop(input);
+    let mut key = KEY_BRIDGE_SENDER.lock().unwrap_or_else(|e| e.into_inner());
+    if key.as_ref().is_some_and(|s| s.same_channel(tx)) {
+        *key = None;
     }
 }
 
@@ -1219,15 +1284,16 @@ pub fn send_key_code(keycode: i32) {
         input_event_write(tx, EV_SYN, SYN_REPORT, SYN_REPORT);
     }
 
-    // 6-Z293c: DUAL-WRITE to the abstract evdev bridge. The loader-path
-    // recoveries (lineage/AOSP-minui generations) never open the key0
-    // device — their ONLY input fds are the fb hook's bridge sockets —
-    // so keys sent solely through KEY_SENDER vanish. The bridge worker
-    // encodes EV_KEY + SYN_REPORT records of the negotiated size (and
-    // drops the message on the legacy TouchMessage path, where keys
-    // were never supported). A synthetic press+release back-to-back is
-    // what the guest's key handler expects for a single navigation step.
-    if let Some(tx) = INPUT_SENDER
+    // 6-Z293c + 6-Z294: DUAL-WRITE to the abstract evdev bridge. The
+    // loader-path recoveries (lineage/AOSP-minui generations) never
+    // open the key0 device — their ONLY input fds are the fb hook's
+    // bridge sockets — so keys sent solely through KEY_SENDER vanish.
+    // The records go to the GPIO-KEYS-MIRROR connection (6-Z294): the
+    // guest's key handler drops EV_KEY records from devices whose
+    // EVIOCGBIT(EV_KEY) lacks the code, and the touchscreen handler
+    // ignores EV_KEY outright — the keys device advertises
+    // VOLUMEUP/VOLUMEDOWN/POWER exactly like real gpio-keys hardware.
+    if let Some(tx) = KEY_BRIDGE_SENDER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
