@@ -7296,6 +7296,182 @@ fn parse_prop_msg(frame: &[u8]) -> Option<(String, String)> {
     Some((name, value))
 }
 
+/// 6-Z305: the real-Android BOOT_COMPLETED bridge predicate. TRUE exactly
+/// when a guest-observed property set IS the Android boot-completion signal:
+/// `sys.boot_completed` = "1" (init writes "1" when the framework finishes
+/// booting; some ROMs re-set the same value — same signal, idempotent).
+/// Kept as a free function so the honest-semantics contract has unit tests.
+fn is_boot_completed_prop(name: &str, value: &str) -> bool {
+    name == "sys.boot_completed" && value.trim() == "1"
+}
+
+/// 6-Z305: process-wide one-shot guard shared by BOTH BOOT_COMPLETED
+/// delivery sites — (1) the recovery-path execve synthesis (Task 6-Z48 /
+/// 6-Z62) and (2) the real-Android `sys.boot_completed` property bridge
+/// (this round). Idempotent delivery: the app side
+/// (BootCompletionServer.markCompleted) is a compare-and-set, so ONE
+/// successful send is enough; this guard prevents stacking sender threads
+/// if either site fires more than once per process.
+static BOOT_COMPLETED_SENDER_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 6-Z305: spawn the detached BOOT_COMPLETED delivery thread.
+///
+/// Connect-per-message (the Task 6-Z50/6-Z62 recipe): no persistent fd, both
+/// @TWOYI_SOCK and @TWOYI_BOOT_SOCK abstract-namespace listeners, SOCK_SEQPACKET
+/// (a SOCK_STREAM connect can never even SEE a SOCK_SEQPACKET listener — the
+/// kernel's abstract-socket hash bucket is keyed by `hash ^ sk_type`), payload
+/// exactly "BOOT_COMPLETED\n". Retries every 250 ms for up to 120 s on a
+/// DETACHED thread so the traced guest never blocks on the app's bind timing.
+///
+/// Two callers, one honest semantic:
+///   * recovery mode — synthesized at the guest recovery binary's execve
+///     completion (Task 6-Z48; a recovery never sets sys.boot_completed);
+///   * full-Android mode — fired when the guest REALLY sets
+///     `sys.boot_completed=1` through the (6-Z110/6-Z111-emulated) property
+///     service. This is the exact contract the twoyi app's boot gate waits
+///     on (BootCompletionServer, 300 s window) — Android's init sets the
+///     property once the framework has finished booting, and the host app
+///     must observe it through the ONLY channel the container has: this
+///     @TWOYI_SOCK message. No synthetic success for the Android path: if
+///     the property never flips, the message never sends and the app's
+///     boot gate honestly times out.
+fn spawn_boot_completed_sender(trigger_pid: libc::pid_t, reason: &str) {
+    // `log` in run_ptrace_loop is a closure over crate::trace_log_line; this
+    // module-level fn delegates to the same sink directly (6-Z267 buffered
+    // trace-line path — identical format, identical cap).
+    let log = |msg: &str| {
+        crate::trace_log_line(msg);
+    };
+    if BOOT_COMPLETED_SENDER_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        log("[KR64] BOOT_COMPLETED: sender thread already started — not spawning another (Task 6-Z62)");
+        return;
+    }
+    match std::thread::Builder::new()
+        .name("boot-completed-sender".to_string())
+        .spawn(move || {
+            use std::io::Write;
+            let tlog = |msg: &str| {
+                // Same 8 KB line cap as the main `log` closure above.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[KR64][ptrace] {}",
+                    crate::cap_log_line(msg, crate::MAX_LOG_LINE)
+                );
+            };
+            tlog(&format!(
+                "[KR64] BOOT_COMPLETED sender thread started (trigger PID={}, reason={}, will retry every 250 ms for up to 120 s)",
+                trigger_pid, reason
+            ));
+            const SOCK_NAMES: [&str; 2] = ["TWOYI_SOCK", "TWOYI_BOOT_SOCK"];
+            const RETRY_INTERVAL_MS: u64 = 250;
+            const RETRY_TOTAL_MS: u64 = 120_000;
+            let started_at = std::time::Instant::now();
+            let mut attempt: u64 = 0;
+            loop {
+                attempt += 1;
+                let mut delivered = false;
+                for sock_name in SOCK_NAMES {
+                    let sock = unsafe {
+                        libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0)
+                    };
+                    if sock < 0 {
+                        let e = std::io::Error::last_os_error();
+                        tlog(&format!(
+                            "[KR64] BOOT_COMPLETED: socket(SOCK_SEQPACKET) failed for @{} (attempt {}): {}",
+                            sock_name, attempt, e
+                        ));
+                        continue;
+                    }
+                    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+                    addr.sun_family = libc::AF_UNIX as u16;
+                    // Abstract socket: sun_path[0] = 0, then the name.
+                    let name_bytes = sock_name.as_bytes();
+                    let copy_len = name_bytes.len().min(addr.sun_path.len() - 1);
+                    for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
+                        addr.sun_path[i + 1] = b as libc::c_char;
+                    }
+                    let addr_len =
+                        (std::mem::size_of::<u16>() + 1 + copy_len) as u32;
+                    let ret = unsafe {
+                        libc::connect(
+                            sock,
+                            &addr as *const _ as *const libc::sockaddr,
+                            addr_len,
+                        )
+                    };
+                    if ret == 0 {
+                        let msg = b"BOOT_COMPLETED\n";
+                        let written = unsafe {
+                            libc::write(
+                                sock,
+                                msg.as_ptr() as *const libc::c_void,
+                                msg.len(),
+                            )
+                        };
+                        if written == msg.len() as isize {
+                            tlog(&format!(
+                                "[KR64] BOOT_COMPLETED sent to @{} via SOCK_SEQPACKET on attempt {} ({} ms elapsed)",
+                                sock_name,
+                                attempt,
+                                started_at.elapsed().as_millis()
+                            ));
+                            delivered = true;
+                        } else {
+                            let e = std::io::Error::last_os_error();
+                            tlog(&format!(
+                                "[KR64] BOOT_COMPLETED: write to @{} failed (ret={}, errno={})",
+                                sock_name, written, e
+                            ));
+                        }
+                    } else {
+                        let e = std::io::Error::last_os_error();
+                        tlog(&format!(
+                            "[KR64] BOOT_COMPLETED: connect(SOCK_SEQPACKET) to @{} failed on attempt {} ({} ms elapsed): {}",
+                            sock_name,
+                            attempt,
+                            started_at.elapsed().as_millis(),
+                            e
+                        ));
+                    }
+                    unsafe { libc::close(sock) };
+                    if delivered {
+                        break;
+                    }
+                }
+                if delivered {
+                    tlog(
+                        "[KR64] BOOT_COMPLETED delivery confirmed — sender thread exiting",
+                    );
+                    return;
+                }
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                if elapsed_ms + RETRY_INTERVAL_MS >= RETRY_TOTAL_MS {
+                    tlog(&format!(
+                        "[KR64] BOOT_COMPLETED: giving up after {} attempts / {} ms — @TWOYI_SOCK and @TWOYI_BOOT_SOCK unreachable",
+                        attempt, elapsed_ms
+                    ));
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(
+                    RETRY_INTERVAL_MS,
+                ));
+            }
+        }) {
+        Ok(_join_handle) => {
+            // Detached: dropping the JoinHandle lets the sender thread
+            // outlive this scope (kr64 keeps ptracing while it retries in
+            // the background).
+        }
+        Err(e) => {
+            log(&format!(
+                "[KR64] BOOT_COMPLETED: failed to spawn sender thread: {} ({})",
+                e, reason
+            ));
+        }
+    }
+}
+
 /// Task 6-Z111: detect the property-area format of a snapshot blob.
 /// Returns one of:
 ///   - `New`: valid NEW-format area (Android 8+, the AOSP-11 target).
@@ -14011,218 +14187,15 @@ pub fn run_ptrace_loop(
                                 "[KR64] BOOT_COMPLETED synthesis: execve SUCCEEDED for PID={} (PTRACE_EVENT_EXEC) — sending BOOT_COMPLETED to @TWOYI_SOCK (Task 6-Z48)",
                                 pid
                             ));
-                            // Task 6-Z62: connect with SOCK_SEQPACKET, on a
-                            // detached retry thread. The app binds BOTH
-                            // @TWOYI_SOCK and @TWOYI_BOOT_SOCK as SEQPACKET
-                            // (TwoyiSocketServer.start0() and
-                            // BootCompletionServer.start0() both use
-                            // `new LocalSocket(LocalSocket.SOCKET_SEQPACKET)`).
-                            // The previous SOCK_STREAM connect ALWAYS failed
-                            // with "Connection refused (os error 111)": on
-                            // Linux the abstract-socket hash bucket is keyed
-                            // by `hash ^ sk_type` (kernel af_unix.c binds with
-                            // `addr->hash ^= sk->sk_type` and looks up in
-                            // `unix_socket_table[hash ^ type]`), so a
-                            // SOCK_STREAM connect cannot even SEE a
-                            // SOCK_SEQPACKET listener — unix_find_other()
-                            // returns ECONNREFUSED exactly as if the name did
-                            // not exist. (Verified empirically on kernel
-                            // 5.10: stream→seqpacket abstract connect =
-                            // errno 111; seqpacket→seqpacket = success.)
-                            // This was previously misdiagnosed as a
-                            // connect-before-bind race, but the b889666
-                            // logcat timing rules that out: the app binds
-                            // @TWOYI_SOCK at Application.attachBaseContext
-                            // (~21:29:39) and @TWOYI_BOOT_SOCK in
-                            // bootSystem() (~21:30:32), while kr64's first
-                            // connect fires >= 21:32:30 — three minutes
-                            // later. TwoyiMessenger.java (the reference
-                            // host-side client) also uses SOCKET_SEQPACKET.
-                            //
-                            // The send runs on a DETACHED thread because this
-                            // code is inside the ptrace event loop — blocking
-                            // here (retrying for up to 120 s) would freeze the
-                            // traced recovery mid-syscall. The thread retries
-                            // every 250 ms for up to 120 s (defense in depth:
-                            // covers a hypothetical early-boot guest racing
-                            // the app's bind, and the app's own 5-attempt
-                            // bind-retry backoff). The app side is idempotent
-                            // (BootCompletionServer.markCompleted is a
-                            // compare-and-set), so ONE successful delivery is
-                            // sufficient; the process-wide AtomicBool below
-                            // prevents stacking sender threads if this
-                            // synthesis fires more than once per process.
-                            static BOOT_COMPLETED_SENDER_STARTED: std::sync::atomic::AtomicBool =
-                                std::sync::atomic::AtomicBool::new(false);
-                            if BOOT_COMPLETED_SENDER_STARTED
-                                .swap(true, std::sync::atomic::Ordering::SeqCst)
-                            {
-                                log("[KR64] BOOT_COMPLETED: sender thread already started — not spawning another (Task 6-Z62)");
-                            } else {
-                                let trigger_pid = pid;
-                                match std::thread::Builder::new()
-                                    .name("boot-completed-sender".to_string())
-                                    .spawn(move || {
-                                        use std::io::Write;
-                                        let tlog = |msg: &str| {
-                                            // 6-Z131: same 8 KB line cap as
-                                            // the main `log` closure above.
-                                            let _ = writeln!(
-                                                std::io::stderr(),
-                                                "[KR64][ptrace] {}",
-                                                crate::cap_log_line(msg, crate::MAX_LOG_LINE)
-                                            );
-                                        };
-                                        tlog(&format!(
-                                            "[KR64] BOOT_COMPLETED sender thread started (recovery execve PID={}, will retry every 250 ms for up to 120 s) (Task 6-Z62)",
-                                            trigger_pid
-                                        ));
-                                        // Socket names + abstract-namespace
-                                        // encoding are UNCHANGED from Task
-                                        // 6-Z50 (both were correct); only the
-                                        // socket TYPE changed
-                                        // (SOCK_STREAM → SOCK_SEQPACKET).
-                                        const SOCK_NAMES: [&str; 2] =
-                                            ["TWOYI_SOCK", "TWOYI_BOOT_SOCK"];
-                                        const RETRY_INTERVAL_MS: u64 = 250;
-                                        const RETRY_TOTAL_MS: u64 = 120_000;
-                                        let started_at = std::time::Instant::now();
-                                        let mut attempt: u64 = 0;
-                                        loop {
-                                            attempt += 1;
-                                            let mut delivered = false;
-                                            for sock_name in SOCK_NAMES {
-                                                let sock = unsafe {
-                                                    libc::socket(
-                                                        libc::AF_UNIX,
-                                                        libc::SOCK_SEQPACKET,
-                                                        0,
-                                                    )
-                                                };
-                                                if sock < 0 {
-                                                    let e =
-                                                        std::io::Error::last_os_error();
-                                                    tlog(&format!(
-                                                        "[KR64] BOOT_COMPLETED: socket(SOCK_SEQPACKET) failed for @{} (attempt {}): {} (Task 6-Z62)",
-                                                        sock_name, attempt, e
-                                                    ));
-                                                    continue;
-                                                }
-                                                let mut addr: libc::sockaddr_un =
-                                                    unsafe { std::mem::zeroed() };
-                                                addr.sun_family =
-                                                    libc::AF_UNIX as u16;
-                                                // Abstract socket:
-                                                // sun_path[0] = 0, then the name.
-                                                let name_bytes = sock_name.as_bytes();
-                                                let copy_len = name_bytes
-                                                    .len()
-                                                    .min(addr.sun_path.len() - 1);
-                                                for (i, &b) in
-                                                    name_bytes[..copy_len].iter().enumerate()
-                                                {
-                                                    addr.sun_path[i + 1] =
-                                                        b as libc::c_char;
-                                                }
-                                                let addr_len =
-                                                    (std::mem::size_of::<u16>()
-                                                        + 1
-                                                        + copy_len)
-                                                        as u32;
-                                                let ret = unsafe {
-                                                    libc::connect(
-                                                        sock,
-                                                        &addr as *const _
-                                                            as *const libc::sockaddr,
-                                                        addr_len,
-                                                    )
-                                                };
-                                                if ret == 0 {
-                                                    let msg = b"BOOT_COMPLETED\n";
-                                                    let written = unsafe {
-                                                        libc::write(
-                                                            sock,
-                                                            msg.as_ptr()
-                                                                as *const libc::c_void,
-                                                            msg.len(),
-                                                        )
-                                                    };
-                                                    if written
-                                                        == msg.len() as isize
-                                                    {
-                                                        tlog(&format!(
-                                                            "[KR64] BOOT_COMPLETED sent to @{} via SOCK_SEQPACKET on attempt {} ({} ms elapsed) (Task 6-Z62)",
-                                                            sock_name,
-                                                            attempt,
-                                                            started_at
-                                                                .elapsed()
-                                                                .as_millis()
-                                                        ));
-                                                        delivered = true;
-                                                    } else {
-                                                        let e =
-                                                            std::io::Error::last_os_error();
-                                                        tlog(&format!(
-                                                            "[KR64] BOOT_COMPLETED: write to @{} failed (ret={}, errno={}) (Task 6-Z62)",
-                                                            sock_name, written, e
-                                                        ));
-                                                    }
-                                                } else {
-                                                    let e =
-                                                        std::io::Error::last_os_error();
-                                                    tlog(&format!(
-                                                        "[KR64] BOOT_COMPLETED: connect(SOCK_SEQPACKET) to @{} failed on attempt {} ({} ms elapsed): {} (Task 6-Z62)",
-                                                        sock_name,
-                                                        attempt,
-                                                        started_at
-                                                            .elapsed()
-                                                            .as_millis(),
-                                                        e
-                                                    ));
-                                                }
-                                                unsafe { libc::close(sock); }
-                                                if delivered {
-                                                    break;
-                                                }
-                                            }
-                                            if delivered {
-                                                tlog("[KR64] BOOT_COMPLETED delivery confirmed — sender thread exiting (Task 6-Z62)");
-                                                return;
-                                            }
-                                            let elapsed_ms = started_at
-                                                .elapsed()
-                                                .as_millis() as u64;
-                                            if elapsed_ms + RETRY_INTERVAL_MS
-                                                >= RETRY_TOTAL_MS
-                                            {
-                                                tlog(&format!(
-                                                    "[KR64] BOOT_COMPLETED: giving up after {} attempts / {} ms — @TWOYI_SOCK and @TWOYI_BOOT_SOCK unreachable (Task 6-Z62)",
-                                                    attempt, elapsed_ms
-                                                ));
-                                                return;
-                                            }
-                                            std::thread::sleep(
-                                                std::time::Duration::from_millis(
-                                                    RETRY_INTERVAL_MS,
-                                                ),
-                                            );
-                                        }
-                                    })
-                                {
-                                    Ok(_join_handle) => {
-                                        // Detached: dropping the JoinHandle
-                                        // lets the sender thread outlive this
-                                        // scope (kr64 keeps ptracing while it
-                                        // retries in the background).
-                                    }
-                                    Err(e) => {
-                                        log(&format!(
-                                            "[KR64] BOOT_COMPLETED: failed to spawn sender thread: {} (Task 6-Z62)",
-                                            e
-                                        ));
-                                    }
-                                }
-                            }
+                            // 6-Z305: the sender now lives in the shared
+                            // spawn_boot_completed_sender() (same SOCK_SEQPACKET
+                            // connect-per-message recipe, same one-shot guard) —
+                            // shared with the 6-Z305 real-Android
+                            // sys.boot_completed property bridge.
+                            spawn_boot_completed_sender(
+                                pid,
+                                "recovery execve synthesis (Task 6-Z48/6-Z62)",
+                            );
                         }
 
                         continue;
@@ -24759,6 +24732,23 @@ pub fn run_ptrace_loop(
                                             read_child_bytes(pid, buf_ptr, req_len)
                                         {
                                             if let Some((name, value)) = parse_prop_msg(&payload) {
+                                                // 6-Z305: real-Android BOOT_COMPLETED bridge.
+                                                // When the guest's init REALLY sets
+                                                // sys.boot_completed=1 through the emulated
+                                                // property service, notify the twoyi app over
+                                                // @TWOYI_SOCK (the BootCompletionServer boot
+                                                // gate). Honest semantics: fires ONLY on a
+                                                // genuine prop_msg observed on the wire — the
+                                                // host notification corresponds 1:1 with the
+                                                // property Android's init sets at boot
+                                                // completion. One-shot guard prevents stacking
+                                                // sender threads on repeated sets.
+                                                if is_boot_completed_prop(&name, &value) {
+                                                    spawn_boot_completed_sender(
+                                                        pid,
+                                                        "guest set sys.boot_completed=1 (real-Android bridge, 6-Z305)",
+                                                    );
+                                                }
                                                 z111_apply_property_set(
                                                     pid,
                                                     &name,
@@ -25079,6 +25069,15 @@ pub fn run_ptrace_loop(
                                             read_child_bytes(pid, buf_ptr, req_len)
                                         {
                                             if let Some((name, value)) = parse_prop_msg(&payload) {
+                                                // 6-Z305: real-Android BOOT_COMPLETED bridge
+                                                // (i386 socketcall path — same semantics as
+                                                // the direct-SendTo arm above).
+                                                if is_boot_completed_prop(&name, &value) {
+                                                    spawn_boot_completed_sender(
+                                                        pid,
+                                                        "guest set sys.boot_completed=1 (real-Android bridge, 6-Z305, socketcall)",
+                                                    );
+                                                }
                                                 z111_apply_property_set(
                                                     pid,
                                                     &name,
@@ -33816,5 +33815,69 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!is_glog_redirect_write(b"[glog"));
         assert!(!is_glog_redirect_write(b"[glogx"));
         assert!(!is_glog_redirect_write(b""));
+    }
+
+    // ── 6-Z305: real-Android BOOT_COMPLETED bridge predicate ─────────
+    //
+    // The bridge MUST fire only on the exact Android semantic: init's
+    // sys.boot_completed=1 write observed as a genuine prop_msg on the
+    // emulated property-service socket. Every near-miss (wrong key, wrong
+    // value, padded value, similarly-named keys like sys.boot_completed.,
+    // oem boot props, the recovery-mode "0") must stay FALSE so the app's
+    // boot gate never receives a synthetic success.
+
+    #[test]
+    fn z305_boot_completed_bridge_accepts_exact_signal() {
+        assert!(is_boot_completed_prop("sys.boot_completed", "1"));
+        // bionic pads nothing here, but the value travels through a
+        // fixed-width field — trailing whitespace is not part of the value.
+        assert!(is_boot_completed_prop("sys.boot_completed", "1\n"));
+        assert!(is_boot_completed_prop("sys.boot_completed", " 1"));
+        // some ROMs re-set the same value mid-boot — same signal
+        assert!(is_boot_completed_prop("sys.boot_completed", "1 "));
+    }
+
+    #[test]
+    fn z305_boot_completed_bridge_rejects_near_misses() {
+        // not yet completed
+        assert!(!is_boot_completed_prop("sys.boot_completed", "0"));
+        // wrong key: the whole trie of look-alikes must stay FALSE
+        assert!(!is_boot_completed_prop("sys.boot_completedx", "1"));
+        assert!(!is_boot_completed_prop("sys.boot_complete", "1"));
+        assert!(!is_boot_completed_prop("ro.boot_completed", "1"));
+        assert!(!is_boot_completed_prop("service.boot_completed", "1"));
+        assert!(!is_boot_completed_prop("dev.bootcomplete", "1"));
+        // wrong value on the right key
+        assert!(!is_boot_completed_prop("sys.boot_completed", ""));
+        // wrong everything
+        assert!(!is_boot_completed_prop("init.svc.zygote", "running"));
+        // empty name guard
+        assert!(!is_boot_completed_prop("", "1"));
+    }
+
+    #[test]
+    fn z305_prop_msg_parsing_feeds_the_bridge() {
+        // End-to-end predicate contract: a REAL bionic classic prop_msg
+        // (128 B: cmd=1, name@4, value@36) carrying sys.boot_completed=1
+        // must parse through parse_prop_msg and satisfy the bridge.
+        let mut frame = [0u8; 128];
+        frame[0] = 1; // PROP_MSG_SETPROP
+        let name = b"sys.boot_completed";
+        frame[4..4 + name.len()].copy_from_slice(name);
+        let value = b"1";
+        frame[36..36 + value.len()].copy_from_slice(value);
+        let (name, value) = parse_prop_msg(&frame).expect("classic prop_msg must parse");
+        assert!(is_boot_completed_prop(&name, &value));
+
+        // ...and the negative: a setprop of a DIFFERENT property on the
+        // same wire must parse fine but NOT trip the bridge.
+        let mut frame2 = [0u8; 128];
+        frame2[0] = 1;
+        let name2 = b"init.svc.zygote";
+        frame2[4..4 + name2.len()].copy_from_slice(name2);
+        let value2 = b"running";
+        frame2[36..36 + value2.len()].copy_from_slice(value2);
+        let (name2, value2) = parse_prop_msg(&frame2).expect("classic prop_msg must parse");
+        assert!(!is_boot_completed_prop(&name2, &value2));
     }
 }
