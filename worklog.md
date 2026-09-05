@@ -24732,3 +24732,19 @@ Work Log:
 
 Stage Summary:
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 6-Z300 — IVibrator.perform answers the .aidl duration/0 semantics + forwards REAL host haptics
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+- Authentication is provided through the private agent environment.
+
+Work Log:
+- Authentication is provided through the private agent environment.
+- PUSHED the 6-Z298/299 backlog: 7c7046d..3cc33f3 → origin/main (aede0a7 virtual IHealth AIDL V4, b26e83e/9df6f07 docs, d85315a virtual_fallback restore, 3cc33f3 worklog). Auto lint+test on 3cc33f3: SUCCESS (33963351484).
+- VERIFICATION WAVE dispatched on 3cc33f3 (standing rule honored: checked the run list first, zero existing E2E runs on 3cc33f3, dispatched exactly one wave): runs 33963410035 / 33963412329 / 33963411361 (lineage-22.2-sailfish + TWRP 3.7.0 angler + OrangeFox R12.0 lavender via scripts/recovery-corpus/dispatch_by_name.sh, GITHUB_TOKEN passed in-memory). First run completed SUCCESS within ~13 min; two in progress at commit time.
+- 6-Z300 (8790777): the fox R12 decode named IVibrator as the client-facing gap. perform(Effect, EffectStrength, cb?) used to answer EX_UNSUPPORTED_OPERATION — DISHONEST per android-13 IVibrator.aidl ("@return The duration of the predefined effect in milliseconds, or 0 if the effect is not supported"). A bare exception breaks TWRP-12.1's SYNCHRONOUS tap-haptic client (events.cpp treats a failed transaction like a dead HAL and re-waits — the R12 touch-latency queue item). Now: the 8 non-deprecated android-13 effects (CLICK/THUD/TEXTURE_TICK/TICK/LOW_TICK/POP/HEAVY_CLICK/SPINNER) map to synthetic one-shots (8-40 ms base × LIGHT 0.8 / MEDIUM 1.0 / STRONG 1.2), each forwarded to the host app over the existing TWOYI_VIBRATE bridge for a REAL vibration, and the reply carries the honest duration. Unsupported (deprecated RINGTONE_* slots, out of range) → 0 ms + status OK, never an exception. getSupportedEffects lists exactly the synthetic set (was: empty — clients gating perform() on it never vibrated). Caps stay 0 (no callback/amplitude promises).
+- Tests: z300_perform_answers_duration_not_exception (CLICK/MEDIUM=20, LIGHT=16, STRONG=24, whole set non-zero, 7 unsupported shapes → 0+OK) + z300_get_supported_effects_lists_the_synthetic_set (byte-precise array shape). 730 green (+2), fmt + clippy -D warnings clean.
+
+Stage Summary:
+- Local HEAD 8790777 (1 commit ahead of origin/main; PUSH PENDING until the wave completes — E2E checkouts ref=main). Wave on 3cc33f3 in flight. Next: push 8790777 + worklog after wave; decode the wave's fox/lineage logs (expect "IVibrator.perform(effect=N strength=M) → X ms host" on tap events; IHealth GetBatteryInfo lines); remaining queue: keystore2 timing, R12 touch-latency re-measure with the honest perform path.
