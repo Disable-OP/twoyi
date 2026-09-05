@@ -24679,3 +24679,19 @@ Work Log:
 
 Stage Summary:
 - Every guest-side unknown in the lineage touch path is now CLEARED statically and dynamically: gate1048=0, rot=0, tap gate reachable, queue healthy, callback processes the full MT protocol, keys work end-to-end. The ONLY remaining reason for frame_delta=0 is interference — now removed at the source. Wave 3 (3cc21d8) is the clean experiment: if the tap on Apply-update still fails to redraw, the probe's own state lines name the failing branch in the same round.
+
+---
+Task ID: 6-Z297c — INPUT SAGA CLOSED: touch PROVEN interactive end-to-end (tap activated Apply update -> adb sideload); probe verdict fixed
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: decode wave 3 (3cc21d8 lineage + TWRP guard), fix the probe's verdict measurement.
+
+Work Log:
+- Wave 3 lineage (run 33957458252): baseline = PRISTINE AOSP menu (the 6-Z297b ui-navigate AOSP early-out worked — zero interference). Tap 1 at (360,769) = "Apply update" row ACTIVATED the row: the guest rendered the adb-sideload screen ("Now send the package you want to apply to the device with \"adb sideload <filename>\"..."). cap_differs=true. THE FULL TOUCH PATH IS PROVEN END-TO-END: app frame -> bridge -> guest evdev -> minui ev_get_input -> OnInputEvent MT state machine -> OnTouchRelease tap detect -> EnqueueTouch -> WaitInputEvent -> ShowMenu -> SelectMenu(Point) -> row hit -> ACTION.
+- kr64 probe final hit (+46.75s): qlen=2 (EnqueueTouch live), touch_x/y=(360,769) 1:1, start==last (perfect tap gate satisfied), gate1048=0, rot=0, menu geometry POPULATED (menu_left=-72/menu_w=120/menu_top=180/menu_h=120 — SelectMenu(Point) ran and lazily initialized them from rendered surfaces).
+- TWRP guard (run 33957459106): BOOT_OK + UI_READY + battery TRUE + vfs CLEAN — harness changes harmless to TWRP.
+- Measurement fixes (8401493): probe interactive now includes cap_differs_after_taps (screencap hash = ground truth; the blit-counter source was unavailable that run); INPUT_READS_RE fixed — the hook's line is "INPUT raw read(fd=10, count=24) -> 24" and the old pattern's \) right after fd=\d+ matched NOTHING (channels_used=[] in every past run was this stale regex, not silent drops).
+- LINEAGE VERDICT HISTORY REWRITTEN: every past "SPLASH_HANG/frame_delta=0" on lineage was a harness artifact (probe ordering, gate gestures, TWRP nav chain wandering the menu, stale regexes). The guest input stack (loader path) is FULLY FUNCTIONAL for keys AND touch.
+
+Stage Summary:
+- HEAD 8401493. Corpus: lineage TOUCH-INTERACTIVE (proven by activation), TWRP UI_READY, R12 last verified green at 47dafeb (input stack untouched since; the kr64 probe changes are read-only). The lineage input saga (6-Z272..6-Z297) is CLOSED. Remaining queued work: host HAL bridge depth (torch/sensors/props), battery 0%+ on lineage header, keystore2/device-mapper timing, R12 touch-latency comparison. Cron webDevReview (job 359061, fixed_rate 3600s, priority 15) continues from repo state.
