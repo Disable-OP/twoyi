@@ -7048,6 +7048,8 @@ fn forget_dead_pid_state(
     z296_epoll_add_logged: &mut std::collections::HashMap<libc::pid_t, u32>,
     z296_read_hits: &mut std::collections::HashMap<libc::pid_t, u32>,
     z296_maps_dumped: &mut std::collections::HashSet<libc::pid_t>,
+    z296_epoll_data: &mut std::collections::HashMap<(libc::pid_t, i64), u64>,
+    z296_seen_headers: &mut std::collections::HashSet<(u64, u64, u64, u64, i64)>,
 ) {
     // 6-Z184 AUDIT FIX (agent 11): the death hygiene missed ~10 per-pid
     // maps — a pid-RECYCLED successor inherited stale state (e.g. a
@@ -7074,6 +7076,8 @@ fn forget_dead_pid_state(
     z296_epoll_add_logged.remove(&pid);
     z296_read_hits.remove(&pid);
     z296_maps_dumped.remove(&pid);
+    z296_epoll_data.retain(|(p, _), _| *p != pid);
+    z296_seen_headers.clear();
     // 6-Z271b: a stale entry would make the recycled pid's FIRST EXIT
     // consume a synthetic-uevent delivery with OLD buffers — POKEDATA
     // into an unrelated process's memory. Must go with the process.
@@ -12145,6 +12149,17 @@ pub fn run_ptrace_loop(
     // pids whose maps were already fully dumped (once per pid).
     let mut z296_maps_dumped: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // (tgid, fd) -> epoll data payload recorded at ADD — at probe-hit
+    // time we dump the words AT that pointer: it is the DISPATCH OBJECT
+    // the guest's epoll_wait will hand back (minui's fd_info / event
+    // forwarder), the link between the registration and the drop site.
+    let mut z296_epoll_data: std::collections::HashMap<(libc::pid_t, i64), u64> =
+        std::collections::HashMap::new();
+    // header-line dedup: identical (sp,pc,lr,fp,fd) hits have identical
+    // stacks — log the FIRST of each shape, skip the rest (the +23 s
+    // boot-time reads must not burn the cap before the +120 s probe).
+    let mut z296_seen_headers: std::collections::HashSet<(u64, u64, u64, u64, i64)> =
+        std::collections::HashSet::new();
     // 6-Z163b: counter for the bind-rewrite skip DIAG (first 12 skips log
     // the reason + the first 16 blob bytes — run 32990637557's silent
     // skip of init's property bind made the miss invisible).
@@ -13164,6 +13179,8 @@ pub fn run_ptrace_loop(
                 &mut z296_epoll_add_logged,
                 &mut z296_read_hits,
                 &mut z296_maps_dumped,
+                &mut z296_epoll_data,
+                &mut z296_seen_headers,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
@@ -13357,6 +13374,8 @@ pub fn run_ptrace_loop(
                 &mut z296_epoll_add_logged,
                 &mut z296_read_hits,
                 &mut z296_maps_dumped,
+                &mut z296_epoll_data,
+                &mut z296_seen_headers,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
@@ -16094,6 +16113,11 @@ pub fn run_ptrace_loop(
                                     if op == 1 {
                                         let tgid = z296_tgid_of(pid, &mut z296_tgid_cache);
                                         z296_epoll_members.entry(tgid).or_default().insert(add_fd);
+                                        // remember the data payload for the
+                                        // probe-hit dispatch-object dump.
+                                        if let Some(d) = data {
+                                            z296_epoll_data.insert((tgid, add_fd), d);
+                                        }
                                     }
                                     let logged = z296_epoll_add_logged.entry(pid).or_insert(0);
                                     *logged = logged.saturating_add(1);
@@ -16120,6 +16144,7 @@ pub fn run_ptrace_loop(
                                     if let Some(set) = z296_epoll_members.get_mut(&tgid) {
                                         set.remove(&add_fd);
                                     }
+                                    z296_epoll_data.remove(&(tgid, add_fd));
                                     log(&format!(
                                         "6-Z296 epoll_ctl DEL pid={} tgid={} epfd={} fd={}",
                                         pid, tgid, epfd, add_fd
@@ -19680,85 +19705,158 @@ pub fn run_ptrace_loop(
                                         *hits = hits.saturating_add(1);
                                         *hits
                                     };
-                                    if z296_occ <= 6 {
+                                    if z296_occ <= 24 {
                                         let z296_sp = get_syscall_arg(&regs, abi.reg_sp);
                                         let z296_pc = get_syscall_arg(&regs, 32);
                                         let z296_lr = get_syscall_arg(&regs, 30);
                                         let z296_fp = get_syscall_arg(&regs, 29);
                                         let z296_x28 = get_syscall_arg(&regs, 28);
-                                        let z296_comm =
-                                            std::fs::read_to_string(format!("/proc/{}/comm", pid))
-                                                .unwrap_or_else(|_| "?".to_string());
-                                        let z296_tgid = std::fs::read_to_string(format!(
-                                            "/proc/{}/status",
-                                            pid
-                                        ))
-                                        .ok()
-                                        .and_then(|s| {
-                                            s.lines().find(|l| l.starts_with("Tgid:")).and_then(
-                                                |l| {
-                                                    l.split(':')
-                                                        .nth(1)
-                                                        .and_then(|v| v.trim().parse::<i64>().ok())
-                                                },
-                                            )
-                                        })
-                                        .unwrap_or(-1);
-                                        log(&format!(
-                                            "6-Z296 INPUT-READ hit #{}: pid={} tgid={} comm={:?} fd={} ret={} sp={:#x} pc={:#x} lr={:#x} fp={:#x} x28={:#x}",
+                                        // maps FIRST (annotation source for the
+                                        // header regs, the stack, the chain and
+                                        // the dispatch objects); full dump once.
+                                        let z296_maps =
+                                            std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                                .unwrap_or_default();
+                                        let z296_triples = z296_maps_triples(&z296_maps);
+                                        let z296_ann = |w: u64| -> String {
+                                            z296_annotate(w, &z296_triples)
+                                                .map(|n| format!("[{}]", n))
+                                                .unwrap_or_default()
+                                        };
+                                        // Header dedup: identical (sp,pc,lr,fp,fd)
+                                        // ⇒ identical stack — log only the first
+                                        // of each shape (boot-time spam must not
+                                        // burn the cap before the probe window).
+                                        let z296_hdr =
+                                            (z296_sp, z296_pc, z296_lr, z296_fp, z296_fd);
+                                        if z296_seen_headers.insert(z296_hdr) {
+                                            let z296_comm = std::fs::read_to_string(format!(
+                                                "/proc/{}/comm",
+                                                pid
+                                            ))
+                                            .unwrap_or_else(|_| "?".to_string());
+                                            log(&format!(
+                                            "6-Z296 INPUT-READ hit #{}: pid={} tgid={} comm={:?} fd={} ret={} sp={:#x}{} pc={:#x}{} lr={:#x}{} fp={:#x}{} x28={:#x}{}",
                                             z296_occ,
                                             pid,
                                             z296_tgid,
                                             z296_comm.trim_end(),
                                             z296_fd,
                                             z296_ret,
-                                            z296_sp,
-                                            z296_pc,
-                                            z296_lr,
-                                            z296_fp,
-                                            z296_x28
+                                            z296_sp, z296_ann(z296_sp),
+                                            z296_pc, z296_ann(z296_pc),
+                                            z296_lr, z296_ann(z296_lr),
+                                            z296_fp, z296_ann(z296_fp),
+                                            z296_x28, z296_ann(z296_x28),
                                         ));
-                                        // maps snapshot: annotation source + full
-                                        // dump ONCE per pid (the recovery maps
-                                        // name every loaded input-related lib).
-                                        let z296_maps =
-                                            std::fs::read_to_string(format!("/proc/{}/maps", pid))
-                                                .unwrap_or_default();
-                                        let z296_triples = z296_maps_triples(&z296_maps);
-                                        if z296_maps_dumped.insert(pid) {
-                                            log(&format!("6-Z296 maps for pid={} (once):", pid));
-                                            for line in z296_maps.lines() {
-                                                log(&format!("  6-Z296 MAPS: {}", line));
+                                            if z296_maps_dumped.insert(pid) {
+                                                log(&format!(
+                                                    "6-Z296 maps for pid={} (once):",
+                                                    pid
+                                                ));
+                                                for line in z296_maps.lines() {
+                                                    log(&format!("  6-Z296 MAPS: {}", line));
+                                                }
                                             }
-                                        }
-                                        // Stack walk: 96 words ABOVE sp — the
-                                        // return chain (read wrapper frame →
-                                        // ev_get_input → its caller → ...).
-                                        let z296_stack =
-                                            z296_dump_words(pid, z296_sp, 96, &z296_triples);
-                                        log(&format!(
-                                            "6-Z296 stack@sp+0..768: {}",
-                                            z296_stack.join(" ")
-                                        ));
-                                        // minui per-fd info array (lineage
-                                        // librecovery_ui.so: .bss+0x5d1f0,
-                                        // 64-byte stride — fd_info/callback
-                                        // slots; 3 entries = 192 bytes).
-                                        if let Some(z296_base) =
-                                            z296_lib_base(&z296_triples, "librecovery_ui.so")
-                                        {
-                                            let z296_ctx = z296_dump_words(
-                                                pid,
-                                                z296_base + 0x5d1f0,
-                                                24,
-                                                &z296_triples,
-                                            );
+                                            // Stack walk: 192 words ABOVE sp — run
+                                            // 33944873040 showed fp-sp = 0x400: the
+                                            // caller frames sit above the 0x300
+                                            // window the first version dumped.
+                                            let z296_stack =
+                                                z296_dump_words(pid, z296_sp, 192, &z296_triples);
                                             log(&format!(
-                                                "6-Z296 ctx@{:#x}+0x5d1f0 (24 words): {}",
-                                                z296_base,
-                                                z296_ctx.join(" ")
+                                                "6-Z296 stack@sp+0..1536: {}",
+                                                z296_stack.join(" ")
                                             ));
-                                        }
+                                            // Frame-pointer chain: aarch64 frames are
+                                            // [saved_fp, saved_lr] pairs — walk the
+                                            // REAL call chain (not window guessing),
+                                            // 24 hops with <gap> markers.
+                                            {
+                                                let mut z296_chain: Vec<String> = Vec::new();
+                                                let mut z296_cur = z296_fp;
+                                                for k in 0..24 {
+                                                    if z296_cur == 0 {
+                                                        z296_chain.push(format!("#{}:<end>", k));
+                                                        break;
+                                                    }
+                                                    let saved_fp = read_child_u64(pid, z296_cur);
+                                                    let saved_lr = read_child_u64(
+                                                        pid,
+                                                        z296_cur.wrapping_add(8),
+                                                    );
+                                                    match (saved_fp, saved_lr) {
+                                                        (Some(nf), Some(l)) => {
+                                                            z296_chain.push(format!(
+                                                                "#{} lr={:#x}{} fp={:#x}",
+                                                                k,
+                                                                l,
+                                                                z296_ann(l),
+                                                                nf
+                                                            ));
+                                                            // fp-chain sanity: the chain
+                                                            // must walk UPWARD (or to 0).
+                                                            if nf <= z296_cur {
+                                                                z296_chain.push(
+                                                                    "#:<stop-nonrising>"
+                                                                        .to_string(),
+                                                                );
+                                                                break;
+                                                            }
+                                                            z296_cur = nf;
+                                                        }
+                                                        _ => {
+                                                            z296_chain
+                                                                .push(format!("#{}:<gap>", k));
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                log(&format!(
+                                                    "6-Z296 fp-chain from fp={:#x}: {}",
+                                                    z296_fp,
+                                                    z296_chain.join(" ")
+                                                ));
+                                            }
+                                            // Dispatch objects: the epoll data payload
+                                            // recorded at ADD for THIS fd — the guest's
+                                            // epoll_wait hands THIS pointer back (dump
+                                            // 8 words), plus the minui ctx entry slots
+                                            // (64-byte stride @ .bss+0x5d1f0, run
+                                            // 33944873040: entry[0]=fd 9, entry[1]=fd
+                                            // 10, word2/3 = fn ptrs).
+                                            if let Some(z296_dptr) =
+                                                z296_epoll_data.get(&(z296_tgid, z296_fd)).copied()
+                                            {
+                                                if z296_dptr != 0 {
+                                                    let z296_dobj = z296_dump_words(
+                                                        pid,
+                                                        z296_dptr,
+                                                        8,
+                                                        &z296_triples,
+                                                    );
+                                                    log(&format!(
+                                                    "6-Z296 dispatch-obj@{:#x} (epoll data, fd={}): {}",
+                                                    z296_dptr, z296_fd, z296_dobj.join(" ")
+                                                ));
+                                                }
+                                            }
+                                            if let Some(z296_base) =
+                                                z296_lib_base(&z296_triples, "librecovery_ui.so")
+                                            {
+                                                let z296_ctx = z296_dump_words(
+                                                    pid,
+                                                    z296_base + 0x5d1f0,
+                                                    24,
+                                                    &z296_triples,
+                                                );
+                                                log(&format!(
+                                                    "6-Z296 ctx@{:#x}+0x5d1f0 (24 words): {}",
+                                                    z296_base,
+                                                    z296_ctx.join(" ")
+                                                ));
+                                            }
+                                        } // header-dedup else-end
                                     }
                                 }
                             }
@@ -31834,6 +31932,10 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             std::collections::HashMap::new();
         let mut z296_maps_dumped: std::collections::HashSet<libc::pid_t> =
             std::collections::HashSet::new();
+        let mut z296_epoll_data: std::collections::HashMap<(libc::pid_t, i64), u64> =
+            std::collections::HashMap::new();
+        let mut z296_seen_headers: std::collections::HashSet<(u64, u64, u64, u64, i64)> =
+            std::collections::HashSet::new();
         let pid: libc::pid_t = 4242;
         in_syscall_map.insert(pid, true);
         pending_uevent_recv.insert(
@@ -31862,6 +31964,8 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         z296_epoll_add_logged.insert(pid, 1);
         z296_read_hits.insert(pid, 3);
         z296_maps_dumped.insert(pid);
+        z296_epoll_data.insert((pid, 9), 0x1000);
+        z296_seen_headers.insert((1, 2, 3, 4, 9));
         // Sanity: all four maps have the pid entry before cleanup
         // (5 = a real kernel fd, 0x6b000000+ = synthetic fake fds).
         fake_propserv_fds.entry(pid).or_default().insert(5);
@@ -31890,6 +31994,8 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             &mut z296_epoll_add_logged,
             &mut z296_read_hits,
             &mut z296_maps_dumped,
+            &mut z296_epoll_data,
+            &mut z296_seen_headers,
         );
         // All four maps no longer have the pid entry — pid-RECYCLED
         // successor inherits NOTHING.
@@ -31911,6 +32017,8 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!z296_epoll_add_logged.contains_key(&pid));
         assert!(!z296_read_hits.contains_key(&pid));
         assert!(!z296_maps_dumped.contains(&pid));
+        assert!(!z296_epoll_data.contains_key(&(pid, 9)));
+        assert!(!z296_seen_headers.contains(&(1, 2, 3, 4, 9)));
         assert!(!pending_getpid.contains(&pid));
         // 6-Z271b: the in-flight uevent-recv rewrite must die with the
         // process (a stale entry would POKEDATA the recycled pid's
