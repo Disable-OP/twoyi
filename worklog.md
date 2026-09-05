@@ -24881,3 +24881,57 @@ Work Log:
 
 Stage Summary:
 - origin/main 99ea97c + worklog commit. FIVE families UI_READY with deep nav. Remaining queue: client-side decrypt exercise (IKeystoreSecurity client transactions), pr-tier promotion candidate for pbrp/shrp entries. Cron webDevReview (job 359061) continues from repo state.
+
+---
+Task ID: 6-Z305 — mission pivot: PURE UNMODIFIED stock Android 11 rootfs + the generic full-Android boot path
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-06
+Task: (user directive) the Android 8.1 rootfs is heavily modified and "bypasses everything to just boot" — pure unmodified ROMs only, pure stock Android 11 rootfs. Implement the generic full-Android boot path (tar symlink import, full-Android routing, honest boot bridge), source + vendor the pure rootfs, build the boot-ladder CI instrument, dispatch the first boot attempt.
+
+Work Log:
+- Wave 1 (generic blockers, commits 76ee6ba + d72badf + 541fb77 + bc73f92, lint+test GREEN):
+  * fix(importer): extractTarJava wrote tar symlink entries (typeflag 2) as EMPTY REGULAR FILES — every
+    tar/tar.gz full-Android rootfs imported CORRUPT (hundreds of dead symlinks; boot died at the guest
+    linker, not at import). Symlinks now write the same .symlink sidecar the cpio importer always used;
+    hardlinks resolve against extracted content with a logged empty-file fallback. Manifest gains .gz /
+    doubled pathPattern arms so .tar.gz packages open the importer (gzip detected by magic).
+  * fix(android-boot): isTwrpLayout() returns TRUE for a full-Android rootfs (/init regular file) and
+    silently routed Android down the recovery fb-hook path. isFullAndroidLayout() detects full-Android
+    STRUCTURALLY (framework.jar + app_process64 + /init, no recovery binary) and wins in autoSetBootRecovery;
+    recovery semantics untouched.
+  * fix(kr64): real-Android BOOT_COMPLETED bridge — when the guest init REALLY sets sys.boot_completed=1
+    on the 6-Z110/6-Z111 emulated property wire, spawn_boot_completed_sender() notifies BootCompletionServer
+    over @TWOYI_SOCK/@TWOYI_BOOT_SOCK (6-Z62 SOCK_SEQPACKET recipe, one-shot, detached). Honest semantics:
+    no property flip → no message → honest 300s boot-gate timeout. Predicate unit-tested against near-misses.
+  * E0521/E0382 fixes in spawn_boot_completed_sender (own the reason string before the 'static spawn).
+- Wave 2 (pure stock Android 11 rootfs):
+  * 8.1 audit: fingerprint Android/twoyi_arm64/twoyi_arm64:8.1.0, STATIC init, custom product — confirmed
+    modified from-source build; retired from boot testing per user directive.
+  * Sourced PURE stock Android 11: official Google SDK sys-img arm64-v8a-30_r02.zip
+    (sha256 cb50112c...; fingerprint Android/sdk_phone_arm64/emulator_arm64:11/RSR1.210722.013.A4,
+    TagId=default = pure AOSP, no GMS). GSI direct links were license-gated; ci.android.com unreachable
+    from the sandbox; the SDK image IS pure AOSP (goldfish flavor is stock AOSP source).
+  * scripts/assemble-android11-rootfs.py: ZERO-MODIFICATION rootfs assembler — pure-python cpio-newc +
+    minimal read-only ext4 reader (extents, htree dx walk, fast/slow symlinks) with BYTE-EXACT symlink
+    targets (7zz's ext4 extraction REWRITES absolute targets → corrupts the ROM; it is used ONLY for
+    GPT/super → dynamic partitions). Assembly = mount topology only: system-as-root image root at /
+    (ramdisk overlay wins, dirs merge) + system_ext/product/vendor at their mountpoints. Sanity gate +
+    ROOTFS_MANIFEST.json provenance (all input sha256s). Output verified: 432 real symlinks preserved in
+    the GNU tar, framework.jar/app_process64/init present, release=11.
+  * Vendored as release android11-aosp-arm64-rsr1 (twoyi-android11-aosp-arm64-rsr1.tar.gz + manifest).
+- Wave 3 (CI instrument):
+  * scripts/android-boot-classify.py: the mission's boot milestone ladder as a machine-readable classifier
+    (IMPORT_FAIL → ROOTFS_READY → INIT_STARTED → PROPERTY_SERVICE → CORE_DAEMONS → ZYGOTE → SYSTEM_SERVER →
+    SURFACEFLINGER → SYSTEMUI_LAUNCHER → BOOT_COMPLETED), evidence-cited, blocker forensics, honest note:
+    BOOT_COMPLETED rung fires ONLY on the real bridge.
+  * scripts/ui-navigate.py: generic knobs TWOYI_ROM_FILE + TWOYI_IMPORT_WAIT_SECONDS (defaults = the
+    recovery flow, byte-for-byte).
+  * .github/workflows/ui-e2e-android-arm64.yml: two-job arm64 redroid E2E — downloads the vendored rootfs,
+    REJECTS it if provenance (official SDK zip sha256) mismatches, imports via the .tar.gz path, boots the
+    GL path, dumps the full evidence bundle, classifies the ladder; expect_rung input gates a minimum rung.
+
+Stage Summary:
+- The container now has a REAL full-Android boot path and a PURE stock Android 11 payload. Next: dispatch
+  ui-e2e-android-arm64.yml, read the boot timeline from the artifacts, fix the earliest real blocker
+  generically (Stage A→H order), regression-test recoveries. Recovery suites (5 families UI_READY) remain
+  the regression guard. Cron webDevReview continues.

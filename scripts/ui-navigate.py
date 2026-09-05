@@ -1238,6 +1238,14 @@ def main():
     # wait is just for the TWRP render itself. 30s is generous: redroid
     # arm64 is native and TWRP is a ramdisk-only guest.
     boot_wait = int(os.environ.get("BOOT_WAIT_SECONDS", "30"))
+    # 6-Z305: the ROM file to open + import-wait budget are generic knobs.
+    # Defaults preserve the recovery flow byte-for-byte (recovery.img, 120s);
+    # the full-Android rootfs boot workflow sets TWOYI_ROM_FILE=rootfs.tar.gz
+    # (matched by the .tar.gz intent-filter arm added in 6-Z305) and raises
+    # the import wait (a ~494MB tar.gz with 432 symlinks extracts for
+    # minutes on redroid).
+    rom_file = os.environ.get("TWOYI_ROM_FILE", "recovery.img")
+    import_wait_seconds = int(os.environ.get("TWOYI_IMPORT_WAIT_SECONDS", "120"))
 
     # ─────────────────────────────────────────────
     # Step 1: Launch app
@@ -1382,7 +1390,7 @@ def main():
     #                    apps also match the filter. This makes the test
     #                    deterministic.
     am_cmd = ('am start -a android.intent.action.VIEW '
-              '-d "file:///sdcard/Download/recovery.img" '
+              f'-d "file:///sdcard/Download/{rom_file}" '
               '-t "*/*" '
               f'-n {PACKAGE}/io.twoyi.ui.SettingsActivity')
     print(f"  $ adb shell {am_cmd}")
@@ -1423,9 +1431,9 @@ def main():
     # ─────────────────────────────────────────────
     print()
     print("=" * 60)
-    print("  Step 4: Wait for ROM import (up to 120s)")
+    print(f"  Step 4: Wait for ROM import (up to {import_wait_seconds}s)")
     print("=" * 60)
-    for i in range(60):
+    for i in range(max(1, import_wait_seconds // 2)):
         wait(2)
         xml = dump_ui(f"05_import_wait_{i}")
         root = parse_ui(xml)
