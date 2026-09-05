@@ -1957,26 +1957,75 @@ def main():
         gate_bytes = b"" if no_gate_family else _shot_bytes("term-00-gate")
         menu_confirmed = False
         global _FORCE_SENDEVENT
+        # 6-Z304: the gate page is NOT one control — three decoded layouts:
+        #   * TWRP classic (angler 3.7.0, the 6-Z186 VLM decode): bottom
+        #     slider, track center y 0.88, x span 0.06..0.94.
+        #   * PitchBlack 4.0 (ginkgo run 33975054171 term-07 screenshot,
+        #     grid-measured on the 720x1600 frame): "Keep Read Only"
+        #     BUTTON x 72..348 y 1176..1266 → tap (0.29, 0.763); "Swipe to
+        #     Allow Modification" slider track y 1305..1437, handle x
+        #     55..198 → drag (0.175, 0.857) -> (0.93, 0.857). The legacy
+        #     y-0.88 swipe starts at 0.10 INSIDE the handle and crosses
+        #     the track — yet had ZERO effect in 6 rounds (fast 350 ms
+        #     drag vs PBRP's slider gesture detector) — the run burned
+        #     its whole gate budget and died UI_HANG on this page.
+        #   * SHRP v3.1 (starlte wave-3 run 33976820237 term-00-gate
+        #     screenshot): NO slider at all — orange confirm button
+        #     center (0.845, 0.853), purple cancel above (0.845, 0.762).
+        #     A horizontal swipe crosses the button but never taps it.
+        # Ladder semantics: one rung per round, page markers as feedback.
+        # Cross-layout hits are all no-ops (tap-on-track / tap-on-empty),
+        # so a fixed ladder is safe for every family. main/main2/
+        # clear_vars are the post-gate menu pages (clear_vars forwards
+        # straight to main2 — SHRP walks gate->clear_vars->main2).
+        GATE_MENU_PAGES = ("main2", "main", "clear_vars")
+        rungs = [
+            ("tap", (0.845, 0.853)),                 # SHRP confirm ✓
+            ("tap", (0.29, 0.763)),                  # PBRP Keep Read Only
+            ("swipe", (0.175, 0.857, 0.93, 0.857)),  # PBRP slider
+            ("swipe", (0.10, 0.88, 0.90, 0.88)),     # TWRP classic slider
+        ]
+        if "Starting PitchBlackRecovery" in rec_head:
+            # PBRP: button first (definitive), then its slider, then the
+            # classic fallback.
+            rungs = [rungs[1], rungs[2], rungs[3], rungs[0]]
+
+        def _gate_advanced():
+            pages = _pages()
+            return any(p in GATE_MENU_PAGES and pos > gate_pos
+                       for pos, p in pages)
+
         # 6-Z251e: the read-only slider only exists on the TWRP gate —
         # for no-gate families go straight to the settle check below.
-        for i in range(0 if no_gate_family else 6):
-            y = int(SCREEN_H * 0.88)
-            input_cmd(f"input swipe {int(SCREEN_W * 0.10)} {y} "
-                      f"{int(SCREEN_W * 0.90)} {y} 350")
+        for i in range(0 if no_gate_family else 8):
+            kind, args = rungs[i % len(rungs)]
+            if kind == "tap":
+                fx, fy = args
+                x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
+                print(f"  [gate] rung {i % len(rungs)}: tap ({x},{y})")
+                input_cmd(f"input tap {x} {y}")
+            else:
+                fx0, fy0, fx1, fy1 = args
+                x0, y0 = int(SCREEN_W * fx0), int(SCREEN_H * fy0)
+                x1, y1 = int(SCREEN_W * fx1), int(SCREEN_H * fy1)
+                print(f"  [gate] rung {i % len(rungs)}: "
+                      f"swipe ({x0},{y0})->({x1},{y1})")
+                input_cmd(f"input swipe {x0} {y0} {x1} {y1} 600")
             wait(3.0)
             dismiss_fullscreen_overlay("post-swipe")
-            pages = _pages()
-            if any(p == "main2" and pos > gate_pos for pos, p in pages):
+            if _gate_advanced():
                 menu_confirmed = True
+                print(f"  [gate] advanced past gate after rung "
+                      f"{i % len(rungs)}")
                 break
             if i == 1:
-                # iter-10: TWO swipe rounds produced no new page marker.
+                # iter-10: TWO rounds produced no new page marker.
                 # Either the gate needs a different gesture or docker
                 # `input` is silently dead (rc=0 no-op — runs 33108190303,
                 # 33110255428). Escalate to kernel-level sendevent NOW.
                 cur = _shot_bytes("term-00b-swipe-effect")
                 if cur == gate_bytes:
-                    print("  [input] swipe rounds show ZERO effect — "
+                    print("  [input] gate rounds show ZERO effect — "
                           "escalating to sendevent-only input")
                     _FORCE_SENDEVENT = True
         # Settle-wait: markers may lag; require visual stability.
@@ -1991,10 +2040,15 @@ def main():
                     break
                 prev = cur
             pages = _pages()
-            if any(p == "main2" and pos > gate_pos for pos, p in pages):
+            # 6-Z304: accept any post-gate menu page (main/main2/
+            # clear_vars), matching the ladder's feedback predicate —
+            # SHRP walks gate->clear_vars->main2 and a clear_vars-only
+            # window raced the old main2-only check.
+            if any(p in GATE_MENU_PAGES and pos > gate_pos
+                   for pos, p in pages):
                 menu_confirmed = True
                 if i >= 3:
-                    print("  main2 marker present; proceeding")
+                    print("  post-gate menu marker present; proceeding")
                 break
             wait(3)
         if not menu_confirmed:
