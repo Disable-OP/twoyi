@@ -1682,11 +1682,52 @@ def main():
         f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",               # 2: center
         f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",               # 3: center
     ]
+
+    # ── 6-Z297: AOSP-layout EARLY-OUT ──
+    # The gate-feeding gestures (and the >120 s "safe" rotation: CENTER
+    # TAPS + BACK) are TWRP tools. On a minui/AOSP-layout recovery the
+    # center tap lands INSIDE the rendered menu (720x1600: (360,800) is
+    # the "Apply update" row) and a tap on a menu row drives ScreenRe-
+    # coveryUI's touch-menu state machine — run 6a6b789's guest walked
+    # itself into "Reboot system now" (guest log: "Rebooting..." at
+    # t=79 s) BEFORE ui-navigate-recovery-menu.py could tap anything,
+    # so the probe measured a dead menu again (frame_delta=0). The menu
+    # probe needs a PRISTINE menu: detect the AOSP layout (minui fbdev
+    # marker in the GUEST recovery log, zero TWRP pages — the exact
+    # classifier ui-navigate-recovery-menu.py uses) and stop feeding
+    # gestures; the dedicated probe owns everything after.
+    def aosp_layout_detected():
+        out = ""
+        for p in (f"/data/user/0/{PACKAGE}/rootfs/tmp/recovery.log",
+                  f"/data/user/0/{PACKAGE}/profiles/default/rootfs/tmp/recovery.log",
+                  f"/data/data/{PACKAGE}/rootfs/tmp/recovery.log"):
+            try:
+                r = subprocess.run(
+                    ["sudo", "docker", "exec", "redroid", "sh", "-c",
+                     f"tail -n 4000 '{p}' 2>/dev/null"],
+                    capture_output=True, text=True, timeout=15)
+                out = r.stdout or ""
+                if len(out) > 200:
+                    break
+            except Exception:
+                continue
+        has_minui_fb = bool(re.search(r"framebuffer: \d+ \(\d+ x \d+\)", out))
+        has_twrp_pages = bool(re.findall(r"Set page: '([^']+)'", out))
+        return has_minui_fb and not has_twrp_pages
+
+    aosp_bailed = False
+
     gesture_index = 0
     for i in range(max(1, boot_wait // 5)):
         wait(5)
         elapsed = (i + 1) * 5
         if elapsed % 10 == 0:
+            if aosp_layout_detected():
+                print(f"  [6-Z297] AOSP-layout recovery detected at {elapsed}s — "
+                      f"STOPPING gate gestures (menu must stay pristine for "
+                      f"ui-navigate-recovery-menu.py)")
+                aosp_bailed = True
+                break
             g = gesture_index % 4
             seq = gestures if elapsed <= 120 else gestures_safe
             input_cmd(seq[g])
@@ -1734,7 +1775,16 @@ def main():
     # The CI rootfs is disposable per-run; every tapped target here is
     # a navigation action, never a destructive confirm slider.
     # ─────────────────────────────────────────────
-    if os.environ.get("TWOYI_PROBE_SYSTEM_APP", "0") == "1":
+    # 6-Z297: the sandbox probe's chain (GOT IT -> gate swipe ->
+    # Advanced -> File Manager -> Terminal) is TWRP-navigation. On
+    # an AOSP-layout recovery it blind-taps the rendered MENU (the
+    # 6a6b789 run walked the guest into "Reboot system now" here).
+    # The minui menu has no File Manager; skip untouched.
+    if os.environ.get("TWOYI_PROBE_SYSTEM_APP", "0") == "1" and (
+            aosp_bailed or aosp_layout_detected()):
+        print("  [6-Z297] AOSP-layout recovery — skipping Step 8b "
+              "sandbox probe (TWRP-only navigation chain)")
+    elif os.environ.get("TWOYI_PROBE_SYSTEM_APP", "0") == "1":
         print()
         print("=" * 60)
         print("  Step 8c: sandbox-escape repro — EXACT physical-device chain")
