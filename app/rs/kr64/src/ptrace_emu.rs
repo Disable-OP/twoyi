@@ -7320,10 +7320,8 @@ static BOOT_COMPLETED_SENDER_STARTED: std::sync::atomic::AtomicBool =
 /// the pure-Android-11 boot died inside this sequence at libselinux's
 /// selinux_restorecon canonicalization — these counters keep the traces
 /// bounded while the failing leg names itself).
-static Z305C_OPEN_DIAG: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static Z305C_RL_DIAG: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static Z305C_OPEN_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static Z305C_RL_DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 6-Z305: spawn the detached BOOT_COMPLETED delivery thread.
 ///
@@ -20524,8 +20522,10 @@ pub fn run_ptrace_loop(
                                         .get(&pid)
                                         .cloned()
                                         .unwrap_or_default();
-                                    Z305C_OPEN_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if Z305C_OPEN_DIAG.load(std::sync::atomic::Ordering::Relaxed) <= 40 {
+                                    let n =
+                                        Z305C_OPEN_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
+                                    if n <= 40 {
                                         log(&format!(
                                             "6-Z305c realpath-trace: open orig={:?} translated={:?} -> {} ({}) (occurrence {})",
                                             orig,
@@ -20536,7 +20536,7 @@ pub fn run_ptrace_loop(
                                             } else {
                                                 "fd".to_string()
                                             },
-                                            Z305C_OPEN_DIAG.load(std::sync::atomic::Ordering::Relaxed),
+                                            n,
                                         ));
                                     }
                                 }
@@ -21113,8 +21113,9 @@ pub fn run_ptrace_loop(
                                     if rl_path.starts_with("/proc/self/fd")
                                         || rl_path.starts_with("/proc/self/cwd")
                                     {
-                                        Z305C_RL_DIAG
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        let n = Z305C_RL_DIAG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
                                         log(&format!(
                                             "6-Z305c realpath-trace: readlink {:?} -> {} ({}) (occurrence {})",
                                             rl_path,
@@ -21124,7 +21125,7 @@ pub fn run_ptrace_loop(
                                             } else {
                                                 "ok".to_string()
                                             },
-                                            Z305C_RL_DIAG.load(std::sync::atomic::Ordering::Relaxed),
+                                            n,
                                         ));
                                     }
                                 }
