@@ -1430,6 +1430,16 @@ struct inbr_slot {
                                  * faking still applies. 0 = legacy
                                  * TouchMessage stream this hook decodes. */
     unsigned ev_size;           /* 6-Z293: negotiated sizeof(input_event) */
+    int is_keys;                /* 6-Z294: 1 = THIS fd mimics the gpio-keys
+                                 * KEYBOARD device (EVIOCGID bustype=
+                                 * BUS_HOST, EVIOCGBIT(EV_KEY) advertises
+                                 * VOLUMEUP/VOLUMEDOWN/POWER, no ABS bits);
+                                 * 0 = the i2c touchscreen mirror. The
+                                 * classifier in minui's ev_init picks the
+                                 * device class PURELY from EVIOCGID's
+                                 * bustype — a zeroed id classified BOTH
+                                 * fds as keyboards and every record was
+                                 * dropped. */
     int next_tid;               /* monotonic Type-B tracking-id counter */
     int active_tid;             /* 0 = finger up */
     unsigned ring_len;          /* synthesized input_event bytes pending */
@@ -1876,6 +1886,12 @@ static int try_open_input_bridge(const char *path) {
     struct inbr_slot *slot = 0;
     int fd;
     int i;
+    /* 6-Z294: event1 mimics the gpio-keys KEYBOARD (volume/power keys);
+     * everything else (event0/event2/touch) is the touchscreen. minui
+     * classifies each device by EVIOCGID's bustype, so the two classes
+     * need different ioctl answers. */
+    int is_keys = (my_strcmp(path, "/dev/input/event1") == 0 ||
+                   my_strcmp(path, "event1") == 0);
 
     if (!is_input_path(path)) return -2;
 
@@ -1926,19 +1942,31 @@ static int try_open_input_bridge(const char *path) {
      * whichever read path the guest uses (hooked or real), the bytes
      * are already in the guest's native evdev format. */
     {
-        unsigned char hello[5];
+        unsigned char hello[6];
         hello[0] = 0xA5;
         hello[1] = 'T';
         hello[2] = 'W';
         hello[3] = 'I';
         hello[4] = (unsigned char)INBR_EV_SIZE;
+        /* 6-Z294: the device class rides in hello[5]. minui's ev_init
+         * classifies devices SOLELY by EVIOCGID's bustype (disassembled
+         * 0x36a90: byte0 & 0x22 → touch; BUS_I2C 0x18 needs the allow
+         * flag; zeroed id → keyboard) — so the hook mirrors REAL phone
+         * hardware: event0/touch = the i2c touchscreen (bustype 0x18),
+         * event1 = the gpio-keys keyboard (bustype 0x19 = BUS_HOST).
+         * The app routes touch frames to class-0 connections and key
+         * records to class-1 connections. */
+        hello[5] = (unsigned char)(is_keys ? 1 : 0);
         (void)raw_syscall3(SYS_write, fd, (long)hello, (long)sizeof(hello));
         slot->raw = 1;
         slot->ev_size = (unsigned)INBR_EV_SIZE;
+        slot->is_keys = is_keys ? 1 : 0;
         if (g_inbr_log_open < 8) {
             g_inbr_log_open++;
             write_str(2, "[twrp_fb_hook] INPUT bridge: hello sent (raw evdev, ev_size=");
             write_num(2, (int)INBR_EV_SIZE);
+            write_str(2, ", class=");
+            write_num(2, is_keys ? 1 : 0);
             write_str(2, ")\n");
         }
     }
@@ -2206,6 +2234,8 @@ static int input_ioctl(int fd, unsigned req, void *argp) {
     unsigned type = (req >> 8) & 0xffu;
     unsigned nr = req & 0xffu;
     unsigned size = (req >> 16) & 0x3fffu;
+    struct inbr_slot *s = inbr_slot_for(fd);
+    int is_keys = (s && s->is_keys) ? 1 : 0;
 
     (void)fd;
     if (type != 0x45u /* 'E' */ || !argp) return -2;   /* not ours */
@@ -2214,8 +2244,19 @@ static int input_ioctl(int fd, unsigned req, void *argp) {
         *(int *)argp = 0x010001;
         return 0;
     }
-    if (nr == 0x02u && size >= 8) {              /* EVIOCGID */
-        my_memset(argp, 0, 8);
+    if (nr == 0x02u && size >= 8) {              /* EVIOCGID — 6-Z294:
+         * minui's ev_init classifies the device SOLELY by
+         * input_id.bustype (disassembled 0x36a90: byte0 & 0x22 → touch,
+         * BUS_I2C 0x18 via the allow flag, ZEROED id → keyboard — the
+         * old memset-0 answer classified BOTH bridge fds as keyboards
+         * and every touch AND key record was dropped). Mirror real
+         * phone hardware: the touch device = BUS_I2C (0x18), the keys
+         * device = BUS_HOST (0x19, gpio-keys). */
+        unsigned short *id = (unsigned short *)argp;
+        id[0] = is_keys ? 0x19u /*BUS_HOST*/ : 0x18u /*BUS_I2C*/;
+        id[1] = 0x1234u;                         /* product */
+        id[2] = 0x5678u;                         /* vendor */
+        id[3] = 0x0100u;                         /* version */
         return 0;
     }
     if (nr == 0x06u || nr == 0x07u || nr == 0x08u) { /* EVIOCGNAME/PHYS/UNIQ */
@@ -2272,18 +2313,37 @@ static int input_ioctl(int fd, unsigned req, void *argp) {
         if (ev == 0) {                           /* event-type bits */
             inbr_set_bit((unsigned char *)argp, cap, INBR_EV_SYN);
             inbr_set_bit((unsigned char *)argp, cap, INBR_EV_KEY);
-            inbr_set_bit((unsigned char *)argp, cap, INBR_EV_ABS);
+            if (!is_keys) {
+                inbr_set_bit((unsigned char *)argp, cap, INBR_EV_ABS);
+            }
         } else if (ev == INBR_EV_KEY) {
-            inbr_set_bit((unsigned char *)argp, cap, INBR_BTN_TOUCH);
-            inbr_set_bit((unsigned char *)argp, cap, INBR_BTN_TOOL_FINGER);
+            if (is_keys) {
+                /* 6-Z294: the recovery menu's navigation keys —
+                 * KEY_VOLUMEUP(114)/KEY_VOLUMEDOWN(115)/KEY_POWER(116),
+                 * the exact gpio-keys set on every Pixel. The keyboard
+                 * dispatch drops EV_KEY records whose code is absent
+                 * from THIS bitmap, so the synthetic key records must
+                 * be advertised here. */
+                inbr_set_bit((unsigned char *)argp, cap, 114u);
+                inbr_set_bit((unsigned char *)argp, cap, 115u);
+                inbr_set_bit((unsigned char *)argp, cap, 116u);
+            } else {
+                inbr_set_bit((unsigned char *)argp, cap, INBR_BTN_TOUCH);
+                inbr_set_bit((unsigned char *)argp, cap, INBR_BTN_TOOL_FINGER);
+            }
         } else if (ev == INBR_EV_ABS) {
-            inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_X);
-            inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_Y);
-            inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_SLOT);
-            inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_POSITION_X);
-            inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_POSITION_Y);
-            inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_TRACKING_ID);
-            inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_PRESSURE);
+            if (is_keys) {
+                /* 6-Z294: a gpio-keys device has NO absolute axes —
+                 * an empty bitmap keeps the classifier honest. */
+            } else {
+                inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_X);
+                inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_Y);
+                inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_SLOT);
+                inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_POSITION_X);
+                inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_POSITION_Y);
+                inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_TRACKING_ID);
+                inbr_set_bit((unsigned char *)argp, cap, INBR_ABS_MT_PRESSURE);
+            }
         }
         /* Kernel-faithful: EVIOCGBIT returns the number of bytes copied
          * (min(len, bits-map size)), not 0 — callers that check > 0 (the
