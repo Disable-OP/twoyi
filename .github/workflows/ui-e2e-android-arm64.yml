@@ -184,7 +184,14 @@ jobs:
               echo "  ✗ Runner is $(uname -m), expected aarch64. ubuntu-24.04-arm required."
               exit 1
           fi
-          command -v adb || { sudo apt-get update && sudo apt-get install -y --no-install-recommends android-tools-adb; }
+          echo "── Install kernel modules + native arm64 adb ──"
+          # binder_linux.ko lives in linux-modules-extra for the RUNNING
+          # kernel — install it ALWAYS (a preinstalled adb must not skip
+          # this: run 33986239077 failed on exactly that).
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              linux-modules-extra-$(uname -r) \
+              android-tools-adb
           adb version | head -2
           sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
           sudo mkdir -p /dev/binderfs
