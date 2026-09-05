@@ -1,0 +1,387 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# FULL-ANDROID boot-ladder E2E (arm64, redroid) — Mission 6-Z305.
+#
+# The primary objective is BOOTING A REAL ARM64 ANDROID SYSTEM inside
+# twoyi — pure unmodified stock Android 11 (user directive: the old
+# twoyi Android 8.1 rootfs is a heavily modified from-source build that
+# "bypasses everything to just boot"; it is retired from boot testing).
+#
+# The ROM under test is the vendored PURE STOCK Android 11 rootfs
+# (release tag android11-aosp-arm64-rsr1): assembled byte-verbatim from
+# Google's OFFICIAL AOSP SDK system image arm64-v8a-30_r02.zip by
+# scripts/assemble-android11-rootfs.py — zero ROM modifications, only
+# mount topology. Provenance: ROOTFS_MANIFEST.json in the same release.
+#
+# Boot path exercised (boot_recovery=false — GL renderer):
+#   import (.tar.gz via the 6-Z305 intent-filter + tar symlink arm)
+#     → isFullAndroidLayout() structural detection (6-Z305)
+#     → kr64 normal path exec /init (6-Z88)
+#     → real init → property service → daemons → zygote → system_server
+#     → SurfaceFlinger → SystemUI → Launcher → sys.boot_completed=1
+#     → the 6-Z305 honest BOOT_COMPLETED bridge → app boot gate.
+#
+# HONEST LADDER SEMANTICS: the first rung "init started" is NOT "Android
+# booted". This workflow is a DIAGNOSTIC INSTRUMENT: it classifies the
+# HIGHEST boot-ladder rung reached (scripts/android-boot-classify.py)
+# and uploads the full evidence bundle. A run "succeeds" only when the
+# harness itself worked; the boot verdict is the reported rung —
+# BOOT_COMPLETED fires ONLY on a REAL sys.boot_completed=1 property
+# write observed on the emulated property wire (never synthesized).
+---
+name: Android Boot Ladder (ARM64 via redroid on ubuntu-24.04-arm)
+
+'on':
+  workflow_dispatch:
+    inputs:
+      boot_wait_seconds:
+        description: 'How long to watch the container after launching it (seconds). Android needs minutes — default 600'
+        required: false
+        default: '600'
+      import_wait_seconds:
+        description: 'Budget for the rootfs import (494MB tar.gz → ~1.7GB tree). Default 1200s'
+        required: false
+        default: '1200'
+      redroid_tag:
+        description: 'redroid Docker image tag (arm64) — the HOST android inside which twoyi runs'
+        required: false
+        default: '14.0.0-latest'
+      redroid_resolution:
+        description: 'Native resolution for the redroid display as WxH'
+        required: false
+        default: '720x1600'
+      redroid_dpi:
+        description: 'Native density for the redroid display'
+        required: false
+        default: '320'
+      rootfs_release_tag:
+        description: 'Release tag holding the vendored pure-stock Android 11 rootfs'
+        required: false
+        default: 'android11-aosp-arm64-rsr1'
+      rootfs_asset_name:
+        description: 'Asset name of the vendored rootfs tar.gz'
+        required: false
+        default: 'twoyi-android11-aosp-arm64-rsr1.tar.gz'
+      expect_rung:
+        description: 'Minimum ladder rung the run must reach for the job to exit 0 (0 = never fail on the ladder; diagnostic mode). Rungs: 1 ROOTFS_READY, 2 INIT, 3 PROPS, 4 DAEMONS, 5 ZYGOTE, 6 SYSTEM_SERVER, 7 SURFACEFLINGER, 8 SYSTEMUI, 9 BOOT_COMPLETED'
+        required: false
+        default: '0'
+
+concurrency:
+  group: ui-e2e-android-arm64-${{ github.ref }}-${{ github.event.inputs.rootfs_release_tag || 'android11-aosp-arm64-rsr1' }}
+  cancel-in-progress: true
+
+env:
+  # The OFFICIAL Google SDK zip the vendored rootfs must have been built
+  # from (provenance gate — the run refuses an unverified rootfs).
+  OFFICIAL_SDK_ZIP_SHA256: cb50112cf2dd234a71e2a29b0241c23dbb37dd5fc3156c68cc9c49d0f58ad304
+  TWOYI_PACKAGE: io.twoyi.debug
+
+jobs:
+  # ════════════════════════════════════════════════════════════════
+  # JOB 1: Build the arm64-v8a APK on an x86_64 runner
+  # (NDK r27c only ships x86_64 Linux host binaries — same split as
+  # ui-e2e-test-arm64.yml)
+  # ════════════════════════════════════════════════════════════════
+  build-apk:
+    name: Build arm64-v8a APK (x86_64 runner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-linux-android
+          cache: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/rs/target
+            app/rs/loader/target
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-arm64-
+
+      - name: Cache cargo-xdk
+        id: cache-cargo-xdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-xdk
+          key: ${{ runner.os }}-cargo-xdk-2.12.6
+
+      - name: Install cargo-xdk
+        if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
+        run: cargo install cargo-xdk
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Grant execute permission for gradlew and build scripts
+        run: |
+          chmod +x gradlew
+          chmod +x app/rs/build_rs.sh
+          chmod +x app/rs/loader/build.sh || true
+
+      - name: Build APK (debuggable variant, arm64-v8a only)
+        run: ./gradlew assembleDebuggable -Pabis=arm64-v8a
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-v8a-apk
+          path: app/build/outputs/apk/debuggable/*.apk
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  # ════════════════════════════════════════════════════════════════
+  # JOB 2: Import + boot the pure-stock Android 11 rootfs on redroid
+  # ════════════════════════════════════════════════════════════════
+  android-boot-ladder:
+    name: Android 11 boot ladder E2E (arm64 runner)
+    needs: build-apk
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download pre-built arm64-v8a APK
+        uses: actions/download-artifact@v4
+        with:
+          name: arm64-v8a-apk
+          path: app/build/outputs/apk/debuggable/
+
+      - name: Provision redroid prerequisites (binderfs + adb)
+        run: |
+          set -e
+          echo "── Runner architecture ──"
+          uname -m
+          if [ "$(uname -m)" != "aarch64" ]; then
+              echo "  ✗ Runner is $(uname -m), expected aarch64. ubuntu-24.04-arm required."
+              exit 1
+          fi
+          command -v adb || { sudo apt-get update && sudo apt-get install -y --no-install-recommends android-tools-adb; }
+          adb version | head -2
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+          sudo mkdir -p /dev/binderfs
+          sudo mount -t binder binder /dev/binderfs
+          ls -la /dev/binderfs/
+          command -v docker >/dev/null || sudo apt-get install -y docker.io
+          docker --version
+
+      - name: Download vendored PURE STOCK Android 11 rootfs (release asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.rootfs_release_tag || 'android11-aosp-arm64-rsr1' }}
+          ASSET_NAME: ${{ github.event.inputs.rootfs_asset_name || 'twoyi-android11-aosp-arm64-rsr1.tar.gz' }}
+        run: |
+          set -e
+          mkdir -p /tmp/android11-rootfs
+          cd /tmp/android11-rootfs
+          echo "── downloading $ASSET_NAME from release $RELEASE_TAG ──"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$RELEASE_TAG"
+          URL=$(curl -sf -H "Authorization: token $GH_TOKEN" "$API" \
+                | python3 -c "import json,sys,os; d=json.load(sys.stdin); print(next(a['url'] for a in d['assets'] if a['name']==os.environ['ASSET_NAME']))")
+          curl -fL --retry 3 -H "Authorization: token $GH_TOKEN" -o "$ASSET_NAME" "$URL"
+          # provenance gate: fetch the manifest and require the official
+          # SDK zip sha256 — refuse to boot an unverified rootfs.
+          MAN_URL=$(curl -sf -H "Authorization: token $GH_TOKEN" "$API" \
+                | python3 -c "import json,sys; d=json.load(sys.stdin); print(next(a['url'] for a in d['assets'] if a['name']=='ROOTFS_MANIFEST.json'))")
+          curl -sfL -H "Authorization: token $GH_TOKEN" -o ROOTFS_MANIFEST.json "$MAN_URL"
+          ZSHA=$(python3 -c "import json; print(json.load(open('ROOTFS_MANIFEST.json'))['sdk_zip_sha256'])")
+          if [ "$ZSHA" != "$OFFICIAL_SDK_ZIP_SHA256" ]; then
+              echo "✗ rootfs provenance mismatch: manifest sdk_zip_sha256=$ZSHA expected=$OFFICIAL_SDK_ZIP_SHA256"
+              exit 1
+          fi
+          echo "  ✓ provenance verified: built from OFFICIAL arm64-v8a-30_r02.zip ($ZSHA)"
+          FP=$(python3 -c "import json; print(json.load(open('ROOTFS_MANIFEST.json'))['fingerprint'])")
+          echo "  fingerprint: $FP"
+          mv "$ASSET_NAME" rootfs.tar.gz
+          ls -lh rootfs.tar.gz
+
+      - name: Pull + launch redroid
+        env:
+          REDROID_TAG: ${{ github.event.inputs.redroid_tag || '14.0.0-latest' }}
+          REDROID_RESOLUTION: ${{ github.event.inputs.redroid_resolution || '720x1600' }}
+          REDROID_DPI: ${{ github.event.inputs.redroid_dpi || '320' }}
+        run: |
+          set -e
+          mkdir -p /tmp/ui-e2e-artifacts
+          sudo docker pull "redroid/redroid:$REDROID_TAG"
+          sudo docker run -itd --rm --privileged \
+              --name redroid \
+              -v /dev/binderfs:/dev/binderfs:rw \
+              -v $HOME/redroid-data:/data \
+              -p 5555:5555 \
+              "redroid/redroid:$REDROID_TAG" \
+              androidboot.use_memfd=1 \
+              androidboot.redroid_gpu_mode=guest \
+              androidboot.redroid_width=720 androidboot.redroid_height=1600 \
+              androidboot.redroid_dpi=$REDROID_DPI
+          sudo docker logs -f redroid > /tmp/ui-e2e-artifacts/redroid.log 2>&1 &
+          BOOT_TIMEOUT=180
+          WAITED=0
+          while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
+              adb connect localhost:5555 >/dev/null 2>&1 || true
+              BOOTED=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+              [ "$BOOTED" = "1" ] && { echo "  ✓ redroid booted after ${WAITED}s"; break; }
+              sleep 5; WAITED=$((WAITED+5))
+          done
+          [ "$BOOTED" = "1" ] || { sudo docker logs redroid | tail -100; exit 1; }
+          ABI=$(adb -s localhost:5555 shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r' || true)
+          [ "$ABI" = "arm64-v8a" ] || { echo "✗ ABI $ABI"; exit 1; }
+          echo "  ✓ redroid arm64-v8a ready (the twoyi HOST)"
+
+      - name: Install APK + push pure Android 11 rootfs
+        run: |
+          set -e
+          ADB="adb -s localhost:5555"
+          $ADB shell settings put global immersive_mode_confirmations confirmed || true
+          APK=$(ls app/build/outputs/apk/debuggable/*.apk | head -1)
+          $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
+          echo "  ✓ APK installed"
+          echo "── Pushing pure-stock Android 11 rootfs (~494MB) ──"
+          PUSH_OK=0
+          for ATTEMPT in 1 2 3 4 5; do
+            if $ADB push /tmp/android11-rootfs/rootfs.tar.gz /sdcard/Download/rootfs.tar.gz; then
+              PUSH_OK=1; echo "  ✓ push succeeded on attempt $ATTEMPT"; break
+            fi
+            echo "  ⚠ push attempt $ATTEMPT failed — retrying in 10s"; sleep 10
+          done
+          [ "$PUSH_OK" = "1" ] || { echo "✗ rootfs push failed after 5 attempts"; exit 1; }
+          $ADB shell ls -la /sdcard/Download/rootfs.tar.gz
+
+      - name: UI navigation — import rootfs + boot Android
+        env:
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '600' }}
+          TWOYI_IMPORT_WAIT_SECONDS: ${{ github.event.inputs.import_wait_seconds || '1200' }}
+          TWOYI_ROM_FILE: rootfs.tar.gz
+          ADB_SERIAL: localhost:5555
+        run: |
+          mkdir -p /tmp/ui-e2e-artifacts
+          # adb-independent liveness watcher (light — same as the TWRP suite)
+          rm -f /tmp/ui-e2e-artifacts/nav-done
+          (
+            I=0
+            while [ ! -f /tmp/ui-e2e-artifacts/nav-done ]; do
+              sleep 30; I=$((I+30))
+              {
+                echo "===== liveness @${I}s $(date -u +%H:%M:%S) ====="
+                if sudo docker ps --filter name=redroid --filter status=running -q | grep -q .; then
+                  echo "-- container: RUNNING"
+                  sudo docker exec redroid sh -c \
+                    "ps -A -o PID,NAME 2>/dev/null | grep -E 'init|twoyi|kr64|zygote|system_server|surfaceflinger'" 2>&1 | head -12
+                else
+                  echo "-- container: NOT RUNNING"
+                  sudo docker logs redroid 2>&1 | tail -n 30
+                fi
+              } >> /tmp/ui-e2e-artifacts/docker-exec-watch.log 2>&1
+            done
+          ) &
+          WATCHER=$!
+          RC=0
+          python3 scripts/ui-navigate.py || RC=$?
+          touch /tmp/ui-e2e-artifacts/nav-done
+          kill $WATCHER 2>/dev/null || true
+
+          # ── final evidence dumps (docker exec — survives adb death) ──
+          sudo docker exec redroid /system/bin/logcat -d \
+            > /tmp/ui-e2e-artifacts/logcat-dockerexec.txt 2>&1 || true
+          sudo docker exec redroid /system/bin/sh -c "ps -A" \
+            > /tmp/ui-e2e-artifacts/ps-dockerexec.txt 2>&1 || true
+          sudo docker exec redroid sh -c \
+            "tail -n 60000 /data/user/0/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || tail -n 60000 /data/data/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null" \
+            > /tmp/ui-e2e-artifacts/kr64-app-stderr-dockerexec.log 2>&1 || true
+          sudo docker exec redroid sh -c \
+            "tail -n 12000 /data/user/0/io.twoyi.debug/kr64.log 2>/dev/null" \
+            > /tmp/ui-e2e-artifacts/kr64-dockerexec.log 2>&1 || true
+          sudo docker exec redroid sh -c \
+            "ls -la /data/user/0/io.twoyi.debug/rootfs/ 2>/dev/null | head -40; \
+             ls -la /data/user/0/io.twoyi.debug/rootfs/system/framework/ 2>/dev/null | head -10; \
+             ls -la /data/user/0/io.twoyi.debug/rootfs/dev/socket/ 2>/dev/null" \
+            > /tmp/ui-e2e-artifacts/rootfs-listing.txt 2>&1 || true
+          sudo docker exec redroid sh -c \
+            "ls -la /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/ 2>/dev/null; \
+             for f in /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/property_info \
+                      /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/properties_serial; do \
+               [ -f \$f ] && echo \"== \$f (\$(stat -c%s \$f) bytes) first 32 hex:\" && od -A x -t x1 -N 32 \$f; \
+             done" \
+            > /tmp/ui-e2e-artifacts/property-area-state.txt 2>&1 || true
+          sudo docker exec redroid /system/bin/sh -c \
+            "/system/bin/screencap -p /data/local/tmp/final-1.png 2>/dev/null && cat /data/local/tmp/final-1.png" \
+            > /tmp/ui-e2e-artifacts/screencap-dockerexec.png 2>&1 || true
+          sleep 5
+          sudo docker exec redroid /system/bin/sh -c \
+            "/system/bin/screencap -p /data/local/tmp/final-2.png 2>/dev/null && cat /data/local/tmp/final-2.png" \
+            > /tmp/ui-e2e-artifacts/screencap-dockerexec-5s-later.png 2>&1 || true
+          sudo docker inspect redroid --format \
+            'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' \
+            > /tmp/ui-e2e-artifacts/container-state.txt 2>&1 || true
+          exit $RC
+
+      - name: Classify boot ladder (machine-readable)
+        if: always()
+        run: |
+          python3 scripts/android-boot-classify.py \
+            /tmp/ui-e2e-artifacts \
+            /tmp/ui-e2e-artifacts/result.json \
+            > /tmp/ui-e2e-artifacts/result-pretty.json 2>&1 || true
+          echo "════════ ANDROID BOOT LADDER VERDICT ════════"
+          cat /tmp/ui-e2e-artifacts/result.json || true
+          # The boot-ladder gate: only fail the job when a minimum rung was
+          # requested (expect_rung > 0) AND the harness produced a verdict.
+          EXPECT=${{ github.event.inputs.expect_rung || '0' }}
+          if [ "$EXPECT" != "0" ] && [ -f /tmp/ui-e2e-artifacts/result.json ]; then
+            RUNG=$(python3 -c "import json; print(json.load(open('/tmp/ui-e2e-artifacts/result.json'))['rung'])")
+            if [ "$RUNG" -lt "$EXPECT" ]; then
+              echo "✗ ladder rung $RUNG < expected $EXPECT"
+              exit 1
+            fi
+            echo "✓ ladder rung $RUNG ≥ expected $EXPECT"
+          fi
+
+      - name: Pack artifacts
+        if: always()
+        run: |
+          ./scripts/pack-logs.sh /tmp/ui-e2e-logs.tar.xz \
+            /tmp/ui-e2e-artifacts/ || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-boot-ladder-logs
+          path: /tmp/ui-e2e-logs.tar.xz
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Stop redroid
+        if: always()
+        run: |
+          sudo docker stop redroid 2>/dev/null || true
+          sudo docker rm   redroid 2>/dev/null || true
