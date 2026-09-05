@@ -445,8 +445,12 @@ static INPUT_SENDER: Lazy<Mutex<Option<Sender<TouchMessage>>>> = Lazy::new(|| Mu
 /// gpio-keys, and the app routes touch frames and key records to the
 /// matching connections. Keys sent only through INPUT_SENDER would land
 /// on the touchscreen device whose handler ignores EV_KEY.
-static KEY_BRIDGE_SENDER: Lazy<Mutex<Option<Sender<TouchMessage>>>> =
+static KEY_BRIDGE_SENDER: Lazy<Mutex<Option<(u64, Sender<TouchMessage>)>>> =
     Lazy::new(|| Mutex::new(None));
+
+/// Monotonic connection generation for `detach_bridge_sender`'s identity
+/// check (`Sender::same_channel` is newer than the CI toolchain).
+static BRIDGE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static KEY_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| Mutex::new(None));
 
 pub fn start_input_system(width: i32, height: i32) {
@@ -922,6 +926,7 @@ fn touch_server_abstract() {
             // TouchMessages buffer in `rx` until the negotiation
             // resolves).
             thread::spawn(move || {
+                let my_gen = BRIDGE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mode = negotiate_bridge_mode(client);
                 match mode {
                     BridgeMode::RawEvdev {
@@ -954,10 +959,10 @@ fn touch_server_abstract() {
                 match mode {
                     BridgeMode::RawEvdev { keys: true, .. } => {
                         *KEY_BRIDGE_SENDER.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(tx.clone());
+                            Some((my_gen, tx));
                     }
                     BridgeMode::RawEvdev { keys: false, .. } | BridgeMode::LegacyTouchMessage => {
-                        *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
+                        *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
                     }
                 }
                 let mut finger: Option<(i32, i32)> = None; // (slot, tracking_id)
@@ -1029,13 +1034,13 @@ fn touch_server_abstract() {
                                     }
                                 }
                                 while rx.recv().is_ok() {}
-                                detach_bridge_sender(&tx);
+                                detach_bridge_sender(my_gen);
                                 close(client);
                                 return;
                             }
                         }
                         Err(_) => {
-                            detach_bridge_sender(&tx);
+                            detach_bridge_sender(my_gen);
                             close(client);
                             return;
                         }
@@ -1169,18 +1174,14 @@ fn encode_evdev(
     }
 }
 
-/// 6-Z294: drop `tx` from whichever bridge registration currently holds
-/// it (INPUT_SENDER for touch connections, KEY_BRIDGE_SENDER for the
-/// gpio-keys mirror) so a dead connection never keeps a stale sender.
-/// `Sender::same_channel` keeps the identity check exact.
-fn detach_bridge_sender(tx: &Sender<TouchMessage>) {
-    let mut input = INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner());
-    if input.as_ref().is_some_and(|s| s.same_channel(tx)) {
-        *input = None;
-    }
-    drop(input);
+/// 6-Z294: drop a dead connection's registration from KEY_BRIDGE_SENDER
+/// so a reconnect isn't shadowed by a stale sender. Identity = the
+/// connection's generation (`Sender::same_channel` is newer than the
+/// CI toolchain; INPUT_SENDER only ever holds touch connections under
+/// negotiation-time registration, so it needs no cleanup here).
+fn detach_bridge_sender(my_gen: u64) {
     let mut key = KEY_BRIDGE_SENDER.lock().unwrap_or_else(|e| e.into_inner());
-    if key.as_ref().is_some_and(|s| s.same_channel(tx)) {
+    if key.as_ref().is_some_and(|(gen, _)| *gen == my_gen) {
         *key = None;
     }
 }
@@ -1293,7 +1294,7 @@ pub fn send_key_code(keycode: i32) {
     // EVIOCGBIT(EV_KEY) lacks the code, and the touchscreen handler
     // ignores EV_KEY outright — the keys device advertises
     // VOLUMEUP/VOLUMEDOWN/POWER exactly like real gpio-keys hardware.
-    if let Some(tx) = KEY_BRIDGE_SENDER
+    if let Some((_, tx)) = KEY_BRIDGE_SENDER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
