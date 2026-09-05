@@ -173,9 +173,13 @@ images:
       corpus — exercises the Android-15 init + linker expectations.
 
   # ── PitchBlack Recovery Project (TWRP fork, SourceForge /pbrp) ──
-  # 6-Z303: first PitchBlack entries; URLs verified live from the dev box
-  # (sourceforge.net reachable; the 6-Z28x-era "SF unreachable" note is
-  # stale). PBRP builds self-identify ONLY via twres theme assets
+  # 6-Z303: first PitchBlack entries. sourceforge.net IS reachable from
+  # the dev box, but 403s GitHub Actions runner egress (proven on all 4
+  # first-wave runs) — so each verified build is VENDORED as a
+  # checksum-pinned asset of the release recovery-corpus-6-Z303 on this
+  # repo (upstream URL + full provenance in the release notes; upstream
+  # stays the origin of truth, the release is the CI-reachable mirror).
+  # PBRP builds self-identify ONLY via twres theme assets
   # (main_button_pbrp_*.png) — the inspector's detect_family handles that.
   - name: pbrp-4.0-ginkgo
     family: PitchBlack
@@ -183,7 +187,7 @@ images:
     arch: arm64
     generation: "12.1"
     tier: nightly
-    url: https://sourceforge.net/projects/pbrp/files/ginkgo/recovery.img/download
+    url: https://github.com/Disable-OP/twoyi/releases/download/recovery-corpus-6-Z303/pbrp-ginkgo-4.0-recovery.img
     referer: ""
     md5: 55507353ea584c5476b224fd9516ee49
     sha256: d6ec92f7dacd4887a4efd415567e93e23298ee62b6f88684d2f1a40fa7d28678
@@ -193,10 +197,12 @@ images:
       corpus's TWRP ginkgo entries — clean family A/B on known hardware.
       A12.1-style rootfs (apex, data_mirror, debug_ramdisk) with symlink
       init -> /system/bin/init (dynamic, PT_INTERP=/system/bin/linker64 —
-      the OrangeFox-R12 shape proven since 6-Z196). SourceForge
-      /files/<dev>/recovery.img is a ROLLING file (content moves without a
-      name change, like the fox corpus): md5+sha256 pin the verified build;
-      CI drift is possible and means re-verification, not failure.
+      the OrangeFox-R12 shape proven since 6-Z196). UPSTREAM:
+      sourceforge.net/projects/pbrp/files/ginkgo/recovery.img (a ROLLING
+      file — content moves without a name change). 6-Z303 wave: the SF
+      download 403s from GitHub Actions runner egress, so the VERIFIED
+      build is vendored as the release asset above (checksum-pinned;
+      upstream is the provenance, release is the CI source).
 
   - name: pbrp-4.0-vayu
     family: PitchBlack
@@ -204,7 +210,7 @@ images:
     arch: arm64
     generation: "12.1"
     tier: nightly
-    url: https://sourceforge.net/projects/pbrp/files/vayu/PBRP-vayu-4.0-20251016-0805-OFFICIAL.zip/download
+    url: https://github.com/Disable-OP/twoyi/releases/download/recovery-corpus-6-Z303/PBRP-vayu-4.0-20251016-0805-OFFICIAL.zip
     referer: ""
     md5: 36e15129d5558055008834f24c95787d
     sha256: ""
@@ -214,7 +220,9 @@ images:
       ramdisk, 3755 files). Poco X3 Pro (SM8150, already in corpus via
       TWRP). Exercises the workflow's zip-extraction path on the
       top-level layout (OrangeFox nests elsewhere; the TWRP/recovery
-      subdir fallback stays unexercised by PBRP).
+      subdir fallback stays unexercised by PBRP). UPSTREAM:
+      sourceforge.net/projects/pbrp/files/vayu/... (SF 403s GitHub
+      runner egress — vendored as the checksum-pinned release asset).
 
   - name: pbrp-4.0-surya
     family: PitchBlack
@@ -222,7 +230,7 @@ images:
     arch: arm64
     generation: "12.1"
     tier: nightly
-    url: https://sourceforge.net/projects/pbrp/files/surya/PBRP-surya-4.0-20250803-0709-OFFICIAL.zip/download
+    url: https://github.com/Disable-OP/twoyi/releases/download/recovery-corpus-6-Z303/PBRP-surya-4.0-20250803-0709-OFFICIAL.zip
     referer: ""
     md5: def34603fe471df367c1ea039808e7a9
     sha256: ""
@@ -230,7 +238,9 @@ images:
       PitchBlack 4.0 OFFICIAL 20250803 (zip, 68MB; top-level recovery.img,
       128MiB, gzip ramdisk, 3968 files). Poco X3 NFC (SM7125) — NEW device
       codename for the corpus; vayu's Snapdragon sibling for SoC diversity
-      inside the PitchBlack family.
+      inside the PitchBlack family. UPSTREAM:
+      sourceforge.net/projects/pbrp/files/surya/... (SF 403s GitHub
+      runner egress — vendored as the checksum-pinned release asset).
 
   # ── SHRP / SkyHawk Recovery (TWRP fork, SourceForge /shrp) ──
   # 6-Z303: first SHRP entry. LZMA-compressed ramdisk — a ramdisk
@@ -243,7 +253,7 @@ images:
     arch: arm64
     generation: "12.1"
     tier: nightly
-    url: https://sourceforge.net/projects/shrp/files/starlte/SHRP_v3.1_stable-Official_starlte-1675556822.img/download
+    url: https://github.com/Disable-OP/twoyi/releases/download/recovery-corpus-6-Z303/shrp_v3.1_stable-Official_starlte-1675556822.img
     referer: ""
     md5: d15161709e4b5f9849b9589f9427300a
     sha256: 1b4d7b71a6535579646f4335b8cf735516ec1f02ec5d3749fa8f96ca827500c0
@@ -253,7 +263,9 @@ images:
       (Exynos 9810) — the SAME device as twrp-3.7.0_9-0-starlte, so a
       clean SHRP-vs-TWRP family A/B on known hardware. Static init +
       dynamic /sbin/linker64 userland (sbin/{twrp,sh,busybox,recovery}
-      all dynamic against /sbin/linker64).
+      all dynamic against /sbin/linker64). UPSTREAM:
+      sourceforge.net/projects/shrp/files/starlte/... (SF 403s GitHub
+      runner egress — vendored as the checksum-pinned release asset).
 
   # ── future expansions (URLs verified as CI proves them) ──
   # AOSP recovery:   built from source or extracted from factory images
