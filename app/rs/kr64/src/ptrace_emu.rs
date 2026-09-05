@@ -5043,6 +5043,35 @@ fn guest_readlink_target(
     None
 }
 
+/// 6-Z305d: strip the kernel-reported rootfs prefix from a
+/// /proc/self/fd|cwd readlink result, trying BOTH the app-facing rootfs
+/// path AND its canonical (symlink-resolved) form.
+///
+/// Why both: the kernel always reports the CANONICAL path of an open
+/// file. The twoyi app's rootfs path may itself be a SYMLINK — the
+/// legacy `/data/user/0/<pkg>/rootfs` resolves to the active profile dir
+/// `/data/user/0/<pkg>/profiles/default/rootfs`. Guest opens via the
+/// legacy prefix work (the kernel follows the symlink), but every
+/// readlink("/proc/self/fd/N") result carries the canonical
+/// profiles/…/rootfs prefix, which never matched the legacy param — so
+/// the class-2 rewrite silently skipped, init's bionic realpath stat'ed
+/// the raw host path, the /data/* translation rule prefixed it into
+/// {rootfs}/data/… and ENOENT'd → InitFatalReboot (runs 33987046990 /
+/// 33989721659 / 33991778662 / 33994075691).
+fn strip_guest_prefix(target: &str, rootfs: &str, rootfs_canonical: &str) -> Option<String> {
+    for rf in [rootfs, rootfs_canonical] {
+        if !rf.is_empty() && target.starts_with(rf) {
+            let guest = target[rf.len()..].to_string();
+            return Some(if guest.is_empty() {
+                "/".to_string()
+            } else {
+                guest
+            });
+        }
+    }
+    None
+}
+
 /// Does this syscall number need the backstop at all? (Cheap pre-filter
 /// on the stop's OWN register snapshot — zero cost for the ~90% of
 /// syscalls that take no path.)
@@ -12489,6 +12518,19 @@ pub fn run_ptrace_loop(
     // branches) — the execve EXIT handler logs the kernel's verdict +
     // the child's cwd for these (the two facts the next fix iteration
     // needs).
+    // 6-Z305d: the kernel reports CANONICAL paths in /proc/self/fd links.
+    // The app-facing rootfs path may be a symlink (legacy dir → active
+    // profile dir); resolve it ONCE so the readlink class-2 rewrite can
+    // strip the prefix the kernel actually emits (see strip_guest_prefix).
+    let rootfs_canonical: String = std::fs::canonicalize(rootfs)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !rootfs_canonical.is_empty() && rootfs_canonical != rootfs {
+        log(&format!(
+            "6-Z305d: rootfs canonical form: {:?} -> {:?} (symlinked rootfs — fd-link results carry the canonical prefix)",
+            rootfs, rootfs_canonical
+        ));
+    }
     let mut pending_blind_execve: std::collections::HashMap<libc::pid_t, String> =
         std::collections::HashMap::new();
     // 6-Z305c: full-fidelity death-window tracer. Armed by init's own
@@ -21266,7 +21308,13 @@ pub fn run_ptrace_loop(
                                         rootfs,
                                         data_dir,
                                         staged_exes.as_ref(),
-                                    );
+                                    )
+                                    .or_else(|| {
+                                        // 6-Z305d: canonical-rootfs fallback —
+                                        // the kernel fd-link prefix may be the
+                                        // SYMLINK-RESOLVED rootfs path.
+                                        strip_guest_prefix(&target, rootfs, &rootfs_canonical)
+                                    });
                                     let z305c_req =
                                         read_child_string(pid, path_addr).unwrap_or_default();
                                     if (z305c_req.starts_with("/proc/self/fd")
@@ -33624,6 +33672,80 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             .as_deref(),
             Some("/init")
         );
+    }
+
+    // ── 6-Z305d: canonical-rootfs prefix strip ──────────────────────
+    //
+    // The app's rootfs path may BE a symlink (legacy dir → active
+    // profile dir). The kernel always reports the canonical form in
+    // /proc/self/fd readlink results; the class-2 rewrite must strip
+    // whichever prefix the kernel emitted, or bionic realpath's
+    // stat(dst) walks the /data/* translation rule into
+    // {rootfs}/data/… and ENOENTs → InitFatalReboot.
+
+    #[test]
+    fn z305d_strip_guest_prefix_legacy_form() {
+        assert_eq!(
+            strip_guest_prefix(
+                "/data/user/0/io.twoyi.debug/rootfs/system/bin",
+                "/data/user/0/io.twoyi.debug/rootfs",
+                "",
+            )
+            .as_deref(),
+            Some("/system/bin")
+        );
+    }
+
+    #[test]
+    fn z305d_strip_guest_prefix_canonical_profile_form() {
+        // The run-33995156647 evidence: fd links carry
+        // profiles/default/rootfs while the tracer's rootfs param is the
+        // legacy path — only the canonical prefix matches.
+        assert_eq!(
+            strip_guest_prefix(
+                "/data/user/0/io.twoyi.debug/profiles/default/rootfs/system/bin",
+                "/data/user/0/io.twoyi.debug/rootfs",
+                "/data/user/0/io.twoyi.debug/profiles/default/rootfs",
+            )
+            .as_deref(),
+            Some("/system/bin")
+        );
+    }
+
+    #[test]
+    fn z305d_strip_guest_prefix_rootfs_itself_reads_back_as_slash() {
+        assert_eq!(
+            strip_guest_prefix(
+                "/data/user/0/io.twoyi.debug/profiles/default/rootfs",
+                "/data/user/0/io.twoyi.debug/rootfs",
+                "/data/user/0/io.twoyi.debug/profiles/default/rootfs",
+            )
+            .as_deref(),
+            Some("/")
+        );
+    }
+
+    #[test]
+    fn z305d_strip_guest_prefix_non_rootfs_paths_stay_none() {
+        assert_eq!(
+            strip_guest_prefix(
+                "/system/bin",
+                "/data/user/0/io.twoyi.debug/rootfs",
+                "/data/user/0/io.twoyi.debug/profiles/default/rootfs",
+            ),
+            None
+        );
+        assert_eq!(
+            strip_guest_prefix(
+                "/memfd:twa (deleted)",
+                "/data/user/0/io.twoyi.debug/rootfs",
+                "/data/user/0/io.twoyi.debug/profiles/default/rootfs",
+            ),
+            None
+        );
+        // Empty canonical form (canonicalize failed at loop start) must
+        // never prefix-match: every string starts with "".
+        assert_eq!(strip_guest_prefix("/anything", "/legacy/rootfs", ""), None);
     }
 
     #[test]
