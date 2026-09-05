@@ -274,13 +274,17 @@ def main():
     # lineage-22.2-sailfish final screenshot (720x1600): rows are
     #   Reboot system now  y = 555-690  (pre-highlighted — NEVER tapped)
     #   Apply update       y = 700-840  (center ~770 = 0.481H)
-    #   Factory reset      y = 850-990  (center ~920 = 0.575H)
+    #   Factory reset      y = 850-990  (NEVER tapped — 6-Z297: under
+    #                      tap-ACTIVATES semantics this opens the wipe
+    #                      confirmation; pointless exposure)
     #   Advanced           y = 1000-1140 (center ~1070 = 0.669H)
-    # Tapping a NON-highlighted row moves the selection (a redraw);
-    # tapping the highlighted row would ACTIVATE it — the destructive
-    # case this probe must never hit.
+    # Tapping a NON-highlighted row either moves the selection or opens
+    # that row's submenu (both redraw); Apply update / Advanced open
+    # ESCAPABLE submenus — safe under either touch semantic. Tapping
+    # the highlighted row would ACTIVATE it — the destructive case this
+    # probe must never hit.
     cx = W // 2
-    ladder = [int(H * 0.481), int(H * 0.575), int(H * 0.481)]
+    ladder = [int(H * 0.481), int(H * 0.669), int(H * 0.481)]
     channels_used = []
 
     # ── 6-Z297 ORDER FIX: TAPS FIRST, KEY LADDER LAST ──
