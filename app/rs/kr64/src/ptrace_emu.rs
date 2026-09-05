@@ -7041,6 +7041,12 @@ fn forget_dead_pid_state(
     esrch_streak: &mut std::collections::HashMap<libc::pid_t, u32>,
     pending_getpid: &mut std::collections::HashSet<libc::pid_t>,
     pending_uevent_recv: &mut std::collections::HashMap<libc::pid_t, PendingUeventRecv>,
+    // 6-Z296: input-read probe state — a recycled pid must not inherit
+    // a stale epoll membership (false probe hits) or hit caps.
+    z296_epoll_members: &mut std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
+    z296_epoll_add_logged: &mut std::collections::HashMap<libc::pid_t, u32>,
+    z296_read_hits: &mut std::collections::HashMap<libc::pid_t, u32>,
+    z296_maps_dumped: &mut std::collections::HashSet<libc::pid_t>,
 ) {
     // 6-Z184 AUDIT FIX (agent 11): the death hygiene missed ~10 per-pid
     // maps — a pid-RECYCLED successor inherited stale state (e.g. a
@@ -7060,6 +7066,12 @@ fn forget_dead_pid_state(
     accept4_einval_streak.remove(&pid);
     esrch_streak.remove(&pid);
     pending_getpid.remove(&pid);
+    // 6-Z296: probe state must go with the process (a recycled pid
+    // inheriting a stale epoll membership would get false probe hits).
+    z296_epoll_members.remove(&pid);
+    z296_epoll_add_logged.remove(&pid);
+    z296_read_hits.remove(&pid);
+    z296_maps_dumped.remove(&pid);
     // 6-Z271b: a stale entry would make the recycled pid's FIRST EXIT
     // consume a synthetic-uevent delivery with OLD buffers — POKEDATA
     // into an unrelated process's memory. Must go with the process.
@@ -8463,6 +8475,95 @@ fn resolve_addr_in_maps(maps: &str, want: u64) -> String {
         }
     }
     format!("{:#x} in UNMAPPED", want)
+}
+
+// ── 6-Z296: input-read CALLER identification probe — pure helpers ──
+//
+// The probe (runtime arms live in run_ptrace_loop) walks the guest's
+// stack at every epoll-registered input read EXIT. These helpers are
+// pure so the annotation/locator contract is unit-locked independent
+// of ptrace.
+
+/// 6-Z296: parse a /proc/<pid>/maps snapshot into `(start, end, path)`
+/// triples (anonymous regions keep an empty path — they can never
+/// annotate, but their ranges still delimit the file-backed ones).
+/// Thin wrapper over [`parse_map_line`] so callers pass one string.
+fn z296_maps_triples(maps: &str) -> Vec<(u64, u64, &str)> {
+    maps.lines()
+        .filter_map(parse_map_line)
+        .map(|(start, end, _perms, path)| (start, end, path))
+        .collect()
+}
+
+/// 6-Z296: annotate a guest pointer against a maps snapshot. Returns
+/// `"<basename>+0x<delta>"` where delta is measured from the pointer's
+/// FILE's LOWEST mapping start — for an ELF that is the load bias, so
+/// a pointer landing in ANY segment (r--p/r-xp/rw-p) comes out as the
+/// same offset the static disassembly quotes (e.g. text pointer into
+/// the r-xp segment of librecovery_ui.so annotates as
+/// `librecovery_ui.so+0x37594` = ev_get_input, NOT segment-relative).
+/// None for empty-path (truly anonymous) or unmapped words; named
+/// special mappings ([anon:...], [stack]) annotate with their own name.
+fn z296_annotate(word: u64, triples: &[(u64, u64, &str)]) -> Option<String> {
+    let (_, _, path) = triples
+        .iter()
+        .find(|(start, end, _)| word >= *start && word < *end)
+        .map(|(start, _, path)| (*start, path, *path))?;
+    if path.is_empty() {
+        return None;
+    }
+    // ELF-relative delta: the file's lowest mapping start (load bias).
+    let base = triples
+        .iter()
+        .filter(|(_, _, p)| *p == path)
+        .map(|(start, _, _)| *start)
+        .min()
+        .unwrap_or(0);
+    let name = path.rsplit('/').next().unwrap_or(path);
+    Some(format!("{}+{:#x}", name, word.saturating_sub(base)))
+}
+
+/// 6-Z296: lowest mapping start among the mappings of the file whose
+/// path contains `needle` (bionic maps a shared object as several
+/// segments of ONE file — the lowest start is the ELF base / load
+/// bias). None when the file is not mapped.
+fn z296_lib_base(triples: &[(u64, u64, &str)], needle: &str) -> Option<u64> {
+    triples
+        .iter()
+        .filter(|(_, _, path)| path.contains(needle))
+        .map(|(start, _, _)| *start)
+        .min()
+}
+
+/// 6-Z296: render one probed word compactly — bare for zero, annotated
+/// when it lands in a mapping, raw hex otherwise. Pure formatting for
+/// the stack walk / ctx-array dumps.
+fn z296_render_word(word: u64, suffix_off: u64, triples: &[(u64, u64, &str)]) -> String {
+    match (word, z296_annotate(word, triples)) {
+        (0, _) => format!("+{:#x}:0", suffix_off),
+        (w, Some(name)) => format!("+{:#x}:{:#x}[{}]", suffix_off, w, name),
+        (w, None) => format!("+{:#x}:{:#x}", suffix_off, w),
+    }
+}
+
+/// 6-Z296: read `words` u64s starting at `addr` and render them via
+/// [`z296_render_word`]; unreadable words render as `<gap>`. Returns an
+/// empty Vec when `addr` is 0 (defensive — callers already guard).
+fn z296_dump_words(
+    pid: libc::pid_t,
+    addr: u64,
+    words: u64,
+    triples: &[(u64, u64, &str)],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(words as usize);
+    for k in 0..words {
+        let a = addr.wrapping_add(k * 8);
+        match read_child_u64(pid, a) {
+            Some(w) => out.push(z296_render_word(w, k * 8, triples)),
+            None => out.push(format!("+{:#x}:<gap>", k * 8)),
+        }
+    }
+    out
 }
 
 /// 6-Z231: pure decision core of the fresh-create guarantee — should the
@@ -11987,6 +12088,24 @@ pub fn run_ptrace_loop(
     let mut spin_diag_epoll_count: u64 = 0;
     let mut spin_diag_seen_fds: std::collections::HashSet<(libc::pid_t, i64)> =
         std::collections::HashSet::new();
+    // ── 6-Z296: input-read CALLER identification probe state ──
+    // (rationale + gates live with the runtime arms; per-pid, all
+    // cleaned in forget_dead_pid_state — zero behaviour change)
+    // fds this pid epoll_ctl(ADD)'d — the input-reader signature gate.
+    let mut z296_epoll_members: std::collections::HashMap<
+        libc::pid_t,
+        std::collections::HashSet<i64>,
+    > = std::collections::HashMap::new();
+    // per-pid logged epoll_ctl ADD count (cap 24 — recoveries add ~2-6).
+    let mut z296_epoll_add_logged: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    // per-pid input-read probe hits (cap 6 — the stack shape is
+    // identical for every hit; more is noise).
+    let mut z296_read_hits: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    // pids whose maps were already fully dumped (once per pid).
+    let mut z296_maps_dumped: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     // 6-Z163b: counter for the bind-rewrite skip DIAG (first 12 skips log
     // the reason + the first 16 blob bytes — run 32990637557's silent
     // skip of init's property bind made the miss invisible).
@@ -13001,6 +13120,10 @@ pub fn run_ptrace_loop(
                 &mut esrch_streak,
                 &mut pending_getpid,
                 &mut pending_uevent_recv,
+                &mut z296_epoll_members,
+                &mut z296_epoll_add_logged,
+                &mut z296_read_hits,
+                &mut z296_maps_dumped,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
@@ -13189,6 +13312,10 @@ pub fn run_ptrace_loop(
                 &mut esrch_streak,
                 &mut pending_getpid,
                 &mut pending_uevent_recv,
+                &mut z296_epoll_members,
+                &mut z296_epoll_add_logged,
+                &mut z296_read_hits,
+                &mut z296_maps_dumped,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
@@ -15866,6 +15993,96 @@ pub fn run_ptrace_loop(
                                     get_syscall_arg(&regs, abi.reg_arg3) as usize,
                                 ),
                             );
+                        }
+                        // ── 6-Z296: epoll_ctl MEMBERSHIP logger (ENTRY side) ──
+                        //
+                        // The input-path investigation (6-Z293..295a) ended at:
+                        // the guest READS our input records byte-perfectly
+                        // (read(fd, ev, 24) == 24 on the epoll-registered touch
+                        // fd) but the caller of ev_get_input DROPS every event.
+                        // minui's dispatch is pointer-driven (no direct BL
+                        // caller — the callback is a stored function
+                        // pointer/std::function whose identity exists only at
+                        // runtime). The tracer sees every epoll_ctl passively:
+                        // log (epfd, fd, op, events, data). The data union is
+                        // either the fd or a pointer into minui's per-fd info
+                        // array (lineage disassembly: ctx array @.bss+0x5d1f0,
+                        // 64-byte stride) — this is the epoll-set ground truth
+                        // and ALSO settles whether ev_init's keyboard branch
+                        // really kept fd 9 out of the set (close-without-ADD).
+                        // Membership additionally GATES the EXIT-side stack
+                        // walk (same state, next block) so only true
+                        // epoll-registered reads are probed.
+                        // aarch64 hosts may also trace AArch32-compat children
+                        // (arm32 epoll_ctl = 251); on x86_64 hosts the flag is
+                        // constant-false so BOTH probe arms stay dead there
+                        // (abi.read 0/3 never equals 63 either).
+                        #[cfg(target_arch = "aarch64")]
+                        let z296_is_arm32 = pid_is_arm32(pid);
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let z296_is_arm32 = false;
+                        let z296_is_epoll_ctl = (abi.read == 63 && syscall_num == 21)
+                            || (z296_is_arm32 && syscall_num == 251);
+                        if z296_is_epoll_ctl {
+                            // int epoll_ctl(int epfd, int op, int fd,
+                            //                struct epoll_event *event)
+                            // arg1=epfd, arg2=op, arg3=fd, arg4=event.
+                            let epfd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            let op = get_syscall_arg(&regs, abi.reg_arg2) as i64;
+                            let add_fd = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                            let ev_ptr = get_syscall_arg(&regs, abi.reg_arg4);
+                            let op_name = match op {
+                                1 => "ADD",
+                                2 => "MOD",
+                                3 => "DEL",
+                                _ => "?",
+                            };
+                            match op {
+                                1 | 2 => {
+                                    // struct epoll_event: u32 events @0, u64 data @8.
+                                    let events = if ev_ptr != 0 {
+                                        read_child_u32(pid, ev_ptr)
+                                    } else {
+                                        None
+                                    };
+                                    let data = if ev_ptr != 0 {
+                                        read_child_u64(pid, ev_ptr.wrapping_add(8))
+                                    } else {
+                                        None
+                                    };
+                                    if op == 1 {
+                                        z296_epoll_members.entry(pid).or_default().insert(add_fd);
+                                    }
+                                    let logged = z296_epoll_add_logged.entry(pid).or_insert(0);
+                                    *logged = logged.saturating_add(1);
+                                    if *logged <= 24 {
+                                        log(&format!(
+                                            "6-Z296 epoll_ctl {} pid={} epfd={} fd={} events={:?} data={:?}",
+                                            op_name, pid, epfd, add_fd, events, data
+                                        ));
+                                        // fd identity, once per (pid, fd) — names
+                                        // which /dev/input/eventN each registration
+                                        // belongs to.
+                                        if let Some(msg) = spin_diag_readlink_fd(
+                                            pid,
+                                            add_fd,
+                                            &mut spin_diag_seen_fds,
+                                        ) {
+                                            log(&msg);
+                                        }
+                                    }
+                                }
+                                3 => {
+                                    if let Some(set) = z296_epoll_members.get_mut(&pid) {
+                                        set.remove(&add_fd);
+                                    }
+                                    log(&format!(
+                                        "6-Z296 epoll_ctl DEL pid={} epfd={} fd={}",
+                                        pid, epfd, add_fd
+                                    ));
+                                }
+                                _ => {}
+                            }
                         }
                         // ── 6-Z163: AF_UNIX bind() sun_path rewrite (TWRP
                         // mode, direct-bind ABIs only) — see the helpers'
@@ -19363,6 +19580,143 @@ pub fn run_ptrace_loop(
                                 "SANDBOX BACKSTOP: EXIT getregs FAILED for pid {}: {} (6-Z185)",
                                 pid, e
                             )),
+                        }
+                    }
+
+                    // ── 6-Z296: input-read CALLER identification (EXIT side) ──
+                    //
+                    // WHERE THE INPUT CHAIN STANDS (6-Z293..295a): the app
+                    // frames evdev records byte-perfectly, the bridge delivers
+                    // them, the guest's ev_get_input consumes them
+                    // (read(fd, ev, 24) == 24 on fds 9/10) — and STILL no UI
+                    // reaction: the caller of ev_get_input drops every event.
+                    // Static analysis is exhausted (ev_get_input has ZERO BL
+                    // callers — dispatch is pointer-driven). But the tracer is
+                    // stopped at the read() EXIT, and lr(x30) STILL holds the
+                    // return address inside ev_get_input (bionic's read
+                    // wrapper does not touch x30 across the syscall); the
+                    // stack above sp carries the rest of the return chain;
+                    // x28 is the keyboard-branch condition global. Log all of
+                    // it annotated against /proc/<pid>/maps so every text
+                    // pointer names library+offset inline. The SAME probe
+                    // fires on TWRP (input WORKS there) — the stack diff
+                    // between a working and the broken guest is the answer.
+                    //
+                    // Gates (ALL must hold):
+                    //   1. read() EXIT (abi.read) with return ==
+                    //      sizeof(input_event) (24 aarch64 / 16 arm32),
+                    //   2. the 6-Z199 ENTRY stash matches THIS stop's (nr, fd)
+                    //      — guards desynced/aliased x0 (aarch64 arg1 == ret),
+                    //   3. the fd was epoll_ctl(ADD)'d by THIS pid (minui
+                    //      reader signature — kills boot-time 24-byte reads
+                    //      from unrelated threads).
+                    // Per-pid cap 6 hits; read-only — zero behaviour change.
+                    if abi.read > 0 && syscall_num == abi.read {
+                        // aarch64 input_event is 24 bytes; the AArch32-compat
+                        // struct (32-bit timeval) is 16. x86_64 hosts: always
+                        // 24 but the probe is unreachable there (empty
+                        // z296_epoll_members — see the ENTRY-side logger).
+                        #[cfg(target_arch = "aarch64")]
+                        let z296_is_arm32 = pid_is_arm32(pid);
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let z296_is_arm32 = false;
+                        let z296_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        let z296_ev_sz: i64 = if z296_is_arm32 { 16 } else { 24 };
+                        if z296_ret == z296_ev_sz {
+                            if let Some(&(z296_nr, z296_fd)) = pending_entry_fd.get(&pid) {
+                                if z296_nr == abi.read
+                                    && z296_epoll_members
+                                        .get(&pid)
+                                        .map(|set| set.contains(&z296_fd))
+                                        .unwrap_or(false)
+                                {
+                                    let z296_occ = {
+                                        let hits = z296_read_hits.entry(pid).or_insert(0);
+                                        *hits = hits.saturating_add(1);
+                                        *hits
+                                    };
+                                    if z296_occ <= 6 {
+                                        let z296_sp = get_syscall_arg(&regs, abi.reg_sp);
+                                        let z296_pc = get_syscall_arg(&regs, 32);
+                                        let z296_lr = get_syscall_arg(&regs, 30);
+                                        let z296_fp = get_syscall_arg(&regs, 29);
+                                        let z296_x28 = get_syscall_arg(&regs, 28);
+                                        let z296_comm =
+                                            std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                                .unwrap_or_else(|_| "?".to_string());
+                                        let z296_tgid = std::fs::read_to_string(format!(
+                                            "/proc/{}/status",
+                                            pid
+                                        ))
+                                        .ok()
+                                        .and_then(|s| {
+                                            s.lines().find(|l| l.starts_with("Tgid:")).and_then(
+                                                |l| {
+                                                    l.split(':')
+                                                        .nth(1)
+                                                        .and_then(|v| v.trim().parse::<i64>().ok())
+                                                },
+                                            )
+                                        })
+                                        .unwrap_or(-1);
+                                        log(&format!(
+                                            "6-Z296 INPUT-READ hit #{}: pid={} tgid={} comm={:?} fd={} ret={} sp={:#x} pc={:#x} lr={:#x} fp={:#x} x28={:#x}",
+                                            z296_occ,
+                                            pid,
+                                            z296_tgid,
+                                            z296_comm.trim_end(),
+                                            z296_fd,
+                                            z296_ret,
+                                            z296_sp,
+                                            z296_pc,
+                                            z296_lr,
+                                            z296_fp,
+                                            z296_x28
+                                        ));
+                                        // maps snapshot: annotation source + full
+                                        // dump ONCE per pid (the recovery maps
+                                        // name every loaded input-related lib).
+                                        let z296_maps =
+                                            std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                                .unwrap_or_default();
+                                        let z296_triples = z296_maps_triples(&z296_maps);
+                                        if z296_maps_dumped.insert(pid) {
+                                            log(&format!("6-Z296 maps for pid={} (once):", pid));
+                                            for line in z296_maps.lines() {
+                                                log(&format!("  6-Z296 MAPS: {}", line));
+                                            }
+                                        }
+                                        // Stack walk: 96 words ABOVE sp — the
+                                        // return chain (read wrapper frame →
+                                        // ev_get_input → its caller → ...).
+                                        let z296_stack =
+                                            z296_dump_words(pid, z296_sp, 96, &z296_triples);
+                                        log(&format!(
+                                            "6-Z296 stack@sp+0..768: {}",
+                                            z296_stack.join(" ")
+                                        ));
+                                        // minui per-fd info array (lineage
+                                        // librecovery_ui.so: .bss+0x5d1f0,
+                                        // 64-byte stride — fd_info/callback
+                                        // slots; 3 entries = 192 bytes).
+                                        if let Some(z296_base) =
+                                            z296_lib_base(&z296_triples, "librecovery_ui.so")
+                                        {
+                                            let z296_ctx = z296_dump_words(
+                                                pid,
+                                                z296_base + 0x5d1f0,
+                                                24,
+                                                &z296_triples,
+                                            );
+                                            log(&format!(
+                                                "6-Z296 ctx@{:#x}+0x5d1f0 (24 words): {}",
+                                                z296_base,
+                                                z296_ctx.join(" ")
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -31422,6 +31776,17 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             std::collections::HashSet::new();
         let mut pending_uevent_recv: std::collections::HashMap<libc::pid_t, PendingUeventRecv> =
             std::collections::HashMap::new();
+        // 6-Z296: probe state maps for the cleanup-contract test.
+        let mut z296_epoll_members: std::collections::HashMap<
+            libc::pid_t,
+            std::collections::HashSet<i64>,
+        > = std::collections::HashMap::new();
+        let mut z296_epoll_add_logged: std::collections::HashMap<libc::pid_t, u32> =
+            std::collections::HashMap::new();
+        let mut z296_read_hits: std::collections::HashMap<libc::pid_t, u32> =
+            std::collections::HashMap::new();
+        let mut z296_maps_dumped: std::collections::HashSet<libc::pid_t> =
+            std::collections::HashSet::new();
         let pid: libc::pid_t = 4242;
         in_syscall_map.insert(pid, true);
         pending_uevent_recv.insert(
@@ -31445,6 +31810,10 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         pending_getpid.insert(pid);
         fake_netlink_fds.entry(pid).or_default().insert(0x6b00_0000);
         netlink_fd_next.insert(pid, 0x6b00_0001);
+        z296_epoll_members.entry(pid).or_default().insert(9);
+        z296_epoll_add_logged.insert(pid, 1);
+        z296_read_hits.insert(pid, 3);
+        z296_maps_dumped.insert(pid);
         // Sanity: all four maps have the pid entry before cleanup
         // (5 = a real kernel fd, 0x6b000000+ = synthetic fake fds).
         fake_propserv_fds.entry(pid).or_default().insert(5);
@@ -31468,6 +31837,10 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             &mut esrch_streak,
             &mut pending_getpid,
             &mut pending_uevent_recv,
+            &mut z296_epoll_members,
+            &mut z296_epoll_add_logged,
+            &mut z296_read_hits,
+            &mut z296_maps_dumped,
         );
         // All four maps no longer have the pid entry — pid-RECYCLED
         // successor inherits NOTHING.
@@ -31483,6 +31856,11 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!open_fd_owner_paths.contains_key(&(pid, 7)));
         assert!(!accept4_einval_streak.contains_key(&pid));
         assert!(!esrch_streak.contains_key(&pid));
+        // 6-Z296: probe state is part of the death-hygiene contract.
+        assert!(!z296_epoll_members.contains_key(&pid));
+        assert!(!z296_epoll_add_logged.contains_key(&pid));
+        assert!(!z296_read_hits.contains_key(&pid));
+        assert!(!z296_maps_dumped.contains(&pid));
         assert!(!pending_getpid.contains(&pid));
         // 6-Z271b: the in-flight uevent-recv rewrite must die with the
         // process (a stale entry would POKEDATA the recycled pid's
@@ -32789,5 +33167,86 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             }
         }
         assert!(subsystem && action, "uevent keys malformed: {}", s);
+    }
+
+    // ── 6-Z296: input-read caller probe — pure helper contracts ──
+
+    #[test]
+    fn z296_maps_triples_and_annotate_lock_the_load_bias_contract() {
+        // Realistic bionic layout for a mapped .so: first mapping is the
+        // r--p ELF header (its start IS the load bias the static
+        // disassembly offsets are relative to), then exec/data segments.
+        let maps = "\
+7a1b0c000000-7a1b0c010000 r--p 00000000 fd:01 12345   /system/lib64/librecovery_ui.so
+7a1b0c010000-7a1b0c080000 r-xp 00010000 fd:01 12345   /system/lib64/librecovery_ui.so
+7a1b0c080000-7a1b0c081000 rw-p 00070000 fd:01 12345   /system/lib64/librecovery_ui.so
+7a1b0d000000-7a1b0d010000 rw-p 00000000 00:00 0       [anon:libc_malloc]
+7a1b0e000000-7a1b0e040000 r-xp 00000000 fd:01 99999   /system/bin/recovery
+";
+        let triples = z296_maps_triples(maps);
+        assert_eq!(triples.len(), 5);
+
+        // ev_get_input's static offset (0x37594) + base → annotated with
+        // the ELF-relative delta the disassembly quotes — even though the
+        // pointer lands in the SECOND (r-xp) mapping of the same file.
+        let base = z296_lib_base(&triples, "librecovery_ui.so").unwrap();
+        assert_eq!(base, 0x7a1b0c000000);
+        let ev_get_input_pc = base + 0x37594;
+        assert_eq!(
+            z296_annotate(ev_get_input_pc, &triples).as_deref(),
+            Some("librecovery_ui.so+0x37594")
+        );
+        // An exec-segment pointer deep in a later segment of the same
+        // file still annotates ELF-relative (find() hits the containing
+        // mapping; the delta is rebased to the file's lowest mapping).
+        // Mapping 2 spans base+0x10000..base+0x80000.
+        assert_eq!(
+            z296_annotate(base + 0x50000, &triples).as_deref(),
+            Some("librecovery_ui.so+0x50000")
+        );
+        // The recovery binary annotates with its own basename.
+        assert_eq!(
+            z296_annotate(0x7a1b0e001000, &triples).as_deref(),
+            Some("recovery+0x1000")
+        );
+        // Named special mappings annotate with their name (heap/stack
+        // words stay attributable in the stack-walk line).
+        assert_eq!(
+            z296_annotate(0x7a1b0d000008, &triples).as_deref(),
+            Some("[anon:libc_malloc]+0x8")
+        );
+        // Unmapped words → None; end-exclusive boundary.
+        assert_eq!(z296_annotate(0xdead_0000_0000, &triples), None);
+        assert_eq!(z296_annotate(0x7a1b0e040000, &triples), None);
+
+        // Needle miss → None (the ctx-array dump is skipped cleanly).
+        assert_eq!(z296_lib_base(&triples, "libnope.so"), None);
+    }
+
+    #[test]
+    fn z296_render_word_and_dump_words_lock_the_line_format() {
+        let maps = "\
+7a1b0c000000-7a1b0c010000 r--p 00000000 fd:01 12345   /system/lib64/librecovery_ui.so
+";
+        let triples = z296_maps_triples(maps);
+        // Zero, annotated, raw, and gap rendering — the exact log shapes
+        // the CI analysis greps for.
+        assert_eq!(z296_render_word(0, 0x18, &triples), "+0x18:0");
+        let base = z296_lib_base(&triples, "librecovery_ui.so").unwrap();
+        // Word inside the single mapping (mapping end = base+0x10000).
+        assert_eq!(
+            z296_render_word(base + 0x7594, 0x20, &triples),
+            "+0x20:0x7a1b0c007594[librecovery_ui.so+0x7594]"
+        );
+        assert_eq!(z296_render_word(0x1234, 0x28, &triples), "+0x28:0x1234");
+        // z296_dump_words on an unreadable address is exercised on-host
+        // only via ptrace (no child here) — the None path renders <gap>;
+        // lock it through a direct read_child_u64 guard: addr 0 returns
+        // None → gap. (read_child_u64(0) is None by contract.)
+        let gaps = z296_dump_words(1, 0x0, 2, &triples);
+        assert_eq!(
+            gaps,
+            vec!["+0x0:<gap>".to_string(), "+0x8:<gap>".to_string()]
+        );
     }
 }
