@@ -93,6 +93,15 @@ mod touch_action {
     /// A non-last finger lifted or the gesture was cancelled
     /// (MotionEvent.ACTION_POINTER_UP / ACTION_CANCEL).
     pub const CANCEL: u32 = 3;
+    /// 6-Z293c: synthetic key press — `x` carries the LINUX keycode.
+    /// Only meaningful on the abstract evdev bridge (the loader-path
+    /// minui never opens the key0 device, so send_key_code dual-writes
+    /// here to reach recovery menus with KEY_VOLUMEUP/KEY_POWER style
+    /// navigation — the discriminator between "bridge dead" and
+    /// "touch state machine ignores us").
+    pub const KEY_DOWN: u32 = 4;
+    /// 6-Z293c: synthetic key release — `x` carries the LINUX keycode.
+    pub const KEY_UP: u32 = 5;
 }
 
 /// A serialisable touch message sent over the host→kr64 IPC socket at
@@ -1085,6 +1094,28 @@ fn encode_evdev(
             }
             _ => None,
         },
+        // 6-Z293c: synthetic key press/release through the same evdev
+        // stream — EV_KEY(code, value) + SYN_REPORT. `x` = linux keycode.
+        touch_action::KEY_DOWN | touch_action::KEY_UP => {
+            let mut out = Vec::with_capacity(ev_size * 2);
+            out.extend(encode_evdev_record(
+                ev_size,
+                EV_KEY as u16,
+                msg.x as u16,
+                if msg.action == touch_action::KEY_DOWN {
+                    1
+                } else {
+                    0
+                },
+            )?);
+            out.extend(encode_evdev_record(
+                ev_size,
+                EV_SYN as u16,
+                SYN_REPORT as u16,
+                0,
+            )?);
+            Some(out)
+        }
         _ => None,
     }
 }
@@ -1186,6 +1217,39 @@ pub fn send_key_code(keycode: i32) {
         input_event_write(tx, EV_SYN, SYN_REPORT, SYN_REPORT);
         input_event_write(tx, EV_KEY, linux_keycode, 0);
         input_event_write(tx, EV_SYN, SYN_REPORT, SYN_REPORT);
+    }
+
+    // 6-Z293c: DUAL-WRITE to the abstract evdev bridge. The loader-path
+    // recoveries (lineage/AOSP-minui generations) never open the key0
+    // device — their ONLY input fds are the fb hook's bridge sockets —
+    // so keys sent solely through KEY_SENDER vanish. The bridge worker
+    // encodes EV_KEY + SYN_REPORT records of the negotiated size (and
+    // drops the message on the legacy TouchMessage path, where keys
+    // were never supported). A synthetic press+release back-to-back is
+    // what the guest's key handler expects for a single navigation step.
+    if let Some(tx) = INPUT_SENDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        let _ = tx.send(TouchMessage {
+            action: touch_action::KEY_DOWN,
+            pointer_id: 0,
+            x: linux_keycode,
+            y: 0,
+            pressure: 0,
+        });
+        let _ = tx.send(TouchMessage {
+            action: touch_action::KEY_UP,
+            pointer_id: 0,
+            x: linux_keycode,
+            y: 0,
+            pressure: 0,
+        });
+        info!(
+            "[INPUT] send_key_code: linux key {} also queued to the abstract evdev bridge",
+            linux_keycode
+        );
     }
 }
 
@@ -1433,6 +1497,37 @@ mod tests {
         assert!(encode_evdev_touch_down(20, 0, 1, 1, 1, 1).is_none());
         assert!(encode_evdev_touch_move(32, 0, 1, 1, 1).is_none());
         assert!(encode_evdev_touch_release(20, 0).is_none());
+    }
+
+    /// 6-Z293c: synthetic KEY records through the bridge —
+    /// KEY_DOWN = [EV_KEY(code, 1), SYN_REPORT], KEY_UP = value 0,
+    /// both at the negotiated record size (the KEY discriminator the
+    /// probe rides: VOLUMEUP must move the menu highlight even if the
+    /// guest's touch state machine never reacts to our touch frames).
+    #[test]
+    fn evdev_key_records_layout() {
+        let mut finger: Option<(i32, i32)> = None;
+        let k = encode_evdev(
+            24,
+            &mut finger,
+            touch_msg(touch_action::KEY_DOWN, 0, 114, 0, 0),
+        )
+        .expect("KEY_DOWN must encode");
+        assert_eq!(k.len(), 48); // 2 × 24
+        assert_eq!(evdev_rec(&k, 0, 24), (EV_KEY as u16, 114, 1));
+        assert_eq!(evdev_rec(&k, 1, 24), (EV_SYN as u16, SYN_REPORT as u16, 0));
+        // keys must NOT disturb the finger state
+        assert!(finger.is_none());
+
+        let k = encode_evdev(
+            16,
+            &mut finger,
+            touch_msg(touch_action::KEY_UP, 0, 114, 0, 0),
+        )
+        .expect("KEY_UP must encode");
+        assert_eq!(k.len(), 32); // 2 × 16
+        assert_eq!(evdev_rec(&k, 0, 16), (EV_KEY as u16, 114, 0));
+        assert_eq!(evdev_rec(&k, 1, 16), (EV_SYN as u16, SYN_REPORT as u16, 0));
     }
 
     /// The full per-connection state machine: DOWN assigns a fresh

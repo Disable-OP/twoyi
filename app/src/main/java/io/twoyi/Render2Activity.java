@@ -153,10 +153,27 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                 int py = intent.getIntExtra("y", -1);
                 Log.i(TAG, "debug touch broadcast received: x=" + px + " y=" + py
                         + " action=" + intent.getStringExtra("action"));
+                String act = intent.getStringExtra("action");
+                // 6-Z293c: synthetic KEY injection — routes through
+                // Renderer.sendKeycode (Android keycode), which since
+                // 6-Z293c also dual-writes EV_KEY records onto the
+                // abstract evdev bridge (the loader-path recoveries'
+                // only input fds). Discriminates "bridge dead" from
+                // "the guest's touch state machine ignores our touch
+                // records": VOLUMEUP must move the menu highlight.
+                // Checked BEFORE the x/y guard — key broadcasts carry
+                // no coordinates.
+                if ("key".equals(act)) {
+                    int key = intent.getIntExtra("key", -1);
+                    if (key >= 0) {
+                        Log.i(TAG, "debug key broadcast received: key=" + key);
+                        Renderer.sendKeycode(key);
+                    }
+                    return;
+                }
                 if (px < 0 || py < 0) {
                     return;
                 }
-                String act = intent.getStringExtra("action");
                 float sx = px - mSurfaceOffsetX;
                 float sy = py - mSurfaceOffsetY;
                 if ("swipe".equals(act)) {
