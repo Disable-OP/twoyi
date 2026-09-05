@@ -17331,6 +17331,53 @@ pub fn run_ptrace_loop(
                         let flags_raw = flags_addr as u64;
                         let is_propagation_or_remount =
                             is_mount_propagation_or_remount_op(flags_raw);
+                        // 6-Z305e: guest-internal bind mounts (MS_BIND).
+                        // Pure-stock Android 11 init bind-mounts /mnt/user
+                        // inside SetupMountNamespaces; the 6-Z91
+                        // NULL-fstype ENODEV made that fatal:
+                        //   init: Failed to bind mount /mnt/user: No such device
+                        //   init: SetupMountNamespaces failed: No such device
+                        //   init: InitFatalReboot: signal 6
+                        // (run 33997373705). The merged rootfs already
+                        // contains every file the guest can see, so a bind
+                        // INSIDE the guest tree is semantically a no-op —
+                        // only the mountpoint must EXIST for later opens.
+                        // Materialize source + target dirs in the rootfs
+                        // and let the EXIT compute-table return 0. TWRP's
+                        // recovery.fstab storage mounts are UNAFFECTED:
+                        // they carry a real fstype (vfat/ext4/…) and no
+                        // MS_BIND, so the 6-Z91 honest-ENODEV arm below
+                        // still classifies them.
+                        const MS_BIND_FLAG: u64 = 4096; // 1 << 12
+                        let is_bind_mount = (flags_raw & MS_BIND_FLAG) != 0;
+                        let is_propagation_or_remount = is_propagation_or_remount || is_bind_mount;
+                        if is_bind_mount {
+                            for gp in [src.as_deref(), tgt.as_deref()].into_iter().flatten() {
+                                if gp.starts_with('/') {
+                                    let real = format!("{}{}", rootfs, gp);
+                                    match std::fs::create_dir_all(&real) {
+                                        Ok(()) => log(&format!(
+                                            "6-Z305e: bind-mount materialized {} (flags={:#x})",
+                                            real, flags_raw
+                                        )),
+                                        Err(e) => log(&format!(
+                                            "6-Z305e: bind-mount materialize FAILED for {}: {}",
+                                            real, e
+                                        )),
+                                    }
+                                }
+                            }
+                            mount_enodev_logged = mount_enodev_logged.saturating_add(1);
+                            if mount_enodev_logged <= 30 {
+                                log(&format!(
+                                    "6-Z305e: bind mount src={:?} tgt={:?} flags={:#x} classified at ENTRY — EXIT will return 0 (guest-internal bind: merged-rootfs no-op, dirs materialized) [{} /30]",
+                                    src.as_deref().unwrap_or("(null)"),
+                                    tgt.as_deref().unwrap_or("(null)"),
+                                    flags_raw,
+                                    mount_enodev_logged
+                                ));
+                            }
+                        }
                         let block_storage_mount = match fs.as_deref() {
                             Some(f) => !f.is_empty() && !is_pseudo_fs_type(f),
                             None => !is_propagation_or_remount, // NULL/empty fstype: bind/remount — deny (6-Z91 semantics), UNLESS flags indicate a propagation/remount op (6-Z210)
