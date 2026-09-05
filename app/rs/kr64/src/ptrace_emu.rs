@@ -19882,24 +19882,16 @@ pub fn run_ptrace_loop(
                                                     z296_base,
                                                     z296_ctx.join(" ")
                                                 ));
-                                                // 6-Z296d: RecoveryUI state + vtable
-                                                // slots. Static decode of the
-                                                // dispatch chain (callback 0x2e6c8 →
-                                                // ev_get_input → ProcessKey/OnTouch*)
-                                                // shows every path ends in VIRTUAL
-                                                // calls (vtable+0x50/0x58/0xc8/0xd0/
-                                                // 0x110) whose runtime targets only
-                                                // exist in the ScreenRecoveryUI
-                                                // vtable — and the drop could be the
-                                                // UI STATE (key_states / last_key /
-                                                // queue_len / interrupted flag / the
-                                                // touch latch + EVIOCGABS-derived
-                                                // axis limits). Dump them ALL at hit
-                                                // time; the .bss offsets are lineage-
-                                                // specific (librecovery_ui.so).
-                                                // RecoveryUI* = ctx entry word5
-                                                // ([+0x28] heap ptr, bound __bind
-                                                // argument — run 33945773509).
+                                                // 6-Z296d/g: the RecoveryUI pointer
+                                                // lives in the ctx entry's word5
+                                                // ([+0x28] heap ptr — the bound
+                                                // __bind argument). The VTABLE slot
+                                                // dump stays under the header dedup;
+                                                // the STATE + RECORD line is logged
+                                                // PER HIT (see below) because hit #1's
+                                                // state is PRE-first-event — the
+                                                // evolution across the tap stream is
+                                                // the actual evidence.
                                                 let z296_rui =
                                                     read_child_u64(pid, z296_base + 0x5d1f0 + 0x28);
                                                 if let Some(z296_rui) = z296_rui {
@@ -19941,163 +19933,117 @@ pub fn run_ptrace_loop(
                                                                 ));
                                                             }
                                                         }
-                                                        // UI state words (lineage
-                                                        // RecoveryUI layout):
-                                                        //  0xb0 interrupted flag bit0;
-                                                        //  0xcb4 queue len; 0xfe0
-                                                        //  last_key; 0xfe4 long_press;
-                                                        //  0xfe8 press count; 0x1000
-                                                        //  touch latch; 0x101c/0x1024
-                                                        //  ABS-X max/min; 0x1020/0x1028
-                                                        //  ABS-Y max/min; key_states[]
-                                                        //  @0xce0+code (114/115/116).
-                                                        let mut z296_st: Vec<String> = Vec::new();
-                                                        for (z296_nm, z296_off) in [
-                                                            ("interrupted", 0xb0u64),
-                                                            ("qlen", 0xcb4),
-                                                            ("last_key", 0xfe0),
-                                                            ("long_press", 0xfe4),
-                                                            ("press_cnt", 0xfe8),
-                                                            ("touch_latch", 0x1000),
-                                                            ("absx_max", 0x101c),
-                                                            ("absy_max", 0x1020),
-                                                            ("absx_min", 0x1024),
-                                                            ("absy_min", 0x1028),
-                                                        ] {
-                                                            match read_child_u32(
-                                                                pid,
-                                                                z296_rui + z296_off,
-                                                            ) {
-                                                                Some(z296_v) => {
-                                                                    z296_st.push(format!(
-                                                                        "{}={}",
-                                                                        z296_nm, z296_v
-                                                                    ))
-                                                                }
-                                                                None => z296_st.push(format!(
-                                                                    "{}=<gap>",
-                                                                    z296_nm
-                                                                )),
-                                                            }
-                                                        }
-                                                        for z296_k in [114u64, 115, 116] {
-                                                            match read_child_u32(
-                                                                pid,
-                                                                z296_rui + 0xce0 + z296_k,
-                                                            ) {
-                                                                Some(z296_v) => {
-                                                                    z296_st.push(format!(
-                                                                        "ks{}={}",
-                                                                        z296_k, z296_v
-                                                                    ))
-                                                                }
-                                                                None => z296_st.push(format!(
-                                                                    "ks{}=<gap>",
-                                                                    z296_k
-                                                                )),
-                                                            }
-                                                        }
-                                                        // the one-time EVIOCGABS
-                                                        // queried flag (.bss+0x188).
-                                                        let z296_qflag = read_child_u32(
-                                                            pid,
-                                                            z296_base + 0x5d188,
-                                                        );
-                                                        // 6-Z296e: the class byte the
-                                                        // callback gates on ([rui+0x40])
-                                                        // + the ACTUAL record bytes
-                                                        // received (type@16 u16,
-                                                        // code@18 u16, value@20 i32
-                                                        // for the 24-byte aarch64
-                                                        // input_event).
-                                                        let z296_class =
-                                                            read_child_u32(pid, z296_rui + 0x40);
-                                                        let mut z296_rec = String::from("<none>");
-                                                        if let Some(&(_, z296_buf)) =
-                                                            z296_read_bufs.get(&pid)
-                                                        {
-                                                            if z296_buf > 0x100 {
-                                                                if let Some(z296_bytes) =
-                                                                    read_child_bytes(
-                                                                        pid, z296_buf, 24,
-                                                                    )
-                                                                {
-                                                                    if z296_bytes.len() == 24 {
-                                                                        let z296_t =
-                                                                            u16::from_le_bytes([
-                                                                                z296_bytes[16],
-                                                                                z296_bytes[17],
-                                                                            ]);
-                                                                        let z296_c =
-                                                                            u16::from_le_bytes([
-                                                                                z296_bytes[18],
-                                                                                z296_bytes[19],
-                                                                            ]);
-                                                                        let z296_v =
-                                                                            i32::from_le_bytes([
-                                                                                z296_bytes[20],
-                                                                                z296_bytes[21],
-                                                                                z296_bytes[22],
-                                                                                z296_bytes[23],
-                                                                            ]);
-                                                                        z296_rec = format!(
-                                                                            "type={} code={} value={}",
-                                                                            z296_t, z296_c, z296_v
-                                                                        );
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        // 6-Z296f: the callback's ACTUAL
-                                                        // object (x19 at the syscall
-                                                        // exit — callee-saved, still
-                                                        // live). Dump its first words
-                                                        // + the class byte it gates on
-                                                        // ([x19+0x40]) so the object
-                                                        // identity is settled from
-                                                        // runtime data, not inference.
-                                                        let mut z296_x19_info =
-                                                            String::from("x19obj=<none>");
-                                                        if z296_x19 > 0x1000 {
-                                                            let z296_w0 =
-                                                                read_child_u64(pid, z296_x19);
-                                                            let z296_w1 =
-                                                                read_child_u64(pid, z296_x19 + 8);
-                                                            let z296_cls = read_child_u32(
-                                                                pid,
-                                                                z296_x19 + 0x40,
-                                                            );
-                                                            let z296_cls3 = read_child_u32(
-                                                                pid,
-                                                                z296_x19 + 0x3c,
-                                                            );
-                                                            z296_x19_info = format!(
-                                                                "x19obj@{:#x} [0]={:?}[ann {}] [8]={:?} [0x40]={:?} [0x3c]={:?}",
-                                                                z296_x19,
-                                                                z296_w0,
-                                                                z296_w0
-                                                                    .and_then(|w| z296_annotate(
-                                                                        w, &z296_triples
-                                                                    ))
-                                                                    .unwrap_or_default(),
-                                                                z296_w1,
-                                                                z296_cls,
-                                                                z296_cls3
-                                                            );
-                                                        }
-                                                        log(&format!(
-                                                            "6-Z296 rui@{:#x} state: {} abs_init={:?} class40={:?} record: {} {}",
-                                                            z296_rui,
-                                                            z296_st.join(" "),
-                                                            z296_qflag,
-                                                            z296_class,
-                                                            z296_rec,
-                                                            z296_x19_info
-                                                        ));
                                                     }
                                                 }
                                             }
                                         } // header-dedup else-end
+                                          // ── 6-Z296g: PER-HIT state + record ──
+                                          // Sampled on EVERY probe hit (cap 24) so the
+                                          // state EVOLUTION across a tap/key stream is
+                                          // visible: hit #1's snapshot is taken at the
+                                          // read EXIT — BEFORE the callback processed
+                                          // that record — so one-shot dumps only ever
+                                          // showed the pristine pre-event state.
+                                        if let Some(z296_base) =
+                                            z296_lib_base(&z296_triples, "librecovery_ui.so")
+                                        {
+                                            if let Some(z296_rui) =
+                                                read_child_u64(pid, z296_base + 0x5d1f0 + 0x28)
+                                            {
+                                                if z296_rui > 0x1000 {
+                                                    let mut z296_st: Vec<String> = Vec::new();
+                                                    for (z296_nm, z296_off) in [
+                                                        ("interrupted", 0xb0u64),
+                                                        ("qlen", 0xcb4),
+                                                        ("last_key", 0xfe0),
+                                                        ("long_press", 0xfe4),
+                                                        ("press_cnt", 0xfe8),
+                                                        ("touch_latch", 0x1000),
+                                                        ("touch_x", 0x1004),
+                                                        ("touch_y", 0x1008),
+                                                        ("absx_max", 0x101c),
+                                                        ("absy_max", 0x1020),
+                                                        ("absx_min", 0x1024),
+                                                        ("absy_min", 0x1028),
+                                                        ("ss_state", 0x105c),
+                                                    ] {
+                                                        match read_child_u32(
+                                                            pid,
+                                                            z296_rui + z296_off,
+                                                        ) {
+                                                            Some(z296_v) => z296_st.push(format!(
+                                                                "{}={}",
+                                                                z296_nm, z296_v
+                                                            )),
+                                                            None => z296_st
+                                                                .push(format!("{}=<gap>", z296_nm)),
+                                                        }
+                                                    }
+                                                    for z296_k in [114u64, 115, 116] {
+                                                        match read_child_u32(
+                                                            pid,
+                                                            z296_rui + 0xce0 + z296_k,
+                                                        ) {
+                                                            Some(z296_v) => z296_st.push(format!(
+                                                                "ks{}={}",
+                                                                z296_k, z296_v
+                                                            )),
+                                                            None => z296_st.push(format!(
+                                                                "ks{}=<gap>",
+                                                                z296_k
+                                                            )),
+                                                        }
+                                                    }
+                                                    let z296_qflag =
+                                                        read_child_u32(pid, z296_base + 0x5d188);
+                                                    let z296_class =
+                                                        read_child_u32(pid, z296_rui + 0x40);
+                                                    let mut z296_rec = String::from("<none>");
+                                                    if let Some(&(_, z296_buf)) =
+                                                        z296_read_bufs.get(&pid)
+                                                    {
+                                                        if z296_buf > 0x100 {
+                                                            if let Some(z296_bytes) =
+                                                                read_child_bytes(pid, z296_buf, 24)
+                                                            {
+                                                                if z296_bytes.len() == 24 {
+                                                                    let z296_t =
+                                                                        u16::from_le_bytes([
+                                                                            z296_bytes[16],
+                                                                            z296_bytes[17],
+                                                                        ]);
+                                                                    let z296_c =
+                                                                        u16::from_le_bytes([
+                                                                            z296_bytes[18],
+                                                                            z296_bytes[19],
+                                                                        ]);
+                                                                    let z296_v =
+                                                                        i32::from_le_bytes([
+                                                                            z296_bytes[20],
+                                                                            z296_bytes[21],
+                                                                            z296_bytes[22],
+                                                                            z296_bytes[23],
+                                                                        ]);
+                                                                    z296_rec = format!(
+                                                                        "type={} code={} value={}",
+                                                                        z296_t, z296_c, z296_v
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    log(&format!(
+                                                        "6-Z296 hit#{} state rui@{:#x}: {} abs_init={:?} class40={:?} record: {}",
+                                                        z296_occ,
+                                                        z296_rui,
+                                                        z296_st.join(" "),
+                                                        z296_qflag,
+                                                        z296_class,
+                                                        z296_rec
+                                                    ));
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
