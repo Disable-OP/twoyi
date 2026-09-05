@@ -24781,3 +24781,20 @@ Work Log:
 
 Stage Summary:
 - HEAD 03d3710 (1 commit ahead of origin/main, push + wave next). Engagement surface CONFIRMED and partially WORKING (instant virtual-KeyMint resolution — the 6-Z271 stall fix holds); the NEW stall is inside keystore2 startup post-hwinfo, pre-registration. Next: push, dispatch fox (target) + lineage (guard) + TWRP-angler (guard) wave, decode the triangle (glog lines / syscall samples / BC stream) to name the exact stall, then fix it.
+
+---
+Task ID: 6-Z302 — the keystore2 stall root-caused and fixed (VINTF virtual-HAL manifest staging)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: decode the 6-Z301 wave (fox target + lineage/angler guards), name the keystore2 stall, implement and verify the fix.
+
+Work Log:
+- Wave on 45bf3cd: ALL THREE SUCCESS (fox 33970102806 UI_READY, lineage 33970103881 UI_READY, angler 33970101816). Instruments validated: syscall samples flowed, BC stream complete, glog budget captured beyond the old 800-write wall.
+- DECODE: fox keystore2 glog = "Keystore2 is starting." (10.67s) → "Starting thread pool now." (10.67s) → "Watchdog thread idle -> terminating. Have a great day." (20.73s); proxy: addService(android.security.compat) 10.7s, self-tx + tx#2 compat descriptor fetches COMPLETED (the steal delivered tx#2 back to conn2 — 6-Z271i/6-Z271g both work), virtual KeyMint getHardwareInfo tx (km_compat's own query) — then ZERO further binder ops, threads idle-ticking (24 syscalls/s = the 250ms BR_NOOP loop), main never registered IKeystoreService/default. Thread dump: all threads in 8-byte recvfrom (the proxy wire), main renamed by the pool machinery. The watchdog's 'idle -> terminating' = the watched startup section never completed within budget (no violation strings exist in the binary).
+- AOSP source decode (android-12.1.0_r1): keystore2_main.rs registration flow (KeystoreService::new_native_binder → panic on failure — process alive ⇒ not reached/reached via another path); globals.rs connect_keymint(): get_aidl_instances FIRST, legacy compat branch when the VINTF manifest lacks AIDL keymint (addService(android.security.compat) at 10.7s IS that branch); shared_secret_negotiation.rs runs on a SPAWNED thread (1s retry loop, never blocks main); service.rs STRONGBOX = if-let-Ok (errors ignored); watchdog.rs has NO violation strings — 'idle -> terminating' fires on timeout.
+- ROOT CAUSE: TWRP-12-class vendor VINTF manifests declare only legacy HIDL keymaster@4.x ⇒ keystore2's connect_keymint(TEE) took the android.security.compat legacy chain and STALLED inside it (the getKeyMintDevice-on-compat transaction never even issued) — before registration, before SharedSecret, before IKeystoreSecurity/default.
+- FIX 011baed: devices.rs create_vintf_virtual_hal_manifest() stages vendor/etc/vintf/manifest/twoyi-virtual-hals.xml (AOSP fqname shape, mirrored from hardware/interfaces keymint-service.xml) declaring IKeyMintDevice/default + ISharedSecret/default (the services the proxy serves) + IKeyMintDevice/strongbox deliberately UNSERVED (routes connect_keymint(STRONGBOX) through the genuine branch's fast NAME_NOT_FOUND instead of the compat chain; errors ignored by service.rs). Skipped when the guest already declares keymint (no libvintf duplicate-instance merge errors; 6-Z299 virtual_fallback covers guest-HAL death). Dedup guard ignores our own fragment. Call site: lib.rs right after the 6-Z287 staging. +2 tests. 734 green, fmt+clippy clean.
+- Pushed 011baed → origin/main. Wave discipline: run list checked before each dispatch.
+
+Stage Summary:
+- HEAD 011baed. Expectation for the next fox wave: get_aidl_instances resolves 'default' → NO android.security.compat addService, NO compat _NTF fetches; connect_keymint returns via the virtual service; "Shared secret negotiation concluded successfully." + "Successfully registered Keystore 2.0 service." appear in the glog trace; the recovery client can then transact IKeystoreSecurity/default. Next: dispatch fox/lineage/angler wave on 011baed and decode.
