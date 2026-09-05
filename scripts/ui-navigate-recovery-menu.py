@@ -162,7 +162,7 @@ def adb_out(cmd, timeout=20):
     except Exception as e:
         return f"<threw {e!r}>"
 
-INPUT_READS_RE = re.compile(r"INPUT read\(fd=\d+\) -> \d+ bytes")
+INPUT_READS_RE = re.compile(r"INPUT (raw )?read\(fd=\d+\)( -> \d+)?")
 
 
 def count_input_reads():
@@ -313,8 +313,17 @@ def main():
         time.sleep(2)
     probe["channels_used"] = channels_used
 
-    frame_after = blit_frame_counter(logcat_dump())
+    lc_after = logcat_dump()
+    frame_after = blit_frame_counter(lc_after)
     probe["frame_after"] = frame_after
+    # 6-Z293c: persist the POST-probe logcat — the artifact logcat.txt is
+    # dumped by ui-navigate BEFORE the probe runs, so every receiver log
+    # the probe generated was invisible in past runs.
+    try:
+        with open(os.path.join(ART, "menu-probe-final-logcat.txt"), "w") as f:
+            f.write(lc_after or "<empty>")
+    except OSError:
+        pass
 
     # 6-Z289g/h: the host chain is PROVEN healthy by the 6-Z289e/f
     # instrumentation (receiver fires, no drops, worker write succeeds).
