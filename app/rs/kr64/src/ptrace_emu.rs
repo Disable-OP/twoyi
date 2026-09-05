@@ -7343,6 +7343,9 @@ fn spawn_boot_completed_sender(trigger_pid: libc::pid_t, reason: &str) {
     let log = |msg: &str| {
         crate::trace_log_line(msg);
     };
+    // 6-Z305a: own the reason string BEFORE the 'static move closure —
+    // a borrowed &str parameter cannot escape into a spawned thread (E0521).
+    let reason = reason.to_string();
     if BOOT_COMPLETED_SENDER_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         log("[KR64] BOOT_COMPLETED: sender thread already started — not spawning another (Task 6-Z62)");
         return;
