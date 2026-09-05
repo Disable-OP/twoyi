@@ -1998,12 +1998,13 @@ ssize_t read(int fd, void *buf, size_t count) {
          * of raw mode is that the guest's REAL read path consumes the
          * records, so the legacy "INPUT read" logs never fire and the
          * artifacts can't tell delivered-but-ignored from
-         * never-delivered. Log the first 48 raw input-fd reads (fd,
-         * requested count, actual return — for lineage's ev_get_input
-         * the contract is ret == count == sizeof(input_event)); 8 was
-         * consumed by the first popup tap alone. */
-        if (g_inbr_log_read < 48) {
-            g_inbr_log_read++;
+         * never-delivered. Log the first 16 raw input-fd reads AND
+         * every 64th thereafter (a hard cap is useless: the nav phase
+         * burns any cap long before the menu probe runs at +120 s).
+         * For lineage's ev_get_input the contract is
+         * ret == count == sizeof(input_event). */
+        g_inbr_log_read++;
+        if (g_inbr_log_read <= 16 || (g_inbr_log_read % 64) == 0) {
             write_str(2, "[twrp_fb_hook] INPUT raw read(fd=");
             write_num(2, fd);
             write_str(2, ", count=");
