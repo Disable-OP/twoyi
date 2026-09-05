@@ -24608,3 +24608,19 @@ Stage Summary:
   caller-of-ev_get_input → RecoveryUI wiring. NEXT: the kr64 dynamic memory probe (dump the ctx array at 0x5d1f0 + vtable slots +
   the epoll set at probe time) to identify the real HandleEvents implementations, then either route around or reproduce the
   missing wiring. Corpus: TWRP UI_READY ✓, R12 (guard in flight), lineage BOOT_OK/SPLASH_HANG.
+
+---
+Task ID: 6-Z295a VERIFIED — R12 guard green on the full new input stack
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: R12 regression guard on 7b52870 (hello v2 + per-class ioctls + park-not-close + both-device key routing).
+
+Work Log:
+- Run 33941768370: BOOT_OK + UI_READY ✓. The bridge negotiated on R12's device layout (30 raw reads: fd 9 keys-class ×28,
+  fd 8 ×2) — the whole 6-Z293/294/295 stack is safe for the R12 family.
+
+Stage Summary:
+- HEAD 47dafeb. CORPUS FULLY GREEN-OR-EQUAL: TWRP UI_READY ✓, OrangeFox R12 UI_READY ✓ (fresh input stack), lineage BOOT_OK
+  (SPLASH_HANG — transport provably byte-perfect; the remaining inert layer is the guest's caller-of-ev_get_input →
+  RecoveryUI wiring, next round's kr64 dynamic memory probe targets it: ctx array @0x5d1f0/64B stride, vtable+0x30 dispatch,
+  x28 keyboard-close condition). Cron webDevReview (job 359061, fixed_rate 3600s, priority 15) continues from repo state.
