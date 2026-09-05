@@ -347,7 +347,19 @@ jobs:
           sudo docker exec redroid sh -c \
             "ls -la /data/user/0/io.twoyi.debug/rootfs/ 2>/dev/null | head -40; \
              ls -la /data/user/0/io.twoyi.debug/rootfs/system/framework/ 2>/dev/null | head -10; \
-             ls -la /data/user/0/io.twoyi.debug/rootfs/dev/socket/ 2>/dev/null" \
+             ls -la /data/user/0/io.twoyi.debug/rootfs/dev/socket/ 2>/dev/null; \
+             echo '── restorecon/realpath forensics (6-Z305b): the guest init died on \
+             realpath(/system/bin/init) ENOENT → InitFatalReboot; stat every \
+             component through the container view to separate a missing file \
+             from a path-translation bug ──'; \
+             for f in init system system/bin system/bin/init system/bin/sh \
+                      system/bin/linker64 system/framework/framework.jar \
+                      system/etc/prop.default vendor/etc/selinux/precompiled_sepolicy; do \
+               p=/data/user/0/io.twoyi.debug/rootfs/\$f; \
+               if [ -L \$p ]; then echo \"LINK \$f -> \$(readlink \$p)\"; \
+               elif [ -e \$p ]; then echo \"OK   \$f size=\$(stat -c%s \$p 2>/dev/null)\"; \
+               else echo \"MISS \$f\"; fi; \
+             done" \
             > /tmp/ui-e2e-artifacts/rootfs-listing.txt 2>&1 || true
           sudo docker exec redroid sh -c \
             "ls -la /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/ 2>/dev/null; \
