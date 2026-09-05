@@ -11135,6 +11135,21 @@ fn stop_ring_drain(reason: &str, tracked: &[libc::pid_t]) -> Vec<String> {
     out
 }
 
+/// 6-Z301: glog-redirect classification — pure helper (unit-tested).
+/// Returns true when the write payload is a logdw-redirected log line
+/// that belongs on the DEDICATED glog budget instead of the general
+/// 800-write budget. The loader's per-binder-op DIAG spam families
+/// ("*** 6-Z272k …", "*** SM-TR …", "*** SM-REPLY …", "binder proxy
+/// ioctl …") share the "[glog I/twoyi_loader] [twoyi_loader] " prefix
+/// with genuine loader info lines, so they are excluded by exact prefix
+/// here — they must not be able to flood the glog budget and starve the
+/// interesting lines (keystore2's startup trace) in the same process.
+fn is_glog_redirect_write(payload: &[u8]) -> bool {
+    payload.starts_with(b"[glog ")
+        && !payload.starts_with(b"[glog I/twoyi_loader] [twoyi_loader] ***")
+        && !payload.starts_with(b"[glog I/twoyi_loader] [twoyi_loader] binder proxy ioctl")
+}
+
 /// Check if ptrace is likely to work on this device.
 pub fn ptrace_available() -> bool {
     let r = unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) };
@@ -11668,9 +11683,25 @@ pub fn run_ptrace_loop(
     //   diagnostic — only the first 800 post-execve writes are logged,
     //   to bound log volume if init spins. (Init does ~339 writes total
     //   per the strace, so 800 is a comfortable 2.4× headroom.)
+    // `post_execve_glog_count` (6-Z301): the separate budget for the
+    //   logdw-redirected "[glog " writes (cap 2000) — see the comment at
+    //   the declaration.
     let mut kmsg_fd: Option<i32> = None;
     let mut pending_kmsg_open_pid: Option<libc::pid_t> = None; // 6-Z83: per-pid
     let mut post_execve_write_count: u64 = 0;
+    // 6-Z301: glog-redirect budget — writes whose payload starts with
+    // "[glog " come from the twoyi_loader shlib's logdw→/dev/__kmsg__
+    // redirect and are the ONLY faithful trace of guest-side logger
+    // output (keystore2's glog startup trace, the loader's per-binder-op
+    // 6-Z272k DIAGs). The general 800-write budget routinely burns out on
+    // property-area syncs long before the interesting lines — the
+    // 6-Z271o precedent named exactly this for keystore2's abort, and the
+    // fox R12 engagement wave (33964129056) showed 2 of keystore2's
+    // startup lines for the same reason. Separate generous budget, still
+    // bounded per process. The loader's per-binder-op DIAG spam families
+    // stay on the GENERAL budget so they cannot flood this one (see the
+    // classification at the write() EXIT block).
+    let mut post_execve_glog_count: u64 = 0;
     // 6-Z272f-b: focused per-pid syscall DIAG — the corpus's health HAL
     // (android.hardware.health@2.1-service, started via the 6-Z272c rc
     // patch) execs, opens 3 property-area files, and then goes SILENT for
@@ -15050,6 +15081,24 @@ pub fn run_ptrace_loop(
                                 focused_diag_pids.insert(pid, (0, 0, 0));
                                 log(&format!(
                                     "6-Z272b: focused syscall DIAG armed for pid={} ({})",
+                                    pid, exec_path
+                                ));
+                            } else if exec_path.ends_with("/keystore2") {
+                                // 6-Z301: the TWRP-12-class keystore2
+                                // engagement check — the fox R12 guest
+                                // keystore2 went silent after its 2nd
+                                // android.security.compat descriptor fetch
+                                // (wave 33964129056): no SharedSecret fetch,
+                                // no compat method call, no
+                                // IKeystoreService/default registration, all
+                                // threads parked in recvmsg at run end. The
+                                // focused stream + the 1000-stride sample
+                                // (EXIT block) name the last syscall class
+                                // before the park (futex / nanosleep /
+                                // recvfrom) without flooding.
+                                focused_diag_pids.insert(pid, (0, 0, 0));
+                                log(&format!(
+                                    "6-Z301: focused syscall DIAG armed for pid={} ({})",
                                     pid, exec_path
                                 ));
                             }
@@ -20206,7 +20255,23 @@ pub fn run_ptrace_loop(
                                 "6-Z272f-b: pid={} syscall #{} nr={} ret={}",
                                 pid, seen.0, syscall_num, ret
                             ));
-                        } else if ret < 0 {
+                        } else {
+                            // 6-Z301: count EVERY post-head syscall of an
+                            // armed pid and log a 1000-stride sample. A
+                            // thread that parks (futex / nanosleep /
+                            // recvfrom) stops advancing the counter — the
+                            // LAST sample names the syscall class it
+                            // stalled in (±1000 resolution), which is the
+                            // keystore2 engagement-check instrument.
+                            seen.0 = seen.0.saturating_add(1);
+                            if seen.0 % 1000 == 0 {
+                                log(&format!(
+                                    "6-Z301: pid={} syscall sample #{} nr={} ret={}",
+                                    pid, seen.0, syscall_num, ret
+                                ));
+                            }
+                        }
+                        if seen.0 >= 150 && ret < 0 {
                             // 6-Z275: per-pid (window_index, used) budget in
                             // the map value position — the armed map stores
                             // (seen, fail_window, fail_used). Refill the
@@ -20236,9 +20301,16 @@ pub fn run_ptrace_loop(
                                 }
                             };
                             // Store (seen, window, used) — mutate in place.
+                            // 6-Z301 FIX: position 0 must keep the syscall
+                            // TOTAL (the head counter + the sample stride
+                            // base); the old store wrote w_old into position
+                            // 0, corrupting the counter at the first failure
+                            // (benign for the old head-only semantics — the
+                            // head was already exhausted — but it would have
+                            // wrecked the 1000-stride sample base).
                             let (_, w_old, u_old) = *seen;
                             let u_new = if w_old != window { 1 } else { u_old + 1 };
-                            *seen = (w_old, window, u_new);
+                            *seen = (seen.0, window, u_new);
                             if allowed {
                                 // 6-Z272p: name the TARGET: the fd's
                                 // /proc/<pid>/fd/<n> link for fd-taking
@@ -21887,9 +21959,25 @@ pub fn run_ptrace_loop(
                         let probe_worthy = ret > 0 && (ret <= 512 || fatal_evidence_follow > 0);
                         let mut is_fatal_marker = false;
                         let mut in_follow = false;
+                        // 6-Z301: glog-redirect classification — set by the
+                        // probe below (payload prefix), consumed by the
+                        // capture condition. See the declaration of
+                        // `post_execve_glog_count` for the why.
+                        let mut is_glog = false;
                         if probe_worthy {
+                            // 6-Z301: 64 B (was 24) — the glog
+                            // classification must see past the common
+                            // "[glog I/twoyi_loader] [twoyi_loader] " prefix
+                            // to separate the loader's per-binder-op DIAG
+                            // spam from real log lines.
                             let probe =
-                                read_child_bytes(pid, get_syscall_arg(&regs, abi.reg_arg2), 24);
+                                read_child_bytes(pid, get_syscall_arg(&regs, abi.reg_arg2), 64);
+                            // 6-Z301: glog classification FIRST (borrow);
+                            // is_fatal_marker below consumes the probe.
+                            is_glog = probe
+                                .as_ref()
+                                .map(|b| is_glog_redirect_write(b))
+                                .unwrap_or(false);
                             is_fatal_marker = probe
                                 .map(|b| {
                                     b.starts_with(b"[twrp_fb_hook] ***")
@@ -21905,11 +21993,19 @@ pub fn run_ptrace_loop(
                             }
                         }
                         // Capture when: fatal evidence (marker or the
-                        // follow window, any size), or the regular
-                        // budgeted path (ret <= 512).
+                        // follow window, any size), a glog-redirected log
+                        // line (6-Z301, its own budget), or the regular
+                        // budgeted path (ret <= 512). The glog arm sits
+                        // BEFORE the general arm so a captured glog line
+                        // does not also consume the general 800 budget.
                         if ret > 0
                             && (is_fatal_marker
                                 || in_follow
+                                || (is_glog && ret <= 512 && {
+                                    post_execve_glog_count =
+                                        post_execve_glog_count.saturating_add(1);
+                                    post_execve_glog_count <= 2000
+                                })
                                 || (ret <= 512 && {
                                     post_execve_write_count =
                                         post_execve_write_count.saturating_add(1);
@@ -33676,5 +33772,49 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // itself (correct for group leaders) and the result is cached.
         assert_eq!(z296_tgid_of(4243, &mut cache), 4243);
         assert_eq!(cache.get(&4243), Some(&4243));
+    }
+
+    // ── 6-Z301: glog-redirect write classification ──────────────────────
+    // The keystore2 engagement check rides on the dedicated glog budget;
+    // the classification must admit genuine log lines and reject the
+    // loader's per-binder-op DIAG spam families (they share the prefix).
+
+    #[test]
+    fn z301_glog_admits_guest_log_lines() {
+        // keystore2's glog startup trace (the decisive missing evidence
+        // in wave 33964129056).
+        assert!(is_glog_redirect_write(
+            b"[glog I/keystore2] keystore2_main: Keystore2 is starting.\n"
+        ));
+        // a genuine loader info line (non-spam family)
+        assert!(is_glog_redirect_write(
+            b"[glog I/twoyi_loader] [twoyi_loader] init: LD_PRELOAD=..."
+        ));
+        // glog error/warn levels flow too
+        assert!(is_glog_redirect_write(
+            b"[glog E/keystore2] error.rs:180 - Caused by:"
+        ));
+    }
+
+    #[test]
+    fn z301_glog_rejects_loader_diag_spam_and_non_glog() {
+        // the per-binder-op 6-Z272k DIAG spam (2 writes per binder op on
+        // the fox vibrator storm — must NOT consume the glog budget)
+        assert!(!is_glog_redirect_write(
+            b"[glog I/twoyi_loader] [twoyi_loader] *** 6-Z272k BC to proxy: cmd=TX target=0"
+        ));
+        assert!(!is_glog_redirect_write(
+            b"[glog I/twoyi_loader] [twoyi_loader] *** SM-TR flags=0x00000001"
+        ));
+        assert!(!is_glog_redirect_write(
+            b"[glog I/twoyi_loader] [twoyi_loader] binder proxy ioctl 0x40046205 -> wire"
+        ));
+        // plain (non-glog) writes stay on the general budget
+        assert!(!is_glog_redirect_write(b"/linkerconfig/ld.config.txt"));
+        assert!(!is_glog_redirect_write(b"[twrp_fb_hook] ioctl(fd="));
+        // short / ambiguous payloads
+        assert!(!is_glog_redirect_write(b"[glog"));
+        assert!(!is_glog_redirect_write(b"[glogx"));
+        assert!(!is_glog_redirect_write(b""));
     }
 }
