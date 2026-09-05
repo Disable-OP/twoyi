@@ -17352,6 +17352,20 @@ pub fn run_ptrace_loop(
                         let is_bind_mount = (flags_raw & MS_BIND_FLAG) != 0;
                         let is_propagation_or_remount = is_propagation_or_remount || is_bind_mount;
                         if is_bind_mount {
+                            // (re-read the strings here — the earlier DIAG
+                            // reads live in sibling scopes)
+                            let src_addr = get_syscall_arg(&regs, abi.reg_arg1);
+                            let src = if src_addr != 0 {
+                                read_child_string(pid, src_addr)
+                            } else {
+                                None
+                            };
+                            let tgt_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let tgt = if tgt_addr != 0 {
+                                read_child_string(pid, tgt_addr)
+                            } else {
+                                None
+                            };
                             for gp in [src.as_deref(), tgt.as_deref()].into_iter().flatten() {
                                 if gp.starts_with('/') {
                                     let real = format!("{}{}", rootfs, gp);
