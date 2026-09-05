@@ -24935,3 +24935,26 @@ Stage Summary:
   ui-e2e-android-arm64.yml, read the boot timeline from the artifacts, fix the earliest real blocker
   generically (Stage A→H order), regression-test recoveries. Recovery suites (5 families UI_READY) remain
   the regression guard. Cron webDevReview continues.
+
+---
+Task ID: 6-Z305b — FIRST pure-stock Android 11 boot attempt: honest verdict + next blocker
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-06
+Task: dispatch + decode the first boot-ladder run of the PURE unmodified stock Android 11 rootfs; classify the earliest real blocker.
+
+Work Log:
+- Run 33987046990 (5c0d037): ALL GREEN as a harness. Timeline: provenance gate ✓ (manifest sha matches the official SDK zip), 494MB asset download + push ✓, import ✓ (RamdiskImporter: "Import file size: 493824210", GZIP → tar → 3562 entries — the 6-Z305 tar symlink arm held: 432 symlinks materialized), GL boot path ✓ ("Virtual display: 720x1600, SurfaceFlinger: 720x1600"), kr64 exec'd /init.
+- GUEST TIMELINE (from kr64 WRITEV-bridged init stderr — the money evidence):
+  1. "init first stage started!" — REAL Android 11 first-stage init
+  2. fstab-from-DT absent (expected in container) → "First stage mount skipped" (merged topology)
+  3. "Using Android DT directory /proc/device-tree/firmware/android"
+  4. second stage: "Loading SELinux policy" → "SELinux: Loaded policy from /vendor/etc/selinux/precompiled_sepolicy" (policy from the REAL vendor partition!) → "Loaded file_contexts"
+  5. "SELinux: Could not get canonical path for /system/bin/init" → "restorecon failed of /system/bin/init failed: No such file or directory"
+  6. "InitFatalReboot: signal 6" → "Reboot ending, jumping to kernel" — guest init took the fatal-reboot path; kr64 loop ended honestly; kr64 child went zombie.
+- KEY FACT: /system/bin/init DEMONSTRABLY EXISTS (rootfs tree verified; init itself exec'd it via 6-Z102 staging at +57ms). realpath ENOENT on an existing file = kr64 VFS path-translation defect on the restorecon/realpath resolution path (non-root mode: no chroot, path-prefix illusion; exec goes through staging + /proc/self/exe illusion 6-Z200b).
+- CLASSIFIER BUG FIXED (cae52e1): rung 8 SYSTEMUI_LAUNCHER was FALSE — ps matched the redroid HOST framework. Now guest = io.twoyi.debug subtree only; init/prop rungs from kr64 trace only; explicit post-mortem on guest death. Re-verified against run-3 evidence: honest rung 3 (PROPERTY_SERVICE) + post-mortem.
+- Workflow evidence extended: rootfs-listing stats every component of the failing path (separates missing-file from translation-bug).
+
+Stage Summary:
+- origin/main cae52e1. FIRST pure-stock Android 11 boot: reaches second-stage init + SELinux policy load, dies at restorecon realpath ENOENT → InitFatalReboot. This is a REAL generic Stage-A/D blocker (not a ROM hack candidate).
+- NEXT (highest value): kr64 VFS trace of the restorecon path (newfstatat/readlinkat/readlink on /system/bin/* under the path-prefix illusion + staging illusion), fix realpath semantics generically, re-run, expect SELinux setup to complete → init services ladder (vold/keystore2/zygote already proven reachable infra). Recovery regression guard: 5 families UI_READY.
