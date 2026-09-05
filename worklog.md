@@ -24849,3 +24849,18 @@ Work Log:
 
 Stage Summary:
 - Corpus FIVE families live: PitchBlack UI_READY ×2, SHRP boot-verified with the loop-storm root-caused and fixed (fix rides the next wave), ginkgo's residual is harness deep-nav (queued). Next: wave 3 on the fix (SHRP target + PBRP guards), then deep-nav for PBRP's system_readonly prompt. origin/main 0dda43d (worklog follows).
+
+---
+Task ID: 6-Z303c — wave 3: SHRP UI_READY on the loop fix; FIVE families green
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: verify the loop-storm fix + loop-staging regression guard on c468bba.
+
+Work Log:
+- Wave 3 on c468bba (run list checked first; lint+test 33976810373 SUCCESS in flight, zero E2E): shrp-3.1-starlte (target) + pbrp-4.0-vayu (loop-staging guard) — runs 33976820237/33976819206, ALL SUCCESS.
+- SHRP: BOOT_OK + **UI_READY**. The monotonic loopN storm is GONE (zero failed loop opens); the free-loop scan found loop0 immediately, the subsequent loop-mount attempt failed honestly and non-fataly ("mount: can't setup loop device" ×2), and the UI walk ran system_readonly → clear_vars → main2. battery_ok=True. SHRP family: VERIFIED.
+- vayu guard: BOOT_OK + UI_READY, deep nav walked wipe/formatdata/backup/main/main2 — loop staging regression-free for a guest that never scans.
+- Corpus verdict: FIVE recovery families now boot to UI_READY — TWRP, OrangeFox, Lineage, PitchBlack (vayu + surya), SHRP (starlte).
+
+Stage Summary:
+- origin/main c468bba. 735 tests green. Remaining queue: harness deep-nav coverage (PBRP/SHRP system_readonly prompt pages block tap-walks — ginkgo's honest UI_HANG), client-side decrypt exercise, PitchBlack/SHRP pr-tier promotion candidate. Cron webDevReview (job 359061) continues from repo state.
