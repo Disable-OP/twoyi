@@ -24814,3 +24814,20 @@ Work Log:
 
 Stage Summary:
 - origin/main d4a0c81. 734 tests green. All three corpus families UI_READY. Remaining queue candidates: PitchBlack/SHRP corpus depth, harness deep-nav page coverage (+ the now-open client-side decrypt exercise). Cron webDevReview (job 359061) continues from repo state.
+
+---
+Task ID: 6-Z303 — corpus depth: first PitchBlack (×3) + SHRP (×1) entries, URLs downloaded and verified
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: open the "PitchBlack/SHRP corpus depth" queue item — add both families to the corpus with live-verified URLs and pre-verified image metadata.
+
+Work Log:
+- SourceForge IS reachable from the dev box again (the 6-Z28x-era "SF unreachable" comment was stale). Project slugs corrected: pitchblack-twrp → 301 → /pbrp; shrp-project → 404, the real slug is /shrp. Both RSS feeds (rss?path=/) enumerate the file trees.
+- Candidate selection cross-referenced against manifest device coverage: SHRP ships a DIRECT .img for starlte (already in corpus via TWRP 3.7.0 → clean family A/B); PBRP ships a direct /files/ginkgo/recovery.img (ginkgo already ×3 in corpus) plus zips for vayu (in corpus) and surya (NEW codename, SM7125). All four URLs verified 302→mirror→200 with pinned Content-Lengths, then FULLY DOWNLOADED (247MB total) and md5+sha256 recorded.
+- Inspector decode of all four (scripts/recovery-corpus/inspect_image.py): (1) shrp-3.1-starlte — SHRP family markers (twres/images/SKYHAWK.png, shrp*.png), LZMA ramdisk (FIRST LZMA entry in the corpus; RamdiskImporter auto-detects gzip/LZMA/XZ via commons-compress so the code path exists — this entry is its first CI exercise), static init + dynamic /sbin/linker64 userland, 5391 files, header v1. (2) pbrp-4.0-ginkgo — TWRP-fork A12.1 rootfs (apex/data_mirror), SYMLINK init→/system/bin/init (the OrangeFox-R12 dynamic shape proven since 6-Z196), gzip ramdisk, 869 files, 64MiB. (3) pbrp-4.0-vayu + (4) pbrp-4.0-surya — zips with TOP-LEVEL recovery.img (128MiB uncompressed; the workflow's unzip extraction matches, OrangeFox nests differently), gzip ramdisks, 3755/3968 files.
+- Family self-identification gap found + fixed: PBRP carries NO pbrp props — it self-identifies ONLY via twres/images/main_button_pbrp_*.png theme assets. detect_family() gained a PitchBlack branch (theme-asset markers + ro.pbrp/pitchblack.version prop pull) and an ro.shrp.version pull for SHRP (name-based SHRP detection already existed). Verified: all three PBRP images → family PitchBlack; starlte → SHRP. inspect_image.py py_compile clean.
+- manifest.yaml: 4 entries added (tier nightly, generation 12.1, arch arm64), family census now TWRP 149 / OrangeFox 151 / Lineage 297 / PitchBlack 3 / SHRP 1 = 601 entries, no name collisions, all required fields present. Direct .img entries carry md5+sha256 of the exact verified builds; zip entries carry md5 of the zip (the workflow's pre-boot gate) per the fox convention. Notes document the SourceForge ROLLING-FILE caveat (/files/<dev>/recovery.img content moves without a name change — checksum drift means re-verification, not failure).
+- Commits: 6781884 (manifest) + c4e2e5f (inspector) → pushed with the worklog commit. Dispatch of the 4-entry verification wave follows this push (run list checked first; only the push-triggered lint+test was in flight).
+
+Stage Summary:
+- The corpus now covers FIVE recovery families. Expected new coverage from this wave: PitchBlack A12.1 dynamic-init shape (second family after fox), SHRP LZMA ramdisk path (first-ever), top-level-recovery.img zip layout (first-ever), surya as a new SoC. Next queue candidates unchanged: harness deep-nav page coverage, client-side decrypt exercise.
