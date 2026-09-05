@@ -568,12 +568,21 @@ public final class RomManager {
      * the wrong boot mode).
      */
     public static void autoSetBootRecovery(Context context) {
-        boolean isTwrp = isTwrpLayout(context);
+        // 6-Z305: FULL-ANDROID layouts must take the NORMAL boot path
+        // (boot_recovery=false): GL renderer + real sys.boot_completed wait.
+        // isTwrpLayout() alone returns TRUE for a full-Android rootfs
+        // (/init is a regular file) and silently routed the whole Android
+        // system down the recovery fb-hook path. The recovery detectors keep
+        // their exact old semantics — full-Android only wins because it is
+        // checked first and its markers (framework.jar + zygote executor,
+        // with NO recovery binary anywhere) cannot occur in a recovery.
+        boolean isTwrp = !isFullAndroidLayout(context) && isTwrpLayout(context);
         boolean current = ProfileSettings.isBootRecoveryEnabled(context);
         if (current != isTwrp) {
             ProfileSettings.setBootRecovery(context, isTwrp);
             Log.i(TAG, "6-Z209b: auto-set boot_recovery=" + isTwrp
-                + " (was " + current + ") based on the imported recovery layout");
+                + " (was " + current + ") based on the imported recovery layout"
+                + " (6-Z305 full-android-first)");
         }
     }
 
@@ -635,6 +644,66 @@ public final class RomManager {
         // as sidecars and kr64 materializes them at boot).
         return new File(rootfs, "system/bin/recovery").exists()
                 || new File(rootfs, "system/bin/recovery.symlink").exists();
+    }
+
+    /**
+     * 6-Z305: detect a FULL-ANDROID SYSTEM layout (as opposed to a recovery).
+     *
+     * Generic STRUCTURAL rule — no ROM/device/family names anywhere:
+     * <ul>
+     *   <li>{@code /init} is a REGULAR file (a statically-linked init — the
+     *       twoyi-8.1-style rootfs layout; the normal kr64 path execs it via
+     *       the {@code --init /init} argument wired in core.rs Task 6-Z88),
+     *       AND</li>
+     *   <li>{@code /sbin/recovery} is absent (regular file OR .symlink
+     *       sidecar — otherwise it is a TWRP-style recovery), AND</li>
+     *   <li>{@code /system/bin/recovery} is absent (regular file OR .symlink
+     *       sidecar — otherwise it is an AOSP-style recovery), AND</li>
+     *   <li>{@code /system/framework/framework.jar} exists — the marker of a
+     *       full Android framework payload (no recovery ships framework.jar;
+     *       no full-Android system ships without it), AND</li>
+     *   <li>{@code /system/bin/app_process64} OR {@code /system/bin/app_process}
+     *       exists — the zygote executor (the process that becomes
+     *       system_server and the launcher).</li>
+     * </ul>
+     *
+     * Why this matters: {@link #isTwrpLayout()} returns TRUE for such a
+     * rootfs (its {@code /init} is a regular file) — {@link
+     * #autoSetBootRecovery} then routed a FULL Android system down the
+     * TWRP boot path: fb-hook display instead of the GL renderer, and the
+     * execve-time BOOT_COMPLETED synthesis instead of waiting for the
+     * real {@code sys.boot_completed} property. Android 8.1's SurfaceFlinger
+     * speaks GL; the fb0-hook blit can never render its output.
+     *
+     * @return true when the imported rootfs is a full Android system
+     */
+    public static boolean isFullAndroidLayout(Context context) {
+        File rootfs = getRootfsDir(context);
+        // A recovery in the sbin OR system/bin position disqualifies.
+        if (new File(rootfs, "sbin/recovery").exists()
+                || new File(rootfs, "sbin/recovery.symlink").exists()) {
+            return false;
+        }
+        if (new File(rootfs, "system/bin/recovery").exists()
+                || new File(rootfs, "system/bin/recovery.symlink").exists()) {
+            return false;
+        }
+        // The full-Android payload markers.
+        if (!new File(rootfs, "system/framework/framework.jar").exists()) {
+            return false;
+        }
+        boolean hasZygoteExecutor =
+                new File(rootfs, "system/bin/app_process64").exists()
+                        || new File(rootfs, "system/bin/app_process").exists();
+        if (!hasZygoteExecutor) {
+            return false;
+        }
+        // /init must exist as a regular file (static init). NOTE: this
+        // intentionally does NOT require /init to be non-symlink — a GSI-style
+        // rootfs whose /init is a symlink to /system/bin/init still needs the
+        // normal (GL) boot path when the recovery markers above are absent
+        // and framework.jar is present.
+        return new File(rootfs, "init").exists();
     }
 
     public static boolean needsUpgrade(Context context) {
