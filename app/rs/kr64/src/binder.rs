@@ -4317,10 +4317,41 @@ fn virtual_service_transaction(
 /// [`crate::battery::read_guest_battery_values`] — the pinned sysfs
 /// tree the sysfs-reader class sees, host-honest by construction.
 fn virtual_health(code: u32, reader: &mut ParcelReader) -> TransactionResult {
+    // 6-Z300b: per-call observability — the 6-Z298 service registered but
+    // CI could never prove client ENGAGEMENT (the registration lines were
+    // the only trace; the vibrator logs every call, health did not). One
+    // line per transaction names the method and the sysfs snapshot driving
+    // the reply, so the next wave's grep of "[binder][svc] IHealth." either
+    // proves GetBatteryInfo's isDeclared/waitForService chain reaches the
+    // proxy or localises the drop (e.g. the guest's health-V4-ndk.so
+    // ENOENT chain of run 33963412329).
+    let method = match code {
+        1 => "registerCallback",
+        2 => "unregisterCallback",
+        3 => "update",
+        4 => "getChargeCounterUah",
+        5 => "getCurrentNowMicroAmps",
+        6 => "getCurrentAverageMicroAmps",
+        7 => "getCapacity",
+        8 => "getEnergyCounterNwh",
+        9 => "getChargeStatus",
+        10 => "getStorageInfo",
+        11 => "getDiskStats",
+        12 => "getHealthInfo",
+        13 => "setChargingPolicy",
+        14 => "getChargingPolicy",
+        15 => "getBatteryHealthData",
+        _ => "unknown",
+    };
     // Snapshot once per transaction: the refresh thread may rewrite the
     // files mid-transaction; a single coherent snapshot is what the
     // real HAL's own HealthInfo mutex gives clients.
-    virtual_health_with_values(code, reader, &crate::battery::read_guest_battery_values())
+    let vals = crate::battery::read_guest_battery_values();
+    info!(
+        "[KR64][binder][svc] IHealth.{} (code={}) — sysfs snapshot: capacity={:?} status={:?}",
+        method, code, vals.capacity_pct, vals.status_str
+    );
+    virtual_health_with_values(code, reader, &vals)
 }
 
 /// The full IHealth dispatch, parameterised over the value snapshot so
