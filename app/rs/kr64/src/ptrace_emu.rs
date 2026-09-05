@@ -7315,6 +7315,16 @@ fn is_boot_completed_prop(name: &str, value: &str) -> bool {
 static BOOT_COMPLETED_SENDER_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// 6-Z305c: capped counters for the realpath-trace DIAGs (bionic realpath
+/// = open(O_PATH) + readlink(/proc/self/fd) + stat(dst) dev/ino compare;
+/// the pure-Android-11 boot died inside this sequence at libselinux's
+/// selinux_restorecon canonicalization — these counters keep the traces
+/// bounded while the failing leg names itself).
+static Z305C_OPEN_DIAG: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static Z305C_RL_DIAG: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 6-Z305: spawn the detached BOOT_COMPLETED delivery thread.
 ///
 /// Connect-per-message (the Task 6-Z50/6-Z62 recipe): no persistent fd, both
@@ -18231,7 +18241,17 @@ pub fn run_ptrace_loop(
                                         || path == "/init"
                                         || path.contains("/sbin/recovery")
                                         || path.contains("/sbin/linker")
-                                        || path.contains("/system/bin/linker"))
+                                        || path.contains("/system/bin/linker")
+                                        // 6-Z305c: bionic realpath's caller
+                                        // (libselinux selinux_restorecon)
+                                        // canonicalizes the CONTAINING DIR:
+                                        // realpath("/system/bin") + basename,
+                                        // NOT realpath("/system/bin/init").
+                                        // Run 33987046990 died exactly there
+                                        // with the dirname form — the old
+                                        // gate never matched it.
+                                        || path == "/system/bin"
+                                        || path == "/system")
                                 {
                                     z206_stat_diag_count += 1;
                                     let host_exists = std::path::Path::new(&translated).exists();
@@ -20489,6 +20509,37 @@ pub fn run_ptrace_loop(
                             // returns are errors.
                             if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
                                 open_fd_paths.insert(ret as i32, p.clone());
+                                // ── 6-Z305c: realpath-trace open DIAG ──
+                                // bionic realpath (android-11) = open(path,
+                                // O_PATH) + fstat + readlink(/proc/self/fd)
+                                // + stat(dst) dev/ino compare. The pure-
+                                // Android-11 boot died at libselinux's
+                                // realpath("/system/bin") with ENOENT
+                                // (run 33987046990) — log every open whose
+                                // translated path lands under the guest
+                                // /system tree (first 40) so the failing
+                                // leg of that sequence names itself.
+                                if p.contains("/system/") {
+                                    let orig = pending_open_original_path
+                                        .get(&pid)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    Z305C_OPEN_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if Z305C_OPEN_DIAG.load(std::sync::atomic::Ordering::Relaxed) <= 40 {
+                                        log(&format!(
+                                            "6-Z305c realpath-trace: open orig={:?} translated={:?} -> {} ({}) (occurrence {})",
+                                            orig,
+                                            p,
+                                            ret,
+                                            if ret < 0 {
+                                                format!("-errno {}", -ret)
+                                            } else {
+                                                "fd".to_string()
+                                            },
+                                            Z305C_OPEN_DIAG.load(std::sync::atomic::Ordering::Relaxed),
+                                        ));
+                                    }
+                                }
                                 // ── 6-Z163f: /tmp open-result DIAG ──
                                 // Run 32995619653: the jailed recovery
                                 // died (exit 1) right after TWO
@@ -21043,6 +21094,42 @@ pub fn run_ptrace_loop(
                         || (abi.readlinkat != -1 && syscall_num == abi.readlinkat)
                     {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // ── 6-Z305c: realpath-trace readlink DIAG ──
+                        // bionic realpath leg 2 = readlink(/proc/self/fd/N).
+                        // The 6-Z200b rewrite below logs only SUCCESSFUL
+                        // rewrites — a -1 (or a non-rewritten success) was
+                        // invisible in run 33987046990's log. Log every
+                        // fd/cwd readlink with its raw result (first 40).
+                        if Z305C_RL_DIAG.load(std::sync::atomic::Ordering::Relaxed) < 40 {
+                            // readlink(path, buf, siz): path = arg1.
+                            // readlinkat(dirfd, path, buf, flags): path = arg2.
+                            let path_addr = if syscall_num == abi.readlinkat {
+                                get_syscall_arg(&regs, abi.reg_arg2)
+                            } else {
+                                get_syscall_arg(&regs, abi.reg_arg1)
+                            };
+                            if path_addr != 0 {
+                                if let Some(rl_path) = read_child_string(pid, path_addr) {
+                                    if rl_path.starts_with("/proc/self/fd")
+                                        || rl_path.starts_with("/proc/self/cwd")
+                                    {
+                                        Z305C_RL_DIAG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        log(&format!(
+                                            "6-Z305c realpath-trace: readlink {:?} -> {} ({}) (occurrence {})",
+                                            rl_path,
+                                            ret,
+                                            if ret < 0 {
+                                                format!("-errno {}", -ret)
+                                            } else {
+                                                "ok".to_string()
+                                            },
+                                            Z305C_RL_DIAG.load(std::sync::atomic::Ordering::Relaxed),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                         if ret > 0 && ret < 4096 {
                             let buf_reg = if syscall_num == abi.readlink {
                                 abi.reg_arg2
