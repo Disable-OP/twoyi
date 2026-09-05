@@ -70,8 +70,11 @@
 //! * **In-proxy virtual services (6-Z271)** — semantically-correct minimal
 //!   AIDL implementations registered at proxy start:
 //!   `android.hardware.vibrator.IVibrator/default` (kills the ~5 s per-tap
-//!   haptics wait; `on(ms)` is forwarded to the host app for a REAL
-//!   vibration), `android.hardware.security.keymint.IKeyMintDevice/default`
+//!   haptics wait; `on(ms)` AND the TWRP-12.1/fox tap path `perform(effect,
+//!   strength)` are forwarded to the host app for REAL vibrations — 6-Z300:
+//!   perform answers the .aidl-documented duration/0 semantics instead of
+//!   an exception, getSupportedEffects lists the synthetic set),
+//!   `android.hardware.security.keymint.IKeyMintDevice/default`
 //!   (lets keystore2 obtain its backend and register IKeystoreSecurity —
 //!   kills the ~20 s recovery wait; key ops return honest
 //!   `HARDWARE_TYPE_UNAVAILABLE` errors, no fake crypto),
@@ -4484,6 +4487,44 @@ fn virtual_health_info(vals: &crate::battery::GuestBatteryValues) -> Transaction
     TransactionResult::Reply { data, offsets }
 }
 
+/// Synthetic effect set for the virtual IVibrator (6-Z300): the NON-deprecated
+/// members of android-13.0.0_r1 `hardware/interfaces/vibrator/aidl/Effect.aidl`,
+/// each realized as a plain one-shot vibration forwarded to the host app:
+/// CLICK=0, THUD=1, TEXTURE_TICK=5, TICK=6, LOW_TICK=7, POP=8,
+/// HEAVY_CLICK=9, SPINNER=22 (the RINGTONE_* slots 2..4/10..21 are
+/// deprecated carry-overs from the HIDL 1.0 enum and are NOT synthesized).
+const SYNTHETIC_VIBRATOR_EFFECTS: [i32; 8] = [0, 1, 5, 6, 7, 8, 9, 22];
+
+/// Base one-shot duration (ms) per synthetic effect, scaled by
+/// EffectStrength (LIGHT ×0.8, MEDIUM ×1.0, STRONG ×1.2 — the shape
+/// vendor HALs use for strength on one-shot primitives). Returns `None`
+/// for unsupported effects (deprecated RINGTONE_* / out of range) — the
+/// caller answers those with duration **0, status OK** per the .aidl
+/// contract ("or 0 if the effect is not supported"), never an exception.
+fn synthetic_effect_duration(effect: i32, strength: i32) -> Option<i32> {
+    let base: f32 = match effect {
+        0 => 20.0,  // CLICK
+        1 => 30.0,  // THUD
+        5 => 8.0,   // TEXTURE_TICK
+        6 => 10.0,  // TICK
+        7 => 15.0,  // LOW_TICK
+        8 => 40.0,  // POP
+        9 => 35.0,  // HEAVY_CLICK
+        22 => 10.0, // SPINNER
+        _ => return None,
+    };
+    let factor: f32 = match strength {
+        0 => 0.8, // LIGHT
+        1 => 1.0, // MEDIUM
+        2 => 1.2, // STRONG
+        // Out-of-range strength: a real HAL validates the enum, but the
+        // cheap-and-safe fallback is MEDIUM (never 0 ms — a client that
+        // asked for a haptic asked for SOMETHING).
+        _ => 1.0,
+    };
+    Some((base * factor).round() as i32).filter(|ms| *ms >= 1)
+}
+
 /// `android.hardware.vibrator.IVibrator` — method codes VERIFIED against
 /// android-13.0.0_r1 `IVibrator.aidl` (V1..V3 are append-only, so these
 /// codes are stable across the T-base corpus):
@@ -4494,9 +4535,22 @@ fn virtual_health_info(vals: &crate::battery::GuestBatteryValues) -> Transaction
 ///   5 getSupportedEffects → Effect[]
 ///   6 setAmplitude(float) → void
 ///   7 setExternalControl(boolean) → void
-/// We advertise capabilities = 0, so well-behaved clients stick to
-/// plain on(ms) / off(). Every on(ms) is FORWARDED to the host app for a
-/// REAL vibration.
+/// Capabilities stay 0 (no completion callbacks / amplitude control), so
+/// well-behaved clients stick to plain on(ms) / off(). Every on(ms) is
+/// FORWARDED to the host app for a REAL vibration.
+///
+/// 6-Z300 closes the two remaining honesty gaps the fox R12 decode named:
+/// * `perform(effect, strength, cb?)` used to answer
+///   EX_UNSUPPORTED_OPERATION. The .aidl contract instead says the return
+///   value is the effect duration in ms, **0 when the effect is not
+///   supported** — a bare exception breaks TWRP-12.1's synchronous
+///   tap-haptic path (its client treats a failed transaction like a dead
+///   HAL and re-waits). The synthetic set now genuinely fires: each
+///   supported effect is forwarded to the host for a REAL vibration and
+///   its duration returned, so the synchronous haptic resolves in µs and
+///   the input thread never stalls (the R12 touch-latency queue item).
+/// * `getSupportedEffects` used to be empty; it now lists exactly the
+///   synthetic set (clients that gate perform() on it get honest answers).
 fn virtual_vibrator(code: u32, reader: &mut ParcelReader) -> TransactionResult {
     match code {
         1 => {
@@ -4525,15 +4579,51 @@ fn virtual_vibrator(code: u32, reader: &mut ParcelReader) -> TransactionResult {
             virtual_error_reply(EX_NONE, 0)
         }
         4 => {
-            // perform(effect, strength, callback?) → unsupported (we
-            // advertise no composite/effect support).
-            virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0)
-        }
-        5 => {
-            // getSupportedEffects → empty int[].
+            // perform(in Effect effect, in EffectStrength strength,
+            //         in @nullable IVibratorCallback callback) → int
+            // The AIDL interface-token header is already consumed by the
+            // dispatch (6-Z271z) — the reader sits at the first arg. Both
+            // enums are plain int32 on the wire (Effect.aidl /
+            // EffectStrength.aidl, android-13.0.0_r1). The nullable
+            // callback binder is deliberately NOT read: with caps=0 no
+            // well-behaved client sends one, and ignoring the request tail
+            // is what on() already does for its callback argument.
+            let effect = reader.read_i32().unwrap_or(-1);
+            let strength = reader.read_i32().unwrap_or(-1);
             let mut w = ParcelWriter::new();
             w.write_status_ok();
-            w.write_i32(0);
+            match synthetic_effect_duration(effect, strength) {
+                Some(ms) => {
+                    crate::hostbridge::notify_vibrate(ms);
+                    info!(
+                        "[KR64][binder][svc] IVibrator.perform(effect={} strength={}) → {} ms host",
+                        effect, strength, ms
+                    );
+                    w.write_i32(ms);
+                }
+                None => {
+                    // The .aidl-documented unsupported semantic: duration
+                    // 0 with status OK — NOT an exception header.
+                    info!(
+                        "[KR64][binder][svc] IVibrator.perform(effect={}) → 0 (unsupported)",
+                        effect
+                    );
+                    w.write_i32(0);
+                }
+            }
+            let (data, offsets) = w.into_parts();
+            TransactionResult::Reply { data, offsets }
+        }
+        5 => {
+            // getSupportedEffects → Effect[] (length-prefixed i32 array)
+            // listing exactly the synthetic set (6-Z300).
+            let effects: &[i32] = &SYNTHETIC_VIBRATOR_EFFECTS;
+            let mut w = ParcelWriter::new();
+            w.write_status_ok();
+            w.write_i32(effects.len() as i32);
+            for &e in effects {
+                w.write_i32(e);
+            }
             let (data, offsets) = w.into_parts();
             TransactionResult::Reply { data, offsets }
         }
@@ -6805,6 +6895,117 @@ mod tests {
                 assert_eq!(data.len(), 8, "getCapabilities reply = status + caps");
             }
             _ => panic!("getCapabilities must reply"),
+        }
+    }
+
+    /// 6-Z300: perform() must answer per the .aidl contract — the effect
+    /// duration in ms for supported effects (forwarded to the host), 0
+    /// with status OK for unsupported ones — NOT EX_UNSUPPORTED_OPERATION
+    /// (the pre-6-Z300 reply, which TWRP-12.1's synchronous tap-haptic
+    /// client treats like a dead HAL and re-waits on).
+    #[test]
+    fn z300_perform_answers_duration_not_exception() {
+        let build_perform_request = |effect: i32, strength: i32| -> RequestBlob {
+            let mut req = ParcelWriter::new();
+            req.write_i32(0); // strict_mode_policy
+            req.write_i32(-1); // work_source_uid (kUnsetWorkSource)
+            req.write_u32(AIDL_HEADER_TAG_SYST);
+            req.write_string16("android.hardware.vibrator.IVibrator");
+            req.write_i32(effect); // perform(in Effect effect, ...
+            req.write_i32(strength); // ... in EffectStrength strength, ...
+            let (data, offsets) = req.into_parts();
+            RequestBlob { data, offsets }
+        };
+        let read_reply = |res: TransactionResult| -> (i32, i32) {
+            match res {
+                TransactionResult::Reply { data, .. } => {
+                    let status = i32::from_ne_bytes(data[0..4].try_into().unwrap());
+                    let duration = i32::from_ne_bytes(data[4..8].try_into().unwrap());
+                    (status, duration)
+                }
+                _ => panic!("perform must reply"),
+            }
+        };
+
+        // CLICK (0) + MEDIUM (1) → 20 ms, status OK.
+        let (status, duration) = read_reply(virtual_service_transaction(
+            VirtualService::Vibrator,
+            4,
+            Some(&build_perform_request(0, 1)),
+        ));
+        assert_eq!(status, 0, "perform(supported) → status OK (no exception)");
+        assert_eq!(duration, 20, "CLICK/MEDIUM = 20 ms");
+
+        // Strength scaling: CLICK LIGHT (0) = 16 ms, CLICK STRONG (2) = 24 ms.
+        let (_, light) = read_reply(virtual_service_transaction(
+            VirtualService::Vibrator,
+            4,
+            Some(&build_perform_request(0, 0)),
+        ));
+        assert_eq!(light, 16, "CLICK/LIGHT = 20 × 0.8 = 16 ms");
+        let (_, strong) = read_reply(virtual_service_transaction(
+            VirtualService::Vibrator,
+            4,
+            Some(&build_perform_request(0, 2)),
+        ));
+        assert_eq!(strong, 24, "CLICK/STRONG = 20 × 1.2 = 24 ms");
+
+        // The whole synthetic set answers non-zero with status OK.
+        for &effect in &[0i32, 1, 5, 6, 7, 8, 9, 22] {
+            let (status, duration) = read_reply(virtual_service_transaction(
+                VirtualService::Vibrator,
+                4,
+                Some(&build_perform_request(effect, 1)),
+            ));
+            assert_eq!(status, 0, "synthetic effect {} → status OK", effect);
+            assert!(
+                duration >= 1,
+                "synthetic effect {} must return a real duration, got {}",
+                effect,
+                duration
+            );
+        }
+
+        // Deprecated RINGTONE_* (2..4, 10..21) / out-of-range effects →
+        // duration 0 with status OK (the .aidl "not supported" semantic),
+        // NEVER an exception header.
+        for &effect in &[2i32, 3, 4, 10, 21, -1, 9999] {
+            let (status, duration) = read_reply(virtual_service_transaction(
+                VirtualService::Vibrator,
+                4,
+                Some(&build_perform_request(effect, 1)),
+            ));
+            assert_eq!(
+                status, 0,
+                "unsupported effect {} → still status OK (no exception)",
+                effect
+            );
+            assert_eq!(duration, 0, "unsupported effect {} → 0 ms", effect);
+        }
+    }
+
+    /// 6-Z300: getSupportedEffects must list exactly the synthetic set
+    /// (length-prefixed int32 array), so clients that gate perform() on
+    /// the list get honest answers instead of an empty array.
+    #[test]
+    fn z300_get_supported_effects_lists_the_synthetic_set() {
+        match virtual_service_transaction(VirtualService::Vibrator, 5, None) {
+            TransactionResult::Reply { data, .. } => {
+                let status = i32::from_ne_bytes(data[0..4].try_into().unwrap());
+                assert_eq!(status, 0, "getSupportedEffects → status OK");
+                let count = i32::from_ne_bytes(data[4..8].try_into().unwrap());
+                assert_eq!(count, 8, "the synthetic set has 8 non-deprecated effects");
+                let got: Vec<i32> = data[8..]
+                    .chunks_exact(4)
+                    .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
+                    .collect();
+                assert_eq!(
+                    got,
+                    vec![0, 1, 5, 6, 7, 8, 9, 22],
+                    "CLICK/THUD/TEXTURE_TICK/TICK/LOW_TICK/POP/HEAVY_CLICK/SPINNER"
+                );
+            }
+            _ => panic!("getSupportedEffects must reply"),
         }
     }
 
