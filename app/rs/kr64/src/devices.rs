@@ -1537,6 +1537,119 @@ pub fn create_by_name_block_nodes(rootfs: &str) -> std::io::Result<usize> {
     Ok(created)
 }
 
+/// The VINTF manifest fragment we stage for the in-proxy virtualized AIDL
+/// HALs (6-Z302). Shape copied from AOSP's own
+/// `android.hardware.security.keymint-service.xml` (android-12.1.0_r1):
+/// `<hal format="aidl">` + `<name>` + `<fqname>` (interface/instance only,
+/// no version element — libvintf resolves AIDL instances regardless of the
+/// version keystore2's `get_aidl_instances(package, 1, interface)` passes).
+pub const VINTF_VIRTUAL_HAL_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- twoyi 6-Z302: declares the AIDL HALs the kr64 binder proxy serves
+     in-process, so VINTF-based instance enumeration (libvintf
+     VintfObject::GetDeviceHalManifest -> getAidlInstances) resolves them
+     for guests whose own manifests only name legacy HIDL HALs. Without
+     this, keystore2's connect_keymint() falls back to the
+     android.security.compat legacy chain (km_compat + HIDL keymaster HAL
+     lookups), which dead-ends in a recovery guest without a real
+     keymaster HAL and stalls keystore2's startup before it can register
+     android.system.keystore2.IKeystoreService/default. -->
+<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.security.keymint</name>
+        <fqname>IKeyMintDevice/default</fqname>
+    </hal>
+    <hal format="aidl">
+        <name>android.hardware.security.sharedsecret</name>
+        <fqname>ISharedSecret/default</fqname>
+    </hal>
+    <!-- NOT served by the proxy: declaring the instance makes A12.1
+         connect_keymint(STRONGBOX) take the genuine-service branch whose
+         getService fails fast with NAME_NOT_FOUND (the caller ignores
+         STRONGBOX errors), instead of the legacy compat branch whose
+         stall is exactly what this fragment exists to avoid. -->
+    <hal format="aidl">
+        <name>android.hardware.security.keymint</name>
+        <fqname>IKeyMintDevice/strongbox</fqname>
+    </hal>
+</manifest>
+"#;
+
+/// 6-Z302: stage a VINTF manifest fragment into the guest rootfs declaring
+/// the AIDL HALs the kr64 binder proxy virtualizes (IKeyMintDevice/default,
+/// ISharedSecret/default — the two keystore2 consults via
+/// `get_aidl_instances`).
+///
+/// WHY: the fox R12 / sargo TWRP-12-class wave decoded (33964129056 +
+/// the 6-Z301 triangle) proved keystore2 resolves the VIRTUAL KeyMint in
+/// ~40 ms once it reaches it — but A12.1 `connect_keymint()` FIRST asks
+/// the device VINTF manifest for AIDL instances; the TWRP-12.1 vendor
+/// manifest names only legacy HIDL keymaster@4.x, so keystore2 took the
+/// compat path (`android.security.compat` + km_compat + HIDL keymaster
+/// lookups) and stalled inside it before ever transacting
+/// `getKeyMintDevice` — no registration, no IKeystoreSecurity/default,
+/// the recovery's keystore2 client facing a dead service.
+///
+/// With the fragment staged, `getAidlInstances("android.hardware.security.
+/// keymint", 1, "IKeyMintDevice")` returns ["default"] and
+/// `connect_keymint` takes the GENUINE branch straight to the virtual
+/// service (the proven 40 ms path).
+///
+/// SKIPPED when the guest already declares
+/// `android.hardware.security.keymint` in ANY of its own VINTF manifest
+/// files: a duplicate AIDL instance across device fragments is a libvintf
+/// merge error, and a guest that ships its own keymint HAL owns the name
+/// (its registration takes over the virtual handle; on death the
+/// 6-Z299 virtual_fallback restores ours).
+///
+/// Returns true if the fragment was created.
+pub fn create_vintf_virtual_hal_manifest(rootfs: &str) -> std::io::Result<bool> {
+    // Dedup guard: scan the guest's own VINTF manifests for keymint.
+    for dir in [
+        "vendor/etc/vintf/manifest",
+        "system/etc/vintf/manifest",
+        "odm/etc/vintf/manifest",
+        "product/etc/vintf/manifest",
+        "vendor/etc/vintf",
+        "system/etc/vintf",
+    ] {
+        let abs = format!("{}/{}", rootfs, dir);
+        let entries = match fs::read_dir(&abs) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("xml") {
+                continue;
+            }
+            // Our own fragment (from a previous boot/round) contains the
+            // needle too — never treat it as a guest declaration.
+            if p.file_name().and_then(|n| n.to_str()) == Some("twoyi-virtual-hals.xml") {
+                continue;
+            }
+            if let Ok(body) = fs::read_to_string(&p) {
+                if body.contains("android.hardware.security.keymint") {
+                    info!(
+                        "[KR64][devices] VINTF virtual-HAL manifest NOT staged: guest already declares keymint in {}/{} (6-Z302)",
+                        dir,
+                        p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    let dir = format!("{}/vendor/etc/vintf/manifest", rootfs);
+    fs::create_dir_all(&dir)?;
+    let path = format!("{}/twoyi-virtual-hals.xml", dir);
+    fs::write(&path, VINTF_VIRTUAL_HAL_MANIFEST)?;
+    info!(
+        "[KR64][devices] VINTF virtual-HAL manifest staged at {} (keymint IKeyMintDevice/default + sharedsecret ISharedSecret/default, 6-Z302)",
+        path
+    );
+    Ok(true)
+}
+
 /// Extract every `/dev/block/.../by-name/<part>` token from fstab text.
 /// fstab format (v1 and v2 both): the source block device is the FIRST
 /// whitespace-delimited token of a non-comment line.
@@ -2193,6 +2306,79 @@ mod tests {
         assert!(
             content.iter().all(|&b| b == 0),
             "misc must read as NO BCB command after a fresh boot"
+        );
+    }
+
+    // ── 6-Z302: VINTF virtual-HAL manifest staging ──────────────────────
+
+    #[test]
+    fn z302_vintf_manifest_staged_when_guest_has_no_keymint() {
+        let rootfs = tmpdir();
+        // A guest VINTF manifest that names only legacy HIDL HALs (the
+        // fox R12 / TWRP-12.1 shape: keymaster@4.1 citadel, no AIDL
+        // keymint).
+        let vdir = format!("{}/vendor/etc/vintf/manifest", rootfs);
+        fs::create_dir_all(&vdir).unwrap();
+        fs::write(
+            format!(
+                "{}/android.hardware.keymaster@4.1-service.citadel.xml",
+                vdir
+            ),
+            r#"<manifest version="1.0" type="device">
+    <hal format="hidl"><name>android.hardware.keymaster</name>
+        <version>4.1</version><interface><name>IKeymasterDevice</name>
+        <instance>default</instance></interface></hal>
+</manifest>
+"#,
+        )
+        .unwrap();
+
+        let staged = create_vintf_virtual_hal_manifest(&rootfs).expect("staging works");
+        assert!(staged, "fragment must be staged for a keymint-less guest");
+
+        let frag =
+            fs::read_to_string(format!("{}/twoyi-virtual-hals.xml", vdir)).expect("fragment");
+        // Both virtual services declared, AOSP fqname shape.
+        assert!(
+            frag.contains("<fqname>IKeyMintDevice/default</fqname>"),
+            "keymint instance must be declared"
+        );
+        assert!(
+            frag.contains("<fqname>ISharedSecret/default</fqname>"),
+            "sharedsecret instance must be declared"
+        );
+        assert!(frag.contains("format=\"aidl\""), "AIDL format attribute");
+        // Idempotent: a second call re-writes (no duplicate guard needed —
+        // the dedup check only looks for keymint in the GUEST's files; the
+        // fragment itself lives in the same dir and DOES contain the name,
+        // so a re-run must not skip because of our own file).
+        let staged_again = create_vintf_virtual_hal_manifest(&rootfs).expect("re-staging");
+        assert!(staged_again, "own fragment must not trip the dedup guard");
+    }
+
+    #[test]
+    fn z302_vintf_manifest_skipped_when_guest_declares_keymint() {
+        let rootfs = tmpdir();
+        let vdir = format!("{}/vendor/etc/vintf/manifest", rootfs);
+        fs::create_dir_all(&vdir).unwrap();
+        fs::write(
+            format!("{}/keymint.xml", vdir),
+            r#"<manifest version="1.0" type="device">
+    <hal format="aidl"><name>android.hardware.security.keymint</name>
+        <fqname>IKeyMintDevice/default</fqname></hal>
+</manifest>
+"#,
+        )
+        .unwrap();
+
+        let staged = create_vintf_virtual_hal_manifest(&rootfs).expect("skip path");
+        assert!(
+            !staged,
+            "fragment must NOT be staged when the guest owns keymint"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{}/twoyi-virtual-hals.xml", vdir)).exists(),
+            "no fragment file may exist"
         );
     }
 }
