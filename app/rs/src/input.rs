@@ -1297,20 +1297,28 @@ pub fn send_key_code(keycode: i32) {
         input_event_write(tx, EV_SYN, SYN_REPORT, SYN_REPORT);
     }
 
-    // 6-Z293c + 6-Z294: DUAL-WRITE to the abstract evdev bridge. The
-    // loader-path recoveries (lineage/AOSP-minui generations) never
-    // open the key0 device — their ONLY input fds are the fb hook's
-    // bridge sockets — so keys sent solely through KEY_SENDER vanish.
-    // The records go to the GPIO-KEYS-MIRROR connection (6-Z294): the
-    // guest's key handler drops EV_KEY records from devices whose
-    // EVIOCGBIT(EV_KEY) lacks the code, and the touchscreen handler
-    // ignores EV_KEY outright — the keys device advertises
-    // VOLUMEUP/VOLUMEDOWN/POWER exactly like real gpio-keys hardware.
-    if let Some((_, tx)) = KEY_BRIDGE_SENDER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-    {
+    // 6-Z293c + 6-Z294/295: write the key records to BOTH bridge
+    // devices. The loader-path recoveries never open the key0 device —
+    // their ONLY input fds are the fb hook's bridge sockets. Only
+    // touch-class fds enter minui's epoll (the keyboard branch closes
+    // its fds), so the touch device is the one that can actually
+    // deliver EV_KEY records to the UI's type-switch; the gpio-keys
+    // mirror keeps the real-hardware topology and serves whichever
+    // reader does consume it (v294c showed fd-9 reads). Both devices
+    // advertise the menu keys in EVIOCGBIT(EV_KEY) since 6-Z295.
+    let key_targets: [Option<Sender<TouchMessage>>; 2] = [
+        KEY_BRIDGE_SENDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(_, tx)| tx.clone()),
+        INPUT_SENDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|tx| tx.clone()),
+    ];
+    for tx in key_targets.iter().flatten() {
         let _ = tx.send(TouchMessage {
             action: touch_action::KEY_DOWN,
             pointer_id: 0,
