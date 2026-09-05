@@ -249,9 +249,16 @@ impl BatteryDevice {
         let _ = fs::set_permissions(&ac_dir, fs::Permissions::from_mode(0o755));
 
         let dev = Self {
-            dir,
+            dir: dir.clone(),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
+
+        // 6-Z298: publish the directory for the in-proxy virtual
+        // IHealth service (binder.rs reads the SAME tree — one source
+        // of truth). First registration wins; a second BatteryDevice
+        // (shouldn't happen — one VM per daemon process) can't shadow
+        // the values the service already hands out.
+        let _ = GUEST_BATTERY_DIR.set(dir);
 
         // Write the default values immediately so a guest that opens
         // the files before the first refresh tick still sees sane
@@ -659,6 +666,145 @@ impl Drop for BatteryDeviceHandle {
         // They persist across daemon restarts (a new `BatteryDevice::new`
         // will overwrite them via `fs::write`); removing them would
         // race with any guest process that has them open.
+    }
+}
+
+// ============================================================================
+// 6-Z298: sysfs → AIDL IHealth value bridge.
+//
+// The in-proxy virtual `android.hardware.health.IHealth/default` service
+// (binder.rs) serves AIDL clients (AOSP/Lineage recovery ≥ A12 reads the
+// battery through `GetBatteryInfo()` → `AServiceManager_isDeclared` +
+// `waitForService` + `getCapacity`/`getChargeStatus` — verified from
+// android-15.0.0_r1 `recovery_utils/battery_utils.cpp`) with the values
+// this module already materialises in the pinned sysfs tree. ONE source
+// of truth: sysfs readers (TWRP's BatteryMonitor, lineage's
+// BattMonitorThreadLoop) and binder clients (GetBatteryInfo) see the
+// SAME host-honest values.
+// ============================================================================
+
+use std::sync::OnceLock;
+
+/// The battery sysfs directory of the current VM (set by
+/// [`BatteryDevice::new`]; the daemon hosts exactly one VM per
+/// process, so a process-global is a faithful registry).
+static GUEST_BATTERY_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Snapshot of the guest-visible battery state read back from the
+/// materialised sysfs tree. `None` = the file doesn't exist (or is
+/// unparseable) — the virtual service translates that to the AIDL
+/// interface's documented `EX_UNSUPPORTED_OPERATION` semantics (the
+/// real HAL returns that exact exception when the backing sysfs file
+/// is missing), never to a fabricated value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuestBatteryValues {
+    /// `capacity` — remaining capacity in percent (0..100).
+    pub capacity_pct: Option<i32>,
+    /// `status` / `charge_status` — the Linux charge-status string
+    /// (mapped to the AIDL enum by the service layer).
+    pub status_str: Option<String>,
+    /// `voltage_now` — microvolts (the file's own unit).
+    pub voltage_uv: Option<i32>,
+    /// `temp` — 1/10 °C.
+    pub temp_decic: Option<i32>,
+    /// `charge_counter` — µAh.
+    pub charge_counter_uah: Option<i32>,
+    /// `current_now` — µA (signed: positive charging, negative drain).
+    pub current_now_ua: Option<i32>,
+    /// `current_avg` — µA (materialised only by host-managed trees).
+    pub current_avg_ua: Option<i32>,
+    /// `cycle_count`.
+    pub cycle_count: Option<i32>,
+    /// `present` — 1 if the battery device is present.
+    pub present: bool,
+    /// `technology` string (e.g. `Li-ion`).
+    pub technology: Option<String>,
+    /// `health` string (Linux power_supply ABI).
+    pub health_str: Option<String>,
+}
+
+impl GuestBatteryValues {
+    fn read_int_file(dir: &Path, name: &str) -> Option<i32> {
+        let raw = fs::read_to_string(dir.join(name)).ok()?;
+        raw.trim().parse::<i32>().ok()
+    }
+
+    fn read_str_file(dir: &Path, name: &str) -> Option<String> {
+        let raw = fs::read_to_string(dir.join(name)).ok()?;
+        let s = raw.trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    /// Read the battery state from `dir` (the battery sysfs directory).
+    /// Pure filesystem reading — no global state — so tests can point
+    /// it at a synthetic tree.
+    pub fn read_from(dir: &Path) -> Self {
+        let present = Self::read_int_file(dir, "present").unwrap_or(0) == 1;
+        let status_str = Self::read_str_file(dir, "charge_status")
+            .or_else(|| Self::read_str_file(dir, "status"));
+        Self {
+            capacity_pct: Self::read_int_file(dir, "capacity").map(|v| v.clamp(0, 100)),
+            status_str,
+            voltage_uv: Self::read_int_file(dir, "voltage_now"),
+            temp_decic: Self::read_int_file(dir, "temp"),
+            charge_counter_uah: Self::read_int_file(dir, "charge_counter"),
+            current_now_ua: Self::read_int_file(dir, "current_now"),
+            current_avg_ua: Self::read_int_file(dir, "current_avg"),
+            cycle_count: Self::read_int_file(dir, "cycle_count"),
+            present,
+            technology: Self::read_str_file(dir, "technology"),
+            health_str: Self::read_str_file(dir, "health"),
+        }
+    }
+}
+
+/// Read the CURRENT VM's battery state from the materialised sysfs
+/// tree. Returns `Default::default()` (every field `None`/false)
+/// before [`BatteryDevice::new`] ran or when the tree is absent — the
+/// service layer renders that as honest UNSUPPORTED exceptions, which
+/// is exactly what a real battery-less device reports.
+pub fn read_guest_battery_values() -> GuestBatteryValues {
+    match GUEST_BATTERY_DIR.get() {
+        Some(dir) => GuestBatteryValues::read_from(dir),
+        None => GuestBatteryValues::default(),
+    }
+}
+
+/// Map a Linux `power_supply` status/charge_status string to the AIDL
+/// `android.hardware.health.BatteryStatus` enum value (VERIFIED against
+/// android-15.0.0_r1 `BatteryStatus.aidl`: UNKNOWN=1, CHARGING=2,
+/// DISCHARGING=3, NOT_CHARGING=4, FULL=5). `None` for unknown strings —
+/// the service then answers `EX_UNSUPPORTED_OPERATION`, mirroring a
+/// driver that reports nothing.
+pub fn sysfs_status_to_aidl(s: &str) -> Option<i32> {
+    match s {
+        "Charging" => Some(2),
+        "Discharging" => Some(3),
+        "Not charging" => Some(4),
+        "Full" => Some(5),
+        "Unknown" => Some(1),
+        _ => None,
+    }
+}
+
+/// Map a Linux `power_supply` health string to the AIDL
+/// `android.hardware.health.BatteryHealth` enum value (VERIFIED against
+/// android-15.0.0_r1 `BatteryHealth.aidl`: UNKNOWN=1, GOOD=2,
+/// OVERHEAT=3, DEAD=4, OVER_VOLTAGE=5, UNSPECIFIED_FAILURE=6, COLD=7).
+pub fn sysfs_health_to_aidl(s: &str) -> Option<i32> {
+    match s {
+        "Good" => Some(2),
+        "Overheat" => Some(3),
+        "Dead" => Some(4),
+        "Over voltage" => Some(5),
+        "Unspecified failure" => Some(6),
+        "Cold" => Some(7),
+        "Unknown" => Some(1),
+        _ => None,
     }
 }
 
@@ -1186,5 +1332,97 @@ mod tests {
         assert_eq!(jni_get_battery_status(), JNI_STATUS_DISCHARGING);
         assert_eq!(jni_get_battery_voltage(), DEFAULT_VOLTAGE_MV);
         assert_eq!(jni_get_battery_temperature(), DEFAULT_TEMP_DECIC);
+    }
+
+    // -------- 6-Z298: sysfs → AIDL IHealth bridge ----------------------
+
+    #[test]
+    fn z298_guest_values_read_back_the_materialised_tree() {
+        let root = tmpdir();
+        let dev = BatteryDevice::new(&root).unwrap();
+        let v = GuestBatteryValues::read_from(&dev.dir);
+        // Defaults written by new(): capacity 75, Discharging, present,
+        // 4200000 uV, 280 decic, charge_counter = 75*3500, -300000 µA.
+        assert_eq!(v.capacity_pct, Some(75));
+        assert_eq!(v.status_str.as_deref(), Some("Discharging"));
+        assert!(v.present, "present=1 materialised");
+        assert_eq!(v.voltage_uv, Some(DEFAULT_VOLTAGE_MV as i32 * 1000));
+        assert_eq!(v.temp_decic, Some(DEFAULT_TEMP_DECIC as i32));
+        assert_eq!(v.charge_counter_uah, Some(75 * 3_500));
+        assert_eq!(v.current_now_ua, Some(-300_000));
+        assert_eq!(v.cycle_count, Some(0));
+        assert_eq!(v.technology.as_deref(), Some(DEFAULT_TECHNOLOGY));
+        assert_eq!(v.health_str.as_deref(), Some(DEFAULT_HEALTH));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn z298_guest_values_missing_tree_is_all_none() {
+        let root = tmpdir();
+        let dir = Path::new(&root).join("empty-but-real");
+        fs::create_dir_all(&dir).unwrap();
+        let v = GuestBatteryValues::read_from(&dir);
+        assert_eq!(v, GuestBatteryValues::default());
+        assert!(!v.present);
+        assert_eq!(v.capacity_pct, None);
+        assert_eq!(v.status_str, None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn z298_charge_status_preferred_over_status() {
+        // Host-managed trees may carry both; charge_status (A11+ ABI)
+        // wins, `status` is the fallback.
+        let root = tmpdir();
+        let dir = Path::new(&root).join("b");
+        fs::create_dir_all(&dir).unwrap();
+        write_file_at(&dir, "status", "Charging").unwrap();
+        write_file_at(&dir, "charge_status", "Full").unwrap();
+        let v = GuestBatteryValues::read_from(&dir);
+        assert_eq!(v.status_str.as_deref(), Some("Full"));
+        // And without charge_status the legacy file is used.
+        fs::remove_file(dir.join("charge_status")).unwrap();
+        let v2 = GuestBatteryValues::read_from(&dir);
+        assert_eq!(v2.status_str.as_deref(), Some("Charging"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn z298_aidl_status_mapping() {
+        assert_eq!(sysfs_status_to_aidl("Charging"), Some(2));
+        assert_eq!(sysfs_status_to_aidl("Discharging"), Some(3));
+        assert_eq!(sysfs_status_to_aidl("Not charging"), Some(4));
+        assert_eq!(sysfs_status_to_aidl("Full"), Some(5));
+        assert_eq!(sysfs_status_to_aidl("Unknown"), Some(1));
+        assert_eq!(sysfs_status_to_aidl("garbage"), None);
+    }
+
+    #[test]
+    fn z298_aidl_health_mapping() {
+        assert_eq!(sysfs_health_to_aidl("Good"), Some(2));
+        assert_eq!(sysfs_health_to_aidl("Overheat"), Some(3));
+        assert_eq!(sysfs_health_to_aidl("Dead"), Some(4));
+        assert_eq!(sysfs_health_to_aidl("Over voltage"), Some(5));
+        assert_eq!(sysfs_health_to_aidl("Unspecified failure"), Some(6));
+        assert_eq!(sysfs_health_to_aidl("Cold"), Some(7));
+        assert_eq!(sysfs_health_to_aidl("Unknown"), Some(1));
+        assert_eq!(sysfs_health_to_aidl("Warm"), None);
+    }
+
+    #[test]
+    fn z298_capacity_is_clamped_into_aidl_range() {
+        // A host-managed tree with a bogus capacity can't make the
+        // virtual service report an out-of-range level (AIDL HealthInfo
+        // documents batteryLevel in 0..100).
+        let root = tmpdir();
+        let dir = Path::new(&root).join("b");
+        fs::create_dir_all(&dir).unwrap();
+        write_file_at(&dir, "capacity", "9999").unwrap();
+        let v = GuestBatteryValues::read_from(&dir);
+        assert_eq!(v.capacity_pct, Some(100));
+        write_file_at(&dir, "capacity", "-5").unwrap();
+        let v2 = GuestBatteryValues::read_from(&dir);
+        assert_eq!(v2.capacity_pct, Some(0));
+        let _ = fs::remove_dir_all(&root);
     }
 }
