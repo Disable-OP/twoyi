@@ -291,14 +291,18 @@ def main():
     #     problem is RecoveryUI's touch classification/calibration.
     #   - frame frozen -> the callback/queue path itself drops records.
     # KEYCODE_VOLUME_UP (Android 24) maps to linux KEY_VOLUMEUP (114).
+    # 6-Z294c: three-key ladder — VOLUMEDOWN (25), VOLUMEUP (24), POWER
+    # (26 Android = 116 linux). Different UI paths: the volume keys move
+    # the menu selection, POWER selects / opens the power menu. Whichever
+    # reacts proves the key path and narrows the inert layer.
     key_results = []
-    for i in range(2):
+    for android_key in (25, 24, 26):
         r = subprocess.run(
             nav.ADB + ["shell",
-                       "am broadcast -a io.twoyi.debug.TOUCH "
-                       "--es action key --ei key 24"],
+                       f"am broadcast -a io.twoyi.debug.TOUCH "
+                       f"--es action key --ei key {android_key}"],
             capture_output=True, text=True, timeout=20)
-        key_results.append((r.returncode, (r.stdout or "")[:80]))
+        key_results.append((android_key, r.returncode, (r.stdout or "")[:60]))
         time.sleep(2)
     probe["key_broadcasts"] = key_results
     nav.screenshot("menu-00b-after-key")
