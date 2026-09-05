@@ -1033,16 +1033,28 @@ fn touch_server_abstract() {
                                         );
                                     }
                                 }
-                                while rx.recv().is_ok() {}
+                                // 6-Z294b: NEVER close the client on this
+                                // side. A closed app socket EOFs the guest's
+                                // fd, and in raw mode the guest's reader
+                                // BUSY-SPINS on read()->0 / POLLHUP (the
+                                // 6-Z294b TWRP BOOT_FAIL was init starved by
+                                // exactly that spin on the replaced touch
+                                // connection). Park the worker holding the
+                                // fd: the connection stays ESTAB, the guest's
+                                // poll blocks cleanly, nothing spins.
                                 detach_bridge_sender(my_gen);
-                                close(client);
-                                return;
+                                loop {
+                                    std::thread::park_timeout(std::time::Duration::from_secs(3600));
+                                }
                             }
                         }
                         Err(_) => {
+                            // Channel dead (a newer same-class connection took
+                            // over) — see the 6-Z294b note: park, don't close.
                             detach_bridge_sender(my_gen);
-                            close(client);
-                            return;
+                            loop {
+                                std::thread::park_timeout(std::time::Duration::from_secs(3600));
+                            }
                         }
                     }
                 }
