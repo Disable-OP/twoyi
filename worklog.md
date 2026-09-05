@@ -24831,3 +24831,21 @@ Work Log:
 
 Stage Summary:
 - The corpus now covers FIVE recovery families. Expected new coverage from this wave: PitchBlack A12.1 dynamic-init shape (second family after fox), SHRP LZMA ramdisk path (first-ever), top-level-recovery.img zip layout (first-ever), surya as a new SoC. Next queue candidates unchanged: harness deep-nav page coverage, client-side decrypt exercise.
+
+---
+Task ID: 6-Z303b — first PBRP/SHRP wave decoded: SF 403s GH runners (vendored), SHRP loop-storm fixed, PBRP banner decoded
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: run + decode the first PitchBlack/SHRP verification wave; fix everything it surfaced.
+
+Work Log:
+- WAVE 1 (on c50c909, 4 runs) ALL FAILED at the download step in ~1 min: curl(22) HTTP 403 from sourceforge.net on ubuntu-24.04-arm runner egress (runs 33974285572/33974284249/33974282746/33974281161). Definitive answer to the corpus's standing "verify SF from the CI runner" note: SourceForge bot-walls GitHub-hosted runners; dev-box downloads work, CI downloads never will.
+- FIX (a50b815): vendored the 4 verified builds as assets of release recovery-corpus-6-Z303 on this repo (GitHub→GitHub cannot 403); release notes carry the full upstream provenance table (url/size/md5/sha256); round-trip md5 verified; manifest URLs switched, upstream kept in notes.
+- WAVE 2 (on a50b815) ALL SUCCESS (33975054171 ginkgo / 33975056901 surya / 33975055759 vayu / 33975058163 shrp-starlte). Lint+test green. Guest decode:
+  * PBRP vayu + surya: UI_READY on the family's FIRST corpus outing (39 page switches incl. wipe/formatdata deep-nav on vayu; blit FLOWING; PBRP prints "Starting PitchBlackRecovery 4.0-..."). A12.1 dynamic-init shape boots clean.
+  * SHRP starlte: BOOT_OK → brightness OK → ZERO page switches: endless open("/dev/block/loopN") scan (loop0→loop66+ monotonic, 4369 opens at run end) = find-first-free-loop-device loop; /dev/block had no loop nodes so it never terminated. SHRP-specific (PBRP did zero loop opens).
+  * PBRP ginkgo (4.0-UNOFFICIAL rolling build): alive + rendered + interactive on PBRP's system_readonly prompt page (1 page switch, INPUT reads, LED-vibrator feedback per harness tap) — the harness taps never dismissed the prompt → honest UI_HANG. Deep-nav coverage item, not a twoyi bug.
+- FIX (0dda43d): (1) kr64 create_loop_block_nodes() stages /dev/block/loop0..7 as sparse regular files via the 6-Z287 materialise path (LOOP_* ioctls stay ENOTTY; unconditional like by-name staging; +1 test → 735 green, fmt+clippy clean); (2) classify_result.py banner branch for "Starting PitchBlackRecovery ... (pid <DATE>\n)" — PBRP's format string passes the DATE as the pid argument so no legacy regex could match (rec_instances was 0, TIMEOUT_OR_UNKNOWN mislabel); normalizes family to PitchBlack. Re-classified wave 2 artifacts with the new classifier: vayu/surya UI_READY, ginkgo UI_HANG (honest), SHRP UI_HANG (pre-loop-fix run).
+
+Stage Summary:
+- Corpus FIVE families live: PitchBlack UI_READY ×2, SHRP boot-verified with the loop-storm root-caused and fixed (fix rides the next wave), ginkgo's residual is harness deep-nav (queued). Next: wave 3 on the fix (SHRP target + PBRP guards), then deep-nav for PBRP's system_readonly prompt. origin/main 0dda43d (worklog follows).
