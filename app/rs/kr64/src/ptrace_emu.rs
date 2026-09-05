@@ -19728,6 +19728,14 @@ pub fn run_ptrace_loop(
                                         let z296_lr = get_syscall_arg(&regs, 30);
                                         let z296_fp = get_syscall_arg(&regs, 29);
                                         let z296_x28 = get_syscall_arg(&regs, 28);
+                                        // 6-Z296f: x19/x20 are CALLEE-SAVED —
+                                        // at the read EXIT they still hold the
+                                        // callback's object pointer (x19) and
+                                        // its saved arg copy (x20). Dump them;
+                                        // they settle the identity of the
+                                        // object the callback dispatches on.
+                                        let z296_x19 = get_syscall_arg(&regs, 19);
+                                        let z296_x20 = get_syscall_arg(&regs, 20);
                                         // maps FIRST (annotation source for the
                                         // header regs, the stack, the chain and
                                         // the dispatch objects); full dump once.
@@ -19753,7 +19761,7 @@ pub fn run_ptrace_loop(
                                             ))
                                             .unwrap_or_else(|_| "?".to_string());
                                             log(&format!(
-                                            "6-Z296 INPUT-READ hit #{}: pid={} tgid={} comm={:?} fd={} ret={} sp={:#x}{} pc={:#x}{} lr={:#x}{} fp={:#x}{} x28={:#x}{}",
+                                            "6-Z296 INPUT-READ hit #{}: pid={} tgid={} comm={:?} fd={} ret={} sp={:#x}{} pc={:#x}{} lr={:#x}{} fp={:#x}{} x28={:#x}{} x19={:#x}{} x20={:#x}{}",
                                             z296_occ,
                                             pid,
                                             z296_tgid,
@@ -19765,6 +19773,8 @@ pub fn run_ptrace_loop(
                                             z296_lr, z296_ann(z296_lr),
                                             z296_fp, z296_ann(z296_fp),
                                             z296_x28, z296_ann(z296_x28),
+                                            z296_x19, z296_ann(z296_x19),
+                                            z296_x20, z296_ann(z296_x20),
                                         ));
                                             if z296_maps_dumped.insert(pid) {
                                                 log(&format!(
@@ -20038,13 +20048,51 @@ pub fn run_ptrace_loop(
                                                                 }
                                                             }
                                                         }
+                                                        // 6-Z296f: the callback's ACTUAL
+                                                        // object (x19 at the syscall
+                                                        // exit — callee-saved, still
+                                                        // live). Dump its first words
+                                                        // + the class byte it gates on
+                                                        // ([x19+0x40]) so the object
+                                                        // identity is settled from
+                                                        // runtime data, not inference.
+                                                        let mut z296_x19_info =
+                                                            String::from("x19obj=<none>");
+                                                        if z296_x19 > 0x1000 {
+                                                            let z296_w0 =
+                                                                read_child_u64(pid, z296_x19);
+                                                            let z296_w1 =
+                                                                read_child_u64(pid, z296_x19 + 8);
+                                                            let z296_cls = read_child_u32(
+                                                                pid,
+                                                                z296_x19 + 0x40,
+                                                            );
+                                                            let z296_cls3 = read_child_u32(
+                                                                pid,
+                                                                z296_x19 + 0x3c,
+                                                            );
+                                                            z296_x19_info = format!(
+                                                                "x19obj@{:#x} [0]={:?}[ann {}] [8]={:?} [0x40]={:?} [0x3c]={:?}",
+                                                                z296_x19,
+                                                                z296_w0,
+                                                                z296_w0
+                                                                    .and_then(|w| z296_annotate(
+                                                                        w, &z296_triples
+                                                                    ))
+                                                                    .unwrap_or_default(),
+                                                                z296_w1,
+                                                                z296_cls,
+                                                                z296_cls3
+                                                            );
+                                                        }
                                                         log(&format!(
-                                                            "6-Z296 rui@{:#x} state: {} abs_init={:?} class40={:?} record: {}",
+                                                            "6-Z296 rui@{:#x} state: {} abs_init={:?} class40={:?} record: {} {}",
                                                             z296_rui,
                                                             z296_st.join(" "),
                                                             z296_qflag,
                                                             z296_class,
-                                                            z296_rec
+                                                            z296_rec,
+                                                            z296_x19_info
                                                         ));
                                                     }
                                                 }
