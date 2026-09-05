@@ -24748,3 +24748,19 @@ Work Log:
 
 Stage Summary:
 - Local HEAD 8790777 (1 commit ahead of origin/main; PUSH PENDING until the wave completes — E2E checkouts ref=main). Wave on 3cc33f3 in flight. Next: push 8790777 + worklog after wave; decode the wave's fox/lineage logs (expect "IVibrator.perform(effect=N strength=M) → X ms host" on tap events; IHealth GetBatteryInfo lines); remaining queue: keystore2 timing, R12 touch-latency re-measure with the honest perform path.
+
+---
+Task ID: 6-Z300d — wave-2 decode + fox stability-spam forensic (R12 latency closed)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: decode the 0b51ad1 verification wave (6-Z300 perform + 6-Z300b health observability); chase the fox R12 log-flood / touch-latency thread to ground truth.
+
+Work Log:
+- WAVE 2 on 0b51ad1 (runs 33964127832/33964129056/33964129939): ALL THREE overall UI_READY — lineage sailfish, OrangeFox R12 lavender, TWRP 3.7.0 angler. No re-dispatch needed this round.
+- FOX DECODE: guest used IVibrator.on(40 ms) ×6 → forwarded to the host for REAL haptics (TWRP-12.1 events.cpp vibrate() = on(40), NOT perform). perform() honesty fix (6-Z300) stays for the general client surface; fox never exercises it. 1382 getService(IVibrator/default) hits, 0 misses — per-event uncached getService is TWRP's design; proxy answers in µs.
+- STABILITY-SPAM FORENSIC (fox_r12.img → zip → recovery.img → gzip → python cpio-newc parse — NOTE: name starts at header offset +110, first parser attempt read it at +6 and produced garbage; 3632 files incl. system/lib64/libbinder.so): the spam string "Can only set known stability, not %u." is at libbinder.so vaddr 0x2921e; single xref at 0x756a4 = Stability::check's error path. Ground-truth decode of the AArch64: w9 = stability>>24 must be ≤ 0x3F AND its bit must be in mask 0x8000_0000_0000_1008 (accepted w9 ∈ {3, 12, 63}); the log fires with w9 when the incoming annotation's version byte is 0. Our hit annotation 0x3F000001 (version-byte 0x3F) is ACCEPTED — spam cannot come from our replies (0 SM misses → no null annotations sent). 2810 spam ≈ 2×1382 = the guest's own libbinder logging against ITS pre-12-format stability constant per reply read — fox-build quirk, V-level, non-fatal (transactions succeed).
+- R12 LATENCY VERDICT (queue item CLOSED): the historical ~5s per-tap stall was the missing-IVibrator waitForService (fixed by the 6-Z271 virtual service). Remaining churn = guest-side uncached getService + fox's own V-logging; no twoyi-side lever. The log flood's only real damage was the CI BOOT_FAIL misclassification — fixed in 6-Z300c (head+tail capture + ps-live classifier fallback; verified locally on the 33963411361 artifact: BOOT_FAIL → BOOT_OK/overall UI_READY, lineage artifact unchanged).
+- 6-Z300b in wave 2: ZERO IHealth. lines in lineage even with per-call logging → the lineage guest NEVER engages the AIDL health service (its health-V4-ndk.so/@2.0.so are absent from the ramdisk — ENOENT probes in 6-Z272f-b diag; battery_utils.cpp falls through to the sysfs BatteryMonitor path, which IS live per the healthd kmsg lines and is host-honest via HostHalBridge push). The virtual IHealth service stays registered for guests that ship the client lib; observability will prove it if one ever does.
+
+Stage Summary:
+- Local HEAD 6b9f5c5 = origin/main. 730 tests green. All three corpus families UI_READY on the 6-Z300 head. Queue closed this round: R12 touch-latency (guest-side, no lever), fox stability spam (harmless, decoded), lineage AIDL-battery engagement (guest lacks client lib; sysfs path is the honest live one). Remaining candidates: fox/lineage deep-nav page coverage in the harness, IKeystoreSecurity engagement check on TWRP-12-class guests, PitchBlack/SHRP corpus depth.
