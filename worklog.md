@@ -24624,3 +24624,19 @@ Stage Summary:
   (SPLASH_HANG — transport provably byte-perfect; the remaining inert layer is the guest's caller-of-ev_get_input →
   RecoveryUI wiring, next round's kr64 dynamic memory probe targets it: ctx array @0x5d1f0/64B stride, vtable+0x30 dispatch,
   x28 keyboard-close condition). Cron webDevReview (job 359061, fixed_rate 3600s, priority 15) continues from repo state.
+
+---
+Task ID: 6-Z296 — input-read CALLER identification probe landed (read-only, tracer-side)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: implement the queued dynamic memory probe: identify the guest's real caller-of-ev_get_input chain (the last inert layer of the lineage touch path), plus the epoll-set ground truth for fds 9/10.
+
+Work Log:
+- 5c27cdc: kr64 ptrace_emu.rs +459 lines, two read-only arms:
+  (a) ENTRY-side epoll_ctl membership logger (aarch64 nr 21, arm32 251; x86_64 hosts structurally dead): logs (epfd, op, fd, events, data) per registration (per-pid cap 24) + fd identity via the existing 6-Z161 readlink probe. The epoll_event data union names minui's per-fd info slot (lineage disassembly: ctx array @ .bss+0x5d1f0, 64-byte stride) and settles whether ev_init's keyboard branch really kept fd 9 out of the set (close-without-ADD). Membership GATES the EXIT arm.
+  (b) EXIT-side input-read stack walk, gated on ALL of: read EXIT with ret == sizeof(input_event) (24 aarch64 / 16 arm32), fresh 6-Z199 ENTRY stash (nr, fd) match, fd ∈ the pid's epoll membership set; per-pid cap 6. Logs pc/lr/sp/fp/x28 (lr STILL holds the return address inside ev_get_input — bionic's read wrapper does not touch x30 across the syscall), a 96-word annotated stack walk above sp (full return chain), full /proc/<pid>/maps once per pid, and the minui ctx array (librecovery_ui.so base+0x5d1f0, 24 words).
+- New pure helpers z296_maps_triples / z296_annotate / z296_lib_base / z296_render_word / z296_dump_words — annotate() deltas are rebased to the FILE's LOWEST mapping start (the ELF load bias), so a pointer landing in the r-xp segment still yields the static disassembly offset (segment-relative delta would be wrong by the segment's file offset). Named [anon:*] mappings annotate too; empty-path anon → None. Unit-tested (2 new tests; 714 total green) + extended forget_dead_pid_state death-hygiene contract (probe state per-pid, recycled pids inherit nothing).
+- Fixed during self-review: epoll_ctl arg order (arg2=op, arg3=fd — the membership set would have tracked the wrong fd); pid_is_arm32 is aarch64-only → cfg-gated z296_is_arm32 locals so x86_64 host builds compile and BOTH probe arms are structurally dead there.
+
+Stage Summary:
+- HEAD 5c27cdc pushed. Probe is zero-behaviour-change; the SAME lines fire on TWRP/R12 (input WORKS) — the stack diff between a working and the broken guest names the drop point. Verification wave next: lineage-22.2-sailfish (probe target) + TWRP angler + OrangeFox R12 lavender (guards + working baselines). Analysis greps: "6-Z296 epoll_ctl", "6-Z296 INPUT-READ hit", "6-Z296 stack@sp", "6-Z296 ctx@", "6-Z296 MAPS:".
