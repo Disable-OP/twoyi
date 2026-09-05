@@ -24715,3 +24715,20 @@ Work Log:
 
 Stage Summary:
 - Local HEAD aede0a7 (UNPUSHED — no PAT in this sandbox). 727 tests green. The lineage battery story is now fully understood: header = sysfs (works, honest), service = AIDL IHealth (now served, honest), HIDL fallback = untouched. Recommended next: push + dispatch lineage/TWRP/R12 wave; then fox IVibrator host-bridge coverage, keystore2/device-mapper timing.
+
+---
+Task ID: 6-Z299 — guest takeover of a virtual name restores the platform service on death (fox QTI vibrator coexistence)
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: next queue item (fox IVibrator host-bridge coverage). Static-decode the fox R12 vibrator stack from the corpus image; close whatever the decode names. Push still blocked (no PAT in sandbox) — local commits only.
+
+Work Log:
+- Downloaded OrangeFox R12.0 lavender from the corpus URL (md5 differs from the manifest — the API serves a moving build; noted for corpus hygiene) and unpacked its recovery.img ramdisk (old boot header, gzip cpio, 3632 files).
+- VIBRATOR STACK DECODED: fox SHIPS a real QTI vibrator HAL — system/bin/vendor.qti.hardware.vibrator.service + vendor.qti.hardware.vibrator.impl.so + libqtivibratoreffect.so; its VINTF manifest declares AIDL android.hardware.vibrator.IVibrator/default (the EXACT name the proxy virtualizes); init.recovery.qcom.rc marks it `disabled` + `on boot: start vendor.qti.vibrator` (the 6-Z272c health-rc pattern). Client side: TeamWin twrp-12.1 minuitwrp/events.cpp — kVibratorInstance = IVibrator::descriptor + "/default" (fox's USE_QTI_AIDL_HAPTICS_FQNAME variant composes the same canonical name; the "IVibrator/default" string seen in libminuitwrp.so is the runtime-concatenated suffix, NOT a short-name lookup), vibrate() uses a ONE-SHOT AServiceManager_getService (no loop; null → silent no-op). The "Service %s didn't start. Returning NULL" message lives in libbinder.so (ServiceManagerShim::waitForService timeout) — reachable from fox's own waitForService callers (recovery binary imports it).
+- REGRESSION RISK NAMED in the 6-Z298 override semantics: if the QTI HAL registers over the virtual IVibrator name and then dies (its hardware doesn't exist in the container), the connection teardown REMOVED the name from the registry entirely — every later getService misses, poll storms and waitForService timeouts return. (The pre-6-Z298 behaviour — virtual_kind survived takeover — was accidentally the robust one for fox.)
+- FIX d85315a: ServiceEntry.virtual_fallback — a guest takeover records the platform implementation; unregister_conn splits dead-removal (pure guest services still die with their owner) from fallback-restore (the in-proxy service is restored under the SAME handle: existing client handles stay valid, re-lookups succeed) while still firing BR_DEAD_BINDER for the guest node (honest kernel semantics).
+- Tests: z298 updated (fallback recorded on takeover); new z299 test covers takeover + owner death → name keeps resolving / handle survives / death notified / pure guest service still removed. 728 green, clippy + fmt clean.
+- device-mapper ~10s wait: re-verified against android-15 block_dev_initializer.cpp — InitMiscDevice polls for the SYSFS uevent path /sys/devices/virtual/misc/device-mapper (RegenerateUeventsForPath → 10s Poll), NOT the /dev node; the 6-Z270b accept-the-10s decision STANDS (satisfying the probe would push first-stage-mount into dm-table setup behind a "successful" probe — the InitFatalReboot class; the failure path after a timeout is the one the loader already handles). Queued item CLOSED as wontfix-by-design.
+
+Stage Summary:
+- Local HEAD d85315a (5 commits ahead of origin/main; UNPUSHED — no PAT). 728 tests green. Fox vibrator coexistence is now deterministic in both HAL-liveness outcomes. Recommended next round: PUSH + dispatch lineage/TWRP/R12 wave (check for existing runs first); decode fox GetBatteryInfo/IVibrator/health logs; then keystore2 timing + R12 touch-latency comparisons.
