@@ -7050,6 +7050,7 @@ fn forget_dead_pid_state(
     z296_maps_dumped: &mut std::collections::HashSet<libc::pid_t>,
     z296_epoll_data: &mut std::collections::HashMap<(libc::pid_t, i64), u64>,
     z296_seen_headers: &mut std::collections::HashSet<(u64, u64, u64, u64, i64)>,
+    z296_read_bufs: &mut std::collections::HashMap<libc::pid_t, (i64, u64)>,
 ) {
     // 6-Z184 AUDIT FIX (agent 11): the death hygiene missed ~10 per-pid
     // maps — a pid-RECYCLED successor inherited stale state (e.g. a
@@ -7078,6 +7079,7 @@ fn forget_dead_pid_state(
     z296_maps_dumped.remove(&pid);
     z296_epoll_data.retain(|(p, _), _| *p != pid);
     z296_seen_headers.clear();
+    z296_read_bufs.remove(&pid);
     // 6-Z271b: a stale entry would make the recycled pid's FIRST EXIT
     // consume a synthetic-uevent delivery with OLD buffers — POKEDATA
     // into an unrelated process's memory. Must go with the process.
@@ -12160,6 +12162,11 @@ pub fn run_ptrace_loop(
     // boot-time reads must not burn the cap before the +120 s probe).
     let mut z296_seen_headers: std::collections::HashSet<(u64, u64, u64, u64, i64)> =
         std::collections::HashSet::new();
+    // pid -> (fd, buf) captured at read ENTRY — at the probe hit we dump
+    // the ACTUAL record bytes the guest received (type/code/value), the
+    // ground truth for the app-vs-guest framing question.
+    let mut z296_read_bufs: std::collections::HashMap<libc::pid_t, (i64, u64)> =
+        std::collections::HashMap::new();
     // 6-Z163b: counter for the bind-rewrite skip DIAG (first 12 skips log
     // the reason + the first 16 blob bytes — run 32990637557's silent
     // skip of init's property bind made the miss invisible).
@@ -13181,6 +13188,7 @@ pub fn run_ptrace_loop(
                 &mut z296_maps_dumped,
                 &mut z296_epoll_data,
                 &mut z296_seen_headers,
+                &mut z296_read_bufs,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
@@ -13376,6 +13384,7 @@ pub fn run_ptrace_loop(
                 &mut z296_maps_dumped,
                 &mut z296_epoll_data,
                 &mut z296_seen_headers,
+                &mut z296_read_bufs,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
@@ -16083,6 +16092,14 @@ pub fn run_ptrace_loop(
                         let z296_is_arm32 = false;
                         let z296_is_epoll_ctl = (abi.read == 63 && syscall_num == 21)
                             || (z296_is_arm32 && syscall_num == 251);
+                        // 6-Z296e: capture the read buffer address at ENTRY
+                        // (aarch64: x1 = arg2) so the probe hit can decode the
+                        // exact record bytes the guest received.
+                        if abi.read > 0 && syscall_num == abi.read {
+                            let z296_efd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            let z296_ebuf = get_syscall_arg(&regs, abi.reg_arg2);
+                            z296_read_bufs.insert(pid, (z296_efd, z296_ebuf));
+                        }
                         if z296_is_epoll_ctl {
                             // int epoll_ctl(int epfd, int op, int fd,
                             //                struct epoll_event *event)
@@ -19976,11 +19993,58 @@ pub fn run_ptrace_loop(
                                                             pid,
                                                             z296_base + 0x5d188,
                                                         );
+                                                        // 6-Z296e: the class byte the
+                                                        // callback gates on ([rui+0x40])
+                                                        // + the ACTUAL record bytes
+                                                        // received (type@16 u16,
+                                                        // code@18 u16, value@20 i32
+                                                        // for the 24-byte aarch64
+                                                        // input_event).
+                                                        let z296_class =
+                                                            read_child_u32(pid, z296_rui + 0x40);
+                                                        let mut z296_rec = String::from("<none>");
+                                                        if let Some(&(_, z296_buf)) =
+                                                            z296_read_bufs.get(&pid)
+                                                        {
+                                                            if z296_buf > 0x100 {
+                                                                if let Some(z296_bytes) =
+                                                                    read_child_bytes(
+                                                                        pid, z296_buf, 24,
+                                                                    )
+                                                                {
+                                                                    if z296_bytes.len() == 24 {
+                                                                        let z296_t =
+                                                                            u16::from_le_bytes([
+                                                                                z296_bytes[16],
+                                                                                z296_bytes[17],
+                                                                            ]);
+                                                                        let z296_c =
+                                                                            u16::from_le_bytes([
+                                                                                z296_bytes[18],
+                                                                                z296_bytes[19],
+                                                                            ]);
+                                                                        let z296_v =
+                                                                            i32::from_le_bytes([
+                                                                                z296_bytes[20],
+                                                                                z296_bytes[21],
+                                                                                z296_bytes[22],
+                                                                                z296_bytes[23],
+                                                                            ]);
+                                                                        z296_rec = format!(
+                                                                            "type={} code={} value={}",
+                                                                            z296_t, z296_c, z296_v
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                         log(&format!(
-                                                            "6-Z296 rui@{:#x} state: {} abs_init={:?}",
+                                                            "6-Z296 rui@{:#x} state: {} abs_init={:?} class40={:?} record: {}",
                                                             z296_rui,
                                                             z296_st.join(" "),
-                                                            z296_qflag
+                                                            z296_qflag,
+                                                            z296_class,
+                                                            z296_rec
                                                         ));
                                                     }
                                                 }
@@ -32065,6 +32129,8 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             std::collections::HashMap::new();
         let mut z296_seen_headers: std::collections::HashSet<(u64, u64, u64, u64, i64)> =
             std::collections::HashSet::new();
+        let mut z296_read_bufs: std::collections::HashMap<libc::pid_t, (i64, u64)> =
+            std::collections::HashMap::new();
         let pid: libc::pid_t = 4242;
         in_syscall_map.insert(pid, true);
         pending_uevent_recv.insert(
@@ -32095,6 +32161,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         z296_maps_dumped.insert(pid);
         z296_epoll_data.insert((pid, 9), 0x1000);
         z296_seen_headers.insert((1, 2, 3, 4, 9));
+        z296_read_bufs.insert(pid, (9, 0x2000));
         // Sanity: all four maps have the pid entry before cleanup
         // (5 = a real kernel fd, 0x6b000000+ = synthetic fake fds).
         fake_propserv_fds.entry(pid).or_default().insert(5);
@@ -32125,6 +32192,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             &mut z296_maps_dumped,
             &mut z296_epoll_data,
             &mut z296_seen_headers,
+            &mut z296_read_bufs,
         );
         // All four maps no longer have the pid entry — pid-RECYCLED
         // successor inherits NOTHING.
@@ -32148,6 +32216,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!z296_maps_dumped.contains(&pid));
         assert!(!z296_epoll_data.contains_key(&(pid, 9)));
         assert!(!z296_seen_headers.contains(&(1, 2, 3, 4, 9)));
+        assert!(!z296_read_bufs.contains_key(&pid));
         assert!(!pending_getpid.contains(&pid));
         // 6-Z271b: the in-flight uevent-recv rewrite must die with the
         // process (a stale entry would POKEDATA the recycled pid's
