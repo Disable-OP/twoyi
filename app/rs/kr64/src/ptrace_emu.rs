@@ -16926,6 +16926,46 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         }
+
+                        // ── 6-Z305f: unshare(CLONE_NEWNS) → fake success ──
+                        // Pure-stock init's SetupMountNamespaces calls
+                        // unshare(CLONE_NEWNS); the real syscall requires
+                        // CAP_SYS_ADMIN and the guest runs with the app's
+                        // credentials → -EPERM →
+                        //   init: Cannot create mount namespace: Operation not permitted
+                        //   init: SetupMountNamespaces failed: Operation not permitted
+                        //   init: InitFatalReboot: signal 6
+                        // (run 33998490749). The mount namespace IS already
+                        // virtualized — every guest mount is a merged-rootfs
+                        // no-op (6-Z164 / 6-Z210 / 6-Z305e) — so an
+                        // unshared clone is honestly indistinguishable from
+                        // not unsharing. Rewrite to getpid (the prctl
+                        // precedent above): the positive return converts to
+                        // success in bionic. Only CLONE_NEWNS is faked;
+                        // other unshare flavors keep real semantics.
+                        if abi.unshare != -1 && syscall_num == abi.unshare {
+                            const CLONE_NEWNS_FLAG: u64 = 0x0002_0000;
+                            if get_syscall_arg(&regs, abi.reg_arg1) & CLONE_NEWNS_FLAG != 0 {
+                                static Z305F_UNSHARE_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let n = Z305F_UNSHARE_LOGGED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                set_syscall_num(&mut regs, &abi, abi.getpid);
+                                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                    if n < 20 {
+                                        log(&format!(
+                                            "6-Z305f: unshare(CLONE_NEWNS) pid={} faked success (mount ns already virtualized) [{} /20]",
+                                            pid, n + 1
+                                        ));
+                                    }
+                                } else {
+                                    log(&format!(
+                                        "6-Z305f: unshare->getpid rewrite FAILED for pid={} — the real EPERM will surface",
+                                        pid
+                                    ));
+                                }
+                            }
+                        }
                     }
 
                     // Task 6-S: always log fork/clone/vfork/wait4/exit_group
