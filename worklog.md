@@ -24661,3 +24661,21 @@ Work Log:
 
 Stage Summary:
 - The input saga's key half is CLOSED (proven end-to-end by the guest itself selecting Reboot). Touch has never been exercised on a live row: next wave (this commit) taps "Apply update" (y=0.481H) on the LIVE menu FIRST; if the frame rises, TOUCH IS INTERACTIVE and the whole lineage SPLASH_HANG verdict chain was harness artifacts. If not, the new state line (rot/gate1048/start-vs-last/qlen + menu geometry) localizes the drop in one round. Guard: TWRP + R12 waves.
+
+---
+Task ID: 6-Z297b — wave 2 decoded: the HARNESS's own gestures killed the menu again (gate feeds + Step 8b wander); AOSP early-out + safe tap ladder
+Agent: Z.ai Code (main dispatcher)
+Date: 2026-09-05
+Task: decode run 33953520838 (6a6b789 lineage), fix the remaining harness interference, re-dispatch.
+
+Work Log:
+- Probe fields all landed: gate1048=0 (bootreason=recovery_ui ShowText gate NOT set), rot=0 (no rotation remap), 64 hits captured (raised cap worked). Menu geometry globals all ZERO — SelectMenu(Point) never ran on a live menu (the globals are lazily initialized inside SelectMenu from rendered surface dims; first live tap would populate them).
+- Coordinate mystery SOLVED: the guest streams (554,400)/(518,352)/(136..633,1424) are ui-navigate's OWN gate-feeding gestures (job log: "feeding gesture 0: input tap 554 400 (at 10s, gate)", gesture 2 = swipe 136,1424->633,1424). The app transform is IDENTITY (logcat: "Virtual display: 720x1600, Screen: 720x1600, Surface: 720x1600, Offset: 0,0"; mTouchMatrix = scale(1,1); the debug receiver's offset subtract is a no-op).
+- Menu killer this round: ui-navigate Step 8b's TWRP navigation chain (GOT IT candidates, "tap Advanced candidate", keyboard taps at y=1424/1560, taps at (528,708)/(360,810) = menu-row coordinates!) walked the rendered AOSP menu into "Reboot system now" (guest log "Rebooting..." t=79.2s) BEFORE the menu probe ran; probe taps then hit a dead menu (channels_used=[], frame_delta=0). ALSO the >120s "safe" ladder (center taps (360,800) = the Apply-update row + BACK keyevents) is menu-hostile.
+- STATIC completion: SelectMenu(Point) hit-test globals decode — menu_left(0x5d168) = (screen_w - menu_surface_w)/2 lazily guarded; menu_w/h from gr_get_width/height(surface @rui+0x10e8); a MISS returns -5 (no action); tap on the CURRENT row returns -4 (ACTIVATE); OnTouchRelease's tap gate (last==start) verified live (start/last quad constant across tap streams).
+- Fixes (3cc21d8): ui-navigate.py Step 7 gesture loop checks the AOSP classifier (minui fbdev marker + no TWRP pages, same as the menu probe) every 10s and STOPS feeding gestures on AOSP layout; Step 8b sandbox probe skips AOSP guests. ui-navigate-recovery-menu.py tap ladder -> [0.481H, 0.669H, 0.481H] (Apply update / Advanced — escapable submenus under tap-ACTIVATES semantics; Factory reset row removed).
+- TWRP/R12 unchanged: the classifier requires the minui marker + zero TWRP pages; on log-read failure gestures continue exactly as before.
+- Wave 3 dispatched on 3cc21d8: lineage (probe target) + TWRP angler (guard; Step 8b/gesture structure touched).
+
+Stage Summary:
+- Every guest-side unknown in the lineage touch path is now CLEARED statically and dynamically: gate1048=0, rot=0, tap gate reachable, queue healthy, callback processes the full MT protocol, keys work end-to-end. The ONLY remaining reason for frame_delta=0 is interference — now removed at the source. Wave 3 (3cc21d8) is the clean experiment: if the tap on Apply-update still fails to redraw, the probe's own state lines name the failing branch in the same round.
