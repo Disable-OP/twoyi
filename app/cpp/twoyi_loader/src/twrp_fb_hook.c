@@ -2330,6 +2330,16 @@ static int input_ioctl(int fd, unsigned req, void *argp) {
             } else {
                 inbr_set_bit((unsigned char *)argp, cap, INBR_BTN_TOUCH);
                 inbr_set_bit((unsigned char *)argp, cap, INBR_BTN_TOOL_FINGER);
+                /* 6-Z295: the TOUCH device also advertises the menu keys.
+                 * Only touch-class devices enter minui's epoll (the
+                 * keyboard branch CLOSES its fds without epoll_ctl ADD —
+                 * disassembled 0x36820), so EV_KEY records can only reach
+                 * the UI's type-switch through the epoll-registered fd.
+                 * A touchscreen that also reports volume/power keys is
+                 * legal evdev (composite input device). */
+                inbr_set_bit((unsigned char *)argp, cap, 114u);
+                inbr_set_bit((unsigned char *)argp, cap, 115u);
+                inbr_set_bit((unsigned char *)argp, cap, 116u);
             }
         } else if (ev == INBR_EV_ABS) {
             if (is_keys) {
