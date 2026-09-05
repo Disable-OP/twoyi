@@ -11827,6 +11827,20 @@ pub fn run_ptrace_loop(
     // FATAL even though the rewritten socket() had SUCCEEDED.
     let mut pending_entry_fd: std::collections::HashMap<libc::pid_t, (i64, i64)> =
         std::collections::HashMap::new();
+    // 6-Z305c: ENTRY-side readlink/readlinkat arg stash — (pid → (path_ptr,
+    // buf_ptr)). bionic realpath (android-11) = open(O_PATH) + fstat(fd) +
+    // readlink(/proc/self/fd/N) + stat(dst) with a dev/ino compare. At the
+    // syscall-EXIT stop on aarch64 the kernel CLOBBERS x1-x5 (6-Z278), so
+    // the 6-Z200b class-2 rewrite — which reads the buffer pointer from
+    // the EXIT register snapshot — has been reading garbage since it was
+    // written: every /proc/self/fd readlink result reached the guest
+    // UNREWRITTEN, and init's restorecon realpath("/system/bin") then
+    // stat'ed the raw host fd-link path → the /data/* rule translated it
+    // to {rootfs}/data/... → ENOENT → InitFatalReboot (runs 33987046990,
+    // 33989721659, 33991778662). Stash the pointers at ENTRY where x1/x2
+    // still hold the arguments.
+    let mut pending_entry_readlink: std::collections::HashMap<libc::pid_t, (u64, u64)> =
+        std::collections::HashMap::new();
     // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
     // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
     // 0) — the EXIT arm turns the returned REAL fd into a tracked
@@ -14874,6 +14888,27 @@ pub fn run_ptrace_loop(
                             pending_entry_fd.insert(
                                 pid,
                                 (syscall_num, get_syscall_arg(&regs, abi.reg_arg1) as i64),
+                            );
+                        }
+                        // 6-Z305c: stash readlink/readlinkat args the same
+                        // way — x1 (path) and x2 (buf) are clobbered at the
+                        // EXIT stop on aarch64, so both the 6-Z200b class-2
+                        // rewrite and the failure DIAG must consume the
+                        // ENTRY-time pointers.
+                        if (abi.readlink != -1 && syscall_num == abi.readlink)
+                            || (abi.readlinkat != -1 && syscall_num == abi.readlinkat)
+                        {
+                            let (path_reg, buf_reg) = if syscall_num == abi.readlink {
+                                (abi.reg_arg1, abi.reg_arg2)
+                            } else {
+                                (abi.reg_arg2, abi.reg_arg3)
+                            };
+                            pending_entry_readlink.insert(
+                                pid,
+                                (
+                                    get_syscall_arg(&regs, path_reg),
+                                    get_syscall_arg(&regs, buf_reg),
+                                ),
                             );
                         }
                     }
@@ -21156,6 +21191,27 @@ pub fn run_ptrace_loop(
                         || (abi.readlinkat != -1 && syscall_num == abi.readlinkat)
                     {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // 6-Z305c FIX: consume the ENTRY stash. At the EXIT
+                        // stop on aarch64 x1 (path) and x2 (buf) are
+                        // clobbered by the kernel (6-Z278) — the register
+                        // snapshot below is garbage for both. The 6-Z200b
+                        // class-2 rewrite has therefore been a no-op on
+                        // aarch64 for EVERY /proc/self/fd readlink (the
+                        // guest saw raw host fd paths; init's restorecon
+                        // realpath then ENOENT'd and took the fatal-reboot
+                        // path). Fall back to the registers only when no
+                        // stash exists (pre-arm windows, exotic pids).
+                        let (path_addr, buf) = match pending_entry_readlink.remove(&pid) {
+                            Some((p, b)) => (p, b),
+                            None => (
+                                if syscall_num == abi.readlinkat {
+                                    get_syscall_arg(&regs, abi.reg_arg2)
+                                } else {
+                                    get_syscall_arg(&regs, abi.reg_arg1)
+                                },
+                                get_syscall_arg(&regs, abi.reg_arg3),
+                            ),
+                        };
                         // ── 6-Z305c: realpath-trace readlink DIAG v2 ──
                         // The blanket request-path log burned its cap on
                         // linker fd bookkeeping before init's restorecon
@@ -21165,13 +21221,9 @@ pub fn run_ptrace_loop(
                         // rootfs-prefixed results.
                         if ret < 0 && Z305C_RL_DIAG.load(std::sync::atomic::Ordering::Relaxed) < 40
                         {
-                            // readlink(path, buf, siz): path = arg1.
-                            // readlinkat(dirfd, path, buf, flags): path = arg2.
-                            let path_addr = if syscall_num == abi.readlinkat {
-                                get_syscall_arg(&regs, abi.reg_arg2)
-                            } else {
-                                get_syscall_arg(&regs, abi.reg_arg1)
-                            };
+                            // 6-Z305c: path pointer comes from the ENTRY
+                            // stash (see above) — the EXIT registers no
+                            // longer hold it on aarch64.
                             if path_addr != 0 {
                                 if let Some(rl_path) = read_child_string(pid, path_addr) {
                                     if rl_path.starts_with("/proc/self/fd")
@@ -21192,12 +21244,12 @@ pub fn run_ptrace_loop(
                             }
                         }
                         if ret > 0 && ret < 4096 {
-                            let buf_reg = if syscall_num == abi.readlink {
-                                abi.reg_arg2
-                            } else {
-                                abi.reg_arg3
-                            };
-                            let buf = get_syscall_arg(&regs, buf_reg);
+                            // 6-Z305c: `buf` comes from the ENTRY stash
+                            // (consumed above) — the EXIT register read that
+                            // used to live here returned garbage on aarch64
+                            // (x2 clobbered), which made the class-2 rewrite
+                            // a silent no-op and broke every guest
+                            // realpath(/proc/self/fd) consumer.
                             if buf != 0 {
                                 if let Some(bytes) = read_child_bytes(pid, buf, ret as usize) {
                                     let target = String::from_utf8_lossy(&bytes).into_owned();
