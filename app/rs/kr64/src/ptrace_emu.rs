@@ -7345,7 +7345,9 @@ fn spawn_boot_completed_sender(trigger_pid: libc::pid_t, reason: &str) {
     };
     // 6-Z305a: own the reason string BEFORE the 'static move closure —
     // a borrowed &str parameter cannot escape into a spawned thread (E0521).
-    let reason = reason.to_string();
+    // The OUTER `reason` stays borrowed for the spawn-failure log in the
+    // Err arm below; the thread gets its own owned copy (E0382).
+    let reason_owned = reason.to_string();
     if BOOT_COMPLETED_SENDER_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         log("[KR64] BOOT_COMPLETED: sender thread already started — not spawning another (Task 6-Z62)");
         return;
@@ -7364,7 +7366,7 @@ fn spawn_boot_completed_sender(trigger_pid: libc::pid_t, reason: &str) {
             };
             tlog(&format!(
                 "[KR64] BOOT_COMPLETED sender thread started (trigger PID={}, reason={}, will retry every 250 ms for up to 120 s)",
-                trigger_pid, reason
+                trigger_pid, reason_owned
             ));
             const SOCK_NAMES: [&str; 2] = ["TWOYI_SOCK", "TWOYI_BOOT_SOCK"];
             const RETRY_INTERVAL_MS: u64 = 250;
