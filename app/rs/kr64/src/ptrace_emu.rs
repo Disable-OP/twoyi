@@ -12477,6 +12477,14 @@ pub fn run_ptrace_loop(
     // needs).
     let mut pending_blind_execve: std::collections::HashMap<libc::pid_t, String> =
         std::collections::HashMap::new();
+    // 6-Z305c: full-fidelity death-window tracer. Armed by init's own
+    // "Loading SELinux policy" klog writev (the marker immediately
+    // before the restorecon realpath death); then EVERY syscall stop
+    // (ENTRY args + EXIT ret) is logged for the next N stops. This is
+    // the no-blind-spots instrument: the per-leg DIAG gates stayed
+    // silent through the exact death (run 33991778662) which means the
+    // failing syscall(s) took paths/no paths the gates never matched.
+    let mut z305c_window_countdown: u32 = 0;
     // 6-Z167: how many /proc/<pid>/maps brackets we already dumped for the
     // 6-Z164 path-read-failure DIAG (first 3 — enough to name the region
     // class without flooding the log across TWRP's 10 service restarts).
@@ -14713,6 +14721,31 @@ pub fn run_ptrace_loop(
                     },
                     nr: syscall_num,
                 });
+
+                // ── 6-Z305c: death-window full-fidelity trace ──
+                if z305c_window_countdown > 0 {
+                    z305c_window_countdown -= 1;
+                    if is_entry {
+                        log(&format!(
+                            "6-Z305c win E pid={} nr={} {} a=({:#x},{:#x},{:#x},{:#x},{:#x})",
+                            pid,
+                            syscall_num,
+                            syscall_name(syscall_num, &abi),
+                            get_syscall_arg(&regs, abi.reg_arg1),
+                            get_syscall_arg(&regs, abi.reg_arg2),
+                            get_syscall_arg(&regs, abi.reg_arg3),
+                            get_syscall_arg(&regs, abi.reg_arg4),
+                            get_syscall_arg(&regs, abi.reg_arg5),
+                        ));
+                    } else {
+                        log(&format!(
+                            "6-Z305c win X pid={} nr={} ret={}",
+                            pid,
+                            syscall_num,
+                            get_syscall_arg(&regs, abi.reg_ret) as i64
+                        ));
+                    }
+                }
 
                 // 6-Z278: focused-diag ENTRY-arg stash — arg registers are
                 // CLOBBERED at the EXIT stop (aarch64 x0 = return value,
@@ -22221,6 +22254,18 @@ pub fn run_ptrace_loop(
                                             let cl = std::cmp::min(ll as usize, 64);
                                             if let Some(bytes) = read_child_bytes(pid, bb, cl) {
                                                 let txt = String::from_utf8_lossy(&bytes);
+                                                // 6-Z305c: arm the death
+                                                // window on init's own
+                                                // policy-load marker (the
+                                                // writev immediately
+                                                // before the restorecon
+                                                // realpath death).
+                                                if txt.contains("Loading SELinux policy")
+                                                    && z305c_window_countdown == 0
+                                                {
+                                                    z305c_window_countdown = 12000;
+                                                    log("6-Z305c: WINDOW ARMED — init entering SELinux policy setup; every syscall stop logged until the countdown exhausts");
+                                                }
                                                 dump.push_str(&format!("{:?}", txt));
                                             } else {
                                                 dump.push_str("<unreadable>");
