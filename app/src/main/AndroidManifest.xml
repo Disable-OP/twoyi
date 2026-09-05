@@ -67,6 +67,15 @@
                 <data android:pathPattern=".*\\.tar" />
                 <data android:pathPattern=".*\\.cpio" />
                 <data android:pathPattern=".*\\.zip" />
+                <!-- 6-Z305: .gz / .tar.gz rootfs packages. RamdiskImporter
+                     detects gzip BY MAGIC (not by extension), so a .tar.gz
+                     full-Android rootfs flows gzip → inner tar → the tar
+                     importer. Android's PatternMatcher needs the doubled
+                     variants for paths with extra dots (the classic
+                     pathPattern pitfall) — standard escalation ladder. -->
+                <data android:pathPattern=".*\\.gz" />
+                <data android:pathPattern=".*\\..*\\.gz" />
+                <data android:pathPattern=".*\\..*\\..*\\.gz" />
             </intent-filter>
         </activity>
 
