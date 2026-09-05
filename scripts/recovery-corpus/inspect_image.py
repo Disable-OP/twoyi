@@ -241,9 +241,29 @@ def detect_family(files: dict, cmdline: str):
     if any(n in names for n in ofx_names) or \
             b"OrangeFox" in text or b"orangefox." in text:
         fam["family"] = "OrangeFox"
+    # 6-Z303: PitchBlack — TWRP fork with pbrp-branded theme buttons
+    # (no PBRP props in default.prop; verified on pbrp-4.0-ginkgo /
+    # vayu / surya: twres/images/main_button_pbrp_{about,custom,
+    # special_settings,tools}.png are always present).
+    if any(n.startswith("twres/images/main_button_pbrp_") for n in names):
+        fam["family"] = "PitchBlack"
+        for cand in ("default.prop", "prop.default", "twrp.rc"):
+            if cand in files and files[cand][2]:
+                t = files[cand][2].decode("utf-8", "replace")
+                for line in t.splitlines():
+                    if any(k in line for k in ("ro.pbrp.version",
+                                               "ro.pitchblack.version")) \
+                            and "=" in line:
+                        fam["version"] = line.split("=", 1)[1].strip()
     if any("shrp" in n.lower() for n in names) or b"SkyHawk" in text or \
             b"SHRP" in text:
         fam["family"] = "SHRP"
+        for cand in ("default.prop", "prop.default", "twrp.rc"):
+            if cand in files and files[cand][2]:
+                t = files[cand][2].decode("utf-8", "replace")
+                for line in t.splitlines():
+                    if "ro.shrp.version" in line and "=" in line:
+                        fam["version"] = line.split("=", 1)[1].strip()
     # Lineage recovery-in-boot (A/B): init.recovery.<device>.rc at the
     # ramdisk root + no twres/fox markers; the boot.img ramdisk IS the
     # recovery. Verified on lineage-22.2-20260823-nightly-sailfish.
