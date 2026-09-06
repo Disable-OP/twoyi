@@ -1246,6 +1246,16 @@ def main():
     # minutes on redroid).
     rom_file = os.environ.get("TWOYI_ROM_FILE", "recovery.img")
     import_wait_seconds = int(os.environ.get("TWOYI_IMPORT_WAIT_SECONDS", "120"))
+    # 6-Z305n FAST-FAIL: stall-adaptive boot watch. The old ladder stared
+    # at a PARKED guest for the full BOOT_WAIT_SECONDS (600s default —
+    # ~15 min of dead CI per failed iteration, and the user waited an
+    # hour for decode after decode). New contract: guest progress is
+    # measured every 10s as (kr64 klog size, guest-process count); if
+    # BOTH freeze for TWOYI_STALL_SECONDS (after a 60s startup grace),
+    # the boot watch ends EARLY and the evidence bundle becomes the
+    # decode payload. A streaming klog always resets the budget — this
+    # never cuts a genuinely progressing boot.
+    stall_seconds = int(os.environ.get("TWOYI_STALL_SECONDS", "90"))
 
     # ─────────────────────────────────────────────
     # Step 1: Launch app
@@ -1637,7 +1647,8 @@ def main():
     # ─────────────────────────────────────────────
     print()
     print("=" * 60)
-    print(f"  Step 7: Wait for boot ({boot_wait}s) — screenshots every 5s")
+    print(f"  Step 7: Wait for boot ({boot_wait}s cap) — screenshots every 5s; "
+          f"FAST-FAIL: early exit when klog+procs freeze {stall_seconds}s")
     print("=" * 60)
     # ── History: TWRP renders its welcome gate LIVE (run 32640227105):
     # "Unmounted System Partition — Keep Read Only?" with buttons
@@ -1725,6 +1736,49 @@ def main():
 
     aosp_bailed = False
 
+    # ── 6-Z305n: stall-adaptive early exit (FAST-FAIL) ──
+    # Guest progress signature = (kr64-app-stderr.log bytes, guest-process
+    # count), sampled docker-exec side (adb-independent — survives adbd
+    # death, same lesson as the 6-Z305 evidence dumps). When BOTH are
+    # frozen for stall_seconds past a 60s startup grace, the guest is
+    # parked: more waiting only re-proves the stall, so end the watch and
+    # let the classifier + evidence bundle describe it. Any klog growth
+    # or process churn resets the budget, so a live boot is never cut.
+    def guest_progress_signature():
+        size = -1
+        procs = -1
+        for p in (f"/data/user/0/{PACKAGE}/kr64-app-stderr.log",
+                  f"/data/data/{PACKAGE}/kr64-app-stderr.log"):
+            try:
+                r = subprocess.run(
+                    ["sudo", "docker", "exec", "redroid", "sh", "-c",
+                     f"stat -c%s '{p}' 2>/dev/null || echo -1"],
+                    capture_output=True, text=True, timeout=15)
+                lines = (r.stdout or "").strip().splitlines()
+                if lines and lines[-1].strip().lstrip("-").isdigit():
+                    size = max(size, int(lines[-1].strip()))
+                    break
+            except Exception:
+                continue
+        try:
+            r = subprocess.run(
+                ["sudo", "docker", "exec", "redroid", "sh", "-c",
+                 "ps -A -o NAME 2>/dev/null | grep -cE "
+                 "'init|twoyi|kr64|zygote|system_server|surfaceflinger|"
+                 "servicemanager|vold|keystore2|ueventd'"],
+                capture_output=True, text=True, timeout=15)
+            lines = (r.stdout or "").strip().splitlines()
+            if lines and lines[-1].strip().isdigit():
+                procs = int(lines[-1].strip())
+        except Exception:
+            pass
+        return size, procs
+
+    stall_budget = stall_seconds
+    last_sig = (-1, -1)
+    last_progress_at = 0
+    stalled_at = 0
+
     gesture_index = 0
     for i in range(max(1, boot_wait // 5)):
         wait(5)
@@ -1735,6 +1789,33 @@ def main():
                       f"STOPPING gate gestures (menu must stay pristine for "
                       f"ui-navigate-recovery-menu.py)")
                 aosp_bailed = True
+                break
+            # 6-Z305n stall sampling (10s cadence, aligned with gestures)
+            sig = guest_progress_signature()
+            if sig != last_sig:
+                print(f"  [progress @ {elapsed}s] klog={sig[0]}B "
+                      f"guest_procs={sig[1]}")
+                last_sig = sig
+                last_progress_at = elapsed
+            elif elapsed >= 60 and elapsed - last_progress_at >= stall_budget:
+                stalled_at = elapsed
+                print()
+                print("=" * 60)
+                print(f"  ⚑ STALL DETECTED at {elapsed}s: guest klog + process "
+                      f"table frozen for {stall_budget}s "
+                      f"(last progress at {last_progress_at}s)")
+                print("  FAST-FAIL (6-Z305n): ending the boot watch early —")
+                print("  the evidence bundle below IS the decode payload.")
+                print("=" * 60)
+                try:
+                    with open(os.path.join(ART, "stall-detection.txt"), "w") as f:
+                        f.write(f"stalled_at_seconds={elapsed}\n"
+                                f"stall_budget_seconds={stall_budget}\n"
+                                f"last_progress_seconds={last_progress_at}\n"
+                                f"klog_bytes={sig[0]}\n"
+                                f"guest_procs={sig[1]}\n")
+                except Exception:
+                    pass
                 break
             g = gesture_index % 4
             seq = gestures if elapsed <= 120 else gestures_safe
@@ -1753,6 +1834,11 @@ def main():
         # be visible even if the activity changed. Keep taking screenshots.
         if "Render2Activity" not in activity and elapsed > 20:
             print(f"  Note: not in Render2Activity at {elapsed}s: {activity}")
+
+    if stalled_at:
+        print(f"  [6-Z305n] boot watch ended EARLY on stall at {stalled_at}s "
+              f"(budget {stall_budget}s; hard cap was {boot_wait}s) — "
+              f"fast-fail saved ~{max(0, boot_wait - stalled_at)}s of dead CI")
 
     # ─────────────────────────────────────────────
     # Step 8: Final capture
