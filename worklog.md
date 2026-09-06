@@ -24958,3 +24958,47 @@ Work Log:
 Stage Summary:
 - origin/main cae52e1. FIRST pure-stock Android 11 boot: reaches second-stage init + SELinux policy load, dies at restorecon realpath ENOENT → InitFatalReboot. This is a REAL generic Stage-A/D blocker (not a ROM hack candidate).
 - NEXT (highest value): kr64 VFS trace of the restorecon path (newfstatat/readlinkat/readlink on /system/bin/* under the path-prefix illusion + staging illusion), fix realpath semantics generically, re-run, expect SELinux setup to complete → init services ladder (vold/keystore2/zygote already proven reachable infra). Recovery regression guard: 5 families UI_READY.
+
+---
+Task ID: 6-Z305c/305d/305e/305f/305g — four walls breached; init reaches rc parsing
+Agent: Z.ai Code (cron Continue)
+Date: 2026-09-06
+Task: root-cause + fix the restorecon → property-socket → mount-namespace wall chain; advance the pure-stock Android 11 boot.
+
+Work Log:
+- 6-Z305c instrumentation ladder (commits 849d944, d516c28/d623f46 fmt, 8f2e6e9+c05c4af v2, ea8620e window):
+  per-leg DIAGs stayed silent through the death → built the full-fidelity DEATH-WINDOW TRACER (armed by
+  init's own 'Loading SELinux policy' klog writev; every syscall stop logged, 12000-stop budget).
+- 6-Z305c ROOT CAUSE (a7a071c): at the aarch64 syscall-EXIT stop the kernel CLOBBERS x1-x5 (the documented
+  6-Z278 lesson) — the 6-Z200b readlink class-2 rewrite read the BUFFER POINTER from the clobbered
+  register snapshot → silent no-op FOREVER → every /proc/self/fd readlink reached the guest UNREWRITTEN →
+  bionic realpath's stat(dst) ENOENT → libselinux 'Could not get canonical path' → InitFatalReboot.
+  Fix: ENTRY-time (path_ptr, buf_ptr) stash consumed at EXIT (6-Z199 precedent).
+- 6-Z305d ROOT CAUSE (cb5dadd): the kernel's fd-link results carry the CANONICAL rootfs prefix
+  /data/user/0/io.twoyi.debug/profiles/default/rootfs/... while the tracer's rootfs param is the legacy
+  symlinked path → starts_with failed → no rewrite. Fix: canonicalize the rootfs once at loop start +
+  strip_guest_prefix() tries BOTH prefixes (4 unit tests). RESULT: 81 rewrites fired; restorecon PASSED.
+- 6-Z305d bind fix (14f442a): the 6-Z163 bind sun_path rewrite was boot_recovery-gated; pure init's
+  bind(/dev/socket/property_service) passed through to the HOST (redroid's init owns it) → EADDRINUSE →
+  InitFatalReboot. Gate now path-driven on BOTH boot paths. RESULT: "Created socket
+  '/dev/socket/property_service', mode 666".
+- 6-Z305e bind mounts (ef6daba + compile fix): guest-internal MS_BIND mounts (init's /mnt/user in
+  SetupMountNamespaces) → materialize source+target dirs in the merged rootfs + EXIT 0 (recovery.fstab
+  block-storage ENODEV semantics preserved for real-fstype mounts).
+- 6-Z305f/g namespaces (81050e7, 79635eb, 0237682, dc19769): unshare(CLONE_NEWNS) + setns(CLONE_NEWNS)
+  faked via getpid-rewrite + dedicated in-flight pid set + EARLY EXIT ret=0 force (a stale prctl stash
+  initially overwrote the success with -1 — the prctl arm is pid-keyed only). setns added to all four
+  ABI tables (aarch64 268 — window-traced the real nr after a 267 mislabel).
+- RESULT (run 34002339515): "SetupMountNamespaces done" → vendor_init subcontext forked → init parses
+  /system/etc/init/hw/init.rc + imports — then init_pid 2713 exited 0 QUIETLY (no fatal, no reboot
+  message) at +5.3s traced. exit_group(0) is untrailed by design (6-Z247) → cause unknown.
+
+Stage Summary:
+- origin/main dc19769. Lint+test green (742 tests). Boot ladder: init now survives restorecon, owns the
+  property service, completes mount namespaces, forks vendor_init, and begins rc parsing — the boot
+  ladder is UNFOLDING on the pure unmodified stock Android 11 rootfs.
+- NEXT (highest value): arm the death window on 'Parsing file /system/etc/init/hw/init.rc' (or extend
+  6-Z247 to trail exit_group(0) for the CURRENT init) to catch init's quiet exit(0); investigate the
+  vendor_init subcontext fork (clone/ns in the subcontext) and the reboot SIGSYS emulation semantics.
+  Recovery regression guard: dispatch one TWRP + one OrangeFox run to confirm the bind/unshare gate
+  changes are recovery-neutral.
