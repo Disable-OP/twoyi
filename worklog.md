@@ -25562,3 +25562,30 @@ Stage Summary:
 - Known GSI-normal noise ahead (non-fatal): vendor HAL 127s (no vendor binaries), linkerconfig "Skipping insecure file" copy quirk (upstream umask(0x0022) → 0o624 outputs; real devices hit it too), /dev/cpuset write misses.
 - Host/guest log separation is now enforced at three layers: watch (guest-subtree count), workflow labels, LOG-SOURCES.txt manifest; classifier unchanged (already guest-only).
 - NEXT (6-Z305p): decode the next ladder run; the anticipated wall is the first honest zygote exec (init.zygote64.rc imported since the property wire works; watch for linker namespace/ro.zygote/apex-lib failures) or a critical-service crumple (vold/servicemanager). Guards mandatory: TWRP angler + pbrp-ginkgo (vendored; OrangeFox lavender upstream is DEAD).
+---
+Task ID: 6-Z305o-verify
+Agent: Z.ai Code (main dispatcher)
+Task: verify the flattened-apex fix on run 34041198120 (094b63c); decode the new park state.
+
+Work Log:
+- FIX VERIFIED LIVE (run 34041198120, 094b63c, ladder SUCCESS):
+  * "appended ro.apex.updatable=false" to all 5 existing boot-defaults files (+7ms host log).
+  * Override battle in guest klog: 'false'→'true' (+225ms, GSI system/build.prop) → 'true'→'false' (+228ms, later file) — the multi-file append won exactly as designed.
+  * apexd-bootstrap: "This device does not support updatable APEX. Exiting" → **exit 0 in 62ms** (was: 20,115ms + exit 1 + full bootstrap-apexd-failed shutdown cascade + guest reboot). The 6-Z305o wall is DEAD.
+  * NO "Reboot ending" anywhere in the 2.8MB guest log; guest stayed ALIVE at capture (stall rule ended observation, honest).
+  * GUARDS GREEN on 094b63c: TWRP 3.7.0 angler SUCCESS, pbrp-4.0-ginkgo SUCCESS (no recovery regression from the property-layer change). kr64 lint+test SUCCESS.
+- NEW STATE DECODED (next wall, imperfectly — diagnostics blinded):
+  * Guest parked with 7 procs: libkr64 + init(main, ep_poll) + init(subcontext, poll) + ueventd(poll); NO core services spawned (no servicemanager/vold/logd/zygote).
+  * THE KLOG MIRROR STALLED AGAIN: only 221 KLOG-TIMELINE lines, last at +1440ms (mid early-init-class actions), while the guest kept running to ~115s. The uncapped dev-__kmsg__ pull is also only 15KB (a stale/truncated view) vs 2.8MB kr64-app-stderr. Decoders were effectively blind AFTER +1440ms — must be fixed before the next decode is trustworthy (mission §15).
+  * SMOKING GUN for the next wall: "access verdict served" count = 0 (was 7× in run 34036213818) + WRITEV samples show mass client-side property-set denials from +315ms on: ro.gsid.image_running, ro.boottime.ueventd, ro.boottime.apexd-bootstrap (+584ms), ro.cold_boot_done (+674ms), ro.boottime.boringssl_self_test64 (+882ms), ro.hardware.egl/vulkan (+1166-1174ms, vendor ranchu early-init). YET the boot-defaults LOAD path (ucred pid=1 fake) processed fine at +225-330ms (the ro. override lines prove CheckPermissions SUCCESS) and the queue advanced through late-init (apexd exit 0 +644ms).
+  * Queue-order paradox in the klog (late-init commands at +335-644 BEFORE early-init-class lines at +876-1440) is NOT trustworthy evidence of a second boot generation — the stalled/reordered mirror plus delayed subcontext prints make line order unreliable; treat "who parked where" as OPEN until the mirror is fixed.
+  * Prime suspect for 0-serves: the access-node serve chain (6-Z305l/m/m-2 write-capture + read-serve, per-pid fd stashes) broke under the NEW timing/interleaving (fast apexd path = different concurrency between init prop-thread, subcontext, and ueventd). The per-(pid,fd) stash protocol has known aliasing fragility; a permanent mid-boot serve failure = every later client set denied (fail-closed), init eventually parks waiting on a property that can never land.
+- NO speculative fix landed for the serve regression this round (mission §11: fix from the trace, not the hypothesis). The trace needed is: one denied set's full client journey (socket → init prop thread → getpeercon → string_to_security_class → class-node discovery → access write/read) captured with the mirror FIXED.
+
+Stage Summary:
+- origin/main 094b63c. Bootstrap-apexd-failed reboot ELIMINATED (62ms exit 0, guards green). The boot now reaches post-apexd late-init territory with NO core services spawned and the property wire serving 0 verdicts — the CheckMacPerms client path is the top suspect but needs honest traces.
+- NEXT (6-Z305p), in order:
+  1. REPAIR THE KLOG MIRROR (the run must BE the decode payload): find why the 6-Z305l KLOG-TIMELINE mirror stalls at ~221 lines / +1440ms (bounded queue? dropped wake-ups? per-line cap?) without creating a logging storm (§15/§16). Also make the dev-__kmsg__ evidence pull read the LIVE mirror, not a stale snapshot.
+  2. Re-run ladder; capture ONE denied property set end-to-end on the serve chain; fix the exact broken link generically; regression guards; repeat.
+  3. Watch for the queue-order mystery resolving with a working mirror (single vs second generation) before touching init-queue semantics.
+- Timing note: run 34041198120 wall ≈ 11.5 min with the fast-fail harness — the ~10-min cycle discipline holds.
