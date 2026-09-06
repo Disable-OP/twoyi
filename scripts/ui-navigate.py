@@ -1479,10 +1479,16 @@ def main():
     # ─────────────────────────────────────────────
     print()
     print("=" * 60)
-    print(f"  Step 4: Wait for ROM import (up to {import_wait_seconds}s)")
+    print(f"  Step 4: Wait for ROM import (up to {import_wait_seconds}s, wall-clock)")
     print("=" * 60)
-    for i in range(max(1, import_wait_seconds // 2)):
-        wait(2)
+    # 6-Z305n: WALL-CLOCK deadline. The old count-based loop (import_wait//2
+    # iterations of 2s + a 2-4s dump_ui each) turned a 300s budget into
+    # ~10+ wall minutes when the dialog never matched. 5s dump cadence is
+    # plenty for a progress dialog.
+    import_deadline = time.monotonic() + import_wait_seconds
+    i = 0
+    while time.monotonic() < import_deadline:
+        wait(5)
         xml = dump_ui(f"05_import_wait_{i}")
         root = parse_ui(xml)
         has_progress = False
@@ -1493,10 +1499,12 @@ def main():
                     has_progress = True
                     break
         if not has_progress:
-            print(f"  Import appears complete (no progress dialog at attempt {i})")
+            print(f"  Import appears complete (no progress dialog at attempt {i}, "
+                  f"{int(time.monotonic() - (import_deadline - import_wait_seconds))}s)")
             break
-        if i % 10 == 0:
+        if i % 2 == 0:
             print(f"  Still importing... (attempt {i})")
+        i += 1
 
     xml = dump_ui("05_import_done")
     root = parse_ui(xml)
@@ -1817,18 +1825,36 @@ def main():
     last_progress_at = 0
     stalled_at = 0
 
+    # ── 6-Z305n: WALL-CLOCK watch loop ──
+    # The old count-based loop (boot_wait//5 iterations, each carrying a
+    # ~2-3s screencap + ~1-3s dumpsys + 10s-bucket docker execs + gesture
+    # round-trips) turned a 240s watch into ~10+ wall minutes — the real
+    # reason run 34032839712 hit the 15-min job cap. Everything below is
+    # now deadline-driven with explicit cadence buckets:
+    #   screenshots 10s · stall signature 10s · layout check 30s ·
+    #   activity dump 30s · gestures 10s (recovery flows ONLY — a
+    #   full-Android .tar.gz boot has no TWRP gate to feed, and stray
+    #   guest input costs more than it can ever tell us).
+    feed_gestures = not rom_file.endswith(".tar.gz")
+    watch_t0 = time.monotonic()
+    watch_deadline = watch_t0 + boot_wait
+    next_shot = next_progress = next_layout = next_activity_at = next_gest = 0.0
+    shot_n = 0
     gesture_index = 0
-    for i in range(max(1, boot_wait // 5)):
-        wait(5)
-        elapsed = (i + 1) * 5
-        if elapsed % 10 == 0:
-            if aosp_layout_detected():
-                print(f"  [6-Z297] AOSP-layout recovery detected at {elapsed}s — "
-                      f"STOPPING gate gestures (menu must stay pristine for "
-                      f"ui-navigate-recovery-menu.py)")
-                aosp_bailed = True
-                break
-            # 6-Z305n stall sampling (10s cadence, aligned with gestures)
+    while time.monotonic() < watch_deadline:
+        wait(2)
+        now = time.monotonic()
+        elapsed = int(now - watch_t0)
+        if now >= next_progress:
+            next_progress = now + 10
+            if now >= next_layout:
+                next_layout = now + 30
+                if aosp_layout_detected():
+                    print(f"  [6-Z297] AOSP-layout recovery detected at {elapsed}s — "
+                          f"STOPPING gate gestures (menu must stay pristine for "
+                          f"ui-navigate-recovery-menu.py)")
+                    aosp_bailed = True
+                    break
             sig = guest_progress_signature()
             if sig != last_sig:
                 print(f"  [progress @ {elapsed}s] klog={sig[0]}B "
@@ -1855,23 +1881,25 @@ def main():
                 except Exception:
                     pass
                 break
+        if feed_gestures and not aosp_bailed and now >= next_gest:
+            next_gest = now + 10
             g = gesture_index % 4
             seq = gestures if elapsed <= 120 else gestures_safe
             input_cmd(seq[g])
             mode = "gate" if elapsed <= 120 else "safe"
             print(f"  feeding gesture {g}: {seq[g]} (at {elapsed}s, {mode})")
             gesture_index += 1
-            # One-off mid-cycle capture 1 s after the gesture so a
-            # transition (dialog → main menu) is caught even if the
-            # 5 s cadence would have missed a 0.5 s frame.
-            wait(1)
-            screenshot(f"07_boot_{elapsed}s_postg")
-        screenshot(f"07_boot_{elapsed}s")
-        activity = get_current_activity()
-        # Don't break on "left Render2Activity" — the TWRP screen might
-        # be visible even if the activity changed. Keep taking screenshots.
-        if "Render2Activity" not in activity and elapsed > 20:
-            print(f"  Note: not in Render2Activity at {elapsed}s: {activity}")
+        if now >= next_shot:
+            next_shot = now + 10
+            shot_n += 1
+            screenshot(f"07_boot_{(elapsed // 5) * 5}s")
+        if now >= next_activity_at:
+            next_activity_at = now + 30
+            activity = get_current_activity()
+            # Don't break on "left Render2Activity" — the TWRP screen might
+            # be visible even if the activity changed. Keep taking screenshots.
+            if "Render2Activity" not in activity and elapsed > 20:
+                print(f"  Note: not in Render2Activity at {elapsed}s: {activity}")
 
     if stalled_at:
         print(f"  [6-Z305n] boot watch ended EARLY on stall at {stalled_at}s "
