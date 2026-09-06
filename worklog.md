@@ -25619,3 +25619,24 @@ Stage Summary:
 - origin/main 63f84ab. The property wire should now be REAL end-to-end: guest clients reach the guest's own listener, ro.cold_boot_done lands in the GUEST area, init leaves wait_for_coldboot_done, and the queue proceeds into late-init → class_start core/main (expect the first servicemanager/logd/vold/keystore2/zygote exec + registration walls — the rung-4/5 territory predicted since 6-Z305m-2).
 - Known next-round watch items: (1) the prop THREAD is a clone — if it lands untraced its access-node serves miss and CheckMacPerms fails with a NOW-VISIBLE klog line ("SELinux permission check failed") — that failure mode is honest and decodable; (2) sendto-sockaddr translation (datagram logd clients) is deliberately deferred — connect() covers the boot-critical stream sockets; (3) liblog pmsg fallback may surface new harmless ENOENT noise.
 - Timing discipline holds: ~11-min ladder cycle; guards (TWRP angler + pbrp-ginkgo) unchanged.
+
+---
+Task ID: 6-Z305p-2 (decode of the 6-Z305p fix run) + 6-Z305r
+Agent: Z.ai Code (main dispatcher)
+Task: decode ladder run 34055447381 (63f84ab) — verify the connect fix live; find the next wall; minimal generic fix.
+
+Work Log:
+- LADDER 34055447381 + GUARDS ALL SUCCESS (~11-min cycle held). TWRP 3.7.0 angler + pbrp-4.0-ginkgo guards green — the connect rewrite caused zero recovery regression (AOSP-only gate held).
+- 6-Z305p FIX VERIFIED LIVE in the run evidence:
+  * Trace: "6-Z305q: connect(fd=16, guest \"/dev/socket/property_service\") sockaddr translated -> /data/user/0/io.twoyi.debug/rootfs/dev/socket/property_service".
+  * init's prop thread (pid 2659) VISIBLE and accepting (guest-threads.txt — the new thread-level ps artifact worked first try).
+  * property-values.txt (the new landed-vs-denied probe): ro.cold_boot_done present under u:object_r:cold_boot_done_prop:s0 in the GUEST area + ro.boottime.init.cold_boot_wait in boottime_prop (CheckAndResetWait ran).
+  * Guest klog: "start_waiting_for_property(\"ro.cold_boot_done\", \"true\"): already set" — the prop-wait completed instantly. THE PARK IS DEAD.
+- NEW WALL (further, still pre-late-init): SetMmapRndBits → "<3>init: Cannot open for reading: /proc/sys/vm/mmap_rnd_bits" → "<2>init: Unable to set adequate mmap entropy value!" → InitFatalReboot(signal 6) → "Reboot ending, jumping to kernel". Verdict: rung 3 + reboot post-mortem (progress: the boot now DIES LOUDLY at a later builtin instead of parking silently).
+- ROOT CAUSE: the 6-Z305i virtual sysctl store seeds missing backing files from the HOST's /proc/sys and REVERTS TO RAW HOST PASSTHROUGH when that read fails. The ubuntu-24.04-arm runner kernel exposes NO /proc/sys/vm/mmap_rnd_bits → raw passthrough ENOENT → init's ifstream fails → LOG(FATAL) (security.cpp SetHighestAvailableOptionValue: open-fail → false → FATAL). The store was correct for host kernels that HAVE the node; the arm runner does not.
+- FIX (ac3fd76, 6-Z305r): kr64 IS the guest's kernel substitute — when the host seed read fails for a node with a known arm64-Android default, the virtual store serves the REAL kernel default instead of reverting (vm/mmap_rnd_bits=24, vm/mmap_rnd_compat_bits=16 — the values real arm64 Android devices report; init's own SetHighestAvailableOptionValue probe loop then writes and verifies read-back honestly against the backing file). Nodes without a known default keep the honest raw-passthrough revert. Not a ROM hack — the kernel's own configuration, same discipline as the synthetic /proc/version. +1 test (765 green), fmt + clippy --all-targets clean. Guards re-dispatched (the sysctl arm is mode-shared).
+- Hygiene: credential-material handling hardened this round (transient askpass decode, zero plaintext in logs/commands; all temp credential files shredded after use).
+
+Stage Summary:
+- origin/main ac3fd76 (+ this worklog commit). Expected next run: SetMmapRndBits passes → SetKptrRestrict (host HAS kptr_restrict — seed path) → late-init → mount_all/fstab → class_start core (servicemanager, logd, vold, keystore2, hwservicemanager execs) → first honest servicemanager/zygote walls = rung 4/5 territory.
+- Watch items unchanged: prop-thread tracing (if a clone lands untraced, its access-node serves miss and CheckMacPerms fails with a NOW-VISIBLE klog line — decodable either way); sendto-sockaddr translation deliberately deferred; liblog pmsg fallback ENOENT noise is expected and harmless.
