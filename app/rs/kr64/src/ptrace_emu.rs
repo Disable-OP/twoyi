@@ -11870,6 +11870,14 @@ pub fn run_ptrace_loop(
     // still hold the arguments.
     let mut pending_entry_readlink: std::collections::HashMap<libc::pid_t, (u64, u64)> =
         std::collections::HashMap::new();
+    // 6-Z305f: pids with an in-flight unshare(CLONE_NEWNS) rewritten to
+    // getpid. The EXIT side must force ret=0 BEFORE the 6-Z147 prctl arm:
+    // both rewrites use getpid, and a STALE prctl_rewritten_args entry
+    // (the prctl EXIT stop interleaved with a signal) would otherwise
+    // emulated_prctl_ret() -1 over our success — exactly run 33999460337
+    // (fake fired, EXIT showed nr=172 getpid with ret=-1).
+    let mut z305f_unshare_pids: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
     // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
     // 0) — the EXIT arm turns the returned REAL fd into a tracked
@@ -16952,6 +16960,7 @@ pub fn run_ptrace_loop(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 set_syscall_num(&mut regs, &abi, abi.getpid);
                                 if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                    z305f_unshare_pids.insert(pid);
                                     if n < 20 {
                                         log(&format!(
                                             "6-Z305f: unshare(CLONE_NEWNS) pid={} faked success (mount ns already virtualized) [{} /20]",
@@ -22909,6 +22918,21 @@ pub fn run_ptrace_loop(
                     //     PR_SET_SECUREBITS...): 0 — the 6-Z147
                     //     fake-success that cured the abort storms.
                     // 6-Z153: NO counter gate — see the comment above.
+                    // ── 6-Z305f: unshare(CLONE_NEWNS) EXIT — force 0 ──
+                    // MUST run before the 6-Z147 prctl arm below: both
+                    // rewrites travel as getpid, and a stale prctl stash
+                    // would emulated_prctl_ret() -1 over the fake success.
+                    // At most ONE syscall is in flight per thread, so any
+                    // prctl_rewritten_args entry present at THIS stop is
+                    // stale by definition — drop it with our marker.
+                    if z305f_unshare_pids.remove(&pid) {
+                        prctl_rewritten_args.remove(&pid);
+                        let mut regs_u: Regs = unsafe { std::mem::zeroed() };
+                        if ptrace_getregs_wide(pid, &mut regs_u).is_ok() {
+                            set_syscall_ret(&mut regs_u, &abi, 0);
+                            let _ = ptrace_setregs(pid, &regs_u, iov_len);
+                        }
+                    }
                     if past_first_execve {
                         if let Some((prctl_option, prctl_arg2)) = prctl_rewritten_args.remove(&pid)
                         {
