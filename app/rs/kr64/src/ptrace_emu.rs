@@ -754,6 +754,11 @@ struct ChildAbi {
     //     of bug as the aarch64 mount=165 mislabel fixed in Task 5-T.)
     mkdirat: i64,
     unshare: i64,
+    // 6-Z305g: setns(fd, ns_type) — init's SetupMountNamespaces switches
+    // BACK to the bootstrap mount namespace via setns(CLONE_NEWNS) at the
+    // end; like unshare(CLONE_NEWNS) it needs CAP_SYS_ADMIN and must be
+    // faked on the virtualized-namespace container path.
+    setns: i64,
     // mknod(pathname, mode, dev) — TWRP init calls this for /dev/null,
     // /dev/zero, /dev/urandom etc. during early boot. As untrusted_app
     // it returns EPERM (no CAP_MKNOD), and init's fatal-config-error
@@ -1513,6 +1518,7 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // if a future x86_64 guest is ever supported.
     mkdirat: 258,
     unshare: 272,
+    setns: 308, // x86_64 setns
     // x86_64 mknod = 133 (per /usr/include/x86_64-linux-gnu/asm/
     // unistd_64.h, verified directly against the kernel's UAPI
     // header in Task 5-X). Pre-5-X this field was MISSING — added
@@ -1827,6 +1833,7 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // Both numbers are matched by the FIX A ENTRY translation arm.
     mkdirat: 296,
     unshare: 310,
+    setns: 346, // i386 setns
     // i386 mknod = 14 (per /usr/include/x86_64-linux-gnu/asm/
     // unistd_32.h: __NR_mknod 14, verified directly against the
     // kernel's UAPI header in Task 5-X). Pre-5-X this field was
@@ -2201,6 +2208,7 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     mkdir: -1,
     mkdirat: 34,
     unshare: 97,
+    setns: 267, // aarch64 setns
     // aarch64 mknod = -1 (SENTINEL "not present on this ABI"). The
     // asm-generic/unistd.h table (used by aarch64) has NO plain
     // `mknod` — only `mknodat = 33` (verified directly against
@@ -2496,6 +2504,7 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     mkdir: 39,
     mkdirat: 323,
     unshare: 337,
+    setns: 375, // arm32 setns
     mknod: 14,
     setxattr: 226,
     lsetxattr: 227,
@@ -16935,44 +16944,49 @@ pub fn run_ptrace_loop(
                             }
                         }
 
-                        // ── 6-Z305f: unshare(CLONE_NEWNS) → fake success ──
-                        // Pure-stock init's SetupMountNamespaces calls
-                        // unshare(CLONE_NEWNS); the real syscall requires
-                        // CAP_SYS_ADMIN and the guest runs with the app's
-                        // credentials → -EPERM →
-                        //   init: Cannot create mount namespace: Operation not permitted
-                        //   init: SetupMountNamespaces failed: Operation not permitted
-                        //   init: InitFatalReboot: signal 6
-                        // (run 33998490749). The mount namespace IS already
-                        // virtualized — every guest mount is a merged-rootfs
-                        // no-op (6-Z164 / 6-Z210 / 6-Z305e) — so an
-                        // unshared clone is honestly indistinguishable from
-                        // not unsharing. Rewrite to getpid (the prctl
-                        // precedent above): the positive return converts to
-                        // success in bionic. Only CLONE_NEWNS is faked;
-                        // other unshare flavors keep real semantics.
-                        if abi.unshare != -1 && syscall_num == abi.unshare {
-                            const CLONE_NEWNS_FLAG: u64 = 0x0002_0000;
-                            if get_syscall_arg(&regs, abi.reg_arg1) & CLONE_NEWNS_FLAG != 0 {
-                                static Z305F_UNSHARE_LOGGED: std::sync::atomic::AtomicU64 =
-                                    std::sync::atomic::AtomicU64::new(0);
-                                let n = Z305F_UNSHARE_LOGGED
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                set_syscall_num(&mut regs, &abi, abi.getpid);
-                                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
-                                    z305f_unshare_pids.insert(pid);
-                                    if n < 20 {
-                                        log(&format!(
-                                            "6-Z305f: unshare(CLONE_NEWNS) pid={} faked success (mount ns already virtualized) [{} /20]",
-                                            pid, n + 1
-                                        ));
-                                    }
-                                } else {
+                        // ── 6-Z305f/g: unshare/setns(CLONE_NEWNS) → fake
+                        // success ──
+                        // Pure-stock init's SetupMountNamespaces unshares
+                        // CLONE_NEWNS and at the end setns()es BACK to the
+                        // bootstrap mount namespace; both need CAP_SYS_ADMIN
+                        // and the guest runs with the app's credentials:
+                        //   init: Cannot create mount namespace: Operation not permitted   (unshare — 6-Z305f)
+                        //   init: Cannot switch back to bootstrap mount namespace: ... (setns — 6-Z305g)
+                        //   init: SetupMountNamespaces failed: ... → InitFatalReboot
+                        // (runs 33998490749 / 33999460337 / 34000443029). The
+                        // mount namespace IS already virtualized — every
+                        // guest mount is a merged-rootfs no-op (6-Z164 /
+                        // 6-Z210 / 6-Z305e) — so both calls are honestly
+                        // indistinguishable from no-ops. Rewrite to getpid
+                        // (the 6-Z147 prctl precedent): the positive return
+                        // converts to success in bionic. Only CLONE_NEWNS
+                        // flavors are faked; everything else keeps real
+                        // semantics.
+                        let z305f_is_ns_op = (abi.unshare != -1
+                            && syscall_num == abi.unshare
+                            && get_syscall_arg(&regs, abi.reg_arg1) & 0x0002_0000 != 0)
+                            || (abi.setns != -1
+                                && syscall_num == abi.setns
+                                && get_syscall_arg(&regs, abi.reg_arg2) & 0x0002_0000 != 0);
+                        if z305f_is_ns_op {
+                            static Z305F_UNSHARE_LOGGED: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let n = Z305F_UNSHARE_LOGGED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            set_syscall_num(&mut regs, &abi, abi.getpid);
+                            if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                z305f_unshare_pids.insert(pid);
+                                if n < 20 {
                                     log(&format!(
-                                        "6-Z305f: unshare->getpid rewrite FAILED for pid={} — the real EPERM will surface",
-                                        pid
+                                        "6-Z305f: unshare/setns(CLONE_NEWNS) pid={} nr={} faked success (mount ns already virtualized) [{} /20]",
+                                        pid, syscall_num, n + 1
                                     ));
                                 }
+                            } else {
+                                log(&format!(
+                                    "6-Z305f: ns-op->getpid rewrite FAILED for pid={} — the real EPERM will surface",
+                                    pid
+                                ));
                             }
                         }
                     }
