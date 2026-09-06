@@ -12685,6 +12685,9 @@ pub fn run_ptrace_loop(
     let mut z305h_recv_log: u64 = 0;
     let mut z305h_exit_dumped: bool = false;
     let mut z305h_exit127_count: u64 = 0;
+    // 6-Z305i: capped DIAG for the first non-init getpid pass-throughs
+    // (the InitAborter contract fix — see the pending_getpid EXIT arm).
+    let mut z305i_getpid_diag: u64 = 0;
 
     // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
     // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
@@ -18208,7 +18211,7 @@ pub fn run_ptrace_loop(
                                         ));
                                     }
                                 }
-                                let translated = match {
+                                let mut translated = match {
                                     // ── 6-Z103: ROM rc/fstab import
                                     // translation ──
                                     //
@@ -18250,6 +18253,66 @@ pub fn run_ptrace_loop(
                                     }
                                     None => translate_path_via_sandbox(&sandbox, rootfs, &path),
                                 };
+                                // ── 6-Z305i: virtual /proc/sys backing-file
+                                // preparation (see the translate_guest rule).
+                                // Write-intent → dirs + backing file exist.
+                                // Read-intent on a missing backing file →
+                                // seed ONCE from the host's real sysctl;
+                                // unreadable host value → revert to the raw
+                                // host passthrough (honest failure).
+                                let sysctl_prefix =
+                                    format!("{}/dev/.twoyi-sysctl/", rootfs.trim_end_matches('/'));
+                                if let Some(rel) = translated.strip_prefix(&sysctl_prefix) {
+                                    let sysctl_flags = if syscall_num == abi.open {
+                                        get_syscall_arg(&regs, abi.reg_arg2) as u32
+                                    } else if syscall_num == abi.openat {
+                                        get_syscall_arg(&regs, abi.reg_arg3) as u32
+                                    } else {
+                                        0
+                                    };
+                                    let write_intent = sysctl_flags & 0b11 != 0
+                                        || sysctl_flags & (libc::O_TRUNC as u32) != 0
+                                        || sysctl_flags & (libc::O_CREAT as u32) != 0;
+                                    let backing = std::path::Path::new(&translated);
+                                    if write_intent {
+                                        if let Some(parent) = backing.parent() {
+                                            if let Err(e) = std::fs::create_dir_all(parent) {
+                                                log(&format!(
+                                                    "6-Z305i: sysctl backing dir create FAILED for {}: {}",
+                                                    translated, e
+                                                ));
+                                            }
+                                        }
+                                        if !backing.exists() {
+                                            if let Err(e) = std::fs::write(&translated, b"") {
+                                                log(&format!(
+                                                    "6-Z305i: sysctl backing create FAILED for {}: {}",
+                                                    translated, e
+                                                ));
+                                            }
+                                        }
+                                    } else if !backing.exists() {
+                                        match std::fs::read_to_string(format!("/proc/sys/{}", rel))
+                                        {
+                                            Ok(seed) => {
+                                                if let Some(parent) = backing.parent() {
+                                                    let _ = std::fs::create_dir_all(parent);
+                                                }
+                                                if let Err(e) =
+                                                    std::fs::write(&translated, seed.as_bytes())
+                                                {
+                                                    log(&format!(
+                                                        "6-Z305i: sysctl seed write FAILED for {}: {}",
+                                                        translated, e
+                                                    ));
+                                                }
+                                            }
+                                            Err(_) => {
+                                                translated = path.clone();
+                                            }
+                                        }
+                                    }
+                                }
                                 // ── Task 6-U: KLOG fd tracking (ENTRY side) ──
                                 //
                                 // If this open()'s path (original OR
@@ -22761,7 +22824,7 @@ pub fn run_ptrace_loop(
                                     "DIAG WRITEV-SAMPLE #{} ret={} iovcnt={}:",
                                     n, ret, iovcnt
                                 );
-                                for k in 0..iovcnt.min(4) {
+                                for k in 0..iovcnt.min(6) {
                                     let b =
                                         read_child_u64(pid, iov_ptr.wrapping_add((k * 16) as u64));
                                     let l = read_child_u64(
@@ -23637,9 +23700,42 @@ pub fn run_ptrace_loop(
                             // ENTRY stop, which can only happen after
                             // the ENTRY stop that initialized `abi`.
 
-                            // Fake the getpid/getppid return value to 1
-                            // (the intended fake-PID-1 behaviour).
-                            set_syscall_ret(&mut regs2, &abi, 1);
+                            // 6-Z305i: the fake-PID-1 illusion is
+                            // INIT-ONLY now. AOSP init's InitAborter
+                            // (system/core init/util.cpp) keys on
+                            // `getpid() != 1`: "When init forks, it
+                            // continues to use this aborter for
+                            // LOG(FATAL), but we want children to
+                            // simply abort instead of trying to reboot
+                            // the system." Faking getpid()=1 for EVERY
+                            // guest made every child's LOG(FATAL) take
+                            // InitFatalReboot → the reboot machinery's
+                            // multi-second wait → "Reboot ending,
+                            // jumping to kernel" → __reboot EPERM →
+                            // abort() → _exit(127) — run 34005543435:
+                            // the vendor_init subcontext died exactly
+                            // that way (5 s nanosleep loop = the reboot
+                            // path's service-shutdown wait), EOF'd init
+                            // main's subcontext reply wait, and init
+                            // main quietly exited(0) right after. Init
+                            // (this anchor pid) still sees getpid()=1;
+                            // every other guest process now sees its
+                            // REAL host pid — what a real kernel
+                            // reports, what InitAborter expects, and
+                            // what makes raise()/tgkill-self work
+                            // natively (the 6-Z266 translation stays
+                            // for explicit "pid 1" arguments, which
+                            // only init can produce via its own fake).
+                            if pid == init_pid {
+                                set_syscall_ret(&mut regs2, &abi, 1);
+                            } else if z305i_getpid_diag < 3 {
+                                z305i_getpid_diag += 1;
+                                log(&format!(
+                                    "6-Z305i: non-init pid {} keeps its REAL getpid result (InitAborter contract — only the init anchor sees pid 1)",
+                                    pid
+                                ));
+                            }
+                            let _ = len;
                             let _ = ptrace_setregs(pid, &regs2, len);
                         }
                         pending_getpid.remove(&pid);
