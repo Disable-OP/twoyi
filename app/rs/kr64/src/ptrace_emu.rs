@@ -10399,20 +10399,41 @@ pub fn selinuxfs_class_node_parts<'a>(
     None
 }
 
+/// 6-Z305m: hard upper bound for every materialized perm VALUE.
+///
+/// libselinux stringrep.c `discover_class` aborts the WHOLE class
+/// discovery (`goto err4` → node freed → `string_to_security_class`
+/// returns 0 → "Unknown class …" → CheckMacPerms denies) the moment any
+/// `perms/<name>` file parses to `value == 0 || value > MAXVECTORS`
+/// where `#define MAXVECTORS 8*sizeof(access_vector_t)` — an av is a
+/// 32-bit mask, so the bound is 32. Run 34020890721 proved the failure
+/// mode live: readdir order hit the materialized `setcheckreqprot`
+/// (value 34 of the old 36-entry numbering) as the 6th perm read and the
+/// discovery aborted before `security_compute_av` was ever reached.
+/// A kernel class can never address more than 32 perms anyway, so the
+/// materialized set is capped at the first 32 names and out-of-set
+/// requested perms alias the last slot (32) — the collision only
+/// shadows `load_policy` inside the per-class discovery cache, which no
+/// boot-path caller needs.
+pub const TWOYI_SELINUX_MAX_PERM_VALUE: usize = 32;
+
 /// 6-Z305l: materialize the virtual selinuxfs class node backing
 /// `translated` (a path classified by [`selinuxfs_class_node_parts`]) so
 /// the guest's REAL open/opendir/read calls succeed natively:
 ///
 /// * `class/<c>/index`  → regular file containing the class number "1\n"
 ///   (created on demand; the number only has to be a non-zero `%hu`).
-/// * `class/<c>/perms/` → directory pre-populated with
-///   [`TWOYI_SELINUX_CLASS_PERMS`] (file `<name>` containing its 1-based
-///   index) — pre-populated because libselinux enumerates the directory
-///   BEFORE opening individual perm files.
+/// * `class/<c>/perms/` → directory pre-populated with the FIRST
+///   [`TWOYI_SELINUX_MAX_PERM_VALUE`] entries of [`TWOYI_SELINUX_CLASS_PERMS`]
+///   (file `<name>` containing its 1-based index, values 1..=32) —
+///   pre-populated because libselinux enumerates the directory BEFORE
+///   opening individual perm files. Values MUST stay ≤ 32: stringrep.c
+///   `discover_class` aborts the whole discovery on `value > MAXVECTORS`
+///   (6-Z305m; the old 36-entry numbering killed every property set).
 /// * `class/<c>/perms/<p>` → the perm file (created on demand for names
-///   outside the standard set; note a perm created after the guest's
-///   directory walk is invisible to that discovery round — the bounded
-///   DIAG on the call site names such misses).
+///   outside the standard set, aliased onto slot 32; note a perm created
+///   after the guest's directory walk is invisible to that discovery
+///   round — the bounded DIAG on the call site names such misses).
 ///
 /// Idempotent; I/O errors are swallowed (the guest sees the honest
 /// kernel error) and reported via the boolean return for the call-site
@@ -10433,7 +10454,14 @@ pub fn materialize_selinuxfs_class_node(class: &str, perm: Option<&str>, rootfs:
         }
         let perms_dir = format!("{}/perms", root);
         if std::fs::create_dir_all(&perms_dir).is_ok() {
-            for (i, p) in TWOYI_SELINUX_CLASS_PERMS.iter().enumerate() {
+            // 6-Z305m: values MUST stay within 1..=TWOYI_SELINUX_MAX_PERM_VALUE
+            // (32) — stringrep.c discover_class aborts on any larger value and
+            // that abort kills the WHOLE class ("Unknown class …").
+            for (i, p) in TWOYI_SELINUX_CLASS_PERMS
+                .iter()
+                .take(TWOYI_SELINUX_MAX_PERM_VALUE)
+                .enumerate()
+            {
                 let pp = format!("{}/{}", perms_dir, p);
                 if !std::path::Path::new(&pp).exists() {
                     let _ = std::fs::write(&pp, format!("{}\n", i + 1));
@@ -10442,7 +10470,9 @@ pub fn materialize_selinuxfs_class_node(class: &str, perm: Option<&str>, rootfs:
             if let Some(perm_name) = perm {
                 let pp = format!("{}/{}", perms_dir, perm_name);
                 if !std::path::Path::new(&pp).exists() {
-                    let _ = std::fs::write(&pp, format!("{}\n", TWOYI_SELINUX_CLASS_PERMS.len()));
+                    // Out-of-set names have no free av bit (all 32 are taken by
+                    // the capped standard set) — alias the last slot.
+                    let _ = std::fs::write(&pp, format!("{}\n", TWOYI_SELINUX_MAX_PERM_VALUE));
                 }
             }
         }
@@ -31551,6 +31581,72 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             None,
             &rootfs
         ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn selinuxfs_class_discovery_simulation_never_aborts_6z305m() {
+        // 6-Z305m regression lock for run 34020890721: libselinux
+        // stringrep.c discover_class walks <mnt>/class/<c>/perms/ and
+        // `goto err4` (whole-node abort → string_to_security_class == 0 →
+        // "Unknown class …" → every CheckMacPerms denies) the moment any
+        // perm file parses to value == 0 || value > MAXVECTORS (32, an
+        // access_vector_t bit count). The old 36-entry numbering put
+        // values 33..36 on disk and killed the property_service class the
+        // moment readdir reached one of them. Simulate the discovery walk
+        // over the REAL materialized tree — readdir order is arbitrary, so
+        // EVERY entry must satisfy the contract, and the perms the boot
+        // path asks for by name must survive the cap.
+        let tmp = std::env::temp_dir().join(format!("twoyi-seldisc-{}", std::process::id()));
+        let rootfs = tmp.to_string_lossy().to_string();
+        assert!(materialize_selinuxfs_class_node(
+            "property_service",
+            None,
+            &rootfs
+        ));
+        assert!(materialize_selinuxfs_class_node("process", None, &rootfs));
+
+        for class in ["property_service", "process"] {
+            let perms_dir = format!("{}/sys/fs/selinux/class/{}/perms", rootfs, class);
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(&perms_dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                // directory entries are skipped by stringrep.c (S_IFDIR);
+                // everything else must parse as a %u within 1..=32.
+                if path.is_dir() {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap();
+                let value: u32 = content.trim().parse().unwrap(); // sscanf("%u")
+                assert!(
+                    (1..=TWOYI_SELINUX_MAX_PERM_VALUE as u32).contains(&value),
+                    "perm file {:?} has value {} > {} — discover_class would abort the whole class (run 34020890721 wall)",
+                    path,
+                    value,
+                    TWOYI_SELINUX_MAX_PERM_VALUE
+                );
+                names.push(entry.file_name().to_string_lossy().to_string());
+            }
+            assert!(names.contains(&"set".to_string()));
+            assert!(names.contains(&"read".to_string()));
+        }
+
+        // out-of-set requested perms materialize aliased onto slot 32 —
+        // still within the abort bound.
+        assert!(materialize_selinuxfs_class_node(
+            "property_service",
+            Some("totally_custom_perm"),
+            &rootfs
+        ));
+        let custom = std::fs::read_to_string(format!(
+            "{}/sys/fs/selinux/class/property_service/perms/totally_custom_perm",
+            rootfs
+        ))
+        .unwrap();
+        let custom_value: u32 = custom.trim().parse().unwrap();
+        assert_eq!(custom_value, TWOYI_SELINUX_MAX_PERM_VALUE as u32);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

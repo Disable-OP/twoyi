@@ -25447,3 +25447,22 @@ Stage Summary:
   hack retirement + ro.boottime expansion are next in line).
 - Watch for: exec of servicemanager/zygote64 (staged-exec logs), the
   first real system_server wall, and GL SurfaceFlinger.
+---
+Task ID: 6-Z305m
+Agent: Z.ai Code (main dispatcher, cron Continue)
+Task: decode the 0fb6d2a Boot Ladder run 34020890721 — the property wire still denied every ro.* set; find and fix the true failure point inside the CheckMacPerms chain.
+
+Work Log:
+- Queue intervention (sandbox): the nightly corpus wave (530 queued workflow_dispatch runs on the OLD commit 018b4f2) blocked the ladder ~15h → cancelled the wave (re-dispatchable; 018b4f2's own guards already green in 6-Z305k); ladder + both guards on 0fb6d2a started immediately.
+- Run 34020890721 (0fb6d2a) decoded: rung 3 PROPERTY_SERVICE, guest ALIVE (init×2+ueventd, no reboot), but "Init cannot set '<prop>' … SELinux permission check failed" for EVERY ro.* set — the 6-Z305l fix did NOT reach the real failure point.
+- Full syscall-window decode (+218-220 ms, pid 2701): the virtual class nodes DO materialize and the discovery round RUNS (index open → read "1\n" → opendir perms → getdents64 ret=1144 → per-perm open/fstat/read/close…), but libselinux aborts after the 6TH perm read (contents 27,25,30,16,19,34) and writes "Unknown class property_service" (fd 2 write, 30 bytes, captured by DIAG).
+- ROOT CAUSE (AOSP-11 libselinux stringrep.c discover_class): `if (value == 0 || value > MAXVECTORS) goto err4` — `#define MAXVECTORS 8*sizeof(access_vector_t)` = 32 (an av is a 32-bit mask). The 6-Z305l materialization numbered the 36-name standard set 1..36; values 33..36 (setenforce/setcheckreqprot/quotamod/quotaget) are FATAL — any readdir hit frees the whole class node, string_to_security_class → 0, CheckMacPerms denies EVERY set. The trace's 6th read "34\n" (setcheckreqprot) is exactly the abort.
+- SECOND hole (same semantic unit, would be the NEXT wall): /sys/fs/selinux/access was served by the 6-Z305l write-capture/read-serve EXIT protocol but the on-disk node was never pre-created (lib.rs list: enforce/load/null/create/member only) — security_compute_av's open(O_RDWR) would ENOENT the moment class discovery succeeds (compute_av.c line 30-33 verified).
+- FIX (2 production points):
+  1. ptrace_emu.rs: materialize ONLY the first TWOYI_SELINUX_MAX_PERM_VALUE(=32) standard perm names (values 1..=32); out-of-set requested perms alias slot 32 (av bits are 32 — a class can never address more; collision only shadows load_policy, unused on the boot path).
+  2. lib.rs precreate_sysfs_stubs: touch("sys/fs/sel/access"→) sys/fs/selinux/access node.
+- Tests: new selinuxfs_class_discovery_simulation_never_aborts_6z305m (walks the REAL materialized perms/ dir like stringrep.c, asserts EVERY file parses within 1..=32 + "set"/"read" present + out-of-set alias value); precreate test now locks access/create/member. 761 tests green, fmt+clippy clean.
+- Expected next run: discovery completes → string_to_security_class("property_service")=1 → string_to_av_perm("set")=1 → access node open/write/read → synthesized "ffffffff ffffffff 0 0 1 0" verdict → CheckMacPerms ALLOWS → ro.* sets land → late-init resumes → init.${ro.zygote}.rc import → class_start core → servicemanager/vold/logd/keystore2 exec (rung 4).
+
+Stage Summary:
+- The last property-wire blocker is fixed at its true root (a 4-value off-by-bound in the synthetic selinuxfs, not the verdict protocol). Boot ladder: init execs real binaries, property wire served end-to-end, class discovery + access verdict now unblocked. NEXT (6-Z305n): decode the rung-4/5 transition — expect servicemanager/zygote spawns; candidate walls: zygote 32-bit secondary arch exec, /dev/socket service publishes, or the setexeccon path on spawned daemons. Recovery guards must stay green.
