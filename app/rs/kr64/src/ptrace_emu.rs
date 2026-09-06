@@ -2428,11 +2428,24 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     mprotect_nr: 226,
     ppoll_nr: 73,
     // 6-Z155 identity-syscall fakes (aarch64 asm-generic: setuid=146,
-    // setgid=144, setresuid=147, setresgid=148, setgroups=159).
+    // setgid=144, setresuid=147, setresgid=149, setgroups=159).
+    // 6-Z305k CORRECTION: setresgid was listed as 148 — 148 is
+    // getresgid in asm-generic/unistd.h (setresuid 147, getresuid 148,
+    // setresgid 149, getresgid 150). The wrong number meant the
+    // setresgid fake NEVER fired on arm64, so every guest setegid()
+    // (bionic implements it as setresgid(-1, gid, -1)) returned real
+    // -EPERM. On the pure-stock Android 11 boot (run 34014336281) that
+    // killed ueventd: devices.cpp MakeDevice's trailing
+    // `setegid(AID_ROOT)` is PLOG(FATAL) → coldboot handler subprocess
+    // aborts (_exit 127) → ColdBoot::WaitForSubProcesses LOG(FATAL) →
+    // ueventd exit 127 → init critical ×4 → InitFatalReboot. The
+    // setegid(gid) ERROR arm (devices.cpp:264, `goto out`) also skipped
+    // every mknod. Recovery stayed green only because TWRP's init hits
+    // the faked setresuid(147)/setgroups(159) pair first.
     setuid_nr: 146,
     setgid_nr: 144,
     setresuid_nr: 147,
-    setresgid_nr: 148,
+    setresgid_nr: 149,
     setgroups_nr: 159,
     getxattr_nr: 8,
     lgetxattr_nr: 9,
@@ -4317,8 +4330,25 @@ fn arm64_generic_syscall_name(nr: i64) -> &'static str {
         168 => "getcpu",
         169 => "gettimeofday",
         170 => "settimeofday",
-        174 => "gettid",
-        175 => "sysinfo",
+        // 6-Z305k corrections (asm-generic/unistd.h): 174 is getuid
+        // (NOT gettid — the old label made the run 34014336281 death
+        // window read "nr=174 [gettid]" for what was really getuid),
+        // 175 is geteuid (NOT sysinfo — 179). 172/173/176-179 added:
+        // the getpid/gettid pair dominates every bionic abort tail.
+        172 => "getpid",
+        173 => "getppid",
+        174 => "getuid",
+        175 => "geteuid",
+        176 => "getgid",
+        177 => "getegid",
+        178 => "gettid",
+        179 => "sysinfo",
+        // 6-Z305k: the res*id pair between the set*id family members
+        // (setresuid 147 / getresuid 148 / setresgid 149 / getresgid
+        // 150) — 148 shows up in trace tails next to the setresgid
+        // fake (setegid → setresgid(-1, gid, -1) sequencing).
+        148 => "getresuid",
+        150 => "getresgid",
         199 => "socketpair",
         202 => "accept",
         204 => "getsockname",
@@ -23309,8 +23339,24 @@ pub fn run_ptrace_loop(
                                 Some((nr, f)) if *nr == syscall_num => *f as i32,
                                 _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
                             };
-                            if let Some(path) = open_fd_paths.get(&fd) {
-                                if path.contains("attr/exec") {
+                            // 6-Z305k: look up the (pid, fd) pair FIRST. The
+                            // fd-only `open_fd_paths` map collides across
+                            // processes (fd tables are per-process, last
+                            // writer wins) — run 34014336281 spawned ueventd
+                            // five times; four setexeccon writes were
+                            // rescued by this fake, but one (pid 2817) read
+                            // a stale fd-only entry pointing elsewhere → the
+                            // fake missed → the raw host EINVAL surfaced →
+                            // init PLOG'd `cannot setexeccon('u:r:ueventd:s0')
+                            // for ueventd: Invalid argument` and _exit(127)'d
+                            // that spawn. `open_fd_owner_paths` is inserted
+                            // for every translated open EXIT and is keyed by
+                            // the owning pid, so it cannot alias.
+                            let attr_exec_path = open_fd_owner_paths
+                                .get(&(pid, fd))
+                                .or_else(|| open_fd_paths.get(&fd));
+                            match attr_exec_path {
+                                Some(path) if path.contains("attr/exec") => {
                                     let count = get_syscall_arg(&regs, abi.reg_arg3) as i64;
                                     let fake_ret = if count > 0 { count } else { 0 };
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
@@ -23332,6 +23378,35 @@ pub fn run_ptrace_loop(
                                             "DIAG attr/exec: ptrace_getregs FAILED: {}",
                                             e
                                         )),
+                                    }
+                                }
+                                _ => {
+                                    // 6-Z305k: the write failed but this fd's
+                                    // path is not tracked (or is not an attr/
+                                    // exec node) — the fake cannot fire and
+                                    // the raw errno reaches the guest. Log it
+                                    // (bounded) so the next miss is VISIBLE in
+                                    // the trace instead of surfacing only as
+                                    // an init `cannot setexeccon` PLOG.
+                                    static ATTR_EXEC_MISS_LOG: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if ATTR_EXEC_MISS_LOG
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        < 8
+                                    {
+                                        let tracked = open_fd_owner_paths
+                                            .get(&(pid, fd))
+                                            .or_else(|| open_fd_paths.get(&fd));
+                                        log(&format!(
+                                            "DIAG attr/exec: write() failed (ret {}) on pid {} fd {} with {} tracked path — setexeccon fake could not fire (6-Z305k)",
+                                            ret,
+                                            pid,
+                                            fd,
+                                            match tracked {
+                                                Some(p) => format!("non-exec {:?}", p),
+                                                None => String::from("NO"),
+                                            }
+                                        ));
                                     }
                                 }
                             }
@@ -30884,6 +30959,28 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
     }
 
     #[test]
+    fn arm64_generic_name_table_id_getters_6z305k() {
+        // 6-Z305k: the 6-Z180 generic-name table mislabelled the
+        // aarch64 id getters — 174 was "gettid" (really getuid) and
+        // 175 was "sysinfo" (really geteuid; sysinfo is 179). The
+        // wrong labels made the run 34014336281 death-window dump
+        // read "nr=174 [gettid]" for what was really getuid, costing
+        // decode time. Labels only — no behavioural change.
+        assert_eq!(arm64_generic_syscall_name(172), "getpid");
+        assert_eq!(arm64_generic_syscall_name(173), "getppid");
+        assert_eq!(arm64_generic_syscall_name(174), "getuid");
+        assert_eq!(arm64_generic_syscall_name(175), "geteuid");
+        assert_eq!(arm64_generic_syscall_name(176), "getgid");
+        assert_eq!(arm64_generic_syscall_name(177), "getegid");
+        assert_eq!(arm64_generic_syscall_name(178), "gettid");
+        assert_eq!(arm64_generic_syscall_name(179), "sysinfo");
+        // gettid must resolve through BOTH the direct entry and the
+        // syscall_name fingerprint gate (aarch64 ABI anchors).
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(syscall_name(178, &ABI_AARCH64), "gettid");
+    }
+
+    #[test]
     fn compute_exit_return_value_mknodat_returns_zero_6z154() {
         // 6-Z154: mknodat joins the fake-success set on every ABI that
         // has it (i386=297, x86_64=259, aarch64=33 — verified against
@@ -30920,7 +31017,16 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // rt_sigsuspend with no return. Numbers verified against the
         // kernel UAPI headers (asm-generic, unistd_32.h, unistd_64.h):
         //   setresuid: i386=208, x86_64=117, aarch64=147
-        //   setresgid: i386=210, x86_64=119, aarch64=148
+        //   setresgid: i386=210, x86_64=119, aarch64=149
+        //              (6-Z305k: the table originally carried aarch64
+        //              148 — that is getresgid; setresgid is 149,
+        //              sandwiched getresuid=148/setresgid=149 in
+        //              asm-generic/unistd.h. The wrong number made the
+        //              fake never fire on arm64 → every guest setegid
+        //              returned real -EPERM → ueventd's MakeDevice
+        //              `setegid(AID_ROOT)` PLOG(FATAL) killed the
+        //              coldboot subprocess → ueventd critical ×4 →
+        //              InitFatalReboot, run 34014336281.)
         //   setgroups: i386=81,  x86_64=116, aarch64=159
         //   setuid:    (no i386 user syscall), x86_64=105, aarch64=146
         //   setgid:    (no i386 user syscall), x86_64=106, aarch64=144
@@ -30944,12 +31050,19 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         #[cfg(target_arch = "aarch64")]
         {
             assert_eq!(compute_exit_return_value(147, &ABI_AARCH64), Some(0));
-            assert_eq!(compute_exit_return_value(148, &ABI_AARCH64), Some(0));
+            // 6-Z305k: 149 = setresgid (was wrongly 148 = getresgid).
+            assert_eq!(compute_exit_return_value(149, &ABI_AARCH64), Some(0));
             assert_eq!(compute_exit_return_value(159, &ABI_AARCH64), Some(0));
             assert_eq!(compute_exit_return_value(146, &ABI_AARCH64), Some(0));
             assert_eq!(compute_exit_return_value(144, &ABI_AARCH64), Some(0));
             assert_eq!(syscall_name(147, &ABI_AARCH64), "setresuid");
+            assert_eq!(syscall_name(149, &ABI_AARCH64), "setresgid");
             assert_eq!(syscall_name(146, &ABI_AARCH64), "setuid");
+            // 148 is getresgid — a GETTER must stay passthrough so the
+            // guest keeps reading its REAL supplementary-group state
+            // (faking it to 0 was an accidental side effect of the old
+            // mis-numbering; nothing on the boot path reads it).
+            assert_eq!(compute_exit_return_value(148, &ABI_AARCH64), None);
         }
         // No collision with neighbouring numbers: 147 on i386
         // (getgid32-era region) must stay unfaked; aarch64 146/144 only
