@@ -25002,3 +25002,76 @@ Stage Summary:
   vendor_init subcontext fork (clone/ns in the subcontext) and the reboot SIGSYS emulation semantics.
   Recovery regression guard: dispatch one TWRP + one OrangeFox run to confirm the bind/unshare gate
   changes are recovery-neutral.
+
+---
+Task ID: 6-Z305h
+Agent: Z.ai Code (cron Continue)
+Task: decode init main's quiet exit(0) after rc parsing — the subcontext-death cascade.
+
+Work Log (discovery):
+- Reconstructed sandbox: repo at 0ac3b61, evD.zip = run 34002339515 evidence. webDevReview cron
+  fired this session (trace_id web-cron-review-202609060912); cron tool refused list ("not
+  available for this request") — job 361787 was verified active last session and this session
+  IS its execution; no duplicate created.
+- FULL DECODE of the 12000-stop window (kr64-app-stderr):
+  * klog ladder: "init second stage started!" (+152ms) → SetupMountNamespaces done (+225ms) →
+    "Forked subcontext for 'u:r:vendor_init:s0'" (+226ms) → "Parsing file init.rc" (+228ms) →
+    "Added /init.environ.rc to import list" (+228ms, writev sample cap hit here).
+  * +297ms: pid 2713 openat(O_CLOEXEC)/fstat/lseek(0)/read×6/close (a ~6-24KB file) →
+    write(fd=30=kmsg, 30B) = "SELinux: Loaded file_contexts" → ppoll(1 fd, NULL timeout)
+    → BLOCKED 4.98s.
+  * pid 2714 (comm _system_bin_ini = /system/bin/init): nanosleep-loop ~15k stops over ~5s →
+    writev(42B klog, UNSAMPLED — cap starved) → getpid/gettid/getuid-family + rt_tgsigqueueinfo
+    (nr=240) → EVENT_EXIT exit code 127 (+5274ms).
+  * pid 2713: ppoll EXIT ret=1 (+5275) → recvfrom(fd=14, 4096, 0) ret=0 (EOF — aarch64 207 =
+    recvfrom, not recvmsg; the EOF = 2714's socket end closed at death) → ~140 more mprotect
+    flips → exit_group(0) (+5278). 6-Z97: "no traced child alive — genuine init exit".
+- Semantics nailed from exact AOSP-11 sources (googlesource reachable!):
+  * subcontext.cpp MainLoop = poll(ufd,1,-1) + ReadMessage(init_fd) — bionic poll() → ppoll on
+    aarch64; ReadMessage EOF (code 0) → quiet `return` → SubcontextMain → return 0 → exit_group(0)
+    with NO log line. THE QUIET-EXIT SHAPE IS SubcontextMain's, and init main was SYNC-BLOCKED on
+    the subcontext reply when the subcontext died.
+  * SecondStageMain has NO clean exit path (while(true)) — init main's exit(0) is container-induced.
+  * init service children _exit(127) on execv failure (kr64 6-Z66 knowledge) and kr64's own staged
+    exec failure path exits 127 ("FATAL: execve returned") — the subcontext's 127 + 5s nanosleep
+    retry loop points at the STAGED EXEC (6-Z102) path, but the exact guest code is unconfirmed.
+
+Hypothesis (to verify with 6-Z305h forensics):
+- The subcontext's staged exec of /system/bin/init (subcontext mode) failed after a ~5s retry
+  loop (nanosleep) → died 127 → EOF'd init main's TransmitMessage/ReadMessage wait → init main
+  then unwound to a container-induced exit(0) instead of Restart()-ing the subcontext. The R↔RW
+  mprotect flip storm (~7800×, one page) is the teardown/loop that runs on BOTH sides — identity
+  unknown; the addr-bracket PR_SET_VMA name + pc bracket will name it.
+
+Work Log (implementation — commit 553a5ca, diag(kr64) 6-Z305h):
+- ChildAbi: mprotect_nr + ppoll_nr sampler nrs (aarch64 226/73 LIVE-verified from the trace;
+  x86_64 10/271; 32-bit ABIs mprotect-only with ppoll -1 — never guessed).
+- guest_pc_of() (aarch64 pc / x86_64 rip), z305h_flip_milestone() milestones {2,64,512,2048,8192}.
+- Samplers (all capped, diagnostic-only): same-page mprotect flip deep lines (pc bracket + addr
+  bracket + 32B page-head via host /proc/pid/maps — PR_SET_VMA names show up in brackets);
+  in-window poll/ppoll 1-fd wait with HOST fd[0] readlink; recvfrom/recvmsg ENTRY stash + EXIT
+  EOF diagnosis (6-Z278 clobber-safe); 6-Z78 EVENT_EXIT forensics (cmdline/comm/pc/maps≤240/
+  fds≤48) for init_pid once + first 3 exit-127 children.
+- writev sampler 40 → 200 + in-window bypass (the 42-byte subcontext line was starved); window
+  budget 12000 → 40000 stops; flip pairs suppressed from per-stop win lines (budget back).
+- Local: fmt clean, clippy -D warnings clean, 745 tests green. CI kr64 lint+test PASS on 553a5ca
+  (run 34005528453).
+- Dispatched: Android Boot Ladder 34005543435 (553a5ca, diagnostic rung 0) + recovery regression
+  TWRP angler + orangefox-R12.0-lavender. NOTE: one extra orangefox dispatch went out with a
+  wrong corpus name (orangefox-R12.1_9-0-lavender — not in manifest.yaml) — it will fail at the
+  download step; harmless, superseded by the correct-name run.
+- Disk: 4.3GB twoyi-dl intermediates + 1.5GB stale evidence bundles removed (release assets are
+  canonical; ROOTFS_MANIFEST.json kept).
+
+Stage Summary:
+- origin/main 553a5ca. The quiet exit(0) is DECODED as a cascade: subcontext death (127, after a
+  5s nanosleep retry loop) EOFs init main's synchronous subcontext reply wait; init main then
+  exits cleanly instead of Restart(). Next decode (6-Z305h artifacts) must name: the flip page +
+  pc, the subcontext's 42-byte klog line, fd 14's identity, and both processes' maps/fds at
+  death → then the smallest generic fix (staged-exec subcontext semantics or the subcontext
+  socketpair/EOF contract).
+- Recovery guard: TWRP + OrangeFox runs dispatched on the same commit (bind/unshare gate
+  regression check).
+- NEXT: read 6-Z305h lines from run 34005543435 → identify the flip code + the subcontext death
+  cause → implement the generic fix → re-run (expect init.rc action execution to proceed past
+  the subcontext wall) → keep the recovery guard green.
