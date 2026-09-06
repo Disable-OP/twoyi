@@ -25193,3 +25193,64 @@ Stage Summary:
   this run's window (kr64-app-stderr lines ~12868-13060), extend
   apex_extract to full flattened-apex materialization (generic,
   zero-ROM-modification), re-run.
+
+---
+Task ID: 6-Z305j
+Agent: Z.ai Code (cron Continue)
+Task: decode the exec_start apexd-bootstrap failure; implement the smallest generic fix; regression + re-run.
+
+Work Log:
+- DECODE (run 34008640395 on a0a3f92, kmsg lines 165-173 + kr64-app-stderr
+  window): NOT an apexd-internal failure and NOT missing files. The wall is
+  init's Service::Start() → ComputeContextFromExecutable (service.cpp R),
+  failing for EVERY no-seclabel service:
+  * init.rc:59 'exec -- /system/bin/linkerconfig' → "Could not get file
+    context": getfilecon → getxattr(path) returned -ENOENT because the
+    getxattr PATH ARG was never translated — stat() of the same path
+    succeeded via the 6-Z206-translated stat family (guest_path=
+    /system/bin/linkerconfig → {rootfs}/system/bin/linkerconfig,
+    host_exists=true, ret 0), then the raw-path getxattr hit the redroid
+    host namespace → ENOENT; 6-Z156 only fakes -ENODATA/-EPERM.
+  * init.rc:72 'exec_start apexd-bootstrap' → "Could not get process
+    context": apexd's getfilecon got PAST only because redroid's OWN
+    /system/bin/apexd coincidentally exists on the host (ENODATA → 6-Z156
+    fake), then security_compute_create() failed (selinux_mnt NULL —
+    libselinux selinuxfs_exists() statfs f_type != SELINUX_MAGIC on the
+    regular-dir fake, and member never pre-created).
+  * Shutdown cascade proves universality: blank_screen + hwservicemanager
+    died with the SAME "Could not get process context". ueventd started
+    only because its service def carries seclabel.
+- FIX (commit bdb2e02, 752 tests green, fmt/clippy clean):
+  1. getxattr/lgetxattr ENTRY path-arg translation (mirrors the
+     access/readlink/chdir arms) → kernel ENODATA on rootfs files →
+     existing 6-Z156 fake supplies the label → getfilecon universal.
+  2. Virtual selinuxfs member protocol: pre-created
+     {rootfs}/sys/fs/selinux/member; write() EXIT captures the
+     security_compute_create request, read() EOF EXIT serves a
+     synthesized verdict (mycon TYPE field → twoyi_exec; guaranteed
+     distinct from mycon as init's "no domain transition" fatal demands).
+     Computed context only feeds socket labeling (non-fatal), but the
+     compute step itself must succeed for Start() to proceed.
+  3. statfs f_type := SELINUX_MAGIC (0xf97cff8c) on the two virtual
+     selinuxfs roots (EXIT-side buffer patch) → selinuxfs_exists() true →
+     selinux_mnt set.
+  4. arm32 xattr ABI numbers corrected to arch/arm/tools/syscall.tbl
+     (getxattr 385/386/387, setxattr 382/383/384 — previous values were
+     i386's; nr 229 on arm32 is tkill).
+- 6 new unit tests (member response synthesis incl. mls + rejection cases,
+  selinux-root matching, magic constant, per-arch ABI table).
+- DISPATCHED on bdb2e02: Boot Ladder + recovery guard regressions
+  (TWRP angler + OrangeFox R12 lavender) — the xattr-translation +
+  statfs-magic changes touch shared plumbing, guards are mandatory.
+
+Stage Summary:
+- origin/main bdb2e02 (+worklog). The SELinux exec-context chain
+  (getcon → getfilecon → security_compute_create) is now fully
+  container-virtualized; init should get past init.rc:59-72 into the
+  rest of early-init — where the REAL apexd --bootstrap semantics
+  (loop devices, /data/apex, bootstrap apex set) become the next
+  wall, with honest traces this time.
+- NEXT (6-Z305k): decode the new run; expect either advancement past
+  early-init or the first apexd-internal failure (its mount()/loop
+  path). Flattened-apex materialization stays the planned generic
+  remedy if apexd needs activated apexes.
