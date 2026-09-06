@@ -2900,6 +2900,44 @@ fn binary_contains_string(path: &str, needle: &str) -> bool {
 pub const AOSP_LD_PRELOAD_ENV: &str =
     "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so";
 
+/// 6-Z305s: the LD_LIBRARY_PATH chain carried by the guest init execve
+/// envp (Step-5 child env build). The SAME value must ride every guest
+/// execve envp that lacks it — AOSP init does NOT propagate its own
+/// environ to forked services (run 34058989419: linkerconfig/ueventd/
+/// apexd execs carried a 1-entry envp; stock init builds each service
+/// envp fresh from the rc `setenv` options only). Without it, the
+/// shlib's own DT_NEEDED `libdl.so` (version LIBC) resolves from
+/// `/system/lib64/libdl.so` — the 5848-byte bootstrap STUB — and the
+/// preload load fatals the service at spawn ("CANNOT LINK EXECUTABLE").
+/// `/dev` MUST stay first: it holds the 5-L extracted REAL libdl.so
+/// (and the staged hook libs).
+pub const AOSP_SERVICE_LD_LIBRARY_PATH: &str = "/dev:\
+         /apex/com.android.runtime/lib64/bionic:\
+         /apex/com.android.runtime/lib64:\
+         /apex/com.android.runtime/lib64/bootstrap:\
+         /apex/com.android.art/lib64:\
+         /apex/com.android.i18n/lib64:\
+         /system/lib64:\
+         /system/lib64/bootstrap:\
+         /vendor/lib64:\
+         /apex/com.android.os.statsd/lib64:\
+         /system_ext/lib64:\
+         /product/lib64";
+
+/// 6-Z305s: the LD_PRELOAD chain VALUE (no `LD_PRELOAD=` prefix) the
+/// tracer injects into guest execve envps that lack one — the same
+/// effective chain the init execve env carries (compat shim prepended
+/// when staged, 6-Z236). Pure so the tracer arm and the init env build
+/// share one source of truth.
+pub fn aosp_tracer_injected_ld_preload(compat_shim_staged: bool) -> String {
+    let base = AOSP_LD_PRELOAD_ENV.trim_start_matches("LD_PRELOAD=");
+    if compat_shim_staged {
+        format!("/dev/libbionic_compat.so:{}", base)
+    } else {
+        base.to_string()
+    }
+}
+
 #[cfg(test)]
 fn assert_aosp_preload_order() {
     // The FB hook must appear BEFORE the shlib so its open/ioctl
@@ -10340,19 +10378,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     //   falls through to the next LD_LIBRARY_PATH entry
                     //   (/apex/com.android.runtime/lib64/bionic = the
                     //   stub) — same behavior as before this fix.
-                    "LD_LIBRARY_PATH=\
-                /dev:\
-                /apex/com.android.runtime/lib64/bionic:\
-                /apex/com.android.runtime/lib64:\
-                /apex/com.android.runtime/lib64/bootstrap:\
-                /apex/com.android.art/lib64:\
-                /apex/com.android.i18n/lib64:\
-                /system/lib64:\
-                /system/lib64/bootstrap:\
-                /vendor/lib64:\
-                /apex/com.android.os.statsd/lib64:\
-                /system_ext/lib64:\
-                /product/lib64",
+                    //
+                    // 6-Z305s: the literal moved to
+                    // AOSP_SERVICE_LD_LIBRARY_PATH (shared with the
+                    // 6-Z305s tracer envp injection — one source of
+                    // truth, same value on every guest execve).
+                    format!("LD_LIBRARY_PATH={}", AOSP_SERVICE_LD_LIBRARY_PATH),
                 )
                 .unwrap(),
             ]
@@ -10526,6 +10557,26 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     safe_write_err(b" (cwd-relative fallbacks may miss)\n");
                 }
             }
+        }
+
+        // 6-Z305s-a: the virtual kernel's default umask. Linux starts
+        // PID 1 with umask 022 (the INIT_FS umask every real kernel
+        // hands its init), and every real Android device's linkerconfig
+        // output therefore lands 0644. The host APP process's umask
+        // (redroid runners: 000) was leaking into the guest process
+        // tree, so guest-created files landed 0666 — init's ReadFile
+        // refuses group/world-writable inputs ("Skipping insecure
+        // file") and the early-init linkerconfig wiring broke:
+        //   copy /linkerconfig/bootstrap/ld.config.txt
+        //        /linkerconfig/default/ld.config.txt   (init.rc:61)
+        // failed → no default linker config → the bionic fallback
+        // namespace has no /apex paths → every APEX-lib consumer
+        // (zygote: libnativeloader.so, lmkd: libstatssocket.so,
+        // mediaserver/audioserver: libandroidicu.so) died CANNOT LINK
+        // at spawn (run 34058989419). Mode bits only — uid stays the
+        // app uid (rootless unchanged).
+        unsafe {
+            libc::umask(0o022);
         }
 
         let _r = unsafe { libc::execve(init_cstr.as_ptr(), argv.as_ptr(), env_ptrs.as_ptr()) };
