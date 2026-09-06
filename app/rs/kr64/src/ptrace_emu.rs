@@ -2036,28 +2036,35 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     set_thread_area_nr: 243,
     socket_nr: 359,
     ioctl_nr: 54, // i386 ioctl
-    bind_nr: 360,
-    listen_nr: 362,
+    // 6-Z305l corrections — the direct i386 socket family was off by one
+    // from bind onward (verified /usr/include/x86_64-linux-gnu/asm/
+    // unistd_32.h: socket 359 / socketpair 360 / bind 361 / connect 362 /
+    // listen 363 / accept4 364 / getsockopt 365 / setsockopt 366 /
+    // getsockname 367 / getpeername 368 / sendto 369 / sendmsg 370 /
+    // recvfrom 371 / recvmsg 372 / shutdown 373). The runtime i386 guest
+    // multiplexes via socketcall 102 so the direct numbers never fired,
+    // but the SO_PEERSEC arm now GATES on getsockopt_nr and a wrong
+    // number would misfire on recv syscalls.
+    bind_nr: 361,
+    listen_nr: 363,
     sendto_nr: 369,
-    sendmsg_nr: -1,
-    recvfrom_nr: 370,
-    recvmsg_nr: -1,
-    shutdown_nr: 371,
-    setsockopt_nr: 372,
-    getsockopt_nr: 373,
+    sendmsg_nr: 370,
+    recvfrom_nr: 371,
+    recvmsg_nr: 372,
+    shutdown_nr: 373,
+    setsockopt_nr: 366,
+    getsockopt_nr: 365,
     close_nr: 6,
     fcntl_nr: 55,
-    // 6-Z110 + 6-Z184 fix (agent 14): i386 connect = 361 per the
-    // upstream i386 unistd table (socket 359 / bind 360 / connect 361 /
-    // listen 362 / accept 363). The previous value 363 was actually
-    // ACCEPT, inconsistent with our own listen_nr=362. writev = 146.
-    // The direct i386 connect number does NOT fire at runtime (bionic
-    // i386 normally multiplexes ALL socket ops through socketcall
-    // nr=102, subcall 3 = connect — handled by the dedicated i386
-    // socketcall subcall-3 arm). Locked in for ABI completeness + so
-    // the EXIT handler's `== abi.connect_nr` comparison is correct if a
-    // future i386 guest ever issues the direct nr=361.
-    connect_nr: 361,
+    // 6-Z305l: i386 connect = 362 (was 361 = bind). Same off-by-one
+    // batch as the socket family above. writev = 146. The direct i386
+    // connect number does NOT fire at runtime (bionic i386 normally
+    // multiplexes ALL socket ops through socketcall nr=102, subcall 3 =
+    // connect — handled by the dedicated i386 socketcall subcall-3 arm).
+    // Locked in for ABI completeness + so the EXIT handler's
+    // `== abi.connect_nr` comparison is correct if a future i386 guest
+    // ever issues the direct nr=362.
+    connect_nr: 362,
     writev_nr: 146,
     // 6-Z305h sampler numbers (asm/unistd_32.h): mprotect=125. ppoll is
     // left unsampled (-1): the direct i386 ppoll number is not
@@ -7188,6 +7195,10 @@ fn forget_dead_pid_state(
     z296_epoll_data: &mut std::collections::HashMap<(libc::pid_t, i64), u64>,
     z296_seen_headers: &mut std::collections::HashSet<(u64, u64, u64, u64, i64)>,
     z296_read_bufs: &mut std::collections::HashMap<libc::pid_t, (i64, u64)>,
+    // 6-Z305l: a stale SO_PEERSEC stash would let a pid-RECYCLED
+    // successor's first getsockopt EXIT consume the old (fd, optval,
+    // optlen) triple — POKEDATA into an unrelated process's memory.
+    pending_getpeersec: &mut std::collections::HashMap<libc::pid_t, (i32, u64, u64)>,
 ) {
     // 6-Z184 AUDIT FIX (agent 11): the death hygiene missed ~10 per-pid
     // maps — a pid-RECYCLED successor inherited stale state (e.g. a
@@ -7221,6 +7232,9 @@ fn forget_dead_pid_state(
     // consume a synthetic-uevent delivery with OLD buffers — POKEDATA
     // into an unrelated process's memory. Must go with the process.
     pending_uevent_recv.remove(&pid);
+    // 6-Z305l: same class — a stale (fd, optval, optlen) triple would
+    // be consumed by the recycled pid's first failing getsockopt.
+    pending_getpeersec.remove(&pid);
 }
 
 /// Task 6-Z111: drop the dead pid's property-area registrations. The
@@ -10243,7 +10257,9 @@ pub fn is_selinuxfs_root(translated: &str, rootfs: &str) -> bool {
 /// regular files; the write()/read() EXIT pair serves the identical
 /// request/response protocol on either.
 pub fn is_selinuxfs_transition_node(fd_path: &str) -> bool {
-    fd_path.ends_with("/sys/fs/selinux/create") || fd_path.ends_with("/sys/fs/selinux/member")
+    fd_path.ends_with("/sys/fs/selinux/create")
+        || fd_path.ends_with("/sys/fs/selinux/member")
+        || fd_path.ends_with("/sys/fs/selinux/access")
 }
 
 /// Synthesize the `security_compute_create` response for a captured
@@ -10273,6 +10289,166 @@ pub fn twoyi_selinux_member_response(request: &[u8]) -> Option<String> {
             .collect::<Vec<&str>>()
             .join(":"),
     )
+}
+
+/// 6-Z305l: synthesize the `security_compute_av` response for a captured
+/// `/sys/fs/selinux/access` request.
+///
+/// Protocol (libselinux compute_av.c, verified against the
+/// android-11 tree): the guest writes `"<scon> <tcon> <kclass> <kperm>"`
+/// and reads back a line that must sscanf-parse with
+/// `"%x %x %x %x %u %x"` into avd{allowed, decided, auditallow,
+/// auditdeny, seqno, flags} — at least FIVE fields (a five-field read
+/// leaves flags at 0). The container has no policy, so the verdict is
+/// unconditional allow: `allowed = decided = 0xffffffff`, zero audit
+/// fields, seqno 1. Callers AND the returned mask with their requested
+/// permission bit (`avd.allowed & av`), so allow-all satisfies every
+/// check — the same "the guest believes it is root" illusion the
+/// 6-Z155 identity fakes establish.
+pub fn twoyi_selinux_access_response() -> &'static str {
+    "ffffffff ffffffff 0 0 1 0\n"
+}
+
+/// 6-Z305l: the standard permission-name set materialized into EVERY
+/// virtual selinuxfs class `perms/` directory.
+///
+/// libselinux stringrep.c `discover_class_node` maps a class name to its
+/// kernel number by reading `<mnt>/class/<name>/index` (`sscanf("%hu")`)
+/// and a permission name to its bit by walking `<mnt>/class/<name>/perms/`
+/// (one file per perm, content parsed with `sscanf("%u")`). The container
+/// has no policy, so every class gets the same generic set — what matters
+/// is that the name the guest asks for EXISTS (string_to_av_perm returns 0
+/// otherwise and the caller denies) and is non-zero. The set covers every
+/// perm name the pure-stock Android 11 boot path has been observed or is
+/// expected to request (property_service/set is the proven one — run
+/// 34017509677's klog: "Do not have permissions to set 'ro.zygote' …
+/// SELinux permission check failed" for every ro.* boot default).
+pub const TWOYI_SELINUX_CLASS_PERMS: &[&str] = &[
+    "set",
+    "get",
+    "use",
+    "read",
+    "write",
+    "getattr",
+    "setattr",
+    "create",
+    "destroy",
+    "search",
+    "execute",
+    "entrypoint",
+    "transition",
+    "associate",
+    "mount",
+    "unmount",
+    "relabelfrom",
+    "relabelto",
+    "append",
+    "lock",
+    "ioctl",
+    "open",
+    "link",
+    "unlink",
+    "rename",
+    "connectto",
+    "send_msg",
+    "recv_msg",
+    "name_bind",
+    "name_connect",
+    "view",
+    "load_policy",
+    "setenforce",
+    "setcheckreqprot",
+    "quotamod",
+    "quotaget",
+];
+
+/// 6-Z305l: classify a TRANSLATED open path as a virtual selinuxfs class
+/// node. Returns `(class, Some(perm))` for `<root>/class/<class>/perms/
+/// <perm>` opens, `(class, None)` for the `<root>/class/<class>/index`
+/// file and the `<root>/class/<class>/perms` directory itself; `None`
+/// for everything else. Both virtual selinuxfs roots are matched
+/// (`{rootfs}/sys/fs/selinux` and the legacy `{rootfs}/selinux`).
+pub fn selinuxfs_class_node_parts<'a>(
+    translated: &'a str,
+    rootfs: &str,
+) -> Option<(&'a str, Option<&'a str>)> {
+    for root in [
+        format!("{}/sys/fs/selinux/class/", rootfs),
+        format!("{}/selinux/class/", rootfs),
+    ] {
+        if let Some(rest) = translated.strip_prefix(root.as_str()) {
+            // rest = "<class>[/index|/perms[/…]]"
+            let mut segs = rest.splitn(3, '/');
+            let class = segs.next()?;
+            if class.is_empty() {
+                return None;
+            }
+            return Some(match segs.next() {
+                Some("index") => (class, None),
+                Some("perms") => match segs.next() {
+                    Some(perm) if !perm.is_empty() => (class, Some(perm)),
+                    _ => (class, None),
+                },
+                // Any other subpath under the class dir: not a node we
+                // synthesize — let the caller treat it as a miss.
+                Some(_) => return None,
+                None => (class, None),
+            });
+        }
+    }
+    None
+}
+
+/// 6-Z305l: materialize the virtual selinuxfs class node backing
+/// `translated` (a path classified by [`selinuxfs_class_node_parts`]) so
+/// the guest's REAL open/opendir/read calls succeed natively:
+///
+/// * `class/<c>/index`  → regular file containing the class number "1\n"
+///   (created on demand; the number only has to be a non-zero `%hu`).
+/// * `class/<c>/perms/` → directory pre-populated with
+///   [`TWOYI_SELINUX_CLASS_PERMS`] (file `<name>` containing its 1-based
+///   index) — pre-populated because libselinux enumerates the directory
+///   BEFORE opening individual perm files.
+/// * `class/<c>/perms/<p>` → the perm file (created on demand for names
+///   outside the standard set; note a perm created after the guest's
+///   directory walk is invisible to that discovery round — the bounded
+///   DIAG on the call site names such misses).
+///
+/// Idempotent; I/O errors are swallowed (the guest sees the honest
+/// kernel error) and reported via the boolean return for the call-site
+/// DIAG.
+pub fn materialize_selinuxfs_class_node(class: &str, perm: Option<&str>, rootfs: &str) -> bool {
+    for root in [
+        format!("{}/sys/fs/selinux/class/{}", rootfs, class),
+        format!("{}/selinux/class/{}", rootfs, class),
+    ] {
+        // Only materialize under the root that the translated path
+        // actually used.
+        if std::fs::create_dir_all(&root).is_err() {
+            continue;
+        }
+        let index_path = format!("{}/index", root);
+        if !std::path::Path::new(&index_path).exists() {
+            let _ = std::fs::write(&index_path, "1\n");
+        }
+        let perms_dir = format!("{}/perms", root);
+        if std::fs::create_dir_all(&perms_dir).is_ok() {
+            for (i, p) in TWOYI_SELINUX_CLASS_PERMS.iter().enumerate() {
+                let pp = format!("{}/{}", perms_dir, p);
+                if !std::path::Path::new(&pp).exists() {
+                    let _ = std::fs::write(&pp, format!("{}\n", i + 1));
+                }
+            }
+            if let Some(perm_name) = perm {
+                let pp = format!("{}/{}", perms_dir, perm_name);
+                if !std::path::Path::new(&pp).exists() {
+                    let _ = std::fs::write(&pp, format!("{}\n", TWOYI_SELINUX_CLASS_PERMS.len()));
+                }
+            }
+        }
+        return true;
+    }
+    false
 }
 
 /// Write a NUL-terminated string `s` to the child's memory at `addr`,
@@ -12747,6 +12923,17 @@ pub fn run_ptrace_loop(
     // silent through the exact death (run 33991778662) which means the
     // failing syscall(s) took paths/no paths the gates never matched.
     let mut z305c_window_countdown: u32 = 0;
+    // 6-Z305l: virtual selinuxfs class dirs already materialized this
+    // boot (the guest re-opens class/<name>/index on every
+    // CheckMacPerms — without the cache every open would re-stat 36
+    // perm files on the hot property path).
+    let mut selinuxfs_materialized: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // 6-Z305l: pending SO_PEERSEC getsockopt per pid — (fd, optval ptr,
+    // optlen ptr) stashed at ENTRY (see the stash arm), consumed at the
+    // matching EXIT where the fake writes the synthesized peer context.
+    let mut pending_getpeersec: std::collections::HashMap<libc::pid_t, (i32, u64, u64)> =
+        std::collections::HashMap::new();
     // 6-Z167: how many /proc/<pid>/maps brackets we already dumped for the
     // 6-Z164 path-read-failure DIAG (first 3 — enough to name the region
     // class without flooding the log across TWRP's 10 service restarts).
@@ -13702,6 +13889,7 @@ pub fn run_ptrace_loop(
                 &mut z296_epoll_data,
                 &mut z296_seen_headers,
                 &mut z296_read_bufs,
+                &mut pending_getpeersec,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
@@ -13898,6 +14086,7 @@ pub fn run_ptrace_loop(
                 &mut z296_epoll_data,
                 &mut z296_seen_headers,
                 &mut z296_read_bufs,
+                &mut pending_getpeersec,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
@@ -15368,6 +15557,31 @@ pub fn run_ptrace_loop(
                                 pid,
                                 (syscall_num, get_syscall_arg(&regs, abi.reg_arg1) as i64),
                             );
+                        }
+                        // 6-Z305l: SO_PEERSEC getsockopt ENTRY stash —
+                        // getpeercon_raw (libselinux getpeercon.c:26) is
+                        // getsockopt(fd, SOL_SOCKET=1, SO_PEERSEC=31, buf,
+                        // &len). The pure-stock init property-service thread
+                        // calls it on EVERY set (SocketConnection::
+                        // GetSourceContext) and the HOST kernel answers
+                        // EOPNOTSUPP/ENOPROTOOPT without a peersec LSM →
+                        // "Unable to set property … getpeercon() failed" →
+                        // the set never lands. Args x2/x4/x5 are clobbered
+                        // at the aarch64 EXIT stop (6-Z278), so stash them
+                        // here. Only SO_PEERSEC queries are stashed (one
+                        // map slot per pid, consumed at the next EXIT).
+                        if abi.getsockopt_nr != -1 && syscall_num == abi.getsockopt_nr {
+                            let optname = get_syscall_arg(&regs, abi.reg_arg3);
+                            if optname == 31 {
+                                pending_getpeersec.insert(
+                                    pid,
+                                    (
+                                        get_syscall_arg(&regs, abi.reg_arg1) as i32,
+                                        get_syscall_arg(&regs, abi.reg_arg4),
+                                        get_syscall_arg(&regs, abi.reg_arg5),
+                                    ),
+                                );
+                            }
                         }
                         // 6-Z305c: stash readlink/readlinkat args the same
                         // way — x1 (path) and x2 (buf) are clobbered at the
@@ -18531,6 +18745,66 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                 }
+                                // ── 6-Z305l: virtual selinuxfs class-node
+                                // materialization ──
+                                //
+                                // libselinux string_to_security_class maps a
+                                // class NAME to its kernel number by reading
+                                // `<mnt>/class/<name>/index` and walking
+                                // `<mnt>/class/<name>/perms/` (stringrep.c
+                                // discover_class_node). The pure-stock Android
+                                // 11 property service does this on EVERY
+                                // CheckMacPerms (property_service.cpp:148 →
+                                // selinux_check_access("…", "property_service",
+                                // "set")) — and the container's selinuxfs root
+                                // is an empty pre-created directory tree, so
+                                // every lookup failed → EVERY ro.* property
+                                // set was denied ("Do not have permissions to
+                                // set 'ro.zygote' … SELinux permission check
+                                // failed", run 34017509677) → init.zygote64.rc
+                                // never imported → the boot idled forever on
+                                // wait_for_coldboot_done. Materialize the
+                                // index file + the standard perms directory
+                                // here, at the open ENTRY, so the guest's real
+                                // open/opendir/read calls succeed natively.
+                                if syscall_num == abi.open
+                                    || syscall_num == abi.openat
+                                    || syscall_num == abi.openat2
+                                {
+                                    if let Some((sel_class, sel_perm)) =
+                                        selinuxfs_class_node_parts(&translated, rootfs)
+                                    {
+                                        let cache_key = format!(
+                                            "{}/class/{}",
+                                            if translated.contains("/sys/fs/selinux/") {
+                                                "sys/fs/selinux"
+                                            } else {
+                                                "selinux"
+                                            },
+                                            sel_class
+                                        );
+                                        if selinuxfs_materialized.insert(cache_key) {
+                                            if materialize_selinuxfs_class_node(
+                                                sel_class, sel_perm, rootfs,
+                                            ) {
+                                                static SEL_CLASS_MAT_LOG:
+                                                    std::sync::atomic::AtomicU64 =
+                                                    std::sync::atomic::AtomicU64::new(0);
+                                                if SEL_CLASS_MAT_LOG.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                ) < 12
+                                                {
+                                                    log(&format!(
+                                                        "6-Z305l: materialized selinuxfs class node class={:?} perm={:?} (open {:?})",
+                                                        sel_class, sel_perm, translated
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // ── 6-Z272m (final): create-mode rewrite for
                                 // the new-format property-area files ──
                                 //
@@ -23065,6 +23339,83 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // 6-Z305l: KLOG TIMELINE — capture EVERY guest klog
+                    // line (writev of a "<N>…" KernelLogger line) into the
+                    // kr64 log with a high cap. The {rootfs}/dev/__kmsg__
+                    // mirror stopped absorbing writes at ~46 KB on run
+                    // 34017509677 and the WRITEV-SAMPLE cap (200) expired
+                    // at +591 ms — init's own narrative (every "processing
+                    // action", "starting service" and — critically — the
+                    // property-service thread's PLOG errors) went dark
+                    // exactly when the boot stopped dying and started
+                    // idling. KernelLogger emits one writev with ONE iov
+                    // holding the full "<prio>tags: msg\n" line.
+                    if past_first_execve && abi.writev_nr != -1 && syscall_num == abi.writev_nr {
+                        let tl_iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                        let tl_iovcnt = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                        if tl_iovcnt >= 1 {
+                            let tl_base = read_child_u64(pid, tl_iov_ptr);
+                            let tl_len = read_child_u64(pid, tl_iov_ptr.wrapping_add(8));
+                            if let (Some(tb), Some(tl)) = (tl_base, tl_len) {
+                                if tl > 0 && tl <= 4096 && tb != 0 {
+                                    let cl = (tl as usize).min(192);
+                                    if let Some(bytes) = read_child_bytes(pid, tb, cl) {
+                                        let txt = String::from_utf8_lossy(&bytes);
+                                        let is_klog = txt.starts_with('<')
+                                            && txt[1..]
+                                                .chars()
+                                                .next()
+                                                .map_or(false, |c| c.is_ascii_digit())
+                                            && txt[1..].contains('>');
+                                        if is_klog {
+                                            static KLOG_TIMELINE: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            if KLOG_TIMELINE
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                                < 8000
+                                            {
+                                                KLOG_TIMELINE.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                log(&format!(
+                                                    "6-Z305l KLOG-TIMELINE: {}",
+                                                    crate::cap_log_line(&txt, 192)
+                                                ));
+                                            }
+                                            // 6-Z305l: milestone window re-arm —
+                                            // the one-shot 40000-stop death window
+                                            // burns out in the busy early boot
+                                            // (+882 ms on the same run), long before
+                                            // the service-spawn region where every
+                                            // later wall lives. Refill a SHORT
+                                            // window on each klog milestone, capped
+                                            // at 12 refills/boot.
+                                            if z305c_window_countdown == 0
+                                                && (txt.contains("starting service")
+                                                    || txt.contains("processing action"))
+                                            {
+                                                static Z305L_REARM: std::sync::atomic::AtomicU64 =
+                                                    std::sync::atomic::AtomicU64::new(0);
+                                                if Z305L_REARM
+                                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                                    < 12
+                                                {
+                                                    Z305L_REARM.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    z305c_window_countdown = 1200;
+                                                    log("6-Z305l: death window re-armed on klog milestone (1200 stops)");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // 6-Z271r: WRITEV SAMPLE — the 6-Z271q logd-wire
                     // signature never matched (0 captures across three
                     // runs), so the assumed logger_entry shape is wrong.
@@ -23413,6 +23764,97 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // ── 6-Z305l: fake SO_PEERSEC getsockopt (EXIT) ──
+                    //
+                    // getpeercon_raw (libselinux getpeercon.c) is
+                    // getsockopt(fd, SOL_SOCKET=1, SO_PEERSEC=31, buf,
+                    // &len). The pure-stock Android 11 property-service
+                    // thread calls it for EVERY set (property_service.cpp
+                    // SocketConnection::GetSourceContext — a failure logs
+                    // "Unable to set property … getpeercon() failed" and
+                    // rejects the set). The host kernel answers EOPNOTSUPP
+                    // without a peersec LSM, so the failure is faked: write
+                    // the synthesized peer context into optval, store its
+                    // length through optlen, fake ret 0. The peer context
+                    // feeds CheckMacPerms → selinux_check_access → the
+                    // virtual access node (allow-all), so any well-formed
+                    // context passes — "u:r:twoyi_exec:s0" is the same
+                    // domain the 6-Z305j transition synthesis establishes.
+                    if abi.getsockopt_nr != -1 && syscall_num == abi.getsockopt_nr {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // Consume the stash on EVERY getsockopt EXIT — a
+                        // successful SO_PEERSEC leaves the entry stale, and a
+                        // later failing DIFFERENT sockopt (e.g. SO_ERROR,
+                        // 4-byte int buffer) must never consume it and get
+                        // an 18-byte context POKEDATA'd into its buffer.
+                        let peersec = pending_getpeersec.remove(&pid);
+                        if ret < 0 {
+                            if let Some((gfd, optval, optlen_ptr)) = peersec {
+                                const TWOYI_PEERSEC_CONTEXT: &str = "u:r:twoyi_exec:s0";
+                                if optval != 0 && optlen_ptr != 0 {
+                                    let need = TWOYI_PEERSEC_CONTEXT.len() + 1;
+                                    let have = read_child_u64(pid, optlen_ptr).unwrap_or(0);
+                                    if have as usize >= need
+                                        && write_child_string_unchecked(
+                                            pid,
+                                            optval,
+                                            TWOYI_PEERSEC_CONTEXT,
+                                        )
+                                        && write_child_u64s_unchecked(
+                                            pid,
+                                            optlen_ptr,
+                                            &[need as u64],
+                                        )
+                                    {
+                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                        match ptrace_getregs_wide(pid, &mut regs2) {
+                                            Ok(len) => {
+                                                set_syscall_ret(&mut regs2, &abi, 0);
+                                                match ptrace_setregs(pid, &regs2, len) {
+                                                    Ok(()) => {
+                                                        static PEERSEC_LOG:
+                                                            std::sync::atomic::AtomicU64 =
+                                                            std::sync::atomic::AtomicU64::new(0);
+                                                        if PEERSEC_LOG.fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        ) < 8
+                                                        {
+                                                            log(&format!(
+                                                                "6-Z305l: faked SO_PEERSEC getsockopt (pid {} fd {}, ret {} -> 0, context '{}') — getpeercon unblocked",
+                                                                pid, gfd, ret, TWOYI_PEERSEC_CONTEXT
+                                                            ));
+                                                        }
+                                                    }
+                                                    Err(e) => log(&format!(
+                                                        "6-Z305l: SO_PEERSEC setregs FAILED: {}",
+                                                        e
+                                                    )),
+                                                }
+                                            }
+                                            Err(e) => log(&format!(
+                                                "6-Z305l: SO_PEERSEC getregs FAILED: {}",
+                                                e
+                                            )),
+                                        }
+                                    } else {
+                                        static PEERSEC_SHORT_LOG: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        if PEERSEC_SHORT_LOG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            < 8
+                                        {
+                                            log(&format!(
+                                                "6-Z305l: SO_PEERSEC fake SKIPPED (pid {} fd {}, optlen buffer holds {} < {} needed, optval={:#x}) — guest keeps the honest errno",
+                                                pid, gfd, have, need, optval
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Task 6-V Part C — read(fd, buf, count) EXIT:
                     // capture the buffer contents and log them. Mirrors
                     // the 6-U write() diagnostic above. Gated to the
@@ -23445,49 +23887,67 @@ pub fn run_ptrace_loop(
                                 .or_else(|| open_fd_paths.get(&mfd));
                             if let Some(p) = mpath {
                                 if is_selinuxfs_transition_node(p) {
-                                    if let Some(req) = selinux_member_pending.remove(&(pid, mfd)) {
-                                        if let Some(resp) = twoyi_selinux_member_response(&req) {
-                                            let mbuf = get_syscall_arg(&regs, abi.reg_arg2);
-                                            if mbuf != 0
-                                                && write_child_string_unchecked(pid, mbuf, &resp)
-                                            {
-                                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                                match ptrace_getregs_wide(pid, &mut regs2) {
-                                                    Ok(len) => {
-                                                        set_syscall_ret(
-                                                            &mut regs2,
-                                                            &abi,
-                                                            resp.len() as i64,
-                                                        );
-                                                        match ptrace_setregs(pid, &regs2, len) {
-                                                            Ok(()) => {
-                                                                static MEMBER_RESP_LOG:
-                                                                    std::sync::atomic::AtomicU64 =
-                                                                    std::sync::atomic::AtomicU64::
-                                                                        new(0);
-                                                                if MEMBER_RESP_LOG.fetch_add(
-                                                                    1,
-                                                                    std::sync::atomic::Ordering::
-                                                                        Relaxed,
-                                                                ) < 8
-                                                                {
+                                    // 6-Z305l: the access node serves the
+                                    // allow-all av_decision line; member/create
+                                    // serve the transition context.
+                                    let is_access = p.ends_with("/sys/fs/selinux/access");
+                                    let resp_opt = if is_access {
+                                        Some(twoyi_selinux_access_response().to_string())
+                                    } else {
+                                        selinux_member_pending
+                                            .remove(&(pid, mfd))
+                                            .and_then(|req| twoyi_selinux_member_response(&req))
+                                    };
+                                    if let Some(resp) = resp_opt {
+                                        let mbuf = get_syscall_arg(&regs, abi.reg_arg2);
+                                        if mbuf != 0
+                                            && write_child_string_unchecked(pid, mbuf, &resp)
+                                        {
+                                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                            match ptrace_getregs_wide(pid, &mut regs2) {
+                                                Ok(len) => {
+                                                    set_syscall_ret(
+                                                        &mut regs2,
+                                                        &abi,
+                                                        resp.len() as i64,
+                                                    );
+                                                    match ptrace_setregs(pid, &regs2, len) {
+                                                        Ok(()) => {
+                                                            static MEMBER_RESP_LOG:
+                                                                std::sync::atomic::AtomicU64 =
+                                                                std::sync::atomic::AtomicU64::
+                                                                    new(0);
+                                                            if MEMBER_RESP_LOG.fetch_add(
+                                                                1,
+                                                                std::sync::atomic::Ordering::
+                                                                    Relaxed,
+                                                            ) < 8
+                                                            {
+                                                                if is_access {
+                                                                    log(&format!(
+                                                                        "6-Z305l: selinuxfs access verdict '{}' served (pid {} fd {}) — CheckMacPerms/security_compute_av unblocked",
+                                                                        resp.trim(),
+                                                                        pid,
+                                                                        mfd
+                                                                    ));
+                                                                } else {
                                                                     log(&format!(
                                                                         "6-Z305j: selinuxfs member response '{}' served (pid {} fd {}, ret 0 -> {}) — security_compute_create unblocked",
                                                                         resp, pid, mfd, resp.len()
                                                                     ));
                                                                 }
                                                             }
-                                                            Err(e) => log(&format!(
-                                                                "6-Z305j: member response setregs FAILED: {}",
-                                                                e
-                                                            )),
                                                         }
+                                                        Err(e) => log(&format!(
+                                                            "6-Z305j: member response setregs FAILED: {}",
+                                                            e
+                                                        )),
                                                     }
-                                                    Err(e) => log(&format!(
-                                                        "6-Z305j: member response getregs FAILED: {}",
-                                                        e
-                                                    )),
                                                 }
+                                                Err(e) => log(&format!(
+                                                    "6-Z305j: member response getregs FAILED: {}",
+                                                    e
+                                                )),
                                             }
                                         }
                                     }
@@ -30959,6 +31419,161 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
     }
 
     #[test]
+    fn selinuxfs_access_response_format_6z305l() {
+        // 6-Z305l: the access-node verdict must sscanf-parse with
+        // libselinux compute_av.c's "%x %x %x %x %u %x" — six fields,
+        // allowed+decided all-ones so `avd.allowed & av` passes for any
+        // requested permission bit.
+        let resp = twoyi_selinux_access_response();
+        let fields: Vec<&str> = resp.trim().split(' ').collect();
+        assert_eq!(fields.len(), 6);
+        assert_eq!(u32::from_str_radix(fields[0], 16).unwrap(), 0xffffffff);
+        assert_eq!(u32::from_str_radix(fields[1], 16).unwrap(), 0xffffffff);
+        assert_eq!(u32::from_str_radix(fields[2], 16).unwrap(), 0);
+        assert_eq!(u32::from_str_radix(fields[3], 16).unwrap(), 0);
+        assert_eq!(fields[4].parse::<u32>().unwrap(), 1);
+        assert_eq!(u32::from_str_radix(fields[5], 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn selinuxfs_transition_node_includes_access_6z305l() {
+        // The write-capture/read-serve pair keys on the fd path; the
+        // access node joins member/create.
+        assert!(is_selinuxfs_transition_node(
+            "/data/user/0/io.twoyi.debug/rootfs/sys/fs/selinux/access"
+        ));
+        assert!(is_selinuxfs_transition_node(
+            "/data/user/0/io.twoyi.debug/rootfs/sys/fs/selinux/member"
+        ));
+        assert!(is_selinuxfs_transition_node(
+            "/data/user/0/io.twoyi.debug/rootfs/sys/fs/selinux/create"
+        ));
+        assert!(!is_selinuxfs_transition_node(
+            "/data/user/0/io.twoyi.debug/rootfs/sys/fs/selinux/enforce"
+        ));
+    }
+
+    #[test]
+    fn selinuxfs_class_node_parts_6z305l() {
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        // class index open (the discovery entry point)
+        assert_eq!(
+            selinuxfs_class_node_parts(
+                &format!("{}/sys/fs/selinux/class/property_service/index", rootfs),
+                rootfs
+            ),
+            Some(("property_service", None))
+        );
+        // perms DIRECTORY open (libselinux opendir walk)
+        assert_eq!(
+            selinuxfs_class_node_parts(
+                &format!("{}/sys/fs/selinux/class/property_service/perms", rootfs),
+                rootfs
+            ),
+            Some(("property_service", None))
+        );
+        // individual perm file open
+        assert_eq!(
+            selinuxfs_class_node_parts(
+                &format!("{}/sys/fs/selinux/class/property_service/perms/set", rootfs),
+                rootfs
+            ),
+            Some(("property_service", Some("set")))
+        );
+        // legacy root (/selinux) also matched
+        assert_eq!(
+            selinuxfs_class_node_parts(&format!("{}/selinux/class/file/index", rootfs), rootfs),
+            Some(("file", None))
+        );
+        // deeper/unknown subpaths and non-class paths stay None
+        assert_eq!(
+            selinuxfs_class_node_parts(
+                &format!("{}/sys/fs/selinux/class/file/other/thing", rootfs),
+                rootfs
+            ),
+            None
+        );
+        assert_eq!(
+            selinuxfs_class_node_parts(&format!("{}/sys/fs/selinux/enforce", rootfs), rootfs),
+            None
+        );
+        assert_eq!(
+            selinuxfs_class_node_parts("/system/lib64/libc.so", rootfs),
+            None
+        );
+    }
+
+    #[test]
+    fn selinuxfs_class_perms_set_covers_property_service_6z305l() {
+        // The perm the property service asks for by name must exist in
+        // the materialized set, with a non-zero index (string_to_av_perm
+        // returns 0 = "unknown" otherwise and CheckMacPerms denies).
+        assert!(TWOYI_SELINUX_CLASS_PERMS.contains(&"set"));
+        assert!(TWOYI_SELINUX_CLASS_PERMS.contains(&"get"));
+        assert!(TWOYI_SELINUX_CLASS_PERMS.contains(&"read"));
+        assert!(TWOYI_SELINUX_CLASS_PERMS.contains(&"write"));
+        for (i, name) in TWOYI_SELINUX_CLASS_PERMS.iter().enumerate() {
+            assert!(!name.is_empty());
+            let index = i + 1; // materialized content is 1-based
+            assert!(index > 0);
+            assert!(u32::try_from(index).is_ok());
+        }
+    }
+
+    #[test]
+    fn materialize_selinuxfs_class_node_writes_files_6z305l() {
+        let tmp = std::env::temp_dir().join(format!("twoyi-selmat-{}", std::process::id()));
+        let rootfs = tmp.to_string_lossy().to_string();
+        let ok = materialize_selinuxfs_class_node("property_service", Some("set"), &rootfs);
+        assert!(ok);
+        let index = std::fs::read_to_string(format!(
+            "{}/sys/fs/selinux/class/property_service/index",
+            rootfs
+        ))
+        .unwrap();
+        assert_eq!(index.trim().parse::<u16>().unwrap(), 1);
+        // perms dir pre-populated with the standard set, contents numeric
+        let set_content = std::fs::read_to_string(format!(
+            "{}/sys/fs/selinux/class/property_service/perms/set",
+            rootfs
+        ))
+        .unwrap();
+        assert_eq!(set_content.trim().parse::<u32>().unwrap(), 1);
+        let getattr = std::fs::read_to_string(format!(
+            "{}/sys/fs/selinux/class/property_service/perms/getattr",
+            rootfs
+        ))
+        .unwrap();
+        assert!(getattr.trim().parse::<u32>().unwrap() >= 1);
+        // idempotent second call must not fail
+        assert!(materialize_selinuxfs_class_node(
+            "property_service",
+            None,
+            &rootfs
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn i386_socket_family_numbers_corrected_6z305l() {
+        // The direct i386 socket family was off by one from bind onward
+        // (the old getsockopt_nr=373 was RECVFROM — dangerous now that
+        // the SO_PEERSEC fake gates on getsockopt_nr). Verified against
+        // /usr/include/x86_64-linux-gnu/asm/unistd_32.h.
+        assert_eq!(ABI_X86_32.socket_nr, 359);
+        assert_eq!(ABI_X86_32.bind_nr, 361);
+        assert_eq!(ABI_X86_32.connect_nr, 362);
+        assert_eq!(ABI_X86_32.listen_nr, 363);
+        assert_eq!(ABI_X86_32.getsockopt_nr, 365);
+        assert_eq!(ABI_X86_32.setsockopt_nr, 366);
+        assert_eq!(ABI_X86_32.sendto_nr, 369);
+        assert_eq!(ABI_X86_32.sendmsg_nr, 370);
+        assert_eq!(ABI_X86_32.recvfrom_nr, 371);
+        assert_eq!(ABI_X86_32.recvmsg_nr, 372);
+        assert_eq!(ABI_X86_32.shutdown_nr, 373);
+    }
+
+    #[test]
     fn arm64_generic_name_table_id_getters_6z305k() {
         // 6-Z305k: the 6-Z180 generic-name table mislabelled the
         // aarch64 id getters — 174 was "gettid" (really getuid) and
@@ -33262,10 +33877,10 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert_eq!(ABI_X86_64.close_nr, 3);
         assert_eq!(ABI_X86_64.fcntl_nr, 72);
         assert_eq!(ABI_X86_32.socket_nr, 359);
-        assert_eq!(ABI_X86_32.bind_nr, 360);
-        assert_eq!(ABI_X86_32.recvfrom_nr, 370);
-        assert_eq!(ABI_X86_32.sendmsg_nr, -1); // socketcall 16 only
-        assert_eq!(ABI_X86_32.recvmsg_nr, -1); // socketcall 17 only
+        assert_eq!(ABI_X86_32.bind_nr, 361);
+        assert_eq!(ABI_X86_32.recvfrom_nr, 371);
+        assert_eq!(ABI_X86_32.sendmsg_nr, 370);
+        assert_eq!(ABI_X86_32.recvmsg_nr, 372);
         assert_eq!(ABI_X86_32.close_nr, 6);
         // ABI_AARCH64 only exists on aarch64 hosts (the const is
         // `#[cfg(target_arch = "aarch64")]` — same treatment as every
@@ -33478,11 +34093,12 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
 
     #[test]
     fn z110_connect_and_writev_numbers_match_uapi() {
-        // connect: i386 361 / x86_64 42 / aarch64 203 — verified per
-        // the upstream i386 unistd table (socket 359, bind 360,
-        // connect 361, listen 362, accept 363), asm/unistd_64.h,
-        // asm-generic/unistd.h.
-        assert_eq!(ABI_X86_32.connect_nr, 361, "i386 connect must be 361");
+        // connect: i386 362 / x86_64 42 / aarch64 203 — verified per the
+        // kernel UAPI headers (i386 unistd_32.h: socket 359, socketpair
+        // 360, bind 361, connect 362, listen 363, accept4 364 — the
+        // 6-Z305l correction fixed the off-by-one; asm/unistd_64.h,
+        // asm-generic/unistd.h unchanged).
+        assert_eq!(ABI_X86_32.connect_nr, 362, "i386 connect must be 362");
         assert_eq!(ABI_X86_64.connect_nr, 42, "x86_64 connect must be 42");
         // writev: i386 146 / x86_64 20 / aarch64 66.
         assert_eq!(ABI_X86_32.writev_nr, 146, "i386 writev must be 146");
@@ -33634,6 +34250,9 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             std::collections::HashSet::new();
         let mut pending_uevent_recv: std::collections::HashMap<libc::pid_t, PendingUeventRecv> =
             std::collections::HashMap::new();
+        // 6-Z305l: the SO_PEERSEC stash joins the death-hygiene contract.
+        let mut pending_getpeersec: std::collections::HashMap<libc::pid_t, (i32, u64, u64)> =
+            std::collections::HashMap::new();
         // 6-Z296: probe state maps for the cleanup-contract test.
         let mut z296_epoll_members: std::collections::HashMap<
             libc::pid_t,
@@ -33674,6 +34293,8 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         accept4_einval_streak.insert(pid, 3);
         esrch_streak.insert(pid, 2);
         pending_getpid.insert(pid);
+        // 6-Z305l: the SO_PEERSEC stash joins the death-hygiene contract.
+        pending_getpeersec.insert(pid, (5, 0x3000, 0x3100));
         fake_netlink_fds.entry(pid).or_default().insert(0x6b00_0000);
         netlink_fd_next.insert(pid, 0x6b00_0001);
         z296_epoll_members.entry(pid).or_default().insert(9);
@@ -33715,6 +34336,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             &mut z296_epoll_data,
             &mut z296_seen_headers,
             &mut z296_read_bufs,
+            &mut pending_getpeersec,
         );
         // All four maps no longer have the pid entry — pid-RECYCLED
         // successor inherits NOTHING.
@@ -33744,6 +34366,8 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // process (a stale entry would POKEDATA the recycled pid's
         // first EXIT with the OLD process's buffers).
         assert!(!pending_uevent_recv.contains_key(&pid));
+        // 6-Z305l: the SO_PEERSEC stash must die with the process too.
+        assert!(!pending_getpeersec.contains_key(&pid));
 
         // Tracked fds are structurally below every synthetic fake-fd
         // base — locks the disjoint-fd-set invariant the EXIT arm's
@@ -33838,12 +34462,13 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert_eq!(ABI_X86_64.bind_nr, 49);
         assert_eq!(ABI_X86_64.listen_nr, 50);
         assert_eq!(ABI_X86_64.socketcall_nr, -1);
-        // i386: socket=359 bind=360 listen=362 + socketcall 102
-        // (the direct arm is GATED OUT — bionic multiplexes via nr=102,
-        // the 6-Z96c subcall-2 territory).
+        // i386: socket=359 bind=361 listen=363 + socketcall 102
+        // (6-Z305l header-verified correction; the direct arm is GATED
+        // OUT — bionic multiplexes via nr=102, the 6-Z96c subcall-2
+        // territory).
         assert_eq!(ABI_X86_32.socket_nr, 359);
-        assert_eq!(ABI_X86_32.bind_nr, 360);
-        assert_eq!(ABI_X86_32.listen_nr, 362);
+        assert_eq!(ABI_X86_32.bind_nr, 361);
+        assert_eq!(ABI_X86_32.listen_nr, 363);
         assert_eq!(ABI_X86_32.socketcall_nr, 102);
         // aarch64: cfg-gated (the const is #[cfg(target_arch =
         // "aarch64")]).
@@ -33858,8 +34483,8 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert_eq!(netlink_op_for(49, &ABI_X86_64), Some(NetlinkOp::Bind));
         assert_eq!(netlink_op_for(50, &ABI_X86_64), Some(NetlinkOp::Listen));
         assert_eq!(netlink_op_for(359, &ABI_X86_32), Some(NetlinkOp::Socket));
-        assert_eq!(netlink_op_for(360, &ABI_X86_32), Some(NetlinkOp::Bind));
-        assert_eq!(netlink_op_for(362, &ABI_X86_32), Some(NetlinkOp::Listen));
+        assert_eq!(netlink_op_for(361, &ABI_X86_32), Some(NetlinkOp::Bind));
+        assert_eq!(netlink_op_for(363, &ABI_X86_32), Some(NetlinkOp::Listen));
     }
 
     #[test]
@@ -33870,10 +34495,10 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert_eq!(syscall_name(41, &ABI_X86_64), "socket");
         assert_eq!(syscall_name(49, &ABI_X86_64), "bind");
         assert_eq!(syscall_name(50, &ABI_X86_64), "listen");
-        // i386 numbers.
+        // i386 numbers (6-Z305l header-verified correction).
         assert_eq!(syscall_name(359, &ABI_X86_32), "socket");
-        assert_eq!(syscall_name(360, &ABI_X86_32), "bind");
-        assert_eq!(syscall_name(362, &ABI_X86_32), "listen");
+        assert_eq!(syscall_name(361, &ABI_X86_32), "bind");
+        assert_eq!(syscall_name(363, &ABI_X86_32), "listen");
     }
 
     // ── Task 6-Z102: generic executable staging guards ─────────────
