@@ -25390,3 +25390,60 @@ Stage Summary:
 - Dispatched on 06046b4: Boot Ladder + TWRP angler + OrangeFox lavender
   guards (getpid-family + attr/exec semantic changes are shared
   plumbing — recovery must stay green).
+
+---
+Task ID: 6-Z305l
+Agent: Z.ai Code (main dispatcher, cron Continue)
+Task: decode the post-ueventd idle (init main ep_poll 600s, no core services); the real property wire end-to-end.
+
+Work Log:
+- Run 34017509677 (018b4f2) VERDICT: rung 3 but a NEW shape — no
+  InitFatalReboot; guest_processes at capture = init ×2 + ueventd
+  ALIVE; ps WCHAN: init main ep_poll, subcontext poll, ueventd poll.
+  UEVENTD WALL CONFIRMED FALLEN: "ueventd: Coldboot took 0.011 seconds"
+  (the 6-Z305k setresgid fix verified; TWRP + OrangeFox guards GREEN).
+- NEW WALL DECODED: AOSP-11 init main loop sets epoll_timeout=nullopt
+  (INFINITE) while prop_waiter_state.MightBeWaiting() — the ONLY wake
+  is PropertyChanged→CheckAndResetWait, which fires ONLY for sets
+  processed by init's OWN property service. Every path to
+  ro.coldboot.done=true was denied upstream of that point:
+  1. In-process sets (ro.zygote/ro.hardware boot defaults) →
+     CheckMacPerms → selinux_check_access → string_to_security_class
+     reads <mnt>/class/<name>/index + walks <mnt>/class/<name>/perms/
+     (libselinux stringrep.c verified) — the container selinuxfs root
+     was EMPTY → "SELinux permission check failed" for EVERY ro.* set
+     → init.zygote64.rc import never expanded.
+  2. security_compute_av → <mnt>/access node absent.
+  3. ueventd's socket set reached init's REAL socket (6-Z163; connect
+     ret=0 real, sendto 128 real — no 6-Z110 fake fired) but died at
+     SocketConnection::GetSourceContext → getpeercon_raw =
+     getsockopt(SO_PEERSEC=31) → host EOPNOTSUPP → "getpeercon()
+     failed" → no reply (client ppoll NULL-timeout forever).
+- FIX (commit 58dafe7, 760 tests green, fmt/clippy clean):
+  1. Virtual selinuxfs class nodes: open-ENTRY materialization of
+     class/<name>/index + class/<name>/perms/{36-name standard set}
+     (HashSet-cached; libselinux sscanf formats verified).
+  2. access node joins the 6-Z305j write-capture/read-serve family;
+     synthesized verdict "ffffffff ffffffff 0 0 1 0" (allow-all).
+  3. SO_PEERSEC getsockopt fake (ENTRY stash x2/x4/x5 + EXIT write of
+     "u:r:twoyi_exec:s0" + optlen + ret 0; stash consumed on EVERY
+     getsockopt EXIT so it can never alias a different failing sockopt;
+     death-hygiene contract extended).
+- INSTRUMENTS: 6-Z305l KLOG-TIMELINE (every guest klog line → kr64 log,
+  cap 8000; the __kmsg__ mirror stalled at ~46 KB and the 200-sample
+  WRITEV cap went dark at +591 ms) + milestone window re-arm (1200
+  stops on "starting service"/"processing action", max 12/boot).
+- i386 direct-socket table corrected (off-by-one from bind onward —
+  verified unistd_32.h; getsockopt_nr was 373 = recvfrom, dangerous
+  once SO_PEERSEC gates on it). 4 test locks updated.
+- Dispatched on 58dafe7: Boot Ladder + TWRP angler + OrangeFox guards.
+
+Stage Summary:
+- The property wire is now REAL end-to-end: guest sets → init's real
+  socket → getpeercon (faked) → CheckMacPerms (virtual class/access
+  nodes, allow-all) → PropertySet → PropertyChanged →
+  QueuePropertyChange + CheckAndResetWait → late-init chain resumes →
+  class_start core → zygote wall (the queued apexd.status build.prop
+  hack retirement + ro.boottime expansion are next in line).
+- Watch for: exec of servicemanager/zygote64 (staged-exec logs), the
+  first real system_server wall, and GL SurfaceFlinger.
