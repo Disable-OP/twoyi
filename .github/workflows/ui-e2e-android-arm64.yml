@@ -30,6 +30,16 @@
 # harness itself worked; the boot verdict is the reported rung —
 # BOOT_COMPLETED fires ONLY on a REAL sys.boot_completed=1 property
 # write observed on the emulated property wire (never synthesized).
+#
+# FAST-FAIL (6-Z305n, user directive: full test cycle ≤ ~10 min):
+# the boot watch is STALL-ADAPTIVE — ui-navigate.py samples the guest
+# (kr64 klog size + guest-process count, docker-exec side) every 10s
+# and ends the watch as soon as BOTH freeze for stall_seconds (default
+# 90s, 60s startup grace). A stalled guest therefore fails in minutes
+# with a full decode payload instead of burning the whole watch. The
+# defaults below cap the ladder job at 15 min hard; a genuinely
+# progressing boot is never cut early (any klog growth resets the
+# stall budget) and every knob stays overridable via workflow inputs.
 ---
 name: Android Boot Ladder (ARM64 via redroid on ubuntu-24.04-arm)
 
@@ -37,13 +47,17 @@ name: Android Boot Ladder (ARM64 via redroid on ubuntu-24.04-arm)
   workflow_dispatch:
     inputs:
       boot_wait_seconds:
-        description: 'How long to watch the container after launching it (seconds). Android needs minutes — default 600'
+        description: 'HARD CAP on the boot watch (seconds). Stall-adaptive: exits early once the guest freezes for stall_seconds — default 240 keeps the whole cycle ≈10 min'
         required: false
-        default: '600'
+        default: '240'
+      stall_seconds:
+        description: 'FAST-FAIL: end the boot watch after this many seconds with NO guest progress (klog+procs frozen; 60s grace). Default 90; 0 disables fast-fail'
+        required: false
+        default: '90'
       import_wait_seconds:
-        description: 'Budget for the rootfs import (494MB tar.gz → ~1.7GB tree). Default 1200s'
+        description: 'Budget for the rootfs import (494MB tar.gz → ~1.7GB tree). Default 300s (import self-terminates early when the progress dialog clears)'
         required: false
-        default: '1200'
+        default: '300'
       redroid_tag:
         description: 'redroid Docker image tag (arm64) — the HOST android inside which twoyi runs'
         required: false
@@ -88,7 +102,7 @@ jobs:
   build-apk:
     name: Build arm64-v8a APK (x86_64 runner)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -164,7 +178,7 @@ jobs:
     name: Android 11 boot ladder E2E (arm64 runner)
     needs: build-apk
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 75
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -268,7 +282,7 @@ jobs:
               androidboot.redroid_width=720 androidboot.redroid_height=1600 \
               androidboot.redroid_dpi=$REDROID_DPI
           sudo docker logs -f redroid > /tmp/ui-e2e-artifacts/redroid.log 2>&1 &
-          BOOT_TIMEOUT=180
+          BOOT_TIMEOUT=120
           WAITED=0
           while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
               adb connect localhost:5555 >/dev/null 2>&1 || true
@@ -302,8 +316,9 @@ jobs:
 
       - name: UI navigation — import rootfs + boot Android
         env:
-          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '600' }}
-          TWOYI_IMPORT_WAIT_SECONDS: ${{ github.event.inputs.import_wait_seconds || '1200' }}
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '240' }}
+          TWOYI_STALL_SECONDS: ${{ github.event.inputs.stall_seconds || '90' }}
+          TWOYI_IMPORT_WAIT_SECONDS: ${{ github.event.inputs.import_wait_seconds || '300' }}
           TWOYI_ROM_FILE: rootfs.tar.gz
           ADB_SERIAL: localhost:5555
         run: |
