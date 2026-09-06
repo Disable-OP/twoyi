@@ -10760,6 +10760,68 @@ fn connect_translate_target(blob: &[u8], rootfs: &str) -> Option<(String, String
     Some((guest_path.to_string(), host_path, new_sa))
 }
 
+/// 6-Z305s: PURE decision core for the execve envp LD injection — which
+/// of the two virtual-kernel variables the incoming envp is missing.
+///
+/// # Root cause (run 34058989419 decode — the binder-fleet wall)
+///
+/// AOSP init does NOT propagate its own environ to forked services: it
+/// builds each service's execve envp FRESH from the rc `setenv` options
+/// (+ a couple of built-ins). The run's 6-Z238 scans prove it —
+/// linkerconfig/ueventd/apexd all exec'd with a 1-entry envp, init's
+/// own second-stage re-exec with a 2-entry envp — so the LD_PRELOAD /
+/// LD_LIBRARY_PATH chain kr64 put on the INIT exec never reaches ANY
+/// service. Consequences, verbatim from the run's LOGFATAL captures:
+///   * `Binder driver '/dev/binder' could not be opened.  Terminating.`
+///     (ProcessState) × the whole core fleet — no shlib → raw
+///     open(2) on the proxy-socket FILE → ENXIO → fleet death at ~105s
+///     → InitFatalReboot (the hwservicemanager ×4 critical wall);
+///   * the services that DID link would have failed their preload load
+///     anyway: the shlib's DT_NEEDED `libdl.so` (version LIBC) must
+///     resolve from `/dev/libdl.so` (the 5-L extracted REAL libdl) —
+///     a service without LD_LIBRARY_PATH finds only the 5848-byte
+///     bootstrap stub in `/system/lib64`.
+///
+/// The shlib IS the guest's binder-driver client (the in-process side
+/// of the virtual kernel's binder implementation, binder.rs wire
+/// protocol) — delivering it to every guest process is the virtual
+/// kernel providing its driver, the same discipline as the synthetic
+/// /proc/version and the 6-Z305r sysctl defaults. NOT a ROM hack: no
+/// ROM-name logic, no per-service patching, honest guest-provided
+/// values always win (we never override an envp that already carries
+/// LD_PRELOAD).
+///
+/// Returns `(inject_preload, inject_ldlib)` for an envp already scanned
+/// for the two keys. Both missing (the common service case) → both
+/// injected, mirroring the init execve env exactly.
+fn z305s_inject_decision(has_preload: bool, has_ldlib: bool) -> (bool, bool) {
+    (!has_preload, !has_ldlib)
+}
+
+/// 6-Z305s: PURE builder for the injected envp pointer array (64-bit
+/// ABIs only — aarch64 execve=221, x86_64 execve=59; the execve==11
+/// class keeps its proven recovery chains untouched).
+///
+/// The array mirrors the guest's original pointers (argv/envp strings
+/// stay in init's memory — only POINTERS are copied), appends the
+/// injected entries and the mandatory NULL terminator. `preload_addr`
+/// must be a scratch address holding the NUL-terminated
+/// `LD_PRELOAD=...` string; `ldlib_addr` likewise for
+/// `LD_LIBRARY_PATH=...` (None → not injected).
+fn z305s_build_envp_words(
+    existing: &[u64],
+    preload_addr: u64,
+    ldlib_addr: Option<u64>,
+) -> Vec<u64> {
+    let mut words = existing.to_vec();
+    words.push(preload_addr);
+    if let Some(a) = ldlib_addr {
+        words.push(a);
+    }
+    words.push(0);
+    words
+}
+
 /// 6-Z305r: REAL arm64-Android kernel defaults for the sysctls that
 /// AOSP-11 init treats as boot-fatal (security.cpp SetMmapRndBitsAction
 /// LOG(FATAL)s when it cannot open/read/verify them) but that a host or
@@ -12683,6 +12745,12 @@ pub fn run_ptrace_loop(
     // the same path is a fast cache hit (one copy per ROM binary per
     // boot, reused afterwards).
     let mut staged_exes: Option<std::collections::HashMap<String, String>> = None;
+    // 6-Z305s: the LD_PRELOAD chain VALUE injected into guest execve
+    // envps that lack one (see z305s_inject_decision for the root
+    // cause). The compat-shim probe ({rootfs}/dev/libbionic_compat.so)
+    // is a filesystem check — the file set is fixed at boot, so it is
+    // resolved ONCE, lazily, on the first injecting execve.
+    let mut z305s_chain_cache: Option<String> = None;
     // Rolling log of the last N SIGSYS-intercepted syscall numbers.
     // Used on child exit to print "the last few syscalls seccomp
     // blocked" — this is the single most useful diagnostic when init
@@ -16467,6 +16535,265 @@ pub fn run_ptrace_loop(
                                                 "6-Z128: execve(\"{}\") rewrite FAILED (staged \"{}\" + rootfs \"{}\") — the kernel will see the ORIGINAL path (execve will likely ENOENT)",
                                                 orig, c, rf
                                             ));
+                                        }
+                                    }
+                                }
+
+                                // ── 6-Z305s: execve envp LD_PRELOAD /
+                                // LD_LIBRARY_PATH injection ──
+                                //
+                                // The virtual kernel delivering its
+                                // binder-driver client (the loader shlib) to
+                                // every guest process: AOSP init builds each
+                                // service envp FRESH (no environ inheritance —
+                                // proven by the 6-Z238 scans of run
+                                // 34058989419), so the chain on the INIT exec
+                                // never reached ANY service → raw
+                                // open("/dev/binder") → ENXIO → ProcessState
+                                // fatal → the synchronized fleet death at
+                                // ~105s (hwservicemanager ×4 critical →
+                                // InitFatalReboot). See z305s_inject_decision
+                                // for the full decode.
+                                //
+                                // Placement: AFTER the 6-Z101/6-Z102 path
+                                // staging (arg1 may be repointed, arg2 rebuilt
+                                // by the 6-Z187 shebang arm) — this arm
+                                // touches ONLY arg3 (envp), via a FRESH
+                                // getregs snapshot (6-Z135 discipline).
+                                //
+                                // Scope: system mode ONLY (!boot_recovery —
+                                // the four green recovery guards keep their
+                                // proven rc-setenv chains) and 64-bit direct
+                                // ABIs only (the `abi.execve != 11` gate of
+                                // this block; aarch64 execve=221,
+                                // x86_64 execve=59).
+                                if !boot_recovery && past_first_execve {
+                                    static Z305S_OK: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    static Z305S_FAIL: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let envp_addr = get_syscall_arg(&regs, abi.reg_arg3);
+                                    if envp_addr != 0 {
+                                        // Bounded envp read (8-byte stride; the
+                                        // 6-Z238 scan proved init's own envp is
+                                        // ≤7 entries — 96 is a generous cap).
+                                        // Any unreadable entry (PEEK-blind
+                                        // child) → skip: rewriting a partially
+                                        // readable array is how corruption
+                                        // happens.
+                                        let mut existing: Vec<u64> = Vec::new();
+                                        let mut has_preload = false;
+                                        let mut has_ldlib = false;
+                                        let mut readable = true;
+                                        let mut cursor = envp_addr;
+                                        for _ in 0..96usize {
+                                            match read_child_u64(pid, cursor) {
+                                                None => {
+                                                    readable = false;
+                                                    break;
+                                                }
+                                                Some(0) => break,
+                                                Some(w) => {
+                                                    match read_child_string(pid, w) {
+                                                        None => {
+                                                            readable = false;
+                                                            break;
+                                                        }
+                                                        Some(s) => {
+                                                            if s.starts_with("LD_PRELOAD=") {
+                                                                has_preload = true;
+                                                            } else if s
+                                                                .starts_with("LD_LIBRARY_PATH=")
+                                                            {
+                                                                has_ldlib = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    existing.push(w);
+                                                    cursor += 8;
+                                                }
+                                            }
+                                        }
+                                        if readable && existing.len() < 96 {
+                                            let (inj_preload, inj_ldlib) =
+                                                z305s_inject_decision(has_preload, has_ldlib);
+                                            if inj_preload || inj_ldlib {
+                                                // Lazy chain resolution (once per
+                                                // boot — the shim file set is
+                                                // fixed by the parent's staging).
+                                                if z305s_chain_cache.is_none() {
+                                                    let compat = std::path::Path::new(&format!(
+                                                        "{}/dev/libbionic_compat.so",
+                                                        rootfs
+                                                    ))
+                                                    .exists();
+                                                    z305s_chain_cache = Some(
+                                                        crate::aosp_tracer_injected_ld_preload(
+                                                            compat,
+                                                        ),
+                                                    );
+                                                }
+                                                let chain =
+                                                    z305s_chain_cache.clone().unwrap_or_default();
+                                                // Fresh-scratch discipline (6-Z129):
+                                                // the sp-24KB window the 6-Z187
+                                                // argv rewrite already proves
+                                                // writable. Layout: [array words]
+                                                // [LD_PRELOAD string][LD_LIBRARY_PATH
+                                                // string].
+                                                let mut fr: Regs = unsafe { std::mem::zeroed() };
+                                                if ptrace_getregs_wide(pid, &mut fr).is_err() {
+                                                    let n = Z305S_FAIL.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if n < 40 {
+                                                        log(&format!(
+                                                            "6-Z305s: execve(\"{}\") pid={} getregs FAILED — envp left untouched",
+                                                            orig, pid
+                                                        ));
+                                                    }
+                                                } else {
+                                                    let sp_now = get_syscall_arg(&fr, abi.reg_sp);
+                                                    let envp_base =
+                                                        sp_now.wrapping_sub(24 * 1024u64) & !7u64;
+                                                    let preload_str =
+                                                        format!("LD_PRELOAD={}", chain);
+                                                    let ldlib_str = format!(
+                                                        "LD_LIBRARY_PATH={}",
+                                                        crate::AOSP_SERVICE_LD_LIBRARY_PATH
+                                                    );
+                                                    let words_count = existing.len()
+                                                        + 1
+                                                        + if inj_ldlib { 1 } else { 0 };
+                                                    let str_base = envp_base
+                                                        + ((((words_count as u64) + 1) * 8 + 7)
+                                                            & !7u64);
+                                                    let mut ok = write_child_string_unchecked(
+                                                        pid,
+                                                        str_base,
+                                                        &preload_str,
+                                                    );
+                                                    let mut ldlib_addr = None;
+                                                    if inj_ldlib {
+                                                        let a =
+                                                            str_base + preload_str.len() as u64 + 1;
+                                                        ok &= write_child_string_unchecked(
+                                                            pid, a, &ldlib_str,
+                                                        );
+                                                        ldlib_addr = Some(a);
+                                                    }
+                                                    let words = z305s_build_envp_words(
+                                                        &existing, str_base, ldlib_addr,
+                                                    );
+                                                    ok &= write_child_u64s_unchecked(
+                                                        pid, envp_base, &words,
+                                                    );
+                                                    if ok {
+                                                        set_syscall_arg(
+                                                            &mut fr,
+                                                            abi.reg_arg3,
+                                                            envp_base,
+                                                        );
+                                                        if ptrace_setregs(pid, &fr, iov_len).is_ok()
+                                                        {
+                                                            // VERIFY (6-Z129): fresh
+                                                            // getregs → arg3 stuck →
+                                                            // the injected string is
+                                                            // readable back.
+                                                            let mut vr: Regs =
+                                                                unsafe { std::mem::zeroed() };
+                                                            let verified =
+                                                                ptrace_getregs_wide(pid, &mut vr)
+                                                                    .is_ok()
+                                                                    && get_syscall_arg(
+                                                                        &vr,
+                                                                        abi.reg_arg3,
+                                                                    ) == envp_base
+                                                                    && read_child_string(
+                                                                        pid, str_base,
+                                                                    )
+                                                                    .map(|s| s == preload_str)
+                                                                    .unwrap_or(false);
+                                                            if verified {
+                                                                let n = Z305S_OK.fetch_add(
+                                                                    1,
+                                                                    std::sync::atomic::
+                                                                        Ordering::Relaxed,
+                                                                );
+                                                                if n < 64 {
+                                                                    log(&format!(
+                                                                        "6-Z305s: execve(\"{}\") pid={} envp {} entries + LD_PRELOAD{} injected (VERIFIED)",
+                                                                        orig,
+                                                                        pid,
+                                                                        existing.len(),
+                                                                        if inj_ldlib {
+                                                                            "+LD_LIBRARY_PATH"
+                                                                        } else {
+                                                                            ""
+                                                                        }
+                                                                    ));
+                                                                }
+                                                            } else {
+                                                                // RESTORE the original
+                                                                // envp pointer — never
+                                                                // let an unverified
+                                                                // rewrite stand.
+                                                                set_syscall_arg(
+                                                                    &mut fr,
+                                                                    abi.reg_arg3,
+                                                                    envp_addr,
+                                                                );
+                                                                let _ = ptrace_setregs(
+                                                                    pid, &fr, iov_len,
+                                                                );
+                                                                let n = Z305S_FAIL.fetch_add(
+                                                                    1,
+                                                                    std::sync::atomic::
+                                                                        Ordering::Relaxed,
+                                                                );
+                                                                if n < 40 {
+                                                                    log(&format!(
+                                                                        "6-Z305s: execve(\"{}\") pid={} VERIFY FAILED — envp pointer RESTORED",
+                                                                        orig, pid
+                                                                    ));
+                                                                }
+                                                            }
+                                                        } else {
+                                                            let n = Z305S_FAIL.fetch_add(
+                                                                1,
+                                                                std::sync::atomic::Ordering::Relaxed,
+                                                            );
+                                                            if n < 40 {
+                                                                log(&format!(
+                                                                    "6-Z305s: execve(\"{}\") pid={} setregs FAILED — envp left untouched",
+                                                                    orig, pid
+                                                                ));
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let n = Z305S_FAIL.fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                        if n < 40 {
+                                                            log(&format!(
+                                                                "6-Z305s: execve(\"{}\") pid={} scratch write FAILED — envp left untouched",
+                                                                orig, pid
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if !readable {
+                                            let n = Z305S_FAIL
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if n < 40 {
+                                                log(&format!(
+                                                    "6-Z305s: execve(\"{}\") pid={} envp read FAILED (PEEK-blind) — envp left untouched",
+                                                    orig, pid
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -34548,6 +34875,70 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             sockaddr_blob_is_property_service(&blob3, 2 + guest.len() as i64 + 1, &ABI_X86_64),
             Some(PropServSockaddrKind::FilesystemPath)
         );
+    }
+
+    #[test]
+    fn z305s_inject_decision_and_envp_builder() {
+        // 6-Z305s pure decision core + array builder.
+        // (a) The service case: init's fresh 1-entry envp (run
+        //     34058989419: linkerconfig/ueventd/apexd) — both missing →
+        //     both injected.
+        assert_eq!(z305s_inject_decision(false, false), (true, true));
+        // (b) The init case: kr64's exec env already carries both —
+        //     nothing injected (guest-provided values always win).
+        assert_eq!(z305s_inject_decision(true, true), (false, false));
+        // (c) Partial: only the missing half is injected.
+        assert_eq!(z305s_inject_decision(true, false), (false, true));
+        assert_eq!(z305s_inject_decision(false, true), (true, false));
+        // (d) Array builder: original pointers preserved in order, the
+        //     preload pointer appended, then the optional LD_LIBRARY_PATH
+        //     pointer, then the mandatory NULL.
+        let existing = [0x1111u64, 0x2222];
+        let w = z305s_build_envp_words(&existing, 0xABCD, Some(0xEF01));
+        assert_eq!(w, vec![0x1111, 0x2222, 0xABCD, 0xEF01, 0]);
+        let w2 = z305s_build_envp_words(&existing, 0xABCD, None);
+        assert_eq!(w2, vec![0x1111, 0x2222, 0xABCD, 0]);
+        // (e) Empty original envp still builds a valid array.
+        let w3 = z305s_build_envp_words(&[], 0xABCD, None);
+        assert_eq!(w3, vec![0xABCD, 0]);
+    }
+
+    #[test]
+    fn z305s_chain_matches_init_env_sources_of_truth() {
+        // The injected chain must be EXACTLY the chain the init execve
+        // env carries (6-Z238 evidence at +61ms, run 34058989419) and
+        // the LD_LIBRARY_PATH must keep /dev FIRST (the 5-L real-libdl
+        // resolution the shlib's LIBC-versioned DT_NEEDED depends on).
+        let chain = crate::aosp_tracer_injected_ld_preload(false);
+        assert_eq!(
+            chain,
+            "/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so"
+        );
+        // Compat-shim variant prepends the shim (6-Z236 order: shim
+        // FIRST so its FORTIFY exports are visible to later libs).
+        let chain_compat = crate::aosp_tracer_injected_ld_preload(true);
+        assert_eq!(
+            chain_compat,
+            "/dev/libbionic_compat.so:/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so"
+        );
+        // /dev stays first in the LD_LIBRARY_PATH (real libdl wins over
+        // the 5848-byte /system/lib64 bootstrap stub).
+        assert!(crate::AOSP_SERVICE_LD_LIBRARY_PATH.starts_with("/dev:"));
+        // The apex dirs the guest's own linkerconfig would provide must
+        // stay present (art: libnativeloader, i18n: libandroidicu,
+        // statsd: libstatssocket — the three CANNOT LINK families).
+        for apex in [
+            "/apex/com.android.art/lib64",
+            "/apex/com.android.i18n/lib64",
+            "/apex/com.android.os.statsd/lib64",
+            "/apex/com.android.runtime/lib64/bionic",
+        ] {
+            assert!(
+                crate::AOSP_SERVICE_LD_LIBRARY_PATH.contains(apex),
+                "missing apex path {}",
+                apex
+            );
+        }
     }
 
     #[test]
