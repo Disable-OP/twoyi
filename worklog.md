@@ -25466,3 +25466,18 @@ Work Log:
 
 Stage Summary:
 - The last property-wire blocker is fixed at its true root (a 4-value off-by-bound in the synthetic selinuxfs, not the verdict protocol). Boot ladder: init execs real binaries, property wire served end-to-end, class discovery + access verdict now unblocked. NEXT (6-Z305n): decode the rung-4/5 transition — expect servicemanager/zygote spawns; candidate walls: zygote 32-bit secondary arch exec, /dev/socket service publishes, or the setexeccon path on spawned daemons. Recovery guards must stay green.
+---
+Task ID: 6-Z305m-followup
+Agent: Z.ai Code (main dispatcher, cron Continue)
+Task: decode run 34024282699 (197148d) — class discovery fixed but the access verdict was never served; find why and fix.
+
+Work Log:
+- Run 34024282699 decoded: "Unknown class" GONE (perm ≤32 fix verified live — discovery walks all 32 perms, getdents 1008B, values ≤32). New wall: access node open O_RDWR ✓ (pre-creation worked), write ✓ 52B ("u:r:init:s0 u:object_r:exported2_default_prop:s0 1 1" — class=1 perm=1!), read → ret=0 EOF, NO verdict served → compute_av.c sscanf(<5 fields) → deny → 141 "SELinux permission check failed".
+- ROOT CAUSE (aarch64 register ABI): the 6-Z305l member/access read-EOF serve arm (and the write-EXIT request-capture arm) read fd/buf/count from the EXIT register snapshot — but on aarch64 x0 IS the return register (so the "fd" was the byte count; the old run's create capture only matched because write(fd=34, 34B) returned 34) and x1-x5 are clobbered (6-Z278) → captured buffers were garbage / lookups keyed (pid, ret) → serve never fired for any aarch64 guest. x86_64 preserved arg registers, masking the bug until the arm64-only E2E.
+- The old run's execs worked despite the dead serve arm ONLY because compute_create.c treats an EOF read as SUCCESS with newcon="" (strdup(buf) with no strlen guard — fetched and verified from googlesource) and "" != mycon("unconfined\n") passes init's "no domain transition" fatal. compute_av.c has NO such accident: sscanf requires ≥5 fields → EOF = deny.
+- FIX (same 6-Z199 pattern used by 12+ other arms): (1) new selinux_node_write_args ENTRY stash (pid → (fd, buf, count)) captured when write() targets a virtual selinuxfs node (fd→path maps are current at ENTRY; x0-x2 still hold args); (2) write-capture EXIT consumes the stash (raw-register fallback preserves x86_64 behavior); (3) read-EOF serve arm takes the fd from the 6-Z199 pending_entry_fd stash (nr-matched) instead of the clobbered x0.
+- Member/create semantics unchanged for the current boot: the captured request's mycon ("unconfined\n") has no u:r:type structure → twoyi_selinux_member_response returns None → EOF-"" accident continues to pass compute_create (no regression risk); access now serves the real verdict.
+- 761 tests green, fmt+clippy clean.
+
+Stage Summary:
+- CheckMacPerms chain now closes end-to-end on aarch64: discovery ✓ → class=1/perm=1 ✓ → access verdict served (allow-all) → property sets land. Expect late-init → class_start core → servicemanager/logd/vold/keystore2/zygote spawns next run.
