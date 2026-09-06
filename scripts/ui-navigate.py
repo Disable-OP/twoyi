@@ -56,7 +56,20 @@ def _bounded_run(*popenargs, **kwargs):
                 popen.kill()
             except Exception:
                 pass
-        out, err = popen.communicate()
+        # 6-Z305n iter-3: BOUNDED drain. A daemonized grandchild that
+        # escaped the process group (adb server fork+setsid inheriting
+        # stdout/stderr when the client restarts a wedged server) can
+        # hold the pipes FOREVER — run 34034018540 parked python right
+        # there for 12.5 min after [progress @ 12s]. The cleanup itself
+        # must never park: give the drain 5s, then discard the pipes.
+        try:
+            out, err = popen.communicate(timeout=5)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(popen.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            out, err = b"", b""
         return subprocess.CompletedProcess(args, None, out, err)
 
 
