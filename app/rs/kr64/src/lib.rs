@@ -3706,6 +3706,19 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     touch("sys/fs/selinux/create", 0o666, "");
     touch("sys/fs/selinux/member", 0o666, "");
 
+    // 6-Z305m: /sys/fs/selinux/access — the security_compute_av node
+    // (libselinux compute_av.c line 30-33: snprintf("%s/access",
+    // selinux_mnt); open(O_RDWR|O_CLOEXEC) — ENOENT = every
+    // selinux_check_access fails = every ro.* property set denied). The
+    // 6-Z305l round added the write-capture/read-serve EXIT protocol in
+    // ptrace_emu.rs (is_selinuxfs_transition_node +
+    // twoyi_selinux_access_response) but the on-disk node was never
+    // pre-created — masked until now because the guest died EARLIER, in
+    // class discovery (the 6-Z305m >32 perm-value abort). Without this
+    // file the very next wall after the class-discovery fix would be
+    // open("/sys/fs/selinux/access") = -ENOENT inside security_compute_av.
+    touch("sys/fs/selinux/access", 0o666, "");
+
     // 6-Z271: device-mapper /sys node. First-stage init's
     // BlockDevInitializer::InitMiscDevice() (AOSP system/core/init/
     // block_dev_initializer.cpp) REGENERATES the dm uevent by opening
@@ -3730,7 +3743,7 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     );
 
     info!(
-        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null,create,member}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1); 6-Z305j added selinux/member — the security_compute_create node, was the bootstrap-apexd-failed reboot)",
+        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null,create,member,access}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1); 6-Z305j added selinux/member — the security_compute_create node, was the bootstrap-apexd-failed reboot; 6-Z305m added selinux/access — the security_compute_av node, was the post-class-discovery property wall)",
         rootfs_prefix
     );
 }
@@ -16365,10 +16378,15 @@ mod tests {
         }
         // Empty files init opens (SELinux sysfs). 6-Z154: `null` joins the
         // set — arm64 TWRP init's logging sink (see precreate_sysfs_stubs).
+        // 6-Z305m: `access` (security_compute_av's node) and the 6-Z305j
+        // `create`/`member` transition nodes are part of the same contract.
         for rel in &[
             "sys/fs/selinux/enforce",
             "sys/fs/selinux/load",
             "sys/fs/selinux/null",
+            "sys/fs/selinux/create",
+            "sys/fs/selinux/member",
+            "sys/fs/selinux/access",
         ] {
             let p = dir.join(rel);
             assert!(
