@@ -2901,28 +2901,30 @@ pub const AOSP_LD_PRELOAD_ENV: &str =
     "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so";
 
 /// 6-Z305s: the LD_LIBRARY_PATH chain carried by the guest init execve
-/// envp (Step-5 child env build). The SAME value must ride every guest
-/// execve envp that lacks it — AOSP init does NOT propagate its own
-/// environ to forked services (run 34058989419: linkerconfig/ueventd/
-/// apexd execs carried a 1-entry envp; stock init builds each service
-/// envp fresh from the rc `setenv` options only). Without it, the
-/// shlib's own DT_NEEDED `libdl.so` (version LIBC) resolves from
-/// `/system/lib64/libdl.so` — the 5848-byte bootstrap STUB — and the
-/// preload load fatals the service at spawn ("CANNOT LINK EXECUTABLE").
-/// `/dev` MUST stay first: it holds the 5-L extracted REAL libdl.so
-/// (and the staged hook libs).
-pub const AOSP_SERVICE_LD_LIBRARY_PATH: &str = "/dev:\
-         /apex/com.android.runtime/lib64/bionic:\
-         /apex/com.android.runtime/lib64:\
-         /apex/com.android.runtime/lib64/bootstrap:\
-         /apex/com.android.art/lib64:\
-         /apex/com.android.i18n/lib64:\
-         /system/lib64:\
-         /system/lib64/bootstrap:\
-         /vendor/lib64:\
-         /apex/com.android.os.statsd/lib64:\
-         /system_ext/lib64:\
-         /product/lib64";
+/// envp (Step-5 child env build) AND injected by the tracer into guest
+/// execve envps that lack one.
+///
+/// 6-Z305s-b HOTFIX (ladder run decode, 34065965831): this chain used to
+/// carry the FULL apex list (/apex/com.android.art/lib64, …). Those
+/// dirs DO NOT EXIST in the guest rootfs (the apex payloads are still
+/// unextracted — see the 6-Z305t ext4-flattening plan), and the VFS
+/// runtime-host-fallback class (`SandboxPolicy::is_runtime_host_fallback`
+/// — /system/lib* + /apex/*/lib*) converted every such miss into a RAW
+/// HOST open — serving the REDROID HOST's own Android libs into the
+/// guest. A foreign-build libbase.so (no fmt v6.8 `basic_data` tables)
+/// then fataled init: "CANNOT LINK EXECUTABLE \"/system/bin/init\":
+/// cannot locate symbol _ZN3fmt2v68internal10basic_dataIvE23zero_or_
+/// powers_of_10_32E". The twoyi_loader_shlib's execve hook (6-Z132) had
+/// the same defect for the KVM test environment (where the host IS the
+/// same-version emulator) — its list is fixed in the same commit.
+///
+/// `/dev` is the ONLY entry: it exists in the guest (no host fallback
+/// is possible for it) and holds the 5-L extracted REAL libdl.so (the
+/// shlib's LIBC-versioned DT_NEEDED) plus the staged hook libs.
+/// Everything else resolves through the bionic fallback search
+/// (/system/lib64:/odm/lib64:/vendor/lib64) — ALL rootfs copies that
+/// exist for every lib the guest actually ships.
+pub const AOSP_SERVICE_LD_LIBRARY_PATH: &str = "/dev";
 
 /// 6-Z305s: the LD_PRELOAD chain VALUE (no `LD_PRELOAD=` prefix) the
 /// tracer injects into guest execve envps that lack one — the same

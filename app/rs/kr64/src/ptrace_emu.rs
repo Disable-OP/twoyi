@@ -34921,24 +34921,17 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             chain_compat,
             "/dev/libbionic_compat.so:/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so"
         );
-        // /dev stays first in the LD_LIBRARY_PATH (real libdl wins over
-        // the 5848-byte /system/lib64 bootstrap stub).
-        assert!(crate::AOSP_SERVICE_LD_LIBRARY_PATH.starts_with("/dev:"));
-        // The apex dirs the guest's own linkerconfig would provide must
-        // stay present (art: libnativeloader, i18n: libandroidicu,
-        // statsd: libstatssocket — the three CANNOT LINK families).
-        for apex in [
-            "/apex/com.android.art/lib64",
-            "/apex/com.android.i18n/lib64",
-            "/apex/com.android.os.statsd/lib64",
-            "/apex/com.android.runtime/lib64/bionic",
-        ] {
-            assert!(
-                crate::AOSP_SERVICE_LD_LIBRARY_PATH.contains(apex),
-                "missing apex path {}",
-                apex
-            );
-        }
+        // 6-Z305s-b HOTFIX: the injected LD_LIBRARY_PATH is /dev ONLY —
+        // the apex dirs do NOT exist in the guest rootfs and the VFS
+        // runtime-host-fallback served the REDROID HOST's own Android
+        // libs for them (foreign-build libbase.so → CANNOT LINK
+        // basic_data → init death, run 34065965831). /dev exists in the
+        // guest (no fallback possible) and carries the 5-L real libdl.
+        assert_eq!(crate::AOSP_SERVICE_LD_LIBRARY_PATH, "/dev");
+        // The 5-L real-libdl entry stays first so the shlib's
+        // LIBC-versioned DT_NEEDED never hits the 5848-byte bootstrap
+        // stub at /system/lib64/libdl.so.
+        assert!(crate::AOSP_SERVICE_LD_LIBRARY_PATH.starts_with("/dev"));
     }
 
     #[test]
