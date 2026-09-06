@@ -2535,9 +2535,14 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     unshare: 337,
     setns: 375, // arm32 setns
     mknod: 14,
-    setxattr: 226,
-    lsetxattr: 227,
-    fsetxattr: 228,
+    // 6-Z305j: arm32 xattr numbers per arch/arm/tools/syscall.tbl —
+    // the PREVIOUS values (226/227/228) were the I386 numbers copied
+    // into the arm32 table (same root cause as the 6-Z156 comment on
+    // getxattr_nr below). arm32's xattr family lives in the private
+    // 382..393 range: setxattr=382, lsetxattr=383, fsetxattr=384.
+    setxattr: 382,
+    lsetxattr: 383,
+    fsetxattr: 384,
     shmget: 307,
     shmat: 305,
     shmctl: 308,
@@ -2587,9 +2592,15 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     setresuid_nr: 208, // setresuid32
     setresgid_nr: 210, // setresgid32
     setgroups_nr: 206, // setgroups32
-    getxattr_nr: 229,
-    lgetxattr_nr: 230,
-    fgetxattr_nr: 231,
+    // 6-Z305j: corrected from the i386 values (229/230/231) — arm32
+    // (arch/arm/tools/syscall.tbl) has getxattr=385, lgetxattr=386,
+    // fgetxattr=387 in the same 382..393 private range as setxattr.
+    // With the i386 numbers the 6-Z156 ENODATA→fake-label handler
+    // could never fire for an arm32 guest (nr 229 on arm32 is
+    // tkill, not getxattr).
+    getxattr_nr: 385,
+    lgetxattr_nr: 386,
+    fgetxattr_nr: 387,
     reg_syscall: 7, // r7 (arm EABI syscall number register)
     reg_ret: 0,     // r0
     reg_arg1: 0,    // r0
@@ -10157,6 +10168,73 @@ fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     true
 }
 
+///
+/// ── 6-Z305j: virtual selinuxfs constants + helpers ────────────────
+///
+/// The pure-stock Android 11 init reaches every `Service::Start()`
+/// through `ComputeContextFromExecutable` (service.cpp): getcon →
+/// getfilecon → `security_compute_create(...)`. The last call is the
+/// libselinux request/response protocol on the selinuxfs `member`
+/// node — and its FIRST gate is `selinuxfs_exists()`, a statfs() that
+/// demands `f_type == SELINUX_MAGIC`. Both are emulated here:
+///
+/// * `is_selinuxfs_root` — which translated paths are the virtual
+///   selinuxfs roots (their statfs buffer gets the magic patched in).
+/// * `SELINUX_MAGIC` — the fs-magic constant of the real selinuxfs
+///   (include/uapi/linux/magic.h: `#define SELINUX_MAGIC 0xf97cff8c`).
+/// * `twoyi_selinux_member_response` — the deterministic transition
+///   response: libselinux writes `"<mycon> <tcon> <class>"` and reads
+///   the kernel's type-transition verdict. The container has no
+///   policy, so the verdict is synthesized by swapping mycon's TYPE
+///   (domain) field to `twoyi_exec` (context shape
+///   `user:role:type[:mls]` — an execve transition changes the type).
+///   init REQUIRES the result to differ from mycon (service.cpp:
+///   "File … has incorrect label or no domain transition from …" is a
+///   fatal) — the role swap is guaranteed-distinct for any
+///   well-formed input because mycon's own role can never be
+///   `twoyi_exec` (the guest never writes such a role).
+pub const SELINUX_MAGIC: u64 = 0xf97cff8c;
+
+/// Whether `translated` (a rootfs-translated path) is one of the
+/// virtual selinuxfs roots whose statfs f_type must read as
+/// [`SELINUX_MAGIC`]. Matches the exact pre-created roots only —
+/// `…/sys/fs/selinux` (modern) and `…/selinux` (legacy libselinux
+/// mount point) — never deeper paths (enforce/load/member), whose
+/// statfs must stay honest.
+pub fn is_selinuxfs_root(translated: &str, rootfs: &str) -> bool {
+    translated == format!("{}/sys/fs/selinux", rootfs)
+        || translated == format!("{}/selinux", rootfs)
+}
+
+/// Synthesize the `security_compute_create` response for a captured
+/// `/sys/fs/selinux/member` request (see the read() EXIT handler).
+///
+/// Request format (libselinux security.c): the first whitespace-
+/// delimited token is the SUBJECT context (mycon); everything after it
+/// is the target context + class, ignored here. `None` on empty /
+/// non-UTF-8 / fewer-than-3 `:`-fields input — an unparsable mycon
+/// cannot guarantee the response-distinctness init demands, so the
+/// emulation stays silent and the guest sees the honest EOF error.
+pub fn twoyi_selinux_member_response(request: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(request).ok()?;
+    let mycon = s.split_whitespace().next()?;
+    let fields: Vec<&str> = mycon.split(':').collect();
+    if fields.len() < 3 {
+        return None;
+    }
+    // user:role:TYPE[:mls] — an execve domain transition changes the TYPE
+    // field (index 2), exactly what a real policy type_transition would
+    // compute. Result: "u:r:twoyi_exec:s0[:mls]".
+    Some(
+        fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| if i == 2 { "twoyi_exec" } else { *f })
+            .collect::<Vec<&str>>()
+            .join(":"),
+    )
+}
+
 /// Write a NUL-terminated string `s` to the child's memory at `addr`,
 /// WITHOUT the "new string must be shorter than the existing string"
 /// guard that [`write_child_string`] enforces.
@@ -11912,6 +11990,19 @@ pub fn run_ptrace_loop(
     // 6-Z206: stash the most recent stat-family ENTRY for the EXIT-side
     // ENOENT-correlation log. (pid, nr, guest_path, translated, host_exists).
     let mut z206_pending_stat_path: Option<(libc::pid_t, i64, String, String, bool)> = None;
+    // 6-Z305j: pending virtual-selinuxfs state (both are bounded by
+    // construction — see the handlers at the statfs/getxattr arms and
+    // the write()/read() EXIT blocks):
+    //   * selinux_member_pending — request captured from the write()
+    //     to a /sys/fs/selinux/member fd; consumed by the matching
+    //     read() EOF (the libselinux security_compute_create
+    //     request/response protocol). Keyed (pid, fd) so interleaved
+    //     threads cannot cross-contaminate.
+    //   * selinux_statfs_pending — one-shot statfs EXIT patch target
+    //     (f_type := SELINUX_MAGIC for the virtual selinuxfs roots).
+    let mut selinux_member_pending: std::collections::HashMap<(libc::pid_t, i32), Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut selinux_statfs_pending: Option<(libc::pid_t, i64, u64, bool)> = None;
     // 6-Z199: ENTRY-side arg1 stash — (pid → (syscall_nr, fd)) captured
     // at the ENTRY stop of fd-taking syscalls, consumed by their EXIT
     // arms. On aarch64 x0 is BOTH arg1 and the return register, so the
@@ -19064,6 +19155,69 @@ pub fn run_ptrace_loop(
                                 let _ = ptrace_setregs(pid, &regs, iov_len);
                             }
                         }
+                        // ── 6-Z305j: getxattr / lgetxattr path-arg
+                        // translation ────────────────────────────────
+                        //
+                        // libselinux getfilecon(path) / lgetfilecon(path)
+                        // issue getxattr(path, "security.selinux", …) /
+                        // lgetxattr. The PATH argument was never
+                        // translated, so the kernel resolved the RAW
+                        // guest path against the HOST container's mount
+                        // namespace: stat(args_[0]) succeeded via the
+                        // 6-Z206-translated stat family ("/system/bin/
+                        // linkerconfig" → {rootfs}/system/bin/
+                        // linkerconfig, EXISTS), but the immediately
+                        // following getxattr of the SAME path hit the
+                        // host namespace → -ENOENT (-2). The 6-Z156
+                        // EXIT-side fake only fires on -ENODATA/-EPERM,
+                        // so the ENOENT propagated verbatim →
+                        // ComputeContextFromExecutable: "Could not get
+                        // file context" → init.rc:59
+                        // 'exec -- /system/bin/linkerconfig' failed →
+                        // init.rc:72 'exec_start apexd-bootstrap' →
+                        // "Could not get process context" (apexd only
+                        // got PAST getfilecon because redroid's OWN
+                        // /system/bin/apexd happens to exist on the
+                        // host → ENODATA → 6-Z156 fake) → init.rc
+                        // reboot bootloader,bootstrap-apexd-failed →
+                        // full shutdown cascade (run 34008640395,
+                        // kmsg lines 165-173).
+                        //
+                        // With the path translated, the kernel executes
+                        // getxattr({rootfs}/…): the file EXISTS in the
+                        // rootfs but has no security.* xattr (app-data
+                        // storage) → -ENODATA → the existing 6-Z156
+                        // EXIT-side fake injects the sandbox label —
+                        // getfilecon now succeeds for EVERY guest file,
+                        // not just paths that coincidentally exist on
+                        // the host.
+                        //
+                        // Path is arg1 for BOTH (arg2=name, arg3=value
+                        // buf, arg4=size — untouched; the 6-Z156 EXIT
+                        // handler re-reads those fresh). fgetxattr/
+                        // fsetxattr are fd-based (no path arg); the SET
+                        // side never executes (the 6-Z83 getpid-swap arm
+                        // below turns setxattr/lsetxattr into getpid).
+                        n if n == abi.getxattr_nr || n == abi.lgetxattr_nr => {
+                            let path_addr = get_syscall_arg(&regs, abi.reg_arg1);
+                            if let Some(path) = read_child_string(pid, path_addr) {
+                                let translated =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &path);
+                                if translated != path
+                                    && !write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        abi.reg_arg1,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &translated,
+                                    )
+                                {
+                                    write_child_string(pid, path_addr, &translated);
+                                }
+                            }
+                        }
                         n if n == abi.readlink || n == abi.readlinkat => {
                             let path_arg_index = if syscall_num == abi.readlink {
                                 abi.reg_arg1
@@ -19428,6 +19582,32 @@ pub fn run_ptrace_loop(
                                     translate_path_via_sandbox(&sandbox, rootfs, &path);
                                 if translated != path && loop_count <= 500 {
                                     log(&format!("intercepted statfs({}) -> {}", path, translated));
+                                }
+                                // ── 6-Z305j: SELINUX_MAGIC f_type patch
+                                // stash (EXIT side patches the buffer) ──
+                                //
+                                // libselinux selinuxfs_exists() does
+                                // statfs("/sys/fs/selinux") and requires
+                                // f_type == SELINUX_MAGIC (0xf97cff8c)
+                                // before setting selinux_mnt; on a regular
+                                // ext4/f2fs dir the kernel reports the data
+                                // partition's fstype → selinux_mnt stays
+                                // NULL → security_compute_create()
+                                // short-circuits with -1 →
+                                // ComputeContextFromExecutable: "Could not
+                                // get process context" → exec_start
+                                // apexd-bootstrap failed → init.rc reboot
+                                // bootloader,bootstrap-apexd-failed (run
+                                // 34008640395). With f_type patched, the
+                                // member-node response emulation below
+                                // completes the transition chain.
+                                if is_selinuxfs_root(&translated, rootfs) {
+                                    let buf_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                    if buf_addr != 0 {
+                                        let is64 = detect_child_is_64bit(pid).unwrap_or(true);
+                                        selinux_statfs_pending =
+                                            Some((pid, syscall_num, buf_addr, is64));
+                                    }
                                 }
                                 if translated != path
                                     && !write_translated_path(
@@ -22666,6 +22846,49 @@ pub fn run_ptrace_loop(
                     // writes are uninteresting setup noise).
                     if past_first_execve && syscall_num == abi.write {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // ── 6-Z305j: virtual /sys/fs/selinux/member
+                        // request capture ── libselinux
+                        // security_compute_create() opens member O_RDWR,
+                        // writes "<mycon> <tcon> <class>", then READS the
+                        // transition response back. The pre-created member
+                        // node is a regular file, so the real write lands
+                        // on the rootfs (harmless; ret > 0). Capture the
+                        // request here; the matching read() EOF below
+                        // serves the synthesized response.
+                        if ret > 0 {
+                            let mfd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            let mpath = open_fd_owner_paths
+                                .get(&(pid, mfd))
+                                .or_else(|| open_fd_paths.get(&mfd));
+                            if let Some(p) = mpath {
+                                if p.ends_with("/sys/fs/selinux/member") {
+                                    let mbuf = get_syscall_arg(&regs, abi.reg_arg2);
+                                    let mcount = get_syscall_arg(&regs, abi.reg_arg3) as usize;
+                                    if mbuf != 0 && mcount > 0 {
+                                        let n = mcount.min(512);
+                                        if let Some(req) = read_child_bytes(pid, mbuf, n) {
+                                            if selinux_member_pending.len() > 8 {
+                                                selinux_member_pending.clear();
+                                            }
+                                            selinux_member_pending.insert((pid, mfd), req.clone());
+                                            static MEMBER_REQ_LOG: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            if MEMBER_REQ_LOG
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                                < 8
+                                            {
+                                                log(&format!(
+                                                    "6-Z305j: captured selinuxfs member request (pid {} fd {}): {:?}",
+                                                    pid,
+                                                    mfd,
+                                                    String::from_utf8_lossy(&req)
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // 6-Z271o: FATAL-MARKER GATE — the fb_hook fatal
                         // path (kind + caller_pc + maps) MUST be
                         // attributable in artifacts regardless of the
@@ -23113,6 +23336,79 @@ pub fn run_ptrace_loop(
                     // avoid capturing buffers from unrelated syscalls.
                     if past_first_execve && syscall_num == abi.read {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // ── 6-Z305j: virtual /sys/fs/selinux/member
+                        // response injection ── the real read() returns 0
+                        // (EOF — the fd's file position sits at the end of
+                        // the captured request write). When a captured
+                        // request exists for this (pid, fd), serve the
+                        // synthesized transition context instead (same
+                        // mechanics as the 6-Z25 attr/current fake below:
+                        // inject buffer + fresh getregs/setregs ret).
+                        //
+                        // This closes ComputeContextFromExecutable's
+                        // security_compute_create() call — the LAST selinux
+                        // wall in Service::Start() ("Could not get process
+                        // context" → reboot
+                        // bootloader,bootstrap-apexd-failed, run
+                        // 34008640395). The computed context only feeds
+                        // socket labeling (non-fatal), but the COMPUTE
+                        // step must succeed for the service to start.
+                        if ret == 0 {
+                            let mfd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            let mpath = open_fd_owner_paths
+                                .get(&(pid, mfd))
+                                .or_else(|| open_fd_paths.get(&mfd));
+                            if let Some(p) = mpath {
+                                if p.ends_with("/sys/fs/selinux/member") {
+                                    if let Some(req) = selinux_member_pending.remove(&(pid, mfd)) {
+                                        if let Some(resp) = twoyi_selinux_member_response(&req) {
+                                            let mbuf = get_syscall_arg(&regs, abi.reg_arg2);
+                                            if mbuf != 0
+                                                && write_child_string_unchecked(pid, mbuf, &resp)
+                                            {
+                                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                                match ptrace_getregs_wide(pid, &mut regs2) {
+                                                    Ok(len) => {
+                                                        set_syscall_ret(
+                                                            &mut regs2,
+                                                            &abi,
+                                                            resp.len() as i64,
+                                                        );
+                                                        match ptrace_setregs(pid, &regs2, len) {
+                                                            Ok(()) => {
+                                                                static MEMBER_RESP_LOG:
+                                                                    std::sync::atomic::AtomicU64 =
+                                                                    std::sync::atomic::AtomicU64::
+                                                                        new(0);
+                                                                if MEMBER_RESP_LOG.fetch_add(
+                                                                    1,
+                                                                    std::sync::atomic::Ordering::
+                                                                        Relaxed,
+                                                                ) < 8
+                                                                {
+                                                                    log(&format!(
+                                                                        "6-Z305j: selinuxfs member response '{}' served (pid {} fd {}, ret 0 -> {}) — security_compute_create unblocked",
+                                                                        resp, pid, mfd, resp.len()
+                                                                    ));
+                                                                }
+                                                            }
+                                                            Err(e) => log(&format!(
+                                                                "6-Z305j: member response setregs FAILED: {}",
+                                                                e
+                                                            )),
+                                                        }
+                                                    }
+                                                    Err(e) => log(&format!(
+                                                        "6-Z305j: member response getregs FAILED: {}",
+                                                        e
+                                                    )),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Only capture successful reads with a
                         // reasonable size (0 < ret <= 256). ret <= 0
                         // is a failed/EOF read (nothing to capture).
@@ -24664,6 +24960,60 @@ pub fn run_ptrace_loop(
                                                 "(host path genuinely missing — translation gap)"
                                             }
                                         ));
+                                    }
+                                }
+                                // ── 6-Z305j: SELINUX_MAGIC f_type patch
+                                // (EXIT side) ── consumed the stash armed by
+                                // the statfs ENTRY arm. The kernel has now
+                                // filled the caller's buffer with the REAL
+                                // statfs of the (regular-dir) selinux root —
+                                // overwrite f_type (offset 0, 8 bytes LP64 /
+                                // 4 bytes ILP32) with SELINUX_MAGIC so
+                                // libselinux selinuxfs_exists() returns true
+                                // and selinux_mnt gets set. No regs write —
+                                // only guest memory.
+                                if let Some((spid, snr, sbuf, sis64)) =
+                                    selinux_statfs_pending.take()
+                                {
+                                    if spid == pid && snr == syscall_num {
+                                        if fresh_ret == 0 && sbuf != 0 {
+                                            if let Some(mut sbuf_bytes) =
+                                                read_child_bytes(pid, sbuf, 16)
+                                            {
+                                                if sbuf_bytes.len() == 16 {
+                                                    if sis64 {
+                                                        sbuf_bytes[0..8].copy_from_slice(
+                                                            &SELINUX_MAGIC.to_le_bytes(),
+                                                        );
+                                                    } else {
+                                                        sbuf_bytes[0..4].copy_from_slice(
+                                                            &(SELINUX_MAGIC as u32).to_le_bytes(),
+                                                        );
+                                                    }
+                                                    let mut vw: Option<bool> = None;
+                                                    let (written, how) =
+                                                        write_child_bytes_injection(
+                                                            pid,
+                                                            sbuf,
+                                                            &sbuf_bytes,
+                                                            &mut vw,
+                                                        );
+                                                    static STATFS_MAGIC_LOG:
+                                                        std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    if STATFS_MAGIC_LOG.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    ) < 8
+                                                    {
+                                                        log(&format!(
+                                                            "6-Z305j: statfs f_type patched to SELINUX_MAGIC ({}/16 bytes via {}) — selinuxfs_exists() will now succeed",
+                                                            written, how
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 // 6-Z145: the compute-table match is checked
@@ -34829,5 +35179,109 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         frame2[36..36 + value2.len()].copy_from_slice(value2);
         let (name2, value2) = parse_prop_msg(&frame2).expect("classic prop_msg must parse");
         assert!(!is_boot_completed_prop(&name2, &value2));
+    }
+
+    // ── 6-Z305j: virtual selinuxfs helpers ──────────────────────────
+    #[test]
+    fn twoyi_selinux_member_response_swaps_role_of_wellformed_context() {
+        let req = b"u:r:recovery:s0 u:object_r:rootfs:s0 process\0";
+        let resp = twoyi_selinux_member_response(req).expect("wellformed request must parse");
+        assert_eq!(resp, "u:r:twoyi_exec:s0");
+        // init's Start() REQUIRES response != mycon ("no domain transition" fatal).
+        assert_ne!(resp, "u:r:recovery:s0");
+    }
+
+    #[test]
+    fn twoyi_selinux_member_response_preserves_user_type_and_mls() {
+        // The 6-Z25 fake makes init read its context as u:r:recovery:s0, but
+        // getcon() can also return the REAL host container context (with an
+        // mls suffix) when the attr/current read bypasses the fake — the role
+        // swap must keep every other field byte-identical.
+        let req = b"u:r:untrusted_app_32:s0:c512,c768 u:object_r:rootfs:s0 2";
+        let resp = twoyi_selinux_member_response(req).expect("mls request must parse");
+        assert_eq!(resp, "u:r:twoyi_exec:s0:c512,c768");
+    }
+
+    #[test]
+    fn twoyi_selinux_member_response_rejects_unparsable_mycon() {
+        assert_eq!(twoyi_selinux_member_response(b""), None);
+        assert_eq!(twoyi_selinux_member_response(b"   \n"), None);
+        assert_eq!(twoyi_selinux_member_response(b"short"), None);
+        assert_eq!(twoyi_selinux_member_response(b"u:r"), None);
+        assert_eq!(twoyi_selinux_member_response(&[0xff, 0xfe, 0x20]), None); // non-UTF8
+    }
+
+    #[test]
+    fn is_selinuxfs_root_matches_exact_virtual_roots_only() {
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        assert!(is_selinuxfs_root(
+            &format!("{}/sys/fs/selinux", rootfs),
+            rootfs
+        ));
+        assert!(is_selinuxfs_root(&format!("{}/selinux", rootfs), rootfs));
+        // Deeper nodes (incl. the member protocol file) must stay honest:
+        assert!(!is_selinuxfs_root(
+            &format!("{}/sys/fs/selinux/member", rootfs),
+            rootfs
+        ));
+        assert!(!is_selinuxfs_root(
+            &format!("{}/sys/fs/selinux/enforce", rootfs),
+            rootfs
+        ));
+        assert!(!is_selinuxfs_root(
+            &format!("{}/sys/fs/selinuxfs", rootfs),
+            rootfs
+        ));
+        assert!(!is_selinuxfs_root("/sys/fs/selinux", rootfs)); // untranslated raw path
+    }
+
+    #[test]
+    fn selinux_magic_matches_kernel_uapi_constant() {
+        assert_eq!(SELINUX_MAGIC, 0xf97cff8c);
+        assert_eq!(
+            (SELINUX_MAGIC as u32).to_le_bytes(),
+            [0x8c, 0xff, 0x7c, 0xf9]
+        );
+    }
+
+    #[test]
+    fn xattr_abi_numbers_are_arch_correct() {
+        // 6-Z305j: per-arch xattr syscall numbers. arm32 per
+        // arch/arm/tools/syscall.tbl — the previous values were the i386
+        // numbers copy-pasted into the arm32 table (getxattr 229 on arm32
+        // is tkill, not getxattr). aarch64 per asm-generic/unistd.h —
+        // live-verified: the 6-Z156 fake fired on nr=8 in run 34008640395.
+        #[cfg(target_arch = "arm")]
+        {
+            assert_eq!(ABI_ARM32.getxattr_nr, 385);
+            assert_eq!(ABI_ARM32.lgetxattr_nr, 386);
+            assert_eq!(ABI_ARM32.fgetxattr_nr, 387);
+            assert_eq!(ABI_ARM32.setxattr, 382);
+            assert_eq!(ABI_ARM32.lsetxattr, 383);
+            assert_eq!(ABI_ARM32.fsetxattr, 384);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(ABI_AARCH64.getxattr_nr, 8);
+            assert_eq!(ABI_AARCH64.lgetxattr_nr, 9);
+            assert_eq!(ABI_AARCH64.fgetxattr_nr, 10);
+            assert_eq!(ABI_AARCH64.setxattr, 5);
+            assert_eq!(ABI_AARCH64.lsetxattr, 6);
+            assert_eq!(ABI_AARCH64.fsetxattr, 7);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(ABI_X86_64.getxattr_nr, 191);
+            assert_eq!(ABI_X86_64.lgetxattr_nr, 192);
+            assert_eq!(ABI_X86_64.setxattr, 188);
+            assert_eq!(ABI_X86_64.lsetxattr, 189);
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            assert_eq!(ABI_X86_32.getxattr_nr, 229);
+            assert_eq!(ABI_X86_32.lgetxattr_nr, 230);
+            assert_eq!(ABI_X86_32.setxattr, 226);
+            assert_eq!(ABI_X86_32.lsetxattr, 227);
+        }
     }
 }
