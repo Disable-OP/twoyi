@@ -12249,6 +12249,19 @@ pub fn run_ptrace_loop(
     let mut selinux_member_pending: std::collections::HashMap<(libc::pid_t, i32), Vec<u8>> =
         std::collections::HashMap::new();
     let mut selinux_statfs_pending: Option<(libc::pid_t, i64, u64, bool)> = None;
+    // 6-Z305m: ENTRY-side argument stash for write() calls aimed at a
+    // virtual selinuxfs transition/access node — (pid → (fd, buf_ptr,
+    // count)). The write-EXIT request capture previously read fd/buf/count
+    // from the EXIT register snapshot: on aarch64 x0 IS the return value
+    // (so the "fd" was the byte count — it only ever matched when the fd
+    // number coincidentally equaled the request length, run 34020890721:
+    // write(fd=34, 34 bytes)) and x1-x5 are outright clobbered (6-Z278),
+    // so the captured buffer was garbage. Stash at ENTRY where x0-x2 still
+    // hold the arguments; the EXIT arm consumes the stash and, per the
+    // 6-Z199 contract, falls back to the raw registers on x86_64 where
+    // they survive.
+    let mut selinux_node_write_args: std::collections::HashMap<libc::pid_t, (i32, u64, usize)> =
+        std::collections::HashMap::new();
     // 6-Z199: ENTRY-side arg1 stash — (pid → (syscall_nr, fd)) captured
     // at the ENTRY stop of fd-taking syscalls, consumed by their EXIT
     // arms. On aarch64 x0 is BOTH arg1 and the return register, so the
@@ -15587,6 +15600,34 @@ pub fn run_ptrace_loop(
                                 pid,
                                 (syscall_num, get_syscall_arg(&regs, abi.reg_arg1) as i64),
                             );
+                        }
+                        // 6-Z305m: stash write(fd, buf, count) arguments at
+                        // ENTRY when the fd targets a virtual selinuxfs
+                        // transition/access node (see selinux_node_write_args
+                        // above for why EXIT-side reads are unusable on
+                        // aarch64). The fd→path maps are current at ENTRY
+                        // (opens register at their EXIT), so this resolves the
+                        // node classification here where x0 is still arg1.
+                        if abi.write != -1 && syscall_num == abi.write {
+                            let z305m_fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            let z305m_path = open_fd_owner_paths
+                                .get(&(pid, z305m_fd))
+                                .or_else(|| open_fd_paths.get(&z305m_fd))
+                                .cloned();
+                            if z305m_path
+                                .as_deref()
+                                .map(is_selinuxfs_transition_node)
+                                .unwrap_or(false)
+                            {
+                                selinux_node_write_args.insert(
+                                    pid,
+                                    (
+                                        z305m_fd,
+                                        get_syscall_arg(&regs, abi.reg_arg2),
+                                        get_syscall_arg(&regs, abi.reg_arg3) as usize,
+                                    ),
+                                );
+                            }
                         }
                         // 6-Z305l: SO_PEERSEC getsockopt ENTRY stash —
                         // getpeercon_raw (libselinux getpeercon.c:26) is
@@ -23200,14 +23241,28 @@ pub fn run_ptrace_loop(
                         // request here; the matching read() EOF below
                         // serves the synthesized response.
                         if ret > 0 {
-                            let mfd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            // 6-Z305m: fd/buf/count now come from the
+                            // ENTRY stash (selinux_node_write_args) — at
+                            // the aarch64 EXIT stop x0 is the return
+                            // value (the old "fd" was the byte count) and
+                            // x1/x2 are clobbered, so the raw-register
+                            // reads captured garbage. Fallback to the raw
+                            // registers keeps the x86_64 behavior intact
+                            // for a stash miss (e.g. an fd opened before
+                            // the tracer attached).
+                            let (mfd, mbuf, mcount) = match selinux_node_write_args.remove(&pid) {
+                                Some((f, b, c)) => (f, b, c),
+                                None => (
+                                    get_syscall_arg(&regs, abi.reg_arg1) as i32,
+                                    get_syscall_arg(&regs, abi.reg_arg2),
+                                    get_syscall_arg(&regs, abi.reg_arg3) as usize,
+                                ),
+                            };
                             let mpath = open_fd_owner_paths
                                 .get(&(pid, mfd))
                                 .or_else(|| open_fd_paths.get(&mfd));
                             if let Some(p) = mpath {
                                 if is_selinuxfs_transition_node(p) {
-                                    let mbuf = get_syscall_arg(&regs, abi.reg_arg2);
-                                    let mcount = get_syscall_arg(&regs, abi.reg_arg3) as usize;
                                     if mbuf != 0 && mcount > 0 {
                                         let n = mcount.min(512);
                                         if let Some(req) = read_child_bytes(pid, mbuf, n) {
@@ -23911,7 +23966,20 @@ pub fn run_ptrace_loop(
                         // socket labeling (non-fatal), but the COMPUTE
                         // step must succeed for the service to start.
                         if ret == 0 {
-                            let mfd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            // 6-Z305m: fd from the 6-Z199 ENTRY stash — at
+                            // the aarch64 EXIT stop x0 IS the return value
+                            // (0 for this EOF read), so the old
+                            // raw-register "fd" was always 0 and the
+                            // (pid, 0) lookup missed for every aarch64
+                            // guest: the verdict/context was never served
+                            // and compute_av.c hit the honest EOF
+                            // (sscanf < 5 fields → deny). Falls back to
+                            // the raw register on a stash miss (x86_64
+                            // preserves arg registers across the syscall).
+                            let mfd = match pending_entry_fd.get(&pid) {
+                                Some((nr, f)) if *nr == syscall_num => *f as i32,
+                                _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
+                            };
                             let mpath = open_fd_owner_paths
                                 .get(&(pid, mfd))
                                 .or_else(|| open_fd_paths.get(&mfd));
