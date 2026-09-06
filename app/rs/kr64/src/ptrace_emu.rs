@@ -6867,6 +6867,19 @@ fn sockaddr_blob_is_property_service(
     if path_bytes == FS_SPELLING {
         return Some(PropServSockaddrKind::FilesystemPath);
     }
+    // 6-Z305p: the TRANSLATED spelling. The 6-Z305d bind rewrite and the
+    // 6-Z305q connect rewrite place the guest listener at
+    // "{rootfs}/dev/socket/property_service"; EXIT-side matchers (the
+    // TWRP gate + the ret<0 client-fd tracking) peek the sockaddr AFTER
+    // the ENTRY rewrite, so they must recognize the prefixed form too.
+    // `ends_with` keeps the matcher's superstring hostility: a name that
+    // merely CONTAINS the spelling with a non-rootfs prefix or a longer
+    // final component (".../property_service2") still does not match —
+    // only a path whose final component IS the canonical guest path
+    // qualifies, and only the tracer ever writes such paths.
+    if path_bytes.len() > FS_SPELLING.len() && path_bytes.ends_with(FS_SPELLING) {
+        return Some(PropServSockaddrKind::FilesystemPath);
+    }
     // AbstractNamespace spelling: leading NUL is the marker (byte 0 of
     // sun_path); the rest is "property_service" with NO trailing NUL
     // required (abstract-namespace names are length-tagged by addrlen,
@@ -10690,6 +10703,61 @@ fn build_translated_unix_sockaddr(host_path: &str) -> Option<Vec<u8>> {
     out.extend_from_slice(host_path.as_bytes());
     out.push(0); // NUL
     Some(out)
+}
+
+/// 6-Z305p: PURE decision core for the connect() sockaddr translation —
+/// the client-side mirror of the 6-Z305d bind rewrite.
+///
+/// # Root cause (run 34041198120 decode — the 6-Z305p park)
+///
+/// kr64 has NO mount namespace (seccomp blocks mount(2) — the 6-Z110
+/// TWRP-gate comment), so the kernel resolves an AF_UNIX connect()
+/// sockaddr against the HOST root. The 6-Z305d bind rewrite correctly
+/// placed the guest init's listener at
+/// `{rootfs}/dev/socket/property_service`, but the CLIENT connects were
+/// never translated: every guest property-set connect landed on the
+/// REDROID HOST's own `/dev/socket/property_service`. The host service
+/// answers instantly and rejects every `ro.*` set with
+/// PROP_ERROR_READ_ONLY_PROPERTY (0xb — its own values are already
+/// set; seen verbatim in the run's logcat: `Unable to set property
+/// "ro.cold_boot_done" to "true": error code: 0xb` from guest pid
+/// 2668), and silently UPDATEs the host area for non-ro names
+/// (`init.svc.*` "succeeded" — into the HOST's property area). The
+/// guest's own init never saw a single client set → ueventd's
+/// `ro.cold_boot_done=true` never landed → init parked forever at
+/// `wait_for_coldboot_done` (ep_poll, 7 procs, trace log dark after
+/// +1440 ms — the "klog mirror stall" of the 6-Z305o-verify decode was
+/// this park, not a mirror bug).
+///
+/// Given a connect() sockaddr blob, returns `(guest_path, host_path,
+/// new_sockaddr)` when the blob is an AF_UNIX FILESYSTEM-spelling
+/// absolute guest path that must be translated into the guest rootfs.
+/// The caller writes `new_sockaddr` into the tracer scratch area and
+/// repoints (arg2, arg3=new_sockaddr.len()) at it.
+///
+/// None leaves the connect untouched:
+///   * empty rootfs prefix (root-relative guest — nothing to translate),
+///   * abstract-namespace / relative / non-AF_UNIX spellings
+///     ([`unix_fs_sun_path`] rejects them),
+///   * a path already inside the rootfs prefix (idempotence — never
+///     double-translate),
+///   * a translated path that cannot fit sun_path[108]
+///     ([`build_translated_unix_sockaddr`] rejects it) — the connect
+///     then runs on the RAW path and the existing EXIT arms decide.
+fn connect_translate_target(blob: &[u8], rootfs: &str) -> Option<(String, String, Vec<u8>)> {
+    if rootfs.is_empty() {
+        return None;
+    }
+    let guest_path = unix_fs_sun_path(blob)?;
+    if guest_path.starts_with(rootfs) {
+        return None; // already translated — never double-prefix
+    }
+    let host_path = translate_path(rootfs, guest_path);
+    if host_path == guest_path {
+        return None; // translation is a no-op for this path
+    }
+    let new_sa = build_translated_unix_sockaddr(&host_path)?;
+    Some((guest_path.to_string(), host_path, new_sa))
 }
 
 // ============================================================================
@@ -17421,6 +17489,175 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
+                        // ── 6-Z305p: AF_UNIX connect() sockaddr translation ──
+                        // the CLIENT-side mirror of the 6-Z305d bind rewrite.
+                        // See `connect_translate_target` for the full root
+                        // cause (run 34041198120): guest property-set clients
+                        // resolved "/dev/socket/property_service" against the
+                        // HOST root and reached the REDROID HOST's property
+                        // service — every ro.* set died with 0xb READ_ONLY,
+                        // init parked at wait_for_coldboot_done forever.
+                        //
+                        // Mechanics mirror the 6-Z163 bind arm exactly: peek
+                        // the sockaddr, build the translated blob, write it
+                        // to the tracer scratch area, repoint (arg2, arg3)
+                        // via one getregs/setregs (one retry, 6-Z268). The
+                        // local `regs` snapshot is kept consistent so later
+                        // ENTRY arms still read the same view.
+                        //
+                        // SCOPE (deliberate):
+                        //   * AOSP/system mode ONLY (!boot_recovery): TWRP's
+                        //     property flow is verified-green on the 6-Z110
+                        //     fake semantics (the old-format area aborts on
+                        //     real read-backs, run 32701082892) and the
+                        //     6-Z110 TWRP gate already guards it — changing
+                        //     recovery behavior here risks the four green
+                        //     guards for zero boot progress. Recovery keeps
+                        //     its proven path; the SYSTEM boot gets the real
+                        //     guest wire.
+                        //   * Direct connect ABIs only (socketcall_nr == -1):
+                        //     aarch64 + x86_64. The i386 socketcall class
+                        //     keeps its existing arms (recovery-only).
+                        //   * Abstract/relative/non-AF_UNIX sockaddrs are
+                        //     left alone (connect_translate_target → None),
+                        //     and paths already inside the rootfs prefix are
+                        //     never double-translated.
+                        //
+                        // When the guest listener does NOT exist (clients
+                        // racing init's StartPropertyService, or services
+                        // that never run — logd is the loud one: its socket
+                        // connects now fail honestly instead of leaking
+                        // guest log entries into the HOST's logd), the
+                        // connect fails ENOENT/ECONNREFUSED and the EXISTING
+                        // 6-Z110 ret<0 arm fakes the client side exactly as
+                        // before — the fallback is untouched.
+                        if !boot_recovery
+                            && past_first_execve
+                            && abi.connect_nr != -1
+                            && syscall_num == abi.connect_nr
+                            && abi.socketcall_nr == -1
+                            && scratch_addr != 0
+                        {
+                            static Z305Q_CONNECT_LOG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            static Z305Q_CONNECT_SKIP_LOG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let z305q_sa_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let z305q_sa_len = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                            let z305q_blob =
+                                if z305q_sa_ptr == 0 || z305q_sa_len < 3 || z305q_sa_len > 128 {
+                                    None
+                                } else {
+                                    read_child_bytes(pid, z305q_sa_ptr, 128)
+                                };
+                            let z305q_target =
+                                z305q_blob.and_then(|b| connect_translate_target(&b, rootfs));
+                            match z305q_target {
+                                Some((guest_path, host_path, new_sa)) => {
+                                    let aligned = (new_sa.len() + 7) & !7;
+                                    let cursor = if scratch_offset + aligned > 4096 {
+                                        0
+                                    } else {
+                                        scratch_offset
+                                    };
+                                    let sa_scratch = scratch_addr + cursor as u64;
+                                    if write_child_blob(pid, sa_scratch, &new_sa) {
+                                        let mut fresh: Regs = unsafe { std::mem::zeroed() };
+                                        match ptrace_getregs_wide(pid, &mut fresh) {
+                                            Err(e) => log(&format!(
+                                                "6-Z305q: connect sockaddr rewrite getregs FAILED: {} — connect runs on the RAW path",
+                                                e
+                                            )),
+                                            Ok(len) => {
+                                                set_syscall_arg(
+                                                    &mut fresh,
+                                                    abi.reg_arg2,
+                                                    sa_scratch,
+                                                );
+                                                set_syscall_arg(
+                                                    &mut fresh,
+                                                    abi.reg_arg3,
+                                                    new_sa.len() as u64,
+                                                );
+                                                let mut rewrite_ok =
+                                                    ptrace_setregs(pid, &fresh, len).is_ok();
+                                                if !rewrite_ok {
+                                                    // 6-Z268: one retry — transient
+                                                    // GETREGSET/SETREGSET failures
+                                                    // must not silently downgrade
+                                                    // the whole property wire.
+                                                    rewrite_ok = ptrace_setregs(
+                                                        pid, &fresh, len,
+                                                    )
+                                                    .is_ok();
+                                                }
+                                                if rewrite_ok {
+                                                    set_syscall_arg(
+                                                        &mut regs,
+                                                        abi.reg_arg2,
+                                                        sa_scratch,
+                                                    );
+                                                    set_syscall_arg(
+                                                        &mut regs,
+                                                        abi.reg_arg3,
+                                                        new_sa.len() as u64,
+                                                    );
+                                                    let n = Z305Q_CONNECT_LOG
+                                                        .fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                    if n < 24 {
+                                                        log(&format!(
+                                                            "6-Z305q: connect(fd={}, guest {:?}) sockaddr translated -> {} (len {} -> {}) — guest client reaches the GUEST listener",
+                                                            get_syscall_arg(
+                                                                &regs,
+                                                                abi.reg_arg1
+                                                            ),
+                                                            guest_path,
+                                                            host_path,
+                                                            z305q_sa_len,
+                                                            new_sa.len()
+                                                        ));
+                                                    }
+                                                } else {
+                                                    log(
+                                                        "6-Z305q: connect sockaddr setregs FAILED (twice) — connect runs on the RAW path",
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let n = Z305Q_CONNECT_SKIP_LOG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if n < 8 {
+                                            log(&format!(
+                                                "6-Z305q: connect sockaddr scratch write FAILED (pid {}) — connect runs on the RAW path [{} /8]",
+                                                pid,
+                                                n + 1
+                                            ));
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // No translation — the honest paths: abstract
+                                    // spellings, non-AF_UNIX families, already-
+                                    // translated names, over-long paths. Silent
+                                    // by design EXCEPT one bounded probe so a
+                                    // future decode can see the arm RAN (the
+                                    // 6-Z268 no-silent-branch lesson).
+                                    let n = Z305Q_CONNECT_SKIP_LOG
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n < 8 {
+                                        log(&format!(
+                                            "6-Z305q: connect(fd={}) sockaddr NOT translated (no AF_UNIX absolute guest path or too long) [{} /8]",
+                                            get_syscall_arg(&regs, abi.reg_arg1),
+                                            n + 1
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                         // 6-Z145 (Task 2): prctl-arg ENTRY logging — see the
                         // counter's declaration for the full rationale. The
                         // args are read from the ENTRY-side `regs` snapshot
@@ -23300,7 +23537,16 @@ pub fn run_ptrace_loop(
                                                 std::sync::atomic::AtomicU64::new(0);
                                             if MEMBER_REQ_LOG
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                                < 8
+                                                // 6-Z305p: 8 → 64. Run 34041198120's
+                                                // decode was blinded right here: the
+                                                // load-path calls exhausted the cap at
+                                                // +213 ms and every LATER serve (the
+                                                // prop-thread calls that mattered) was
+                                                // invisible, which fed the wrong
+                                                // "0 access-verdict serves" conclusion.
+                                                // 64 covers a full early boot without
+                                                // approaching a logging storm.
+                                                < 64
                                             {
                                                 log(&format!(
                                                     "6-Z305j: captured selinuxfs member request (pid {} fd {}): {:?}",
@@ -24062,7 +24308,17 @@ pub fn run_ptrace_loop(
                                                                 1,
                                                                 std::sync::atomic::Ordering::
                                                                     Relaxed,
-                                                            ) < 8
+                                                            )
+                                                            // 6-Z305p: 8 → 64 — same decode
+                                                            // blindness as the REQ cap above:
+                                                            // run 34041198120 burned the
+                                                            // 8-line budget on the load-path
+                                                            // serves and the later prop-thread
+                                                            // serves went dark exactly when
+                                                            // the boot stopped dying. 64 keeps
+                                                            // the wire observable through the
+                                                            // service-spawn region.
+                                                            < 64
                                                             {
                                                                 if is_access {
                                                                     log(&format!(
@@ -34183,6 +34439,124 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             sockaddr_blob_is_property_service(&blob4, addrlen_abs, &ABI_X86_64),
             Some(PropServSockaddrKind::AbstractNamespace)
         );
+    }
+
+    #[test]
+    fn z305q_sockaddr_matcher_accepts_translated_property_spelling() {
+        // 6-Z305p: after the ENTRY-side connect/bind sockaddr rewrite, the
+        // EXIT-side matchers peek the TRANSLATED blob —
+        // "{rootfs}/dev/socket/property_service" — and must still match.
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        let translated = format!("{}/dev/socket/property_service", rootfs);
+        let mut blob = vec![0u8; 128];
+        blob[0] = 1; // AF_UNIX
+        blob[1] = 0;
+        blob[2..2 + translated.len()].copy_from_slice(translated.as_bytes());
+        blob[2 + translated.len()] = 0;
+        let addrlen = (2 + translated.len() + 1) as i64;
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob, addrlen, &ABI_X86_64),
+            Some(PropServSockaddrKind::FilesystemPath)
+        );
+        // A superstring with a LONGER final component still must not
+        // match (".../property_service2"): the ends_with branch is only
+        // for the exact canonical spelling as the final component.
+        let sup = format!("{}/dev/socket/property_service2", rootfs);
+        let mut blob2 = vec![0u8; 128];
+        blob2[0] = 1;
+        blob2[1] = 0;
+        blob2[2..2 + sup.len()].copy_from_slice(sup.as_bytes());
+        blob2[2 + sup.len()] = 0;
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob2, 2 + sup.len() as i64 + 1, &ABI_X86_64),
+            None
+        );
+        // The exact guest spelling keeps matching (unchanged behavior).
+        let guest = b"/dev/socket/property_service";
+        let mut blob3 = vec![0u8; 128];
+        blob3[0] = 1;
+        blob3[1] = 0;
+        blob3[2..2 + guest.len()].copy_from_slice(guest);
+        blob3[2 + guest.len()] = 0;
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob3, 2 + guest.len() as i64 + 1, &ABI_X86_64),
+            Some(PropServSockaddrKind::FilesystemPath)
+        );
+    }
+
+    #[test]
+    fn z305q_connect_translate_target_core() {
+        // 6-Z305p pure decision core: translate guest AF_UNIX FS-spelling
+        // connect sockaddrs into the rootfs; refuse everything else.
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        // (a) The boot-critical case: the property socket.
+        let guest = b"/dev/socket/property_service";
+        let mut blob = vec![0u8; 128];
+        blob[0] = 1;
+        blob[1] = 0;
+        blob[2..2 + guest.len()].copy_from_slice(guest);
+        blob[2 + guest.len()] = 0;
+        let (g, h, new_sa) =
+            connect_translate_target(&blob, rootfs).expect("property socket must translate");
+        assert_eq!(g, "/dev/socket/property_service");
+        assert_eq!(h, format!("{}{}", rootfs, guest_str()));
+        assert_eq!(
+            new_sa,
+            build_translated_unix_sockaddr(&h).expect("built sockaddr must be valid")
+        );
+        // addrlen contract: family(2) + path + NUL.
+        assert_eq!(new_sa.len(), 2 + h.len() + 1);
+        // (b) Already-translated path → None (never double-prefix).
+        let translated = format!("{}/dev/socket/property_service", rootfs);
+        let mut blob2 = vec![0u8; 128];
+        blob2[0] = 1;
+        blob2[1] = 0;
+        blob2[2..2 + translated.len()].copy_from_slice(translated.as_bytes());
+        blob2[2 + translated.len()] = 0;
+        assert!(connect_translate_target(&blob2, rootfs).is_none());
+        // (c) Abstract spelling → None (outside this fix's semantics).
+        let mut blob3 = vec![0u8; 128];
+        blob3[0] = 1;
+        blob3[1] = 0;
+        blob3[2] = 0;
+        let name3 = b"property_service";
+        blob3[3..3 + name3.len()].copy_from_slice(name3);
+        assert!(connect_translate_target(&blob3, rootfs).is_none());
+        // (d) Relative path → None.
+        let mut blob4 = vec![0u8; 128];
+        blob4[0] = 1;
+        blob4[1] = 0;
+        let rel = b"property_service";
+        blob4[2..2 + rel.len()].copy_from_slice(rel);
+        blob4[2 + rel.len()] = 0;
+        assert!(connect_translate_target(&blob4, rootfs).is_none());
+        // (e) Non-AF_UNIX family → None.
+        let mut blob5 = vec![0u8; 128];
+        blob5[0] = 2; // AF_INET
+        blob5[1] = 0;
+        blob5[2..2 + guest.len()].copy_from_slice(guest);
+        blob5[2 + guest.len()] = 0;
+        assert!(connect_translate_target(&blob5, rootfs).is_none());
+        // (f) Empty rootfs prefix → None (nothing to translate).
+        assert!(connect_translate_target(&blob, "").is_none());
+        // (g) A translated path that cannot fit sun_path[108] → None
+        // (the connect then runs on the RAW path; EXIT arms decide).
+        let deep = format!(
+            "{}/very/deeply/nested/service/socket/with/a/long/name",
+            rootfs
+        );
+        let deep = format!("{}{}", deep, "x".repeat(40));
+        let mut blob6 = vec![0u8; 128];
+        blob6[0] = 1;
+        blob6[1] = 0;
+        blob6[2..2 + deep.len()].copy_from_slice(deep.as_bytes());
+        blob6[2 + deep.len()] = 0;
+        assert!(connect_translate_target(&blob6, rootfs).is_none());
+
+        // Helper so (a)'s expected host path reads clearly.
+        fn guest_str() -> String {
+            "/dev/socket/property_service".to_string()
+        }
     }
 
     #[test]

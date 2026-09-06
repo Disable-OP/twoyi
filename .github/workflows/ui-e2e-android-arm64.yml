@@ -361,6 +361,20 @@ jobs:
             > /tmp/ui-e2e-artifacts/logcat-dockerexec.txt 2>&1 || true
           timeout 30 sudo docker exec redroid /system/bin/sh -c "ps -A" \
             > /tmp/ui-e2e-artifacts/ps-dockerexec.txt 2>&1 || true
+          # ── 6-Z305p: THREAD-level view of the guest subtree ─────────────
+          # `ps -A` (above) shows process leaders only. Init's property
+          # service runs on a detached std::thread (PropertyServiceThread)
+          # whose wchan is invisible at process granularity — exactly the
+          # question the 6-Z305p decode could not answer ("is the prop
+          # thread idle, blocked in recv, or never started?"). The guest
+          # runs under the app's uid (u0_a87) while the HOST's own init is
+          # root — the uid filter keeps this artifact GUEST-only.
+          timeout 30 sudo docker exec redroid sh -c \
+            "for p in \$(ps -A | grep -E '^u0_a87 .* (init|ueventd|libkr64.so)$' | awk '{print \$2}'); do \
+               echo \"== threads of \$p (\$(cat /proc/\$p/cmdline 2>/dev/null | tr '\0' ' '))\"; \
+               ps -T -p \$p 2>/dev/null | head -24; \
+             done" \
+            > /tmp/ui-e2e-artifacts/guest-threads.txt 2>&1 || true
           timeout 45 sudo docker exec redroid sh -c \
             "tail -n 20000 /data/user/0/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || tail -n 20000 /data/data/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null" \
             > /tmp/ui-e2e-artifacts/kr64-app-stderr-dockerexec.log 2>&1 || true
@@ -391,6 +405,20 @@ jobs:
                [ -f \$f ] && echo \"== \$f (\$(stat -c%s \$f) bytes) first 32 hex:\" && od -A x -t x1 -N 32 \$f; \
              done" \
             > /tmp/ui-e2e-artifacts/property-area-state.txt 2>&1 || true
+          # ── 6-Z305p: guest property VALUE probe ──────────────────────────
+          # The area LISTING (above) cannot answer "did the set land?" —
+          # run 34041198120's decoder had to guess and guessed wrong (the
+          # ro.cold_boot_done set never reached the guest at all). This
+          # probe strings-dumps the guest's per-context prop area files so
+          # landed-vs-denied is directly readable (ro.cold_boot_done +
+          # "true" adjacency = landed). Values sit next to names in the
+          # prop trie; the grep keeps the artifact bounded per context.
+          timeout 30 sudo docker exec redroid sh -c \
+            "for f in /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/u:object_r:*; do \
+               echo \"== \$(basename \$f)\"; \
+               strings -n 4 \$f 2>/dev/null | grep -aE '^(ro\.|sys\.|init\.svc|init\.svc_debug_pid|persist\.)' | head -30; \
+             done" \
+            > /tmp/ui-e2e-artifacts/property-values.txt 2>&1 || true
           timeout 45 sudo docker exec redroid /system/bin/sh -c \
             "/system/bin/screencap -p /data/local/tmp/final-1.png 2>/dev/null && cat /data/local/tmp/final-1.png" \
             > /tmp/ui-e2e-artifacts/screencap-dockerexec.png 2>&1 || true
