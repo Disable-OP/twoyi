@@ -3698,6 +3698,12 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     // in ptrace_emu.rs serves the request/response protocol on this
     // regular file (write lands here, read EOF is intercepted and
     // answered with the synthesized transition context).
+    // 6-Z305j-followup: ANDROID-11 libselinux opens /sys/fs/selinux/CREATE
+    // (libselinux/src/compute_create.c line 67: snprintf(path, sizeof path,
+    // "%s/create", selinux_mnt)) — "member" was the pre-2.x node name. Both
+    // names are pre-created + served so old omni/TWRP libselinux (member)
+    // and stock R (create) both work.
+    touch("sys/fs/selinux/create", 0o666, "");
     touch("sys/fs/selinux/member", 0o666, "");
 
     // 6-Z271: device-mapper /sys node. First-stage init's
@@ -3724,7 +3730,7 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     );
 
     info!(
-        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null,member}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1); 6-Z305j added selinux/member — the security_compute_create node, was the bootstrap-apexd-failed reboot)",
+        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null,create,member}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1); 6-Z305j added selinux/member — the security_compute_create node, was the bootstrap-apexd-failed reboot)",
         rootfs_prefix
     );
 }
