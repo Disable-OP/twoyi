@@ -25140,3 +25140,56 @@ Stage Summary:
   stay green (getpid semantics changed for children too).
 - NEXT: decode the new ladder run → verify kptr action passes and the
   subcontext wall → next blocker in the Stage A→H ladder.
+
+---
+Task ID: 6-Z305i decode + next wall
+Agent: Z.ai Code (cron Continue, continued)
+Task: 6-Z305i verification decode (run on a0a3f92, artifact 9981975896).
+
+Work Log (decode):
+- FIXES VERIFIED: no kptr_restrict/mmap_rnd FATAL this run (the virtual
+  sysctl store passed the kptr wall silently); 6-Z305i getpid DIAG
+  fired (non-init pid 2714 keeps REAL getpid). Recovery guards GREEN
+  on a0a3f92 (TWRP angler + OrangeFox R12.0 lavender, runs
+  34008647593/34008646577) — the getpid/sysctl semantics changes are
+  recovery-neutral.
+- THE BOOT GOT FURTHER (+298ms past early-init actions: mkdir/acct,
+  memcg, /dev/net, linkerconfig exec, copy ld.config) and died on the
+  NEXT wall: "init: Command 'exec_start apexd-bootstrap'
+  action=early-init" FAILED → "<3>init: reboot-bootloader: Error
+  writing bootloader_message: failed" → "Clear action queue and start
+  shutdown trigger" → "Entering shutdown mode" → "Reboot start, reason:
+  reboot,bootloader,bootstrap-apexd-failed" (persist.sys.boot.reason)
+  → shutdown critical services all fail to start → "Stopping 113
+  services SIGTERM/SIGKILL" → sync/umount → "Reboot ending, jumping to
+  kernel" → init main (2710) exit 127 at +1086 ms. The ueventd service
+  children (2715/2717, cmdline "/system/bin/ueventd") also died 127 at
+  +426/+452 — secondary, decode next round.
+- KEY FACT (apex_extract INFO lines at boot): the rootfs DOES ship
+  system/apex/com.android.runtime.apex (ZIP-format, non-flattened);
+  kr64's apex_extract already extracts apex_payload.img (3 MB) at boot
+  and /apex/com.android.runtime/lib64/bionic/libdl.so EXISTS at
+  runtime (136608 bytes) — the /apex tree is RUNTIME-populated (the
+  static listing is misleading). Loop-mount is impossible (no
+  /dev/loop-control, EACCES) — the extraction uses its own reader.
+- NEXT WALL (6-Z305j): make exec_start apexd-bootstrap succeed
+  honestly — materialize the FULL flattened apex tree
+  (/apex/<name>/** from every system/apex/*.apex, including
+  com.android.runtime/bin/apexd) via the existing apex_extract
+  machinery BEFORE init's early-init runs, so the real apexd --bootstrap
+  finds an activated (flattened) apex tree. Decode first: WHY the
+  apexd-bootstrap exec_start failed (its exec path + child exit are in
+  the trace window; the four exit-127s need their klog text — the
+  WRITEV iov 4-6 bump now samples the logd FATAL wire).
+
+Stage Summary:
+- origin/main 082a0b6 (a0a3f92 + worklog). Ladder rungs reached: init
+  parses rc, executes early-init commands (mkdirs, linkerconfig),
+  starts ueventd — the boot is now INSIDE init.rc action execution.
+  The apexd-bootstrap wall is the single blocker between early-init
+  and the rest of the boot ladder (zygote/system_server/SF/launcher
+  all sit beyond it).
+- NEXT session: decode the apexd-bootstrap exec_start failure from
+  this run's window (kr64-app-stderr lines ~12868-13060), extend
+  apex_extract to full flattened-apex materialization (generic,
+  zero-ROM-modification), re-run.
