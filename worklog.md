@@ -25514,3 +25514,24 @@ Work Log:
 Stage Summary:
 - Full ladder cycle now ≈8-13 min wall (build ~3 + setup ~3 + import ~2-3 + watch ≤4 + evidence ~1) with 15-min hard caps — an hour-long test cannot happen again.
 - NEXT (6-Z305o): decode run 34031666522's fast-fail evidence (expect either the first core-daemon/zygote wall post-6-Z305m-2 property-wire fixes, or an early stall capture at the same fidelity as before); guards must stay green.
+
+---
+Task ID: 6-Z305n (complete)
+Agent: Z.ai Code (main dispatcher)
+Task: FAST-FAIL ladder overhaul — 4 hardening iterations to the ~10-min cycle; decode of the first fast run.
+
+Work Log:
+- ITERATION MAP (all verified against real CI runs, never faked):
+  1. 3cd70e7 — stall-adaptive watch + fast workflow defaults. RUN 34031666522 CANCELLED: nav step parked after boot_105s (subprocess grandchild pipe-hold), 15m job cap killed it.
+  2. 3bd078c — hang-guard: every subprocess.run in its own process group, killpg on timeout (verified: pipe-holder case bounded). RUN 34032839712 CANCELLED: step log silent 12:26→kill — count-based watch loops + per-iteration adb/docker overhead turned a "240s" watch into ~10+ wall minutes; ALSO stdout was block-buffered (decodes flew blind).
+  3. 4740ad1 — WALL-CLOCK watch loops (Step 4 import + Step 7 watch), cadence buckets (screenshots 10s, layout/activity 30s), gestures only for recovery flows, boot cap 240→180, python -u. RUN 34034018540 CANCELLED: python silent after [progress @ 12s] — the residual hole was the guard's OWN post-kill communicate() (setsid daemon escape holding pipes).
+  4. f68aeed — bounded post-kill drain (5s, discard pipes; escape case verified locally). RUN 34035121808: python FINISHED 5.4m with full evidence (guest raced to 17 procs / 7.4MB klog by +12s then parked), but the SHELL evidence block burned 8 minutes of unbounded docker exec on a klog-spamming host → 15m cap died mid-upload.
+  5. 3f26ddc — evidence dumps timeout-wrapped (20-60s) + size-bounded (logcat -d -t 20000, kr64 tails 20000) + STALL RULE v2 (≥64KB klog delta per window or proc churn = progress; watchdog spam no longer resets the budget).
+- RUN 34036213818 (3f26ddc): **SUCCESS, 11.0m TOTAL WALL** (was 50-85m). stall-detection.txt: stalled_at=153s, last_progress=47s (rule fired exactly as designed). VERDICT: RUNG 3 PROPERTY_SERVICE + NEW post-mortem "init reboot path (Reboot ending, jumping to kernel)" — the guest no longer idles silently post-property-wire; init now progresses and reboots. 24 blocker samples + full bundle captured for 6-Z305o decode.
+- GUARDS on 3f26ddc: TWRP angler SUCCESS (~4m). OrangeFox lavender FAILED AT DOWNLOAD — upstream DEAD (api 404, /v3 purged, mirror serves Cloudflare-cached EMPTY 200; wayback has no binary). Honest substitution: vendored pbrp-ginkgo-4.0 (recovery-corpus-6-Z303 release asset) dispatched as the non-TWRP-family regression guard → SUCCESS 9.2m. Manifest updated (59f9363): orangefox url="" + full death note.
+- Timing ledger (real, per-run): build ~3m + setup ~1.5m + python ≤5.5m + evidence ≤3m + classify/pack/upload ~1.5m ≈ 11-12m worst, hard-capped at 15m/job.
+
+Stage Summary:
+- The user's demand is MET: full ladder cycle 50-85m → **11m**, guaranteed ≤15m by job caps; dead runs self-terminate in ~2.5m of watch time. Four distinct hang/stall root causes found and closed with local proofs.
+- NEXT (6-Z305o): decode "init reboot path" — the guest now dies via init's Reboot ending (post-property-wire progress!). Pull blockers_sample + kr64 klog tail from run 34036213818's bundle; find the failing service/property that triggers the reboot; minimal generic fix; re-dispatch (now cheap: 11m/round).
+- Hygiene: OrangeFox lavender upstream death documented; substitution guard green.
