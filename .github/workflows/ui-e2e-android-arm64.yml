@@ -349,17 +349,22 @@ jobs:
           kill $WATCHER 2>/dev/null || true
 
           # ── final evidence dumps (docker exec — survives adb death) ──
-          sudo docker exec redroid /system/bin/logcat -d \
+          # 6-Z305n iter-4: EVERY dump is `timeout`-wrapped and size-bounded.
+          # Run 34035121808 burned 8 minutes here: a guest pushing a 7.5MB
+          # klog starved the host enough that unbounded `logcat -d` and
+          # friends crawled. Logs are truncated to the LAST N lines — the
+          # classifier needs the tail, not the whole history.
+          timeout 60 sudo docker exec redroid /system/bin/logcat -d -t 20000 \
             > /tmp/ui-e2e-artifacts/logcat-dockerexec.txt 2>&1 || true
-          sudo docker exec redroid /system/bin/sh -c "ps -A" \
+          timeout 30 sudo docker exec redroid /system/bin/sh -c "ps -A" \
             > /tmp/ui-e2e-artifacts/ps-dockerexec.txt 2>&1 || true
-          sudo docker exec redroid sh -c \
-            "tail -n 60000 /data/user/0/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || tail -n 60000 /data/data/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null" \
+          timeout 45 sudo docker exec redroid sh -c \
+            "tail -n 20000 /data/user/0/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || tail -n 20000 /data/data/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null" \
             > /tmp/ui-e2e-artifacts/kr64-app-stderr-dockerexec.log 2>&1 || true
-          sudo docker exec redroid sh -c \
+          timeout 30 sudo docker exec redroid sh -c \
             "tail -n 12000 /data/user/0/io.twoyi.debug/kr64.log 2>/dev/null" \
             > /tmp/ui-e2e-artifacts/kr64-dockerexec.log 2>&1 || true
-          sudo docker exec redroid sh -c \
+          timeout 30 sudo docker exec redroid sh -c \
             "ls -la /data/user/0/io.twoyi.debug/rootfs/ 2>/dev/null | head -40; \
              ls -la /data/user/0/io.twoyi.debug/rootfs/system/framework/ 2>/dev/null | head -10; \
              ls -la /data/user/0/io.twoyi.debug/rootfs/dev/socket/ 2>/dev/null; \
@@ -376,21 +381,21 @@ jobs:
                else echo \"MISS \$f\"; fi; \
              done" \
             > /tmp/ui-e2e-artifacts/rootfs-listing.txt 2>&1 || true
-          sudo docker exec redroid sh -c \
+          timeout 30 sudo docker exec redroid sh -c \
             "ls -la /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/ 2>/dev/null; \
              for f in /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/property_info \
                       /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/properties_serial; do \
                [ -f \$f ] && echo \"== \$f (\$(stat -c%s \$f) bytes) first 32 hex:\" && od -A x -t x1 -N 32 \$f; \
              done" \
             > /tmp/ui-e2e-artifacts/property-area-state.txt 2>&1 || true
-          sudo docker exec redroid /system/bin/sh -c \
+          timeout 45 sudo docker exec redroid /system/bin/sh -c \
             "/system/bin/screencap -p /data/local/tmp/final-1.png 2>/dev/null && cat /data/local/tmp/final-1.png" \
             > /tmp/ui-e2e-artifacts/screencap-dockerexec.png 2>&1 || true
           sleep 5
-          sudo docker exec redroid /system/bin/sh -c \
+          timeout 45 sudo docker exec redroid /system/bin/sh -c \
             "/system/bin/screencap -p /data/local/tmp/final-2.png 2>/dev/null && cat /data/local/tmp/final-2.png" \
             > /tmp/ui-e2e-artifacts/screencap-dockerexec-5s-later.png 2>&1 || true
-          sudo docker inspect redroid --format \
+          timeout 20 sudo docker inspect redroid --format \
             'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' \
             > /tmp/ui-e2e-artifacts/container-state.txt 2>&1 || true
           exit $RC
