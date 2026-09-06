@@ -693,35 +693,72 @@ pub fn write_proc_vm_properties(rootfs: &str, cpu_count: u32, mem_mb: u64) -> st
     Ok(())
 }
 
-/// Write boot-critical preset properties to `{rootfs}/system/build.prop`.
+/// Boot-defaults property files that init's `PropertyLoadBootDefaults()`
+/// reads, in EXACT load order (system/core/init/property_service.cpp,
+/// Android 11: lines 882-901). Later files override earlier ones — for
+/// `ro.` properties too ("Overriding previous 'ro.' property" path,
+/// verified live in run 34036213818 klog).
+///
+/// Appending the same override to EVERY file in this list that exists in
+/// the guest rootfs guarantees the override wins regardless of which
+/// partition layout a given system image (GSI) ships. Files that don't
+/// exist are skipped.
+const BOOT_DEFAULTS_PROP_FILES: &[&str] = &[
+    "system/etc/prop.default",
+    "system/build.prop",
+    "system_ext/build.prop",
+    "vendor/default.prop",
+    "vendor/build.prop",
+    "odm/etc/build.prop",
+    "odm/default.prop",
+    "odm/build.prop",
+    "product/build.prop",
+];
+
+/// Write boot-critical preset properties to the guest's boot-defaults
+/// property files.
 ///
 /// `PropertyLoadBootDefaults()` in `system/core/init/property_service.cpp`
 /// loads a FIXED list of .prop files (it does NOT scan `/system/etc/`
-/// generically — only `/system/etc/prop.default`, `/system/build.prop`,
-/// `/vendor/build.prop`, `/product/build.prop`, etc.). The previously-used
-/// `/system/etc/ro.vm.prop` is therefore NOT loaded by init's property
-/// service; only `ro.vm.*` consumers that read the file directly (none in
-/// AOSP 11) would see those values. To inject properties that init's
-/// property service actually loads, we must append to one of the files in
-/// `PropertyLoadBootDefaults`'s fixed list. `/system/build.prop` is the
-/// safest target: it always exists in a standard Android rootfs and is
-/// always loaded unconditionally.
+/// generically — see [`BOOT_DEFAULTS_PROP_FILES`] for the exact ordered
+/// list). The previously-used `/system/etc/ro.vm.prop` is therefore NOT
+/// loaded by init's property service; only `ro.vm.*` consumers that read
+/// the file directly (none in AOSP 11) would see those values. To inject
+/// properties that init's property service actually loads, we must append
+/// to one of the files in `PropertyLoadBootDefaults`'s fixed list.
+/// `/system/build.prop` is the safest primary target: it always exists in
+/// a standard Android rootfs and is always loaded unconditionally.
 ///
 /// # Properties injected
 ///
-/// | Property             | Value        | Why                                                          |
-/// |----------------------|--------------|--------------------------------------------------------------|
-/// | `apexd.status`       | `activated`  | Unblocks `wait_for_prop apexd.status activated` at           |
-/// |                      |              | init.rc:763. apexd exits 0 immediately in our container      |
-/// |                      |              | ("This device does not support updatable APEX. Exiting")     |
-/// |                      |              | and sets `apexd.status=activated` in its OWN per-process     |
-/// |                      |              | property table (the loader's in-memory `g_props` is          |
-/// |                      |              | per-process, not shared). Init's `wait_for_prop` busy-loops  |
-/// |                      |              | forever because the loader's `__system_property_wait_any`    |
-/// |                      |              | hook returns immediately, so a missing property = infinite   |
-/// |                      |              | spin. Pre-setting it in init's table (via this .prop file)   |
-/// |                      |              | lets `__system_property_find("apexd.status")` succeed and    |
-/// |                      |              | `wait_for_prop` return immediately.                          |
+/// | Property                 | Value        | Why                                                      |
+/// |--------------------------|--------------|----------------------------------------------------------|
+/// | `apexd.status`           | `activated`  | Unblocks `wait_for_prop apexd.status activated` at       |
+/// |                          |              | init.rc:763 as soon as init reaches it. On the           |
+/// |                          |              | container's flattened-apex device model (see next row)   |
+/// |                          |              | the real apexd main service also sets this property      |
+/// |                          |              | through the now-real property wire — the preset only     |
+/// |                          |              | guarantees the wait unblocks even if apexd main's        |
+/// |                          |              | own set is delayed.                                      |
+/// | `ro.apex.updatable`      | `false`      | Declares the container as a FLATTENED (non-updatable)    |
+/// |                          |              | APEX device — a genuine Android configuration            |
+/// |                          |              | (apexd_main.cpp:107). With it, `apexd --bootstrap`       |
+/// |                          |              | exits 0 BEFORE any loop-device work ("This device does   |
+/// |                          |              | not support updatable APEX. Exiting"), which removes     |
+/// |                          |              | three walls at once: the 20s `/dev/loop-control` wait,   |
+/// |                          |              | the `mkdir /apex/<name>@<ver>` EEXIST collisions with    |
+/// |                          |              | the host `/apex` bind mount, and the impossible          |
+/// |                          |              | loop-backed ext4 mounts. Without it, apexd-bootstrap     |
+/// |                          |              | exits 1 and its `reboot_on_failure` reboots the guest    |
+/// |                          |              | ("reboot,bootloader,bootstrap-apexd-failed" — run        |
+/// |                          |              | 34036213818).                                            |
+///
+/// `ro.apex.updatable=false` is appended to EVERY existing file in
+/// [`BOOT_DEFAULTS_PROP_FILES`] (not just `/system/build.prop`) because
+/// later-loading files override earlier ones even for `ro.` properties:
+/// a GSI shipping `ro.apex.updatable=true` in a later-loading file
+/// (e.g. `/product/build.prop`) must still lose to the container's device
+/// declaration.
 ///
 /// # Why not also set `ro.crypto.state`?
 ///
@@ -738,13 +775,13 @@ pub fn write_proc_vm_properties(rootfs: &str, cpu_count: u32, mem_mb: u64) -> st
 ///
 /// # Why append (not overwrite)?
 ///
-/// `/system/build.prop` already contains `ro.build.*` and other standard
-/// properties that the guest's framework expects. Overwriting would break
-/// those. Appending is safe: `LoadProperties` in property_service.cpp
-/// stores later entries in a `std::map` keyed by property name, and
-/// `PropertySet` honours "last write wins" for non-`ro.` properties.
-/// `apexd.status` is not `ro.`, so our appended value is the one that
-/// sticks.
+/// The guest's build.prop files already contain `ro.build.*` and other
+/// standard properties that the guest's framework expects. Overwriting
+/// would break those. Appending is safe: for `apexd.status` (non-`ro.`)
+/// the value simply lands; for `ro.apex.updatable` init's loader applies
+/// its "Overriding previous 'ro.' property" rule, so the appended line
+/// (which appears after any image-shipped value within the same file, and
+/// in later-loading files across the whole set) wins.
 pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
     let build_prop_path = format!("{}/system/build.prop", rootfs);
 
@@ -753,12 +790,17 @@ pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
     // Android rootfs, but possible for minimal test rootfs), create it.
     let existing = fs::read_to_string(&build_prop_path).unwrap_or_default();
 
-    // Only append if the property isn't already present (idempotency: a
-    // previous kr64 run may have already appended it). We check for the
-    // exact line `apexd.status=activated` to avoid duplicate entries.
-    let marker = "apexd.status=activated";
-    if existing.contains(marker) {
-        info!("[KR64][proc_emu] build.prop already contains apexd.status=activated — skip append");
+    // Idempotency is checked PER PROPERTY: a rootfs persisted from an
+    // older kr64 version may already carry `apexd.status=activated` but
+    // not the flattened-apex declaration (or vice versa). The early
+    // return must not skip a missing property.
+    let needs_apexd_status = !existing.contains("apexd.status=activated");
+    let needs_apex_updatable = !existing.contains("ro.apex.updatable=false");
+    if !needs_apexd_status && !needs_apex_updatable {
+        info!(
+            "[KR64][proc_emu] {} already contains both boot preset properties — skip append",
+            build_prop_path
+        );
         return Ok(());
     }
 
@@ -772,15 +814,31 @@ pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
     }
 
     // Build the append block. The leading newline ensures we don't
-    // concatenate with the last line of the existing file. No `format!`
-    // needed — there are no interpolation placeholders.
-    let append_block = "\n\
-         # --- twoyi kr64 boot preset properties ---\n\
-         # Appended by kr64's write_boot_preset_properties() to unblock\n\
-         # init's wait_for_prop apexd.status activated (init.rc:763).\n\
-         # apexd exits 0 immediately in our container and sets this prop\n\
-         # only in its own per-process table; init never sees it.\n\
-         apexd.status=activated\n";
+    // concatenate with the last line of the existing file.
+    let mut append_block = String::from("\n# --- twoyi kr64 boot preset properties ---\n");
+    if needs_apexd_status {
+        append_block.push_str(
+            "# Appended by kr64's write_boot_preset_properties(): unblocks\n\
+             # init's wait_for_prop apexd.status activated (init.rc:763).\n\
+             # The real apexd main service also sets this property through\n\
+             # the guest property wire; the preset only guarantees the wait\n\
+             # unblocks even if that set is delayed.\n\
+             apexd.status=activated\n",
+        );
+    }
+    if needs_apex_updatable {
+        append_block.push_str(
+            "# Declares the container as a flattened (non-updatable) APEX\n\
+             # device — a genuine Android configuration (apexd_main.cpp:\n\
+             # \"This device does not support updatable APEX. Exiting\").\n\
+             # apexd --bootstrap then exits 0 before any loop-device work:\n\
+             # no 20s /dev/loop-control wait, no /apex/<name>@<ver> mkdir\n\
+             # EEXIST collisions with the host /apex bind mount, no\n\
+             # loop-backed ext4 mounts — and therefore no\n\
+             # reboot_on_failure reboot (bootstrap-apexd-failed).\n\
+             ro.apex.updatable=false\n",
+        );
+    }
 
     // Open in append mode (creates the file if it doesn't exist).
     // `std::io::Write` is already imported at the top of this file.
@@ -799,10 +857,56 @@ pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
     }
 
     info!(
-        "[KR64][proc_emu] appended apexd.status=activated to {} ({} bytes appended)",
+        "[KR64][proc_emu] appended boot preset properties to {} ({} bytes appended)",
         build_prop_path,
         append_block.len()
     );
+
+    // `ro.apex.updatable=false` must ALSO reach every OTHER boot-defaults
+    // file that exists in this rootfs: init loads those files AFTER
+    // /system/build.prop and a later value overrides an earlier one even
+    // for `ro.` properties. Appending to every existing file makes the
+    // declaration win for ANY partition layout (GSI system-only, images
+    // with real vendor/odm/product, ...). Files that don't exist are
+    // skipped — we never create partition prop files, only mirror the
+    // declaration into what this image actually ships.
+    for rel in BOOT_DEFAULTS_PROP_FILES {
+        if *rel == "system/build.prop" {
+            continue; // already handled above (created if missing)
+        }
+        let path = format!("{}/{}", rootfs, rel);
+        if !Path::new(&path).exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        if content.contains("ro.apex.updatable=false") {
+            continue; // idempotent
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+        }
+        let mut f = fs::OpenOptions::new().append(true).open(&path)?;
+        f.write_all(
+            b"\n# --- twoyi kr64 boot preset properties ---\n\
+              # Flattened (non-updatable) APEX device declaration; see\n\
+              # kr64 proc_emu::write_boot_preset_properties. Later-loading\n\
+              # boot-defaults files override earlier ones even for ro.\n\
+              # properties, so every existing file carries the override.\n\
+              ro.apex.updatable=false\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+        }
+        info!(
+            "[KR64][proc_emu] appended ro.apex.updatable=false to {} (flattened-apex device declaration)",
+            path
+        );
+    }
+
     Ok(())
 }
 
@@ -1223,12 +1327,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&rootfs);
     }
 
-    /// Regression test: `write_boot_preset_properties` must append
-    /// `apexd.status=activated` to `{rootfs}/system/build.prop`. Without
-    /// this, init's `wait_for_prop apexd.status activated` (init.rc:763)
-    /// busy-loops forever because the loader's
-    /// `__system_property_wait_any` hook returns immediately, so a
-    /// missing property = infinite spin.
+    /// Regression test (6-Z305o): `write_boot_preset_properties` must append
+    /// `apexd.status=activated` AND the flattened-apex device declaration
+    /// `ro.apex.updatable=false` to `{rootfs}/system/build.prop`. Without
+    /// `apexd.status`, init's `wait_for_prop apexd.status activated`
+    /// (init.rc:763) busy-loops forever. Without `ro.apex.updatable=false`,
+    /// `apexd --bootstrap` takes the updatable path: a 20s
+    /// `/dev/loop-control` wait, `mkdir /apex/<name>@<ver>` EEXIST
+    /// collisions with the host `/apex` bind mount, exit 1, and the
+    /// `reboot_on_failure` shutdown cascade
+    /// ("reboot,bootloader,bootstrap-apexd-failed" — run 34036213818).
     #[test]
     fn write_boot_preset_properties_appends_apexd_status() {
         let rootfs = tmpdir();
@@ -1253,6 +1361,68 @@ mod tests {
             content.contains("apexd.status=activated"),
             "apexd.status=activated should be appended: {}",
             content
+        );
+        assert!(
+            content.contains("ro.apex.updatable=false"),
+            "ro.apex.updatable=false (flattened-apex device declaration) should be appended: {}",
+            content
+        );
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test (6-Z305o): on a GSI-style rootfs where the image
+    /// itself declares `ro.apex.updatable=true` in a LATER-loading
+    /// boot-defaults file (e.g. `/product/build.prop`), the container's
+    /// flattened-device declaration must be appended to that file too —
+    /// init's loader lets later files override earlier `ro.` properties,
+    /// so the last-loading existing file must carry our value.
+    #[test]
+    fn apex_updatable_override_lands_on_every_existing_boot_defaults_file() {
+        let rootfs = tmpdir();
+        for rel in [
+            "system/build.prop",
+            "system_ext/build.prop",
+            "vendor/default.prop",
+            "vendor/build.prop",
+            "product/build.prop",
+        ] {
+            let dir = format!("{rootfs}/{}", rel.rsplit_once('/').unwrap().0);
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                format!("{rootfs}/{rel}"),
+                "# image-shipped\nro.apex.updatable=true\n",
+            )
+            .unwrap();
+        }
+
+        write_boot_preset_properties(&rootfs).expect("write_boot_preset_properties");
+
+        for rel in [
+            "system/build.prop",
+            "system_ext/build.prop",
+            "vendor/default.prop",
+            "vendor/build.prop",
+            "product/build.prop",
+        ] {
+            let content = std::fs::read_to_string(format!("{rootfs}/{rel}")).unwrap();
+            assert!(
+                content.contains("ro.apex.updatable=false"),
+                "{rel} must carry the flattened-apex declaration: {}",
+                content
+            );
+            // Image-shipped content must be preserved (append, not overwrite).
+            assert!(
+                content.contains("ro.apex.updatable=true"),
+                "{rel} image content must be preserved: {}",
+                content
+            );
+        }
+
+        // Files that don't exist must NOT be created.
+        assert!(
+            !Path::new(&format!("{rootfs}/odm/etc/build.prop")).exists(),
+            "missing boot-defaults files must not be created"
         );
 
         let _ = std::fs::remove_dir_all(&rootfs);
@@ -1279,6 +1449,13 @@ mod tests {
             count, 1,
             "apexd.status=activated should appear exactly once (got {}): {}",
             count, content
+        );
+        // Exactly one occurrence of the flattened-apex declaration
+        let count_updatable = content.matches("ro.apex.updatable=false").count();
+        assert_eq!(
+            count_updatable, 1,
+            "ro.apex.updatable=false should appear exactly once (got {}): {}",
+            count_updatable, content
         );
 
         let _ = std::fs::remove_dir_all(&rootfs);
