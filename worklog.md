@@ -25335,3 +25335,58 @@ Stage Summary:
   window for the subprocess pids + capture its last 50 syscalls; check
   whether setegid needs the 6-Z155 fake family, and what FATALs the
   handler silently); then the ro.hardware/ro.zygote property-import gap.
+
+---
+Task ID: 6-Z305k
+Agent: Z.ai Code (main dispatcher, cron Continue)
+Task: decode the ueventd coldboot subprocess-127 wall; smallest generic fix; regression + dispatch.
+
+Work Log:
+- Run 34014336281 evidence decoded (logs + 40MB artifact). Verdict rung 3
+  (PROPERTY_SERVICE); guest died in the ueventd critical loop (5 spawns,
+  all exit 127 → critical ×4 → InitFatalReboot).
+- WALL DECODED (trace, +705-710ms): AOSP-11 ColdBoot forks N handler
+  subprocesses; subprocess 2731 handled the synthetic device-mapper
+  uevent (6-Z274) → devices.cpp MakeDevice → setegid(gid) ERROR (EPERM,
+  `goto out` — mknod SKIPPED) → trailing setegid(AID_ROOT) PLOG(FATAL)
+  → bionic abort (debuggerd handler ran; rt_tgsigqueueinfo re-raise
+  failed → _exit(127)) → ueventd main WaitForSubProcesses LOG(FATAL)
+  ("subprocess exited with status 127") → ueventd 127.
+  ROOT CAUSE: the 6-Z155 identity-fake table carried aarch64
+  setresgid_nr=148 — asm-generic says 148=getresgid, setresgid=149
+  (verified /usr/include/asm-generic/unistd.h + kernel UAPI). The fake
+  NEVER fired on arm64; bionic setegid = setresgid(-1,gid,-1) hit real
+  EPERM. Trace smoking gun: fchownat(54) → nr=149 → mmap/prctl →
+  writev FATAL "setegid(AID_ROOT) failed: Operation not permitted".
+  Recovery stayed green because TWRP init's setresuid(147)/setgroups(159)
+  (correct numbers) fired first.
+- SECONDARY (same wall): spawn #3 (pid 2817) died at `cannot
+  setexeccon('u:r:ueventd:s0')` EINVAL — the 6-Z29 write-fake resolved
+  the fd through the fd-ONLY open_fd_paths map (cross-process aliasing);
+  a stale entry hid the attr/exec path → raw host EINVAL → init
+  _exit(127)'d the spawn. Fixed: (pid,fd) owner-map first + bounded
+  miss-DIAG.
+- UPSTREAM QUIRK (no action, documented): `copy /linkerconfig/
+  bootstrap/ld.config.txt` fails "Skipping insecure file" because
+  linkerconfig main.cc:316 calls umask(0x0022) — HEX 0x22 = 0o42 — so
+  outputs are 0o624 (group-writable); init ReadFile refuses S_IWGRP.
+  Non-fatal on real AOSP-11 devices too; container stays faithful.
+- DIAG LABELS: arm64 name table had 174="gettid" (is getuid), 175=
+  "sysinfo" (is geteuid); corrected + 172/173/176-179 + getresuid(148)/
+  getresgid(150) added. Labels only.
+- Commit 06046b4 (fix + this worklog). 754 tests green, fmt/clippy
+  clean (local x86_64; aarch64-gated asserts compile on CI arm64).
+
+Stage Summary:
+- NEXT WALL (6-Z305l, pre-characterized from this run's kmsg): every
+  ro.* property set fails "SELinux permission check failed" — init
+  cannot set ro.hardware; ro.zygote/ro.hardware never land →
+  `import /init.${ro.hardware}.rc` + init.${ro.zygote}.rc expansion
+  fails → zygote wall. Root: the virtual selinuxfs serves
+  create/member but NOT the `access` node that property check_mac_perms
+  needs (selinux_check_access fails closed). Plan: implement an
+  access-node verdict protocol (synthesize allow for init's self-mac
+  checks) on the 6-Z305j virtual selinuxfs.
+- Dispatched on 06046b4: Boot Ladder + TWRP angler + OrangeFox lavender
+  guards (getpid-family + attr/exec semantic changes are shared
+  plumbing — recovery must stay green).
