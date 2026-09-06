@@ -47,9 +47,9 @@ name: Android Boot Ladder (ARM64 via redroid on ubuntu-24.04-arm)
   workflow_dispatch:
     inputs:
       boot_wait_seconds:
-        description: 'HARD CAP on the boot watch (seconds). Stall-adaptive: exits early once the guest freezes for stall_seconds — default 240 keeps the whole cycle ≈10 min'
+        description: 'HARD CAP (wall-clock) on the boot watch (seconds). Stall-adaptive: exits early once the guest freezes for stall_seconds — default 180 keeps the whole cycle ≈10 min'
         required: false
-        default: '240'
+        default: '180'
       stall_seconds:
         description: 'FAST-FAIL: end the boot watch after this many seconds with NO guest progress (klog+procs frozen; 60s grace). Default 90; 0 disables fast-fail'
         required: false
@@ -316,7 +316,7 @@ jobs:
 
       - name: UI navigation — import rootfs + boot Android
         env:
-          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '240' }}
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '180' }}
           TWOYI_STALL_SECONDS: ${{ github.event.inputs.stall_seconds || '90' }}
           TWOYI_IMPORT_WAIT_SECONDS: ${{ github.event.inputs.import_wait_seconds || '300' }}
           TWOYI_ROM_FILE: rootfs.tar.gz
@@ -344,7 +344,7 @@ jobs:
           ) &
           WATCHER=$!
           RC=0
-          python3 scripts/ui-navigate.py || RC=$?
+          python3 -u scripts/ui-navigate.py || RC=$?
           touch /tmp/ui-e2e-artifacts/nav-done
           kill $WATCHER 2>/dev/null || true
 
