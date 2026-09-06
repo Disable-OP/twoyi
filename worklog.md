@@ -25481,3 +25481,16 @@ Work Log:
 
 Stage Summary:
 - CheckMacPerms chain now closes end-to-end on aarch64: discovery ✓ → class=1/perm=1 ✓ → access verdict served (allow-all) → property sets land. Expect late-init → class_start core → servicemanager/logd/vold/keystore2/zygote spawns next run.
+---
+Task ID: 6-Z305m-2
+Agent: Z.ai Code (main dispatcher, cron Continue)
+Task: decode run 34025888210 (9276692) — verdict serves landed but stale-tail reads denied later sets; position-independent serving.
+
+Work Log:
+- Run 34025888210 decoded: fd-stash fix VERIFIED (7× "access verdict served", "Init cannot set" 141→28) — but the boot still stalls at wait_for_coldboot_done (+977ms; init main ep_poll, guest tree init×2+ueventd).
+- WALL: ueventd's sys.coldboot_done=1 set (via the property socket → init prop thread → CheckMacPerms → compute_av) was DENIED. Mechanism: the virtual nodes are REGULAR files — a shorter request after a longer one leaves stale tail bytes; the follow-up read returns N>0 residue (NOT EOF) → the ret==0 serve gate missed → sscanf(<5 fields) → deny → WaitForProperty("sys.coldboot_done") idles forever (PropertyChanged never fires). init's own first-7 unique-key sets hit EOF (fresh file / exact-length overwrites) and served — the asymmetry that hid the bug.
+- FIX (same commit family): serve arm gate ret==0 → ret>=0 (position-independent; kernel selinuxfs nodes have no file-position semantics — ANY successful read is a protocol read; errors stay honest). Read buffer pointer now stashed at ENTRY (selinux_node_read_buf) with the EXIT-snapshot fallback (x1 empirically intact for read(): 7 serves). Member/create unchanged in shape: serve still requires a pending captured request; without one the guest sees the honest EOF/"" accident that compute_create.c accepts.
+- 761 tests green, fmt+clippy clean. Pushed; dispatched Boot Ladder + TWRP + OrangeFox guards.
+
+Stage Summary:
+- The CheckMacPerms chain is now complete for EVERY caller (init, vendor_init, ueventd, and later zygote/system_server property threads): discovery ✓ → class/perm ✓ → verdict on ANY read ✓. Expected next: sys.coldboot_done lands → late-fs/post-fs-data → class_start core → servicemanager/logd/vold/keystore2/zygote spawns (rung 4-5) — the first honest zygote wall is the anticipated 6-Z305n subject.

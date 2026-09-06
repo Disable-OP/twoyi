@@ -12262,6 +12262,14 @@ pub fn run_ptrace_loop(
     // they survive.
     let mut selinux_node_write_args: std::collections::HashMap<libc::pid_t, (i32, u64, usize)> =
         std::collections::HashMap::new();
+    // 6-Z305m: ENTRY-side buffer-pointer stash for read() calls on the
+    // same nodes — (pid → buf_ptr). The serve arm rewrites the guest's
+    // read buffer at EXIT; x1 is empirically intact there (run
+    // 34025888210: 7 verdict serves) but the 6-Z278 round-5 evidence
+    // records x1-x5 clobbering for other exit paths — stash at ENTRY
+    // where x1 is guaranteed, fall back to the EXIT snapshot.
+    let mut selinux_node_read_buf: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
     // 6-Z199: ENTRY-side arg1 stash — (pid → (syscall_nr, fd)) captured
     // at the ENTRY stop of fd-taking syscalls, consumed by their EXIT
     // arms. On aarch64 x0 is BOTH arg1 and the return register, so the
@@ -15627,6 +15635,24 @@ pub fn run_ptrace_loop(
                                         get_syscall_arg(&regs, abi.reg_arg3) as usize,
                                     ),
                                 );
+                            }
+                        }
+                        // 6-Z305m: same stash for read(fd, buf, count) on a
+                        // node fd — the serve arm needs the guest's buffer
+                        // pointer at EXIT.
+                        if abi.read != -1 && syscall_num == abi.read {
+                            let z305m_rfd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            let z305m_rpath = open_fd_owner_paths
+                                .get(&(pid, z305m_rfd))
+                                .or_else(|| open_fd_paths.get(&z305m_rfd))
+                                .cloned();
+                            if z305m_rpath
+                                .as_deref()
+                                .map(is_selinuxfs_transition_node)
+                                .unwrap_or(false)
+                            {
+                                selinux_node_read_buf
+                                    .insert(pid, get_syscall_arg(&regs, abi.reg_arg2));
                             }
                         }
                         // 6-Z305l: SO_PEERSEC getsockopt ENTRY stash —
@@ -23965,17 +23991,14 @@ pub fn run_ptrace_loop(
                         // 34008640395). The computed context only feeds
                         // socket labeling (non-fatal), but the COMPUTE
                         // step must succeed for the service to start.
-                        if ret == 0 {
+                        if ret >= 0 {
                             // 6-Z305m: fd from the 6-Z199 ENTRY stash — at
-                            // the aarch64 EXIT stop x0 IS the return value
-                            // (0 for this EOF read), so the old
-                            // raw-register "fd" was always 0 and the
-                            // (pid, 0) lookup missed for every aarch64
-                            // guest: the verdict/context was never served
-                            // and compute_av.c hit the honest EOF
-                            // (sscanf < 5 fields → deny). Falls back to
-                            // the raw register on a stash miss (x86_64
-                            // preserves arg registers across the syscall).
+                            // the aarch64 EXIT stop x0 IS the return value,
+                            // so the old raw-register "fd" was the byte
+                            // count/0 and the lookup missed for every
+                            // aarch64 guest. Falls back to the raw register
+                            // on a stash miss (x86_64 preserves arg
+                            // registers across the syscall).
                             let mfd = match pending_entry_fd.get(&pid) {
                                 Some((nr, f)) if *nr == syscall_num => *f as i32,
                                 _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
@@ -23985,9 +24008,22 @@ pub fn run_ptrace_loop(
                                 .or_else(|| open_fd_paths.get(&mfd));
                             if let Some(p) = mpath {
                                 if is_selinuxfs_transition_node(p) {
-                                    // 6-Z305l: the access node serves the
-                                    // allow-all av_decision line; member/create
-                                    // serve the transition context.
+                                    // 6-Z305m: POSITION-INDEPENDENT serving.
+                                    // The nodes are regular files: a shorter
+                                    // request after a longer one leaves stale
+                                    // tail bytes, so the follow-up read returns
+                                    // N>0 stale bytes (NOT EOF) and the old
+                                    // ret==0 gate missed — run 34025888210:
+                                    // init's own property sets served (7×) but
+                                    // ueventd's sys.coldboot_done set (a
+                                    // different request length) read tail
+                                    // residue → sscanf < 5 fields → deny →
+                                    // WaitForProperty(“sys.coldboot_done”)
+                                    // idles in ep_poll forever. The kernel
+                                    // nodes have no file-position semantics;
+                                    // ANY successful read of the node is a
+                                    // protocol read and gets the verdict/
+                                    // response. Errors (ret<0) stay honest.
                                     let is_access = p.ends_with("/sys/fs/selinux/access");
                                     let resp_opt = if is_access {
                                         Some(twoyi_selinux_access_response().to_string())
@@ -23997,7 +24033,14 @@ pub fn run_ptrace_loop(
                                             .and_then(|req| twoyi_selinux_member_response(&req))
                                     };
                                     if let Some(resp) = resp_opt {
-                                        let mbuf = get_syscall_arg(&regs, abi.reg_arg2);
+                                        // 6-Z305m: buffer pointer from the ENTRY
+                                        // stash (guaranteed by construction);
+                                        // fall back to the EXIT snapshot which
+                                        // is empirically intact for read().
+                                        let mbuf =
+                                            selinux_node_read_buf.remove(&pid).unwrap_or_else(
+                                                || get_syscall_arg(&regs, abi.reg_arg2),
+                                            );
                                         if mbuf != 0
                                             && write_child_string_unchecked(pid, mbuf, &resp)
                                         {
