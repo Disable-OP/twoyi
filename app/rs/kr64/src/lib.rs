@@ -3686,6 +3686,19 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     touch("sys/fs/selinux/enforce", 0o666, "0");
     touch("sys/fs/selinux/load", 0o666, "");
     touch("sys/fs/selinux/null", 0o666, "");
+    // 6-Z305j: the libselinux security_compute_create() request/response
+    // node. Pure-stock Android 11 init's Service::Start() →
+    // ComputeContextFromExecutable ends with security_compute_create —
+    // without `member` the open() ENOENTs (or selinux_mnt stays NULL
+    // because statfs f_type != SELINUX_MAGIC — patched at the statfs
+    // EXIT arm) → "Could not get process context" → exec_start
+    // apexd-bootstrap failed → init.rc reboot
+    // bootloader,bootstrap-apexd-failed → full shutdown cascade (run
+    // 34008640395, kmsg lines 165-173). The write()/read() EXIT pair
+    // in ptrace_emu.rs serves the request/response protocol on this
+    // regular file (write lands here, read EOF is intercepted and
+    // answered with the synthesized transition context).
+    touch("sys/fs/selinux/member", 0o666, "");
 
     // 6-Z271: device-mapper /sys node. First-stage init's
     // BlockDevInitializer::InitMiscDevice() (AOSP system/core/init/
@@ -3711,7 +3724,7 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     );
 
     info!(
-        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1))",
+        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null,member}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1); 6-Z305j added selinux/member — the security_compute_create node, was the bootstrap-apexd-failed reboot)",
         rootfs_prefix
     );
 }
