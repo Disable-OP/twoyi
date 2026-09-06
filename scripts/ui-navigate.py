@@ -1819,16 +1819,48 @@ def main():
                     break
             except Exception:
                 continue
+        # 6-Z305o HOST-CONTAMINATION FIX: the previous probe counted every
+        # HOST process matching init|zygote|system_server|surfaceflinger|…
+        # — but redroid runs its OWN Android framework, so HOST boot churn
+        # registered as GUEST progress and kept stalled guests "alive" in
+        # the watch (the exact false-positive class the classifier's
+        # run-33987046990 guard removed from the verdict path). Guest
+        # processes are the io.twoyi.debug SUBTREE: pull PID/PPID/NAME and
+        # BFS the subtree here (same semantics as
+        # scripts/android-boot-classify.py guest_process_view).
         try:
             r = subprocess.run(
                 ["sudo", "docker", "exec", "redroid", "sh", "-c",
-                 "ps -A -o NAME 2>/dev/null | grep -cE "
-                 "'init|twoyi|kr64|zygote|system_server|surfaceflinger|"
-                 "servicemanager|vold|keystore2|ueventd'"],
+                 "ps -A -o PID,PPID,NAME 2>/dev/null"],
                 capture_output=True, text=True, timeout=15)
-            lines = (r.stdout or "").strip().splitlines()
-            if lines and lines[-1].strip().isdigit():
-                procs = int(lines[-1].strip())
+            rows = []
+            for line in (r.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                try:
+                    rows.append((int(parts[0]), int(parts[1]), parts[-1]))
+                except ValueError:
+                    continue  # header line
+            if rows:
+                parent = {pid: ppid for pid, ppid, _name in rows}
+                app = None
+                for pid, _ppid, name in rows:
+                    if name.rstrip("]").endswith(PACKAGE):
+                        app = pid
+                        break
+                if app is not None:
+                    guests = {app}
+                    changed = True
+                    while changed:
+                        changed = False
+                        for pid, ppid in parent.items():
+                            if ppid in guests and pid not in guests:
+                                guests.add(pid)
+                                changed = True
+                    procs = len(guests)
+                else:
+                    procs = 0  # app process gone: guest definitively not running
         except Exception:
             pass
         return size, procs
@@ -2625,6 +2657,44 @@ def main():
     logcat = adb("logcat", "-d", timeout=15)
     with open(os.path.join(ART, "logcat.txt"), "w") as f:
         f.write(logcat)
+
+    # 6-Z305o LOG-SOURCE MANIFEST: this E2E runs on redroid, which is
+    # ITSELF a full Android system. The HOST's own boot log looks exactly
+    # like a successful guest Android boot (zygote, system_server,
+    # SystemUI, "Boot completed" — all HOST). Decoders MUST read this
+    # manifest first and only ever take guest verdicts from GUEST-sourced
+    # artifacts (user directive + the run-33987046990 host-contamination
+    # lesson, which the classifier already guards against).
+    with open(os.path.join(ART, "LOG-SOURCES.txt"), "w") as f:
+        f.write(
+            "# LOG SOURCE MANIFEST — read BEFORE interpreting any artifact.\n"
+            "# Two Android systems produce logs in this run:\n"
+            "#   HOST  = the redroid container's own Android (its framework\n"
+            "#           boot is NOT twoyi progress, no matter how similar\n"
+            "#           it looks)\n"
+            "#   GUEST = the Android running inside the twoyi app\n"
+            "#   APP   = the twoyi app process itself (bridges GUEST data)\n"
+            "#\n"
+            "# HOST   logcat.txt                 adb logcat -d of the redroid HOST\n"
+            "# HOST   logcat-dockerexec.txt      host logcat via docker exec\n"
+            "# HOST   redroid.log                docker container log\n"
+            "# HOST   docker-exec-watch.log      liveness watcher; its ps lines are HOST\n"
+            "#                                   processes (explicitly labeled in-log)\n"
+            "# APP    app-logs/log/*.log         twoyi app FileLogger (app story; kr64.log\n"
+            "#                                   inside it carries the GUEST klog timeline)\n"
+            "# GUEST  kr64-app-stderr.log        kr64 daemon stderr — guest syscall traces\n"
+            "#                                   + KLOG-TIMELINE (the boot-timeline source)\n"
+            "# GUEST  dev-__kmsg__               guest __kmsg__ mirror (guest kernel-log\n"
+            "#                                   writes incl. init/recovery fatals)\n"
+            "# GUEST  property-area-state.txt    guest rootfs property area state\n"
+            "# MIXED  ps-dockerexec.txt          FULL host ps -A dump — guest processes are\n"
+            "#                                   the io.twoyi.debug SUBTREE only (the\n"
+            "#                                   classifier's guest_process_view does the\n"
+            "#                                   BFS; raw ps includes HOST framework procs)\n"
+            "#\n"
+            "# Rung verdicts: scripts/android-boot-classify.py consumes kr64 logs,\n"
+            "# property-area state, and the io.twoyi.debug ps subtree ONLY.\n"
+        )
 
     # Pull app's FileLogger logs
     print("  Pulling app file logs...")
