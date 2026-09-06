@@ -10206,6 +10206,16 @@ pub fn is_selinuxfs_root(translated: &str, rootfs: &str) -> bool {
         || translated == format!("{}/selinux", rootfs)
 }
 
+/// Whether `fd_path` is one of the virtual selinuxfs transition
+/// request/response nodes. ANDROID-11 libselinux security_compute_create
+/// opens `<selinux_mnt>/create` (compute_create.c); libselinux < 2.x
+/// (old omni TWRP) opens `<selinux_mnt>/member`. Both are pre-created
+/// regular files; the write()/read() EXIT pair serves the identical
+/// request/response protocol on either.
+pub fn is_selinuxfs_transition_node(fd_path: &str) -> bool {
+    fd_path.ends_with("/sys/fs/selinux/create") || fd_path.ends_with("/sys/fs/selinux/member")
+}
+
 /// Synthesize the `security_compute_create` response for a captured
 /// `/sys/fs/selinux/member` request (see the read() EXIT handler).
 ///
@@ -22861,7 +22871,7 @@ pub fn run_ptrace_loop(
                                 .get(&(pid, mfd))
                                 .or_else(|| open_fd_paths.get(&mfd));
                             if let Some(p) = mpath {
-                                if p.ends_with("/sys/fs/selinux/member") {
+                                if is_selinuxfs_transition_node(p) {
                                     let mbuf = get_syscall_arg(&regs, abi.reg_arg2);
                                     let mcount = get_syscall_arg(&regs, abi.reg_arg3) as usize;
                                     if mbuf != 0 && mcount > 0 {
@@ -23359,7 +23369,7 @@ pub fn run_ptrace_loop(
                                 .get(&(pid, mfd))
                                 .or_else(|| open_fd_paths.get(&mfd));
                             if let Some(p) = mpath {
-                                if p.ends_with("/sys/fs/selinux/member") {
+                                if is_selinuxfs_transition_node(p) {
                                     if let Some(req) = selinux_member_pending.remove(&(pid, mfd)) {
                                         if let Some(resp) = twoyi_selinux_member_response(&req) {
                                             let mbuf = get_syscall_arg(&regs, abi.reg_arg2);
@@ -24857,6 +24867,81 @@ pub fn run_ptrace_loop(
                             }
                         }
                     }
+                    // ── 6-Z305j: SELINUX_MAGIC f_type patch (EXIT side)
+                    // ── consumed the stash armed by the statfs ENTRY arm.
+                    // Runs for EVERY EXIT stop on EVERY ABI — the previous
+                    // placement (inside the `_forced_ret_opt.is_some() ||
+                    // abi.execve == 11` region) NEVER fired on aarch64:
+                    // statfs is not in the compute table and abi.execve is
+                    // 221 there, so the whole fresh-regs2 block was dead
+                    // code for the aarch64 guest.
+                    //
+                    // WHY it matters (run 34012554250 decode): second-stage
+                    // init is a FRESH process image (init re-exec) — libselinux
+                    // state resets, and selinux_mnt is re-detected ONLY by
+                    // verify_selinuxmnt(): statfs("/sys/fs/selinux") must
+                    // report f_type == SELINUX_MAGIC (0xf97cff8c) +
+                    // statvfs writable. On the regular-dir fake the real
+                    // fstype (ext4/f2fs) fails that check, the /proc/mounts
+                    // fallback finds nothing, and selinux_mnt stays NULL for
+                    // the whole second stage → string_to_security_class +
+                    // security_compute_create short-circuit with ZERO
+                    // syscalls → ComputeContextFromExecutable: "Could not
+                    // get process context" for every no-seclabel service →
+                    // reboot bootloader,bootstrap-apexd-failed.
+                    // Conditional consume: only when (pid, nr) match — an
+                    // interleaved stop from another pid/thread must not
+                    // discard the pending patch (unlike the z206 log-only
+                    // stash, a dropped stash here means NO magic →
+                    // verify_selinuxmnt fails again).
+                    let statfs_stash_matches = matches!(
+                        &selinux_statfs_pending,
+                        Some((spid, snr, ..)) if *spid == pid && *snr == syscall_num
+                    );
+                    if statfs_stash_matches {
+                        if let Some((spid, snr, sbuf, sis64)) = selinux_statfs_pending.take() {
+                            if spid == pid && snr == syscall_num {
+                                // Fresh regs (the stale `regs` snapshot may have
+                                // been rewritten by dedicated handlers above).
+                                let mut sregs: Regs = unsafe { std::mem::zeroed() };
+                                let sret = ptrace_getregs_wide(pid, &mut sregs)
+                                    .map(|_| get_syscall_arg(&sregs, abi.reg_ret) as i64)
+                                    .unwrap_or(-1);
+                                if sret == 0 && sbuf != 0 {
+                                    if let Some(mut sbuf_bytes) = read_child_bytes(pid, sbuf, 16) {
+                                        if sbuf_bytes.len() == 16 {
+                                            if sis64 {
+                                                sbuf_bytes[0..8]
+                                                    .copy_from_slice(&SELINUX_MAGIC.to_le_bytes());
+                                            } else {
+                                                sbuf_bytes[0..4].copy_from_slice(
+                                                    &(SELINUX_MAGIC as u32).to_le_bytes(),
+                                                );
+                                            }
+                                            let mut vw: Option<bool> = None;
+                                            let (written, how) = write_child_bytes_injection(
+                                                pid,
+                                                sbuf,
+                                                &sbuf_bytes,
+                                                &mut vw,
+                                            );
+                                            static STATFS_MAGIC_LOG: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            if STATFS_MAGIC_LOG
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                                < 8
+                                            {
+                                                log(&format!(
+                                                "6-Z305j: statfs f_type patched to SELINUX_MAGIC ({}/16 bytes via {}) — verify_selinuxmnt() will now succeed",
+                                                written, how
+                                            ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let _forced_ret_opt = compute_exit_return_value(syscall_num, &abi);
                     // Task 6-Z53/6-Z60: ENOSYS fallback. The DESYNC issue
                     // means the EXIT handler sometimes sees the wrong syscall
@@ -24960,60 +25045,6 @@ pub fn run_ptrace_loop(
                                                 "(host path genuinely missing — translation gap)"
                                             }
                                         ));
-                                    }
-                                }
-                                // ── 6-Z305j: SELINUX_MAGIC f_type patch
-                                // (EXIT side) ── consumed the stash armed by
-                                // the statfs ENTRY arm. The kernel has now
-                                // filled the caller's buffer with the REAL
-                                // statfs of the (regular-dir) selinux root —
-                                // overwrite f_type (offset 0, 8 bytes LP64 /
-                                // 4 bytes ILP32) with SELINUX_MAGIC so
-                                // libselinux selinuxfs_exists() returns true
-                                // and selinux_mnt gets set. No regs write —
-                                // only guest memory.
-                                if let Some((spid, snr, sbuf, sis64)) =
-                                    selinux_statfs_pending.take()
-                                {
-                                    if spid == pid && snr == syscall_num {
-                                        if fresh_ret == 0 && sbuf != 0 {
-                                            if let Some(mut sbuf_bytes) =
-                                                read_child_bytes(pid, sbuf, 16)
-                                            {
-                                                if sbuf_bytes.len() == 16 {
-                                                    if sis64 {
-                                                        sbuf_bytes[0..8].copy_from_slice(
-                                                            &SELINUX_MAGIC.to_le_bytes(),
-                                                        );
-                                                    } else {
-                                                        sbuf_bytes[0..4].copy_from_slice(
-                                                            &(SELINUX_MAGIC as u32).to_le_bytes(),
-                                                        );
-                                                    }
-                                                    let mut vw: Option<bool> = None;
-                                                    let (written, how) =
-                                                        write_child_bytes_injection(
-                                                            pid,
-                                                            sbuf,
-                                                            &sbuf_bytes,
-                                                            &mut vw,
-                                                        );
-                                                    static STATFS_MAGIC_LOG:
-                                                        std::sync::atomic::AtomicU64 =
-                                                        std::sync::atomic::AtomicU64::new(0);
-                                                    if STATFS_MAGIC_LOG.fetch_add(
-                                                        1,
-                                                        std::sync::atomic::Ordering::Relaxed,
-                                                    ) < 8
-                                                    {
-                                                        log(&format!(
-                                                            "6-Z305j: statfs f_type patched to SELINUX_MAGIC ({}/16 bytes via {}) — selinuxfs_exists() will now succeed",
-                                                            written, how
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                                 // 6-Z145: the compute-table match is checked
@@ -35209,6 +35240,24 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert_eq!(twoyi_selinux_member_response(b"short"), None);
         assert_eq!(twoyi_selinux_member_response(b"u:r"), None);
         assert_eq!(twoyi_selinux_member_response(&[0xff, 0xfe, 0x20]), None); // non-UTF8
+    }
+
+    #[test]
+    fn is_selinuxfs_transition_node_matches_both_generations() {
+        // Android-11 libselinux opens <selinux_mnt>/create; old omni libselinux
+        // (TWRP) opens <selinux_mnt>/member. Both must be served.
+        assert!(is_selinuxfs_transition_node(
+            "/data/user/0/io.twoyi.debug/rootfs/sys/fs/selinux/create"
+        ));
+        assert!(is_selinuxfs_transition_node(
+            "/data/user/0/io.twoyi.debug/rootfs/sys/fs/selinux/member"
+        ));
+        assert!(!is_selinuxfs_transition_node(
+            "/data/user/0/io.twoyi.debug/rootfs/sys/fs/selinux/enforce"
+        ));
+        assert!(!is_selinuxfs_transition_node(
+            "/data/user/0/io.twoyi.debug/rootfs/system/lib64/libc.so"
+        ));
     }
 
     #[test]
