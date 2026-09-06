@@ -25494,3 +25494,23 @@ Work Log:
 
 Stage Summary:
 - The CheckMacPerms chain is now complete for EVERY caller (init, vendor_init, ueventd, and later zygote/system_server property threads): discovery ✓ → class/perm ✓ → verdict on ANY read ✓. Expected next: sys.coldboot_done lands → late-fs/post-fs-data → class_start core → servicemanager/logd/vold/keystore2/zygote spawns (rung 4-5) — the first honest zygote wall is the anticipated 6-Z305n subject.
+
+---
+Task ID: 6-Z305n
+Agent: Z.ai Code (main dispatcher, cron Continue)
+Task: FAST-FAIL test cycle (user directive: full ladder cycle ≈10 min, no more hour-long watches on a parked guest); regression dispatch.
+
+Work Log:
+- USER DIRECTIVE: the ladder kept burning 50-85 min to re-prove a known stall (blind 600s watch + 1200s import budget + 75-min job cap). Test time must drop to ~10 minutes.
+- FIX (commit 3cd70e7, py_compile + YAML-schema validated):
+  1. ui-navigate.py Step 7 STALL-ADAPTIVE BOOT WATCH: guest progress signature = (kr64-app-stderr.log bytes, guest-process count) sampled every 10s docker-exec side (adb-independent); boot watch ENDS EARLY when BOTH freeze for TWOYI_STALL_SECONDS (default 90s) past a 60s startup grace; streaming klog always resets the budget — a genuinely progressing boot is NEVER cut; stall-detection.txt (stalled_at/budget/last_progress/klog/procs) joins the evidence bundle so the run IS the decode payload.
+  2. Workflow ui-e2e-android-arm64.yml: boot_wait_seconds 600→240 (hard cap), new stall_seconds input (default 90; 0 disables), import_wait_seconds 1200→300, job timeout-minutes 30/75→15/15, redroid boot wait 180→120. All knobs stay overridable for deep-debug runs.
+- SIMULATED exit math: zero-progress run exits at 90s; stall-at-120s run at 210s; live boot reaches the 240s cap untouched.
+- Honesty unchanged: no synthesized verdicts — early exit only ends OBSERVATION; the classifier still rules on the evidence (expect_rung=0 diagnostic semantics intact).
+- Guards untouched (ui-e2e-test-arm64.yml already 30s-class).
+- Pushed 3cd70e7; dispatched on it: Boot Ladder 34031666522 + TWRP angler guard + OrangeFox R12.0 lavender guard (dispatch_by_name.sh); kr64 lint+test GREEN on 3cd70e7 pre-dispatch.
+- Process hygiene this round: last bfa3878 ladder (34027583809) had been CANCELLED by concurrency collision — never decoded; 3cd70e7 supersedes it.
+
+Stage Summary:
+- Full ladder cycle now ≈8-13 min wall (build ~3 + setup ~3 + import ~2-3 + watch ≤4 + evidence ~1) with 15-min hard caps — an hour-long test cannot happen again.
+- NEXT (6-Z305o): decode run 34031666522's fast-fail evidence (expect either the first core-daemon/zygote wall post-6-Z305m-2 property-wire fixes, or an early stall capture at the same fidelity as before); guards must stay green.
