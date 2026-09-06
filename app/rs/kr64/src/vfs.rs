@@ -1156,6 +1156,30 @@ impl SandboxPolicy {
         if path == "/proc/cmdline" {
             return format!("{}/twrp-cmdline", self.rootfs.to_string_lossy());
         }
+        // 6-Z305i: /proc/sys/** — the VIRTUAL SYSCTL STORE. The host's
+        // /proc/sys is read-only for the untrusted app, so every guest
+        // sysctl WRITE failed (EACCES) — and AOSP-11 init's early
+        // builtins treat some of those as FATAL:
+        // SetKptrRestrictAction (security.cpp):
+        //     if (!SetHighestAvailableOptionValue("/proc/sys/kernel/
+        //      kptr_restrict", ...)) LOG(FATAL) << "Unable to set
+        //      adequate kptr_restrict value!";
+        // run 34005543435: that LOG(FATAL) → InitFatalReboot killed the
+        // loader parent at +261 ms (and the same wall is queued for
+        // every boot: SetMmapRndBitsAction writes
+        // /proc/sys/vm/mmap_rnd_bits, libprocessgroup writes cgroup
+        // sysctls, netd/vold write net.* keys). The store backs each
+        // guest sysctl with a real file under the app-writable rootfs
+        // ({rootfs}/dev/.twoyi-sysctl/**): writes succeed honestly and
+        // reads serve the container's own value, seeded ONCE from the
+        // host's real sysctl (see the open-ENTRY prep in ptrace_emu.rs).
+        if path.starts_with("/proc/sys/") {
+            return format!(
+                "{}/dev/.twoyi-sysctl/{}",
+                self.rootfs.to_string_lossy(),
+                &path["/proc/sys/".len()..]
+            );
+        }
         // /proc/<pid>/{maps,status,cmdline,auxv} → /proc/self/… (the
         // synthetic generators the VFS registered).
         if path.starts_with("/proc/") {
@@ -2562,6 +2586,38 @@ mod tests {
             p.translate_guest("/apex/com.android.runtime/etc/foo"),
             format!("{rootfs}/apex/com.android.runtime/etc/foo")
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn z305i_proc_sys_translates_to_virtual_sysctl_store() {
+        // Guest /proc/sys/** must land in the per-profile virtual sysctl
+        // store {rootfs}/dev/.twoyi-sysctl/** — the host /proc/sys is
+        // read-only for the untrusted app and AOSP-11 init FATALs on the
+        // kptr_restrict write (SetKptrRestrictAction → InitFatalReboot,
+        // run 34005543435). The store makes writes succeed honestly and
+        // reads serve the container's own (host-seeded) value.
+        let tmp = z196_tmp_rootfs("sysctl_store");
+        let rootfs = tmp.to_str().unwrap();
+        let p = SandboxPolicy::new(rootfs);
+        assert_eq!(
+            p.translate_guest("/proc/sys/kernel/kptr_restrict"),
+            format!("{rootfs}/dev/.twoyi-sysctl/kernel/kptr_restrict")
+        );
+        assert_eq!(
+            p.translate_guest("/proc/sys/vm/mmap_rnd_bits"),
+            format!("{rootfs}/dev/.twoyi-sysctl/vm/mmap_rnd_bits")
+        );
+        // The translated backing path is INSIDE the rootfs → the
+        // enforcement backstop allows it (no host escape).
+        assert!(matches!(
+            p.verify_real_path(std::path::Path::new(&format!(
+                "{rootfs}/dev/.twoyi-sysctl/kernel/kptr_restrict"
+            ))),
+            crate::vfs::SandboxVerdict::Allow
+        ));
+        // Non-sys /proc paths keep their existing semantics (untouched).
+        assert_eq!(p.translate_guest("/proc/self/status"), "/proc/self/status");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
