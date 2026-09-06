@@ -25254,3 +25254,41 @@ Stage Summary:
   early-init or the first apexd-internal failure (its mount()/loop
   path). Flattened-apex materialization stays the planned generic
   remedy if apexd needs activated apexes.
+
+---
+Task ID: 6-Z305j-followup (decode of run 34012554250 on bdb2e02)
+Agent: Z.ai Code (cron Continue)
+Task: decode the 6-Z305j re-run; the exec-context chain still failed for linkerconfig/apexd ("process context" variant).
+
+Work Log:
+- bdb2e02 run result: getfilecon FIXED (xattr path translation worked —
+  linkerconfig's failure string advanced "Could not get file context" →
+  "Could not get process context"; 6-Z156 fakes firing). But
+  security_compute_create still failed with ZERO syscalls in the
+  death window (window tracer live at +275ms) → selinux_mnt == NULL.
+- DECODED: second-stage init is a FRESH process image (init re-exec) —
+  libselinux globals reset. selinux_mnt is re-detected ONLY by
+  verify_selinuxmnt() (libselinux/src/init.c): statfs("/sys/fs/selinux")
+  must report f_type == SELINUX_MAGIC + statvfs writable; the fallback
+  /proc/mounts scan finds nothing in the container. FIRST-stage init's
+  set_selinuxmnt died with its process image.
+- TWO fixes (commit 0ef9f1c, 753 tests green):
+  1. The f_type patch block was inside the `_forced_ret_opt.is_some() ||
+     abi.execve == 11` EXIT region = DEAD CODE on aarch64 (statfs not in
+     the compute table; aarch64 execve is 221). Relocated to the
+     top-level EXIT section (fresh regs read, conditional (pid,nr)
+     consume so interleaved stops can't discard the stash).
+  2. ANDROID-11 libselinux opens <selinux_mnt>/CREATE
+     (compute_create.c), not member (pre-2.x name). Both nodes
+     pre-created; both served by the same write-capture/read-response
+     protocol (is_selinuxfs_transition_node).
+- DISPATCHED on 0ef9f1c: Boot Ladder + TWRP angler + OrangeFox guards.
+
+Stage Summary:
+- Expected chain after this fix: verify_selinuxmnt statfs magic →
+  set_selinuxmnt → discover_class graceful-miss (tclass 0, harmless) →
+  open create → write request → read EOF → synthesized verdict
+  ("u:r:twoyi_exec:s0…") → ComputeContextFromExecutable OK →
+  linkerconfig + apexd-bootstrap EXEC for real → first honest
+  apexd --bootstrap internal wall (loop devices / /data/apex) becomes
+  the next ladder rung.
