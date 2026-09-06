@@ -144,7 +144,14 @@ images:
     arch: arm64
     generation: "11"
     tier: pr
-    url: https://api.orangefox.download/release/69f5cec33ba4241a6c1e095f/dl
+    # 6-Z305n (2026-09-06): UPSTREAM DEAD — api.orangefox.download/release/<id>/dl
+    # returns 404, the /v3 device list is purged, and the
+    # download.orangefox.download mirror serves a Cloudflare-cached
+    # EMPTY 200 (content-length: 0). Guard substitution: vendored
+    # pbrp-ginkgo-4.0 (recovery-corpus-6-Z303 release) covers the
+    # non-TWRP-family regression slot until an OrangeFox lavender
+    # source reappears. Old md5 kept for provenance.
+    url: ""
     referer: ""
     md5: 8dd3688b814fc99f8251e3c749812d92
     sha256: ""
