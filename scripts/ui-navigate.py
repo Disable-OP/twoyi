@@ -19,10 +19,48 @@ all swipe/tap coordinates accordingly.
 """
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+
+
+# ── 6-Z305n HANG-GUARD: bounded subprocess.run that CANNOT park forever ──
+# Plain subprocess.run(timeout=N) still hangs indefinitely when the child
+# daemonizes while holding the stdout/stderr pipes: the TimeoutExpired
+# path kills the child, then the SECOND communicate() drains pipes that
+# a grandchild still holds. Run 34031666522 parked the whole nav step
+# after boot_105s (~10 dead minutes) until the 15-min job cap killed it
+# — the classic trigger is adb auto-starting its server mid-run on a
+# wedged adbd. Every child now runs in its OWN process group
+# (start_new_session); on timeout we killpg(SIGKILL) the whole group so
+# no orphan can hold the pipes, then drain and return.
+def _bounded_run(*popenargs, **kwargs):
+    capture = kwargs.pop("capture_output", False)
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    kwargs.setdefault("start_new_session", True)
+    timeout = kwargs.pop("timeout", None)
+    args = popenargs[0] if popenargs else kwargs.get("args")
+    popen = subprocess.Popen(*popenargs, **kwargs)
+    try:
+        out, err = popen.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(args, popen.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(popen.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                popen.kill()
+            except Exception:
+                pass
+        out, err = popen.communicate()
+        return subprocess.CompletedProcess(args, None, out, err)
+
+
+subprocess.run = _bounded_run  # shadow for every call site in this script
 
 PACKAGE = os.environ.get("TWOYI_PACKAGE", "io.twoyi")
 
