@@ -1834,7 +1834,16 @@ def main():
         return size, procs
 
     stall_budget = stall_seconds
-    last_sig = (-1, -1)
+    # 6-Z305n iter-4: a parked guest still SPAMS klog (watchdog/healthd
+    # chatter) — run 34035121808 logged 7.53→7.57MB of pure noise over
+    # 130s and the old byte-identity rule kept calling it "progress",
+    # burning the full 180s cap. A REAL boot moves MEGABYTES of klog.
+    # Progress bar: ≥64KB of new guest klog since the last reset, or any
+    # guest-process churn. Anything under that within the budget window
+    # = frozen → fast-fail.
+    STALL_KLOG_DELTA = 65536
+    base_bytes = -1
+    base_procs = -1
     last_progress_at = 0
     stalled_at = 0
 
@@ -1868,32 +1877,42 @@ def main():
                           f"ui-navigate-recovery-menu.py)")
                     aosp_bailed = True
                     break
-            sig = guest_progress_signature()
-            if sig != last_sig:
-                print(f"  [progress @ {elapsed}s] klog={sig[0]}B "
-                      f"guest_procs={sig[1]}")
-                last_sig = sig
-                last_progress_at = elapsed
-            elif elapsed >= 60 and elapsed - last_progress_at >= stall_budget:
-                stalled_at = elapsed
-                print()
-                print("=" * 60)
-                print(f"  ⚑ STALL DETECTED at {elapsed}s: guest klog + process "
-                      f"table frozen for {stall_budget}s "
-                      f"(last progress at {last_progress_at}s)")
-                print("  FAST-FAIL (6-Z305n): ending the boot watch early —")
-                print("  the evidence bundle below IS the decode payload.")
-                print("=" * 60)
-                try:
-                    with open(os.path.join(ART, "stall-detection.txt"), "w") as f:
-                        f.write(f"stalled_at_seconds={elapsed}\n"
-                                f"stall_budget_seconds={stall_budget}\n"
-                                f"last_progress_seconds={last_progress_at}\n"
-                                f"klog_bytes={sig[0]}\n"
-                                f"guest_procs={sig[1]}\n")
-                except Exception:
-                    pass
-                break
+            klog, procs = guest_progress_signature()
+            if base_bytes < 0:
+                base_bytes, base_procs, last_progress_at = klog, procs, elapsed
+                print(f"  [watch @ {elapsed}s] klog={klog}B guest_procs={procs}")
+            else:
+                dk = (klog - base_bytes) if (klog >= 0 and base_bytes >= 0) else 0
+                moved = dk >= STALL_KLOG_DELTA or (procs != base_procs and procs >= 0)
+                if moved:
+                    print(f"  [progress @ {elapsed}s] klog={klog}B (Δ{dk}) "
+                          f"guest_procs={procs}")
+                    if klog >= 0 and dk >= 0:
+                        base_bytes = klog
+                    base_procs = procs
+                    last_progress_at = elapsed
+                elif elapsed >= 60 and elapsed - last_progress_at >= stall_budget:
+                    stalled_at = elapsed
+                    print()
+                    print("=" * 60)
+                    print(f"  ⚑ STALL DETECTED at {elapsed}s: guest klog moved "
+                          f"<{STALL_KLOG_DELTA // 1024}KB and process table frozen "
+                          f"for {stall_budget}s "
+                          f"(last progress at {last_progress_at}s)")
+                    print("  FAST-FAIL (6-Z305n): ending the boot watch early —")
+                    print("  the evidence bundle below IS the decode payload.")
+                    print("=" * 60)
+                    try:
+                        with open(os.path.join(ART, "stall-detection.txt"), "w") as f:
+                            f.write(f"stalled_at_seconds={elapsed}\n"
+                                    f"stall_budget_seconds={stall_budget}\n"
+                                    f"last_progress_seconds={last_progress_at}\n"
+                                    f"klog_bytes={klog}\n"
+                                    f"klog_delta_bytes={dk}\n"
+                                    f"guest_procs={procs}\n")
+                    except Exception:
+                        pass
+                    break
         if feed_gestures and not aosp_bailed and now >= next_gest:
             next_gest = now + 10
             g = gesture_index % 4
