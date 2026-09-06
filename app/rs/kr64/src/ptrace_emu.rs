@@ -10760,6 +10760,33 @@ fn connect_translate_target(blob: &[u8], rootfs: &str) -> Option<(String, String
     Some((guest_path.to_string(), host_path, new_sa))
 }
 
+/// 6-Z305r: REAL arm64-Android kernel defaults for the sysctls that
+/// AOSP-11 init treats as boot-fatal (security.cpp SetMmapRndBitsAction
+/// LOG(FATAL)s when it cannot open/read/verify them) but that a host or
+/// container kernel may not expose at all (the ubuntu-24.04-arm CI
+/// runner kernel has no `/proc/sys/vm/mmap_rnd_bits` — run 34055447381:
+/// init died at SetMmapRndBits before late-init).
+///
+/// kr64 IS the guest's kernel substitute: when the host seed read fails
+/// for a node with a known arm64 default, the virtual sysctl store serves
+/// that default (the same discipline as the synthetic /proc/version).
+/// This is the kernel's own configuration, not a ROM-specific hack, and
+/// init's own writes (SetHighestAvailableOptionValue probes 33→24) then
+/// proceed honestly against the backing file. Nodes without a known
+/// default keep the honest raw-passthrough revert.
+fn arm64_sysctl_default(rel: &str) -> Option<&'static str> {
+    match rel {
+        // arm64 ARCH_MMAP_RND_BITS default (24 — the value real arm64
+        // Android devices report; init's probe loop 33→24 verifies
+        // read-back against this file).
+        "vm/mmap_rnd_bits" => Some("24\n"),
+        // arm64 ARCH_MMAP_RND_COMPAT_BITS default (32-bit compat ASLR;
+        // SetMmapRndBitsMin(16, 16, true) writes exactly 16).
+        "vm/mmap_rnd_compat_bits" => Some("16\n"),
+        _ => None,
+    }
+}
+
 // ============================================================================
 // Task 6-Z62: mmap2 CONTENT INJECTION — module-level helpers
 // ============================================================================
@@ -18987,7 +19014,46 @@ pub fn run_ptrace_loop(
                                                 }
                                             }
                                             Err(_) => {
-                                                translated = path.clone();
+                                                // 6-Z305r: the HOST kernel lacks this sysctl
+                                                // (real case: the ubuntu-24.04-arm runner
+                                                // kernel exposes no /proc/sys/vm/
+                                                // mmap_rnd_bits — run 34055447381: the raw
+                                                // passthrough ENOENT'd, init's
+                                                // SetHighestAvailableOptionValue ifstream
+                                                // failed → LOG(FATAL) "Unable to set
+                                                // adequate mmap entropy value!" →
+                                                // InitFatalReboot before late-init). kr64
+                                                // IS the guest's kernel substitute — serve
+                                                // the REAL arm64-Android kernel defaults
+                                                // for the nodes init treats as boot-fatal
+                                                // (the same discipline as the synthetic
+                                                // /proc/version), instead of reverting to
+                                                // a passthrough that cannot exist. Truly
+                                                // host-absent non-Android sysctls still
+                                                // fall back to the raw passthrough
+                                                // (honest failure preserved).
+                                                if let Some(default_val) = arm64_sysctl_default(rel)
+                                                {
+                                                    if let Some(parent) = backing.parent() {
+                                                        let _ = std::fs::create_dir_all(parent);
+                                                    }
+                                                    match std::fs::write(
+                                                        &translated,
+                                                        default_val.as_bytes(),
+                                                    ) {
+                                                        Ok(()) => log(&format!(
+                                                            "6-Z305r: sysctl {} seeded with the arm64 kernel default '{}' (host kernel lacks the node)",
+                                                            rel,
+                                                            default_val.trim()
+                                                        )),
+                                                        Err(e) => log(&format!(
+                                                            "6-Z305r: sysctl arm64-default seed write FAILED for {}: {}",
+                                                            translated, e
+                                                        )),
+                                                    }
+                                                } else {
+                                                    translated = path.clone();
+                                                }
                                             }
                                         }
                                     }
@@ -34557,6 +34623,24 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         fn guest_str() -> String {
             "/dev/socket/property_service".to_string()
         }
+    }
+
+    #[test]
+    fn z305r_arm64_sysctl_default_table() {
+        // 6-Z305r: the boot-fatal sysctls get REAL arm64 kernel defaults
+        // when the host kernel cannot seed them.
+        assert_eq!(arm64_sysctl_default("vm/mmap_rnd_bits"), Some("24\n"));
+        assert_eq!(
+            arm64_sysctl_default("vm/mmap_rnd_compat_bits"),
+            Some("16\n")
+        );
+        // kptr_restrict is universally present on host kernels — the host
+        // seed path covers it, no default needed (stays honest).
+        assert_eq!(arm64_sysctl_default("kernel/kptr_restrict"), None);
+        // Unknown sysctls keep the raw-passthrough revert (honest failure).
+        assert_eq!(arm64_sysctl_default("vm/overcommit_memory"), None);
+        assert_eq!(arm64_sysctl_default("net/core/something"), None);
+        assert_eq!(arm64_sysctl_default(""), None);
     }
 
     #[test]
