@@ -25075,3 +25075,68 @@ Stage Summary:
 - NEXT: read 6-Z305h lines from run 34005543435 → identify the flip code + the subcontext death
   cause → implement the generic fix → re-run (expect init.rc action execution to proceed past
   the subcontext wall) → keep the recovery guard green.
+
+---
+Task ID: 6-Z305h decode + 6-Z305i
+Agent: Z.ai Code (cron Continue, continued)
+Task: 6-Z305h forensics decoded; two production fixes landed (commit a0a3f92).
+
+Work Log (decode — run 34005543435, commit 553a5ca):
+- EXIT-FORENSICS nailed the pid map: 2691 = loader parent (cmdline
+  "/system/bin/init second_stage"), died exit 127 at +267 ms;
+  2694 = first subcontext, exit 127 at +267 ms; 2695 = re-anchored
+  init (init_pid), the one that parsed rc, forked subcontext 2696,
+  polled fd 14 (socket 45314) for 5 s, recvfrom-EOF, exit_group(0)
+  at +5269; 2696 = second subcontext: nanosleep-loop ~5 s (15341
+  stops) → writev(42 B "<6>init: Reboot ending, jumping to kernel\n")
+  → getpid/gettid/getuid → rt_tgsigqueueinfo(SIGABRT) → rt_sigaction/
+  rt_sigprocmask → retry → exit_group(127). fd 14 pair
+  (45313↔45314) = the subcontext socketpair. The mprotect flip storm
+  = bionic arc4random (pc = bootstrap libc.so+0x9a9f8, page
+  "[anon:arc4random data]") — the entropy-path spin, secondary.
+- ROOT CAUSE 1 (exact AOSP-11 source, googlesource reachable —
+  security.cpp): SetKptrRestrictAction LOG(FATAL) "Unable to set
+  adequate kptr_restrict value!" when /proc/sys/kernel/kptr_restrict
+  is not writable (host /proc/sys read-only for the app). Killed the
+  loader parent at +261 ms ("InitFatalReboot: signal 6" → "Reboot
+  ending" → exit 127). InitAborter (util.cpp): getpid()!=1 →
+  DefaultAborter; getpid()==1 → InitFatalReboot.
+- ROOT CAUSE 2: kr64 faked getpid()=1 for EVERY guest — every child
+  LOG(FATAL) took InitFatalReboot (impossible reboot): the subcontext's
+  5 s sleep loop IS the reboot path's service-shutdown wait; its death
+  127 = bionic abort's last-resort _exit(127); init main then EOF'd its
+  synchronous TransmitMessage reply wait and quietly exited(0)
+  (SecondStageMain has no clean exit path — the exit(0) is
+  container-induced via the subcontext-EOF unwind).
+
+Work Log (fixes — commit a0a3f92, fix(kr64) 6-Z305i):
+- Init-only pid-1 illusion: ptrace EXIT getpid/getppid fake now fires
+  only for the init anchor pid (capped DIAG x3 on non-init
+  pass-throughs); libgetpid_hook.so passes the raw syscall through
+  unless TWOYI_INIT_PID pins an anchor. Children abort cleanly by
+  signal; raise()/tgkill-self native; 6-Z266 translation retained for
+  explicit pid-1 args (init-only producer).
+- Virtual /proc/sys store: guest /proc/sys/** →
+  {rootfs}/dev/.twoyi-sysctl/** (vfs.rs translate_guest + open-ENTRY
+  prep in ptrace_emu.rs): write-intent creates dirs+file; read-intent
+  seeds once from the host's real sysctl; unreadable host value
+  reverts to raw passthrough. Kills the SetKptrRestrictAction /
+  SetMmapRndBitsAction FATAL class for every boot.
+- WRITEV-SAMPLE iov display 4 → 6 (logd FATAL wire's message iovecs
+  were never shown — the subcontext's original LOG(FATAL) text is
+  still anonymous; next run names it).
+- 746 tests green (new vfs test: sysctl store translation + backstop
+  Allow verdict). fmt/clippy -D warnings clean.
+- Dispatched on a0a3f92: Boot Ladder (rung 0) + TWRP angler +
+  OrangeFox R12.0 lavender (recovery guard for the getpid/sysctl
+  semantics changes).
+
+Stage Summary:
+- origin/main a0a3f92. The quiet-exit cascade has named causes and
+  production fixes. Expected next run: init main survives past the
+  early builtins WITHOUT InitFatalReboot; the subcontext either works
+  (first subcontext command executed) or fails VISIBLY by signal with
+  the FATAL text captured (iov 4-6 now sampled). Recovery guard must
+  stay green (getpid semantics changed for children too).
+- NEXT: decode the new ladder run → verify kptr action passes and the
+  subcontext wall → next blocker in the Stage A→H ladder.
