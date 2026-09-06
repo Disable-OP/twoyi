@@ -1262,6 +1262,20 @@ struct ChildAbi {
     // socketcall; the direct nr fires on every ABI.
     connect_nr: i64,
     writev_nr: i64,
+    // 6-Z305h: quiet-death sampler numbers (DIAGNOSTIC ONLY — no EXIT
+    // handler ever rewrites these syscalls). `mprotect_nr` drives the
+    // same-page R↔RW flip detector (run 34002339515: ~7800 flips on ONE
+    // page during init main's last 5 s — the pc + the maps bracket name
+    // the flipping code and the flip page). `ppoll_nr` drives the
+    // 1-fd blocking-wait sampler (bionic's poll() libc wrapper issues
+    // ppoll on aarch64 — the aarch64 value is live-verified against the
+    // boot trace: nr=73 carried init main's 5-second block).
+    //   mprotect: i386=125, x86_64=10, aarch64(asm-generic)=226
+    //   ppoll:    x86_64=271, aarch64=73; the two 32-bit ABIs stay -1
+    //             (numbers not double-verified and a wrong sampler nr
+    //             would only ever mislabel a diagnostic line).
+    mprotect_nr: i64,
+    ppoll_nr: i64,
     // 6-Z155: identity-syscall fake-success fields. See the long doc on
     // these in `ChildAbi` — plain `setuid`/`setgid` (x86_64 only),
     // `setresuid`/`setresgid` (all three ABIs), and `setgroups` (all
@@ -1659,6 +1673,9 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // so these are the values that actually fire.
     connect_nr: 42,
     writev_nr: 20,
+    // 6-Z305h sampler numbers (asm/unistd_64.h): mprotect=10, ppoll=271.
+    mprotect_nr: 10,
+    ppoll_nr: 271,
     // 6-Z155 identity-syscall fakes (x86_64: setuid=105, setgid=106,
     // setresuid=117, setresgid=119, setgroups=116).
     setuid_nr: 105,
@@ -2042,6 +2059,12 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // future i386 guest ever issues the direct nr=361.
     connect_nr: 361,
     writev_nr: 146,
+    // 6-Z305h sampler numbers (asm/unistd_32.h): mprotect=125. ppoll is
+    // left unsampled (-1): the direct i386 ppoll number is not
+    // double-verified, i386 guests poll via poll_nr=168, and a wrong
+    // sampler nr would only mislabel a diagnostic line.
+    mprotect_nr: 125,
+    ppoll_nr: -1,
     // 6-Z155 identity-syscall fakes (i386: no plain setuid/setgid —
     // kernel-internal only; setresuid=208, setresgid=210, setgroups=81).
     setuid_nr: -1,
@@ -2398,6 +2421,12 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // ABI-completeness precedent.
     connect_nr: 203,
     writev_nr: 66,
+    // 6-Z305h sampler numbers (asm-generic/unistd.h, LIVE-VERIFIED on
+    // the pure-stock Android 11 boot trace: nr=226 carried the R↔RW
+    // mprotect flip storm of init main's final 5 s, nr=73 carried its
+    // 5-second 1-fd blocking wait): mprotect=226, ppoll=73.
+    mprotect_nr: 226,
+    ppoll_nr: 73,
     // 6-Z155 identity-syscall fakes (aarch64 asm-generic: setuid=146,
     // setgid=144, setresuid=147, setresgid=148, setgroups=159).
     setuid_nr: 146,
@@ -2548,6 +2577,11 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     fcntl_nr: 55,
     connect_nr: 283,
     writev_nr: 146,
+    // 6-Z305h sampler numbers (arch/arm/tools/syscall.tbl): mprotect=125.
+    // ppoll left unsampled (-1, number not double-verified; arm32 guests
+    // poll via poll_nr=168).
+    mprotect_nr: 125,
+    ppoll_nr: -1,
     setuid_nr: 213,    // setuid32 (bionic lp32)
     setgid_nr: 214,    // setgid32
     setresuid_nr: 208, // setresuid32
@@ -3077,6 +3111,30 @@ fn get_syscall_num(regs: &Regs, abi: &ChildAbi) -> i64 {
 fn get_syscall_arg(regs: &Regs, arg: usize) -> u64 {
     let regs_ptr = regs as *const Regs as *const u64;
     unsafe { *regs_ptr.add(arg) }
+}
+
+/// 6-Z305h: the child's program counter from the traced register view.
+/// aarch64: `Aarch64Regs.pc` (named field — user_pt_regs regs[31] + sp
+/// + pc + pstate). x86_64: `rip` at u64 index 16 of user_regs_struct
+/// (the same raw-index read the 6-Z148 prctl sampler uses; an i386
+/// child's eip is zero-extended into that slot by PTRACE_GETREGS).
+#[cfg(target_arch = "aarch64")]
+fn guest_pc_of(regs: &Regs) -> u64 {
+    regs.pc
+}
+
+#[cfg(target_arch = "x86_64")]
+fn guest_pc_of(regs: &Regs) -> u64 {
+    let regs_ptr = regs as *const Regs as *const u64;
+    unsafe { *regs_ptr.add(16) }
+}
+
+/// 6-Z305h: same-page mprotect flip milestones that earn a deep sample
+/// (pc + maps brackets + page head). Run 34002339515: the flip storm
+/// ran ~7800 iterations — milestones keep the summary at ~5 lines
+/// while still bracketing the page early (run=2: "is a flip") and late.
+fn z305h_flip_milestone(run: u64) -> bool {
+    matches!(run, 2 | 64 | 512 | 2048 | 8192)
 }
 
 /// Set the return value of a syscall in registers.
@@ -12609,6 +12667,24 @@ pub fn run_ptrace_loop(
     let mut prctl_spin_consecutive: std::collections::HashMap<libc::pid_t, u64> =
         std::collections::HashMap::new();
     let mut connect_path_log_count: u64 = 0;
+    // 6-Z305h: quiet-death sampler state. Run 34002339515's window
+    // decoded init main's quiet exit(0) but left four facts anonymous:
+    // the R↔RW flip page + its code pc, the subcontext's final 42-byte
+    // klog writev (the 40-sample writev cap starved exactly there) and
+    // the 5-second ppoll's fd. Samplers (all capped): same-page mprotect
+    // flip milestones, in-window poll-wait fd identity (host fd-table
+    // readlink), recv EOF with host fd link, and pre-exit forensics
+    // (cmdline/comm/pc/maps/fds) for init_pid and the first 3 exit-127
+    // children.
+    let mut z305h_flips: std::collections::HashMap<libc::pid_t, (u64, u64, u64)> =
+        std::collections::HashMap::new();
+    let mut z305h_recv_pending: std::collections::HashMap<libc::pid_t, (i64, u64, u64)> =
+        std::collections::HashMap::new();
+    let mut z305h_flip_deep: u64 = 0;
+    let mut z305h_ppoll_log: u64 = 0;
+    let mut z305h_recv_log: u64 = 0;
+    let mut z305h_exit_dumped: bool = false;
+    let mut z305h_exit127_count: u64 = 0;
 
     // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
     // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
@@ -14142,6 +14218,90 @@ pub fn run_ptrace_loop(
                                 "6-Z78: PTRACE_EVENT_EXIT pid={} status={:#x} ({}) — child entering exit now; falling through to standard resume",
                                 pid, exit_status, decoded
                             ));
+                            // 6-Z305h: quiet-death forensics. The child is
+                            // ptrace-stopped PRE-exit here, so /proc is
+                            // still valid: dump the identity (cmdline,
+                            // comm), the pc + its maps bracket, the whole
+                            // maps (capped) and the fd table (capped).
+                            // Fires ONCE for init_pid (the quiet exit(0)
+                            // needs its pc named) and for the first 3
+                            // exit-127 children (run 34002339515: the
+                            // vendor_init subcontext died 127 after a 5 s
+                            // retry loop — its maps/fds name what it was
+                            // stuck on).
+                            if (pid == init_pid && !z305h_exit_dumped)
+                                || (libc::WIFEXITED(ws)
+                                    && libc::WEXITSTATUS(ws) == 127
+                                    && z305h_exit127_count < 3)
+                            {
+                                if pid == init_pid {
+                                    z305h_exit_dumped = true;
+                                } else {
+                                    z305h_exit127_count += 1;
+                                }
+                                log(&format!(
+                                    "6-Z305h EXIT-FORENSICS begin pid={} (init_pid={}) decoded={}",
+                                    pid, init_pid, decoded
+                                ));
+                                if let Ok(cmdline) =
+                                    std::fs::read_to_string(format!("/proc/{}/cmdline", pid))
+                                {
+                                    log(&format!(
+                                        "6-Z305h cmdline: {:?}",
+                                        cmdline.trim_end_matches('\u{0}').replace('\u{0}', " ")
+                                    ));
+                                }
+                                if let Ok(comm) =
+                                    std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                {
+                                    log(&format!("6-Z305h comm: {:?}", comm.trim_end()));
+                                }
+                                let mut regs = unsafe { std::mem::zeroed() };
+                                match ptrace_getregs(pid, &mut regs) {
+                                    Ok(_) => {
+                                        let pc = guest_pc_of(&regs);
+                                        log(&format!("6-Z305h pc={:#x}", pc));
+                                        if let Ok(content) =
+                                            std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                        {
+                                            log(&format!(
+                                                "6-Z305h pc-bracket:\n{}",
+                                                maps_bracket_in(&content, pc)
+                                            ));
+                                            for (idx, line) in content.lines().enumerate() {
+                                                if idx >= 240 {
+                                                    log(&format!(
+                                                        "6-Z305h maps truncated at {} lines",
+                                                        idx
+                                                    ));
+                                                    break;
+                                                }
+                                                log(&format!("6-Z305h maps: {}", line));
+                                            }
+                                        } else {
+                                            log("6-Z305h maps read failed");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log(&format!("6-Z305h getregs failed at exit: {}", e))
+                                    }
+                                }
+                                let mut fd_lines = 0usize;
+                                for fd in 0..48i32 {
+                                    if let Ok(target) =
+                                        std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                                    {
+                                        log(&format!("6-Z305h fd {} -> {}", fd, target.display()));
+                                        fd_lines += 1;
+                                    }
+                                }
+                                log(&format!(
+                                    "6-Z305h EXIT-FORENSICS end pid={} ({} fd lines, flip state: {:?})",
+                                    pid,
+                                    fd_lines,
+                                    z305h_flips.get(&pid).copied()
+                                ));
+                            }
                             // 6-Z260: a SIGNAL death is exactly the moment the
                             // stop-ring exists for — dump the last resume/stop
                             // pairs around it.
@@ -14796,9 +14956,15 @@ pub fn run_ptrace_loop(
                 });
 
                 // ── 6-Z305c: death-window full-fidelity trace ──
+                // 6-Z305h: same-page mprotect flips are excluded from the
+                // per-stop win lines and summarized by the flip sampler
+                // below instead (run 34002339515: ~7000 of the 12000-stop
+                // budget burned on R↔RW flip pairs of ONE page, each pair
+                // carrying zero information beyond the first).
+                let z305h_is_mprotect = abi.mprotect_nr >= 0 && syscall_num == abi.mprotect_nr;
                 if z305c_window_countdown > 0 {
                     z305c_window_countdown -= 1;
-                    if is_entry {
+                    if is_entry && !z305h_is_mprotect {
                         log(&format!(
                             "6-Z305c win E pid={} nr={} {} a=({:#x},{:#x},{:#x},{:#x},{:#x})",
                             pid,
@@ -14810,13 +14976,133 @@ pub fn run_ptrace_loop(
                             get_syscall_arg(&regs, abi.reg_arg4),
                             get_syscall_arg(&regs, abi.reg_arg5),
                         ));
-                    } else {
+                    } else if !is_entry && !z305h_is_mprotect {
                         log(&format!(
                             "6-Z305c win X pid={} nr={} ret={}",
                             pid,
                             syscall_num,
                             get_syscall_arg(&regs, abi.reg_ret) as i64
                         ));
+                    }
+                }
+
+                // ── 6-Z305h: quiet-death samplers ───────────────────────
+                // (a) same-page mprotect R↔RW flip detector — fires on
+                //     ENTRY regardless of the window (a spin may outlive
+                //     the stop budget), summarized at milestones.
+                if is_entry && z305h_is_mprotect {
+                    let a1 = get_syscall_arg(&regs, abi.reg_arg1);
+                    let a2 = get_syscall_arg(&regs, abi.reg_arg2);
+                    let a3 = get_syscall_arg(&regs, abi.reg_arg3);
+                    let st = z305h_flips.entry(pid).or_insert((0u64, 0u64, 0u64));
+                    if st.0 == a1 && st.1 == a2 {
+                        st.2 = st.2.saturating_add(1);
+                    } else {
+                        *st = (a1, a2, 1);
+                    }
+                    let run = st.2;
+                    if z305h_flip_milestone(run)
+                        && z305h_flip_deep < 10
+                        && (z305c_window_countdown > 0 || run >= 4096)
+                    {
+                        z305h_flip_deep += 1;
+                        let pc = guest_pc_of(&regs);
+                        let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok();
+                        let pc_br = maps
+                            .as_deref()
+                            .map(|c| maps_bracket_in(c, pc))
+                            .unwrap_or_else(|| "<maps unreadable>".to_string());
+                        let addr_br = maps
+                            .as_deref()
+                            .map(|c| maps_bracket_in(c, a1))
+                            .unwrap_or_else(|| "<maps unreadable>".to_string());
+                        let page_head = read_child_bytes(pid, a1, 32)
+                            .map(|b| b.iter().map(|x| format!("{:02x}", x)).collect::<String>())
+                            .unwrap_or_else(|| "<unreadable>".to_string());
+                        log(&format!(
+                            "6-Z305h mprotect-flip pid={} run={} addr={:#x} len={:#x} prot={:#x} pc={:#x}\n6-Z305h pc-bracket: {}\n6-Z305h addr-bracket: {}\n6-Z305h page-head: {}",
+                            pid, run, a1, a2, a3, pc, pc_br, addr_br, page_head
+                        ));
+                    }
+                } else if is_entry {
+                    // Any other syscall ENTRY breaks the flip run AND is
+                    // the chance to sample the blocking waits.
+                    z305h_flips.remove(&pid);
+                    if z305c_window_countdown > 0 {
+                        // (b) poll/ppoll sampler — names the 1-fd blocking
+                        // wait (run 34002339515: init main's 5-second block)
+                        // and resolves fd[0] through the HOST fd table
+                        // (socket:[inode] / file path).
+                        if z305h_ppoll_log < 12
+                            && ((abi.ppoll_nr >= 0 && syscall_num == abi.ppoll_nr)
+                                || (abi.poll_nr >= 0 && syscall_num == abi.poll_nr))
+                        {
+                            z305h_ppoll_log += 1;
+                            let fds_ptr = get_syscall_arg(&regs, abi.reg_arg1);
+                            let nfds = get_syscall_arg(&regs, abi.reg_arg2);
+                            let tmo = get_syscall_arg(&regs, abi.reg_arg3);
+                            let mut desc = format!(
+                                "6-Z305h poll-wait pid={} nr={} nfds={} tmo={:#x}",
+                                pid, syscall_num, nfds, tmo
+                            );
+                            for k in 0..nfds.min(4) {
+                                if let Some(w) = read_child_u64(pid, fds_ptr.wrapping_add(k * 8)) {
+                                    let fd = (w & 0xffff_ffff) as u32 as i32;
+                                    let ev = (w >> 32) & 0xffff;
+                                    desc.push_str(&format!(" [{}]=fd={} ev={:#06x}", k, fd, ev));
+                                    if k == 0 {
+                                        if let Ok(link) =
+                                            std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                                        {
+                                            desc.push_str(&format!(" (host: {})", link.display()));
+                                        }
+                                    }
+                                }
+                            }
+                            log(&desc);
+                        }
+                        // (c) recvfrom/recvmsg ENTRY stash — the EXIT stop
+                        // clobbers aarch64 arg registers (6-Z278), so the
+                        // EOF diagnosis needs the fd captured here.
+                        if (abi.recvfrom_nr >= 0 && syscall_num == abi.recvfrom_nr)
+                            || (abi.recvmsg_nr >= 0 && syscall_num == abi.recvmsg_nr)
+                        {
+                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as u32 as i32;
+                            z305h_recv_pending.insert(
+                                pid,
+                                (syscall_num, fd as u64, get_syscall_arg(&regs, abi.reg_arg2)),
+                            );
+                        }
+                    }
+                } else {
+                    // EXIT side: recv-EOF diagnosis — ret==0 on a
+                    // recvfrom/recvmsg means the peer closed its end
+                    // (run 34002339515: init main's reply-read EOF'd 3 ms
+                    // before its own quiet exit).
+                    if let Some((nr, fd, buf)) = z305h_recv_pending.remove(&pid) {
+                        if syscall_num == nr {
+                            let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            if ret == 0 {
+                                let host = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                                    .map(|l| l.to_string_lossy().to_string())
+                                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                                log(&format!(
+                                    "6-Z305h recv-EOF pid={} nr={} fd={} host-fd={} — peer closed its end",
+                                    pid, nr, fd, host
+                                ));
+                            } else if ret > 0 && z305h_recv_log < 8 {
+                                z305h_recv_log += 1;
+                                let head = read_child_bytes(pid, buf, (ret as usize).min(32))
+                                    .map(|b| {
+                                        b.iter().map(|x| format!("{:02x}", x)).collect::<String>()
+                                    })
+                                    .unwrap_or_else(|| "<unreadable>".to_string());
+                                log(&format!(
+                                    "6-Z305h recv-data pid={} nr={} fd={} ret={} head={}",
+                                    pid, nr, fd, ret, head
+                                ));
+                            }
+                        }
                     }
                 }
 
@@ -22462,10 +22748,12 @@ pub fn run_ptrace_loop(
                     if past_first_execve && abi.writev_nr != -1 && syscall_num == abi.writev_nr {
                         static WRITEV_SAMPLE: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
-                        if WRITEV_SAMPLE.load(std::sync::atomic::Ordering::Relaxed) < 40 {
+                        if z305c_window_countdown > 0
+                            || WRITEV_SAMPLE.load(std::sync::atomic::Ordering::Relaxed) < 200
+                        {
                             let n =
                                 WRITEV_SAMPLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if n < 40 {
+                            if z305c_window_countdown > 0 || n < 200 {
                                 let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                                 let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                                 let iovcnt = get_syscall_arg(&regs, abi.reg_arg3) as i64;
@@ -22498,7 +22786,13 @@ pub fn run_ptrace_loop(
                                                 if txt.contains("Loading SELinux policy")
                                                     && z305c_window_countdown == 0
                                                 {
-                                                    z305c_window_countdown = 12000;
+                                                    // 6-Z305h: 12000 → 40000 — run
+                                                    // 34002339515's budget was consumed
+                                                    // by the mprotect flip pairs; 40000
+                                                    // covers the flips (now suppressed
+                                                    // from the per-stop lines) plus the
+                                                    // recv-EOF/exit tail with margin.
+                                                    z305c_window_countdown = 40000;
                                                     log("6-Z305c: WINDOW ARMED — init entering SELinux policy setup; every syscall stop logged until the countdown exhausts");
                                                 }
                                                 dump.push_str(&format!("{:?}", txt));
@@ -28090,6 +28384,57 @@ mod tests {
         assert_eq!(ABI_ARM32.reg_arg6, 5);
         assert_eq!(ABI_ARM32.reg_marker, 6);
         assert_eq!(ABI_ARM32.reg_sp, 31);
+    }
+
+    #[test]
+    fn z305h_flip_milestones_are_bounded() {
+        // The sampler fires 5 deep lines per ~7800-flip storm max, and
+        // the global cap (10) is enforced by the caller.
+        for run in [1u64, 3, 63, 65, 511, 513, 2047, 2049, 8191, 8193, 10_000] {
+            assert!(!z305h_flip_milestone(run), "run={}", run);
+        }
+        for run in [2u64, 64, 512, 2048, 8192] {
+            assert!(z305h_flip_milestone(run), "run={}", run);
+        }
+    }
+
+    #[test]
+    fn z305h_abi_sampler_numbers() {
+        // 6-Z305h sampler nrs — aarch64 asm-generic live-verified on the
+        // Android 11 boot trace (mprotect nr=226 flip storm, ppoll nr=73
+        // 1-fd block); x86_64 per asm/unistd_64.h; the two 32-bit ABIs
+        // only enable mprotect (their ppoll numbers are not
+        // double-verified and the sampler is diagnostic-only).
+        assert_eq!(ABI_X86_64.mprotect_nr, 10);
+        assert_eq!(ABI_X86_64.ppoll_nr, 271);
+        assert_eq!(ABI_X86_32.mprotect_nr, 125);
+        assert_eq!(ABI_X86_32.ppoll_nr, -1);
+        assert_eq!(ABI_ARM32.mprotect_nr, 125);
+        assert_eq!(ABI_ARM32.ppoll_nr, -1);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn z305h_abi_sampler_numbers_aarch64() {
+        assert_eq!(ABI_AARCH64.mprotect_nr, 226);
+        assert_eq!(ABI_AARCH64.ppoll_nr, 73);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn z305h_guest_pc_reads_the_pc_slot() {
+        let mut regs: Regs = unsafe { std::mem::zeroed() };
+        regs.pc = 0x0055_a000_1234;
+        assert_eq!(guest_pc_of(&regs), 0x0055_a000_1234);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn z305h_guest_pc_reads_the_rip_slot() {
+        let mut regs: Regs = unsafe { std::mem::zeroed() };
+        let regs_ptr = &mut regs as *mut Regs as *mut u64;
+        unsafe { *regs_ptr.add(16) = 0x0055_a000_1234 };
+        assert_eq!(guest_pc_of(&regs), 0x0055_a000_1234);
     }
 
     #[cfg(target_arch = "aarch64")]
