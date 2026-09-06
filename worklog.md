@@ -25292,3 +25292,46 @@ Stage Summary:
   linkerconfig + apexd-bootstrap EXEC for real → first honest
   apexd --bootstrap internal wall (loop devices / /data/apex) becomes
   the next ladder rung.
+
+---
+Task ID: 6-Z305j-verify (decode of run 34014336281 on 0ef9f1c)
+Agent: Z.ai Code (cron Continue)
+Task: verify the create-node + statfs fixes; decode the new wall.
+
+Work Log:
+- WALL BREACHED: linkerconfig 'exec 1' STARTED (pid 2727), exited 0 in
+  14ms; apexd-bootstrap STARTED (pid 2729), exited 0 in 68ms. The entire
+  SELinux exec-context chain (getcon → getfilecon → verify_selinuxmnt →
+  create-node protocol) is container-virtualized and working: setexeccon
+  fakes fire (6-Z29, ret -22→len), every no-seclabel service computes a
+  context, seclabel services get past setexeccon via the faked write.
+  Guards GREEN (TWRP angler + OrangeFox lavender on 0ef9f1c).
+- NEW WALL (ueventd): service ueventd execs fine (staged + PTRACE_EVENT_EXEC),
+  'ueventd started!', parses /system+vendor/ueventd.rc, then during
+  coldboot: setegid(0)/setegid(AID_ROOT) EPERM for /dev/device-mapper,
+  a coldboot handler-subprocess dies exit-127 (no exec in trace — same
+  bionic abort→tgkill(tgid=0)→EINVAL→_exit(127) fallback shape as the
+  main process), then ueventd main's ColdBoot::WaitForSubProcesses()
+  LOG(FATAL)s 'subprocess exited with status 127' (ueventd.cpp R) →
+  abort → tgkill EINVAL ×2 → exit_group(127) (BOUNDED — the §13 abort
+  invariant holds) → critical ×4 → InitFatalReboot → shutdown cascade.
+- Also observed (queued, non-fatal this run):
+  * init.rc imports fail: '/init.${ro.hardware}.rc' + init.${ro.zygote}.rc
+    don't expand (ro.hardware/ro.zygote missing at parse) → init.zygote64.rc
+    NOT imported → zygote wall after ueventd.
+  * copy ld.config.txt fails 'Skipping insecure file' — linkerconfig's
+    output file is group/world-writable through the container
+    (ReadFile rejects S_IWGRP|S_IWOTH, a11-util.cpp:167) →
+    /linkerconfig/default/ld.config.txt missing (linker still resolves
+    via fallback namespaces — linkerconfig+apexd both ran).
+  * kr64 proc_emu 'appended apexd.status=activated to build.prop' hack
+    now hits 'SELinux permission check failed' (8.1-era shortcut to retire).
+
+Stage Summary:
+- origin/main 6a83763. Ladder reached: services EXEC for real (linkerconfig
+  ✓ apexd-bootstrap ✓); the boot is now blocked by the ueventd coldboot
+  subprocess-127 wall — the first wall INSIDE a real guest daemon.
+- NEXT (6-Z305k): decode the ueventd handler-subprocess 127 (arm the
+  window for the subprocess pids + capture its last 50 syscalls; check
+  whether setegid needs the 6-Z155 fake family, and what FATALs the
+  handler silently); then the ro.hardware/ro.zygote property-import gap.
