@@ -2208,7 +2208,7 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     mkdir: -1,
     mkdirat: 34,
     unshare: 97,
-    setns: 267, // aarch64 setns
+    setns: 268, // aarch64 setns (asm-generic __NR_setns; run 34001424252 window-traced the real nr=268)
     // aarch64 mknod = -1 (SENTINEL "not present on this ABI"). The
     // asm-generic/unistd.h table (used by aarch64) has NO plain
     // `mknod` — only `mknodat = 33` (verified directly against
