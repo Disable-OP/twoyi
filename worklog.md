@@ -25723,3 +25723,17 @@ Work Log:
 Stage Summary:
 - origin/main 7300b5f. Expected next run: init (shlib-less) passes selinux as in the rung-4 run; service execs carry the shlib → binder opens hit the wire protocol → the 105s fleet wall should be gone; apex consumers (zygote/lmkd/media) still CANNOT LINK until 6-Z305t part 2 (flatten wiring).
 - NEXT: decode re-run; wire apex flattening into the boot staging (zip → temp img → Ext4Image::extract_tree → {rootfs}/apex/<manifest-name>); guards + ladder.
+
+---
+Task ID: 6-Z305s-d (ladder 34070192375 decode + property-wire gate)
+Agent: Z.ai Code (main dispatcher)
+Task: decode the init-skip re-run; restore the property wire for services.
+
+Work Log:
+- Ladder decode: init correctly SKIPPED by the injection (no init lines in 6-Z305s output); boot PASSED selinux, reached early-init: linkerconfig +341ms exit 0, ueventd +595ms, apexd-bootstrap +604ms exit 0, BOTH boringssl self-tests exit 0 (dynamic binaries running WITH the shlib — the linker wall is confirmed dead). Then init parked: guest process table at end-of-run = init (2673, poll_schedule_timeout) + ueventd ONLY. No fleet.
+- WALL: wait_for_coldboot_done. ueventd (shlib-injected) called __system_property_set("ro.cold_boot_done","true") which the shlib's TWRP-era IN-PROCESS property table swallowed — init's property service never saw it. The rung-4 run (25addba: "coldboot prop landed, park dead") proved the REAL wire works when clients run bionic's own property code against the tracer-served area + translated socket.
+- FIX b7a1cc6: TWOYI_SHLIB_NO_PROPS=1 (third injected env string) gates ALL shlib property hooks (set/add/get/find/read_callback/wait_any/update/read/serial) to dlsym(RTLD_NEXT) delegation. Recovery boots unaffected (never receive the flag). +builder test update (774 green).
+
+Stage Summary:
+- origin/main b7a1cc6. Expected next run: ueventd sets ro.cold_boot_done on the real wire → init proceeds past wait_for_coldboot_done → on init/late-init → mount_all → class_start core → the fleet spawns WITH the shlib → binder opens hit the wire protocol → zygote exec (rung 5). Remaining named walls beyond that: apex-lib consumers (zygote/libnativeloader etc.) still CANNOT LINK until 6-Z305t part 2 (flatten wiring), class_start service coverage, then SurfaceFlinger/SystemUI.
+- NEXT: decode re-run; wire apex flattening (6-Z305t part 2).
