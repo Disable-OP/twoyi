@@ -3460,6 +3460,26 @@ static void fatal_dump_maps(void) {
 }
 
 // Print the fatal evidence exactly once (see g_fatal_entered).
+//
+// 6-Z305t-19: stderr is /dev/null for EVERY init-spawned service, so the
+// evidence was invisible on the Android system boot (only recovery's
+// stderr reaches a real pipe). Mirror ONE short line to /dev/__kmsg__ —
+// the guest klog — where the boot-ladder artifact always captures it.
+// Raw openat/write/close only; a failing kmsg open is fine (best effort).
+static void write_kmsg_line(const char *buf, unsigned long len) {
+    volatile char kpath[15]; /* "/dev/__kmsg__" + NUL — stack, see 6-Z176b */
+    {
+        static const char src[] = "/dev/__kmsg__";
+        unsigned k;
+        for (k = 0; k < sizeof(src); k++) kpath[k] = src[k];
+    }
+    long kfd = raw_syscall4(SYS_openat, AT_FDCWD, (long)(const char *)kpath,
+                            1 /*O_WRONLY*/, 0);
+    if (kfd < 0) return;
+    raw_syscall3(SYS_write, kfd, (long)buf, (long)len);
+    raw_syscall1(SYS_close, kfd);
+}
+
 static void fatal_evidence_once(const char *kind, void *pc) {
     if (g_fatal_entered) return;
     g_fatal_entered = 1;
@@ -3469,6 +3489,27 @@ static void fatal_evidence_once(const char *kind, void *pc) {
     write_hex64(2, (unsigned long long)(unsigned long)pc);
     write_str(2, "\n");
     fatal_dump_maps();
+    /* 6-Z305t-19: the kmsg mirror — the only channel services have. */
+    {
+        char line[128];
+        unsigned long p = 0;
+        static const char pre[] = "<3>[twrp_fb_hook] *** ";
+        static const char mid[] = " INTERCEPTED *** caller_pc=0x";
+        unsigned k;
+        for (k = 0; pre[k]; k++) if (p < sizeof(line) - 24) line[p++] = pre[k];
+        for (k = 0; kind && kind[k]; k++) if (p < sizeof(line) - 24) line[p++] = kind[k];
+        for (k = 0; mid[k]; k++) if (p < sizeof(line) - 24) line[p++] = mid[k];
+        {
+            unsigned long long v = (unsigned long long)(unsigned long)pc;
+            int i;
+            for (i = 15; i >= 0 && p < sizeof(line) - 2; i--) {
+                int nib = (int)((v >> (i * 4)) & 0xF);
+                line[p++] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10);
+            }
+        }
+        line[p++] = '\n';
+        write_kmsg_line(line, p);
+    }
 }
 
 // 6-Z269: park forever instead of re-raising, with EXPLICIT NULL args.
@@ -3519,8 +3560,47 @@ static void fatal_evidence_once(const char *kind, void *pc) {
 // (all-NULL) so the park between re-raises actually parks.
 static volatile int g_abort_reraise_mode = -1; /* -1 = unresolved */
 
+// 6-Z305t-19: TWOYI_ABORT_DIE=1 — the SYSTEM-MODE fatal policy.
+//
+// Ladder #75 decode (run 34150495103): EVERY parked rung-4 process —
+// flags_health_check (blocking init's synchronous `exec 11` and thus the
+// whole action queue below load_persist_props → no zygote), logd main +
+// threads (nobody drains logdw → every liblog client wedges in its
+// retry-poll), init subcontext — sat in the PARK loop below
+// (pc=fb_hook+0xbac, raw ppoll(NULL,0,NULL,NULL), proven by the
+// 6-Z305t-18 SIGSTOP stall probe). The park is the RECOVERY policy: on
+// OrangeFox the aborting recovery main thread must NOT kill the process
+// or the framebuffer producer dies. For REAL Android services the exact
+// opposite is correct: a service that aborts must DIE so init's restart
+// policy applies and the action queue advances — that is what init sees
+// on a physical device. The kr64 exec-env injection sets this variable
+// for system-mode (non-recovery) service execs; recovery keeps the park.
+static volatile int g_abort_die_mode = -1; /* -1 = unresolved */
+
 static void fatal_reraise(void) __attribute__((noreturn));
 static void fatal_reraise(void) {
+    if (g_abort_die_mode < 0) {
+        const char *d = getenv("TWOYI_ABORT_DIE");
+        g_abort_die_mode = (d != NULL && d[0] == '1') ? 1 : 0;
+    }
+    if (g_abort_die_mode) {
+        /* Unblock SIGABRT first — a caller that aborted with SIGABRT
+         * blocked would otherwise park silently below (the tgkill would
+         * pend, never deliver) and we'd be back to a wedge. */
+        unsigned long empty = 0; /* one sigset word, all bits clear */
+        raw_syscall4(SYS_rt_sigprocmask, 2 /*SIG_UNBLOCK*/, (long)&empty, 0,
+                     (long)sizeof(unsigned long));
+        long pid = raw_syscall1(SYS_getpid, 0);
+        long tid = raw_syscall1(SYS_gettid, 0);
+        for (;;) {
+            /* Tracer 6-Z266 translates the faked pid-1 to the real tgid,
+             * so the raise delivers; the default SIGABRT disposition ends
+             * the process and init takes over. The loop is only a
+             * fallback if the signal somehow does not stick. */
+            raw_syscall4(SYS_tgkill, pid, tid, 6 /*SIGABRT*/, 0);
+            raw_syscall4(SYS_ppoll, 0, 0, 0, 0);
+        }
+    }
     if (g_abort_reraise_mode < 0) {
         /* Raw getenv-free probe: reading an env var through libc getenv
          * is safe here (no TLS/errno hazards — environ is plain data). */
