@@ -19880,7 +19880,23 @@ pub fn run_ptrace_loop(
                                 get_syscall_arg(&regs, abi.reg_arg2) as i64
                             };
 
-                            let tgid_translated = if pid_arg == FAKE_GUEST_PID {
+                            // 6-Z305t-23: the fake-self reference set grows —
+                            // tgkill(tgid=0, …) is ALWAYS EINVAL in the
+                            // kernel (a tgid of 0 can never be real), and
+                            // ladder #79 caught the fb_hook's die branch
+                            // calling tgkill(raw getpid()=0, real tid, 6)
+                            // → EINVAL → the raising thread silently
+                            // parked in its own ppoll retry loop forever
+                            // (the abort never delivered, the process
+                            // never died, init's exec-wait never freed).
+                            // Translating a 0 tgid to the real tgid is
+                            // strictly a fix: no legitimate guest code
+                            // can mean tgid 0. (kill(0)/negative pids keep
+                            // their kernel-native process-group semantics
+                            // and are NOT touched — tgkill only.)
+                            let fake_self =
+                                pid_arg == FAKE_GUEST_PID || (is_tgkill && pid_arg == 0);
+                            let tgid_translated = if fake_self {
                                 let real = match real_tgid_cache.get(&pid) {
                                     Some(t) => Some(*t),
                                     None => {
