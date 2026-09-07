@@ -26336,3 +26336,26 @@ Local verification: cargo fmt CLEAN (fmt --check exit 0), clippy -D warnings CLE
 CI: ladder #70 dispatch follows. Expected decode outcomes: (i) if the #69 freeze was skip-steal → NO VIOLATION lines (the fix removes the mechanism) and the queue advances past load_persist_props → nonencrypted → zygote (RUNG 5); (ii) if a DIFFERENT resume-loss path exists → the checker pins it precisely (which tid, which stop class, which iteration) instead of a silent freeze; either way the next artifact is decisive. Recovery corpus risk: the two skip sites are unreachable in recovery boots (6-Z186 needs 64 consecutive ESRCH rounds; the fork-arm conditional only changes the parent-already-exited case) — the shared-machinery regression gate stands.
 
 Honest unverified: no local ARM64 runtime; the skip-steal interleaving remains inferred until the #70 artifact (that is precisely what the checker is for).
+
+## 6-Z305t-17 — #70 decode: the tracer is CLEAN, the queue is parked behind a REAL logd wedge; PTRACE_INTERRUPT stall probe lands (the uid-independent instrument)
+
+#70 (8c6b16e → run 34144007376) decode — rung 4 held, but the FAILURE MODE CHANGED FUNDAMENTALLY:
+- The 6-Z305t-16 machinery is CLEAN: 0 PENDING-RESUME VIOLATION lines, every logd thread stop→resume pair ret=0 (6-Z305t-14/16 forensics), NO +8.1 s fleet freeze (the loop stayed alive through +193 s), NO resume loss anywhere. The skip-steal elimination + non-blocking tee removed the tracer-side freeze class FOR GOOD.
+- The queue ADVANCED: post-fs-data ran fully (+3.2→+6.9 s: apexd, derive_sdk, vdc, tzdatacheck, otapreopt, tombstoned…), load_persist_props_action started (+6.95 s), logd-reinit ran, flags_health_check EXEC'D (+7.0 s, pid 2749).
+- The queue is STILL parked at load_persist_props_action: exec 11 is synchronous ("started; waiting...") and flags_health_check NEVER exits — blocked writing to logd's logdw socket (nr=64 write, fd 3 = socket:[48967], liblog+0x3740 ppoll) — for the ENTIRE run (+193 s). The "+8.1/+13.2/+18.2 s starting service" lines are init's ASYNC restart loop of the two crash-looping vendor HALs (atrace/keymaster, /dev/hwbinder missing → exit 1 every ~5 s), NOT queue progress.
+- logd MAIN (2680) itself has been blocked-in-kernel since ~+2.5 s (its last ENTRY stop: nr=64 write; in_syscall=true forever; 4× STALL lines at +8.1 s). Its threads (2685/2687/2688/2689, CLONEd +2.42–2.47 s) completed their startup and went quiet (forensics budget exhausted at the linker phase). THE LOGDW WEDGE IS REAL AND INTERNAL TO LOGD — logd main appears to block writing its OWN logs before/while its reader starts (the 6-Z305t-14c self-deadlock hypothesis), now isolated as a single-process pathology with a healthy tracer.
+- VISIBILITY GAP: every /proc read for logd's pids fails (comm=?, wchan=?, no 271f dump) — after logd's setuid to uid 1036 the app's /proc reads are DAC-denied; the ENTRY forensics budgets (24/tid) exhausted during thread startup. The true blocked syscall of the ONE tracee that matters is invisible to all existing instruments.
+- Secondary observation (later-stage, parked): 80 SIGSEGVs across vendor-HAL processes at one shared pc offset ...128, si_code=1 unmapped — the hwbinder crash-loop class; revisit after zygote.
+
+Implementation (app/rs/kr64/src/ptrace_emu.rs):
+1. `stall_interrupt_probe(pid, abi)`: PTRACE_INTERRUPT → specific-tid WNOHANG spin (≤250 ms, NEVER waitpid(-1) — the main dispatch stays intact) → GETREGS → TRUE nr (get_syscall_num) + args + pc → `maps_region_for_pc` → loud `6-Z305t-17 STALL-PROBE` line → PTRACE_SYSCALL resume restoring the exact mid-syscall flow (the EXIT stop arrives via the main loop; in_syscall bookkeeping unchanged). Every failure path resumes-or-logs honestly (ESRCH/dead → nothing probed; timeout → re-armed PTRACE_SYSCALL).
+2. Wired into the 271d stall scan: probe when blocked >10 s, budget 6/pid, 15 s/pid cooldown. The tracer RELATIONSHIP bypasses the post-setuid /proc DAC wall — this is the instrument that works exactly where every /proc-based one fails.
+3. `maps_region_for_pc` factored out of stall_forensic_dump (shared).
+
+Commits: (this commit) `diag(ptrace): 6-Z305t-17 — PTRACE_INTERRUPT stall probe …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 783 passed / 0 failed.
+
+CI: ladder #71 dispatch follows. Expected: STALL-PROBE lines name logd main's (2680) TRUE blocked syscall + owning library — if it is the logdw write (fd→socket via the shlib hook), the 6-Z305t-18 fix targets logd's self-logging path (honest semantics: logd must drain like logd — likely the logd-internal early-log path racing its LogReader thread, or the tracer's socket-hook mishandling logd's OWN connect/write); if it names something else entirely, the wedge class changes with the evidence in hand.
+
+Honest unverified: no local ARM64 runtime; the logd-main-blocks-writing-own-logs attribution is the leading hypothesis, not yet a fact — the probe exists precisely to make it one.
