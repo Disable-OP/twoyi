@@ -12162,7 +12162,11 @@ pub fn run_ptrace_loop(
     // the fake return value for a syscall the backstop neutered
     // (rewrote to getpid) at its ENTRY stop — the matching EXIT stop
     // consumes it. Per-pid, mirroring the other pending_* maps.
-    let sandbox = crate::vfs::SandboxPolicy::with_staging(rootfs, data_dir);
+    // 6-Z305t-8: system boots get the honest-ENOENT semantics for the
+    // 6-Z196 runtime-fallback class (see vfs::SandboxPolicy::system_mode)
+    // — recovery keeps the raw-host fallback (TWRP's proven boot path).
+    let sandbox =
+        crate::vfs::SandboxPolicy::with_staging(rootfs, data_dir).with_system_mode(!boot_recovery);
     let mut pending_sandbox_deny: std::collections::HashMap<libc::pid_t, i64> =
         std::collections::HashMap::new();
     let mut sandbox_deny_count: u64 = 0;

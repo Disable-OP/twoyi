@@ -948,6 +948,19 @@ pub struct SandboxPolicy {
     /// probe result cannot change under a running boot. Cap 4096 with
     /// clear-on-overflow.
     fallback_exists_cache: std::cell::RefCell<std::collections::HashMap<Box<str>, bool>>,
+    /// 6-Z305t-8: SYSTEM-mode semantics for the 6-Z196 runtime-host-fallback
+    /// class. In SYSTEM mode the guest boots with its OWN linker + a real
+    /// linkerconfig-generated ld.config.txt, so a lib missing from the
+    /// rootfs's /system/lib64 must yield an honest ENOENT — the bionic
+    /// linker then CONTINUES its namespace search into /apex/<name>/lib64
+    /// (exactly like a real device). The fallback's RAW host path instead
+    /// leaked the open past the rootfs and the 6-Z185 backstop faked -13
+    /// (EACCES), which makes lmkd's lazy dlopen("libstatssocket.so") fail
+    /// immediately → exit(1) → critical ×4 → InitFatalReboot (ladder
+    /// 34120752351/#59). RECOVERY keeps the fallback: TWRP ramdisks keep
+    /// their runtime in /sbin and ship no /system tree — the host linker
+    /// parity IS the boot path there.
+    system_mode: bool,
 }
 
 impl SandboxPolicy {
@@ -984,7 +997,22 @@ impl SandboxPolicy {
             staging_dir_canon: None,
             canon_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             fallback_exists_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            // 6-Z305t-8: default RECOVERY semantics (the 6-Z196 raw-host
+            // runtime fallback stays ON) — exactly the pre-t-8 behavior.
+            // run_ptrace_loop flips this off for system boots.
+            system_mode: false,
         }
+    }
+
+    /// 6-Z305t-8: set SYSTEM-mode semantics (see the `system_mode` field
+    /// doc): the 6-Z196 raw-host runtime fallback is DISABLED for
+    /// /system|/apex lib/linker paths — a rootfs miss yields an honest
+    /// ENOENT so the bionic linker's namespace search continues into the
+    /// flattened apex trees, instead of a backstop-faked EACCES that
+    /// aborts the search (lmkd dlopen failure, ladder #59).
+    pub fn with_system_mode(mut self, system_mode: bool) -> Self {
+        self.system_mode = system_mode;
+        self
     }
 
     /// Full policy: rootfs + the exec staging area.
@@ -1261,7 +1289,11 @@ impl SandboxPolicy {
             let mut rootfs_copy = String::with_capacity(self.rootfs.as_os_str().len() + path.len());
             rootfs_copy.push_str(&self.rootfs.to_string_lossy());
             rootfs_copy.push_str(path);
-            if self.is_runtime_host_fallback(Path::new(path))
+            // 6-Z305t-8: SYSTEM mode never leaks the raw host path — the
+            // honest ENOENT on a rootfs miss lets the linker continue its
+            // namespace search (see the `system_mode` field doc).
+            if !self.system_mode
+                && self.is_runtime_host_fallback(Path::new(path))
                 && !self.fallback_exists_cached(&rootfs_copy)
             {
                 // The guest ROM does not ship an APEX of its own — keep
@@ -1274,7 +1306,9 @@ impl SandboxPolicy {
             let mut rootfs_copy = String::with_capacity(self.rootfs.as_os_str().len() + path.len());
             rootfs_copy.push_str(&self.rootfs.to_string_lossy());
             rootfs_copy.push_str(path);
-            if self.is_runtime_host_fallback(Path::new(path))
+            // 6-Z305t-8: same system-mode gate as the /apex arm above.
+            if !self.system_mode
+                && self.is_runtime_host_fallback(Path::new(path))
                 && !self.fallback_exists_cached(&rootfs_copy)
             {
                 // Kernel-PT_INTERP parity: the kernel opens
@@ -1821,6 +1855,61 @@ mod sandbox_policy_tests {
             )
             .unwrap();
         assert_eq!(p.verify_real_path(&real), SandboxVerdict::Allow);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn z305t8_system_mode_disables_runtime_host_fallback() {
+        // 6-Z305t-8: in SYSTEM mode a lib missing from the rootfs's
+        // /system/lib64 must translate to the ROOTFS COPY (kernel yields
+        // an honest ENOENT and the bionic linker continues its namespace
+        // search into the flattened apex trees), never to the RAW host
+        // path (which the 6-Z185 backstop fakes as EACCES and the linker
+        // treats as a search-aborting failure — lmkd's lazy
+        // dlopen("libstatssocket.so") died exactly that way, ladder #59).
+        let base = std::env::temp_dir().join(format!("twoyi-vfs-sysmode{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("rootfs/system/lib64")).unwrap();
+        // The rootfs does NOT ship libstatssocket.so (matches the AOSP 11
+        // SDK image: it lives only in the com.android.os.statsd apex).
+        // It DOES ship libbacktrace.so (the rootfs copy must keep winning
+        // in both modes).
+        std::fs::write(base.join("rootfs/system/lib64/libbacktrace.so"), b"x").unwrap();
+        let rootfs = base.join("rootfs").to_str().unwrap().to_string();
+
+        // RECOVERY (default) semantics — unchanged since 6-Z196:
+        let p = SandboxPolicy::new(&rootfs);
+        assert_eq!(
+            p.translate_guest("/system/lib64/libstatssocket.so"),
+            "/system/lib64/libstatssocket.so",
+            "recovery keeps the raw-host runtime fallback"
+        );
+        assert_eq!(
+            p.translate_guest("/system/lib64/libbacktrace.so"),
+            format!("{}/system/lib64/libbacktrace.so", rootfs),
+            "recovery: rootfs copy still wins when present"
+        );
+
+        // SYSTEM semantics (with_system_mode(true)):
+        let sys = SandboxPolicy::new(&rootfs).with_system_mode(true);
+        assert_eq!(
+            sys.translate_guest("/system/lib64/libstatssocket.so"),
+            format!("{}/system/lib64/libstatssocket.so", rootfs),
+            "system mode must keep the lookup inside the rootfs (honest ENOENT)"
+        );
+        assert_eq!(
+            sys.translate_guest("/system/lib64/libbacktrace.so"),
+            format!("{}/system/lib64/libbacktrace.so", rootfs),
+        );
+        assert_eq!(
+            sys.translate_guest("/apex/com.android.os.statsd/lib64/libstatssocket.so"),
+            format!(
+                "{}/apex/com.android.os.statsd/lib64/libstatssocket.so",
+                rootfs
+            ),
+            "system mode: apex lib lookups stay in the flattened tree"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
