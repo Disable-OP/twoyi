@@ -9362,7 +9362,12 @@ fn proc_state_char(pid: libc::pid_t) -> Option<char> {
 // 6-Z305t-17: PTRACE_INTERRUPT (0x4203, Linux uapi ptrace.h) — the pinned
 // android libc crate does not export it (the host gnu libc does, which is
 // why local gates passed while the Android CI build failed E0425). Defined
-// locally with the exact libc::ptrace request type.
+// locally, typed to match each platform's libc::ptrace request parameter
+// (host gnu libc: c_uint — android libc: c_int; the same split every
+// exported libc::PTRACE_* constant follows).
+#[cfg(target_os = "android")]
+const PTRACE_INTERRUPT: libc::c_int = 0x4203;
+#[cfg(not(target_os = "android"))]
 const PTRACE_INTERRUPT: libc::c_uint = 0x4203;
 
 /// 6-Z305t-17: the first /proc/<pid>/maps line whose range contains `pc`,
