@@ -26359,3 +26359,22 @@ Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 
 CI: ladder #71 dispatch follows. Expected: STALL-PROBE lines name logd main's (2680) TRUE blocked syscall + owning library — if it is the logdw write (fd→socket via the shlib hook), the 6-Z305t-18 fix targets logd's self-logging path (honest semantics: logd must drain like logd — likely the logd-internal early-log path racing its LogReader thread, or the tracer's socket-hook mishandling logd's OWN connect/write); if it names something else entirely, the wedge class changes with the evidence in hand.
 
 Honest unverified: no local ARM64 runtime; the logd-main-blocks-writing-own-logs attribution is the leading hypothesis, not yet a fact — the probe exists precisely to make it one.
+
+## 6-Z305t-18 — probe hardening: PTRACE_INTERRUPT is SEIZE-only (74: 84/84 ESRCH) → SIGSTOP probe (ATTACH-portable) + fd-context line
+
+#74 (7d9a8f7 → run 34149398612) decode:
+- The build FIXED (android libc E0425 → local const; request-type split android c_int / host c_uint) and the probe pass FIRED — 84 STALL-PROBE attempts — but EVERY one failed `PTRACE_INTERRUPT failed: ESRCH`. Mechanism: PTRACE_INTERRUPT is only valid on PTRACE_SEIZE-attached tracees; every twoyi tracee is PTRACE_TRACEME/PTRACE_ATTACH/auto-event-attached. (A second, smaller leak: probed pids included already-reaped ones — the probe pass swept last_stop_at without liveness filtering; ESRCH made that harmless but noisy.)
+- #74 otherwise reproduced #70 exactly: rung 4, flags_health_check wedged on the logdw write, logd main blocked since ~+2.5 s.
+
+Implementation (app/rs/kr64/src/ptrace_emu.rs):
+1. `stall_interrupt_probe` rewritten around SIGSTOP (ATTACH-portable): kill(pid, SIGSTOP) wakes an INTERRUPTIBLE sleep, the kernel rewinds the syscall for its ERESTARTSYS restart and stops the tracee BEFORE re-executing → GETREGS names the TRUE nr + args + pc → resume with PTRACE_SYSCALL(signal 0) swallows the group-stop and the syscall re-executes transparently (no EINTR visible to the guest; dgram writes are atomic — no double-write). EPERM/ESRCH/timeout paths all logged honestly; a timeout leaves the pending SIGSTOP for the main loop's existing SIGSTOP arm (benign, no ptrace state touched).
+2. NEW `6-Z305t-18 PROBE-CTX` line: before each probe, the LAST CONSUMED ENTRY's (nr, fd) from pending_entry_fd is resolved through open_fd_owner_paths — when the probe's TRUE nr matches, the fd name identifies the exact socket/file the tracee is wedged on (the /proc fd table is DAC-invisible post-setuid; the tracer's own map is not).
+3. The dead PTRACE_INTERRUPT constant removed.
+
+Commits: (this commit) `diag(ptrace): 6-Z305t-18 — SIGSTOP stall probe …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 783 passed / 0 failed.
+
+CI: ladder #75 dispatch follows. Expected: STALL-PROBE lines with TRUE nr for logd main (2680-class) AND its threads — the decisive candidates: nr=64 write with fd→{rootfs}/dev/socket/logdw (self-deadlock proof) / nr=98 futex (lock chain — the futex word names the holder tid) / nr=203 connect. SIGSTOP EPERM is the honest failure mode to watch (host signaling a post-setuid tracee) — if EPERM, the next instrument is a SEIZE migration or a guest-side probe.
+
+Honest unverified: no local ARM64 runtime; the ERESTARTSYS-rewind reasoning is standard kernel behavior but unproven on this host until the #75 artifact.
