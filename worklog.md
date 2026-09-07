@@ -26178,3 +26178,23 @@ Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 783 passed /
 CI: ladder #64 dispatch follows.
 
 Expected: fs_mgr reads the SB ✓ → mount() → 6-Z305t-10 no-op 0 → /data MOUNTED (fs_mgr view) → mount_all returns FS_MGR_MNTALL_DEV_NOT_ENCRYPTABLE → `ro.crypto.state=unsupported` + `nonencrypted` queued → `processing action (nonencrypted)` → `class_start main` → `starting service 'zygote'` → RUNG 5 → system_server → RUNG 6. Honest risks: (a) zygote/ART first contact on the flattened com.android.art apex (boot classpath, odsync); (b) system_server's binder/property-context deps are previously verified; (c) rung 7 graphics (surfaceflinger on the virtual framebuffer).
+
+## 6-Z305t-11 — ro.crypto.state=unsupported preset (init's ONLY `start zygote` call sites are `on zygote-start && property:ro.crypto.state=…` — and nothing ever set the property)
+
+Discovery (ladder run 34130125737 @a7fa660, rung 4):
+
+- pt3 VERIFIED GREEN: "Invalid ext4 superblock" GONE; fs_mgr read the superblock (`superblock s_max_mnt_count:0,/dev/block/by-name/userdata`) and `__mount(source=/dev/block/by-name/userdata,target=/data,type=ext4)=0: Success` — /data MOUNTED in fs_mgr's view; vdc checkpoint exec succeeded; the action queue advanced through post-fs-data → load_persist_props.
+- STILL no zygote. Root decode: guest init's `start zygote` appears ONLY in `on zygote-start && property:ro.crypto.state=unencrypted|unsupported|encrypted+file` (init.rc:824-840, verified in the extracted image). NOTHING ever set ro.crypto.state: do_mount_all sets it only on the fs_mgr codes we no longer produce post-6-Z305t-10 (the /data mount "succeeded" but the overall return code matched no branch — silent), and `<3>init: Unable to set property 'ro.crypto.state' … Read-only property was already set` shows init's own attempt REJECTED — meaning SOMETHING had already landed a value (from the boot-defaults load order), just not one that matches a zygote-start section... and the proc_emu comment's claimed fallback ("the loader's existing pre-set of vold.decrypt=trigger_restart_framework") DOES NOT EXIST anywhere in the tree — dead documentation.
+- This is the direct gate between rung 4 and rung 5 (and it ALSO explains why every prior run since #56 never saw zygote: the property was never set in any of them).
+
+Implementation (app/rs/kr64/src/proc_emu.rs, write_boot_preset_properties):
+1. Pre-set `ro.crypto.state=unsupported` (idempotent per-property like the siblings) — the honest container value: /data is the app's private merged rootfs, unencrypted by definition. The property-conditioned zygote-start section then matches and calls `start zygote` (plus exec_start update_verifier_nonencrypted + start statsd + start netd — all genuine mainline init behavior).
+2. The stale comment block about "why not also set ro.crypto.state" is replaced with the current rationale (the 2026-08-11 SIGABRT worry was createProcessGroup-related and that failure mode is now understood/tolerated; the vold.decrypt fallback never existed).
+
+Commits: (this commit) `fix(props): 6-Z305t-11 — pre-set ro.crypto.state=unsupported …`.
+
+Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 783 passed / 0 failed.
+
+CI: ladder #65 dispatch follows.
+
+Expected: ro.crypto.state=unsupported lands in the boot defaults → `on zygote-start && property:ro.crypto.state=unsupported` matches → `start zygote` → `starting service 'zygote'` → RUNG 5 ZYGOTE (the first zygote since the rung-1-3 era) → ART/system_server path → RUNG 6 stretch. Honest risks: (a) zygote's ART on flattened com.android.art (boot classpath dex2oat / odsync) is first contact; (b) the property-file set may fire the zygote-start section EARLY (queue_property_triggers replays at late-init — before post-fs-data!): `start zygote` before /data is "mounted" — init handles service starts across the queue; zygote itself waits on its own deps (it's a service, started asynchronously; ART reads /data late). If ordering proves wrong, the fix is to move the set to a later point (e.g. via the t-10 mount completion) — decode first.
