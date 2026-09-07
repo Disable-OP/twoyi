@@ -25692,3 +25692,19 @@ Stage Summary:
 - origin/main 593726f. Expected next run: init re-execs carry /dev-only injected env or the shlib's rootfs-prefixed list → ALL libs resolve from the guest rootfs (08:01) → init survives → services spawn WITH the shlib → binder opens hit the wire protocol → the ORIGINAL fleet wall (105s /dev/binder ENXIO) should be GONE; apex consumers (zygote/lmkd/media) still die CANNOT LINK honestly — that is the 6-Z305t ext4-flattening wall.
 - RISK WATCH: the shlib exec-hook list change touches the TWRP-mode chains too (guarded by the two arm64 guards, dispatched). The x86 KVM-era ui-e2e-aosp corpus is NOT guarded here — if it depended on host apex libs it will surface in its next run (accepted; the boundary discipline outranks the legacy corpus).
 - NEXT (6-Z305t): 1. decode the re-run (expect: no CANNOT LINK for init; "6-Z305s injected (VERIFIED)" on service execs; binder fleet alive; zygote/lmkd/media CANNOT LINK as the honest frontier); 2. pure-Rust read-only ext4 reader → /apex/<name> flattening from the 22 /system/apex payloads (incl. com.android.art.debug.apex — userdebug image has NO plain art apex); 3. guards + ladder.
+
+---
+Task ID: 6-Z305t part 1 (ext4 reader, offline window)
+Agent: Z.ai Code (main dispatcher)
+Task: implement the apex-payload ext4 reader while the sandbox→GitHub link is down (hotfix 593726f + worklog d9fa3d8 committed locally, push pending).
+
+Work Log:
+- Inspected a REAL corpus payload (com.android.os.statsd.apex → apex_payload.img, 1560576 bytes): superblock decoded by hand — 4096-byte blocks, 256-byte inodes, first_data_block=0, feature_incompat = FILETYPE(0x2)|EXTENTS(0x40)|FLEX_BG(0x200), NO 64BIT/META_BG/INLINE_DATA; apex_manifest.pb name extraction = first "com.android.*" string.
+- Implemented app/rs/kr64/src/apex_fs.rs (~490 lines): read-only ext4 (superblock validate + reject unsupported incompat bits, GDT incl. desc_size/64BIT sizing, inode walk, extent-tree logical→physical mapping with depth bound, ext4_dir_entry_2 parsing, fast-symlink read, extract_tree materialization with symlink preservation). std+libc only (crate policy). Honest hard-fail (Ext4Error::Bad) on unsupported feature bits — never a partial flatten.
+- DEBUG LESSON (fixture-side, worth recording): ext4_dir_entry_2 is {inode@0, rec_len@4, name_len@6, file_type@7, name@8} — name_len/ftype sit at 6/7 (NOT 5/6), and writing rec_len last must not clobber them; initial fixture had name at offset 7 + a rec_len/name_len byte collision, which surfaced as one garbage entry — the reader itself needed the 6/7 fix.
+- 6 new tests (hand-built minimal ext4 fixture image: listing, file read, missing-path remainder semantics, non-extents rejection, garbage-magic rejection, extract_tree incl. symlink + dir counting) + env-gated real-payload smoke (TWOYI_EXT4_TEST_IMAGE). Smoke PASSED on the real statsd payload (8 root entries). 773 total green; fmt + clippy --all-targets clean.
+- NOT WIRED YET (deliberate): the flattening call into the boot path lands next round AFTER the 6-Z305s-b hotfix proves live on CI — no behavior change in this commit.
+
+Stage Summary:
+- Commit 76c1f91 (local; push pending network). The 6-Z305t frontier is now: (2) flatten wiring in lib.rs staging (zip payload → temp file → Ext4Image::extract_tree → {rootfs}/apex/<manifest-name>/ with mode hygiene), (3) CI verify of the 6-Z305s-b hotfix, (4) ladder re-run expecting the binder fleet alive + apex consumers unblocked.
+- Known remaining risks: x86 KVM-era ui-e2e-aosp corpus unverified against the shlib exec-hook list change; apexd in flattened mode may still expect /system/apex/<name>/ dirs (it exits 0 without them — verified in-run at 62ms); SELinux relabel of flattened apex dirs (lsetxattr EPERM on the runner) is harmless under the fake-selinux device model.
