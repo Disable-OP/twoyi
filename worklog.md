@@ -26282,3 +26282,27 @@ NEXT (6-Z305t-15 — the logd-draining fix, decode-first):
 3. The queue advance is EXPECTED the moment logdw drains: flags_health_check exits → load_persist_props completes → load_bpf_programs → nonencrypted → start zygote → RUNG 5.
 
 Honest unverified: logd's internal thread states are inferred from process-level stalls; the per-TID syscall/fd dump (6-Z305t-15 step 1) is the decisive instrument. The recovery corpus does NOT exercise multithreaded logd (TWRP logs via kmsg) — the regression risk of the eventual fix is system-mode-local.
+
+## 6-Z305t-15 — the tracer's stderr tee is NON-BLOCKING (when the Java tee pipe fills, the ptrace loop froze in write(2) and every tracee stayed ptrace-stopped — THE guest-wide freeze; this is the class of wall that produced the rung-4 ceiling, not logd itself)
+
+Discovery (ladder run 34138249489 @f4472e3 = #68 + the #67/#68 correlation):
+
+- The #68 forensics pinned flags_health_check's wedge fd = socket:[48835] (the real logdw client socket) — and pid 2686 turned out to be UEVENTD (not logd), wedged the IDENTICAL way (fd 5 = a connected logdw client socket, writev→ppoll retry loop). BOTH wedges began at ~+8.1s SIMULTANEOUSLY across unrelated processes — a fleet-wide freeze at one instant is not per-process semantics, it is the TRACER stopping.
+- The tracer's own 6-Z260 comment states the mechanism verbatim: "kr64 blocks when the pipe fills, and the whole guest is frozen while the tracer waits on write()". The ptrace loop's only job between stops is waitpid + resume; when its stderr tee (→ the app's FileLogger pipe) blocks in write(2), every tracee stays ptrace-stopped indefinitely. The #66/#67 "frozen threads" decode was a DOWNSTREAM symptom: the tracer froze mid-loop with logd's threads stopped mid-syscall; my earlier per-thread resume-miss theory is RETRACTED (the 14a forensics showed attach/entry/resume handled correctly whenever the loop was alive).
+- The freeze trigger at +8.1s: the diagnostic burst of the NEW forensics + the WRITEV-SAMPLEs filled the 16 KiB batch faster than the app-side tee drained; one full-pipe flush blocked the loop.
+- The liblog/ppoll wedges (flags_health_check, ueventd) are then EXPLAINED WITHOUT logd pathology: their threads were frozen mid-writev by the tracer (the socket buffer never drained because the CLIENT was ptrace-stopped mid-write for ~90s — the socket buffer filled with exactly ONE partial write).
+
+Implementation (app/rs/kr64/src/lib.rs):
+1. `trace_nb_fd()`: a lazily-created DEDICATED dup(2) with O_NONBLOCK (private open-file description — the app's own fd 2 is untouched).
+2. `trace_nb_write()`: single-shot write; EAGAIN → DROP the remainder (lossy diagnostics under pressure; the guest keeps running); EINTR → one retry; other errors → one blocking stderr fallback (broken-dup guard). A one-shot bounded diag records the first drop ("tee pipe FULL — dropped N bytes").
+3. Both sink paths (buffered flush + the poisoned-Mutex fallback) route through it. The 16 KiB batching stays.
+
+Commits: (this commit) `fix(trace): 6-Z305t-15 — the tracer's stderr tee is NON-BLOCKING …`.
+
+Local verification: cargo fmt CLEAN, clippy CLEAN (two lint iterations), cargo test --lib 783 passed / 0 failed.
+
+CI: ladder #69 dispatch follows.
+
+Expected: NO fleet-wide +8.1s freeze (the 271d stall set shrinks to legitimately-idle daemons); flags_health_check's exec completes (its liblog write proceeds to the real logd socket — if logd genuinely drains, it exits; if logd has its OWN pathology, the stall will now be ISOLATED to flags_health_check alone — a clean single-process decode instead of a fleet-wide freeze); the queue advances past load_persist_props → nonencrypted → zygote (rung 5). Honest risks: (a) the freeze may have MASKED genuine logd issues — the next artifact shows logd's true behavior; (b) the drop-on-full means artifact logs under pressure are lossy (the one-shot diag + the stop-ring keep the forensics usable).
+
+Honest unverified: no local ARM64 runtime; the simultaneous-freeze→tracer-blocking-write attribution rests on the single-instant correlation + the code's own documented mechanism.
