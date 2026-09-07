@@ -10607,10 +10607,17 @@ fn write_child_string_unchecked(pid: libc::pid_t, addr: u64, s: &str) -> bool {
 /// POKEDATA word chunks. Same contract as `write_child_string_unchecked`
 /// but for binary structs (translated sockaddr blobs).
 fn write_child_blob(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> bool {
+    write_child_blob_errno(pid, addr, bytes).is_ok()
+}
+
+/// 6-Z305s-m: errno-reporting variant of [`write_child_blob`] — the
+/// fail-closed connect arm needs the underlying POKEDATA errno for its
+/// denial diagnostic (the bool return swallowed it).
+fn write_child_blob_errno(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> Result<(), i32> {
     // 6-Z180: POKE AUDIT (see write_child_bytes_pokedata).
     poke_audit("blob", pid, addr, bytes);
     if addr == 0 || bytes.is_empty() {
-        return false;
+        return Err(libc::EINVAL);
     }
     let word_size = std::mem::size_of::<libc::c_long>();
     let mut offset = 0i64;
@@ -10629,11 +10636,13 @@ fn write_child_blob(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> bool {
             )
         };
         if r == -1 {
-            return false;
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
         }
         offset += word_size as i64;
     }
-    true
+    Ok(())
 }
 
 // ── Task 6-Z163: AF_UNIX bind() sun_path rewrite — pure helpers ──────
@@ -17966,7 +17975,17 @@ pub fn run_ptrace_loop(
                                         scratch_offset
                                     };
                                     let sa_scratch = scratch_addr + cursor as u64;
-                                    if write_child_blob(pid, sa_scratch, &new_sa) {
+                                    // 6-Z305s-m: capture the underlying POKEDATA
+                                    // errno — the fail-closed denial diagnostic
+                                    // below must name WHY the translation lost
+                                    // the scratch window (was swallowed by the
+                                    // bool return).
+                                    let poke_errno =
+                                        match write_child_blob_errno(pid, sa_scratch, &new_sa) {
+                                            Ok(()) => 0,
+                                            Err(e) => e,
+                                        };
+                                    if poke_errno == 0 {
                                         let mut fresh: Regs = unsafe { std::mem::zeroed() };
                                         match ptrace_getregs_wide(pid, &mut fresh) {
                                             Err(e) => log(&format!(
@@ -18033,14 +18052,111 @@ pub fn run_ptrace_loop(
                                             }
                                         }
                                     } else {
-                                        let n = Z305Q_CONNECT_SKIP_LOG
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if n < 8 {
-                                            log(&format!(
-                                                "6-Z305q: connect sockaddr scratch write FAILED (pid {}) — connect runs on the RAW path [{} /8]",
-                                                pid,
-                                                n + 1
-                                            ));
+                                        // 6-Z305s-m: FAIL CLOSED. The fail-open
+                                        // here let the RAW connect execute and
+                                        // guest connects leaked to the HOST's
+                                        // socket (ladder run 34080741665:
+                                        // /dev/socket/property_service landed on
+                                        // redroid's own listener, whose init
+                                        // answered 0xb
+                                        // PROP_ERROR_READ_ONLY_PROPERTY for every
+                                        // ro.* set — ro.cold_boot_done never
+                                        // reached the guest area → init parked
+                                        // forever at wait_for_coldboot_done,
+                                        // rung 3). Zeroing addrlen makes the
+                                        // kernel return -EINVAL without touching
+                                        // ANY socket (host or guest); bionic
+                                        // retries and the next attempt gets a
+                                        // fresh scratch window. Scope: this arm
+                                        // only runs for filesystem-spelling
+                                        // absolute guest paths past the first
+                                        // execve in system boots
+                                        // (connect_translate_target already
+                                        // rejected abstract/relative/already-
+                                        // translated spellings) — abstract
+                                        // sockets, the @TWOYI_SOCK hostbridge
+                                        // and /dev/qemu_pipe are untouched.
+                                        let mut fresh: Regs = unsafe { std::mem::zeroed() };
+                                        match ptrace_getregs_wide(pid, &mut fresh) {
+                                            Err(e) => {
+                                                // Cannot rewrite regs — the raw
+                                                // connect regrettably executes;
+                                                // keep the honest log (residual
+                                                // leak, next decode target).
+                                                let n = Z305Q_CONNECT_SKIP_LOG.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                if n < 8 {
+                                                    log(&format!(
+                                                        "6-Z305q: connect sockaddr scratch write FAILED (pid {}, errno={}) — fail-closed getregs FAILED: {} — connect runs on the RAW path [{} /8]",
+                                                        pid,
+                                                        std::io::Error::from_raw_os_error(
+                                                            poke_errno
+                                                        ),
+                                                        e,
+                                                        n + 1
+                                                    ));
+                                                }
+                                            }
+                                            Ok(len) => {
+                                                set_syscall_arg(&mut fresh, abi.reg_arg3, 0);
+                                                let mut deny_ok =
+                                                    ptrace_setregs(pid, &fresh, len).is_ok();
+                                                if !deny_ok {
+                                                    // 6-Z268: one retry — transient
+                                                    // GETREGSET/SETREGSET failures
+                                                    // must not downgrade the denial
+                                                    // (same tolerance the translate
+                                                    // arm above relies on).
+                                                    deny_ok = ptrace_setregs(
+                                                        pid, &fresh, len,
+                                                    )
+                                                    .is_ok();
+                                                }
+                                                if deny_ok {
+                                                    // Mirror the translate arm:
+                                                    // keep the ENTRY regs snapshot
+                                                    // consistent in case the
+                                                    // caller re-applies it.
+                                                    set_syscall_arg(
+                                                        &mut regs,
+                                                        abi.reg_arg3,
+                                                        0,
+                                                    );
+                                                    let n = Z305Q_CONNECT_SKIP_LOG
+                                                        .fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                    if n < 8 {
+                                                        log(&format!(
+                                                            "6-Z305q: connect sockaddr scratch write FAILED (pid {}, errno={}) — connect DENIED fail-closed (6-Z305s-m: addrlen=0 → -EINVAL, no host socket touched) [{} /8]",
+                                                            pid,
+                                                            std::io::Error::from_raw_os_error(
+                                                                poke_errno
+                                                            ),
+                                                            n + 1
+                                                        ));
+                                                    }
+                                                } else {
+                                                    let n = Z305Q_CONNECT_SKIP_LOG
+                                                        .fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                    if n < 8 {
+                                                        log(&format!(
+                                                            "6-Z305q: connect sockaddr scratch write FAILED (pid {}, errno={}) — fail-closed setregs FAILED (twice) — connect runs on the RAW path [{} /8]",
+                                                            pid,
+                                                            std::io::Error::from_raw_os_error(
+                                                                poke_errno
+                                                            ),
+                                                            n + 1
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -29725,6 +29841,37 @@ pub fn run_ptrace_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 6-Z305s-m: the fail-closed connect arm's scope gate ──────────
+    //
+    // The denial path only ever runs for connects connect_translate_target
+    // ACCEPTED — filesystem-spelling absolute guest paths. Assert the
+    // exclusions the fail-closed fix relies on: abstract-namespace and
+    // already-translated (rootfs-prefixed) spellings must stay untouched
+    // (→ None), while a plain guest path translates.
+    #[test]
+    fn connect_translate_target_scope_matches_fail_closed_arm() {
+        let fs = {
+            let mut b = vec![1u8, 0];
+            b.extend_from_slice(b"/dev/socket/property_service\0");
+            connect_translate_target(&b, "/data/data/io.twoyi/rootfs").is_some()
+        };
+        assert!(fs);
+        let abstract_ns = {
+            let mut b = vec![1u8, 0];
+            b.extend_from_slice(b"\0property_service");
+            connect_translate_target(&b, "/data/data/io.twoyi/rootfs").is_none()
+        };
+        assert!(abstract_ns);
+        let already_translated = {
+            let mut b = vec![1u8, 0];
+            b.extend_from_slice(
+                b"/data/data/io.twoyi/rootfs/dev/socket/property_service\0",
+            );
+            connect_translate_target(&b, "/data/data/io.twoyi/rootfs").is_none()
+        };
+        assert!(already_translated);
+    }
 
     // ── 6-Z260: stop-forensics ring buffer ────────────────────────────
     //
