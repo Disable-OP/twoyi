@@ -26198,3 +26198,22 @@ Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 783 passed /
 CI: ladder #65 dispatch follows.
 
 Expected: ro.crypto.state=unsupported lands in the boot defaults → `on zygote-start && property:ro.crypto.state=unsupported` matches → `start zygote` → `starting service 'zygote'` → RUNG 5 ZYGOTE (the first zygote since the rung-1-3 era) → ART/system_server path → RUNG 6 stretch. Honest risks: (a) zygote's ART on flattened com.android.art (boot classpath dex2oat / odsync) is first contact; (b) the property-file set may fire the zygote-start section EARLY (queue_property_triggers replays at late-init — before post-fs-data!): `start zygote` before /data is "mounted" — init handles service starts across the queue; zygote itself waits on its own deps (it's a service, started asynchronously; ART reads /data late). If ordering proves wrong, the fix is to move the set to a later point (e.g. via the t-10 mount completion) — decode first.
+
+## 6-Z305t-12 — the shlib's logdw connect hook must try the REAL logd socket first (the unconditional /dev/__kmsg__ redirect wedged EVERY liblog client in system boots → flags_health_check froze in ppoll → init's synchronous exec in load_persist_props_action blocked forever → the init action queue stalled below load_persist_props → zygote-start/boot/nonencrypted never ran)
+
+Discovery (ladder run 34132027245 @69ea76f, rung 4):
+
+- The ro.crypto.state preset landed; the action queue STILL stopped right after load_persist_props_action. The decisive decode came from the 6-Z271d/6-Z271f/6-Z285 stall instrumentation: `SVC_EXEC service 'exec 11 (flags_health_check BOOT_FAILURE)' pid 2773 started; waiting...` and NO exit — init's load_persist_props_action section in flags_health_check.rc runs a SYNCHRONOUS `exec` (init waits), and the child froze: 6-Z271d `in_syscall=true for 6.1s — blocked in-kernel (poll_schedule_timeout)` + 6-Z285 backtrace `libc → liblog+0x3740 → libbase → server_configurable_flags → flags_health_check` — liblog's logdw write path, polling.
+- Why it blocks: the twoyi_loader shlib's connect hook redirects EVERY /dev/socket/logdw connect to /dev/__kmsg__ (6-Z272p — designed for RECOVERY images where no logd runs). In SYSTEM boots logd IS running and listening; the redirect hands liblog clients an fd that liblog's write path (or the hook chain) can wedge in its poll-retry loop. The whole init action queue died at the FIRST liblog-heavy synchronous exec — this is ALSO why the queue has stopped at load_persist_props in every system ladder run since at least #61 (it was never about mount_all — that fix was still necessary for the crypto chain, but the queue never got far enough to consume it).
+- The keymaster/atrace 5s-restart cycling confirmed init itself healthy (a 5s backoff loop, not a starvation state).
+
+Implementation (app/cpp/twoyi_loader/src/twoyi_loader_shlib.c, connect hook):
+1. The /dev/socket/logdw arm now tries the REAL (rootfs-translated) socket FIRST via SYS_connect: in system mode the connect returns 0 immediately (logd's listener exists from init's socket creation) → honest client-server logging, real logcat buffer. In recovery mode the connect fails INSTANTLY (ECONNREFUSED/ENOENT) → falls through to the proven 6-Z279 /dev/__kmsg__ dup3 redirect (unbounded non-blocking klog writes). Self-detecting in both modes — no boot-mode env plumbing needed. Bounded diag lines for both paths.
+
+Commits: (this commit) `fix(shlib): 6-Z305t-12 — logdw connect tries the REAL logd socket first …`.
+
+Local verification: C change (no local NDK — CI compiles via the gradle build); logic mirrors the existing 6-Z272p/6-Z279 patterns; raw syscalls only, no hook recursion; the failed-connect fallback leaves the fd unconnected exactly as the pre-hook state.
+
+CI: ladder #66 dispatch follows (gradle build compiles the shlib; any C error fails the build job loudly).
+
+Expected: `connect(/dev/socket/logdw) -> REAL logd (system mode…)` diag; flags_health_check's exec completes (it logs via liblog without freezing); init's action queue advances past load_persist_props → load_bpf_programs → `processing action (nonencrypted)` → `start zygote` (via the zygote-start property section) → `starting service 'zygote'` → RUNG 5 ZYGOTE → system_server (RUNG 6 stretch). Honest risks: (a) ART/zygote first contact on flattened apexes; (b) netd/statsd/update_verifier started by the zygote-start section may hit their own walls (each is a fresh decode target); (c) recovery boots re-exercise the fallback path (TWRP corpus is the regression gate).
