@@ -26596,3 +26596,26 @@ Implementation: the shim's kmsg open uses O_APPEND when accepted (atomic append 
 Commits: (this commit) `fix(shlib): 6-Z305t-32 — O_APPEND-with-lseek-fallback + dual write/writev fd test …`.
 
 CI: ladder #91 dispatch follows. The four-outcome matrix: both land + both rets positive ⇒ the #90 miss was positional (O_APPEND fixes it — liblog visibility achieved); writev ret positive but absent ⇒ the tracer's writev path eats it (next: the writev handler); write fails ⇒ the fd/dup3 broke (new decode).
+
+## 6-Z305t-33 — THE INVISIBILITY SOLVED: the shim's opens are hook-marked UNtranslated (6-Z187c) — the guest-style kmsg path opened the HOST's /dev/__kmsg__; revert to the host-absolute {g_rootfs} path (correct since 6-Z305t-27) which #89 PROVED lands in the captured file
+
+The #89→#91 contradiction chain resolved:
+- #89: the shim's kmsg open used the HOST-absolute {g_rootfs}/dev/__kmsg__ → hook-marked untranslated → opened the TOP-LEVEL rootfs file DIRECTLY → the write() marker landed mid-file in the ARTIFACT (verified at byte 67043, flanked by real liblog binary records).
+- #90/#91: switched to the guest-style "/dev/__kmsg__" → ALSO hook-marked untranslated → opened the HOST's (redroid) /dev/__kmsg__ — the 37-byte writes succeeded into a file nobody captures. Both fd tests returned 37 into the void.
+- The tracer NEVER ate anything: every write behaved exactly as the kernel would for the file it was pointed at. The bug was MINE (the #90 path change), and the 6-Z187c hook-marking semantics were the missing fact.
+
+Implementation: kmsg_path reverted to {g_rootfs}/dev/__kmsg__ (host-absolute; g_rootfs is the REAL tree since 6-Z305t-27), keeping O_APPEND-with-lseek-fallback and the dual write/writev fd test.
+
+Commits: (this commit) `fix(shlib): 6-Z305t-33 — kmsg path reverted to the host-absolute {g_rootfs} form …`.
+
+CI: ladder #92 dispatch follows. Expected: the fd-test markers APPEND to the captured klog, and with them the FULL guest liblog stream (zygote/app_process, hwservicemanager, the HAL fleet) — the exit(1) decode becomes text-driven.
+
+## 6-Z305t-34 — session checkpoint: the full instrument chain and the current frontier
+
+Session arc (#70→#92): the tracer was exonerated and hardened (6-Z305t-16 invariant + skip-steal; 17/18 the SIGSTOP stall probe after PTRACE_INTERRUPT proved SEIZE-only); the rung-4→5 wall was identified as the fb_hook's RECOVERY abort-park leaking into the system boot (6-Z305t-19 die policy, 20/21 the /dev marker trigger after getenv failed silently, 23 the tgkill(tgid=0)→EINVAL translation that let the abort chain COMPLETE); the boot then moved PAST the wall — zygote starts, onrestart actions run, the class-main fleet launches — and now fails FORWARD with honest crash-loops. The visibility layer was built out: service-stdio capture (24), the abort-message content dump (26/26b — verbatim FATAL texts), TWOYI_ROOTFS injection (27 — the "Binder driver could not be opened" ×9 class ELIMINATED), and the logdw→klog stream chase (25/29/30/31/32/33).
+
+The LAST open instrument question: the service liblog→klog stream. #89 PROVED the guest-absolute open + write() delivers (the marker landed mid-file flanked by real liblog binary records); writev() returns 37 yet delivers nothing (90/91 — lseek AND O_APPEND variants); the host-absolute path double-translates to ENOENT (92). 6-Z305t-34 restores the #89-proven configuration (guest-absolute open, O_APPEND-with-fallback, dual write/writev test) — the next artifact's klog then carries the service liblog stream (the write() class is proven), making hwservicemanager's exit(1) and zygote's exit(1) lines greppable (as binary logger_entry records with embedded text).
+
+Current frontier (unchanged): hwservicemanager exit(1) ×4 → critical-process InitFatalReboot; zygote exit(1) restart loop; the "Pointer tag … truncated" abort class (7×, parked).
+
+Honest unverified: no local ARM64 runtime; the writev-delivery mystery is the one open instrument question and does not block (the write() class is proven).
