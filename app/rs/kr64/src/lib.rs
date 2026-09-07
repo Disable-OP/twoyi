@@ -5234,7 +5234,7 @@ fn normalize_linkerconfig_perms(rootfs: &str) {
     {
         use std::os::unix::fs::PermissionsExt;
         let mut fixed = 0usize;
-        let mut stack = vec![lc_dir];
+        let mut stack: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(lc_dir)];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e) => e,
