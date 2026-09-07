@@ -8739,8 +8739,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 );
                 }
             }
-        } else if cfg.boot_recovery || guest_new_prop_format {
-            // ----- 6-Z196 / 6-Z272m: NEW-format GUEST (Android 8+ init) -----
+        } else {
+            // ----- 6-Z196 / 6-Z272m + 6-Z305s-l: clean-slate property area,
+            // UNCONDITIONAL for every guest except the OLD-format recovery
+            // single-file case above (new-format RECOVERY boots and EVERY
+            // SYSTEM boot, probe outcome irrelevant — see below) -----
             // The guest init OWNS the property area: it parses property
             // contexts, serializes the trie, writes property_info itself
             // (open O_CREAT|O_TRUNC) and — critically — opens
@@ -8756,6 +8759,19 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             //   * a stale single FILE /dev/__properties__ (an old-format
             //     run, or the probe's OLD default) → every child open
             //     fails ENOTDIR → same FATAL.
+            // 6-Z305s-l: this branch is UNCONDITIONAL (not probe-gated).
+            // The format probe byte-scans {rootfs}/init for the format
+            // literals, but a real DYNAMIC AOSP system init does not embed
+            // them (they live in its libc.so) — the probe reported OLD and
+            // the boot fell through to the legacy pre-create branch
+            // (removed with this change), which neither removed a stale nor
+            // avoided creating properties_serial. A populated serial file
+            // from a prior boot then maps back into the fresh boot (real
+            // MAP_SHARED area, ced49ce; the vfs materialize-on-open skips
+            // existing files) and guest init's own PropertySet rejects
+            // every ro.* wire set with PROP_ERROR_READ_ONLY (0xb,
+            // "Read-only property was already set") — ro.boottime.*,
+            // ro.cold_boot_done (worklog 6-Z305s-k/l, ladder 34076304740).
             // So: give init the same clean slate a fresh tmpfs /dev has
             // on real hardware — remove stale artifacts, create ONLY
             // the (empty) directory, pre-create NOTHING.
@@ -8765,7 +8781,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             if matches!(rootfs_prop_md, Ok(ref md) if md.is_file()) {
                 match std::fs::remove_file(&rootfs_prop_dir) {
                     Ok(()) => info!(
-                        "[KR64] PARENT: removed stale OLD-format file {} (new-format recovery boot — 6-Z196)",
+                        "[KR64] PARENT: removed stale OLD-format file {} (6-Z196/6-Z305s-l clean slate)",
                         rootfs_prop_dir
                     ),
                     Err(e) => error!(
@@ -8795,112 +8811,19 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             let _ =
                 std::fs::set_permissions(&rootfs_prop_dir, std::fs::Permissions::from_mode(0o777));
             info!(
-                "[KR64] PARENT: new-format recovery property area: clean dir at {}, NO files pre-created (guest owns them — 6-Z196)"
+                "[KR64] PARENT: clean property area (fresh-tmpfs /dev semantics — 6-Z196/6-Z305s-l): {} — NO files pre-created (guest init owns them)"
             , rootfs_prop_dir);
-        } else {
-            // ----- Android-guest (NEW Android 8+ subdirectory format) -----
-            // Create the directory on the host (if it doesn't exist)
-            let host_prop_dir = "/dev/__properties__";
-            if !Path::new(host_prop_dir).exists() {
-                match std::fs::create_dir_all(host_prop_dir) {
-                    Ok(_) => {
-                        let _ = std::fs::set_permissions(
-                            host_prop_dir,
-                            std::fs::Permissions::from_mode(0o711),
-                        );
-                        info!("[KR64] PARENT: created host {} (mode 0711)", host_prop_dir);
-                    }
-                    Err(e) => {
-                        error!(
-                            "[KR64] PARENT: failed to create host {}: {}",
-                            host_prop_dir, e
-                        );
-                    }
-                }
-            }
-            // Pre-create property_info on host (empty regular file, mode 0666).
-            // `.truncate(false)` makes the "do not overwrite an existing file"
-            // intent explicit (the `if !exists()` guard already ensures this).
-            let host_prop_info = format!("{}/property_info", host_prop_dir);
-            if !Path::new(&host_prop_info).exists() {
-                match std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&host_prop_info)
-                {
-                    Ok(_) => {
-                        let _ = std::fs::set_permissions(
-                            &host_prop_info,
-                            std::fs::Permissions::from_mode(0o666),
-                        );
-                        info!(
-                            "[KR64] PARENT: pre-created host {} (mode 0666)",
-                            host_prop_info
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "[KR64] PARENT: failed to pre-create host {}: {}",
-                            host_prop_info, e
-                        );
-                    }
-                }
-            }
-            // Also pre-create properties_serial on host (host's property service
-            // needs this; don't truncate if it already exists)
-            let host_prop_serial = format!("{}/properties_serial", host_prop_dir);
-            if !Path::new(&host_prop_serial).exists() {
-                match std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&host_prop_serial)
-                {
-                    Ok(_) => {
-                        let _ = std::fs::set_permissions(
-                            &host_prop_serial,
-                            std::fs::Permissions::from_mode(0o666),
-                        );
-                        info!("[KR64] PARENT: pre-created host {}", host_prop_serial);
-                    }
-                    Err(e) => {
-                        error!(
-                            "[KR64] PARENT: failed to pre-create host {}: {}",
-                            host_prop_serial, e
-                        );
-                    }
-                }
-            }
-            // Pre-create the directory + files in the rootfs too
-            let rootfs_prop_dir = format!("{}/dev/__properties__", rootfs_prefix);
-            let _ = std::fs::create_dir_all(&rootfs_prop_dir);
-            let _ =
-                std::fs::set_permissions(&rootfs_prop_dir, std::fs::Permissions::from_mode(0o777));
-            for fname in &["property_info", "properties_serial"] {
-                let path = format!("{}/{}", rootfs_prop_dir, fname);
-                if !Path::new(&path).exists() {
-                    match std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(false)
-                        .open(&path)
-                    {
-                        Ok(_) => {
-                            let _ = std::fs::set_permissions(
-                                &path,
-                                std::fs::Permissions::from_mode(0o666),
-                            );
-                            info!("[KR64] PARENT: pre-created rootfs {}", path);
-                        }
-                        Err(e) => {
-                            error!("[KR64] PARENT: failed to pre-create rootfs {}: {}", path, e);
-                        }
-                    }
-                }
-            }
-            info!("[KR64] PARENT: property files pre-created on host + rootfs");
         }
+        // 6-Z305s-l: the legacy else-branch that previously lived here
+        // (pre-create property_info / properties_serial on host + rootfs,
+        // never remove stale files) is REMOVED. It was the probe-false
+        // fallthrough for system boots, and a real DYNAMIC AOSP init probes
+        // false (the format literals live in libc.so, not in the init
+        // binary) — so every Boot-Ladder boot took that path: a stale
+        // populated properties_serial from a prior boot survived, guest
+        // init mapped it back (real MAP_SHARED area, ced49ce), and every
+        // ro.* wire set died 0xb READ_ONLY. The clean-slate branch above
+        // now serves these boots (fresh-tmpfs /dev semantics).
     } // end of { use PermissionsExt; if cfg.boot_recovery { ... } else { ... } }
 
     // Start a background thread that continuously sets SELinux to permissive.
