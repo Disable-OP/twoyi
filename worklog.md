@@ -26137,3 +26137,23 @@ CI: ladder #62 dispatch follows.
 Expected (next decode): `6-Z305t-10: block-storage mount ->/data … EXIT will return 0` lines; mount_all SUCCEEDS (no "Invalid code: -1"); `processing action (nonencrypted)` appears; `class_start main` runs; `starting service 'zygote'` → rung 5 ZYGOTE; zygote's own fate (ART on flattened com.android.art, system_server spawn → rung 6) is the next honest frontier. Honest risks: (a) zygote needs the ART apex + boot classpath dex files — dex2oat/ART first contact; (b) system_server needs the binder fleet + property contexts — previously verified healthy; (c) surfaceflinger/graphics at rung 7 needs the framebuffer/virtual-GPU path.
 
 Honest unverified: no local ARM64 runtime; fs_mgr_mount_all's exact return code after all-mounts-succeed is inferred (NOT_ENCRYPTABLE via the no-crypto-flags path) — the next ladder confirms via the nonencrypted trigger.
+
+## 6-Z305t-10 pt2 — the materialized fstab needs a /data row (mount_all "silent success" still queued nothing: FS_MGR_MNTALL_SUCCESS matches NO do_mount_all branch → nonencrypted STILL never fired)
+
+Discovery (ladder run 34127222919 @a3622bd, rung 4):
+
+- 6-Z305t-10 part 1 VERIFIED GREEN: "queue_fs_event() failed: Invalid code: -1" GONE (mount_all no longer fails); the t-10 no-op diags fired for /dev/cpuset(cpuset)/binder/bpf/fusectl + /postinstall(ext4).
+- But rung 4 again: `nonencrypted` STILL never processed, zygote still absent. Decode: the 6-Z272j census sourced the materialized fstab.ranchu from **etc/fstab.postinstall** (979 bytes — an A/B postinstall helper fstab with NO userdata row). mount_all with no /data entry → fs_mgr_mount_all returns FS_MGR_MNTALL_SUCCESS (0) — which matches NO branch in do_mount_all (builtins.cpp:578-624 queues nonencrypted only for NOT_ENCRYPTED / NOT_ENCRYPTABLE / FILE_ENCRYPTED / IS_METADATA_ENCRYPTED / NEEDS_METADATA_ENCRYPTION) → no trigger → no class_start main.
+- (The ORIGINAL image fstab.ranchu DOES have /data — /dev/block/vdc, FBE flags — but 6-Z272j replaces it with the postinstall-derived alias; the 6-Z270 sanitize had already made a /data row crypto-clean, but the postinstall source carries no /data row at all.)
+
+Implementation (app/rs/kr64/src/lib.rs, materialize_guest_device_fstab):
+- After flag-dropping, if the materialized fstab has NO /data row → append the container row `/dev/block/by-name/userdata /data ext4 noatime,nosuid,nodev wait` (+ explanatory comment): the merged rootfs IS the userdata view; the device node is staged by the 6-Z287 by-name farm; the mount itself is the 6-Z305t-10 container no-op. fs_mgr_mount_all then sees a non-encryptable userdata entry → FS_MGR_MNTALL_DEV_NOT_ENCRYPTABLE → ro.crypto.state=unsupported + nonencrypted ✓.
+- Not a ROM modification: the fstab.ranchu is twoyi's own 6-Z272j materialized alias (flag-dropping precedent established); the vendored rootfs tar stays byte-verbatim.
+
+Commits: (this commit) `fix(fstab): 6-Z305t-10 pt2 — materialized fstab.ranchu gains a container /data row …`.
+
+Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 782 passed / 0 failed (single-threaded).
+
+CI: ladder #63 dispatch follows.
+
+Expected: `6-Z305t-10: appended container /data row` + `6-Z305t-10: block-storage mount ->/data … EXIT 0` → mount_all completes with NOT_ENCRYPTABLE → `processing action (nonencrypted)` → `class_start main` → `starting service 'zygote'` → RUNG 5 ZYGOTE → system_server → RUNG 6 stretch. Honest risks: (a) zygote = ART first contact (flattened com.android.art, boot classpath, odsync/dex2oat); (b) system_server binder + property-context paths previously healthy; (c) graphics at rung 7.
