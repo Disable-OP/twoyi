@@ -18109,26 +18109,19 @@ pub fn run_ptrace_loop(
                                                     // must not downgrade the denial
                                                     // (same tolerance the translate
                                                     // arm above relies on).
-                                                    deny_ok = ptrace_setregs(
-                                                        pid, &fresh, len,
-                                                    )
-                                                    .is_ok();
+                                                    deny_ok =
+                                                        ptrace_setregs(pid, &fresh, len).is_ok();
                                                 }
                                                 if deny_ok {
                                                     // Mirror the translate arm:
                                                     // keep the ENTRY regs snapshot
                                                     // consistent in case the
                                                     // caller re-applies it.
-                                                    set_syscall_arg(
-                                                        &mut regs,
-                                                        abi.reg_arg3,
-                                                        0,
+                                                    set_syscall_arg(&mut regs, abi.reg_arg3, 0);
+                                                    let n = Z305Q_CONNECT_SKIP_LOG.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
                                                     );
-                                                    let n = Z305Q_CONNECT_SKIP_LOG
-                                                        .fetch_add(
-                                                            1,
-                                                            std::sync::atomic::Ordering::Relaxed,
-                                                        );
                                                     if n < 8 {
                                                         log(&format!(
                                                             "6-Z305q: connect sockaddr scratch write FAILED (pid {}, errno={}) — connect DENIED fail-closed (6-Z305s-m: addrlen=0 → -EINVAL, no host socket touched) [{} /8]",
@@ -18140,11 +18133,10 @@ pub fn run_ptrace_loop(
                                                         ));
                                                     }
                                                 } else {
-                                                    let n = Z305Q_CONNECT_SKIP_LOG
-                                                        .fetch_add(
-                                                            1,
-                                                            std::sync::atomic::Ordering::Relaxed,
-                                                        );
+                                                    let n = Z305Q_CONNECT_SKIP_LOG.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
                                                     if n < 8 {
                                                         log(&format!(
                                                             "6-Z305q: connect sockaddr scratch write FAILED (pid {}, errno={}) — fail-closed setregs FAILED (twice) — connect runs on the RAW path [{} /8]",
@@ -29865,9 +29857,7 @@ mod tests {
         assert!(abstract_ns);
         let already_translated = {
             let mut b = vec![1u8, 0];
-            b.extend_from_slice(
-                b"/data/data/io.twoyi/rootfs/dev/socket/property_service\0",
-            );
+            b.extend_from_slice(b"/data/data/io.twoyi/rootfs/dev/socket/property_service\0");
             connect_translate_target(&b, "/data/data/io.twoyi/rootfs").is_none()
         };
         assert!(already_translated);
