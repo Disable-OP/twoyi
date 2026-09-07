@@ -12581,6 +12581,31 @@ fn materialize_guest_device_fstab(rootfs_prefix: &str) {
     if content.ends_with('\n') && !new_content.ends_with('\n') {
         new_content.push('\n');
     }
+    // 6-Z305t-10 pt2: the materialized fstab MUST carry a /data row.
+    // mount_all's return code drives init's crypto trigger chain — with
+    // NO /data entry fs_mgr_mount_all returns FS_MGR_MNTALL_SUCCESS,
+    // which matches NO do_mount_all branch (builtins.cpp 578-624), so
+    // `nonencrypted` is never queued → `on nonencrypted`
+    // (class_start main) never runs → zygote is unreachable (ladder
+    // 34127222919/#62: mount_all silent-success after 6-Z305t-10 but
+    // still rung 4). The census source (etc/fstab.postinstall) carries
+    // no userdata row; the merged rootfs has no separate userdata
+    // partition — the /data row IS the merged tree (the mount itself is
+    // a 6-Z305t-10 container no-op; the device node exists via the
+    // 6-Z287 by-name farm).
+    let has_data_row = new_content.lines().any(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#') && t.split_whitespace().nth(1) == Some("/data")
+    });
+    if !has_data_row {
+        new_content.push_str(
+            "\n# 6-Z305t-10: container /data row — the merged rootfs IS the userdata view;\n# the mount is a merged-rootfs no-op (6-Z305t-10) and the device node is\n# staged by the 6-Z287 by-name farm.\n/dev/block/by-name/userdata /data ext4 noatime,nosuid,nodev wait\n",
+        );
+        info!(
+            "[KR64] PARENT: 6-Z305t-10: appended container /data row to {}/vendor/etc/fstab.ranchu (mount_all needs a userdata entry to emit the nonencrypted trigger)",
+            rootfs_prefix
+        );
+    }
     let dst = format!("{}/vendor/etc/fstab.ranchu", rootfs_prefix);
     let _ = std::fs::create_dir_all(format!("{}/vendor/etc", rootfs_prefix));
     match std::fs::write(&dst, &new_content) {
