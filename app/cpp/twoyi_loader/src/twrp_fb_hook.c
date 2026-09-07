@@ -3444,9 +3444,69 @@ static void fatal_dump_maps(void) {
     }
     static char buf[2048];
     long total = 0;
+    /* 6-Z305t-26: capture the [anon:abort message] mapping's START
+     * address while streaming the maps — that mapping holds the bionic
+     * abort message (android_set_abort_message — the libbase LOG(FATAL)
+     * text), which is the ONE datum that names the actual failure.
+     * logcat cannot deliver it (the guest logd ring is not captured) and
+     * the svclog only shows the maps. Lines can straddle the 2 KiB read
+     * chunks, so each chunk is scanned as carry(prev partial line) + buf
+     * and the new carry is the last partial line. */
+    unsigned long abort_msg_start = 0;
+    char carry[200];
+    unsigned long carry_len = 0;
     for (;;) {
         long n = raw_syscall3(SYS_read, mfd, (long)buf, (long)sizeof(buf));
         if (n <= 0) break;
+        /* scan window = carry + fresh chunk */
+        char win[2048 + 200];
+        unsigned long wl = 0;
+        unsigned k;
+        for (k = 0; k < carry_len && wl < sizeof(win); k++) win[wl++] = carry[k];
+        for (k = 0; k < (unsigned long)n && wl < sizeof(win); k++) win[wl++] = buf[k];
+        win[wl] = '\0';
+        if (abort_msg_start == 0) {
+            char *hit = strstr(win, "[anon:abort message]");
+            if (hit) {
+                /* walk back to the start of THIS line */
+                char *ls = hit;
+                while (ls > win && ls[-1] != '\n') ls--;
+                /* parse the leading hex address up to '-' */
+                unsigned long v = 0;
+                char *p = ls;
+                for (;;) {
+                    char c = *p;
+                    int d;
+                    if (c >= '0' && c <= '9') d = c - '0';
+                    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                    else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                    else break;
+                    v = (v << 4) | (unsigned long)d;
+                    p++;
+                }
+                if (v != 0 && *p == '-') abort_msg_start = v;
+            }
+        }
+        /* carry = the last partial line of the window (after its last '\n') */
+        char *last_nl = NULL;
+        for (k = 0; k < wl; k++)
+            if (win[k] == '\n') last_nl = &win[k];
+        if (last_nl && last_nl + 1 < win + wl) {
+            unsigned long tl = (unsigned long)(win + wl - (last_nl + 1));
+            if (tl > sizeof(carry) - 1) tl = sizeof(carry) - 1;
+            for (k = 0; k < tl; k++) carry[k] = last_nl[1 + k];
+            carry[tl] = '\0';
+            carry_len = tl;
+        } else if (!last_nl) {
+            /* no newline at all — the whole window is a partial line */
+            unsigned long tl = wl;
+            if (tl > sizeof(carry) - 1) tl = sizeof(carry) - 1;
+            for (k = 0; k < tl; k++) carry[k] = win[wl - tl + k];
+            carry[tl] = '\0';
+            carry_len = tl;
+        } else {
+            carry_len = 0;
+        }
         raw_syscall3(SYS_write, 2, (long)buf, n);
         total += n;
         /* 6-Z269: 32 KiB truncated before the aborting module's r-xp
@@ -3457,6 +3517,25 @@ static void fatal_dump_maps(void) {
     }
     raw_syscall1(SYS_close, mfd);
     write_str(2, "[twrp_fb_hook] --- end maps ---\n");
+    if (abort_msg_start != 0) {
+        /* bionic abort_msg_t = { size_t size; char msg[]; } — the string
+         * starts at offset 8. The mapping belongs to THIS process, so the
+         * dereference is safe; printable-only, NUL-terminated, capped. */
+        volatile const unsigned char *m =
+            (volatile const unsigned char *)(abort_msg_start + 8);
+        char out[320];
+        unsigned long op = 0;
+        static const char pre[] = "[twrp_fb_hook] abort message: ";
+        unsigned k;
+        for (k = 0; pre[k] && op < sizeof(out) - 4; k++) out[op++] = pre[k];
+        for (k = 0; k < 240 && op < sizeof(out) - 2; k++) {
+            unsigned char c = m[k];
+            if (c == 0) break;
+            if (c >= 0x20 && c < 0x7f) out[op++] = (char)c;
+        }
+        out[op++] = '\n';
+        raw_syscall3(SYS_write, 2, (long)out, (long)op);
+    }
 }
 
 // Print the fatal evidence exactly once (see g_fatal_entered).

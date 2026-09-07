@@ -26510,3 +26510,21 @@ Local verification: C brace balance; no Rust changes.
 CI: ladder #82 dispatch follows. Expected: dev-__kmsg__ now carries the guest's FULL logcat stream — zygote's exit(1) reason (app_process/ART errors), hwservicemanager's registration failures, the HAL fleet's verbatim errors — the next fixes decode from real log lines.
 
 Honest unverified: no local ARM64 runtime; the logd-buffer-invisibility attribution is inferred from the zero-AndroidRuntime-lines klog vs the live logd fleet.
+
+## 6-Z305t-26 — abort-message content dump: the hook reads its own [anon:abort message] mapping at the fatal (the ONE datum logcat can't deliver)
+
+#82 (b9d3fcc → run 34159287299) decode:
+- The klog still carries NO liblog-format lines — the zygote/app_process fleet logs via liblog but its output remains invisible even with the unconditional kmsg redirect (the svclogs DO show glog stderr mirrors for many services — gatekeeperd, dumpstate, installd, the pixel camera provider — the capture works where the process writes stderr).
+- audioserver's svclog (81 KB) ends with its full maps INCLUDING one [anon:abort message] mapping — bionic's abort message (the libbase LOG(FATAL) text set by android_set_abort_message) sits right there, and the hook CAN read its own memory.
+
+Implementation (twrp_fb_hook.c fatal_dump_maps):
+- While streaming /proc/self/maps, scan each read chunk (carry + chunk window, straddle-safe) for "[anon:abort message]"; on the first hit, parse the mapping's start address.
+- After the dump, dereference start+8 (bionic abort_msg_t = {size_t size; char msg[]}) and raw-write up to 240 printable bytes as "[twrp_fb_hook] abort message: <text>" to fd 2 — which the 6-Z305t-24 svclog capture now guarantees lands in the artifact.
+
+Commits: (this commit) `feat(hook): 6-Z305t-26 — abort-message content dump …`.
+
+Local verification: C brace balance; no Rust changes.
+
+CI: ladder #83 dispatch follows. Expected: every crash-looped service's svclog now ends with its VERBATIM abort reason ("Binder driver could not be opened", ART/zygote failures, etc.) — the crash-loop fleet decodes from real text.
+
+Honest unverified: no local ARM64 runtime; the abort_msg_t layout (msg at +8) follows bionic's abort_message.cpp and the mapping is 1 page (the 240-byte read stays in-bounds).
