@@ -6502,6 +6502,30 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             &format!("{}/libtwoyi_loader_shlib.so", dev_stage_dir),
         );
     }
+    // ── 6-Z305t-20: the SYSTEM-MODE abort-policy marker ─────────────
+    //
+    // The fb_hook's fatal machinery (abort()/__assert2/__cxa_pure_virtual
+    // interception) must DIE on system boots — the 6-Z269 park wedged the
+    // whole rung-4→5 queue (flags_health_check parked inside init's
+    // synchronous exec; logd parked so logdw never drained; ladder #75
+    // SIGSTOP probes: 72/72 tracees in the park loop). The policy switch
+    // is THIS marker file: kr64 creates /dev/.twoyi-abort-die ONLY when
+    // !boot_recovery; the hook raw-openat()s it once per process when a
+    // fatal fires (the same channel that provably works — the shlibs it
+    // loads live in this exact directory). getenv("TWOYI_ABORT_DIE")
+    // stays as a secondary trigger; recovery boots create NEITHER and
+    // keep the proven park byte-for-byte.
+    if !cfg.boot_recovery {
+        let die_marker = format!("{}/.twoyi-abort-die", dev_stage_dir);
+        if let Err(e) = std::fs::write(&die_marker, b"1\n") {
+            error!(
+                "[KR64] PARENT: failed to write the 6-Z305t-20 abort-die marker {}: {} (errno={}) — system-mode fatals will keep the recovery park",
+                die_marker,
+                e,
+                e.raw_os_error().unwrap_or(0)
+            );
+        }
+    }
     // TWRP BOOT: write the i686 libtwrp_fb_hook.so to /sbin/libtwrp_fb_hook.so
     // (tmpfs). The dynamically-linked i386 recovery binary loads it via
     // LD_PRELOAD=/sbin/libtwrp_fb_hook.so (injected via init.rc `setenv`).

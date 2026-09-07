@@ -3473,12 +3473,23 @@ static void write_kmsg_line(const char *buf, unsigned long len) {
         unsigned k;
         for (k = 0; k < sizeof(src); k++) kpath[k] = src[k];
     }
+    /* 6-Z305t-20: O_APPEND — a plain O_WRONLY open positions at offset 0
+     * and CLOBBERS the klog head (ladder #76: the mirror line replaced
+     * init's first ~76 bytes). The kernel-side O_APPEND on the generic
+     * ABI is 000002000 octal = 0x400. */
     long kfd = raw_syscall4(SYS_openat, AT_FDCWD, (long)(const char *)kpath,
-                            1 /*O_WRONLY*/, 0);
+                            1 /*O_WRONLY*/ | 0x400 /*O_APPEND*/, 0);
     if (kfd < 0) return;
     raw_syscall3(SYS_write, kfd, (long)buf, (long)len);
     raw_syscall1(SYS_close, kfd);
 }
+
+static void write_kmsg_line(const char *buf, unsigned long len);
+
+/* 6-Z305t-20: forward declaration — fatal_evidence_once reports the
+ * resolved die-state in its kmsg mirror line; the definition (with the
+ * marker-file probe) lives below, next to fatal_reraise. */
+static int abort_die_resolved(void);
 
 static void fatal_evidence_once(const char *kind, void *pc) {
     if (g_fatal_entered) return;
@@ -3489,24 +3500,29 @@ static void fatal_evidence_once(const char *kind, void *pc) {
     write_hex64(2, (unsigned long long)(unsigned long)pc);
     write_str(2, "\n");
     fatal_dump_maps();
-    /* 6-Z305t-19: the kmsg mirror — the only channel services have. */
+    /* 6-Z305t-19: the kmsg mirror — the only channel services have.
+     * 6-Z305t-20: carries the RESOLVED die-mode state so the artifact
+     * shows not just the abort but which policy branch ran. */
     {
-        char line[128];
+        char line[160];
         unsigned long p = 0;
         static const char pre[] = "<3>[twrp_fb_hook] *** ";
         static const char mid[] = " INTERCEPTED *** caller_pc=0x";
+        static const char die[] = " die=";
         unsigned k;
-        for (k = 0; pre[k]; k++) if (p < sizeof(line) - 24) line[p++] = pre[k];
-        for (k = 0; kind && kind[k]; k++) if (p < sizeof(line) - 24) line[p++] = kind[k];
-        for (k = 0; mid[k]; k++) if (p < sizeof(line) - 24) line[p++] = mid[k];
+        for (k = 0; pre[k]; k++) if (p < sizeof(line) - 32) line[p++] = pre[k];
+        for (k = 0; kind && kind[k]; k++) if (p < sizeof(line) - 32) line[p++] = kind[k];
+        for (k = 0; mid[k]; k++) if (p < sizeof(line) - 32) line[p++] = mid[k];
         {
             unsigned long long v = (unsigned long long)(unsigned long)pc;
             int i;
-            for (i = 15; i >= 0 && p < sizeof(line) - 2; i--) {
+            for (i = 15; i >= 0 && p < sizeof(line) - 16; i--) {
                 int nib = (int)((v >> (i * 4)) & 0xF);
                 line[p++] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10);
             }
         }
+        for (k = 0; die[k]; k++) if (p < sizeof(line) - 8) line[p++] = die[k];
+        line[p++] = (char)('0' + abort_die_resolved());
         line[p++] = '\n';
         write_kmsg_line(line, p);
     }
@@ -3560,7 +3576,7 @@ static void fatal_evidence_once(const char *kind, void *pc) {
 // (all-NULL) so the park between re-raises actually parks.
 static volatile int g_abort_reraise_mode = -1; /* -1 = unresolved */
 
-// 6-Z305t-19: TWOYI_ABORT_DIE=1 — the SYSTEM-MODE fatal policy.
+// 6-Z305t-19/20: TWOYI_ABORT_DIE — the SYSTEM-MODE fatal policy.
 //
 // Ladder #75 decode (run 34150495103): EVERY parked rung-4 process —
 // flags_health_check (blocking init's synchronous `exec 11` and thus the
@@ -3573,17 +3589,45 @@ static volatile int g_abort_reraise_mode = -1; /* -1 = unresolved */
 // or the framebuffer producer dies. For REAL Android services the exact
 // opposite is correct: a service that aborts must DIE so init's restart
 // policy applies and the action queue advances — that is what init sees
-// on a physical device. The kr64 exec-env injection sets this variable
-// for system-mode (non-recovery) service execs; recovery keeps the park.
+// on a physical device.
+//
+// Ladder #76 decode (run 34151834777): the getenv("TWOYI_ABORT_DIE")
+// trigger DID NOT FIRE even though the kr64 envp injection verified —
+// flags_health_check still parked (its own kmsg mirror line was the ONE
+// evidence line in the artifact). The policy switch is therefore DUAL:
+// (1) PRIMARY: the /dev/.twoyi-abort-die marker file — kr64 creates it
+//     at /dev staging for every !boot_recovery boot (the same channel
+//     that provably works: the shlibs this very process loaded live in
+//     that exact directory); (2) SECONDARY: the getenv trigger, kept.
+// The mode is resolved ONCE per process on the first fatal.
 static volatile int g_abort_die_mode = -1; /* -1 = unresolved */
+
+static int abort_die_resolved(void) {
+    if (g_abort_die_mode < 0) {
+        volatile char ppath[23]; /* "/dev/.twoyi-abort-die" + NUL — stack */
+        {
+            static const char src[] = "/dev/.twoyi-abort-die";
+            unsigned k;
+            for (k = 0; k < sizeof(src); k++) ppath[k] = src[k];
+        }
+        long dfd = raw_syscall4(SYS_openat, AT_FDCWD, (long)(const char *)ppath,
+                                0 /*O_RDONLY*/, 0);
+        if (dfd >= 0) {
+            char b[2] = {0, 0};
+            raw_syscall3(SYS_read, dfd, (long)b, 1);
+            raw_syscall1(SYS_close, dfd);
+            g_abort_die_mode = (b[0] == '1') ? 1 : 0;
+        } else {
+            const char *d = getenv("TWOYI_ABORT_DIE");
+            g_abort_die_mode = (d != NULL && d[0] == '1') ? 1 : 0;
+        }
+    }
+    return g_abort_die_mode;
+}
 
 static void fatal_reraise(void) __attribute__((noreturn));
 static void fatal_reraise(void) {
-    if (g_abort_die_mode < 0) {
-        const char *d = getenv("TWOYI_ABORT_DIE");
-        g_abort_die_mode = (d != NULL && d[0] == '1') ? 1 : 0;
-    }
-    if (g_abort_die_mode) {
+    if (abort_die_resolved()) {
         /* Unblock SIGABRT first — a caller that aborted with SIGABRT
          * blocked would otherwise park silently below (the tgkill would
          * pend, never deliver) and we'd be back to a wedge. */
