@@ -3273,6 +3273,20 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             // forever → the whole init action queue stalled below
             // load_persist_props → zygote-start/boot/nonencrypted never
             // ran → zygote unreachable — ladder 34132027245/#65).
+            //
+            // 6-Z305t-25: the kmsg redirect is now UNCONDITIONAL — the
+            // real-logd connect is kept ONLY as a probe whose result we
+            // ignore. Ladder #81: with logd listening, every liblog
+            // client connected to the REAL logd socket and its entire
+            // output vanished into logd's in-memory ring — unreadable
+            // from the boot-ladder artifacts (zygote exit(1) ×5, the HAL
+            // fleet crash-looping, ALL with zero evidence lines). The
+            // guest klog is the observation point of every artifact;
+            // routing ALL guest liblog output there is non-blocking
+            // (6-Z272p) and mode-uniform. logd keeps running — its buffer
+            // simply stays empty (the guest has no interactive logcat
+            // consumer in the boot path); a future logdr-protocol decode
+            // can revisit if the guest itself ever needs logcat.
             char logdw_path[600];
             snprintf(logdw_path, sizeof(logdw_path), "%s/dev/socket/logdw", g_rootfs);
             struct sockaddr_un real_logdw;
@@ -3280,17 +3294,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             real_logdw.sun_family = AF_UNIX;
             strncpy(real_logdw.sun_path, logdw_path, sizeof(real_logdw.sun_path) - 1);
             int rc = (int)syscall(SYS_connect, sockfd, &real_logdw, sizeof(real_logdw));
-            if (rc == 0) {
-                static int logdw_real_diag = 2;
-                if (logdw_real_diag > 0) {
-                    logdw_real_diag--;
-                    char msg[160];
-                    snprintf(msg, sizeof(msg),
-                        "[twoyi_loader] connect(/dev/socket/logdw) -> REAL logd (system mode: guest logd is listening)\n");
-                    write_str(2, msg);
-                }
-                return 0;
-            }
+            (void)rc; // 6-Z305t-25: probe only — the kmsg redirect wins in ALL modes
             // No listener (recovery) — fall through to the kmsg redirect.
             char kmsg_path[600];
             snprintf(kmsg_path, sizeof(kmsg_path), "%s/dev/__kmsg__", g_rootfs);
