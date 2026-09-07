@@ -26561,3 +26561,18 @@ Next steps (in order):
 3. The "Pointer tag … truncated" aborts (7×) remain parked — bionic tagged-pointer checks firing somewhere in the virtualized environment.
 
 Honest unverified: all of the above is instrument-first; no local ARM64 runtime.
+
+## 6-Z305t-29 — THE KLOG HEAD WAS THE LOGCAT: liblog records WERE landing (each service writing at offset 0, clobbering everything); lseek(SEEK_END) before the dup3 makes all guest logcat APPEND
+
+#86 decode (the head of the captured dev-__kmsg__, cat -v):
+- The first bytes are a LIBLOG BINARY RECORD — "libc\0Pointer tag for 0xf1703d60c6f0 was truncated." — followed by init's text. The liblog→kmsg redirect WORKS; the failure was POSITIONAL: each service's fresh open("/dev/__kmsg__", O_WRONLY) starts at offset 0, so the whole fleet's logcat output was written on top of the klog head and on top of each other (the same class as the 6-Z305t-20 head-clobber, now in the SHIM's path).
+
+Implementation: the shlib's logdw redirect lseeks the kmsg fd to SEEK_END before the dup3 — all guest liblog output appends.
+
+Commits: (this commit) `fix(shlib): 6-Z305t-29 — lseek(SEEK_END) before the logdw kmsg dup …`.
+
+Local verification: C brace balance; no Rust changes.
+
+CI: ladder #87 dispatch follows. Expected: dev-__kmsg__ now carries the FULL guest logcat stream (zygote/app_process, hwservicemanager, every HAL) — hwservicemanager's exit(1) line and zygote's exit(1) line become readable verbatim, and the "Pointer tag … truncated" abort class gets its owning processes named.
+
+Honest unverified: no local ARM64 runtime.
