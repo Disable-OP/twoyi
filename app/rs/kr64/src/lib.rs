@@ -5199,7 +5199,11 @@ fn flatten_one_apex(
     data_dir: &str,
 ) -> Result<usize, String> {
     let img_bytes = apex_extract::extract_apex_payload_img(apex_path)?;
-    let tmp = format!("{}/cache/twoyi-apex-payload-{}.img", data_dir, std::process::id());
+    let tmp = format!(
+        "{}/cache/twoyi-apex-payload-{}.img",
+        data_dir,
+        std::process::id()
+    );
     if let Some(parent) = Path::new(&tmp).parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
