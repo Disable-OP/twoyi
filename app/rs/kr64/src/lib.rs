@@ -168,9 +168,100 @@ pub(crate) fn boot_clock_init() {
 static TRACE_LINE_BUF: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 const TRACE_LINE_FLUSH_BYTES: usize = 16 * 1024;
 
+// ── 6-Z305t-15: NON-BLOCKING stderr for the tracer ─────────────────
+//
+// The tracer's stderr is the Java tee pipe. When the pipe FILLS (the
+// app-side reader stalls for any reason — logcat flush, GC, scheduler),
+// the tracer's write(2) BLOCKS — and the ptrace loop is the only thing
+// draining guest syscall-stops: EVERY tracee stays ptrace-stopped and
+// THE WHOLE GUEST FREEZES (the code's own 6-Z260 note: "kr64 blocks
+// when the pipe fills, and the whole guest is frozen while the tracer
+// waits on write()"). Ladder #68: at +8.1s every unrelated process
+// (ueventd threads, logd threads, flags_health_check) froze at the
+// same instant — the tracer sat in a blocking stderr write while its
+// 16 KiB batch flushed into a full pipe.
+//
+// Fix: the sink flushes through a DEDICATED dup(2) with O_NONBLOCK
+// (the open-file-description is private to this fd — the app's own
+// fd 2 semantics are untouched). On EAGAIN the tail is DROPPED (log
+// lines are lossy under pressure; a frozen guest is not acceptable).
+// A bounded one-shot diag records the first drop so the artifacts show
+// the pressure event.
+static TRACE_NB_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-2);
+static TRACE_DROP_DIAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn trace_nb_fd() -> i32 {
+    let cur = TRACE_NB_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if cur != -2 {
+        return cur;
+    }
+    // Lazily create the non-blocking dup of stderr (fd 2). -1 = dup/
+    // fcntl failed → fall back to fd 2 (blocking — legacy behavior).
+    let fd = unsafe { libc::dup(2) };
+    let out = if fd >= 0 {
+        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if fl >= 0 {
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
+        }
+        fd
+    } else {
+        2
+    };
+    TRACE_NB_FD.store(out, std::sync::atomic::Ordering::Relaxed);
+    out
+}
+
+/// Write `buf` to the non-blocking stderr dup. Returns bytes WRITTEN;
+/// on EAGAIN the remainder is dropped (never retried, never blocking).
+fn trace_nb_write(buf: &[u8]) -> usize {
+    let fd = trace_nb_fd();
+    // Single-shot handling: one write, then EAGAIN-tolerant completion.
+    // (The pipe consumer is a line reader; partial writes end mid-line —
+    // acceptable for lossy diagnostics, and rare: only under pressure.)
+    let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+    let written = if n >= 0 {
+        n as usize
+    } else {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EINTR) {
+            // One retry on EINTR (the only transient non-pressure error).
+            let n2 = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+            if n2 > 0 {
+                n2 as usize
+            } else {
+                0
+            }
+        } else if e.raw_os_error() == Some(libc::EAGAIN)
+            || e.raw_os_error() == Some(libc::EWOULDBLOCK)
+        {
+            0
+        } else {
+            // EBADF/EPIPE etc. — fall back to the real stderr once so a
+            // broken dup doesn't silently silence every later line.
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), buf);
+            buf.len()
+        }
+    };
+    if written < buf.len() {
+        let dropped = buf.len() - written;
+        let d = TRACE_DROP_DIAG.fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+        if d == 0 {
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                format!(
+                    "[KR64][trace] tee pipe FULL — dropped {} diagnostic bytes (tracer NEVER blocks on the tee; the guest keeps running)\n",
+                    dropped
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    written
+}
+
 fn trace_line_flush_locked(buf: &mut String) {
     if !buf.is_empty() {
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), buf.as_bytes());
+        trace_nb_write(buf.as_bytes());
         buf.clear();
     }
 }
@@ -190,10 +281,10 @@ pub(crate) fn trace_log_line(msg: &str) {
             }
         }
         Err(_) => {
-            // Poisoned (a panic while the buffer was held): never drop
-            // a line — write it through directly.
-            let _ = std::io::Write::write_all(
-                &mut std::io::stderr(),
+            // Poisoned (a panic while the buffer was held): write through
+            // the non-blocking path (6-Z305t-15 — a blocked tee write here
+            // would freeze the guest exactly like the buffered path).
+            trace_nb_write(
                 format!(
                     "[KR64][ptrace][+{}ms] {}\n",
                     boot_elapsed_ms(),
