@@ -25737,3 +25737,15 @@ Work Log:
 Stage Summary:
 - origin/main b7a1cc6. Expected next run: ueventd sets ro.cold_boot_done on the real wire → init proceeds past wait_for_coldboot_done → on init/late-init → mount_all → class_start core → the fleet spawns WITH the shlib → binder opens hit the wire protocol → zygote exec (rung 5). Remaining named walls beyond that: apex-lib consumers (zygote/libnativeloader etc.) still CANNOT LINK until 6-Z305t part 2 (flatten wiring), class_start service coverage, then SurfaceFlinger/SystemUI.
 - NEXT: decode re-run; wire apex flattening (6-Z305t part 2).
+
+---
+Task ID: 6-Z305s-e (ladder 34071327829 decode + canonical-rootfs fix)
+Agent: Z.ai Code (main dispatcher)
+Task: decode the NO_PROPS re-run; fix the double-translation.
+
+Work Log:
+- The NO_PROPS gate landed verbatim ("TWOYI_SHLIB_NO_PROPS set — property hooks delegate to bionic") and the REAL bionic property code ran in ueventd. Its /dev/__properties__ opens went through the shlib's own open hook first, which prefixed with its TWOYI_ROOTFS env — the CANONICAL rootfs form (/data/data/io.twoyi/rootfs; /data/user/0/io.twoyi.debug is a symlink to it). The tracer's /data/* rule did not recognize that spelling and double-prefixed: {rootfs}/data/data/io.twoyi/rootfs/dev/__properties__/... → ENOENT → the set failed → init STILL parked at wait_for_coldboot_done (guest = init + ueventd only).
+- FIX 7788553: SandboxPolicy::under_rootfs accepts rootfs_canon_slash (always present). +1 test (775 green).
+
+Stage Summary:
+- origin/main 7788553. Next run expectation: the property opens resolve inside the real rootfs → ro.cold_boot_done lands → init proceeds to on init/late-init → mount_all → class_start core → fleet with shlib → zygote (rung 5); apex consumers still blocked until 6-Z305t part 2.
