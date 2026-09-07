@@ -6516,7 +6516,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // stays as a secondary trigger; recovery boots create NEITHER and
     // keep the proven park byte-for-byte.
     if !cfg.boot_recovery {
-        let die_marker = format!("{}/.twoyi-abort-die", dev_stage_dir);
+        // 6-Z305t-21: no leading dot — dotfiles may be special-cased in
+        // the guest-visible /dev tree; a plain name rides the exact same
+        // resolution as the shlibs this directory provably serves.
+        let die_marker = format!("{}/twoyi-abort-die", dev_stage_dir);
         if let Err(e) = std::fs::write(&die_marker, b"1\n") {
             error!(
                 "[KR64] PARENT: failed to write the 6-Z305t-20 abort-die marker {}: {} (errno={}) — system-mode fatals will keep the recovery park",

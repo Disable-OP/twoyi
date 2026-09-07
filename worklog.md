@@ -26417,3 +26417,22 @@ Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 
 CI: ladder #77 dispatch follows. Expected: the marker exists in the guest /dev (verify via rootfs listing) → flags_health_check's abort resolves die=1 → SIGABRT delivery → init logs the exec exit → the queue advances past load_persist_props → nonencrypted → start zygote → RUNG 5. The kmsg line's die=1/0 field is the direct verdict: die=0 with the marker present would mean the raw-openat path failed (new decode needed); die=1 + still parked would mean the SIGABRT raise is being swallowed (tracer signal-forwarding decode needed).
 
 Honest unverified: no local ARM64 runtime; WHY getenv failed remains unexplained (the marker path sidesteps it — a further decode only if the marker path also fails).
+
+## 6-Z305t-21 — #77 decode: the park persisted with the marker unstaged-visible; instrument the fatal machinery itself (constructor-time kmsg: die= + marker_errno; die-loop raise line) and de-dot the marker
+
+#77 (d0e7c85 → run 34153448204) decode:
+- Still rung 4. flags_health_check (2755) parked in the fb_hook fatal ppoll (pc segment-relative 0x7fbc; file offset 0x9fbc — the SAME park loop as #76's 0x9ef8 shifted +0xC4 by the new code — the die branch never ran in either run). ZERO kmsg evidence lines this run (the O_APPEND mirror wrote nothing — no fatal evidence at all), zero signal-6 deliveries, and NO marker-write failure in the parent log.
+- The three raw-ppoll sites are ALL inside fatal_reraise (die/reraise/park loops) — the reraise loop is excluded (it would spam signal-6 stops), the die loop is excluded (its first tgkill would produce a signal-6 stop) → the thread is in the PARK loop and abort_die_resolved() returned 0 in both #76 and #77: the marker open failed AND the getenv failed. The remaining unknowns: (a) did the marker reach the guest-visible /dev (the vfs /dev tree is EMULATED — a dotfile / an unregistered name may ENOENT through translate_path), (b) does the evidence/mirror kmsg channel work with O_APPEND.
+
+Implementation (instrument-first, per the decode-first discipline):
+1. twrp_fb_hook.c — abort_die_resolved() now emits ONE kmsg line when it resolves: "<6>[twrp_fb_hook] loaded die=<0|1> marker_errno=<errno>" (raw decimal formatting, no libc). The artifact now shows, per process: whether the marker probe ran, its errno if it failed, and which policy resolved — "die=1 + no die-loop line" ⇒ the resolution lied; "die=1 + die-loop line + no death" ⇒ the raise is swallowed tracer-side; "marker_errno=2" ⇒ the marker didn't reach the guest /dev tree.
+2. twrp_fb_hook.c — the DIE branch emits "<6>[twrp_fb_hook] die-loop: raising SIGABRT" once before the first tgkill.
+3. Marker renamed /dev/.twoyi-abort-die → /dev/twoyi-abort-die (no leading dot — dotfiles may be special-cased in the vfs /dev emulation; a plain name rides the exact resolution the shlibs provably use). kr64 lib.rs staging updated.
+
+Commits: (this commit) `fix(hook): 6-Z305t-21 — abort-die resolution visibility …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 783 passed / 0 failed; C brace balance verified.
+
+CI: ladder #78 dispatch follows. Expected: the first fatal in each parked process emits loaded-die/marker_errno + evidence + (die=1) die-loop lines. The verdict matrix is unambiguous for all four outcomes (marker missing / marker found + die raised / die swallowed / evidence channel broken).
+
+Honest unverified: no local ARM64 runtime; the park-site identification across builds rests on the +0xC4 code-shift arithmetic and the exclusion of the reraise/die loops by the zero-signal-6 evidence.
