@@ -492,6 +492,21 @@ impl Ext4Image {
     /// host, recreating dirs/files and fast symlinks. Returns the count
     /// of materialized entries. Skips nothing silently: hard failures
     /// propagate (the caller logs + skips the whole apex).
+    ///
+    /// 6-Z305t-4: DIR and FILE permission bits are carried from the
+    /// payload inode (mode & 0o777). A real flattened-APEX device
+    /// exposes /apex/<name>/** with the payload's own modes — apex
+    /// binaries (com.android.runtime/bin/linker64, dex2oat, …) are
+    /// EXECUTABLE. The v1 extractor wrote every file via std::fs::write
+    /// (0644 & ~umask), and the moment the flattened runtime linker
+    /// became resolvable through the RELATIVE sidecar symlink
+    /// /system/bin/linker64 -> ../../apex/com.android.runtime/bin/linker64,
+    /// ensure_guest_interp (6-Z196) started patching every staged guest
+    /// exec's PT_INTERP onto that 0644 file — the kernel's MAY_EXEC
+    /// failed EACCES on EVERY dynamic guest exec: "cannot execv …
+    /// Permission denied" fleet-wide, boringssl_self_test64
+    /// (reboot_on_failure) rebooted the guest mid-boot (ladder
+    /// 34104378680 post-mortem "Reboot ending, jumping to kernel").
     pub fn extract_tree(&mut self, src: &str, dst: &str) -> Result<usize, Ext4Error> {
         let mut n = 0usize;
         let entries = self.list_dir(src)?;
@@ -511,6 +526,16 @@ impl Ext4Image {
                 n += 1;
             } else if src_ino.mode & S_IFMT == S_IFDIR {
                 std::fs::create_dir_all(&dst_path).map_err(Ext4Error::Io)?;
+                // 6-Z305t-4: payload dir mode (create_dir_all's 0755 &
+                // ~umask is NOT always the payload's own mode).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &dst_path,
+                        std::fs::Permissions::from_mode((src_ino.mode & 0o777) as u32),
+                    );
+                }
                 n += 1 + self.extract_tree(&src_path, &dst_path)?;
             } else {
                 let data = self.read_file_data(&src_ino)?;
@@ -518,6 +543,18 @@ impl Ext4Image {
                     std::fs::create_dir_all(parent).map_err(Ext4Error::Io)?;
                 }
                 std::fs::write(&dst_path, &data).map_err(Ext4Error::Io)?;
+                // 6-Z305t-4: carry the payload's permission bits — apex
+                // payloads ship executables (0755); std::fs::write alone
+                // lands 0644 & ~umask and breaks kernel MAY_EXEC for
+                // anything linking/interp-ing through the flattened tree.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &dst_path,
+                        std::fs::Permissions::from_mode((src_ino.mode & 0o777) as u32),
+                    );
+                }
                 n += 1;
             }
         }
@@ -765,6 +802,37 @@ mod tests {
         let link = std::fs::read_link(dir.join("link")).unwrap();
         assert_eq!(link.to_str().unwrap(), "bionic");
         assert!(dir.join("d").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn z305t4_extract_tree_preserves_file_mode() {
+        // 6-Z305t-4: the payload's permission bits must land on the
+        // materialized file. The fixture ships "hello" as S_IFREG|0644;
+        // flip the same inode to S_IFREG|0755 (what apex payloads carry
+        // for bin/*) and require the extracted copy to be executable —
+        // the 0644 extractor made the flattened runtime linker
+        // non-executable and every staged guest exec died EACCES
+        // (ladder 34104378680).
+        let mut img = build_test_image();
+        // file inode (ino 11) = inode table @block 2, index 10; mode u16
+        // at offset 0 of the inode record.
+        let f = block_at(2) + 10 * 256;
+        img[f..f + 2].copy_from_slice(&0x81EDu16.to_le_bytes()); // S_IFREG|0755
+        let mut fs = open_img(img);
+        let dir = std::env::temp_dir().join(format!("twoyi-apexfs-mode{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let n = fs.extract_tree("/", dir.to_str().unwrap()).unwrap();
+        assert_eq!(n, 3);
+        use std::os::unix::fs::PermissionsExt;
+        let md = std::fs::metadata(dir.join("hello")).unwrap();
+        assert_eq!(
+            md.permissions().mode() & 0o777,
+            0o755,
+            "extracted file must carry the payload's exec bits"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

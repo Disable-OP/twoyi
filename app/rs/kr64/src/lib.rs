@@ -5128,12 +5128,13 @@ fn z192_property_format_probe_detects_new_format() {
 ///     updatable=false and never touches the trees).
 ///
 /// Idempotent: per-apex marker <dest>/<name>/.twoyi_extracted stores
-/// "<size>:<mtime>" of the source .apex; a mismatch (ROM swap/update)
-/// re-extracts. The marker lives INSIDE the dest, so switching modes
-/// between boots re-extracts automatically (marker not found in the
-/// new dest). One payload failing is logged and skipped (honest,
-/// non-fatal): the host apex underneath still covers that name and
-/// apexd-bootstrap still runs in-guest.
+/// "v2:<size>:<mtime>" of the source .apex (6-Z305t-4; v1 trees were
+/// extracted without payload permission bits); a mismatch (ROM
+/// swap/update, format bump) re-extracts. The marker lives INSIDE the
+/// dest, so switching modes between boots re-extracts automatically
+/// (marker not found in the new dest). One payload failing is logged
+/// and skipped (honest, non-fatal): the host apex underneath still
+/// covers that name and apexd-bootstrap still runs in-guest.
 fn flatten_apex_payloads(cfg: &Config) {
     if cfg.boot_recovery {
         return; // TWRP: statically linked init, no APEX consumers
@@ -5180,7 +5181,15 @@ fn flatten_apex_payloads(cfg: &Config) {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let want = format!("{}:{}", meta.len(), mtime);
+        // 6-Z305t-4: "v2:" prefix — v1 trees were extracted WITHOUT the
+        // payload's permission bits (every file 0644 & ~umask), which
+        // made the flattened com.android.runtime/bin/linker64
+        // non-executable once it became the patched PT_INTERP of every
+        // staged guest exec (kernel MAY_EXEC → EACCES → "cannot execv"
+        // fleet-wide → boringssl reboot_on_failure rebooted the guest,
+        // ladder 34104378680). The prefix mismatch vs a persisted v1
+        // marker forces a one-time re-extraction with mode preservation.
+        let want = format!("v2:{}:{}", meta.len(), mtime);
         let dst = format!("{}/{}", apex_stage_root, apex_name);
         let marker = format!("{}/.twoyi_extracted", dst);
         if let Ok(c) = std::fs::read_to_string(&marker) {
