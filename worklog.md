@@ -26045,3 +26045,26 @@ Verification: no Android SDK/gradle locally — the change is confined to one me
 CI: ladder #58 dispatch follows.
 
 Expected (next decode): vendor/default.prop retains the ROM's ro.vndk.version=30 (import no longer truncates; kr64 appends around it) → linkerconfig runs to completion → NON-EMPTY bootstrap + default ld.config.txt with /apex sections → lmkd resolves libstatssocket.so → lmkd survives → fleet up → rung 4 CORE_DAEMONS → zygote (rung 5) → system_server (rung 6) stretch. Honest risks: (a) linkerconfig may next demand further vendor artifacts (VINTF manifest, VNDK APEX libs) — decode whatever it CHECKs next; (b) zygote/ART on flattened apexes (dex2oat/boot-image paths) is first-contact territory; (c) socket fchmodat/fchownat behavior under the real-chmod gate for /dev/socket/* — watch logd/netd/zygote socket creation.
+
+## 6-Z305t-7 — flattened apex dirs must use the apex_manifest.pb name (file names lie: com.android.vndk.current.apex → com.android.vndk.v30, com.android.art.debug.apex → com.android.art)
+
+Discovery (ladder run 34119002232 @aa98b04, rung 3 / post-mortem init reboot path):
+
+- 6-Z305t-6 pt1+pt2 VERIFIED GREEN: `VENDOR_VNDK_VERSION is not defined` GONE — the ROM's ro.vndk.version=30 survives import (RomManager.initRootfs append) and boot prep (proc_emu append) and init loads it. Both overwriters fixed.
+- linkerconfig advanced to the NEXT variable: `Check failed: !"undefined var" LLNDK_LIBRARIES_VENDOR is not defined` (same context.cc:115 CHECK chain) → abort → no output → empty default/ld.config.txt → lmkd CANNOT LINK libstatssocket ×5 → critical ×4 → InitFatalReboot (same downstream signature).
+- Where LLNDK_LIBRARIES_VENDOR lives: strings(1) on the guest's OWN /system/bin/linkerconfig shows it reads /etc/llndk.libraries.<ver> (+ vndkcore/vndksp/vndkprivate variants) — and the versioned files ship INSIDE the com.android.vndk.current.apex payload: apex_payload.img contains `etc/llndk.libraries.30.txt`, `vndkcore.libraries.30.txt`, `vndksp.libraries.30.txt` (vndkapayload strings decode). The image's /system/etc + /vendor/etc ship NONE of them — the VNDK apex is the only source.
+- Root cause: the flatten derived the apex DIR name from the .apex FILE name (trim .apex), but the ACTIVE apex name is the apex_manifest.pb field-1 name. Audited all 21 payloads: 19 match, TWO mismatch — `com.android.vndk.current.apex → com.android.vndk.v30` and `com.android.art.debug.apex → com.android.art`. So the flattened tree landed at /apex/com.android.vndk.current/ while linkerconfig reads /apex/com.android.vndk.v30/etc/llndk.libraries.30.txt → "undefined var". (The art.debug→art mismatch would have broken zygote/ART next — same class.)
+
+Implementation:
+1. apex_extract::apex_manifest_name(apex_path) — reads apex_manifest.pb via the existing STORED-entry zip reader and parses the field-1 protobuf name (tag 0x0A + varint len + UTF-8, graphic-ASCII validated; None on any surprise). Unit test z305t7_parse_apex_manifest_name (happy path + empty + wrong tag + truncated len + non-graphic bytes).
+2. flatten_apex_payloads uses the manifest name for the dest dir (file name = fallback when the manifest is absent/unparseable); one bounded diag line when they differ; best-effort removal of OUR OWN legacy file-name-derived dir (guarded by the .twoyi_extracted marker — never a ROM dir).
+
+Commits: (this commit) `fix(apex): 6-Z305t-7 — derive flattened apex dir from apex_manifest.pb …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 780 passed / 0 failed.
+
+CI: ladder #59 dispatch follows.
+
+Expected (next decode): `6-Z305t-7: manifest name com.android.vndk.v30 != file name com.android.vndk.current` diag; linkerconfig reads /apex/com.android.vndk.v30/etc/llndk.libraries.30.txt → LLNDK_LIBRARIES_VENDOR defined → next variable in the CHECK chain if any (vndkcore/vndksp/vndkprivate lists are siblings in the same apex — should resolve) → linkerconfig completes → NON-EMPTY bootstrap + default ld.config.txt with /apex sections → lmkd resolves libstatssocket.so from /apex/com.android.os.statsd/lib64 → lmkd survives → rung 4 CORE_DAEMONS → zygote (rung 5; ALSO unblocked by art.debug→com.android.art) → system_server (rung 6) stretch. Honest risks: (a) the ld.config.txt CONTENT may reference paths the container lacks (e.g. /vendor/${LIB}/vndk-sp — the rootfs vendor ships libs? vendor/lib64 — the image's vendor tree) — namespace resolution errors are the next honest frontier; (b) ART/dex2oat on flattened apexes (zygote) is first-contact.
+
+Honest unverified: no local ARM64 runtime; the exact linkerconfig variable resolution order is inferred from the binary strings + the CHECK chain progression (VENDOR_VNDK_VERSION then LLNDK_LIBRARIES_VENDOR) — the next run will confirm.
