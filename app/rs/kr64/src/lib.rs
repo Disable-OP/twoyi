@@ -5169,8 +5169,36 @@ fn flatten_apex_payloads(cfg: &Config) {
         if !name.ends_with(".apex") {
             continue;
         }
-        let apex_name = name.trim_end_matches(".apex").to_string();
         let path = format!("{}/{}", apex_src_dir, name);
+        // 6-Z305t-7: the APEX's ACTIVE name is the apex_manifest.pb name,
+        // NOT the file name. The SDK image ships
+        // com.android.vndk.current.apex → manifest "com.android.vndk.v30"
+        // (linkerconfig reads /apex/com.android.vndk.v30/etc/
+        // llndk.libraries.30.txt) and com.android.art.debug.apex →
+        // manifest "com.android.art" (zygote/ART consumers expect
+        // /apex/com.android.art/**). A real flattened-APEX device
+        // exposes /apex/<manifest-name>. File name = fallback only.
+        let apex_name = match crate::apex_extract::apex_manifest_name(&path) {
+            Some(manifest_name) if manifest_name != name.trim_end_matches(".apex") => {
+                info!(
+                    "[KR64][apex] 6-Z305t-7: manifest name {} != file name {} — using {} (real flattened-apex identity)",
+                    manifest_name,
+                    name.trim_end_matches(".apex"),
+                    manifest_name
+                );
+                // Best-effort cleanup of OUR OWN artifact from a
+                // previous boot's file-name-derived extraction (only
+                // when it carries the extraction marker — never a
+                // ROM-shipped dir).
+                let legacy = format!("{}/{}", apex_stage_root, name.trim_end_matches(".apex"));
+                if Path::new(&format!("{}/.twoyi_extracted", legacy)).exists() {
+                    let _ = std::fs::remove_dir_all(&legacy);
+                }
+                manifest_name
+            }
+            Some(manifest_name) => manifest_name,
+            None => name.trim_end_matches(".apex").to_string(),
+        };
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             Err(_) => continue,
