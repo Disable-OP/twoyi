@@ -1034,9 +1034,33 @@ impl SandboxPolicy {
     /// rootfs sandbox.
     fn under_rootfs(&self, host_path: &str) -> bool {
         let lit = self.rootfs.to_string_lossy();
-        host_path == self.rootfs_slash.trim_end_matches('/')
+        if host_path == self.rootfs_slash.trim_end_matches('/')
             || host_path.starts_with(&self.rootfs_slash)
             || host_path.starts_with(lit.as_ref())
+        {
+            return true;
+        }
+        // 6-Z305s-e: the CANONICAL rootfs spelling too. The rootfs dir
+        // is often a symlink (/data/user/0/<pkg> -> /data/data/<pkg>),
+        // and host-side actors that received the canonicalized form —
+        // e.g. the loader shlib's own open hook prefixing with its
+        // TWOYI_ROOTFS env, which kr64's child chdir made canonical —
+        // hand us paths already prefixed with /data/data/<pkg>/rootfs.
+        // The /data/* rule below would double-prefix those
+        // ({rootfs}/data/data/... — ladder run 34071327829: the real
+        // bionic property code's /dev/__properties__ opens, delegated
+        // through the shlib hook, ENOENT'd and init parked at
+        // wait_for_coldboot_done again).
+        // The canonical form is always present (constructed from the
+        // rootfs itself — see SandboxPolicy::new).
+        if host_path.starts_with(self.rootfs_canon_slash.as_str()) {
+            return true;
+        }
+        let canon_dir = self.rootfs_canon_slash.trim_end_matches('/');
+        if host_path == canon_dir {
+            return true;
+        }
+        false
     }
 
     /// True for the narrow set of host device nodes that the sandbox
@@ -1845,6 +1869,29 @@ mod sandbox_policy_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn z305se_under_rootfs_recognizes_canonical_spelling() {
+        // 6-Z305s-e: the shlib's own open hook prefixes with its
+        // TWOYI_ROOTFS env (the CANONICAL rootfs form,
+        // /data/data/<pkg>/rootfs) — the tracer must recognize it and
+        // never double-prefix via the /data/* rule.
+        let dir = std::env::temp_dir().join(format!("twoyi-vfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let real = dir.join("canonical").join("rootfs");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("userlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let p = SandboxPolicy::new(link.to_str().unwrap());
+        let canon = p.rootfs_canon_slash.clone();
+        // canonical-spelling host paths are inside the sandbox:
+        assert!(p.under_rootfs(&format!("{}dev/__properties__/x", canon)));
+        assert!(p.under_rootfs(canon.trim_end_matches('/')));
+        // absolute /data paths outside the canonical rootfs are NOT:
+        assert!(!p.under_rootfs("/data/data/other.pkg/rootfs/dev/x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]
