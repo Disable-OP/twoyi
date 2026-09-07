@@ -25762,3 +25762,18 @@ Work Log:
 
 Stage Summary:
 - origin/main e456cb7. Next run expectation: the property socket connect lands → ro.cold_boot_done=1 → init exits early-init → on init/late-init → mount_all → class_start core → fleet with shlib → zygote (rung 5) → apex consumers still CANNOT LINK (6-Z305t part 2 = flatten wiring is the next implementation).
+
+---
+Task ID: 6-Z305s-f (ladder 34072797380 decode — session-end state)
+Agent: Z.ai Code (main dispatcher)
+Task: decode the translation-gate re-run.
+
+Work Log:
+- MAJOR PROGRESS confirmed: the property wire now reaches the GUEST listener — "6-Z305q: connect(fd=16, guest /dev/socket/property_service) sockaddr translated -> {rootfs}/dev/socket/property_service — guest client reaches the GUEST listener"; the 33-byte prop_msg writev SUCCEEDED (ret=33, no ENOTCONN). The double-translation class is dead.
+- REMAINING WALL: the SET is REJECTED on init's side — "Unable to set property \"ro.cold_boot_done\" to \"true\": error code ..." (69 bytes, truncated in the WRITEV-SAMPLE) and the same for "ro.boottime.ueventd" (80-byte variant) — bionic retries the connect+send (+1541/+1542ms repeats). The guest still holds only init + ueventd at end-of-run; rung 3 by classification.
+- NEXT DECODE (precise): extract the FULL error strings from the WRITEV-SAMPLE payloads (both the 69-byte and 80-byte variants) and init's side of the wire (init is shlib-free; its HandlePropertySet decision is pure AOSP). Candidates: (a) client-side bionic rejection because the tracer-served /dev/__properties__ area already presents ro.cold_boot_done (the 6-Z272m/6-Z121 area-create arms materialize the context file — a visible-but-set entry would trip bionic's "read-only property was already set" without the wire); (b) init's HandlePropertySet failing on the SELinux checkSELinux access against the fake selinuxfs; (c) init's area write failing on the 6-Z121 fstat-serialized span.
+
+Stage Summary:
+- origin/main 367c1ac. This session landed (chronological): bd9d68d (umask 022 + tracer envp injection) → 593726f (guest-only LD_LIBRARY_PATH) → 7300b5f (init excluded from injection) → b7a1cc6 (TWOYI_SHLIB_NO_PROPS property gate) → 7788553 (canonical-rootfs under_rootfs) → e456cb7 (shlib translation fully gated) → 76c1f91 (6-Z305t part 1: pure-Rust ext4 reader, smoke-verified on a real payload). Every recovery guard stayed green across all seven.
+- Boot progression this session: park-at-early-init (1.4s) → rung-4 fleet-death-at-105s → selinux-policy FATAL → wait_for_coldboot_done park ×2 → the property wire NOW reaches init's own listener and the set is rejected by a named, extractable error. The CANNOT LINK class is extinct (boringssl self-tests pass with the shlib; linkerconfig/apexd-bootstrap exit 0).
+- NEXT (6-Z305s-g): 1. decode the full property-set rejection message; 2. 6-Z305t part 2 — wire apex flattening into staging (the ext4 reader is landed + verified); 3. guards + ladder.
