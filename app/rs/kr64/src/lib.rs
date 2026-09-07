@@ -5106,6 +5106,112 @@ fn z192_property_format_probe_detects_new_format() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── 6-Z305t-2: flattened-APEX boot prep ─────────────────────────────
+
+/// 6-Z305t-2: extract every /system/apex/<name>.apex payload the rootfs
+/// ships into a staging tree {rootfs}/apex.twoyi/<name>/ — a pure-Rust
+/// ext4 read (apex_fs) of the ZIP's apex_payload.img (apex_extract), no
+/// loop device, no mount, no subprocess. mount_mgr then stacks each
+/// staged apex OVER the host's ambient /apex/<name>, so the guest sees
+/// exactly what a real flattened-APEX device's apexd (ro.apex.updatable
+/// =false) would expose at /apex/<name>/**. Without this, executables
+/// whose DT_NEEDED lives only inside an apex (lmkd ← libstatssocket.so
+/// from com.android.os.statsd on an R GSI) die pre-main in the bionic
+/// linker: CANNOT LINK EXECUTABLE (run 34091671773, ×5 → critical
+/// process ×4 → InitFatalReboot signal 6).
+///
+/// Idempotent: per-apex marker {rootfs}/apex.twoyi/<name>/
+/// .twoyi_extracted stores "<size>:<mtime>" of the source .apex; a
+/// mismatch (ROM swap/update) re-extracts. One payload failing is
+/// logged and skipped (honest, non-fatal): the host apex underneath
+/// still covers that name and apexd-bootstrap still runs in-guest.
+fn flatten_apex_payloads(cfg: &Config) {
+    if cfg.boot_recovery {
+        return; // TWRP: statically linked init, no APEX consumers
+    }
+    let apex_src_dir = format!("{}/system/apex", cfg.rootfs);
+    let entries = match std::fs::read_dir(&apex_src_dir) {
+        Ok(e) => e,
+        Err(_) => return, // no /system/apex in this rootfs — nothing to do
+    };
+    let mut flattened = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if !name.ends_with(".apex") {
+            continue;
+        }
+        let apex_name = name.trim_end_matches(".apex").to_string();
+        let path = format!("{}/{}", apex_src_dir, name);
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let want = format!("{}:{}", meta.len(), mtime);
+        let dst = format!("{}/apex.twoyi/{}", cfg.rootfs, apex_name);
+        let marker = format!("{}/.twoyi_extracted", dst);
+        if let Ok(c) = std::fs::read_to_string(&marker) {
+            if c.trim() == want {
+                skipped += 1;
+                continue;
+            }
+        }
+        match flatten_one_apex(&path, &dst, &marker, &want, &cfg.data_dir) {
+            Ok(_) => {
+                flattened += 1;
+            }
+            Err(e) => {
+                failed += 1;
+                warning!(
+                    "[KR64][apex] 6-Z305t-2: {} extraction failed: {} — host apex stays visible underneath",
+                    apex_name,
+                    e
+                );
+            }
+        }
+    }
+    info!(
+        "[KR64][apex] apex: flattened {} payload(s) (skipped {}, failed {}) (6-Z305t-2)",
+        flattened, skipped, failed
+    );
+}
+
+/// Extract one .apex payload into `dst` (6-Z305t-2). Returns the number
+/// of materialized entries. The ZIP side (apex_extract's STORED-entry
+/// reader) hands us the ext4 apex_payload.img bytes; apex_fs parses the
+/// image read-only and materializes the tree as real host files. The
+/// marker is written LAST, so a failed extraction is retried next boot.
+fn flatten_one_apex(
+    apex_path: &str,
+    dst: &str,
+    marker: &str,
+    marker_val: &str,
+    data_dir: &str,
+) -> Result<usize, String> {
+    let img_bytes = apex_extract::extract_apex_payload_img(apex_path)?;
+    let tmp = format!("{}/cache/twoyi-apex-payload-{}.img", data_dir, std::process::id());
+    if let Some(parent) = Path::new(&tmp).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&tmp, &img_bytes).map_err(|e| e.to_string())?;
+    let mut img = apex_fs::Ext4Image::open(&tmp).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    let n = img.extract_tree("/", dst).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(marker, format!("{}\n", marker_val)).map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // 6-Z260: anchor the boot clock as the very first action so every
     // subsequent log line's [+Nms] prefix measures from daemon start.
@@ -5822,6 +5928,23 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
     };
+
+    // ---------------------------------------------------------------
+    // 6-Z305t-2: flattened-APEX boot prep + linkerconfig perms.
+    // Materialize every /system/apex payload the rootfs ships into
+    // {rootfs}/apex.twoyi/ (pure-Rust ext4 read; no loop device, no
+    // mount) so mount_mgr can stack each one OVER the host's ambient
+    // /apex/<name> — the guest then sees what a real flattened-APEX
+    // device's apexd exposes (ro.apex.updatable=false). Without this,
+    // /system/bin/lmkd dies pre-main in the linker: CANNOT LINK
+    // EXECUTABLE "/system/bin/lmkd": library "libstatssocket.so" not
+    // found (run 34091671773: ×5 → critical-process ×4 → InitFatalReboot
+    // signal 6). TWRP: skipped — same gating as the libdl extraction
+    // above (statically linked init, no APEX consumers). The
+    // linkerconfig perms pass is unconditional and cheap (no-op on
+    // clean trees; recovery has no linkerconfig).
+    // ---------------------------------------------------------------
+    flatten_apex_payloads(&cfg);
 
     // ---------------------------------------------------------------
     // Step 4: set up mount namespace + bind mounts + tmpfs.
