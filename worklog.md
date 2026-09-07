@@ -26266,3 +26266,19 @@ Commits: (this commit) `diag(ptrace): 6-Z305t-14b — fd-table dump at stall sit
 Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 783 passed / 0 failed.
 
 CI: ladder #68 dispatch follows. Expected: 6-Z305t-14b STALL-FD lines for flags_health_check name the blocked fd — if it is socket:[inode] → {rootfs}/dev/socket/logdw, the logd-not-draining thread investigation (why logd's LogReader never recvfroms) becomes the precise 6-Z305t-15 fix target; if it is something else entirely, the wedge class changes.
+
+## 6-Z305t-14c — #68 decode: the wedge fd IS the real logdw socket; logd does not drain it (6-Z305t-15 target)
+
+Discovery (ladder run 34138249489 @f4472e3, rung 4):
+
+- 6-Z305t-14b fd-table forensics DECISIVE: flags_health_check (exec 11, pid 2761) has exactly fd 0/1/2 → /dev/null + **fd 3 → socket:[48835]** — ONE socket, the logdw client socket. The shlib's 6-Z305t-12 real-connect path IS working for exec'd services (the "REAL logd" diag prints to stderr = /dev/null for service children — swallowed, which is why the artifact showed no diag).
+- The wedge: liblog's blocking dgram write on that full socket (liblog+0x3740 → ppoll, wchan poll_schedule_timeout) — **logd does not recvfrom its logdw queue**. logd (pid 2688-class) main thread + threads were in ppoll/healthy stops in #67 — the LogReader thread's recvfrom never happens (or it is blocked elsewhere). With logd not draining, liblog's socket write fills the buffer → the client's retry ppoll → init's SYNCHRONOUS `exec` of flags_health_check (its load_persist_props_action section) blocks forever → the init action queue stops below load_persist_props → `on nonencrypted`/zygote-start/boot never run → no zygote → rung 4 ceiling.
+- The 271f dump's arg regs (0/0/0) are a stale-capture artifact — the 6-Z282 pollfd naming was skipped by the a0!=0 guard; the fd-table dump (14b) is the reliable instrument.
+- The thread-stop forensics (#67) stand: guest THREAD attach/entry stops are consumed + resumed correctly (logd's threads all showed SIGSTOP→resume→syscall-stops healthy) — the freeze is NOT a resume bookkeeping bug.
+
+NEXT (6-Z305t-15 — the logd-draining fix, decode-first):
+1. Instrument LOGD's threads specifically: at 271f, ALSO dump /proc/<tid>/syscall (raw) for every TID of the logd process group (the reader should sit in recvfrom; if it sits in ppoll/futex/poll_schedule_timeout, that names the stuck layer — e.g. its own liblog write to the undrained socket (self-deadlock: logd logs to itself before its reader starts? — logd's internal writes go direct-to-buffer, but libbase LOG() in logd's early init goes via liblog → its own socket!).
+2. Candidate fixes after decode: (a) if logd self-deadlocks on its own logdw write pre-reader: the shlib hook already redirects — but logd ITSELF may bypass (LD_PRELOAD applies ✓ — verify); (b) if the LogReader thread is wedged on the tracer side (e.g. its recvfrom ENTRY stop mishandled — the thread-forensics in #67 showed only the FIRST 3 stops; extend to logd's threads specifically), fix the resume path; (c) honest container alternative: a twoyi klog-drainer — a tracer-side thread that recvfroms the logdw socket queue... NOT honest (logd must work like logd).
+3. The queue advance is EXPECTED the moment logdw drains: flags_health_check exits → load_persist_props completes → load_bpf_programs → nonencrypted → start zygote → RUNG 5.
+
+Honest unverified: logd's internal thread states are inferred from process-level stalls; the per-TID syscall/fd dump (6-Z305t-15 step 1) is the decisive instrument. The recovery corpus does NOT exercise multithreaded logd (TWRP logs via kmsg) — the regression risk of the eventual fix is system-mode-local.
