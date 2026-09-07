@@ -3518,20 +3518,51 @@ static void fatal_dump_maps(void) {
     raw_syscall1(SYS_close, mfd);
     write_str(2, "[twrp_fb_hook] --- end maps ---\n");
     if (abort_msg_start != 0) {
-        /* bionic abort_msg_t = { size_t size; char msg[]; } — the string
-         * starts at offset 8. The mapping belongs to THIS process, so the
-         * dereference is safe; printable-only, NUL-terminated, capped. */
-        volatile const unsigned char *m =
-            (volatile const unsigned char *)(abort_msg_start + 8);
-        char out[320];
+        /* 6-Z305t-26b: layout SELF-DESCRIBING dump — the assumed
+         * {size_t size; char msg[]} +8 layout produced 2-3 byte strings
+         * ("ZuW"), so the string does not start at +8. Scan the first 96
+         * bytes of the mapping and print EVERY printable run >= 3 chars
+         * with its offset ("@<off>:<run>") — the real message text and
+         * its exact offset appear in one shot. */
+        volatile const unsigned char *m = (volatile const unsigned char *)abort_msg_start;
+        char out[512];
         unsigned long op = 0;
-        static const char pre[] = "[twrp_fb_hook] abort message: ";
+        static const char pre[] = "[twrp_fb_hook] abort message scan:";
         unsigned k;
-        for (k = 0; pre[k] && op < sizeof(out) - 4; k++) out[op++] = pre[k];
-        for (k = 0; k < 240 && op < sizeof(out) - 2; k++) {
-            unsigned char c = m[k];
-            if (c == 0) break;
-            if (c >= 0x20 && c < 0x7f) out[op++] = (char)c;
+        for (k = 0; pre[k] && op < sizeof(out) - 8; k++) out[op++] = pre[k];
+        k = 0;
+        while (k < 96 && op < sizeof(out) - 80) {
+            /* find a printable run */
+            while (k < 96) {
+                unsigned char c = m[k];
+                if (c >= 0x20 && c < 0x7f) break;
+                k++;
+            }
+            unsigned long run_start = k;
+            unsigned long run_len = 0;
+            while (k < 96) {
+                unsigned char c = m[k];
+                if (!(c >= 0x20 && c < 0x7f)) break;
+                k++;
+                run_len++;
+            }
+            if (run_len >= 3) {
+                /* append "@<off>:<run>" */
+                char offbuf[8];
+                unsigned long v = run_start;
+                int dn = 0;
+                if (v == 0) offbuf[dn++] = '0';
+                while (v > 0 && dn < 7) {
+                    offbuf[dn++] = (char)('0' + (v % 10));
+                    v /= 10;
+                }
+                if (op < sizeof(out) - 2) out[op++] = '@';
+                while (dn > 0 && op < sizeof(out) - 2) out[op++] = offbuf[--dn];
+                if (op < sizeof(out) - 2) out[op++] = ':';
+                for (v = run_start; v < run_start + run_len && op < sizeof(out) - 2; v++)
+                    out[op++] = (char)m[v];
+                if (op < sizeof(out) - 2) out[op++] = ' ';
+            }
         }
         out[op++] = '\n';
         raw_syscall3(SYS_write, 2, (long)out, (long)op);
