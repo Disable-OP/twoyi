@@ -10798,6 +10798,21 @@ fn z305s_inject_decision(has_preload: bool, has_ldlib: bool) -> (bool, bool) {
     (!has_preload, !has_ldlib)
 }
 
+/// 6-Z305s-c: exec paths the envp injection must NOT touch. The guest
+/// init binary ("/init", "/system/bin/init", and any "*/init" spelling
+/// of it) is excluded: when the shlib rides the selinux_setup/second_stage
+/// re-execs, its TWRP-oriented selinuxfs virtualization intercepts the
+/// policy load and AOSP init FATALs "Unable to load SELinux policy" →
+/// SIGABRT → InitFatalReboot (ladder run 34069416074 decode: rung-3
+/// death at +151ms, glog F/abort verbatim). init does NOT need the shlib
+/// — the rung-4 core-daemon run (34058989419) got all the way to service
+/// spawn with a shlib-less init — because the TRACER injects every
+/// service exec independently. init keeps its proven configuration; the
+/// binder fleet still gets the shlib via the per-exec injection.
+fn z305s_skip_exec_path(orig: &str) -> bool {
+    orig == "/init" || orig.ends_with("/init")
+}
+
 /// 6-Z305s: PURE builder for the injected envp pointer array (64-bit
 /// ABIs only — aarch64 execve=221, x86_64 execve=59; the execve==11
 /// class keeps its proven recovery chains untouched).
@@ -16567,7 +16582,10 @@ pub fn run_ptrace_loop(
                                 // ABIs only (the `abi.execve != 11` gate of
                                 // this block; aarch64 execve=221,
                                 // x86_64 execve=59).
-                                if !boot_recovery && past_first_execve {
+                                if !boot_recovery
+                                    && past_first_execve
+                                    && !z305s_skip_exec_path(&orig)
+                                {
                                     static Z305S_OK: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
                                     static Z305S_FAIL: std::sync::atomic::AtomicU64 =
@@ -34875,6 +34893,21 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             sockaddr_blob_is_property_service(&blob3, 2 + guest.len() as i64 + 1, &ABI_X86_64),
             Some(PropServSockaddrKind::FilesystemPath)
         );
+    }
+
+    #[test]
+    fn z305s_skip_exec_path_covers_init_spellings() {
+        // 6-Z305s-c: the guest init binary never gets the injected env
+        // (the shlib's selinuxfs virtualization fatals AOSP init's policy
+        // load); every service exec still gets it.
+        assert!(z305s_skip_exec_path("/init"));
+        assert!(z305s_skip_exec_path("/system/bin/init"));
+        assert!(z305s_skip_exec_path("/apex/com.android.runtime/bin/init"));
+        assert!(!z305s_skip_exec_path("/system/bin/servicemanager"));
+        assert!(!z305s_skip_exec_path("/system/bin/app_process64"));
+        assert!(!z305s_skip_exec_path("/system/bin/vold"));
+        // init.environ-like names must not match
+        assert!(!z305s_skip_exec_path("/system/bin/initd"));
     }
 
     #[test]
