@@ -25819,3 +25819,17 @@ Work Log:
 
 Stage Summary:
 - origin/main = this commit. Expectation: init's re-execs run shlib-free → ro.* sets land → wait_for_coldboot_done clears → fleet spawns → zygote (rung 5). APEX-lib consumers still need 6-Z305t part 2.
+
+---
+Task ID: 6-Z305s-k (ladder 34076304740 decode — the flag carry was insufficient)
+Agent: Z.ai Code (main dispatcher)
+Task: decode the re-run; find the pre-populated-area writer.
+
+Work Log:
+- The exec-hook carry (14b7413) did NOT clear the 0xb class: ro.gsid.image_running (+342ms), ro.boottime.ueventd (+612ms), ro.boottime.apexd-bootstrap (+616ms), ro.cold_boot_done (+755ms) all still "Read-only property was already set". Guest end-state unchanged (init + ueventd only).
+- ELIMINATED: shlib-in-first-stage (gated), shlib-in-re-execs (carry landed), 6-Z110/6-Z111 tracer machinery (zero activity since ced49ce).
+- REMAINING HYPOTHESES (next decode): (1) THE BOOT RUNS TWICE in the CI job (app crash → auto-restart) — /dev/__properties__ is a PERSISTENT host directory, so boot #2 maps boot #1's fully-populated area (real tmpfs on a device would be fresh); check the kr64 log for a second parent-staging sequence ("wrote libgetpid_hook" ×2) and the area files' persistence across boots. (2) The 6-Z111 broadcaster's FILE-FLUSH persists some other way (zero activity now, but the anon|private areas + the 6-Z231/6-Z229 area-file arms may still materialize entries).
+- THE GENERIC FIX DIRECTION (honest tmpfs semantics): the virtual kernel's /dev must NOT carry the property area across boots — kr64's parent staging should reset {rootfs}/dev/__properties__ to a clean empty dir at boot start (exactly what a real device's fresh tmpfs /dev gives every boot). That closes the class regardless of which writer populated it.
+
+Stage Summary:
+- origin/main cf68961. NEXT: verify the two-boot hypothesis in this run's logs; if confirmed (or regardless), land the dev/__properties__ reset in the parent staging (6-Z305s-l), guards + ladder.
