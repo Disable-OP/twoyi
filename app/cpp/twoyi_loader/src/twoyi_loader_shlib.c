@@ -3329,47 +3329,41 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             // return 0 (real connect success). Subsequent writev(sockfd)
             // lands in /dev/__kmsg__: unbounded, non-blocking, and the
             // log lines still land in the kmsg artifacts.
-            int kmsg_fd = (int)syscall(NR_openat, AT_FDCWD, kmsg_path, O_WRONLY, 0);
-            if (kmsg_fd < 0 && logdw_redirect_diag >= 0) {
-                /* 6-Z305t-30: the open result is now on the record — a
-                 * failing kmsg open means the real-connect fall-through
-                 * (logd's uncapturable ring) happened silently before. */
-                char msg[160];
-                snprintf(msg, sizeof(msg),
-                    "[twoyi_loader] kmsg openat FAILED errno=%d\n",
-                    -(int)kmsg_fd == 0 ? (int)errno : (int)-kmsg_fd);
-                write_str(2, msg);
+            // 6-Z305t-32: open with O_APPEND when the kernel accepts it
+            // (atomic append — immune to multi-writer offset interleaving);
+            // fall back to O_WRONLY + lseek(SEEK_END) (the #77 evidence
+            // showed O_APPEND failing on this node class once).
+            int kmsg_fd = (int)syscall(NR_openat, AT_FDCWD, kmsg_path,
+                                       1 /*O_WRONLY*/ | 0x400 /*O_APPEND*/, 0);
+            if (kmsg_fd < 0) {
+                kmsg_fd = (int)syscall(NR_openat, AT_FDCWD, kmsg_path,
+                                       1 /*O_WRONLY*/, 0);
+                if (kmsg_fd >= 0)
+                    syscall(SYS_lseek, kmsg_fd, 0, 2 /*SEEK_END*/);
             }
             if (kmsg_fd >= 0) {
-                /* 6-Z305t-29: position at END before the dup. Ladder #86
-                 * decode: the liblog records WERE reaching the klog file —
-                 * but every service's fresh open() starts at offset 0, so
-                 * all the fleet's logcat output was written ON TOP OF the
-                 * klog head (the artifact head was literally a liblog
-                 * record: "libc\0Pointer tag for … was truncated."), each
-                 * process clobbering the last. lseek(SEEK_END) on the
-                 * dup'd description makes every liblog write APPEND. */
-                syscall(SYS_lseek, kmsg_fd, 0, 2 /*SEEK_END*/);
                 syscall(SYS_dup3, kmsg_fd, sockfd, 0);
                 syscall(SYS_close, kmsg_fd);
-                /* 6-Z305t-29b/31: fd TEST — one WRITEV (liblog's exact
-                 * write call) through the dup'd fd, with the return on the
-                 * record. write() landed in #89 (the fd is good); if the
-                 * writev test lands too, the miss is liblog-side fd
-                 * bookkeeping; if writev fails, the tracer's writev path
-                 * is the culprit (the ret value distinguishes). */
+                /* 6-Z305t-31/32: fd TEST — BOTH write() (landed in #89) and
+                 * writev() (returned 37 in #90 yet the bytes were never
+                 * found) through the dup'd fd, with both returns on the
+                 * record. One artifact now answers: which call class
+                 * delivers, and whether the miss is the tracer's writev
+                 * path or positional. */
                 static const char fdtest[] =
                     "<6>[twoyi_loader] logdw kmsg fd test\n";
+                long wr = syscall(SYS_write, sockfd, fdtest,
+                                  (long)(sizeof(fdtest) - 1));
                 struct iovec iov[1];
                 iov[0].iov_base = (void *)(uintptr_t)fdtest;
                 iov[0].iov_len = sizeof(fdtest) - 1;
-                long wr = syscall(SYS_writev, sockfd,
-                                  (long)(struct iovec *)iov, 1);
+                long wrv = syscall(SYS_writev, sockfd,
+                                   (long)(struct iovec *)iov, 1);
                 {
-                    char msg[128];
+                    char msg[160];
                     snprintf(msg, sizeof(msg),
-                        "[twoyi_loader] logdw kmsg fd writev test ret=%ld\n",
-                        wr);
+                        "[twoyi_loader] logdw fd tests: write=%ld writev=%ld\n",
+                        wr, wrv);
                     write_str(2, msg);
                 }
                 return 0;
