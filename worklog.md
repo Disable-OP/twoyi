@@ -25806,3 +25806,16 @@ Work Log:
 
 Stage Summary:
 - origin/main ced49ce (+ this commit). Session-3 commits: 6-Z305s-h (MAP_SHARED area fix — verified live: init's own sets green, tracer property machinery fully inert) + the root-cause decode worklogs. The boot is one permission-check away from the fleet.
+
+---
+Task ID: 6-Z305s-j (0xb decoded + first-stage/exec-hook gate carry)
+Agent: Z.ai Code (main dispatcher)
+Task: fix the 0xb READ_ONLY rejection class.
+
+Work Log:
+- 160-byte WRITEV-SAMPLE exposed the exact code: 0xb PROP_ERROR_READ_ONLY on ro.boottime.apexd-bootstrap / ro.boottime.boringssl_self_test64 / ro.gsid.image_running / ro.cold_boot_done.
+- Two holes found and closed: (1) edcd50e — the FIRST init exec (twoyi_init, kr64's own env) carried the shlib WITHOUT the NO_PROPS gate; the shlib's area_init flush pre-populated ro.* into /dev/__properties__; (2) this commit — the shlib's execv/execve hook env rebuild re-arms the shlib on init's re-execs while DROPPING the flag; the rebuild now carries TWOYI_SHLIB_NO_PROPS=1 whenever the caller had it.
+- Both commits pushed; ladder dispatched.
+
+Stage Summary:
+- origin/main = this commit. Expectation: init's re-execs run shlib-free → ro.* sets land → wait_for_coldboot_done clears → fleet spawns → zygote (rung 5). APEX-lib consumers still need 6-Z305t part 2.
