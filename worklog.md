@@ -26248,3 +26248,21 @@ Commits: (this commit) `diag(ptrace): 6-Z305t-14 — per-tid first-3-stops + res
 Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 783 passed / 0 failed.
 
 CI: ladder #67 dispatch follows. Expected: the forensics lines around logd's threads (2696-2698-class) show the exact stop status/class and the missing resume; the 6-Z305t-14 fix lands next round.
+
+## 6-Z305t-14b — fd-table forensics at stall sites + #67 decode refinements
+
+#67 (80807e7) decode:
+- The thread-stop forensics PROVED the attach/resume machinery healthy for guest threads: logd 2688 + threads 2696/2697/2698 + flags_health_check 2739 — ALL first stops are SIGSTOP (status 0x137f) → consumed → resumed ret=0, then clean syscall stops. The #66 frozen-thread theory (attach-stop handling) is DISPROVEN — the freeze state does not reproduce in #67 (271d stalls only for flags_health_check itself).
+- flags_health_check STILL wedges: ppoll (nr=64→73) via liblog+0x3740, PC inside the fb_hook's poll PASSTHROUGH (the fb_hook wrapper is fd-scoped and passes non-input polls through — NOT the 6-Z5 fake), in-kernel poll_schedule_timeout 6.2s. The 271f dump showed arg regs 0/0/0 (stale capture) — the pollfd array naming (6-Z282) was skipped (a0=0 guard).
+- Decisive counting: 24 kmsg-fallback connects, ZERO real-logd connects — BUT the exec'd services' stderr is /dev/null, so the shlib's "REAL logd" diag would be SWALLOWED for exactly the wedged child. The connect-path truth for flags_health_check is unknown (real logd socket with logd not draining, vs something else).
+- liblog+0x3740: an internal (hidden-symtab) function — the offset resolves to no exported symbol; the ppoll args pattern (NULL,0,NULL = infinite sleep) vs the wchan (poll_schedule_timeout) suggests a blocking dgram write to a FULL socket whose reader (logd) isn't draining.
+
+Instrumentation added (this commit):
+1. 6-Z305t-14b STALL-FD: at every 271f stall dump, dump the stalled thread's fd table (first 24 fds via /proc/<pid>/fd readlink — same proven pattern as the 6-Z305h EXIT forensics) — names the blocked fd (socket:[inode] → path via the existing 6-Z282 unix-table naming).
+2. Resume-diag cap fix (log only while stop-count < 3 — the ≤3 condition spammed one line per resume for busy tids).
+
+Commits: (this commit) `diag(ptrace): 6-Z305t-14b — fd-table dump at stall sites …`.
+
+Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 783 passed / 0 failed.
+
+CI: ladder #68 dispatch follows. Expected: 6-Z305t-14b STALL-FD lines for flags_health_check name the blocked fd — if it is socket:[inode] → {rootfs}/dev/socket/logdw, the logd-not-draining thread investigation (why logd's LogReader never recvfroms) becomes the precise 6-Z305t-15 fix target; if it is something else entirely, the wedge class changes.
