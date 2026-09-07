@@ -26157,3 +26157,24 @@ Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 782 passed /
 CI: ladder #63 dispatch follows.
 
 Expected: `6-Z305t-10: appended container /data row` + `6-Z305t-10: block-storage mount ->/data … EXIT 0` → mount_all completes with NOT_ENCRYPTABLE → `processing action (nonencrypted)` → `class_start main` → `starting service 'zygote'` → RUNG 5 ZYGOTE → system_server → RUNG 6 stretch. Honest risks: (a) zygote = ART first contact (flattened com.android.art, boot classpath, odsync/dex2oat); (b) system_server binder + property-context paths previously healthy; (c) graphics at rung 7.
+
+## 6-Z305t-10 pt3 — the /data device node needs a REAL ext4 superblock (fs_mgr validates BEFORE mounting: "Invalid ext4 superblock on /dev/block/by-name/userdata" → entry skipped → mount_all SUCCESS → still no nonencrypted)
+
+Discovery (ladder run 34128683905 @2b56f28, rung 4):
+
+- pt2 VERIFIED GREEN: `6-Z305t-10: appended container /data row to …/vendor/etc/fstab.ranchu` — the /data row exists.
+- Still rung 4. New klog evidence: `[libfs_mgr]Invalid ext4 superblock on '/dev/block/by-name/userdata'` + `Can't read '/dev/block/by-name/userdata' superblock: No such file or directory` — fs_mgr reads and VALIDATES the device's ext4 superblock BEFORE issuing mount(); the 6-Z287 staged node is a SPARSE ZERO FILE (the honest regular-file contract) → magic 0 → invalid → the /data entry is SKIPPED (not even attempted) → mount_all again returns SUCCESS → no crypto branch → no nonencrypted → no zygote.
+
+Implementation (app/rs/kr64/src/devices.rs):
+1. `write_ext4_superblock(path)` — minimal VALID ext4 primary superblock at file offset 1024 (4096-byte blocks, 256-byte inodes, dynamic rev, ZERO feature bits — nothing for fs_mgr's unsupported-feature check to reject — clean state, stable UUID "twoyi-data-volum", 1 GiB block geometry). Layout mirrors the hand-built apex_fs fixture (proven correct in #62/#63 rounds).
+2. `materialise_block_node` applies it to every by-name **userdata** node (both /dev/block/by-name and /dev/block/bootdevice/by-name variants), on create AND on pre-existing (persistent-root) nodes; failure is a logged warning that degrades to the previous behavior (entry skipped).
+3. The 6-Z287 "regular-file honesty" contract is preserved: no ioctl emulation added — the SB is a structural stand-in consumed only by fs_mgr's pre-mount validation; the mount itself remains the 6-Z305t-10 container no-op and no guest data touches the node.
+4. New test z305t10_userdata_node_carries_ext4_superblock (magic + clean state at the exact offsets, both variants).
+
+Commits: (this commit) `fix(devices): 6-Z305t-10 pt3 — the /data by-name node carries a minimal valid ext4 superblock …`.
+
+Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 783 passed / 0 failed.
+
+CI: ladder #64 dispatch follows.
+
+Expected: fs_mgr reads the SB ✓ → mount() → 6-Z305t-10 no-op 0 → /data MOUNTED (fs_mgr view) → mount_all returns FS_MGR_MNTALL_DEV_NOT_ENCRYPTABLE → `ro.crypto.state=unsupported` + `nonencrypted` queued → `processing action (nonencrypted)` → `class_start main` → `starting service 'zygote'` → RUNG 5 → system_server → RUNG 6. Honest risks: (a) zygote/ART first contact on the flattened com.android.art apex (boot classpath, odsync); (b) system_server's binder/property-context deps are previously verified; (c) rung 7 graphics (surfaceflinger on the virtual framebuffer).
