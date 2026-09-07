@@ -1030,13 +1030,11 @@ pub fn init_renderer(
                             // thread per killed PID and ALWAYS paid the full
                             // half second — even when the process was already
                             // reaped within milliseconds.
-                            let deadline = std::time::Instant::now()
-                                + std::time::Duration::from_millis(500);
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_millis(500);
                             loop {
                                 let alive = unsafe { libc::kill(old_pid, 0) } == 0;
-                                if !alive
-                                    || std::time::Instant::now() >= deadline
-                                {
+                                if !alive || std::time::Instant::now() >= deadline {
                                     break;
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1568,7 +1566,9 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
             let stale_handle = match fb_stat {
                 Some((_, _, sz, ino)) => {
                     sz != fb_size as u64
-                        || last_fb_stat.map(|prev| prev.3) .map_or(false, |pino| pino != ino)
+                        || last_fb_stat
+                            .map(|prev| prev.3)
+                            .map_or(false, |pino| pino != ino)
                 }
                 None => true,
             };
@@ -1617,24 +1617,24 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
                         || (changed_frames % 20 == 0 && now.saturating_sub(last) >= 1000)
                     {
                         LAST_DIGEST_MS.store(now, std::sync::atomic::Ordering::Relaxed);
-                    let mut hash: u64 = 0xcbf29ce484222325;
-                    for chunk in fb_buf.chunks_exact(8) {
-                        for &b in chunk {
-                            hash ^= b as u64;
-                            hash = hash.wrapping_mul(0x100000001b3);
+                        let mut hash: u64 = 0xcbf29ce484222325;
+                        for chunk in fb_buf.chunks_exact(8) {
+                            for &b in chunk {
+                                hash ^= b as u64;
+                                hash = hash.wrapping_mul(0x100000001b3);
+                            }
                         }
-                    }
-                    let cx = fb_h / 2 * fb_w + fb_w / 2;
-                    let px = [
-                        fb_buf[cx * 4],
-                        fb_buf[cx * 4 + 1],
-                        fb_buf[cx * 4 + 2],
-                        fb_buf[cx * 4 + 3],
-                    ];
-                    alog(&format!(
-                        "TWRP-FB frame #{} blitted digest={:016x} center=[{},{},{},{}]",
-                        changed_frames, hash, px[0], px[1], px[2], px[3]
-                    ));
+                        let cx = fb_h / 2 * fb_w + fb_w / 2;
+                        let px = [
+                            fb_buf[cx * 4],
+                            fb_buf[cx * 4 + 1],
+                            fb_buf[cx * 4 + 2],
+                            fb_buf[cx * 4 + 3],
+                        ];
+                        alog(&format!(
+                            "TWRP-FB frame #{} blitted digest={:016x} center=[{},{},{},{}]",
+                            changed_frames, hash, px[0], px[1], px[2], px[3]
+                        ));
                     }
                 }
                 if !first_blit_logged {

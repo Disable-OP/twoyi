@@ -9359,6 +9359,137 @@ fn proc_state_char(pid: libc::pid_t) -> Option<char> {
     rest.split_whitespace().next()?.chars().next()
 }
 
+/// 6-Z305t-17: the first /proc/<pid>/maps line whose range contains `pc`,
+/// or "?" when the maps are unreadable (post-setuid DAC) or pc is unmapped.
+/// Shared by the 271f /proc-based stall dump and the 6-Z305t-17
+/// PTRACE_INTERRUPT probe.
+fn maps_region_for_pc(pid: libc::pid_t, pc: u64) -> String {
+    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{}/maps", pid)) {
+        for line in maps.lines() {
+            let mut r = line.splitn(2, ' ');
+            let mut range = r.next().unwrap_or("").split('-');
+            let lo = u64::from_str_radix(range.next().unwrap_or("0"), 16).unwrap_or(0);
+            let hi = u64::from_str_radix(range.next().unwrap_or("0"), 16).unwrap_or(0);
+            if pc >= lo && pc < hi {
+                return line.to_string();
+            }
+        }
+    }
+    "?".to_string()
+}
+
+/// 6-Z305t-17: PTRACE_INTERRUPT stall probe — the uid-independent way to
+/// name a long-stalled tracee's TRUE blocked syscall.
+///
+/// Ladder #70 decode: logd's main thread has been blocked-in-kernel since
+/// ~+2.5 s and the whole action queue is parked behind it (flags_health_check
+/// wedged writing logd's own logdw socket since +7.0 s), but EVERY /proc
+/// read for logd's pids now fails (comm=?, wchan=?, /proc/syscall unreadable)
+/// and the per-tid ENTRY forensics budget exhausted at the thread-startup
+/// linker phase — the stalled tracee's true state is INVISIBLE. The /proc
+/// checks are DAC-gated by the target's (post-setuid) uid, but the TRACER
+/// RELATIONSHIP grants register access regardless of uid: PTRACE_INTERRUPT
+/// forces an event stop on the blocked tracee, GETREGS names the true
+/// syscall nr + args + pc, and a PTRACE_SYSCALL resume restores the exact
+/// mid-syscall flow (the kernel delivers the EXIT stop when the blocked
+/// syscall completes — in_syscall_map bookkeeping stays consistent).
+///
+/// Returns true when the probe completed (stop consumed, state logged,
+/// tracee resumed). Any failure path resumes-or-logs honestly and returns
+/// false; a tracee that exits mid-probe is left to the loop's normal reap.
+fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
+    // 1. Force the stop. A tracee blocked in-kernel stops promptly; a
+    //    RUNNING tracee stops at its next transition. ESRCH → it died.
+    let ir = unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) };
+    if ir != 0 {
+        let e = std::io::Error::last_os_error();
+        crate::trace_log_line(&format!(
+            "6-Z305t-17 STALL-PROBE: pid={} PTRACE_INTERRUPT failed: {} (dead or unstoppable — nothing probed)",
+            pid, e
+        ));
+        return false;
+    }
+    // 2. Consume the event stop OUT-OF-BAND (specific-tid WNOHANG spin —
+    //    never waitpid(-1) here: the main loop's dispatch is mid-flight
+    //    and other children's stops must stay queued for it).
+    let mut status: libc::c_int = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        let w = unsafe { libc::waitpid(pid, &mut status, libc::__WALL | libc::WNOHANG) };
+        if w == pid {
+            break;
+        }
+        if w < 0 {
+            crate::trace_log_line(&format!(
+                "6-Z305t-17 STALL-PROBE: pid={} died between INTERRUPT and its stop ({}) — nothing probed, reap is the loop's job",
+                pid,
+                std::io::Error::last_os_error()
+            ));
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            // The stop never arrived — the tracee is stuck in a state the
+            // kernel cannot stop quickly. Do NOT leave it interrupted:
+            // re-arm the syscall trap so it is exactly as it was (in-syscall
+            // mid-flow), and report the probe as inconclusive.
+            let r = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) };
+            crate::trace_log_line(&format!(
+                "6-Z305t-17 STALL-PROBE: pid={} interrupt stop TIMEOUT (250ms) — re-armed PTRACE_SYSCALL (ret={}) to restore the pre-probe state",
+                pid, r
+            ));
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    if !libc::WIFSTOPPED(status) {
+        crate::trace_log_line(&format!(
+            "6-Z305t-17 STALL-PROBE: pid={} waitpid returned non-stop status {:#x} — leaving it to the loop's exit handling",
+            pid, status as u32
+        ));
+        return false;
+    }
+    // 3. Name the true blocked syscall + pc from the interrupted register
+    //    state. (The tracer relationship makes GETREGS work regardless of
+    //    the tracee's uid — the whole point of the probe.)
+    let mut regs: Regs = unsafe { std::mem::zeroed() };
+    if ptrace_getregs_wide(pid, &mut regs).is_err() {
+        let r = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) };
+        crate::trace_log_line(&format!(
+            "6-Z305t-17 STALL-PROBE: pid={} stopped at {:#x} but GETREGS failed — re-armed PTRACE_SYSCALL (ret={})",
+            pid,
+            status as u32,
+            r
+        ));
+        return false;
+    }
+    let nr = get_syscall_num(&regs, abi);
+    let a0 = get_syscall_arg(&regs, abi.reg_arg1);
+    let a1 = get_syscall_arg(&regs, abi.reg_arg2);
+    let a2 = get_syscall_arg(&regs, abi.reg_arg3);
+    let pc = guest_pc_of(&regs);
+    let region = maps_region_for_pc(pid, pc);
+    crate::trace_log_line(&format!(
+        "6-Z305t-17 STALL-PROBE: pid={} TRUE blocked nr={} a0={:#x} a1={:#x} a2={:#x} pc={:#x} maps[pc]={} (interrupt stop {:#x})",
+        pid, nr, a0, a1, a2, pc, region, status as u32
+    ));
+    // 4. Restore the exact pre-probe flow: the tracee was mid-syscall
+    //    (in_syscall_map[pid]==true by the stall filter), so PTRACE_SYSCALL
+    //    resumes it and the kernel delivers the syscall-EXIT stop when the
+    //    blocked syscall completes — the loop's classification is unchanged.
+    //    (If the tracee was actually between syscalls, the same resume
+    //    simply re-arms the ENTRY trap — either way consistent.)
+    let r = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) };
+    if r != 0 {
+        crate::trace_log_line(&format!(
+            "6-Z305t-17 STALL-PROBE: pid={} resume after probe FAILED: {} — the ESRCH/reap flow will handle it",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+        return false;
+    }
+    true
+}
+
 /// 6-Z271f: forensic dump for one blocked-in-syscall tracee.
 ///
 /// /proc/<pid>/syscall exposes the REAL syscall nr, its 6 argument
@@ -9404,19 +9535,7 @@ fn stall_forensic_dump(pid: libc::pid_t) {
     let pc = parts.get(8).map(|s| parse_hex(s)).unwrap_or(0);
 
     // pc → maps attribution (bounded: stop at the first containing line).
-    let mut region = String::from("?");
-    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{}/maps", pid)) {
-        for line in maps.lines() {
-            let mut r = line.splitn(2, ' ');
-            let mut range = r.next().unwrap_or("").split('-');
-            let lo = u64::from_str_radix(range.next().unwrap_or("0"), 16).unwrap_or(0);
-            let hi = u64::from_str_radix(range.next().unwrap_or("0"), 16).unwrap_or(0);
-            if pc >= lo && pc < hi {
-                region = line.to_string();
-                break;
-            }
-        }
-    }
+    let region = maps_region_for_pc(pid, pc);
     crate::trace_log_line(&format!(
         "6-Z271f STALL-DUMP: pid={} nr={} arg0={:#x} arg1={:#x} arg2={:#x} sp={:#x} pc={:#x} maps[pc]={}",
         pid, nr, a0, a1, a2, sp, pc, region
@@ -12289,6 +12408,13 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     let mut stall_log_budget: std::collections::HashMap<libc::pid_t, u32> =
         std::collections::HashMap::new();
+    // 6-Z305t-17: PTRACE_INTERRUPT stall-probe budgets — per-pid probe
+    // count (max 6) and last-probe instant (15 s cooldown). Declared next
+    // to the 271d stall bookkeeping they extend.
+    let mut stall_probe_budget: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    let mut stall_probe_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
+        std::collections::HashMap::new();
     // 6-Z271d: throttle for the stall scan (every 256th stop).
     let mut stall_tick: u64 = 0;
     // 6-Z184 AUDIT FIX (agent 12): this used to be a single global bool —
@@ -14343,6 +14469,33 @@ pub fn run_ptrace_loop(
                 // futex uaddr/op, the futex WORD (a pthread mutex word
                 // holds the owning TID), and the library owning PC.
                 stall_forensic_dump(sp);
+                // 6-Z305t-17: PTRACE_INTERRUPT probe — when the tracee has
+                // been blocked >10 s AND the /proc dump above came back
+                // empty (post-setuid DAC makes /proc/<pid>/{comm,wchan,
+                // syscall,fd,maps} unreadable to the app — ladder #70's
+                // logd pids), the true blocked syscall is invisible. The
+                // tracer relationship grants register access regardless
+                // of uid: interrupt → GETREGS → log → resume exactly as
+                // it was. Budget 6 per pid, 15 s per-pid cooldown.
+                if elapsed.as_secs() >= 10 {
+                    let probe_budget = stall_probe_budget.get(&sp).copied().unwrap_or(0);
+                    let cooldown_ok = match stall_probe_last.get(&sp) {
+                        None => true,
+                        Some(t) => now.duration_since(*t) >= std::time::Duration::from_secs(15),
+                    };
+                    if probe_budget < 6 && cooldown_ok {
+                        stall_probe_budget.insert(sp, probe_budget + 1);
+                        stall_probe_last.insert(sp, now);
+                        if let Some(&abi) = abi_map.get(&sp) {
+                            // The probe consumes an out-of-band stop and
+                            // resumes the tracee — its next stop (the EXIT
+                            // of the blocked syscall) arrives via the main
+                            // waitpid with the in_syscall bookkeeping
+                            // unchanged.
+                            stall_interrupt_probe(sp, &abi);
+                        }
+                    }
+                }
             }
         }
 
