@@ -5109,26 +5109,49 @@ fn z192_property_format_probe_detects_new_format() {
 // ── 6-Z305t-2: flattened-APEX boot prep ─────────────────────────────
 
 /// 6-Z305t-2: extract every /system/apex/<name>.apex payload the rootfs
-/// ships into a staging tree {rootfs}/apex.twoyi/<name>/ — a pure-Rust
-/// ext4 read (apex_fs) of the ZIP's apex_payload.img (apex_extract), no
-/// loop device, no mount, no subprocess. mount_mgr then stacks each
-/// staged apex OVER the host's ambient /apex/<name>, so the guest sees
-/// exactly what a real flattened-APEX device's apexd (ro.apex.updatable
-/// =false) would expose at /apex/<name>/**. Without this, executables
-/// whose DT_NEEDED lives only inside an apex (lmkd ← libstatssocket.so
-/// from com.android.os.statsd on an R GSI) die pre-main in the bionic
-/// linker: CANNOT LINK EXECUTABLE (run 34091671773, ×5 → critical
-/// process ×4 → InitFatalReboot signal 6).
+/// ships into a staging tree — a pure-Rust ext4 read (apex_fs) of the
+/// ZIP's apex_payload.img (apex_extract), no loop device, no mount, no
+/// subprocess. The staging DEST is mode-aware (6-Z305t-3):
 ///
-/// Idempotent: per-apex marker {rootfs}/apex.twoyi/<name>/
-/// .twoyi_extracted stores "<size>:<mtime>" of the source .apex; a
-/// mismatch (ROM swap/update) re-extracts. One payload failing is
-/// logged and skipped (honest, non-fatal): the host apex underneath
-/// still covers that name and apexd-bootstrap still runs in-guest.
+///   * use_namespaces=true (root/pivot_root): {rootfs}/apex.twoyi/<name>/
+///     staging; mount_mgr then MS_BIND-stacks each tree OVER the host's
+///     ambient /apex/<name> so the guest sees what a real flattened-APEX
+///     device's apexd (ro.apex.updatable=false) would expose.
+///   * use_namespaces=false (chroot-only, non-root): setup_mounts is
+///     SKIPPED entirely (lib.rs "skipping setup_mounts"), so a staged
+///     tree would never become visible — run 34095981723 booted with an
+///     EMPTY /apex and lmkd died CANNOT LINK libstatssocket.so ×5 →
+///     critical-process ×4 → InitFatalReboot signal 6 (still rung 3).
+///     Here we extract DIRECTLY into {rootfs}/apex/<name>/: the guest
+///     sees the rootfs dir as-is (init's emulated /apex tmpfs is a
+///     pseudo-mount onto the same real dir; apexd exits immediately on
+///     updatable=false and never touches the trees).
+///
+/// Idempotent: per-apex marker <dest>/<name>/.twoyi_extracted stores
+/// "<size>:<mtime>" of the source .apex; a mismatch (ROM swap/update)
+/// re-extracts. The marker lives INSIDE the dest, so switching modes
+/// between boots re-extracts automatically (marker not found in the
+/// new dest). One payload failing is logged and skipped (honest,
+/// non-fatal): the host apex underneath still covers that name and
+/// apexd-bootstrap still runs in-guest.
 fn flatten_apex_payloads(cfg: &Config) {
     if cfg.boot_recovery {
         return; // TWRP: statically linked init, no APEX consumers
     }
+    // 6-Z305t-3: dest per execution mode. At this point use_namespaces
+    // still reflects the PRE-setup_mounts intent (the only downgrade —
+    // a setup_mounts failure — happens after flatten; in that legacy
+    // root-mode-fallback case the staged trees stay at apex.twoyi, as
+    // before this change; documented residual, not a regression).
+    let apex_stage_root = if cfg.use_namespaces {
+        format!("{}/apex.twoyi", cfg.rootfs)
+    } else {
+        format!("{}/apex", cfg.rootfs)
+    };
+    info!(
+        "[KR64][apex] 6-Z305t-3: extraction dest {} (use_namespaces={})",
+        apex_stage_root, cfg.use_namespaces
+    );
     let apex_src_dir = format!("{}/system/apex", cfg.rootfs);
     let entries = match std::fs::read_dir(&apex_src_dir) {
         Ok(e) => e,
@@ -5158,7 +5181,7 @@ fn flatten_apex_payloads(cfg: &Config) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let want = format!("{}:{}", meta.len(), mtime);
-        let dst = format!("{}/apex.twoyi/{}", cfg.rootfs, apex_name);
+        let dst = format!("{}/{}", apex_stage_root, apex_name);
         let marker = format!("{}/.twoyi_extracted", dst);
         if let Ok(c) = std::fs::read_to_string(&marker) {
             if c.trim() == want {
@@ -6008,6 +6031,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // above (statically linked init, no APEX consumers). The
     // linkerconfig perms pass is unconditional and cheap (no-op on
     // clean trees; recovery has no linkerconfig).
+    //
+    // 6-Z305t-3: flatten is now mode-aware — chroot-only boots extract
+    // straight into {rootfs}/apex/<name>/ (setup_mounts never runs there,
+    // so apex.twoyi staging was invisible and /apex stayed empty).
     // ---------------------------------------------------------------
     flatten_apex_payloads(&cfg);
     normalize_linkerconfig_perms(&cfg.rootfs);
