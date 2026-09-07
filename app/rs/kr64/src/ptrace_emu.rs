@@ -26497,7 +26497,39 @@ pub fn run_ptrace_loop(
                             }
                         }
                     }
-                    let _forced_ret_opt = compute_exit_return_value(syscall_num, &abi);
+                    let mut _forced_ret_opt = compute_exit_return_value(syscall_num, &abi);
+                    // 6-Z305t-5: in SYSTEM mode the chmod/fchmod/fchmodat
+                    // family runs FOR REAL — the 5-T-era blanket fake-success
+                    // silently discards guest init's OWN mode normalization:
+                    // init.rc early-init does `exec -- linkerconfig --target
+                    // /linkerconfig/bootstrap`, then `chmod 644
+                    // /linkerconfig/bootstrap/ld.config.txt`, THEN `copy …
+                    // /linkerconfig/default/ld.config.txt`. init's ReadFile
+                    // refuses group/world-writable inputs (util.cpp:168
+                    // S_IWGRP|S_IWOTH — "Skipping insecure file") and
+                    // linkerconfig's output lands 0666 (first_stage_init runs
+                    // umask(0), service.cpp:495 umask(077) notwithstanding —
+                    // observed in every system ladder), so with the fake the
+                    // chmod NEVER lands → no default linker config → the
+                    // guest linker's /apex namespace is broken (lmkd CANNOT
+                    // LINK libstatssocket.so ×5 → critical ×4 →
+                    // InitFatalReboot, ladder 34113686284). In rootless
+                    // chroot mode every guest file is app-uid-owned, so a
+                    // real same-uid chmod honestly succeeds — strictly
+                    // closer to a real device (where init IS root and the
+                    // chmod always lands). The kernel's honest return (real
+                    // success or real errno) is preserved via the 6-Z60
+                    // fresh-return path below. RECOVERY keeps the blanket
+                    // fake: TWRP's proven 5-T/6-R rc chains depend on it and
+                    // the recovery-regression rule wins.
+                    if _forced_ret_opt.is_some()
+                        && !boot_recovery
+                        && (syscall_num == abi.chmod
+                            || syscall_num == abi.fchmod
+                            || syscall_num == abi.fchmodat)
+                    {
+                        _forced_ret_opt = None;
+                    }
                     // Task 6-Z53/6-Z60: ENOSYS fallback. The DESYNC issue
                     // means the EXIT handler sometimes sees the wrong syscall
                     // number (ENTRY says nr=125, EXIT says nr=191).
