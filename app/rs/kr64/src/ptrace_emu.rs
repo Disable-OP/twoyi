@@ -13409,6 +13409,12 @@ pub fn run_ptrace_loop(
     // 6-Z237: bounded boot-window "intercepted open" extension counter
     // (loops 400-1000, first 80 non-property translated opens).
     let mut boot_window_open_count: u64 = 0;
+    // 6-Z305t-24: service-stdio capture — how many /dev/null write-side
+    // opens have been redirected to the per-pid svclog files. Boot-wide
+    // cap keeps the /dev/twoyi-svclogs tree bounded even in a
+    // crash-loop storm (each service generation redirects once).
+    let mut svclog_redirects: u64 = 0;
+    const SVCLOG_REDIRECT_CAP: u64 = 400;
     let mut pending_mount_enodev: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     // 6-Z168: log cap for the block-storage mount -ENODEV overrides (the
@@ -20100,6 +20106,60 @@ pub fn run_ptrace_loop(
                                     }
                                     None => translate_path_via_sandbox(&sandbox, rootfs, &path),
                                 };
+                                // ── 6-Z305t-24: service-stdio capture — the
+                                // /dev/null WRITE-side redirect ──────────
+                                //
+                                // init spawns every service with stdio
+                                // = /dev/null, so the ONLY evidence a dying
+                                // service ever emits (glog FATALs, the
+                                // hw-ProcessState open failures, ART's
+                                // startup errors) is swallowed. Ladder #80:
+                                // zygote crash-looped exit(1) ×5 and
+                                // hwservicemanager (critical) ×4 →
+                                // InitFatalReboot — all invisible. THIS
+                                // redirect sends each guest child's
+                                // /dev/null WRITE opens (init's SetStdio
+                                // O_RDWR, glog reopen, etc.) to a per-pid
+                                // file in the guest /dev tree; /dev/null
+                                // READ opens keep the REAL node so EOF
+                                // semantics never change. The CI artifact
+                                // tails the directory (svclogs.txt).
+                                if path == "/dev/null"
+                                    && !boot_recovery
+                                    && pid != init_pid
+                                    && svclog_redirects < SVCLOG_REDIRECT_CAP
+                                {
+                                    let open_flags = if syscall_num == abi.open {
+                                        get_syscall_arg(&regs, abi.reg_arg2) as i32
+                                    } else if syscall_num == abi.openat {
+                                        get_syscall_arg(&regs, abi.reg_arg3) as i32
+                                    } else {
+                                        0
+                                    };
+                                    if open_flags & (libc::O_WRONLY | libc::O_RDWR) != 0 {
+                                        let svclog_dir = format!("{}/dev/twoyi-svclogs", rootfs);
+                                        if std::fs::metadata(&svclog_dir).is_ok() {
+                                            let host_log =
+                                                format!("{}/svc-{}.log", svclog_dir, pid);
+                                            // Pre-create (append mode): the
+                                            // guest's open carries no O_CREAT,
+                                            // so the file must exist for the
+                                            // kernel's open to succeed.
+                                            let _ = std::fs::OpenOptions::new()
+                                                .create(true)
+                                                .append(true)
+                                                .open(&host_log);
+                                            translated = host_log;
+                                            svclog_redirects += 1;
+                                            if svclog_redirects <= 12 {
+                                                log(&format!(
+                                                    "6-Z305t-24: open(/dev/null) write-side by pid={} → {} (service stdio capture)",
+                                                    pid, translated
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
                                 // ── 6-Z305i: virtual /proc/sys backing-file
                                 // preparation (see the translate_guest rule).
                                 // Write-intent → dirs + backing file exist.

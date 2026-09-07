@@ -422,6 +422,20 @@ jobs:
           timeout 45 sudo docker exec redroid /system/bin/sh -c \
             "/system/bin/screencap -p /data/local/tmp/final-1.png 2>/dev/null && cat /data/local/tmp/final-1.png" \
             > /tmp/ui-e2e-artifacts/screencap-dockerexec.png 2>&1 || true
+          # ── 6-Z305t-24: guest SERVICE-STDIO capture ────────────────────
+          # Every init-spawned service's stdout/stderr lands in
+          # {rootfs}/dev/twoyi-svclogs/svc-<pid>.log (the tracer redirects
+          # the /dev/null WRITE-side opens; reads keep EOF semantics).
+          # The zygote / hwservicemanager / HAL exit(1) crash-loops have
+          # their only failure evidence on that previously-swallowed
+          # stderr — these files name the failing lines verbatim.
+          timeout 30 sudo docker exec redroid sh -c \
+            "d=/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs; \
+             ls -la \$d 2>/dev/null | head -50; \
+             for f in \$d/svc-*.log; do \
+               [ -f \$f ] && echo \"== \$(basename \$f) (\$(stat -c%s \$f) bytes) ==\" && tail -c 4096 \$f; \
+             done" \
+            > /tmp/ui-e2e-artifacts/svclogs.txt 2>&1 || true
           sleep 5
           timeout 45 sudo docker exec redroid /system/bin/sh -c \
             "/system/bin/screencap -p /data/local/tmp/final-2.png 2>/dev/null && cat /data/local/tmp/final-2.png" \
