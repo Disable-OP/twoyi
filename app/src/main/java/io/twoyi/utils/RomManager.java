@@ -76,8 +76,44 @@ public final class RomManager {
 
         properties.setProperty("ro.sf.lcd_density", String.valueOf(DisplayMetrics.DENSITY_DEVICE_STABLE));
 
-        try (Writer writer = new FileWriter(propFile)) {
-            properties.store(writer, null);
+        // 6-Z305t-6: the old `new FileWriter(propFile)` TRUNCATED a
+        // ROM-shipped /vendor/default.prop. The Android 11 SDK image
+        // ships ro.vndk.version=30, ro.bionic.arch=arm64,
+        // dalvik.vm.isa.arm64.*, ro.logd.size.stats, … in this exact
+        // file; after the truncation guest linkerconfig aborted with
+        // `Check failed: !"undefined var" VENDOR_VNDK_VERSION is not
+        // defined` (it reads ro.vndk.version), the early-init
+        // ld.config.txt copy then propagated an EMPTY default config →
+        // no /apex linker namespaces → lmkd CANNOT LINK
+        // libstatssocket.so ×5 → critical ×4 → InitFatalReboot (ladder
+        // 34113686284 + 34117397991). APPEND the container props to a
+        // shipped file instead (idempotent via the marker); keep the
+        // create-from-scratch path for rootfs that ship none (legacy
+        // 8.1). kr64's proc_emu::write_vendor_default_prop is the
+        // append-aware sibling of this fix.
+        final String marker = "# twoyi container props (RomManager.initRootfs)";
+        StringBuilder sb = new StringBuilder();
+        if (propFile.exists()) {
+            try {
+                String existing = new String(java.nio.file.Files.readAllBytes(propFile.toPath()),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                if (existing.contains(marker)) {
+                    return; // already initialized — nothing to do
+                }
+                sb.append('\n');
+            } catch (IOException ignored) {
+                // Unreadable existing file: fall through and append what
+                // we can (FileWriter in append mode never truncates).
+            }
+        }
+        sb.append(marker).append('\n');
+        for (String name : new String[]{
+                "persist.sys.language", "persist.sys.country",
+                "persist.sys.timezone", "ro.sf.lcd_density"}) {
+            sb.append(name).append('=').append(properties.getProperty(name)).append('\n');
+        }
+        try (Writer writer = new FileWriter(propFile, true /* append — never truncate */)) {
+            writer.write(sb.toString());
         } catch (IOException ignored) {
         }
     }
