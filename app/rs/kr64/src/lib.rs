@@ -10391,6 +10391,19 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 .unwrap(),
             ]
         };
+        // 6-Z305s-j: the FIRST init exec carries the shlib (kr64's own
+        // LD_PRELOAD chain) — on system boots it must ALSO carry the
+        // NO_PROPS gate. Without it the shlib's property hooks own
+        // first-stage init's sets AND its __system_property_area_init hook
+        // flushes the accumulated table INTO the /dev/__properties__ files
+        // — the second-stage init then maps a PRE-POPULATED area and every
+        // ro.* set (ro.boottime.*, ro.cold_boot_done) dies 0xb READ_ONLY
+        // ("Read-only property was already set"; ladder 34074871936: the
+        // full bionic messages captured at 160-byte WRITEV-SAMPLE depth).
+        // System mode: the shlib never owns properties, anywhere.
+        if !cfg.boot_recovery {
+            env_vars.push(CString::new("TWOYI_SHLIB_NO_PROPS=1").unwrap());
+        }
         // LD_DEBUG support: if TWOYI_LD_DEBUG is set in the parent env,
         // propagate it as LD_DEBUG to the guest init. This enables bionic
         // linker debug output (which library is being loaded when the
