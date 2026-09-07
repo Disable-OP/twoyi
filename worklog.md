@@ -26576,3 +26576,13 @@ Local verification: C brace balance; no Rust changes.
 CI: ladder #87 dispatch follows. Expected: dev-__kmsg__ now carries the FULL guest logcat stream (zygote/app_process, hwservicemanager, every HAL) — hwservicemanager's exit(1) line and zygote's exit(1) line become readable verbatim, and the "Pointer tag … truncated" abort class gets its owning processes named.
 
 Honest unverified: no local ARM64 runtime.
+
+## 6-Z305t-30 — the kmsg openat in the logdw redirect was NEVER verified and is now the prime suspect for the invisible liblog stream: guest-absolute path + fd logging
+
+#88 (e3f8e87 → run 34166592291) decode: the dup'd-fd test marker did NOT land — and the whole "connect → /dev/__kmsg__" branch's OPEN RESULT was never logged. The shim's kmsg_path was the HOST-absolute "{g_rootfs}/dev/__kmsg__" — an openat with an already-host path through the tracer's translation — if that open fails silently, the hook falls through to the REAL logd connect (logd IS listening in system boots) and every liblog line vanishes into logd's uncapturable ring — matching ladders #82-#88 exactly (zero liblog records in the klog).
+
+Implementation: kmsg_path is now the GUEST-absolute "/dev/__kmsg__" (the tracer translates it exactly like the fb_hook's own raw opens, which provably work), and the open result is logged (2/process: "kmsg openat FAILED errno=N").
+
+Commits: (this commit) `fix(shlib): 6-Z305t-30 — logdw kmsg redirect uses the guest-absolute path …`.
+
+CI: ladder #89 dispatch follows. Expected: "logdw kmsg fd test" markers APPEND to the klog (the fd good + the fd test firing) → liblog output follows → zygote/hwservicemanager exit(1) reasons become readable. If the fd test still doesn't land with kmsg_fd >= 0 logged, the tracer is eating writes on the dup'd fd (next decode: the write path for non-init fds).
