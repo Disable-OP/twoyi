@@ -26398,3 +26398,22 @@ Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 
 CI: ladder #76 dispatch follows. Expected: flags_health_check DIES (init logs its exit — ANY exit unblocks `exec 11 waiting`) → the queue advances past load_persist_props → nonencrypted → start zygote → **RUNG 5**; logd aborts → dies → init restarts it (5 s backoff) → logdw drains. The kmsg mirror names the underlying abort sites (the NEXT decode targets: whatever made flags_health_check and logd abort in the first place). Risks: (a) if SIGABRT is trapped/handled by the guest's own handlers the park fallback keeps the process alive (wedge unchanged — but now VISIBLE via the kmsg line); (b) a service aborting in a tight restart loop could churn init (the kmsg evidence will show the cadence); (c) recovery corpus must stay green — the park is byte-identical when the env is absent.
 
 Honest unverified: no local ARM64 runtime; the park-loop pc attribution (fb_hook+0xbac = the raw ppoll park) is inferred from the two probes whose maps resolved + the code reading, and the abort REASONS remain unknown until the kmsg mirror lands.
+
+## 6-Z305t-20 — #76 decode: the die env verified but the hook STILL parked → the policy switch moves to a /dev marker file (the channel that provably works); kmsg mirror gains O_APPEND + die-state
+
+#76 (c824cda → run 34151834777) decode:
+- The build had BOTH halves (head_sha verified c824cda; the shlib's park pc moved 0x1128→0x1ef8 = the new C code IS in the run; the envp injection VERIFIED for flags_health_check pid 2747). Yet flags_health_check STILL parked in the fb_hook fatal loop (TRUE probes: nr=73 ppoll at fb_hook+0xef8, 6/6 budget) and no SIGABRT delivery ever reached the tracer → `getenv("TWOYI_ABORT_DIE")` did not resolve to '1' in the guest. The ONE kmsg mirror line in the artifact (abort(), caller_pc=0xb5b832371d6c) is flags_health_check's own — the evidence channel works.
+- ARTIFACT POLLUTION found: the mirror opened /dev/__kmsg__ with plain O_WRONLY → offset-0 write CLOBBERED the klog head (the abort line replaced init's first ~76 bytes).
+
+Implementation:
+1. twrp_fb_hook.c — the die mode now resolves DUAL: PRIMARY = raw openat("/dev/.twoyi-abort-die") + read 1 byte (the same channel that provably works — the shlibs this process loaded live in that exact directory; stack-path per 6-Z176b); SECONDARY = the getenv trigger kept. Resolved once per process (abort_die_resolved()). fatal_evidence_once's kmsg line now carries " die=<0|1>" so the artifact shows WHICH branch ran.
+2. twrp_fb_hook.c — the kmsg mirror opens with O_WRONLY|O_APPEND (0x400 on the generic ABI).
+3. kr64 lib.rs — /dev staging writes the marker {rootfs}/dev/.twoyi-abort-die = "1\n" gated on !cfg.boot_recovery (next to the shlib staging, Step 4.6); recovery boots create NEITHER marker NOR env → the proven park stays byte-identical.
+
+Commits: (this commit) `fix(hook): 6-Z305t-20 — abort-die via /dev marker file …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 783 passed / 0 failed (single rerun; one parallel-run temp-dir flake observed and dismissed per the established precedent).
+
+CI: ladder #77 dispatch follows. Expected: the marker exists in the guest /dev (verify via rootfs listing) → flags_health_check's abort resolves die=1 → SIGABRT delivery → init logs the exec exit → the queue advances past load_persist_props → nonencrypted → start zygote → RUNG 5. The kmsg line's die=1/0 field is the direct verdict: die=0 with the marker present would mean the raw-openat path failed (new decode needed); die=1 + still parked would mean the SIGABRT raise is being swallowed (tracer signal-forwarding decode needed).
+
+Honest unverified: no local ARM64 runtime; WHY getenv failed remains unexplained (the marker path sidesteps it — a further decode only if the marker path also fails).
