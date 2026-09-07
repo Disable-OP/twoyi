@@ -9359,6 +9359,12 @@ fn proc_state_char(pid: libc::pid_t) -> Option<char> {
     rest.split_whitespace().next()?.chars().next()
 }
 
+// 6-Z305t-17: PTRACE_INTERRUPT (0x4203, Linux uapi ptrace.h) — the pinned
+// android libc crate does not export it (the host gnu libc does, which is
+// why local gates passed while the Android CI build failed E0425). Defined
+// locally with the exact libc::ptrace request type.
+const PTRACE_INTERRUPT: libc::c_uint = 0x4203;
+
 /// 6-Z305t-17: the first /proc/<pid>/maps line whose range contains `pc`,
 /// or "?" when the maps are unreadable (post-setuid DAC) or pc is unmapped.
 /// Shared by the 271f /proc-based stall dump and the 6-Z305t-17
@@ -9400,7 +9406,7 @@ fn maps_region_for_pc(pid: libc::pid_t, pc: u64) -> String {
 fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
     // 1. Force the stop. A tracee blocked in-kernel stops promptly; a
     //    RUNNING tracee stops at its next transition. ESRCH → it died.
-    let ir = unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, pid, 0, 0) };
+    let ir = unsafe { libc::ptrace(PTRACE_INTERRUPT, pid, 0, 0) };
     if ir != 0 {
         let e = std::io::Error::last_os_error();
         crate::trace_log_line(&format!(
