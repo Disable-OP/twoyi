@@ -26068,3 +26068,27 @@ CI: ladder #59 dispatch follows.
 Expected (next decode): `6-Z305t-7: manifest name com.android.vndk.v30 != file name com.android.vndk.current` diag; linkerconfig reads /apex/com.android.vndk.v30/etc/llndk.libraries.30.txt → LLNDK_LIBRARIES_VENDOR defined → next variable in the CHECK chain if any (vndkcore/vndksp/vndkprivate lists are siblings in the same apex — should resolve) → linkerconfig completes → NON-EMPTY bootstrap + default ld.config.txt with /apex sections → lmkd resolves libstatssocket.so from /apex/com.android.os.statsd/lib64 → lmkd survives → rung 4 CORE_DAEMONS → zygote (rung 5; ALSO unblocked by art.debug→com.android.art) → system_server (rung 6) stretch. Honest risks: (a) the ld.config.txt CONTENT may reference paths the container lacks (e.g. /vendor/${LIB}/vndk-sp — the rootfs vendor ships libs? vendor/lib64 — the image's vendor tree) — namespace resolution errors are the next honest frontier; (b) ART/dex2oat on flattened apexes (zygote) is first-contact.
 
 Honest unverified: no local ARM64 runtime; the exact linkerconfig variable resolution order is inferred from the binary strings + the CHECK chain progression (VENDOR_VNDK_VERSION then LLNDK_LIBRARIES_VENDOR) — the next run will confirm.
+
+## 6-Z305t-8 — system mode: honest-ENOENT for the runtime-fallback class (the 6-Z196 raw-host escape leaked lmkd's dlopen past the rootfs; backstop faked -13; bionic treats EACCES as search-aborting → exit(1) → critical ×4 → InitFatalReboot)
+
+Discovery (ladder run 34120752351 @a0cb7f0, rung 3 / post-mortem init reboot path):
+
+- 6-Z305t-7 VERIFIED GREEN: `6-Z305t-7: manifest name com.android.vndk.v30 != file name com.android.vndk.current` + `com.android.art != com.android.art.debug` diag lines present; linkerconfig **exited 0** (Check failed = 0; it produced REAL bootstrap + default ld.config.txt); `CANNOT LINK` = 0 anywhere — the linker-namespace frontier is CLEARED. The linkerconfig chain (VENDOR_VNDK_VERSION → LLNDK_LIBRARIES_VENDOR → completion) is fully decoded and closed.
+- New wall: lmkd STILL critical ×4 → InitFatalReboot — but now with NO CANNOT LINK. Decode: lmkd's lazy `dlopen("libstatssocket.so")` first tries /system/lib64 (correct default-namespace search order). The 6-Z196 runtime-host-fallback rule matched /system/lib64/** and — because the rootfs has no /system/lib64/libstatssocket.so (it lives ONLY in the statsd apex) — returned the RAW HOST path; the open leaked past the rootfs and the 6-Z185 backstop faked -13 (EACCES). Bionic's dlopen treats EACCES as a search-aborting failure (unlike ENOENT) → dlopen fails → lmkd exit(1) ~2ms later (SANDBOX BACKSTOP DENIED + Task-6-S exit_group(1) 2ms apart in the trace).
+- The fallback rule is a TWRP-era bootstrap mechanism (ramdisks that ship no /system tree). In SYSTEM mode it now MANUFACTURES failures: the guest boots with its own linker + a real generated ld.config.txt, so a rootfs miss MUST yield ENOENT and let the namespace search continue into /apex/<name>/lib64 — exactly real-device semantics.
+
+Implementation:
+1. vfs::SandboxPolicy gains `system_mode: bool` + `with_system_mode()` builder (default false = exact legacy recovery semantics; all pre-existing tests untouched).
+2. translate_guest: the /apex and /system runtime-fallback RAW returns are gated on `!self.system_mode` — in system mode the rootfs copy ALWAYS wins (missing file → honest kernel ENOENT).
+3. run_ptrace_loop constructs the sandbox with `.with_system_mode(!boot_recovery)` — recovery keeps the fallback (TWRP regression rule).
+4. Regression test z305t8_system_mode_disables_runtime_host_fallback (recovery keeps raw fallback for missing libs; system mode returns rootfs copies for both /system and /apex lib paths; rootfs-present libs keep winning in both modes).
+
+Commits: (this commit) `fix(vfs): 6-Z305t-8 — system mode disables the 6-Z196 raw-host runtime fallback …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 781 passed / 0 failed.
+
+CI: ladder #60 dispatch follows.
+
+Expected (next decode): lmkd's dlopen search: /system/lib64 → honest ENOENT → namespace search hits /apex/com.android.os.statsd/lib64/libstatssocket.so (0755, flattened) → dlopen SUCCEEDS → lmkd stays up past +22s (no critical ×4) → `Connection with lmkd established` (GUEST side) → fleet survives → rung 4 CORE_DAEMONS → zygote spawn (rung 5) → system_server (rung 6) stretch. Honest risks: (a) `Could not create socket 'lmkd': fchmodat /dev/socket/lmkd ENOENT` raced on first start and `createProcessGroup … Permission denied` recurs every start — warnings today, may matter for services whose rc marks them console/critical; (b) zygote/ART first-contact on flattened apexes (dex2oat, boot image, /apex/com.android.art now correctly named); (c) more backstop denials of the same manufactured-EACCES class may surface for OTHER binaries (e.g. libkeymaster41.so denial seen this run — vendor HAL lib path) — same fix class now covers them via the system-mode gate.
+
+Honest unverified: no local ARM64 runtime; the "bionic aborts dlopen search on EACCES" conclusion is inferred from the 2ms denial→exit correlation, not from bionic source-level proof.
