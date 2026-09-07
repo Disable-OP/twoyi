@@ -24271,7 +24271,15 @@ pub fn run_ptrace_loop(
                                                 " iov{}[base={:#x} len={}]=",
                                                 k, bb, ll
                                             ));
-                                            let cl = std::cmp::min(ll as usize, 64);
+                                            // 6-Z305s-i: 64 → 160 — the
+                                            // property-set rejection decode
+                                            // (runs 34072797380/34074016330)
+                                            // needs the FULL bionic "Unable
+                                            // to set property ... error
+                                            // code: 0x??" message (69 bytes)
+                                            // and the 64-byte cap clipped the
+                                            // hex code off every sample.
+                                            let cl = std::cmp::min(ll as usize, 160);
                                             if let Some(bytes) = read_child_bytes(pid, bb, cl) {
                                                 let txt = String::from_utf8_lossy(&bytes);
                                                 // 6-Z305c: arm the death
