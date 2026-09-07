@@ -3332,6 +3332,14 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
                 syscall(SYS_lseek, kmsg_fd, 0, 2 /*SEEK_END*/);
                 syscall(SYS_dup3, kmsg_fd, sockfd, 0);
                 syscall(SYS_close, kmsg_fd);
+                /* 6-Z305t-29b: fd TEST — one marker write THROUGH the dup'd
+                 * fd. Lands in the captured klog ⇒ the fd is good and any
+                 * missing liblog output is liblog-side (its own fd
+                 * bookkeeping / a cached failed writer). Missing ⇒ the
+                 * tracer eats the write on this fd. */
+                static const char fdtest[] =
+                    "<6>[twoyi_loader] logdw kmsg fd test\n";
+                syscall(SYS_write, sockfd, fdtest, (long)(sizeof(fdtest) - 1));
                 return 0;
             }
             // kmsg open failed — fall through to the real connect so the
