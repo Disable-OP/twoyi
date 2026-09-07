@@ -3604,9 +3604,10 @@ static volatile int g_abort_die_mode = -1; /* -1 = unresolved */
 
 static int abort_die_resolved(void) {
     if (g_abort_die_mode < 0) {
-        volatile char ppath[23]; /* "/dev/.twoyi-abort-die" + NUL — stack */
+        long marker_err = 0;
+        volatile char ppath[25]; /* "/dev/twoyi-abort-die" + NUL — stack */
         {
-            static const char src[] = "/dev/.twoyi-abort-die";
+            static const char src[] = "/dev/twoyi-abort-die";
             unsigned k;
             for (k = 0; k < sizeof(src); k++) ppath[k] = src[k];
         }
@@ -3618,8 +3619,40 @@ static int abort_die_resolved(void) {
             raw_syscall1(SYS_close, dfd);
             g_abort_die_mode = (b[0] == '1') ? 1 : 0;
         } else {
+            marker_err = (unsigned long)-dfd;
             const char *d = getenv("TWOYI_ABORT_DIE");
             g_abort_die_mode = (d != NULL && d[0] == '1') ? 1 : 0;
+        }
+        /* 6-Z305t-21: CONSTRUCTOR-TIME visibility — one kmsg line per
+         * process naming the resolved mode and the marker-open errno.
+         * #77: with the resolution hidden inside the fatal path and the
+         * fatal evidence failing to appear, the artifact could not
+         * distinguish "marker missing" from "raise swallowed". */
+        {
+            char line[96];
+            unsigned long p = 0;
+            static const char pre[] = "<6>[twrp_fb_hook] loaded die=";
+            unsigned k;
+            for (k = 0; pre[k]; k++) if (p < sizeof(line) - 24) line[p++] = pre[k];
+            line[p++] = (char)('0' + g_abort_die_mode);
+            static const char mid[] = " marker_errno=";
+            for (k = 0; mid[k]; k++) if (p < sizeof(line) - 24) line[p++] = mid[k];
+            {
+                unsigned long v = (unsigned long)marker_err;
+                char digits[12];
+                int n = 0;
+                if (v == 0) {
+                    digits[n++] = '0';
+                } else {
+                    while (v > 0 && n < 11) {
+                        digits[n++] = (char)('0' + (v % 10));
+                        v /= 10;
+                    }
+                }
+                while (n > 0 && p < sizeof(line) - 2) line[p++] = digits[--n];
+            }
+            line[p++] = '\n';
+            write_kmsg_line(line, p);
         }
     }
     return g_abort_die_mode;
@@ -3636,6 +3669,15 @@ static void fatal_reraise(void) {
                      (long)sizeof(unsigned long));
         long pid = raw_syscall1(SYS_getpid, 0);
         long tid = raw_syscall1(SYS_gettid, 0);
+        {
+            /* 6-Z305t-21: one kmsg line naming the branch actually taken
+             * — with this, "die=1 + die-loop line + no death" pins the
+             * raise-swallowing on the tracer side, while "die=1" alone
+             * with the park-loop pc would mean the raise never ran. */
+            static const char raise[] =
+                "<6>[twrp_fb_hook] die-loop: raising SIGABRT\n";
+            write_kmsg_line(raise, sizeof(raise) - 1);
+        }
         for (;;) {
             /* Tracer 6-Z266 translates the faked pid-1 to the real tgid,
              * so the raise delivers; the default SIGABRT disposition ends
