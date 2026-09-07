@@ -25749,3 +25749,16 @@ Work Log:
 
 Stage Summary:
 - origin/main 7788553. Next run expectation: the property opens resolve inside the real rootfs → ro.cold_boot_done lands → init proceeds to on init/late-init → mount_all → class_start core → fleet with shlib → zygote (rung 5); apex consumers still blocked until 6-Z305t part 2.
+
+---
+Task ID: 6-Z305s-e pt2 (ladder 34072088587 decode + translation gate)
+Agent: Z.ai Code (main dispatcher)
+Task: fix the property-socket connect failure; kill the double-translation class.
+
+Work Log:
+- The canonical under_rootfs fix let bionic's property code reach the area files; ueventd then attempted the REAL set — writev(prop_msg) returned ENOTCONN: the property socket CONNECT failed. The shlib's connect() hook pre-translated /dev/socket/property_service with its canonical TWOYI_ROOTFS form; the tracer's 6-Z305q arm (literal-spelling check) re-prefixed → ENOENT.
+- FIX e456cb7: with TWOYI_SHLIB_NO_PROPS set, should_translate() returns 0 for ALL paths — the tracer owns every translation (one per syscall); the shlib keeps binder/qemu-pipe open fallbacks + seccomp/SIGSYS install. Recovery boots unaffected.
+- Host gcc syntax check passes past the new code (pre-existing statfs64 glibc noise aside); the NDK build in CI is authoritative.
+
+Stage Summary:
+- origin/main e456cb7. Next run expectation: the property socket connect lands → ro.cold_boot_done=1 → init exits early-init → on init/late-init → mount_all → class_start core → fleet with shlib → zygote (rung 5) → apex consumers still CANNOT LINK (6-Z305t part 2 = flatten wiring is the next implementation).
