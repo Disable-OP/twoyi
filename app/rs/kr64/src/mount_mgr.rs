@@ -579,6 +579,41 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
                 e
             ),
         }
+
+        // 6-Z305t-2: stack each flattened apex from boot prep OVER the
+        // host's ambient /apex/<name>. Boot prep extracted the rootfs's
+        // own /system/apex payloads into {rootfs}/apex.twoyi/<name>/
+        // (lib.rs flatten_apex_payloads — apex_fs pure-Rust ext4 read,
+        // no loop device, no mount). The guest must see the GSI's OWN
+        // apex payloads — what apexd would expose on a flattened-APEX
+        // device (ro.apex.updatable=false) — not whatever /apex the
+        // HOST happens to carry: libstatssocket.so exists only in the
+        // rootfs's com.android.os.statsd payload, so /system/bin/lmkd
+        // died CANNOT LINK at spawn (run 34091671773). MS_BIND over an
+        // existing mount/entry shadows it; mounts done here are carried
+        // through the rootfs self-bind + pivot_root below. A failed
+        // overlay is non-fatal: the host apex stays visible underneath.
+        if let Ok(staged) = std::fs::read_dir(format!("{}/apex.twoyi", cfg.rootfs)) {
+            for entry in staged.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let staged_path = format!("{}/apex.twoyi/{}", cfg.rootfs, name);
+                let apex_name_dst = format!("{}/apex/{}", cfg.rootfs, name);
+                let _ = std::fs::create_dir_all(&apex_name_dst);
+                match mount(&staged_path, &apex_name_dst, "", MS_BIND, None) {
+                    Ok(()) => info!(
+                        "[KR64][mount_mgr] 6-Z305t-2: stacked flattened apex {} over {}",
+                        name, apex_name_dst
+                    ),
+                    Err(e) => warning!(
+                        "[KR64][mount_mgr] 6-Z305t-2: flattened apex {} overlay failed: {} — host apex stays visible",
+                        name, e
+                    ),
+                }
+            }
+        }
     }
 
     // Step 5: pivot_root (or chroot fallback).
