@@ -26586,3 +26586,13 @@ Implementation: kmsg_path is now the GUEST-absolute "/dev/__kmsg__" (the tracer 
 Commits: (this commit) `fix(shlib): 6-Z305t-30 — logdw kmsg redirect uses the guest-absolute path …`.
 
 CI: ladder #89 dispatch follows. Expected: "logdw kmsg fd test" markers APPEND to the klog (the fd good + the fd test firing) → liblog output follows → zygote/hwservicemanager exit(1) reasons become readable. If the fd test still doesn't land with kmsg_fd >= 0 logged, the tracer is eating writes on the dup'd fd (next decode: the write path for non-init fds).
+
+## 6-Z305t-32 — logdw visibility instrument consolidation: O_APPEND-with-lseek-fallback + dual write/writev fd test (the #89/#90 contradiction: write() landed, writev() returned 37 yet the bytes were never found)
+
+#89/#90 cross-decode: the guest-absolute /dev/__kmsg__ open WORKS (#89 write() marker found mid-file at the then-END, immediately followed by a REAL liblog binary record — "libc\0Pointer tag…" — the service liblog stream HAS been reaching the file as binary records); #90's writev returned 37 but the marker was absent. The contradiction (write delivers, writev ret=37 delivers nothing) is either the tracer's writev path or multi-writer offset interleaving.
+
+Implementation: the shim's kmsg open uses O_APPEND when accepted (atomic append — immune to interleaving), falls back to O_WRONLY+lseek; the fd test fires BOTH write() and writev() with both returns logged to the svclog ("logdw fd tests: write=N writev=M") and both payloads landing (or not) in the klog.
+
+Commits: (this commit) `fix(shlib): 6-Z305t-32 — O_APPEND-with-lseek-fallback + dual write/writev fd test …`.
+
+CI: ladder #91 dispatch follows. The four-outcome matrix: both land + both rets positive ⇒ the #90 miss was positional (O_APPEND fixes it — liblog visibility achieved); writev ret positive but absent ⇒ the tracer's writev path eats it (next: the writev handler); write fails ⇒ the fd/dup3 broke (new decode).
