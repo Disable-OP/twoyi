@@ -3321,6 +3321,15 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             // log lines still land in the kmsg artifacts.
             int kmsg_fd = (int)syscall(NR_openat, AT_FDCWD, kmsg_path, O_WRONLY, 0);
             if (kmsg_fd >= 0) {
+                /* 6-Z305t-29: position at END before the dup. Ladder #86
+                 * decode: the liblog records WERE reaching the klog file —
+                 * but every service's fresh open() starts at offset 0, so
+                 * all the fleet's logcat output was written ON TOP OF the
+                 * klog head (the artifact head was literally a liblog
+                 * record: "libc\0Pointer tag for … was truncated."), each
+                 * process clobbering the last. lseek(SEEK_END) on the
+                 * dup'd description makes every liblog write APPEND. */
+                syscall(SYS_lseek, kmsg_fd, 0, 2 /*SEEK_END*/);
                 syscall(SYS_dup3, kmsg_fd, sockfd, 0);
                 syscall(SYS_close, kmsg_fd);
                 return 0;
