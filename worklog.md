@@ -26495,3 +26495,18 @@ Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 
 CI: ladder #81 dispatch follows. Expected: svclogs.txt shows zygote's and hwservicemanager's ACTUAL failure lines (app_process/ART/linker errors for zygote; the hwbinder registration failure for hwservicemanager) — the next minimal fixes decode from verbatim guest output instead of blind pc arithmetic. Risks: services that poll stdin (none known in the core fleet); the redirect widens the /dev tree by ~dozens of small files per boot (capped).
 
 Honest unverified: no local ARM64 runtime; the zygote exit(1) cause is unknown until the svclogs land (that is precisely what this fix buys).
+
+## 6-Z305t-25 — #81 decode: the svclogs landed (full service stderr!); the remaining blind spot was logd's in-memory ring swallowing ALL liblog output — the kmsg redirect is now unconditional
+
+#81 (79d9f46 → run 34158013704) decode:
+- The 6-Z305t-24 svclogs WORK: every service's stderr is captured (svclogs.txt 109 KB) — the hw-ProcessState/hook diagnostics, the fatal maps dumps ([anon:abort message] mappings in ~12 crash-looped services), installd's exact failure ("Could not create directories; exiting." — /data/misc/installd missing), qemu-props' goldfish-pipe abort. The zygote logs are EMPTY (app_process logs via liblog, not stderr).
+- THE BLIND SPOT MOVED: with logd RUNNING, the 6-Z305t-12 heuristic connects every liblog client to the REAL logd socket — the output lands in logd's in-memory ring, unreadable from the artifacts (no AndroidRuntime/ART lines in the klog). zygote's exit(1) ×5 is therefore STILL evidence-less.
+- Fix: the logdw connect hook's kmsg redirect becomes UNCONDITIONAL (the real-logd connect is a probe whose result is ignored). ALL guest liblog output now lands in the captured klog, non-blocking, mode-uniform (the recovery path is byte-identical — it always took the fallback). logd keeps running with an empty buffer; a logdr-protocol decode can revisit if the guest itself ever needs logcat.
+
+Commits: (this commit) `fix(shlib): 6-Z305t-25 — logdw kmsg redirect unconditional …`.
+
+Local verification: C brace balance; no Rust changes.
+
+CI: ladder #82 dispatch follows. Expected: dev-__kmsg__ now carries the guest's FULL logcat stream — zygote's exit(1) reason (app_process/ART errors), hwservicemanager's registration failures, the HAL fleet's verbatim errors — the next fixes decode from real log lines.
+
+Honest unverified: no local ARM64 runtime; the logd-buffer-invisibility attribution is inferred from the zero-AndroidRuntime-lines klog vs the live logd fleet.
