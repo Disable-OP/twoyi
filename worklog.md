@@ -26026,3 +26026,22 @@ CI: ladder #57 dispatch follows on this commit.
 Expected (next decode): vendor/default.prop keeps ro.vndk.version=30 → linkerconfig runs to completion → bootstrap AND default ld.config.txt are NON-EMPTY with /apex/<name> sections → lmkd resolves libstatssocket.so from the flattened com.android.os.statsd → lmkd stays up past +22s → class_start main completes → zygote spawn (rung 5) → system_server (rung 6) as stretch. Honest risks: (a) linkerconfig may next demand other vendor artifacts (vintf /vendor/manifest, vndk sp libs) — decode whatever it CHECKs next; (b) zygote/system_server will exercise the binder fleet + ART on the flattened apexes for the first time — ART boot image / dex2oat behavior on extracted apex trees is unproven; (c) the earlier secondary wrinkle `Could not create socket 'lmkd': fchmodat /dev/socket/lmkd ENOENT` may return with real chmod now active for socket fchmodat (fchmodat is in the un-faked set) — watch logd/netd/zygote sockets.
 
 Honest unverified: no local ARM64 runtime; the linkerconfig output CONTENT for this image is trusted (real linkerconfig binary, real props).
+
+## 6-Z305t-6 pt2 — the SECOND vendor/default.prop overwriter: RomManager.initRootfs (Java, import-time)
+
+Discovery (ladder run 34117397991 @d424757, rung 3 / post-mortem init reboot path):
+
+- The pt1 (kr64 append) fix DID run — but the boot still showed the SAME signature: linkerconfig CHECK-fail `VENDOR_VNDK_VERSION is not defined` → empty ld.config.txt → lmkd CANNOT LINK libstatssocket ×5 → critical ×4 → InitFatalReboot. property-values dump (#57): ro.zygote SET, ro.vndk.version ABSENT, ro.bionic.arch ABSENT; goldfish-rejection still logged → the file init read was STILL the old stub+block, NOT the ROM's props.
+- Root cause: a SECOND, EARLIER overwriter — `RomManager.initRootfs(Context)` (app/src/main/java/io/twoyi/utils/RomManager.java:62) does `new FileWriter(propFile)` (TRUNCATE) and stores only persist.sys.language/country/timezone + ro.sf.lcd_density. It runs at IMPORT time (Render2Activity first-boot import @826 + SettingsActivity re-import @661), BEFORE kr64 ever starts. Sequence on the runner: tar import (byte-verbatim, extractTarJava extracts ./vendor/default.prop fine) → initRootfs TRUNCATES it to 4 props → kr64 boot prep appends apex line + its block → init reads a file with NO ro.vndk.version. The pt1 fix was correct but downstream of the destruction.
+- (Corroboration: vendored property_service.cpp PropertyLoadBootDefaults reads /vendor/default.prop unconditionally — the load list was never the problem; the FILE was already destroyed at import.)
+
+Implementation (RomManager.java initRootfs):
+- APPEND-only semantics, mirroring the Rust fix: if the file exists and already carries the marker "# twoyi container props (RomManager.initRootfs)" → no-op (both call sites run right after a fresh extraction, so this only guards double-init); if it exists without the marker → append "\n" + marker + the 4 container props (FileWriter append mode — never truncates); if absent → create with the block (legacy 8.1 path). No ROM special-casing; the ROM's own props simply stop being deleted.
+
+Commits: (this commit) `fix(app): 6-Z305t-6 pt2 — RomManager.initRootfs APPENDS …`.
+
+Verification: no Android SDK/gradle locally — the change is confined to one method, uses only already-imported classes (Files/StandardCharsets/Writer/FileWriter/IOException), and mirrors the unit-tested Rust logic. CI build gate + ladder #58 validate.
+
+CI: ladder #58 dispatch follows.
+
+Expected (next decode): vendor/default.prop retains the ROM's ro.vndk.version=30 (import no longer truncates; kr64 appends around it) → linkerconfig runs to completion → NON-EMPTY bootstrap + default ld.config.txt with /apex sections → lmkd resolves libstatssocket.so → lmkd survives → fleet up → rung 4 CORE_DAEMONS → zygote (rung 5) → system_server (rung 6) stretch. Honest risks: (a) linkerconfig may next demand further vendor artifacts (VINTF manifest, VNDK APEX libs) — decode whatever it CHECKs next; (b) zygote/ART on flattened apexes (dex2oat/boot-image paths) is first-contact territory; (c) socket fchmodat/fchownat behavior under the real-chmod gate for /dev/socket/* — watch logd/netd/zygote socket creation.
