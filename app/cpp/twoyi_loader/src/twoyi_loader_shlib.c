@@ -3255,6 +3255,43 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         struct sockaddr_un *un = (struct sockaddr_un *)addr;
         if (un->sun_path[0] == '/' &&
             strncmp(un->sun_path, "/dev/socket/logdw", 17) == 0) {
+            // 6-Z305t-12: try the REAL (rootfs-translated) logd socket
+            // FIRST. In SYSTEM boots logd IS running and listening on
+            // {rootfs}/dev/socket/logdw — an honest client connection
+            // returns 0 immediately and liblog logs to the real logd
+            // buffer (real-device semantics). In RECOVERY boots there is
+            // no listener: the connect fails INSTANTLY with ECONNREFUSED
+            // (or ENOENT for a missing socket inode) and we fall through
+            // to the proven /dev/__kmsg__ redirect below (6-Z272p: liblog
+            // writes that socket SYNCHRONOUSLY — once its buffer fills
+            // every write blocks in liblog's poll-retry loop and the
+            // process freezes; the redirect gives the fd unbounded
+            // non-blocking writes). The unconditional redirect of the old
+            // code wedged SYSTEM boots: every liblog client froze (e.g.
+            // flags_health_check blocked in ppoll for 6+s → init's
+            // synchronous `exec` in its load_persist_props_action waited
+            // forever → the whole init action queue stalled below
+            // load_persist_props → zygote-start/boot/nonencrypted never
+            // ran → zygote unreachable — ladder 34132027245/#65).
+            char logdw_path[600];
+            snprintf(logdw_path, sizeof(logdw_path), "%s/dev/socket/logdw", g_rootfs);
+            struct sockaddr_un real_logdw;
+            memset(&real_logdw, 0, sizeof(real_logdw));
+            real_logdw.sun_family = AF_UNIX;
+            strncpy(real_logdw.sun_path, logdw_path, sizeof(real_logdw.sun_path) - 1);
+            int rc = (int)syscall(SYS_connect, sockfd, &real_logdw, sizeof(real_logdw));
+            if (rc == 0) {
+                static int logdw_real_diag = 2;
+                if (logdw_real_diag > 0) {
+                    logdw_real_diag--;
+                    char msg[160];
+                    snprintf(msg, sizeof(msg),
+                        "[twoyi_loader] connect(/dev/socket/logdw) -> REAL logd (system mode: guest logd is listening)\n");
+                    write_str(2, msg);
+                }
+                return 0;
+            }
+            // No listener (recovery) — fall through to the kmsg redirect.
             char kmsg_path[600];
             snprintf(kmsg_path, sizeof(kmsg_path), "%s/dev/__kmsg__", g_rootfs);
             static int logdw_redirect_diag = 2;
@@ -3263,7 +3300,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
                 char msg[160];
                 snprintf(msg, sizeof(msg),
                     "[twoyi_loader] connect(/dev/socket/logdw) -> /dev/__kmsg__ "
-                    "(no logd in recovery images — liblog would block)\n");
+                    "(no logd reader — liblog would block)\n");
                 write_str(2, msg);
             }
             // 6-Z279 FIX: the caller KEEPS writing to ITS OWN sockfd after
