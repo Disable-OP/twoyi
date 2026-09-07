@@ -9348,6 +9348,17 @@ fn proc_ppid(pid: libc::pid_t) -> Option<libc::pid_t> {
     tokens.next()?.parse::<libc::pid_t>().ok()
 }
 
+/// 6-Z305t-16: the /proc/<pid>/stat STATE char of a pid, or None when the
+/// entry is gone/unreadable. 't' = ptrace tracing stop, 'T' = job-control
+/// stop, 'Z' = zombie. The pending-resume invariant checker uses it to
+/// distinguish "stopped, waiting for OUR resume" ('t'/'T') from "exited —
+/// owes nothing" ('Z'/gone).
+fn proc_state_char(pid: libc::pid_t) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let rest = stat.rfind(')').map(|p| stat.get(p + 2..).unwrap_or(""))?;
+    rest.split_whitespace().next()?.chars().next()
+}
+
 /// 6-Z271f: forensic dump for one blocked-in-syscall tracee.
 ///
 /// /proc/<pid>/syscall exposes the REAL syscall nr, its 6 argument
@@ -12302,13 +12313,35 @@ pub fn run_ptrace_loop(
     // resumed → logd's logdw reader never drains → every liblog client
     // wedges in its retry-poll → init's synchronous exec inside
     // load_persist_props_action blocks forever → the action queue stalls
-    // → zygote unreachable). For every NEW tid, log the first 3 stops
+    // → zygote unreachable). For every NEW tid, log the first 8 stops
     // (raw status + WSTOPSIG + ptrace event + the tracked-set size) and
     // the resumes issued for it, so the exact state-machine miss (which
     // stop class was consumed, which resume went where) is visible in
-    // the next ladder artifact.
+    // the next ladder artifact. (6-Z305t-16: cap raised 3 → 8 — the #69
+    // decode showed the freeze hits the 4th+ stop of specific threads,
+    // which the old cap hid entirely.)
     let mut thread_stop_diag: std::collections::HashMap<libc::pid_t, u32> =
         std::collections::HashMap::new();
+    // 6-Z305t-16: per-tid ENTRY-consumption forensics — every consumed
+    // syscall-ENTRY logs one line (per-tid budget 24) so each ENTRY can
+    // be correlated with the 6-Z305t-14 resume-side line or its ABSENCE
+    // (the freeze signature: ENTRY consumed, no resume, tid parked in a
+    // tracing stop forever).
+    let mut thread_entry_diag: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    // 6-Z305t-16: per-tid pending-resume invariant map — inserted at
+    // EVERY stop consumption (pid → (iter, raw status)), removed when
+    // the loop-top actually serves that tid (a successful PTRACE_SYSCALL
+    // or a legitimate skip). An entry persisting >2 iterations for a tid
+    // the loop is NOT serving while /proc says it sits in a tracing stop
+    // ('t') is a STOP-CONSUMED-WITHOUT-RESUME violation — the per-thread
+    // resume loss that froze the guest at the rung-4→5 gate (ladder #69).
+    let mut pending_resume: std::collections::HashMap<libc::pid_t, (u64, u32)> =
+        std::collections::HashMap::new();
+    // 6-Z305t-16: monotonic iteration clock for the invariant (loop_count
+    // only advances on syscall stops — event-stop storms would undercount
+    // ages and mask violations).
+    let mut iter_count: u64 = 0;
     // 6-Z266: real-tgid cache for the kill-family fake-pid translation.
     // Filled lazily per tracee (one /proc/<pid>/status read per pid per
     // boot); cleared never — tracee tgids are immutable for the life of
@@ -13632,6 +13665,57 @@ pub fn run_ptrace_loop(
         // in its SIGSTOP forever, and init would never receive the
         // child-stop event that breaks it out of its own waitpid.
         //
+        // ── 6-Z305t-16: per-tid pending-resume invariant checker ──────
+        //
+        // Runs EVERY iteration before the loop-top resume. In healthy
+        // operation at most ONE tid is ever in the consumed-not-resumed
+        // state: current_pid (between its dispatch and THIS resume), so
+        // any other entry older than 2 iterations whose tid sits in a
+        // TRACING STOP ('t'/'T') is a stop-consumed-without-resume
+        // violation — the per-thread resume loss class (#69: logd tid
+        // 2711 consumed at ENTRY nr=63 uname, never resumed → logd's
+        // logdw reader never drains → rung-4 ceiling).
+        iter_count = iter_count.wrapping_add(1);
+        {
+            let mut violation_pids: Vec<libc::pid_t> = Vec::new();
+            pending_resume.retain(|t, v| {
+                let t = *t;
+                let (loop0, _st0) = *v;
+                if t == current_pid {
+                    return true; // served (or legitimately skipped) below
+                }
+                if !tracked_pids.contains(&t) {
+                    return false; // reaped/dropped — owes nothing
+                }
+                let age = iter_count.saturating_sub(loop0);
+                if age > 4096 {
+                    return false; // ancient-entry hygiene
+                }
+                if age > 2 && matches!(proc_state_char(t), Some('t') | Some('T')) {
+                    violation_pids.push(t);
+                }
+                true
+            });
+            for t in violation_pids {
+                static PR_VIOLATION_LOGGED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = PR_VIOLATION_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 32 {
+                    if let Some(&(loop0, st0)) = pending_resume.get(&t) {
+                        log(&format!(
+                            "6-Z305t-16 PENDING-RESUME VIOLATION: tid {} consumed stop status=0x{:08x} at iter {} but {} iterations later the loop-top serves pid {} while tid {} still sits in a tracing stop — its resume was NEVER issued (the #69 freeze signature: stop-consumed-without-resume)",
+                            t,
+                            st0,
+                            loop0,
+                            iter_count.saturating_sub(loop0),
+                            current_pid,
+                            t
+                        ));
+                    }
+                }
+            }
+        }
+        let skip_was_set = skip_next_resume;
         // 6-Z122: `skip_next_resume` (set by the ESRCH branch when
         // current_pid is a RUNNING — not ptrace-stopped — tracee)
         // skips this resume entirely: PTRACE_SYSCALL on a running
@@ -13692,12 +13776,24 @@ pub fn run_ptrace_loop(
                 )
             }
         };
+        // 6-Z305t-16: close the pending-resume entry for the tid this
+        // loop-top served — a skip (the fork arm already resumed it) and
+        // a SUCCESSFUL PTRACE_SYSCALL both close it. A FAILED resume
+        // (r == -1, ESRCH) leaves the entry open: the ESRCH branch's
+        // reap/drop prunes dead tids via the checker's tracked-set probe,
+        // and an AliveStopped survivor keeps its entry so the checker can
+        // still flag it if its resume never arrives.
+        if skip_was_set || r == 0 {
+            pending_resume.remove(&current_pid);
+        }
         // 6-Z305t-14: resume-side correlation for NEW tids — pairs with
         // the stop-side forensics above. If a tid's stop was consumed but
         // THIS resume never fires (or fires with ESRCH), the state-machine
         // miss is pinned to the exact stop class.
         if let Some(c) = thread_stop_diag.get(&current_pid) {
-            if *c < 3 {
+            // 6-Z305t-16: cap raised 3 → 8 (the #69 decode showed the
+            // freeze hits the 4th+ stop of specific threads).
+            if *c < 8 {
                 log(&format!(
                     "6-Z305t-14: tid {} resume ret={} (stop #{} seen, skip_was={})",
                     current_pid, r, c, resume_signal,
@@ -13919,7 +14015,22 @@ pub fn run_ptrace_loop(
                                         esrch_pid, live_pid
                                     ));
                                     current_pid = live_pid;
-                                    skip_next_resume = true;
+                                    // 6-Z305t-16 FIX (skip-steal elimination):
+                                    // the skip here was UNCONDITIONAL, but
+                                    // live_pid is usually a DIFFERENT child
+                                    // than the disposed esrch_pid — a
+                                    // ptrace-STOPPED live child is owed its
+                                    // loop-top resume, and the unconditional
+                                    // skip stole it (stop-consumed-without-
+                                    // resume, the #69 freeze class). Skip
+                                    // ONLY when the switch target IS the
+                                    // disposed pid itself (the RUNNING-tracee
+                                    // case: PTRACE_SYSCALL on it would
+                                    // ping-pong ESRCH). Every other live
+                                    // child gets its normal loop-top resume.
+                                    if live_pid == esrch_pid {
+                                        skip_next_resume = true;
+                                    }
                                     continue;
                                 }
                                 None => {
@@ -14159,6 +14270,10 @@ pub fn run_ptrace_loop(
             }
         }
         current_pid = waited;
+        // 6-Z305t-16: mark the stop we just consumed as pending-resume
+        // for this tid — closed at the loop-top that serves it (see the
+        // invariant checker there).
+        pending_resume.insert(waited, (iter_count, status as u32));
         // 6-Z271d: record liveness for the stall detector.
         last_stop_at.insert(waited, std::time::Instant::now());
         // Shadow the function-parameter `pid` (init's PID) with
@@ -14588,7 +14703,9 @@ pub fn run_ptrace_loop(
             // misroutes the resume.
             {
                 let c = thread_stop_diag.entry(pid).or_insert(0);
-                if *c < 3 {
+                // 6-Z305t-16: cap raised 3 → 8 (the #69 decode showed the
+                // freeze hits the 4th+ stop of specific threads).
+                if *c < 8 {
                     *c += 1;
                     log(&format!(
                         "6-Z305t-14: tid {} stop #{} status=0x{:08x} WSTOPSIG={} event={} ({} tracked, in_syscall={} for this tid) — about to classify",
@@ -14887,7 +15004,24 @@ pub fn run_ptrace_loop(
                         // resume the parent → ESRCH → 6-Z89 reap loop → drained
                         // the parent's mount() ENTRY syscall-stop (status 0x857f)
                         // → 6-Z210 classification never fired.
-                        skip_next_resume = true;
+                        //
+                        // 6-Z305t-16 FIX (skip-steal elimination): the skip is
+                        // now CONDITIONAL on the explicit parent resume having
+                        // SUCCEEDED (resume_r == 0). In this arm pid ==
+                        // current_pid (the event's tracee IS the loop's current
+                        // child), so resume+skip is the exact 6-Z211h+i
+                        // contract. But when the parent resume FAILS (ESRCH —
+                        // the parent already exited, the daemonize race), an
+                        // unconditional skip would swallow the loop-top resume
+                        // owed to whatever tid current_pid names at that point
+                        // — the per-thread resume-loss class that froze logd's
+                        // threads at the rung-4→5 gate (ladder #69). Leave the
+                        // skip unset on failure: the loop-top attempts the
+                        // normal resume and a dead parent ESRCHs into the
+                        // 6-Z89 reap/switch flow, as intended.
+                        if resume_r == 0 {
+                            skip_next_resume = true;
+                        }
                         // 6-Z268: capped at 8 — this fires per fork/clone
                         // EVENT and formatted the whole tracked_pids Vec
                         // each time; thread storms made it a log-flood
@@ -15924,6 +16058,23 @@ pub fn run_ptrace_loop(
                 if is_entry {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
+
+                    // 6-Z305t-16: per-tid ENTRY-consumption forensics —
+                    // pairs each consumed ENTRY with its loop-top resume
+                    // (the 6-Z305t-14 resume-side line). A consumed ENTRY
+                    // with NO subsequent resume line for this tid is the
+                    // #69 freeze signature; the pending-resume invariant
+                    // checker turns that absence into a loud VIOLATION.
+                    {
+                        let c = thread_entry_diag.entry(pid).or_insert(0);
+                        if *c < 24 {
+                            *c += 1;
+                            log(&format!(
+                                "6-Z305t-16: tid {} ENTRY #{} nr={} consumed at iter {} — awaiting its loop-top resume",
+                                pid, *c, syscall_num, iter_count
+                            ));
+                        }
+                    }
 
                     // ── 6-Z199: ENTRY-side arg1 (fd) stash for
                     // EXIT-side consumers ──
