@@ -25859,3 +25859,16 @@ Remaining (next decodes):
 - Confirm the boot-twice trigger from the ladder log: count "guest init property-format probe" lines (two sequences = in-job re-boot) and confirm the clean-slate line fires per boot.
 - End-state candidate: probe-false system boots still get Vfs::new_android (Dynamic properties_serial node + 6-Z61 O_EXCL strip); the 6-Z272m walleye evidence (186× 0x24) suggests a new_recovery_new_format()-style VFS (NO property entries, guest-owned files) may be the cleaner terminal design for real AOSP init.
 ---
+## 6-Z305s-l-verify — rung 3 (PROPERTY_SERVICE): clean-slate staging VERIFIED live, mass 0xb class extinct, but 4 residual ro.* wire-set 0xb denials (ro.cold_boot_done!) park init at the early-init coldboot wait — fleet never spawns
+
+Discovery:
+- Ladder run 34080741665 (head 47eb99c) = workflow SUCCESS but result.json classification: rung 3 / PROPERTY_SERVICE, stall (klog delta 0B at 115s wall, budget 90s; last progress 22s). Workflow green ≠ boot green — the classifier's honest stall path fired.
+
+Evidence (kr64-app-stderr.log 3.68MB, artifact android-boot-ladder-logs):
+- 6-Z305s-l signatures ALL present in-job, single boot (probe count = 1, no re-boot): "[KR64] PARENT: clean property area (fresh-tmpfs /dev semantics — 6-Z196/6-Z305s-l) … NO files pre-created" at +48ms; "property files pre-created" absent; "guest init property-format probe: NEW (Android 8+ subdirectory)" at +47ms.
+- Mass client-side 0xb denial class (prior rounds, hundreds from +315ms) is EXTINCT: only 4 "Unable to set property …: error code: 0xb" wire denials remain — ro.gsid.image_running="0" (+348ms, first), ro.boottime.ueventd, ro.boottime.apexd-bootstrap, ro.cold_boot_done="true" (+786ms from ueventd). "Read-only property was already set" total = 2, zero of them on ro.boottime/ro.cold_boot_done.
+- ro.cold_boot_done did NOT land (property-values.txt: no ro.cold_boot_done entry; only the u:object_r:cold_boot_done_prop:s0 context string); "wait_for_coldboot_done" never appears → coldboot wait never cleared.
+- Milestone ceiling: rung 3. Spawns seen = ueventd, linkerconfig bootstrap exec, boringssl_self_test64(_vendor), apexd-bootstrap (exit 0 in 108ms — 6-Z305o fix still green); NO logd/servicemanager/vold/zygote/system_server/surfaceflinger. Init queue last action = early-init from /vendor/etc/init/boringssl_self_test.rc, then park. Log tail = pid 2663 tight ppoll/writev loop (property-service side alive and answering, NOT crashed) — a parked queue, not a dead guest.
+
+Next (the one blocker, Stage A decode):
+- The fresh area makes the 6-Z305s-l root-cause (stale boot-1 area) NECESSARY but NOT SUFFICIENT: something still makes guest init's PropertySet reply 0xb for ro.* names on a brand-new area (ro.cold_boot_done never landed, yet the set is denied read-only; ro.boottime.* re-sets also denied). Decode the exact denial site for ro.cold_boot_done on the fresh area — capture the prop_info/area state at denial time (does the dynamic properties_serial node pre-populate ro.* entries? is the same-boot ro.* re-set path misclassified?) — then fix generically. Clearing this is the rung-4 gate: ro.cold_boot_done lands → coldboot wait clears → class_start core → fleet → zygote.
