@@ -25792,3 +25792,17 @@ Work Log:
 Stage Summary:
 - origin/main 853c4e9 (+ this commit). NEXT (6-Z305s-h, smallest fix first): gate the 6-Z111 MAP_SHARED rewrite + area-write broadcaster OFF in system mode (the SAME NO_PROPS-style gate the tracer already injects), letting real MAP_SHARED area semantics serve every process; expect ro.cold_boot_done to land → wait_for_coldboot_done clears → on init/late-init → mount_all → class_start core → fleet → zygote (rung 5). Then 6-Z305t part 2 (apex flattening wiring) for the APEX-lib consumers.
 - Session-2 landed commits: 7300b5f (init-skip) → b7a1cc6 (NO_PROPS gate) → 7788553 (canonical rootfs) → e456cb7 (translation gate) — all guards green, all pushed.
+
+---
+Task ID: 6-Z305s-h (ladder 34074016330 decode — area fix verified, wire-check wall isolated)
+Agent: Z.ai Code (main dispatcher)
+Task: verify the MAP_SHARED area fix; isolate the remaining rejection.
+
+Work Log:
+- 6-Z110/6-Z111 activity this run: ZERO (the boot_recovery gating works). init: "Created socket '/dev/socket/property_service', mode 666" — real listener up. init's OWN sets SUCCEED (klog: "Setting product property ro.product.device...", "Setting property 'ro.build.fingerprint'..." — no already-set collisions) — the MAP_SHARED fix fixed init's area.
+- REMAINING WALL (now precisely isolated): SOCKET-path sets still rejected — bionic "Unable to set property ro.cold_boot_done ... error code: 0x?? (truncated)" after a successful 33-byte prop_msg send. init's own direct sets pass; only wire sets fail → the rejection is in init's socket-path check (CheckPermissions/CheckMacPermissions), NOT the area.
+- Prime suspect: init's libselinux selinux_check_access(source_context, property_context, "set") → security_compute_av → writes a query to /sys/fs/selinux/access (the STATIC fake regular file from 6-Z305m) and reads back a decision — a static empty file cannot answer a dynamic query → invalid decision → PROP_ERROR_PERMISSION (0x12?).
+- NEXT (6-Z305s-i): 1. extract the exact hex code (the 69-byte message tail); 2. make the fake selinuxfs access/check nodes answer honestly-dynamic (query→allow decision), or serve a permissive default decision file that libselinux parses as allow; 3. guards + ladder. After the wire works: ro.cold_boot_done lands → wait_for_coldboot_done clears → class_start core → fleet → zygote (rung 5); then 6-Z305t part 2 (apex flattening wiring — the ext4 reader is landed).
+
+Stage Summary:
+- origin/main ced49ce (+ this commit). Session-3 commits: 6-Z305s-h (MAP_SHARED area fix — verified live: init's own sets green, tracer property machinery fully inert) + the root-cause decode worklogs. The boot is one permission-check away from the fleet.
