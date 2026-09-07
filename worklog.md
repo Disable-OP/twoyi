@@ -25708,3 +25708,18 @@ Work Log:
 Stage Summary:
 - Commit 76c1f91 (local; push pending network). The 6-Z305t frontier is now: (2) flatten wiring in lib.rs staging (zip payload → temp file → Ext4Image::extract_tree → {rootfs}/apex/<manifest-name>/ with mode hygiene), (3) CI verify of the 6-Z305s-b hotfix, (4) ladder re-run expecting the binder fleet alive + apex consumers unblocked.
 - Known remaining risks: x86 KVM-era ui-e2e-aosp corpus unverified against the shlib exec-hook list change; apexd in flattened mode may still expect /system/apex/<name>/ dirs (it exits 0 without them — verified in-run at 62ms); SELinux relabel of flattened apex dirs (lsetxattr EPERM on the runner) is harmless under the fake-selinux device model.
+
+---
+Task ID: 6-Z305s-c (ladder 34069416074 decode + init-skip fix)
+Agent: Z.ai Code (main dispatcher)
+Task: decode the hotfix re-run; fix the new wall.
+
+Work Log:
+- CI all green on 78e518d (kr64 lint+test, TWRP-angler guard, ladder) — the shlib exec-hook list change is guard-safe.
+- Ladder decode: RUNG 3 again but a DIFFERENT death — the CANNOT LINK class is GONE (zero linker fatals in the whole run; the "+70ms 6-Z305s injected (VERIFIED)" arm fired; shlib PLT hooks installed). New wall named verbatim: "<2>init: Unable to load SELinux policy" → InitFatalReboot signal 6 at +151ms, in the selinux_setup stage (before second_stage).
+- ROOT CAUSE: my injection put the shlib into init's selinux_setup re-exec; the shlib's TWRP-oriented selinuxfs virtualization ("selinuxfs virtual files created", statfs SELINUX_MAGIC fakes, fopen virtual serving for secilc) breaks AOSP init's in-process CIL policy load → FATAL. The proven rung-4 run (34058989419) reached service spawn with a SHLIB-LESS init — init does not need it because the tracer injects every service exec independently.
+- FIX 7300b5f: z305s_skip_exec_path("/init" | */init) gates the injection arm; init keeps its proven configuration; services still get LD_PRELOAD + LD_LIBRARY_PATH=/dev per exec. +1 test (774 green).
+
+Stage Summary:
+- origin/main 7300b5f. Expected next run: init (shlib-less) passes selinux as in the rung-4 run; service execs carry the shlib → binder opens hit the wire protocol → the 105s fleet wall should be gone; apex consumers (zygote/lmkd/media) still CANNOT LINK until 6-Z305t part 2 (flatten wiring).
+- NEXT: decode re-run; wire apex flattening into the boot staging (zip → temp img → Ext4Image::extract_tree → {rootfs}/apex/<manifest-name>); guards + ladder.
