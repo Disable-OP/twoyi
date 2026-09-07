@@ -19095,16 +19095,63 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         } else if block_storage_mount {
-                            pending_mount_enodev.insert(pid);
-                            mount_enodev_logged = mount_enodev_logged.saturating_add(1);
-                            if mount_enodev_logged <= 30 {
-                                log(&format!(
-                                    "6-Z168: block-storage mount {}->{} fstype={} classified at ENTRY — EXIT will return -ENODEV (honest: no real block devices; the fake 0 caused TWRP's 10,478x Mount/Is_Mounted loop in run 33004885224) [{} /30]",
-                                    "<src>",
-                                    tgt.as_deref().unwrap_or("?"),
-                                    fs.as_deref().unwrap_or("(null)"),
-                                    mount_enodev_logged
-                                ));
+                            // 6-Z305t-10: SYSTEM mode — a block mount whose
+                            // target lives inside the merged rootfs is
+                            // semantically a NO-OP (the merged tree IS the
+                            // mounted view; the mountpoint just has to
+                            // exist). fs_mgr_mount_all's return code drives
+                            // init's crypto trigger chain: with honest
+                            // -ENODEV for every entry, mount_all fails
+                            // ("queue_fs_event() failed: Invalid code: -1")
+                            // and the `nonencrypted` trigger is NEVER
+                            // queued → `on nonencrypted` (class_start main)
+                            // never runs → zygote never starts — THE rung-4
+                            // ceiling (ladder 34124801206/#61: full daemon
+                            // fleet alive, lmkd linked and up, vold up, but
+                            // no zygote). With the no-op success,
+                            // mount_all completes → ro.crypto.state set +
+                            // nonencrypted queued → zygote starts. RECOVERY
+                            // keeps the honest -ENODEV (TWRP's
+                            // Mount/Is_Mounted loop guard, 6-Z91/6-Z168).
+                            let mut sys_mount_noop = false;
+                            if !boot_recovery {
+                                if let Some(t) = tgt.as_deref() {
+                                    if t.starts_with('/') {
+                                        let real = format!("{}{}", rootfs, t);
+                                        match std::fs::create_dir_all(&real) {
+                                            Ok(()) => {
+                                                sys_mount_noop = true;
+                                                mount_enodev_logged =
+                                                    mount_enodev_logged.saturating_add(1);
+                                                if mount_enodev_logged <= 30 {
+                                                    log(&format!(
+                                                        "6-Z305t-10: block-storage mount ->{} fstype={:?} classified at ENTRY — EXIT will return 0 (system mode: merged-rootfs no-op, mountpoint materialized) [{} /30]",
+                                                        t,
+                                                        fs.as_deref().unwrap_or("(null)"),
+                                                        mount_enodev_logged
+                                                    ));
+                                                }
+                                            }
+                                            Err(e) => log(&format!(
+                                                "6-Z305t-10: mountpoint materialize FAILED for {}{}: {} — keeping honest -ENODEV",
+                                                rootfs, t, e
+                                            )),
+                                        }
+                                    }
+                                }
+                            }
+                            if !sys_mount_noop {
+                                pending_mount_enodev.insert(pid);
+                                mount_enodev_logged = mount_enodev_logged.saturating_add(1);
+                                if mount_enodev_logged <= 30 {
+                                    log(&format!(
+                                        "6-Z168: block-storage mount {}->{} fstype={} classified at ENTRY — EXIT will return -ENODEV (honest: no real block devices; the fake 0 caused TWRP's 10,478x Mount/Is_Mounted loop in run 33004885224) [{} /30]",
+                                        "<src>",
+                                        tgt.as_deref().unwrap_or("?"),
+                                        fs.as_deref().unwrap_or("(null)"),
+                                        mount_enodev_logged
+                                    ));
+                                }
                             }
                         }
                     }
