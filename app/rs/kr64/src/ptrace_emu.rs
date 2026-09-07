@@ -10645,6 +10645,46 @@ fn write_child_blob_errno(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> Result<(
     Ok(())
 }
 
+/// 6-Z305s-n: sizeof(sockaddr_un) on the guest ABIs this arm translates
+/// for (bionic aarch64/x86_64: sun_family u16 + sun_path [u8; 108]).
+pub const Z305Q_SOCKADDR_UN_SIZE: usize = 110;
+
+/// 6-Z305s-n: pure guard for the in-place connect-sockaddr POKE — the
+/// translated blob may only be written into the caller's buffer when it
+/// fits inside the caller's own sockaddr_un. Bionic passes the full stack
+/// struct even when the `addrlen` argument is smaller (libcutils'
+/// socket_local_client passes 31 for /dev/socket/property_service).
+fn z305q_in_place_fits(translated_len: usize) -> bool {
+    translated_len <= Z305Q_SOCKADDR_UN_SIZE
+}
+
+/// 6-Z305s-n: per-pid bounded denial-log budget for the 6-Z305q connect
+/// arm. Returns true when THIS denial may be logged: the first 8 events
+/// per pid, under a global 64-event flood cap. Replaces the old SHARED
+/// 8-attempt counter whose budget one process's burst could exhaust,
+/// hiding every other tracee's denials (ladder run 34087740558: init's 8
+/// EIO bursts at +325/+604ms consumed the cap and ueventd's 11
+/// cold_boot_done denials stayed invisible). Cold path only — the
+/// Mutex/map is touched exclusively on rare denial events.
+fn z305q_deny_log_budget(pid: libc::pid_t) -> bool {
+    static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static PER_PID: std::sync::Mutex<Option<std::collections::HashMap<libc::pid_t, u32>>> =
+        std::sync::Mutex::new(None);
+    let mut guard = match PER_PID.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let count = guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(pid)
+        .and_modify(|c| *c += 1)
+        .or_insert(1);
+    if *count > 8 {
+        return false;
+    }
+    TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64
+}
+
 // ── Task 6-Z163: AF_UNIX bind() sun_path rewrite — pure helpers ──────
 //
 // Run 32988644183 (SHA dc3962a, 6-Z161 DIAG) pinned the arm64 TWRP init
@@ -17912,12 +17952,15 @@ pub fn run_ptrace_loop(
                         // service — every ro.* set died with 0xb READ_ONLY,
                         // init parked at wait_for_coldboot_done forever.
                         //
-                        // Mechanics mirror the 6-Z163 bind arm exactly: peek
-                        // the sockaddr, build the translated blob, write it
-                        // to the tracer scratch area, repoint (arg2, arg3)
-                        // via one getregs/setregs (one retry, 6-Z268). The
-                        // local `regs` snapshot is kept consistent so later
-                        // ENTRY arms still read the same view.
+                        // Mechanics (6-Z305s-n, reworked): peek the sockaddr,
+                        // build the translated blob, POKE it IN PLACE into the
+                        // caller's own sockaddr buffer (arg2 is NOT repointed)
+                        // and widen arg3 (addrlen) via one getregs/setregs
+                        // (one retry, 6-Z268). The local `regs` snapshot is
+                        // kept consistent so later ENTRY arms still read the
+                        // same view. The tracer scratch area is NOT used by
+                        // this arm anymore (it is shared across tracees and
+                        // frequently stale for the target — see the arm body).
                         //
                         // SCOPE (deliberate):
                         //   * AOSP/system mode ONLY (!boot_recovery): TWRP's
@@ -17950,11 +17993,8 @@ pub fn run_ptrace_loop(
                             && abi.connect_nr != -1
                             && syscall_num == abi.connect_nr
                             && abi.socketcall_nr == -1
-                            && scratch_addr != 0
                         {
                             static Z305Q_CONNECT_LOG: std::sync::atomic::AtomicU64 =
-                                std::sync::atomic::AtomicU64::new(0);
-                            static Z305Q_CONNECT_SKIP_LOG: std::sync::atomic::AtomicU64 =
                                 std::sync::atomic::AtomicU64::new(0);
                             let z305q_sa_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                             let z305q_sa_len = get_syscall_arg(&regs, abi.reg_arg3) as i64;
@@ -17968,23 +18008,53 @@ pub fn run_ptrace_loop(
                                 z305q_blob.and_then(|b| connect_translate_target(&b, rootfs));
                             match z305q_target {
                                 Some((guest_path, host_path, new_sa)) => {
-                                    let aligned = (new_sa.len() + 7) & !7;
-                                    let cursor = if scratch_offset + aligned > 4096 {
-                                        0
+                                    // 6-Z305s-n: IN-PLACE sockaddr translation.
+                                    // Root cause of the 6-Z305s-m EIO denials
+                                    // (ladder run 34087740558, S3-e decode):
+                                    // `scratch_addr` is ONE per-loop variable
+                                    // shared by ALL tracees, re-reserved at
+                                    // every syscall-ENTRY stop from the CURRENT
+                                    // tracee's sp (6-Z16). This arm runs at
+                                    // SECCOMP-window stops, so the window often
+                                    // belongs to the LAST-ENTRY tracee's stack —
+                                    // a different, COW-private process — and
+                                    // POKEDATA into the target hit unmapped
+                                    // memory (errno 5 EIO); the fail-closed
+                                    // denial then killed ueventd's
+                                    // ro.cold_boot_done property_service
+                                    // connect 11 times (hidden by the shared
+                                    // 8-cap log) → init parked at
+                                    // wait_for_coldboot_done (rung 3).
+                                    //
+                                    // The caller's buffer is GUARANTEED mapped
+                                    // here: read_child_bytes just read it to
+                                    // produce `z305q_blob`, and bionic passes a
+                                    // full stack sockaddr_un (110 B) even when
+                                    // the addrlen argument is smaller (observed
+                                    // 31 for property_service, 110 for logdw).
+                                    // The kernel copies arg3 bytes, so growing
+                                    // 31 -> 65 stays inside the caller's struct.
+                                    // The tracer scratch area is no longer
+                                    // touched by this arm at all (all other
+                                    // scratch_addr users are untouched).
+                                    let overlong = !z305q_in_place_fits(new_sa.len());
+                                    let poke_errno = if overlong {
+                                        // 6-Z305s-n guard: the translated
+                                        // sockaddr cannot fit the caller's
+                                        // sockaddr_un (110 B). No POKE is
+                                        // attempted; the fail-closed denial
+                                        // below names the guard as the reason.
+                                        -1
                                     } else {
-                                        scratch_offset
-                                    };
-                                    let sa_scratch = scratch_addr + cursor as u64;
-                                    // 6-Z305s-m: capture the underlying POKEDATA
-                                    // errno — the fail-closed denial diagnostic
-                                    // below must name WHY the translation lost
-                                    // the scratch window (was swallowed by the
-                                    // bool return).
-                                    let poke_errno =
-                                        match write_child_blob_errno(pid, sa_scratch, &new_sa) {
+                                        // 6-Z305s-m: capture the underlying
+                                        // POKEDATA errno — the fail-closed
+                                        // denial diagnostic must name WHY the
+                                        // in-place write failed.
+                                        match write_child_blob_errno(pid, z305q_sa_ptr, &new_sa) {
                                             Ok(()) => 0,
                                             Err(e) => e,
-                                        };
+                                        }
+                                    };
                                     if poke_errno == 0 {
                                         let mut fresh: Regs = unsafe { std::mem::zeroed() };
                                         match ptrace_getregs_wide(pid, &mut fresh) {
@@ -17993,11 +18063,9 @@ pub fn run_ptrace_loop(
                                                 e
                                             )),
                                             Ok(len) => {
-                                                set_syscall_arg(
-                                                    &mut fresh,
-                                                    abi.reg_arg2,
-                                                    sa_scratch,
-                                                );
+                                                // 6-Z305s-n: arg2 is NOT repointed —
+                                                // the translated blob now lives IN
+                                                // the caller's own sockaddr buffer.
                                                 set_syscall_arg(
                                                     &mut fresh,
                                                     abi.reg_arg3,
@@ -18018,11 +18086,6 @@ pub fn run_ptrace_loop(
                                                 if rewrite_ok {
                                                     set_syscall_arg(
                                                         &mut regs,
-                                                        abi.reg_arg2,
-                                                        sa_scratch,
-                                                    );
-                                                    set_syscall_arg(
-                                                        &mut regs,
                                                         abi.reg_arg3,
                                                         new_sa.len() as u64,
                                                     );
@@ -18033,7 +18096,7 @@ pub fn run_ptrace_loop(
                                                         );
                                                     if n < 24 {
                                                         log(&format!(
-                                                            "6-Z305q: connect(fd={}, guest {:?}) sockaddr translated -> {} (len {} -> {}) — guest client reaches the GUEST listener",
+                                                            "6-Z305q: connect(fd={}, guest {:?}) sockaddr translated IN-PLACE -> {} (len {} -> {}) — guest client reaches the GUEST listener",
                                                             get_syscall_arg(
                                                                 &regs,
                                                                 abi.reg_arg1
@@ -18060,22 +18123,31 @@ pub fn run_ptrace_loop(
                                         // redroid's own listener, whose init
                                         // answered 0xb
                                         // PROP_ERROR_READ_ONLY_PROPERTY for every
-                                        // ro.* set — ro.cold_boot_done never
-                                        // reached the guest area → init parked
-                                        // forever at wait_for_coldboot_done,
-                                        // rung 3). Zeroing addrlen makes the
+                                        // ro.* set). Zeroing addrlen makes the
                                         // kernel return -EINVAL without touching
-                                        // ANY socket (host or guest); bionic
-                                        // retries and the next attempt gets a
-                                        // fresh scratch window. Scope: this arm
-                                        // only runs for filesystem-spelling
-                                        // absolute guest paths past the first
-                                        // execve in system boots
-                                        // (connect_translate_target already
+                                        // ANY socket (host or guest). 6-Z305s-n:
+                                        // the trigger (`why`) is either the
+                                        // >110 in-place guard or the underlying
+                                        // POKE errno (6-Z305s-m kept the errno
+                                        // honest). Scope: this arm only runs
+                                        // for filesystem-spelling absolute guest
+                                        // paths past the first execve in system
+                                        // boots (connect_translate_target already
                                         // rejected abstract/relative/already-
                                         // translated spellings) — abstract
                                         // sockets, the @TWOYI_SOCK hostbridge
                                         // and /dev/qemu_pipe are untouched.
+                                        let why = if overlong {
+                                            format!(
+                                                "translated len {} > sockaddr_un 110",
+                                                new_sa.len()
+                                            )
+                                        } else {
+                                            format!(
+                                                "in-place sockaddr POKE FAILED: {}",
+                                                std::io::Error::from_raw_os_error(poke_errno)
+                                            )
+                                        };
                                         let mut fresh: Regs = unsafe { std::mem::zeroed() };
                                         match ptrace_getregs_wide(pid, &mut fresh) {
                                             Err(e) => {
@@ -18083,19 +18155,10 @@ pub fn run_ptrace_loop(
                                                 // connect regrettably executes;
                                                 // keep the honest log (residual
                                                 // leak, next decode target).
-                                                let n = Z305Q_CONNECT_SKIP_LOG.fetch_add(
-                                                    1,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
-                                                if n < 8 {
+                                                if z305q_deny_log_budget(pid) {
                                                     log(&format!(
-                                                        "6-Z305q: connect sockaddr scratch write FAILED (pid {}, errno={}) — fail-closed getregs FAILED: {} — connect runs on the RAW path [{} /8]",
-                                                        pid,
-                                                        std::io::Error::from_raw_os_error(
-                                                            poke_errno
-                                                        ),
-                                                        e,
-                                                        n + 1
+                                                        "6-Z305s-n: connect sockaddr translation dropped (pid {}, why: {}) — fail-closed getregs FAILED: {} — connect runs on the RAW path",
+                                                        pid, why, e
                                                     ));
                                                 }
                                             }
@@ -18118,33 +18181,17 @@ pub fn run_ptrace_loop(
                                                     // consistent in case the
                                                     // caller re-applies it.
                                                     set_syscall_arg(&mut regs, abi.reg_arg3, 0);
-                                                    let n = Z305Q_CONNECT_SKIP_LOG.fetch_add(
-                                                        1,
-                                                        std::sync::atomic::Ordering::Relaxed,
-                                                    );
-                                                    if n < 8 {
+                                                    if z305q_deny_log_budget(pid) {
                                                         log(&format!(
-                                                            "6-Z305q: connect sockaddr scratch write FAILED (pid {}, errno={}) — connect DENIED fail-closed (6-Z305s-m: addrlen=0 → -EINVAL, no host socket touched) [{} /8]",
-                                                            pid,
-                                                            std::io::Error::from_raw_os_error(
-                                                                poke_errno
-                                                            ),
-                                                            n + 1
+                                                            "6-Z305s-n: connect sockaddr translation dropped (pid {}, why: {}) — connect DENIED fail-closed (addrlen=0 → -EINVAL, no host socket touched)",
+                                                            pid, why
                                                         ));
                                                     }
                                                 } else {
-                                                    let n = Z305Q_CONNECT_SKIP_LOG.fetch_add(
-                                                        1,
-                                                        std::sync::atomic::Ordering::Relaxed,
-                                                    );
-                                                    if n < 8 {
+                                                    if z305q_deny_log_budget(pid) {
                                                         log(&format!(
-                                                            "6-Z305q: connect sockaddr scratch write FAILED (pid {}, errno={}) — fail-closed setregs FAILED (twice) — connect runs on the RAW path [{} /8]",
-                                                            pid,
-                                                            std::io::Error::from_raw_os_error(
-                                                                poke_errno
-                                                            ),
-                                                            n + 1
+                                                            "6-Z305s-n: connect sockaddr translation dropped (pid {}, why: {}) — fail-closed setregs FAILED (twice) — connect runs on the RAW path",
+                                                            pid, why
                                                         ));
                                                     }
                                                 }
@@ -18159,13 +18206,10 @@ pub fn run_ptrace_loop(
                                     // by design EXCEPT one bounded probe so a
                                     // future decode can see the arm RAN (the
                                     // 6-Z268 no-silent-branch lesson).
-                                    let n = Z305Q_CONNECT_SKIP_LOG
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if n < 8 {
+                                    if z305q_deny_log_budget(pid) {
                                         log(&format!(
-                                            "6-Z305q: connect(fd={}) sockaddr NOT translated (no AF_UNIX absolute guest path or too long) [{} /8]",
-                                            get_syscall_arg(&regs, abi.reg_arg1),
-                                            n + 1
+                                            "6-Z305q: connect(fd={}) sockaddr NOT translated (no AF_UNIX absolute guest path or too long) — arm-scope skip, raw connect preserved",
+                                            get_syscall_arg(&regs, abi.reg_arg1)
                                         ));
                                     }
                                 }
@@ -35236,6 +35280,31 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // Helper so (a)'s expected host path reads clearly.
         fn guest_str() -> String {
             "/dev/socket/property_service".to_string()
+        }
+    }
+
+    #[test]
+    fn z305sn_in_place_guard_bounds() {
+        // 6-Z305s-n: the in-place POKE may only write INSIDE the caller's
+        // sockaddr_un (110 B: sun_family + sun_path[108]). Known wire
+        // sizes: property_service 31 -> 65 (grows, still inside the
+        // struct), logdw 110 -> 54 (shrinks). A max-sun_path translation
+        // (108 chars → blob 111) must NOT poke in place — it takes the
+        // fail-closed path instead.
+        assert!(z305q_in_place_fits(65));
+        assert!(z305q_in_place_fits(54));
+        assert!(z305q_in_place_fits(110));
+        assert!(!z305q_in_place_fits(111));
+        // The two boot-critical sockets always stay in-place-eligible.
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        for guest in ["/dev/socket/property_service", "/dev/socket/logdw"] {
+            let mut blob = vec![0u8; 128];
+            blob[0] = 1;
+            blob[1] = 0;
+            blob[2..2 + guest.len()].copy_from_slice(guest.as_bytes());
+            blob[2 + guest.len()] = 0;
+            let (_, h, new_sa) = connect_translate_target(&blob, rootfs).expect("must translate");
+            assert!(z305q_in_place_fits(new_sa.len()), "{} -> {}", h, new_sa.len());
         }
     }
 
