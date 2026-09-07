@@ -58,6 +58,7 @@
 //! lazy statics use `std::sync::OnceLock` (stabilised in Rust 1.70).
 
 pub mod apex_extract;
+pub mod apex_fs;
 pub mod audio;
 pub mod battery;
 pub mod binder;
