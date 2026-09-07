@@ -26528,3 +26528,22 @@ Local verification: C brace balance; no Rust changes.
 CI: ladder #83 dispatch follows. Expected: every crash-looped service's svclog now ends with its VERBATIM abort reason ("Binder driver could not be opened", ART/zygote failures, etc.) — the crash-loop fleet decodes from real text.
 
 Honest unverified: no local ARM64 runtime; the abort_msg_t layout (msg at +8) follows bionic's abort_message.cpp and the mapping is 1 page (the 240-byte read stays in-bounds).
+
+## 6-Z305t-27 — THE CRASH-LOOP ROOT CAUSE NAMED VERBATIM: "Binder driver '/dev/binder' could not be opened. Terminating." — the shim never had TWOYI_ROOTFS and its proxy connect hit the legacy default tree; the env is now injected
+
+#84 (06ac656 → run 34161661869) decode — the self-describing abort-message scan delivered the exact text:
+- **9× "Binder driver '/dev/binder' could not be opened. Terminating."** — libbinder's ProcessState::open_driver FATAL — the crash-loop fleet's cause.
+- 7× "Pointer tag for 0x… was truncated." — bionic tagged-pointer/MTE-style aborts (a separate, later class — parked).
+- THE ROOT CAUSE: the svclogs showed the shim running with `TWOYI_ROOTFS=(null) g_rootfs=/data/data/io.twoyi/rootfs` — the LEGACY default. Init builds service envps FRESH (the 6-Z305s root cause), so services never inherited TWOYI_ROOTFS from init's env; the shim's binder_proxy_connect therefore probed {legacy}/vm0/dev/binder and {legacy}/dev/binder — BOTH nonexistent (the real tree is /data/user/0/io.twoyi.debug/rootfs) — the relative candidate missed too — the /dev/null fallback fd got returned but the libbinder version/negotiation path still FATALed → abort → (die policy) death → init crash-loop → the critical-process reboot.
+
+Implementation:
+1. kr64 ptrace_emu.rs — the 6-Z305s exec-env injection now appends TWOYI_ROOTFS=<rootfs> (the tracer's REAL rootfs) right after the die string (or the nops string on recovery boots); z305s_build_envp_words grew the rootfs_addr slot (unit tests updated: the recovery shape gains only the always-correct rootfs value).
+2. The abort-message scan (26b) stays as landed — offset +24, self-describing.
+
+Commits: (this commit) `fix(kr64): 6-Z305t-27 — inject TWOYI_ROOTFS into service execs …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 783 passed / 0 failed.
+
+CI: ladder #85 dispatch follows. Expected: the shim's g_rootfs matches the real tree → binder_proxy_connect succeeds → libbinder clients get REAL proxy fds → the "could not be opened" aborts vanish → zygote/audioserver/cameraserver/drm/gatekeeperd stop crash-looping → the queue advances toward system_server (rung 6). If zygote STILL exits 1: its own abort/exit reason is now visible via the abort-message scan + svclogs.
+
+Honest unverified: no local ARM64 runtime; the /dev/null-fallback fd's negotiation behavior with un-marked fds is inferred — the ROOTFS injection removes the dominant failure path regardless.
