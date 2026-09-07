@@ -433,7 +433,8 @@ jobs:
             "d=/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs; \
              ls -la \$d 2>/dev/null | head -50; \
              for f in \$d/svc-*.log; do \
-               [ -f \$f ] && echo \"== \$(basename \$f) (\$(stat -c%s \$f) bytes) ==\" && tail -c 4096 \$f; \
+               [ -f \$f ] && echo \"== \$(basename \$f) (\$(stat -c%s \$f) bytes) ==\" && \
+               grep -aE 'linker|CANNOT LINK|cannot locate|not found|WARNING|virtualization|binder_open_fallback|proxy|TWOYI_ROOTFS|logdw' \$f | head -24; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs.txt 2>&1 || true
           sleep 5
