@@ -1714,6 +1714,7 @@ fn materialise_block_node(rootfs: &str, dev_path: &str) -> std::io::Result<bool>
     let rel = dev_path.trim_start_matches('/');
     let path = format!("{}/{}", rootfs, rel);
     let p = Path::new(&path);
+    let mut created = false;
     if p.exists() {
         // Already there (previous boot, or kr64 staged it). One exception:
         // misc must be RESET every boot — a stale BCB ("boot-recovery"
@@ -1728,26 +1729,79 @@ fn materialise_block_node(rootfs: &str, dev_path: &str) -> std::io::Result<bool>
             f.set_len(BCB_MISC_SIZE as u64)?;
             f.sync_all()?;
         }
-        return Ok(false);
-    }
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    let size: u64 = if dev_path.ends_with("/misc") {
-        BCB_MISC_SIZE as u64
     } else {
-        BLOCK_NODE_SIZE
-    };
-    f.set_len(size)?;
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let size: u64 = if dev_path.ends_with("/misc") {
+            BCB_MISC_SIZE as u64
+        } else {
+            BLOCK_NODE_SIZE
+        };
+        f.set_len(size)?;
+        created = true;
+    }
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o660));
     }
-    Ok(true)
+    // 6-Z305t-10 pt3: the /data device node carries a MINIMAL VALID ext4
+    // superblock. fs_mgr validates the superblock BEFORE mounting
+    // ("Invalid ext4 superblock on '/dev/block/by-name/userdata'" → the
+    // entry is skipped → mount_all returns SUCCESS → NO crypto branch in
+    // do_mount_all → `nonencrypted` never queued → zygote unreachable,
+    // ladder 34128683905/#63). The superblock is a structural stand-in
+    // (clean state, no feature bits, stable UUID) — the mount itself is
+    // the 6-Z305t-10 container no-op; no guest data ever touches it.
+    if dev_path.ends_with("/userdata") {
+        if let Err(e) = write_ext4_superblock(&path) {
+            warning!(
+                "[KR64][devices] ext4 superblock placeholder for {} failed: {} (fs_mgr will skip the /data mount)",
+                dev_path, e
+            );
+        }
+    }
+    Ok(created)
+}
+
+/// Write a minimal VALID ext4 primary superblock at byte offset 1024 of
+/// the staged regular-file device node (6-Z305t-10 pt3). Layout mirrors
+/// the apex_fs test fixture's hand-built image: 4096-byte blocks, 256-
+/// byte inodes, dynamic rev, NO feature bits (nothing for fs_mgr's
+/// unsupported-feature check to reject), clean state, stable UUID.
+fn write_ext4_superblock(path: &str) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut sb = [0u8; 4096];
+    sb[0..4].copy_from_slice(&65536u32.to_le_bytes()); // s_inodes_count
+    sb[4..8].copy_from_slice(&262_144u32.to_le_bytes()); // s_blocks_count_lo (1 GiB @ 4K)
+    sb[8..12].copy_from_slice(&16_384u32.to_le_bytes()); // s_r_blocks_count_lo
+    sb[12..16].copy_from_slice(&251_904u32.to_le_bytes()); // s_free_blocks_count_lo
+    sb[16..20].copy_from_slice(&65_490u32.to_le_bytes()); // s_free_inodes_count
+    sb[20..24].copy_from_slice(&0u32.to_le_bytes()); // s_first_data_block (4K blocks)
+    sb[24..28].copy_from_slice(&2u32.to_le_bytes()); // s_log_block_size = 4096
+    sb[28..32].copy_from_slice(&2u32.to_le_bytes()); // s_log_cluster_size
+    sb[32..36].copy_from_slice(&32_768u32.to_le_bytes()); // s_blocks_per_group
+    sb[36..40].copy_from_slice(&32_768u32.to_le_bytes()); // s_clusters_per_group
+    sb[40..44].copy_from_slice(&8_192u32.to_le_bytes()); // s_inodes_per_group
+    sb[56..58].copy_from_slice(&0xEF53u16.to_le_bytes()); // s_magic
+    sb[58..60].copy_from_slice(&1u16.to_le_bytes()); // s_state = clean
+    sb[76..80].copy_from_slice(&1u32.to_le_bytes()); // s_rev_level = dynamic
+    sb[84..88].copy_from_slice(&11u32.to_le_bytes()); // s_first_ino
+    sb[88..90].copy_from_slice(&256u16.to_le_bytes()); // s_inode_size
+    sb[92..96].copy_from_slice(&0u32.to_le_bytes()); // s_feature_compat
+    sb[96..100].copy_from_slice(&0u32.to_le_bytes()); // s_feature_incompat
+    sb[100..104].copy_from_slice(&0u32.to_le_bytes()); // s_feature_ro_compat
+                                                       // s_uuid @104: fixed, arbitrary — "twoyi-data-volum"
+    sb[104..120].copy_from_slice(b"twoyi-data-volum");
+    let mut f = fs::OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(1024))?;
+    f.write_all(&sb)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// BCB region size (bootloader_message): the first 2 KiB of misc.
@@ -2450,5 +2504,29 @@ mod tests {
             !std::path::Path::new(&format!("{}/twoyi-virtual-hals.xml", vdir)).exists(),
             "no fragment file may exist"
         );
+    }
+    #[test]
+    fn z305t10_userdata_node_carries_ext4_superblock() {
+        // 6-Z305t-10 pt3: the staged /data device node must carry a
+        // valid ext4 superblock (magic 0xEF53 at file offset 1024+0x38)
+        // or fs_mgr skips the mount ("Invalid ext4 superblock") and
+        // mount_all returns a code that queues no crypto trigger —
+        // zygote unreachable (ladder #63).
+        let rootfs = tmpdir();
+        let n = create_by_name_block_nodes(&rootfs).expect("create_by_name_block_nodes");
+        assert!(n > 0);
+        let node = format!("{}/dev/block/by-name/userdata", rootfs);
+        let raw = std::fs::read(&node).expect("userdata node");
+        assert!(raw.len() >= 1080 + 2, "node too small: {}", raw.len());
+        let magic = u16::from_le_bytes([raw[1024 + 0x38], raw[1024 + 0x39]]);
+        assert_eq!(magic, 0xEF53, "superblock magic missing");
+        let state = u16::from_le_bytes([raw[1024 + 0x3A], raw[1024 + 0x3B]]);
+        assert_eq!(state, 1, "superblock must be clean");
+        // bootdevice variant also gets one.
+        let node2 = format!("{}/dev/block/bootdevice/by-name/userdata", rootfs);
+        let raw2 = std::fs::read(&node2).expect("bootdevice userdata node");
+        let magic2 = u16::from_le_bytes([raw2[1024 + 0x38], raw2[1024 + 0x39]]);
+        assert_eq!(magic2, 0xEF53);
+        let _ = std::fs::remove_dir_all(&rootfs);
     }
 }
