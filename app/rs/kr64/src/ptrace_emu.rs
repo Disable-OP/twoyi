@@ -35304,7 +35304,12 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             blob[2..2 + guest.len()].copy_from_slice(guest.as_bytes());
             blob[2 + guest.len()] = 0;
             let (_, h, new_sa) = connect_translate_target(&blob, rootfs).expect("must translate");
-            assert!(z305q_in_place_fits(new_sa.len()), "{} -> {}", h, new_sa.len());
+            assert!(
+                z305q_in_place_fits(new_sa.len()),
+                "{} -> {}",
+                h,
+                new_sa.len()
+            );
         }
     }
 
