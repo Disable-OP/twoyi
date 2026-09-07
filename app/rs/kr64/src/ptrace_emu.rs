@@ -10827,10 +10827,14 @@ fn z305s_build_envp_words(
     existing: &[u64],
     preload_addr: u64,
     ldlib_addr: Option<u64>,
+    nops_addr: Option<u64>,
 ) -> Vec<u64> {
     let mut words = existing.to_vec();
     words.push(preload_addr);
     if let Some(a) = ldlib_addr {
+        words.push(a);
+    }
+    if let Some(a) = nops_addr {
         words.push(a);
     }
     words.push(0);
@@ -16681,9 +16685,12 @@ pub fn run_ptrace_loop(
                                                         "LD_LIBRARY_PATH={}",
                                                         crate::AOSP_SERVICE_LD_LIBRARY_PATH
                                                     );
+                                                    // 6-Z305s-d: +1 slot for the
+                                                    // TWOYI_SHLIB_NO_PROPS gate string.
                                                     let words_count = existing.len()
                                                         + 1
-                                                        + if inj_ldlib { 1 } else { 0 };
+                                                        + if inj_ldlib { 1 } else { 0 }
+                                                        + 1;
                                                     let str_base = envp_base
                                                         + ((((words_count as u64) + 1) * 8 + 7)
                                                             & !7u64);
@@ -16701,8 +16708,34 @@ pub fn run_ptrace_loop(
                                                         );
                                                         ldlib_addr = Some(a);
                                                     }
+                                                    // 6-Z305s-d: the TWOYI_SHLIB_NO_PROPS
+                                                    // gate string — the shlib's
+                                                    // in-process property hooks must
+                                                    // NOT swallow service property sets
+                                                    // on the system wire (ueventd's
+                                                    // ro.cold_boot_done never reached
+                                                    // init without this; run
+                                                    // 34070192375: init parked at
+                                                    // wait_for_coldboot_done, fleet
+                                                    // never spawned).
+                                                    let nops_addr = str_base
+                                                        + preload_str.len() as u64
+                                                        + 1
+                                                        + if inj_ldlib {
+                                                            ldlib_str.len() as u64 + 1
+                                                        } else {
+                                                            0
+                                                        };
+                                                    ok &= write_child_string_unchecked(
+                                                        pid,
+                                                        nops_addr,
+                                                        "TWOYI_SHLIB_NO_PROPS=1",
+                                                    );
                                                     let words = z305s_build_envp_words(
-                                                        &existing, str_base, ldlib_addr,
+                                                        &existing,
+                                                        str_base,
+                                                        ldlib_addr,
+                                                        Some(nops_addr),
                                                     );
                                                     ok &= write_child_u64s_unchecked(
                                                         pid, envp_base, &words,
@@ -34927,13 +34960,13 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         //     preload pointer appended, then the optional LD_LIBRARY_PATH
         //     pointer, then the mandatory NULL.
         let existing = [0x1111u64, 0x2222];
-        let w = z305s_build_envp_words(&existing, 0xABCD, Some(0xEF01));
-        assert_eq!(w, vec![0x1111, 0x2222, 0xABCD, 0xEF01, 0]);
-        let w2 = z305s_build_envp_words(&existing, 0xABCD, None);
+        let w = z305s_build_envp_words(&existing, 0xABCD, Some(0xEF01), Some(0xBEEF));
+        assert_eq!(w, vec![0x1111, 0x2222, 0xABCD, 0xEF01, 0xBEEF, 0]);
+        let w2 = z305s_build_envp_words(&existing, 0xABCD, None, None);
         assert_eq!(w2, vec![0x1111, 0x2222, 0xABCD, 0]);
         // (e) Empty original envp still builds a valid array.
-        let w3 = z305s_build_envp_words(&[], 0xABCD, None);
-        assert_eq!(w3, vec![0xABCD, 0]);
+        let w3 = z305s_build_envp_words(&[], 0xABCD, None, Some(0xBEEF));
+        assert_eq!(w3, vec![0xABCD, 0xBEEF, 0]);
     }
 
     #[test]

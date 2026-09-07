@@ -3947,8 +3947,41 @@ int __system_property_area_init(void) {
     return 0;
 }
 
+// 6-Z305s-d: system-mode property-wire gate. When TWOYI_SHLIB_NO_PROPS
+// is set in the environment (the kr64 6-Z305s tracer arm sets it for
+// AOSP/system boots it injects the shlib into), these in-process
+// property hooks DELEGATE to the real bionic property API instead of
+// serving the in-memory table.
+//
+// WHY (ladder run 34070192375 decode): with the shlib riding ueventd
+// (and every other init-spawned service), ueventd's
+// __system_property_set("ro.cold_boot_done","true") landed in THIS
+// in-memory table instead of init's property service — init never saw
+// the property, stayed parked at wait_for_coldboot_done, and the whole
+// core fleet never spawned. The rung-4 run (34058989419) proved the
+// REAL wire works end-to-end under the tracer (6-Z305p/q property
+// socket translation + the 6-Z231 area files): clients use bionic's
+// own property code against the tracer-served /dev/__properties area
+// and the translated property_service socket. Recovery boots (TWRP
+// mode) keep the legacy hooks — they never receive this env var.
+static int g_no_props = -1;
+static int no_props(void) {
+    if (g_no_props < 0) {
+        g_no_props = getenv("TWOYI_SHLIB_NO_PROPS") != NULL;
+        if (g_no_props) {
+            write_str(2, "[twoyi_loader] TWOYI_SHLIB_NO_PROPS set — property hooks delegate to bionic\n");
+        }
+    }
+    return g_no_props;
+}
+
 // Hook __system_property_set — store in our in-memory table
 int __system_property_set(const char *key, const char *value) {
+    if (no_props()) {
+        static int (*real_fn)(const char *, const char *);
+        if (!real_fn) real_fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "__system_property_set");
+        if (real_fn) return real_fn(key, value);
+    }
     return prop_set(key, value);
 }
 
@@ -3956,12 +3989,22 @@ int __system_property_set(const char *key, const char *value) {
 // Returns 0 on success, -1 on failure
 int __system_property_add(const char *name, unsigned int namelen,
                           const char *value, unsigned int valuelen) {
+    if (no_props()) {
+        static int (*real_fn)(const char *, unsigned int, const char *, unsigned int);
+        if (!real_fn) real_fn = (int (*)(const char *, unsigned int, const char *, unsigned int))dlsym(RTLD_NEXT, "__system_property_add");
+        if (real_fn) return real_fn(name, namelen, value, valuelen);
+    }
     (void)namelen; (void)valuelen;
     return prop_set(name, value);
 }
 
 // Hook __system_property_update — update an existing property
 int __system_property_update(prop_info *pi, const char *value, unsigned int len) {
+    if (no_props()) {
+        static int (*real_fn)(prop_info *, const char *, unsigned int);
+        if (!real_fn) real_fn = (int (*)(prop_info *, const char *, unsigned int))dlsym(RTLD_NEXT, "__system_property_update");
+        if (real_fn) return real_fn(pi, value, len);
+    }
     (void)len;
     if (!pi) return -1;
     // pi is a pointer to our prop_entry (from __system_property_find)
@@ -3976,6 +4019,11 @@ int __system_property_update(prop_info *pi, const char *value, unsigned int len)
 
 // Hook __system_property_read — read property value
 int __system_property_read(const prop_info *pi, char *name, char *value) {
+    if (no_props()) {
+        static int (*real_fn)(const prop_info *, char *, char *);
+        if (!real_fn) real_fn = (int (*)(const prop_info *, char *, char *))dlsym(RTLD_NEXT, "__system_property_read");
+        if (real_fn) return real_fn(pi, name, value);
+    }
     if (!pi) return 0;
     const struct prop_entry *entry = (const struct prop_entry *)pi;
     if (entry->used) {
@@ -3994,6 +4042,11 @@ int __system_property_read(const prop_info *pi, char *name, char *value) {
 
 // Hook __system_property_get — read from our in-memory table
 int __system_property_get(const char *name, char *value) {
+    if (no_props()) {
+        static int (*real_fn)(const char *, char *);
+        if (!real_fn) real_fn = (int (*)(const char *, char *))dlsym(RTLD_NEXT, "__system_property_get");
+        if (real_fn) return real_fn(name, value);
+    }
     return prop_get(name, value);
 }
 
@@ -4001,6 +4054,11 @@ int __system_property_get(const char *name, char *value) {
 // We use the prop_entry address as the "prop_info" pointer
 static char g_dummy_prop_info[1] = {0};
 const void *__system_property_find(const char *name) {
+    if (no_props()) {
+        static const void *(*real_fn)(const char *);
+        if (!real_fn) real_fn = (const void *(*)(const char *))dlsym(RTLD_NEXT, "__system_property_find");
+        if (real_fn) return real_fn(name);
+    }
     if (!name) return NULL;
     for (int i = 0; i < g_props_count; i++) {
         if (g_props[i].used && strcmp(g_props[i].key, name) == 0) {
@@ -4014,6 +4072,11 @@ const void *__system_property_find(const char *name) {
 void __system_property_read_callback(const void *pi,
     void (*callback)(void *cookie, const char *name, const char *value, uint32_t serial),
     void *cookie) {
+    if (no_props()) {
+        static void (*real_fn)(const void *, void (*)(void *, const char *, const char *, uint32_t), void *);
+        if (!real_fn) real_fn = (void (*)(const void *, void (*)(void *, const char *, const char *, uint32_t), void *))dlsym(RTLD_NEXT, "__system_property_read_callback");
+        if (real_fn) { real_fn(pi, callback, cookie); return; }
+    }
     if (!pi || !callback) return;
     const struct prop_entry *entry = (const struct prop_entry *)pi;
     callback(cookie, entry->key, entry->value, 0);
@@ -4021,6 +4084,11 @@ void __system_property_read_callback(const void *pi,
 
 // Hook __system_property_serial — return 0
 uint32_t __system_property_serial(const void *pi) {
+    if (no_props()) {
+        static uint32_t (*real_fn)(const void *);
+        if (!real_fn) real_fn = (uint32_t (*)(const void *))dlsym(RTLD_NEXT, "__system_property_serial");
+        if (real_fn) return real_fn(pi);
+    }
     (void)pi;
     return 0;
 }
@@ -4039,6 +4107,11 @@ int __system_property_foreach(void (*propfn)(const void *pi, void *cookie), void
 // Hook __system_property_wait_any — return immediately with a fake prop_info
 // This unblocks init's WaitForProperty loops (e.g., wait_for_coldboot_done)
 const void *__system_property_wait_any(const void *pi) {
+    if (no_props()) {
+        static const void *(*real_fn)(const void *);
+        if (!real_fn) real_fn = (const void *(*)(const void *))dlsym(RTLD_NEXT, "__system_property_wait_any");
+        if (real_fn) return real_fn(pi);
+    }
     (void)pi;
     // Return a non-NULL pointer to indicate "a property changed"
     // This causes init's WaitForProperty to re-read the property and check
