@@ -26217,3 +26217,24 @@ Local verification: C change (no local NDK — CI compiles via the gradle build)
 CI: ladder #66 dispatch follows (gradle build compiles the shlib; any C error fails the build job loudly).
 
 Expected: `connect(/dev/socket/logdw) -> REAL logd (system mode…)` diag; flags_health_check's exec completes (it logs via liblog without freezing); init's action queue advances past load_persist_props → load_bpf_programs → `processing action (nonencrypted)` → `start zygote` (via the zygote-start property section) → `starting service 'zygote'` → RUNG 5 ZYGOTE → system_server (RUNG 6 stretch). Honest risks: (a) ART/zygote first contact on flattened apexes; (b) netd/statsd/update_verifier started by the zygote-start section may hit their own walls (each is a fresh decode target); (c) recovery boots re-exercise the fallback path (TWRP corpus is the regression gate).
+
+## 6-Z305t-13 (decode only — the rung-4→5 gate is the tracer's thread handling: logd's reader threads freeze, logd never drains logdw, every liblog client wedges, init's synchronous exec blocks, the action queue stalls below load_persist_props)
+
+Discovery (ladder run 34133984224 @7746479, rung 4):
+
+- 6-Z305t-12 partial verify: the NEW fallback diag text (`no logd reader — liblog would block`) is live (fired at +1254ms, pre-logd-listener), but NO `REAL logd` diag ever printed and flags_health_check (exec 11, +6967ms) STILL never exited — init's queue again stalled at exactly load_persist_props_action.
+- The decisive trace: logd = pid 2688 (staged exec +2202ms ✓, LD_PRELOAD injected ✓). Its THREE THREADS (clone 0x3d0f00 = CLONE_VM|CLONE_THREAD|… at +2439/2465ms → TIDs 2696/2697/2698):
+  * 2696: ppoll (nr=64) 6.0s — plausible listener/worker wait;
+  * 2697: `in_syscall=true, nr=-1` 5.6s — the thread NEVER made a syscall: it is stuck at its attach stop, never consumed/resumed;
+  * 2698: blocked at syscall-ENTRY nr=63 (uname — a thread's early init probe) for 5.6s — consumed but NEVER RESUMED.
+  With logd's logdw-reader thread frozen, the logd socket is never drained → every liblog client's write fills the socket buffer → liblog's blocking retry ppoll → flags_health_check (init's SYNCHRONOUS exec inside load_persist_props_action) blocks forever → init's action queue stops → zygote-start/early-boot/boot/nonencrypted never process → no `start zygote` → rung 4 ceiling. (The 271d ppoll "stalls" for vold/lmkd/servicemanager/tombstoned are NORMAL daemon event-loop waits; the 2697/2698 pattern is the wedge.)
+- Root cause class: the tracer's ptrace loop was architected for SERIALIZED children — the PTRACE_EVENT_FORK/CLONE arm's own comment states "only ONE child makes syscalls at a time … the shared state is never raced between two running children". Multi-THREADED guests (logd is the first multithreaded guest process in any system ladder run) break every assumption: per-loop shared state (scratch_addr/scratch_offset/regs snapshots — partially per-pid since 6-Z54), thread attach-stops vs SIGSTOP consumption, and the skip_next_resume/current_pid bookkeeping across interleaved thread stops. The frozen 2697/2698 pattern = attach stop consumed-without-resume and ENTRY-stop-consumed-without-resume respectively.
+- Secondary decode: the shlib connect hook produced NO diag for flags_health_check's logdw connect — the connect reached the kernel via the 6-Z305q in-place translation path (shlib hook not effective in that child for reasons not yet pinned: LD_PRELOAD was injected VERIFIED, so either the hook's logdw arm missed (sun_path shape) or the .so load failed in this specific child — needs one focused probe next round).
+
+NEXT (6-Z305t-14 — the actual fix, scoped carefully):
+1. Thread-safe stop handling: classify the thread auto-attach stop (PTRACE_EVENT_STOP / group-stop vs SIGSTOP) and ALWAYS consume+resume it; audit every `continue`/resume path for the current_pid != stopped-pid case (the 6-Z211h+i pattern must explicitly resume the STOPPED tid, not the stale current_pid).
+2. Per-TRACER-thread state: move scratch_addr/scratch_offset (and any remaining loop-shared mutable syscall state) into the per-pid state map (6-Z54 started this).
+3. Probe the flags_health_check shlib-hook miss (one bounded DIAG: log the hook's entry for every connect, not just logdw).
+4. Then re-run the ladder: expect logd draining → flags_health_check exits → queue advances (nonencrypted/zygote-start/boot) → `start zygote` → RUNG 5.
+
+Honest unverified: the frozen-thread mechanism (attach-stop vs resume bookkeeping) is inferred from the stop-state evidence (nr=-1 / ENTRY-never-resumed), not yet from a targeted code-path trace; the fix MUST be validated against the recovery corpus too (thread handling is shared machinery — the TWRP regression gate).
