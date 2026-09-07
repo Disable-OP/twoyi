@@ -26001,3 +26001,28 @@ CI: ladder #56 dispatch follows on this commit.
 Expected (next decode): `chmod 644 …` lands → `copy /linkerconfig/bootstrap/ld.config.txt` SUCCEEDS → /linkerconfig/default/ld.config.txt exists → lmkd resolves libstatssocket.so from the flattened com.android.os.statsd apex → lmkd survives → `Connection with lmkd established` → fleet stays up → rung 4 CORE_DAEMONS → zygote spawn (rung 5) → system_server (rung 6) as stretch. Honest risks: (a) the guest Android 11 linker now runs with the GENERATED ld.config.txt — namespace/permitted-path errors (linker "… is not accessible for the namespace …") are possible and would be REAL next-blocker findings; (b) keystore/vold/keymaster HAL semantics at rung 4-5 (Stage D honest-failure semantics) may crash-loop non-critically; (c) the /dev/socket fchmodat ENOENT wrinkle may bite the socket-heavy services (logd/netd) — decode before fixing.
 
 Honest unverified: no local ARM64 runtime; all evidence is from redroid ladder artifacts. The linkerconfig-generated default config's CONTENT (guest-generated, real linkerconfig binary) is trusted to be well-formed for this ROM.
+
+## 6-Z305t-6 — vendor/default.prop preserve+append (the truncating rewrite erased the ROM's ro.vndk.version → linkerconfig aborted "VENDOR_VNDK_VERSION is not defined" → empty ld.config.txt → no /apex namespaces → lmkd CANNOT LINK ×5 → InitFatalReboot)
+
+Discovery (ladder run 34115207483 @c98217b, rung 3 / post-mortem init reboot path):
+
+- 6-Z305t-5 VERIFIED GREEN: "Skipping insecure file" GONE — the guest's real `chmod 644` now lands and the early-init `copy /linkerconfig/bootstrap/ld.config.txt → default/` SUCCEEDS. `cannot execv` still 0 (t-4 holding).
+- The wall moved one layer deeper: exec 1 linkerconfig itself ABORTS — DIAG WRITEV-SAMPLE: `linkerconfig … context.cc:115] Check failed: !"undefined var" VENDOR_VNDK_VERSION is not defined` → linkerconfig produces NO (or empty) output; #56's copy then SUCCEEDED copying an EMPTY 0666→0644 file → /linkerconfig/default/ld.config.txt exists but is EMPTY → guest linker has NO /apex namespaces → lmkd `CANNOT LINK EXECUTABLE "/system/bin/lmkd": library "libstatssocket.so" not found` ×6 (DIAG buffer; exit status 1 per linker-fatal convention) → critical 'lmkd' ×4 → InitFatalReboot signal 6. (In #55 the same abort left a 0-byte 0666 file, so the copy tripped the insecure-file check instead — same root, two symptoms.)
+- Root cause: `proc_emu::write_vendor_default_prop` does `fs::write` (O_TRUNC) of a generated stub over {rootfs}/vendor/default.prop. The Android 11 SDK image SHIPS that file with ro.vndk.version=30, ro.bionic.arch=arm64, ro.bionic.cpu_variant, dalvik.vm.isa.arm64.*, ro.logd.size.stats, … (tar-verified: ./vendor/default.prop line 5 = ro.vndk.version=30). The stub erased them; linkerconfig reads ro.vndk.version (its internal variable name VENDOR_VNDK_VERSION) and CHECK-fails when empty. Legacy of the 8.1-era rootfs (no real vendor tree) colliding with a real system-as-root image.
+- Verified NOT property-loading-order / contexts: ro.vndk.version is in plat_property_contexts (line 676, exact string, vndk_prop) and /vendor/default.prop is on the rootfs — init would have loaded it if the file still had its content. klog also shows the generated stub's `ro.hardware=goldfish` being REJECTED ("Read-only property was already set") — ro.* re-sets during .prop load fail; the ROM's original ro.hardware wins. That rejection is pre-existing behavior (not touched).
+
+Implementation (app/rs/kr64/src/proc_emu.rs — write_vendor_default_prop):
+1. File exists (ROM-shipped or legacy): APPEND the container block (persist.sys.*, ro.sf.lcd_density, ro.zygote, ro.hardware, goldfish note) after a leading newline. Idempotent via the block's header marker ("proc_emu::write_vendor_default_prop" present → skip).
+2. File absent (TWRP ramdisk / old rootfs): write the generated content — previous behavior preserved (all 3 legacy tests still green unchanged).
+3. Documented residual: a default.prop that an OLDER build already truncated cannot be resurrected (content lost); CI rootfs imports are fresh so every ladder run gets the pristine file.
+4. New regression test test_vendor_default_prop_preserves_rom_props_and_appends (ROM props survive verbatim + block appended + second call does not duplicate).
+
+Commits: (this commit) `fix(props): 6-Z305t-6 — write_vendor_default_prop APPENDS …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN (one unused-var fix), cargo test --lib 779 passed / 0 failed.
+
+CI: ladder #57 dispatch follows on this commit.
+
+Expected (next decode): vendor/default.prop keeps ro.vndk.version=30 → linkerconfig runs to completion → bootstrap AND default ld.config.txt are NON-EMPTY with /apex/<name> sections → lmkd resolves libstatssocket.so from the flattened com.android.os.statsd → lmkd stays up past +22s → class_start main completes → zygote spawn (rung 5) → system_server (rung 6) as stretch. Honest risks: (a) linkerconfig may next demand other vendor artifacts (vintf /vendor/manifest, vndk sp libs) — decode whatever it CHECKs next; (b) zygote/system_server will exercise the binder fleet + ART on the flattened apexes for the first time — ART boot image / dex2oat behavior on extracted apex trees is unproven; (c) the earlier secondary wrinkle `Could not create socket 'lmkd': fchmodat /dev/socket/lmkd ENOENT` may return with real chmod now active for socket fchmodat (fchmodat is in the un-faked set) — watch logd/netd/zygote sockets.
+
+Honest unverified: no local ARM64 runtime; the linkerconfig output CONTENT for this image is trusted (real linkerconfig binary, real props).
