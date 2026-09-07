@@ -3473,13 +3473,17 @@ static void write_kmsg_line(const char *buf, unsigned long len) {
         unsigned k;
         for (k = 0; k < sizeof(src); k++) kpath[k] = src[k];
     }
-    /* 6-Z305t-20: O_APPEND — a plain O_WRONLY open positions at offset 0
-     * and CLOBBERS the klog head (ladder #76: the mirror line replaced
-     * init's first ~76 bytes). The kernel-side O_APPEND on the generic
-     * ABI is 000002000 octal = 0x400. */
+    /* 6-Z305t-22: O_WRONLY + lseek(SEEK_END) — NOT O_APPEND. Ladder #78:
+     * with O_WRONLY|O_APPEND the open FAILED on the emulated
+     * /dev/__kmsg__ node and EVERY hook kmsg line vanished silently
+     * (evidence, die-state, die-loop lines — the #77/#78 artifacts were
+     * blind); with plain O_WRONLY (ladder #76) the same write landed.
+     * The head-clobber the O_APPEND was meant to fix is avoided by
+     * positioning: lseek(fd, 0, SEEK_END) before the write. */
     long kfd = raw_syscall4(SYS_openat, AT_FDCWD, (long)(const char *)kpath,
-                            1 /*O_WRONLY*/ | 0x400 /*O_APPEND*/, 0);
+                            1 /*O_WRONLY*/, 0);
     if (kfd < 0) return;
+    raw_syscall3(SYS_lseek, kfd, 0, 2 /*SEEK_END*/);
     raw_syscall3(SYS_write, kfd, (long)buf, (long)len);
     raw_syscall1(SYS_close, kfd);
 }
