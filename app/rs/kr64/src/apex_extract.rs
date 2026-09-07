@@ -416,6 +416,56 @@ pub fn extract_apex_payload_img(apex_path: &str) -> Result<Vec<u8>, String> {
     }
 }
 
+/// 6-Z305t-7: the APEX's ACTIVE name is the one declared in
+/// apex_manifest.pb — NOT the .apex file name. The Android 11 SDK image
+/// ships `com.android.vndk.current.apex` whose manifest declares
+/// `com.android.vndk.v30` (and `com.android.art.debug.apex` declaring
+/// `com.android.art`); a real flattened-APEX device exposes the tree at
+/// /apex/<manifest-name>. linkerconfig reads
+/// /apex/com.android.vndk.v30/etc/llndk.libraries.30.txt — a
+/// file-name-derived dir is invisible to it → CHECK fail
+/// "LLNDK_LIBRARIES_VENDOR is not defined" → empty ld.config.txt →
+/// lmkd CANNOT LINK libstatssocket.so → InitFatalReboot (ladder
+/// 34119002232/#58).
+///
+/// The manifest is a 1-2-field protobuf: field 1 (wire type 2) = name —
+/// tag byte 0x0A, varint length, UTF-8 bytes. Returns None on any
+/// parse surprise (caller falls back to the file-derived name).
+pub fn apex_manifest_name(apex_path: &str) -> Option<String> {
+    let pb = read_zip_entry_stored(apex_path, "apex_manifest.pb").ok()?;
+    parse_apex_manifest_name(&pb)
+}
+
+/// Parse the field-1 name out of an apex_manifest.pb byte string.
+fn parse_apex_manifest_name(pb: &[u8]) -> Option<String> {
+    if pb.first() != Some(&0x0A) {
+        return None;
+    }
+    let mut idx = 1usize;
+    let mut len = 0usize;
+    let mut shift = 0u32;
+    loop {
+        let b = *pb.get(idx)?;
+        idx += 1;
+        len |= ((b & 0x7F) as usize) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 28 {
+            return None;
+        }
+    }
+    if len == 0 || idx + len > pb.len() {
+        return None;
+    }
+    let name = std::str::from_utf8(&pb[idx..idx + len]).ok()?;
+    if !name.chars().all(|c| c.is_ascii_graphic()) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 /// Loopback-mounts the ext4 image at `ext4_path` (a regular file) and
 /// reads `file_inside` (a path inside the mounted filesystem, e.g.
 /// `lib64/bionic/libdl.so`).
@@ -2241,5 +2291,33 @@ mod tests {
         // this test host. The point is just to verify the function
         // doesn't panic when data_dir is empty.
         let _ = read_libdl_asset(&cfg);
+    }
+
+    #[test]
+    fn z305t7_parse_apex_manifest_name() {
+        // Real shape: field 1 (wire type 2) = name. tag 0x0A, len 0x14
+        // ("com.android.vndk.v30" = 20 bytes), then field 2 (version
+        // int64) — the parser must stop after field 1.
+        let mut pb = vec![0x0Au8, 0x14];
+        pb.extend_from_slice(b"com.android.vndk.v30");
+        pb.extend_from_slice(&[0x10, 0xE0, 0x8D, 0x02]); // version field
+        assert_eq!(
+            parse_apex_manifest_name(&pb).as_deref(),
+            Some("com.android.vndk.v30")
+        );
+        // Empty payload → None.
+        assert_eq!(parse_apex_manifest_name(&[]), None);
+        // Wrong tag → None.
+        assert_eq!(parse_apex_manifest_name(&[0x08, 0x01]), None);
+        // Truncated length (varint says 100, only 3 bytes) → None.
+        assert_eq!(
+            parse_apex_manifest_name(&[0x0A, 100, b'a', b'b', b'c']),
+            None
+        );
+        // Non-graphic bytes in the name → None.
+        assert_eq!(
+            parse_apex_manifest_name(&[0x0A, 0x03, b'a', 0x01, b'b']),
+            None
+        );
     }
 }
