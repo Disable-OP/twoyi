@@ -6528,6 +6528,23 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 e.raw_os_error().unwrap_or(0)
             );
         }
+        // ── 6-Z305t-24: the service-stdio capture directory ──────────
+        // The tracer redirects each guest child's /dev/null WRITE-side
+        // opens to {rootfs}/dev/twoyi-svclogs/svc-<pid>.log (read opens
+        // keep the real /dev/null and its EOF semantics), giving every
+        // init-spawned service — zygote, hwservicemanager, the HALs —
+        // a persistent stdout/stderr record where previously ALL crash
+        // evidence vanished into /dev/null. The boot-ladder artifact
+        // tails this directory (svclogs.txt).
+        let svclog_dir = format!("{}/twoyi-svclogs", dev_stage_dir);
+        if let Err(e) = std::fs::create_dir_all(&svclog_dir) {
+            error!(
+                "[KR64] PARENT: failed to create the 6-Z305t-24 svclog dir {}: {} (errno={}) — service stderr stays swallowed",
+                svclog_dir,
+                e,
+                e.raw_os_error().unwrap_or(0)
+            );
+        }
     }
     // TWRP BOOT: write the i686 libtwrp_fb_hook.so to /sbin/libtwrp_fb_hook.so
     // (tmpfs). The dynamically-linked i386 recovery binary loads it via

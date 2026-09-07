@@ -26473,3 +26473,25 @@ Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 
 CI: ladder #80 dispatch follows. Expected: the abort chain now COMPLETES — evidence lines land via one of the three klog channels, the die branch's tgkill translates (6-Z266 FIX log line "tgkill (tgid=0, tid=… sig=6) translated"), SIGABRT delivers, flags_health_check DIES (init logs the exec exit) → the queue advances past load_persist_props → nonencrypted → start zygote → RUNG 5. logd's own aborts die → init restarts logd → logdw drains. If the queue STILL stalls: the kmsg lines will now name the remaining wedge precisely.
 
 Honest unverified: no local ARM64 runtime; why raw getpid returned 0 in the aborting thread (vs the documented fake 1) is unexplained — the tracer-side translation covers both values, which is the robust answer either way.
+
+## 6-Z305t-24 — #80 decode: THE DIE POLICY WORKS AND THE BOOT MOVED — zygote started, onrestart ran, then honest crash-loops (zygote exit(1) ×5, hwservicemanager critical ×4 → InitFatalReboot); land SERVICE-STDIO CAPTURE (the /dev/null wall)
+
+#80 (62c7456 → run 34156521892) decode:
+- THE 6-Z305t-23 FIX WORKED END-TO-END: kmsg evidence landed through the dual-channel mirror ("*** abort() INTERCEPTED *** … die=1", "loaded die=1 marker_errno=0" — THE MARKER FILE WORKS — "die-loop: raising SIGABRT"). The tgkill(0→real-tgid) translation delivered the SIGABRT — the abort chain is COMPLETE for the first time.
+- THE QUEUE BROKE THROUGH THE RUNG-4 WALL: "init: starting service 'zygote'" at +2.9 s (the load_persist_props gate is GONE), zygote ran (its onrestart actions executed — "Command 'restart wificond' action=onrestart"), and the class-main fleet launched (hidl_memory, system_suspend, audioserver, cameraserver, drm, gatekeeperd…).
+- THE NEW WALL IS HONEST FAILURE: zygote exit(1) ×5 (pids 2722/3102/3422/3740/4020), hwservicemanager (critical) exit(1) ×4 → "<2>init: critical process 'hwservicemanager' exited 4 times before boot completed" → InitFatalReboot → "Reboot ending, jumping to kernel". Rung dropped to 3 ONLY because the run ends at the guest's reboot — the boot is now failing FORWARD like a real device with a broken HAL fleet, not parking silently.
+- Note: init's FIRST zygote socket attempt failed ("Failed to fchmodat socket '/dev/socket/zygote': No such file or directory") but later restarts proceeded past it — parked as a secondary observation.
+- THE BLINDFOLD IS THE BLOCKER: every service's stdout/stderr = /dev/null, so zygote's exit(1) reason (ART? linker? classpath?) is invisible — the same wall the rung-4 fleet hid behind.
+
+Implementation (service-stdio capture):
+1. kr64 lib.rs — /dev staging creates {rootfs}/dev/twoyi-svclogs/ (gated !boot_recovery — recovery stdio stays untouched).
+2. kr64 ptrace_emu.rs — at open/openat ENTRY, path == "/dev/null" with WRITE flags (O_WRONLY|O_RDWR), caller ≠ init_pid → redirect the translation to {rootfs}/dev/twoyi-svclogs/svc-<pid>.log (host-side pre-created in append mode; the guest's O_RDWR open then binds stdio to the file). /dev/null READ opens keep the REAL node — EOF semantics never change. Boot-wide cap 400 redirects.
+3. CI workflow — the artifact now includes svclogs.txt (ls + 4 KiB tail per file).
+
+Commits: (this commit) `feat(kr64): 6-Z305t-24 — service-stdio capture …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 783 passed / 0 failed.
+
+CI: ladder #81 dispatch follows. Expected: svclogs.txt shows zygote's and hwservicemanager's ACTUAL failure lines (app_process/ART/linker errors for zygote; the hwbinder registration failure for hwservicemanager) — the next minimal fixes decode from verbatim guest output instead of blind pc arithmetic. Risks: services that poll stdin (none known in the core fleet); the redirect widens the /dev tree by ~dozens of small files per boot (capped).
+
+Honest unverified: no local ARM64 runtime; the zygote exit(1) cause is unknown until the svclogs land (that is precisely what this fix buys).
