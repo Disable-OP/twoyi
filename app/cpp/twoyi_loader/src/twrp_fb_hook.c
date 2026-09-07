@@ -3466,26 +3466,52 @@ static void fatal_dump_maps(void) {
 // stderr reaches a real pipe). Mirror ONE short line to /dev/__kmsg__ —
 // the guest klog — where the boot-ladder artifact always captures it.
 // Raw openat/write/close only; a failing kmsg open is fine (best effort).
+static void write_kmsg_line(const char *buf, unsigned long len);
+
+/* 6-Z305t-23: DUAL-CHANNEL klog mirror. Ladder #79: the fatal evidence
+ * STILL failed to reach the captured klog even through the #76-proven
+ * O_WRONLY+lseek channel — the /dev/__kmsg__ node the mirror opens may
+ * not be the node the guest's own klog flow backs (init opens /dev/kmsg,
+ * AOSP klog.cpp). Try /dev/kmsg FIRST, then /dev/__kmsg__; each open is
+ * O_WRONLY (the only mode empirically accepted) with lseek(SEEK_END)
+ * positioning; each failure is silent (best effort) — the dedicated
+ * /dev/twoyi-fatal.log third channel catches whatever the klog nodes
+ * reject, for artifact capture via the rootfs dev tree. */
 static void write_kmsg_line(const char *buf, unsigned long len) {
-    volatile char kpath[15]; /* "/dev/__kmsg__" + NUL — stack, see 6-Z176b */
+    volatile char p1[13]; /* "/dev/kmsg" + NUL */
+    volatile char p2[15]; /* "/dev/__kmsg__" + NUL */
+    volatile char p3[21]; /* "/dev/twoyi-fatal.log" + NUL */
     {
-        static const char src[] = "/dev/__kmsg__";
+        static const char a[] = "/dev/kmsg";
+        static const char b[] = "/dev/__kmsg__";
+        static const char c[] = "/dev/twoyi-fatal.log";
         unsigned k;
-        for (k = 0; k < sizeof(src); k++) kpath[k] = src[k];
+        for (k = 0; k < sizeof(a); k++) p1[k] = a[k];
+        for (k = 0; k < sizeof(b); k++) p2[k] = b[k];
+        for (k = 0; k < sizeof(c); k++) p3[k] = c[k];
     }
-    /* 6-Z305t-22: O_WRONLY + lseek(SEEK_END) — NOT O_APPEND. Ladder #78:
-     * with O_WRONLY|O_APPEND the open FAILED on the emulated
-     * /dev/__kmsg__ node and EVERY hook kmsg line vanished silently
-     * (evidence, die-state, die-loop lines — the #77/#78 artifacts were
-     * blind); with plain O_WRONLY (ladder #76) the same write landed.
-     * The head-clobber the O_APPEND was meant to fix is avoided by
-     * positioning: lseek(fd, 0, SEEK_END) before the write. */
-    long kfd = raw_syscall4(SYS_openat, AT_FDCWD, (long)(const char *)kpath,
+    long kfd = raw_syscall4(SYS_openat, AT_FDCWD, (long)(const char *)p1,
                             1 /*O_WRONLY*/, 0);
-    if (kfd < 0) return;
-    raw_syscall3(SYS_lseek, kfd, 0, 2 /*SEEK_END*/);
-    raw_syscall3(SYS_write, kfd, (long)buf, (long)len);
-    raw_syscall1(SYS_close, kfd);
+    if (kfd >= 0) {
+        raw_syscall3(SYS_lseek, kfd, 0, 2 /*SEEK_END*/);
+        raw_syscall3(SYS_write, kfd, (long)buf, (long)len);
+        raw_syscall1(SYS_close, kfd);
+        return;
+    }
+    kfd = raw_syscall4(SYS_openat, AT_FDCWD, (long)(const char *)p2,
+                       1 /*O_WRONLY*/, 0);
+    if (kfd >= 0) {
+        raw_syscall3(SYS_lseek, kfd, 0, 2 /*SEEK_END*/);
+        raw_syscall3(SYS_write, kfd, (long)buf, (long)len);
+        raw_syscall1(SYS_close, kfd);
+        return;
+    }
+    kfd = raw_syscall4(SYS_openat, AT_FDCWD, (long)(const char *)p3,
+                       0241 /*O_WRONLY|O_CREAT|O_APPEND*/, 0644);
+    if (kfd >= 0) {
+        raw_syscall3(SYS_write, kfd, (long)buf, (long)len);
+        raw_syscall1(SYS_close, kfd);
+    }
 }
 
 static void write_kmsg_line(const char *buf, unsigned long len);

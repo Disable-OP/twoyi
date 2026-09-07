@@ -26436,3 +26436,40 @@ Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 
 CI: ladder #78 dispatch follows. Expected: the first fatal in each parked process emits loaded-die/marker_errno + evidence + (die=1) die-loop lines. The verdict matrix is unambiguous for all four outcomes (marker missing / marker found + die raised / die swallowed / evidence channel broken).
 
 Honest unverified: no local ARM64 runtime; the park-site identification across builds rests on the +0xC4 code-shift arithmetic and the exclusion of the reraise/die loops by the zero-signal-6 evidence.
+
+## 6-Z305t-22 — #78 decode: the kmsg mirror channel itself was BLIND since the O_APPEND change (#77/#78 artifacts saw nothing) — the fatal machinery may have been running the whole time; O_WRONLY + lseek(SEEK_END) restores the proven channel
+
+#78 (a4f59a6 → run 34154575813) decode:
+- STILL zero hook kmsg lines — INCLUDING the constructor-time "loaded die=" line that fires at the FIRST fatal — while flags_health_check (2758-class) is still parked in the fb_hook fatal ppoll (file offset 0xa0a4, shifted +0xE8 by the constructor additions — new shlib confirmed in the run). A thread in the fatal ppoll without any of the three kmsg lines (evidence/die-state/raise) is only possible if the WRITES fail — and the writes share ONE channel: write_kmsg_line.
+- Cross-run comparison nails it: #76 (plain O_WRONLY) → the mirror line APPEARED; #77/#78 (O_WRONLY|O_APPEND, 0x400) → EVERY hook kmsg line vanished. The emulated /dev/__kmsg__ node rejects the O_APPEND open (or the open path treats unknown flag combinations differently) and write_kmsg_line's silent-failure design made the whole instrumentation invisible.
+- Consequence: the #77/#78 "die never resolved" conclusion was UNVERIFIABLE — the fatal machinery may have resolved die=1 and even raised (though zero signal-6 deliveries still says the raise never happened), and the marker probe result was invisible.
+
+Implementation: write_kmsg_line opens plain O_WRONLY (the #76-proven mode) and positions with raw SYS_lseek(fd, 0, SEEK_END) before the write — the head-clobber O_APPEND was meant to fix is avoided by positioning instead of flags.
+
+Commits: (this commit) `fix(hook): 6-Z305t-22 — kmsg mirror channel O_WRONLY + lseek(SEEK_END) …`.
+
+Local verification: C brace balance; no Rust changes (fmt/clippy/783 tests unaffected).
+
+CI: ladder #79 dispatch follows. Expected: the next fatal in any parked process now emits its THREE lines (evidence with die=, loaded die= + marker_errno, die-loop raise if die=1). The verdict matrix is finally observable: die=0 + marker_errno → fix the marker path; die=1 + raise + no death → decode the tracer's signal forwarding; die=1 + death → the queue advances (rung 5).
+
+Honest unverified: no local ARM64 runtime; the O_APPEND-failure mechanism on the emulated klog node is inferred from the cross-run channel comparison, not from a tracer-side decode.
+
+## 6-Z305t-23 — THE ABORT CHAIN ROOT CAUSE: tgkill(fake-tgid=0, tid, SIGABRT) → EINVAL — the raise never delivered and the die branch parked in its own ppoll; the 6-Z266 fake-self translation now covers tgid=0 + dual-channel klog mirror
+
+#79 (11d8365 → run 34155365139) decode:
+- flags_health_check (2749): the 6-Z285 BT at +13.1s shows the LOGDW retry-ppoll (libc → liblog+0x3740 → libbase → server_configurable_flags → flags_health_check+0x308); by +18.4s the SIGSTOP probe catches it parked in the fb_hook fatal ppoll — the abort fired in that window.
+- THE DECISIVE LINES (present in EVERY recent run, missed until now): `nr=131 tgkill a=(0x0,0xa79,0x6) → ret=-22`. The die branch's `raw getpid()` returned **0** (not the documented fake 1), tgkill(0, real-tid, SIGABRT) is **EINVAL** in the kernel, and the die loop's `for(;;){tgkill; ppoll(NULL,0);}` parks FOREVER on the first failing raise — no signal-6 delivery-stop ever reaches the tracer, no death, no exit — EXACTLY the observed signature in #76–#79. The 6-Z266 translation covers fake-pid **1** only; **0** passed through untranslated.
+- tgkill(tgid=0, …) is ALWAYS EINVAL (a tgid of 0 can never be real) — translating it to the caller's real tgid is strictly a fix with no legitimate-behavior change. kill(0)/negative pids keep their process-group semantics (untouched, tgkill only).
+
+Implementation:
+1. kr64 ptrace_emu.rs — the 6-Z266 tgkill translation now treats tgid ∈ {0, 1} as a fake-self reference (0 documented inline: "a tgid of 0 can never be real"); the real tgid comes from the 6-Z266 cache/`read_real_tgid` as before; the existing rate-capped FIX log makes every translation visible.
+2. twrp_fb_hook.c — the klog mirror is now DUAL-CHANNEL (both O_WRONLY + lseek(SEEK_END), the #76-proven mode): /dev/kmsg (the node AOSP init's own klog opens) first, then /dev/__kmsg__, then the dedicated /dev/twoyi-fatal.log (O_CREAT|O_APPEND) as the catch-all — whatever node semantics rejected the single-channel writes, one of the three will carry the fatal evidence.
+3. The marker stays /dev/twoyi-abort-die (de-dotted, 6-Z305t-21) with the getenv secondary; die-state + marker_errno remain in the constructor-time kmsg line.
+
+Commits: (this commit) `fix(kr64): 6-Z305t-23 — tgkill fake-self translation covers tgid=0 …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 783 passed / 0 failed; C brace balance verified.
+
+CI: ladder #80 dispatch follows. Expected: the abort chain now COMPLETES — evidence lines land via one of the three klog channels, the die branch's tgkill translates (6-Z266 FIX log line "tgkill (tgid=0, tid=… sig=6) translated"), SIGABRT delivers, flags_health_check DIES (init logs the exec exit) → the queue advances past load_persist_props → nonencrypted → start zygote → RUNG 5. logd's own aborts die → init restarts logd → logdw drains. If the queue STILL stalls: the kmsg lines will now name the remaining wedge precisely.
+
+Honest unverified: no local ARM64 runtime; why raw getpid returned 0 in the aborting thread (vs the documented fake 1) is unexplained — the tracer-side translation covers both values, which is the robust answer either way.
