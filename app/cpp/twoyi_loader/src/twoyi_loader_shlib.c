@@ -4365,7 +4365,13 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
         "LD_LIBRARY_PATH=/dev:%s/system/lib64:%s/system/lib64/bootstrap:%s/apex/com.android.runtime/lib64:%s/apex/com.android.runtime/lib64/bionic:%s/apex/com.android.runtime/lib64/bootstrap:%s/apex/com.android.art/lib64:%s/apex/com.android.i18n/lib64:%s/vendor/lib64:%s/apex/com.android.os.statsd/lib64:%s/system_ext/lib64:%s/product/lib64",
         g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
 
-    char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 3));
+        // 6-Z305s-j: +4th slot for the NO_PROPS carry (see below) when the
+    // gate is on — without it the shlib's exec hook re-arms the property
+    // hooks in every re-exec'd child (init's selinux_setup/second_stage
+    // re-execs run WITH the shlib the hook re-added and WITHOUT the flag
+    // → the area flush pre-populates ro.* → every later set dies 0xb).
+    int carry_nops = no_props();
+    char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 3 + carry_nops));
     if (!new_envp) {
         // Can't allocate — fall back to environ
         if (!real_execve) return syscall(SYS_execve, exec_path, argv, environ);
@@ -4381,7 +4387,16 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     }
     new_envp[j] = preload_env;
     new_envp[j + 1] = ld_library_path;
-    new_envp[j + 2] = NULL;
+    if (carry_nops) {
+        // 6-Z305s-j: CARRY the gate across the exec — the rebuilt envp
+        // must not silently re-arm the property hooks the caller had
+        // disabled (the caller's own env had the flag; this rebuild
+        // starts from envp minus the LD_* keys and would otherwise DROP it).
+        new_envp[j + 2] = (char *)"TWOYI_SHLIB_NO_PROPS=1";
+        new_envp[j + 3] = NULL;
+    } else {
+        new_envp[j + 2] = NULL;
+    }
 
     write_str(2, "[twoyi_loader] execve: replaced LD_PRELOAD in envp\n");
     int ret;
