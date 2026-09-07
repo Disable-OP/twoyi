@@ -26238,3 +26238,13 @@ NEXT (6-Z305t-14 — the actual fix, scoped carefully):
 4. Then re-run the ladder: expect logd draining → flags_health_check exits → queue advances (nonencrypted/zygote-start/boot) → `start zygote` → RUNG 5.
 
 Honest unverified: the frozen-thread mechanism (attach-stop vs resume bookkeeping) is inferred from the stop-state evidence (nr=-1 / ENTRY-never-resumed), not yet from a targeted code-path trace; the fix MUST be validated against the recovery corpus too (thread handling is shared machinery — the TWRP regression gate).
+
+## 6-Z305t-14a — thread-stop forensics instrumentation (bounded: first 3 stops + paired resumes per new tid)
+
+Instrumentation only, for the next ladder artifact: for every NEW tid, log the first 3 stops (raw status, WSTOPSIG, ptrace event, tracked-set size, per-tid in_syscall) plus the resume outcome for those tids. This pins the exact stop class that gets consumed-without-resume (the logd 2697/2698 pattern from #66) before any state-machine change is attempted.
+
+Commits: (this commit) `diag(ptrace): 6-Z305t-14 — per-tid first-3-stops + resume forensics …`.
+
+Local verification: cargo fmt CLEAN, clippy CLEAN, cargo test --lib 783 passed / 0 failed.
+
+CI: ladder #67 dispatch follows. Expected: the forensics lines around logd's threads (2696-2698-class) show the exact stop status/class and the missing resume; the 6-Z305t-14 fix lands next round.
