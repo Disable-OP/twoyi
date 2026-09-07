@@ -25833,3 +25833,29 @@ Work Log:
 
 Stage Summary:
 - origin/main cf68961. NEXT: verify the two-boot hypothesis in this run's logs; if confirmed (or regardless), land the dev/__properties__ reset in the parent staging (6-Z305s-l), guards + ladder.
+
+## 6-Z305s-l — 0xb READ_ONLY root-caused: probe-gated staging kept boot-1's property area; clean-slate staging is now unconditional
+
+Discovery:
+- 0xb (PROP_ERROR_READ_ONLY) is guest init's OWN rejection: property_service PropertySet finds an existing entry for an ro.* name and replies "Read-only property was already set" (klog verbatim, 6-Z305s-g/k). The wire is real and lands on the guest listener (6-Z305p/q); no kr64/shlib code returns 0xb (comment-only references: ptrace_emu.rs:10721/22666, lib.rs:10400). The rejection site is upstream of everything: the AREA CONTENTS.
+- Staging audit (kr64 run() parent staging): the 6-Z196/6-Z272m clean-slate branch (remove stale files, recreate dir 0777, pre-create NOTHING) was gated on boot_recovery || guest_new_prop_format; guest_new_prop_format comes from probe_init_new_property_format (lib.rs:5033), which byte-scans {rootfs}/init for the "properties_serial"/"property_info" literals. A real DYNAMIC AOSP system init embeds NEITHER (they live in its libc.so) — TWRP's static init embeds both — so every Boot-Ladder system boot probed OLD and fell into the legacy else branch (pre-fix lib.rs 8800-8903): pre-create host+rootfs property_info/properties_serial, never remove stale files.
+
+Hypothesis (6-Z305s-k): two-boot persistence SUPPORTED, mechanism pinned. {rootfs}/dev/__properties__ is a persistent host directory; in system mode the area is a real MAP_SHARED file (ced49ce) and the vfs materialize-on-open SKIPS existing files (vfs.rs:2135 "Task 6-Z skip"), so boot #1's populated properties_serial survives into any later boot (CI retry, app restart, re-run) and init's 6-Z61 O_EXCL-stripped serial open maps the stale content → every ro.boottime.*/ro.cold_boot_done set dies 0xb. Shlib writers ruled out: NO_PROPS gate verified end-to-end (shlib.c:3967-3999, 4372-4395 carry; kr64 lib.rs:10394-10406); the direct prop_set list (shlib.c:6427+) touches only the shlib-private in-memory table.
+
+Implementation (app/rs/kr64/src/lib.rs, run() parent staging):
+- Gate "} else if cfg.boot_recovery || guest_new_prop_format {" → "} else {": clean-slate staging is now UNCONDITIONAL (fresh-tmpfs /dev semantics) for every guest except the old-format recovery single-file branch — untouched, along with its real-host dir guard (host /dev/__properties__ never reset).
+- Legacy pre-create branch deleted (~107 lines) with an in-place rationale comment; log strings updated to "clean property area (fresh-tmpfs /dev semantics — 6-Z196/6-Z305s-l)".
+- Live-dependency check before deletion: none found (repo-wide grep — shlib creates host property_info itself with O_CREAT at shlib.c:3941/6398; no reader requires pre-existing empty files; on real-Android/redroid hosts /dev/__properties__ pre-exists by construction).
+- Untouched: NO_PROPS gate, MAP_SHARED system-mode area, vfs selection, shlib, recovery TWRP branches (idempotent — they already ran the clean path).
+
+Commit: 47eb99c (+30/−107, app/rs/kr64/src/lib.rs).
+
+CI: kr64-tests (cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test --no-fail-fast) auto-runs on push → run 34080718469. Ladder ui-e2e-android-arm64 dispatched via workflow_dispatch → HTTP 204 → run 34080741665 (https://github.com/Disable-OP/twoyi/actions/runs/34080741665), head 47eb99c.
+
+Evidence — honest split: locally proven = code-path analysis + full diff review (cargo ABSENT in this sandbox — no local fmt/clippy/test; the CI gate is the compile/test authority). NOT yet proven = an actual ARM64 boot clearing rung-4: green CI ≠ booted. Expected ladder signatures: "[KR64] PARENT: clean property area (fresh-tmpfs /dev semantics …) — NO files pre-created" on system boots (and NO "property files pre-created on host + rootfs" line), then ro.cold_boot_done lands → wait_for_coldboot_done clears → class_start core → fleet → zygote (rung 5).
+
+Remaining (next decodes):
+- shlib __system_property_area_init hook (twoyi_loader_shlib.c:3935) is an UNGATED stub (returns 0 without the real bionic area init) — next-decode flag: confirm benign under NO_PROPS or gate it.
+- Confirm the boot-twice trigger from the ladder log: count "guest init property-format probe" lines (two sequences = in-job re-boot) and confirm the clean-slate line fires per boot.
+- End-state candidate: probe-false system boots still get Vfs::new_android (Dynamic properties_serial node + 6-Z61 O_EXCL strip); the 6-Z272m walleye evidence (186× 0x24) suggests a new_recovery_new_format()-style VFS (NO property entries, guest-owned files) may be the cleaner terminal design for real AOSP init.
+---
