@@ -3296,8 +3296,18 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             int rc = (int)syscall(SYS_connect, sockfd, &real_logdw, sizeof(real_logdw));
             (void)rc; // 6-Z305t-25: probe only — the kmsg redirect wins in ALL modes
             // No listener (recovery) — fall through to the kmsg redirect.
-            char kmsg_path[600];
-            snprintf(kmsg_path, sizeof(kmsg_path), "%s/dev/__kmsg__", g_rootfs);
+            // 6-Z305t-30: the kmsg path is now the GUEST-absolute
+            // "/dev/__kmsg__" (the tracer translates it, exactly like the
+            // fb_hook's own raw opens). The previous {g_rootfs}/dev/
+            // __kmsg__ HOST-absolute path went through the openat
+            // translation as an already-host path and the fd result was
+            // never logged — with the open failing silently the hook fell
+            // through to the REAL logd connect (logd IS listening in
+            // system boots) and every liblog line vanished into logd's
+            // uncapturable ring (ladders #82-#88: zero liblog records in
+            // the klog). The fd value is now logged (2/process).
+            char kmsg_path[64];
+            snprintf(kmsg_path, sizeof(kmsg_path), "/dev/__kmsg__");
             static int logdw_redirect_diag = 2;
             if (logdw_redirect_diag > 0) {
                 logdw_redirect_diag--;
@@ -3320,6 +3330,16 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             // lands in /dev/__kmsg__: unbounded, non-blocking, and the
             // log lines still land in the kmsg artifacts.
             int kmsg_fd = (int)syscall(NR_openat, AT_FDCWD, kmsg_path, O_WRONLY, 0);
+            if (kmsg_fd < 0 && logdw_redirect_diag >= 0) {
+                /* 6-Z305t-30: the open result is now on the record — a
+                 * failing kmsg open means the real-connect fall-through
+                 * (logd's uncapturable ring) happened silently before. */
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                    "[twoyi_loader] kmsg openat FAILED errno=%d\n",
+                    -(int)kmsg_fd == 0 ? (int)errno : (int)-kmsg_fd);
+                write_str(2, msg);
+            }
             if (kmsg_fd >= 0) {
                 /* 6-Z305t-29: position at END before the dup. Ladder #86
                  * decode: the liblog records WERE reaching the klog file —
