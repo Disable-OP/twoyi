@@ -11999,6 +11999,71 @@ pub fn ptrace_available() -> bool {
     false
 }
 
+// ── 6-Z305t-9: MS_BIND directory materialization (system mode) ──────
+//
+// Recursive HARDLINK of the source tree onto the target (system mode
+// only). The 6-Z305e no-op arm (mountpoint dirs only) is right for
+// /mnt/user-style alias binds, but WRONG for content-overlays the guest
+// reads back: Android 11 early-init does `mount none
+// /linkerconfig/bootstrap /linkerconfig bind rec` so the bionic
+// linker's DEFAULT config path /linkerconfig/ld.config.txt serves the
+// bootstrap config — with the no-op arm the path never existed → the
+// linker ran with NO config → legacy namespace search →
+// /apex/<name>/lib64 unreachable → lmkd CANNOT LINK libstatssocket.so
+// (DT_NEEDED "needed by main executable") at exec → critical ×4 →
+// InitFatalReboot (ladder 34122651985/#60). The generated bootstrap
+// config ALREADY carries namespaces for every flattened apex (it was
+// generated in-guest from the real /apex listing) — only the bind VIEW
+// was missing. Hardlinks keep content live across src/tgt (the closest
+// honest analog of a bind on a no-mount() container); copy is the
+// per-entry fallback; symlinks are recreated as symlinks. MERGE
+// semantics (existing target entries remain where a real bind would
+// hide them) — a superset view, documented divergence. RECOVERY keeps
+// the no-op arm (TWRP regression rule).
+pub(crate) fn materialize_bind_tree(src: &str, tgt: &str) -> std::io::Result<usize> {
+    fn rec(src: &str, tgt: &str, depth: usize, count: &mut usize) -> std::io::Result<()> {
+        const MAX_DEPTH: usize = 64;
+        const MAX_ENTRIES: usize = 50_000;
+        if depth > MAX_DEPTH || *count > MAX_ENTRIES {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let s = entry.path();
+            let name = entry.file_name();
+            let t = std::path::Path::new(tgt).join(&name);
+            let ft = entry.file_type()?;
+            if ft.is_symlink() {
+                let target = std::fs::read_link(&s)?;
+                let _ = std::fs::remove_file(&t);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, &t)?;
+                *count += 1;
+            } else if ft.is_dir() {
+                std::fs::create_dir_all(&t)?;
+                *count += 1;
+                rec(
+                    s.to_str().unwrap_or(""),
+                    t.to_str().unwrap_or(""),
+                    depth + 1,
+                    count,
+                )?;
+            } else if ft.is_file() {
+                let _ = std::fs::remove_file(&t);
+                if std::fs::hard_link(&s, &t).is_err() {
+                    std::fs::copy(&s, &t)?;
+                }
+                *count += 1;
+            }
+        }
+        Ok(())
+    }
+    let mut count = 0usize;
+    std::fs::create_dir_all(tgt)?;
+    rec(src, tgt, 0, &mut count)?;
+    Ok(count)
+}
+
 pub fn run_ptrace_loop(
     pid: libc::pid_t,
     rootfs: &str,
@@ -18958,6 +19023,30 @@ pub fn run_ptrace_loop(
                             } else {
                                 None
                             };
+                            // 6-Z305t-9: tree materialization BEFORE the
+                            // mountpoint-only pass (which stays for its
+                            // recovery semantics).
+                            if !boot_recovery {
+                                if let (Some(s), Some(t)) = (src.as_deref(), tgt.as_deref()) {
+                                    if !s.is_empty() && !t.is_empty() && s != t {
+                                        let src_real = format!("{}{}", rootfs, s);
+                                        let tgt_real = format!("{}{}", rootfs, t);
+                                        if std::path::Path::new(&src_real).is_dir() {
+                                            match materialize_bind_tree(&src_real, &tgt_real) {
+                                                Ok(n) if n > 0 => log(&format!(
+                                                    "6-Z305t-9: bind tree materialized {} → {} ({} entries, hardlink w/ copy fallback, merge semantics)",
+                                                    src_real, tgt_real, n
+                                                )),
+                                                Ok(_) => {}
+                                                Err(e) => log(&format!(
+                                                    "6-Z305t-9: bind tree materialize FAILED {} → {}: {}",
+                                                    src_real, tgt_real, e
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             for gp in [src.as_deref(), tgt.as_deref()].into_iter().flatten() {
                                 if gp.starts_with('/') {
                                     let real = format!("{}{}", rootfs, gp);
@@ -37459,5 +37548,58 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             assert_eq!(ABI_X86_32.setxattr, 226);
             assert_eq!(ABI_X86_32.lsetxattr, 227);
         }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn z305t9_materialize_bind_tree() {
+        // 6-Z305t-9: the bind materialization must reproduce the source
+        // tree under the target (files via hardlink, dirs, symlinks as
+        // symlinks) with MERGE semantics (existing target entries stay),
+        // and be idempotent-enough (a second call re-links the same
+        // entries without duplication).
+        let base = std::env::temp_dir().join(format!("twoyi-bindtree{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let tgt = base.join("tgt");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(&tgt).unwrap();
+        std::fs::write(src.join("ld.config.txt"), b"config").unwrap();
+        std::fs::write(src.join("sub").join("inner"), b"inner").unwrap();
+        std::os::unix::fs::symlink("ld.config.txt", src.join("alias")).unwrap();
+        // Pre-existing target entry — MERGE semantics must keep it.
+        std::fs::write(tgt.join("default.txt"), b"default").unwrap();
+
+        let n = super::materialize_bind_tree(src.to_str().unwrap(), tgt.to_str().unwrap())
+            .expect("materialize_bind_tree");
+        assert_eq!(n, 4, "file + subdir + inner + symlink");
+
+        assert_eq!(
+            std::fs::read(tgt.join("ld.config.txt")).unwrap(),
+            b"config",
+            "content overlay missing at the target"
+        );
+        assert_eq!(
+            std::fs::read(tgt.join("sub").join("inner")).unwrap(),
+            b"inner"
+        );
+        let link = std::fs::read_link(tgt.join("alias")).unwrap();
+        assert_eq!(link.to_str().unwrap(), "ld.config.txt");
+        assert_eq!(std::fs::read(tgt.join("default.txt")).unwrap(), b"default");
+
+        // Content-liveness (hardlink semantics): rewrite via the SOURCE,
+        // read through the TARGET.
+        std::fs::write(src.join("ld.config.txt"), b"config2").unwrap();
+        assert_eq!(
+            std::fs::read(tgt.join("ld.config.txt")).unwrap(),
+            b"config2",
+            "hardlink content-liveness broken"
+        );
+
+        // Second call: no duplication, no error.
+        let n2 = super::materialize_bind_tree(src.to_str().unwrap(), tgt.to_str().unwrap())
+            .expect("materialize_bind_tree (2nd)");
+        assert_eq!(n2, 4);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
