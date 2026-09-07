@@ -796,7 +796,23 @@ pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
     // return must not skip a missing property.
     let needs_apexd_status = !existing.contains("apexd.status=activated");
     let needs_apex_updatable = !existing.contains("ro.apex.updatable=false");
-    if !needs_apexd_status && !needs_apex_updatable {
+    // 6-Z305t-11: the /data tree in this container is the app's private
+    // merged rootfs — unencrypted BY DEFINITION. Guest init's
+    // `on zygote-start && property:ro.crypto.state=<val>` sections are
+    // the ONLY path that calls `start zygote` (init.rc:824/832/840), and
+    // do_mount_all's own SetProperty("ro.crypto.state", …) only fires
+    // for the mount_all codes we can no longer produce once the merged-
+    // rootfs mount no-ops are in place (the observed mount_all outcome
+    // was a silent non-branch code; ladder #62-#64). Pre-set the honest
+    // container value here. The 2026-08-11 SIGABRT worry in the old
+    // comment (createProcessGroup failing for zygote-start-started
+    // services) is obsolete: that failure is understood and tolerated as
+    // a warning since the 6-Z305-era decodes, and the "loader pre-set of
+    // vold.decrypt=trigger_restart_framework" fallback this function
+    // used to rely on DOES NOT EXIST anywhere in the tree — the path was
+    // dead documentation.
+    let needs_crypto_state = !existing.contains("ro.crypto.state=");
+    if !needs_apexd_status && !needs_apex_updatable && !needs_crypto_state {
         info!(
             "[KR64][proc_emu] {} already contains both boot preset properties — skip append",
             build_prop_path
@@ -837,6 +853,15 @@ pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
              # loop-backed ext4 mounts — and therefore no\n\
              # reboot_on_failure reboot (bootstrap-apexd-failed).\n\
              ro.apex.updatable=false\n",
+        );
+    }
+    if needs_crypto_state {
+        append_block.push_str(
+            "# 6-Z305t-11: the container /data is the app's private merged rootfs —\n\
+             # unencrypted by definition. This value gates init's\n\
+             # `on zygote-start && property:ro.crypto.state=…` sections,\n\
+             # which are the only `start zygote` call sites (init.rc:824-840).\n\
+             ro.crypto.state=unsupported\n",
         );
     }
 
