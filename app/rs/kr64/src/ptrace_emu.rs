@@ -9411,6 +9411,34 @@ fn stall_forensic_dump(pid: libc::pid_t) {
         pid, nr, a0, a1, a2, sp, pc, region
     ));
 
+    // 6-Z305t-14b: fd-table forensics for stalled threads. The #66/#67
+    // liblog wedges (flags_health_check blocked in ppoll via liblog's
+    // logd write) need the STALLED thread's fd set — the exec'd services'
+    // stderr is /dev/null so the shlib's connect-path diags are
+    // swallowed; the fd table names the actual socket/file the poll sits
+    // on. Bounded: first 24 fds, one dump per (pid) per stall class
+    // (the 271f dump itself is already capped upstream).
+    {
+        let mut fd_lines = 0usize;
+        for fd in 0..24i32 {
+            if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
+                fd_lines += 1;
+                crate::trace_log_line(&format!(
+                    "6-Z305t-14b STALL-FD: pid={} fd {} -> {}",
+                    pid,
+                    fd,
+                    target.display()
+                ));
+            }
+        }
+        if fd_lines > 0 {
+            crate::trace_log_line(&format!(
+                "6-Z305t-14b STALL-FD: pid={} ({} fds listed)",
+                pid, fd_lines
+            ));
+        }
+    }
+
     // 6-Z282: ppoll/poll fd-array naming — the LineageOS recovery's main
     // loop parks in ppoll for its whole life with a SINGLE drawn frame and
     // ZERO named graphics opens (runs 33846196526/33848918462/33868066820:
@@ -13669,7 +13697,7 @@ pub fn run_ptrace_loop(
         // THIS resume never fires (or fires with ESRCH), the state-machine
         // miss is pinned to the exact stop class.
         if let Some(c) = thread_stop_diag.get(&current_pid) {
-            if *c <= 3 {
+            if *c < 3 {
                 log(&format!(
                     "6-Z305t-14: tid {} resume ret={} (stop #{} seen, skip_was={})",
                     current_pid, r, c, resume_signal,
