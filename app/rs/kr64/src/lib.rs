@@ -5301,6 +5301,22 @@ fn normalize_linkerconfig_perms(rootfs: &str) {
 }
 
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
+    // 6-Z305t-3: 6-Z305s-a set umask(0o022) in the CHILD only (pre-execve
+    // of init). Guest file creations the TRACER performs itself (emulated
+    // syscall paths, pseudo-mount materialization — e.g. linkerconfig's
+    // early-init write of /linkerconfig/bootstrap/ld.config.txt) execute
+    // in THIS parent process with the host APP's umask (redroid: 000), so
+    // the file landed 0666 and init's ReadFile still rejected it:
+    // "Skipping insecure file" (pinned condition: system/core/init
+    // util.cpp ReadFile — S_IWGRP|S_IWOTH on the SOURCE file, see
+    // docs/reference/aosp-init/util.cpp:168) → no default/ld.config.txt
+    // → CANNOT LINK libstatssocket.so (run 34095981723). Setting the same
+    // INIT_FS umask here covers the tracer context too; mode bits only —
+    // uid stays the app uid (rootless unchanged), nothing in kr64 or the
+    // guest relies on group/world-writable files.
+    unsafe {
+        libc::umask(0o022);
+    }
     // 6-Z260: anchor the boot clock as the very first action so every
     // subsequent log line's [+Nms] prefix measures from daemon start.
     boot_clock_init();
