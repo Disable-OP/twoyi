@@ -22652,7 +22652,21 @@ pub fn run_ptrace_loop(
                                 // translate_path rewrites it) —
                                 // is_properties_path() matches the final
                                 // component `__properties__` in both cases.
-                                if is_properties_path(&p) {
+                                if is_properties_path(&p) && boot_recovery {
+                                    // 6-Z305s-h: TWRP-mode ONLY. In system
+                                    // mode the property area must stay a REAL
+                                    // file-backed MAP_SHARED mapping (the
+                                    // tracer-served /dev/__properties__ files
+                                    // are real host files) — the anon|private
+                                    // rewrite + area-write broadcaster are
+                                    // TWRP-era machinery that made every
+                                    // re-exec'd init see ro.* props as
+                                    // "already set" against the now-working
+                                    // real property wire (ladder runs
+                                    // 34071327829/34072797380: "Read-only
+                                    // property was already set" on init's own
+                                    // .prop load; ro.cold_boot_done never
+                                    // landable).
                                     properties_fd = Some(ret as i32);
                                     log(&format!(
                                         "DIAG properties fd captured: open() returned fd={} for {} — subsequent mmap2 with MAP_SHARED on this fd will be rewritten to MAP_ANONYMOUS|MAP_PRIVATE",
@@ -22670,7 +22684,12 @@ pub fn run_ptrace_loop(
                                 // mmap address is what the broadcaster
                                 // writes into). Survives close by
                                 // design — the mapping outlives the fd.
-                                if is_property_area_file(&p) {
+                                if is_property_area_file(&p) && boot_recovery {
+                                    // 6-Z305s-h: TWRP-mode ONLY (see the
+                                    // properties_fd capture above) — the
+                                    // broadcaster is inert in system mode;
+                                    // the real MAP_SHARED wire serves the
+                                    // area honestly.
                                     property_area_fds.insert((pid, ret as i32));
                                     if prop_area_log_count < PROP_AREA_LOG_CAP {
                                         prop_area_log_count += 1;
