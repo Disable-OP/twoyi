@@ -25777,3 +25777,18 @@ Stage Summary:
 - origin/main 367c1ac. This session landed (chronological): bd9d68d (umask 022 + tracer envp injection) → 593726f (guest-only LD_LIBRARY_PATH) → 7300b5f (init excluded from injection) → b7a1cc6 (TWOYI_SHLIB_NO_PROPS property gate) → 7788553 (canonical-rootfs under_rootfs) → e456cb7 (shlib translation fully gated) → 76c1f91 (6-Z305t part 1: pure-Rust ext4 reader, smoke-verified on a real payload). Every recovery guard stayed green across all seven.
 - Boot progression this session: park-at-early-init (1.4s) → rung-4 fleet-death-at-105s → selinux-policy FATAL → wait_for_coldboot_done park ×2 → the property wire NOW reaches init's own listener and the set is rejected by a named, extractable error. The CANNOT LINK class is extinct (boringssl self-tests pass with the shlib; linkerconfig/apexd-bootstrap exit 0).
 - NEXT (6-Z305s-g): 1. decode the full property-set rejection message; 2. 6-Z305t part 2 — wire apex flattening into staging (the ext4 reader is landed + verified); 3. guards + ladder.
+
+---
+Task ID: 6-Z305s-g (ladder 34071327829/34072797380 decode — property-area root cause)
+Agent: Z.ai Code (main dispatcher)
+Task: decode the property-set rejection to its root cause.
+
+Work Log:
+- Client-side errors (bionic tag "libc", verbatim): Unable to set property "ro.gsid.image_running"/"ro.boottime.ueventd"/"ro.cold_boot_done" ... error code — init's service replied nonzero; 6-Z305q confirms the connect lands on the GUEST listener.
+- Init-side klog, verbatim: "<3>init: Could not set 'ro.hardware' to 'goldfish' while loading .prop files / Read-only property was already set" — init's OWN .prop load collides with its area.
+- AREA FORENSICS: 6-Z111 logs show properties_serial opened size=0 by init (2666, +198ms) then size=131072 (POPULATED) by 2671/2672/2673/2674 (+273ms+) — the 6-Z111 mechanism rewrites the area mmap MAP_SHARED → ANON|PRIVATE and runs an "area-write broadcaster" that flushes anon-area writes into the backing FILES; each re-exec'd init then copies the populated file back into a fresh anon area — every ro.* set after the first stage collides with "already set" (ro.cold_boot_done included — init can never accept ueventd's set).
+- ROOT CAUSE CLASS: TWRP-era property-area virtualization (MAP_SHARED rewrite + broadcaster) is incompatible with the now-working REAL property wire in system mode. Real Android semantics = a real shared file mapped MAP_SHARED by every process — the tracer-served /dev/__properties__ files ARE real host files, so plain MAP_SHARED works honestly with no tracer involvement.
+
+Stage Summary:
+- origin/main 853c4e9 (+ this commit). NEXT (6-Z305s-h, smallest fix first): gate the 6-Z111 MAP_SHARED rewrite + area-write broadcaster OFF in system mode (the SAME NO_PROPS-style gate the tracer already injects), letting real MAP_SHARED area semantics serve every process; expect ro.cold_boot_done to land → wait_for_coldboot_done clears → on init/late-init → mount_all → class_start core → fleet → zygote (rung 5). Then 6-Z305t part 2 (apex flattening wiring) for the APEX-lib consumers.
+- Session-2 landed commits: 7300b5f (init-skip) → b7a1cc6 (NO_PROPS gate) → 7788553 (canonical rootfs) → e456cb7 (translation gate) — all guards green, all pushed.
