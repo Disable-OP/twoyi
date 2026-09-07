@@ -3295,19 +3295,19 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             strncpy(real_logdw.sun_path, logdw_path, sizeof(real_logdw.sun_path) - 1);
             int rc = (int)syscall(SYS_connect, sockfd, &real_logdw, sizeof(real_logdw));
             (void)rc; // 6-Z305t-25: probe only — the kmsg redirect wins in ALL modes
-            // No listener (recovery) — fall through to the kmsg redirect.
-            // 6-Z305t-30: the kmsg path is now the GUEST-absolute
-            // "/dev/__kmsg__" (the tracer translates it, exactly like the
-            // fb_hook's own raw opens). The previous {g_rootfs}/dev/
-            // __kmsg__ HOST-absolute path went through the openat
-            // translation as an already-host path and the fd result was
-            // never logged — with the open failing silently the hook fell
-            // through to the REAL logd connect (logd IS listening in
-            // system boots) and every liblog line vanished into logd's
-            // uncapturable ring (ladders #82-#88: zero liblog records in
-            // the klog). The fd value is now logged (2/process).
-            char kmsg_path[64];
-            snprintf(kmsg_path, sizeof(kmsg_path), "/dev/__kmsg__");
+            // 6-Z305t-33: the kmsg path MUST be the HOST-absolute
+            // {g_rootfs}/dev/__kmsg__ — the shim's own opens are
+            // hook-marked (6-Z187c: left UNtranslated, "known-good host
+            // path"), so a guest-style "/dev/__kmsg__" here opens the
+            // HOST's /dev node (ladders #90/#91: the fd tests returned 37
+            // but the bytes went to the host's /dev/__kmsg__, not the
+            // rootfs file the artifacts capture). #89 PROVED the
+            // host-absolute path lands in the captured file (the marker
+            // was found mid-file with liblog records around it). g_rootfs
+            // is correct since 6-Z305t-27. O_APPEND when accepted
+            // (atomic append), else O_WRONLY + lseek(SEEK_END).
+            char kmsg_path[600];
+            snprintf(kmsg_path, sizeof(kmsg_path), "%s/dev/__kmsg__", g_rootfs);
             static int logdw_redirect_diag = 2;
             if (logdw_redirect_diag > 0) {
                 logdw_redirect_diag--;
