@@ -4846,9 +4846,26 @@ static void ensure_selinuxfs_files(void) {
 }
 
 // Check if a path should be translated to rootfs
+static int no_props(void); // 6-Z305s-e forward decl (defined at the property-hooks block)
 static int should_translate(const char *path) {
     if (!path || !g_rootfs || path[0] != '/') return 0;
     if (strncmp(path, g_rootfs, strlen(g_rootfs)) == 0) return 0;
+    // 6-Z305s-e: when the NO_PROPS gate is set (the kr64 6-Z305s tracer
+    // arm injected the shlib into an AOSP/system boot), the TRACER owns
+    // ALL path translation — every syscall of every traced guest process
+    // goes through vfs.translate_guest. The shlib's own prefixing then
+    // only DOUBLE-translates: its g_rootfs is the CANONICAL rootfs form
+    // (/data/data/<pkg>/rootfs) which the tracer's per-rule checks did
+    // not universally recognize (run 34072088587: the property socket
+    // connect pre-prefixed by this hook, re-prefixed by the 6-Z305q arm
+    // → ENOENT → writev ENOTCONN → "Unable to set property
+    // ro.cold_boot_done" → init parked at wait_for_coldboot_done again).
+    // With the gate on, this hook chain passes paths through RAW and the
+    // tracer translates each syscall exactly once; the binder/qemu-pipe
+    // OPEN FALLBACKS below are independent of should_translate and keep
+    // working (their device paths are translated by the tracer, the raw
+    // open ENXIOs on the proxy socket file, and the fallback connects).
+    if (no_props()) return 0;
     // Host-only paths — do NOT translate (these are virtual or host-specific)
     // IMPORTANT: Use boundary checks (path[N] == 0 || path[N] == '/') to avoid
     // matching paths that just start with the same prefix.
