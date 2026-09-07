@@ -5212,6 +5212,67 @@ fn flatten_one_apex(
     Ok(n)
 }
 
+/// 6-Z305t-2 (commit 2): normalize permissions of the persistent
+/// /linkerconfig tree. Runs BEFORE the 6-Z305s-a umask(0o022) fix
+/// persisted files with the host app's umask (redroid runners: 000 →
+/// 0666); init's ReadFile refuses group/world-writable inputs, so
+/// early-init's `copy /linkerconfig/bootstrap/ld.config.txt
+/// /linkerconfig/default/ld.config.txt` failed with "Skipping insecure
+/// file" (run 34091671773 kmsg) and no default linker config existed.
+/// Dirs → 0755, *.txt → 0644; one bounded line only when files were
+/// fixed. Cheap no-op on clean trees.
+fn normalize_linkerconfig_perms(rootfs: &str) {
+    let lc_dir = format!("{}/linkerconfig", rootfs);
+    if !Path::new(&lc_dir).is_dir() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixed = 0usize;
+        let mut stack = vec![lc_dir];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                match entry.file_type() {
+                    Ok(ft) if ft.is_dir() => {
+                        let _ =
+                            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+                        stack.push(p);
+                    }
+                    Ok(ft) if ft.is_file() => {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if !name.ends_with(".txt") {
+                            continue;
+                        }
+                        let mode = std::fs::metadata(&p)
+                            .map(|m| m.permissions().mode() & 0o777)
+                            .unwrap_or(0o644);
+                        if mode != 0o644 {
+                            let _ = std::fs::set_permissions(
+                                &p,
+                                std::fs::Permissions::from_mode(0o644),
+                            );
+                            fixed += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if fixed > 0 {
+            info!(
+                "[KR64] 6-Z305t-2: normalized {} persistent /linkerconfig file(s) to 0644 (init insecure-file check)",
+                fixed
+            );
+        }
+    }
+}
+
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // 6-Z260: anchor the boot clock as the very first action so every
     // subsequent log line's [+Nms] prefix measures from daemon start.
@@ -5945,6 +6006,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // clean trees; recovery has no linkerconfig).
     // ---------------------------------------------------------------
     flatten_apex_payloads(&cfg);
+    normalize_linkerconfig_perms(&cfg.rootfs);
 
     // ---------------------------------------------------------------
     // Step 4: set up mount namespace + bind mounts + tmpfs.
