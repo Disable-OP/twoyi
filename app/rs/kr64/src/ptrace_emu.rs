@@ -14480,31 +14480,48 @@ pub fn run_ptrace_loop(
                 // futex uaddr/op, the futex WORD (a pthread mutex word
                 // holds the owning TID), and the library owning PC.
                 stall_forensic_dump(sp);
-                // 6-Z305t-17: PTRACE_INTERRUPT probe — when the tracee has
-                // been blocked >10 s AND the /proc dump above came back
-                // empty (post-setuid DAC makes /proc/<pid>/{comm,wchan,
-                // syscall,fd,maps} unreadable to the app — ladder #70's
-                // logd pids), the true blocked syscall is invisible. The
-                // tracer relationship grants register access regardless
-                // of uid: interrupt → GETREGS → log → resume exactly as
-                // it was. Budget 6 per pid, 15 s per-pid cooldown.
-                if elapsed.as_secs() >= 10 {
-                    let probe_budget = stall_probe_budget.get(&sp).copied().unwrap_or(0);
-                    let cooldown_ok = match stall_probe_last.get(&sp) {
-                        None => true,
-                        Some(t) => now.duration_since(*t) >= std::time::Duration::from_secs(15),
-                    };
-                    if probe_budget < 6 && cooldown_ok {
-                        stall_probe_budget.insert(sp, probe_budget + 1);
-                        stall_probe_last.insert(sp, now);
-                        if let Some(&abi) = abi_map.get(&sp) {
-                            // The probe consumes an out-of-band stop and
-                            // resumes the tracee — its next stop (the EXIT
-                            // of the blocked syscall) arrives via the main
-                            // waitpid with the in_syscall bookkeeping
-                            // unchanged.
-                            stall_interrupt_probe(sp, &abi);
-                        }
+            }
+        }
+
+        // ── 6-Z305t-17b: PTRACE_INTERRUPT probe pass — INDEPENDENT of the
+        // 271d STALL-line budget ────────────────────────────────────────
+        //
+        // Ladder #73 decode: the probe nested inside the stall scan NEVER
+        // fired — the scan's filter (`stall_log_budget < 4`) excludes
+        // budget-exhausted pids, and logd's 4 STALL lines burned out at
+        // +8.2 s, BEFORE the probe's 10 s threshold. The probe therefore
+        // gets its OWN pass over last_stop_at: any tracee blocked-in-
+        // syscall >=10 s (regardless of its STALL-line budget) is probed
+        // under its own budget (6/pid, 15 s cooldown).
+        if stall_tick % 256 == 0 {
+            let now = std::time::Instant::now();
+            let probe_candidates: Vec<(libc::pid_t, std::time::Duration)> = last_stop_at
+                .iter()
+                .filter(|(p, t)| {
+                    now.duration_since(**t) >= std::time::Duration::from_secs(10)
+                        && in_syscall_map.get(*p).copied().unwrap_or(false)
+                })
+                .map(|(p, t)| (*p, now.duration_since(*t)))
+                .collect();
+            for (sp, _elapsed) in probe_candidates {
+                let probe_budget = stall_probe_budget.get(&sp).copied().unwrap_or(0);
+                let cooldown_ok = match stall_probe_last.get(&sp) {
+                    None => true,
+                    Some(t) => now.duration_since(*t) >= std::time::Duration::from_secs(15),
+                };
+                if probe_budget < 6 && cooldown_ok {
+                    stall_probe_budget.insert(sp, probe_budget + 1);
+                    stall_probe_last.insert(sp, now);
+                    if let Some(&abi) = abi_map.get(&sp) {
+                        // The probe consumes an out-of-band stop and
+                        // resumes the tracee — its next stop (the EXIT of
+                        // the blocked syscall) arrives via the main
+                        // waitpid with the in_syscall bookkeeping
+                        // unchanged. The tracer relationship grants
+                        // register access regardless of the tracee's
+                        // (post-setuid) uid — the instrument that works
+                        // exactly where every /proc-based one fails.
+                        stall_interrupt_probe(sp, &abi);
                     }
                 }
             }
