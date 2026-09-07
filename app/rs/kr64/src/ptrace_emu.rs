@@ -12268,6 +12268,19 @@ pub fn run_ptrace_loop(
     const RECENT_STOPS_CAP: usize = 16;
     let mut recent_stops: std::collections::VecDeque<RecentStopRecord> =
         std::collections::VecDeque::new();
+    // 6-Z305t-14: THREAD-stop forensics — the rung-4→5 gate is frozen
+    // guest THREADS (ladder #66: logd's TIDs 2697 stuck at its attach
+    // stop with nr=-1 and 2698 consumed at ENTRY nr=63 (uname) and never
+    // resumed → logd's logdw reader never drains → every liblog client
+    // wedges in its retry-poll → init's synchronous exec inside
+    // load_persist_props_action blocks forever → the action queue stalls
+    // → zygote unreachable). For every NEW tid, log the first 3 stops
+    // (raw status + WSTOPSIG + ptrace event + the tracked-set size) and
+    // the resumes issued for it, so the exact state-machine miss (which
+    // stop class was consumed, which resume went where) is visible in
+    // the next ladder artifact.
+    let mut thread_stop_diag: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
     // 6-Z266: real-tgid cache for the kill-family fake-pid translation.
     // Filled lazily per tracee (one /proc/<pid>/status read per pid per
     // boot); cleared never — tracee tgids are immutable for the life of
@@ -13651,6 +13664,18 @@ pub fn run_ptrace_loop(
                 )
             }
         };
+        // 6-Z305t-14: resume-side correlation for NEW tids — pairs with
+        // the stop-side forensics above. If a tid's stop was consumed but
+        // THIS resume never fires (or fires with ESRCH), the state-machine
+        // miss is pinned to the exact stop class.
+        if let Some(c) = thread_stop_diag.get(&current_pid) {
+            if *c <= 3 {
+                log(&format!(
+                    "6-Z305t-14: tid {} resume ret={} (stop #{} seen, skip_was={})",
+                    current_pid, r, c, resume_signal,
+                ));
+            }
+        }
         // 6-Z211j REVERTED: the round-robin resume was COUNTERPRODUCTIVE —
         // it CONSUMED the parent's syscall-stops by blindly calling
         // PTRACE_SYSCALL on ANY stopped tracked pid. When the parent was
@@ -14529,6 +14554,26 @@ pub fn run_ptrace_loop(
         // Check if the child was stopped by a signal.
         if libc::WIFSTOPPED(status) {
             let sig = libc::WSTOPSIG(status);
+            // 6-Z305t-14: per-tid first-3-stops forensics (see the map's
+            // declaration). Emits BEFORE any classification so the raw
+            // kernel truth is on the record even if a later arm
+            // misroutes the resume.
+            {
+                let c = thread_stop_diag.entry(pid).or_insert(0);
+                if *c < 3 {
+                    *c += 1;
+                    log(&format!(
+                        "6-Z305t-14: tid {} stop #{} status=0x{:08x} WSTOPSIG={} event={} ({} tracked, in_syscall={} for this tid) — about to classify",
+                        pid,
+                        *c,
+                        status as u32,
+                        sig,
+                        (status as u32) >> 16,
+                        tracked_pids.len(),
+                        in_syscall_map.get(&pid).copied().unwrap_or(false),
+                    ));
+                }
+            }
 
             // ── Task 6-S: ptrace event stops (fork/clone/vfork/exec/exit) ──
             //
