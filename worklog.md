@@ -26547,3 +26547,17 @@ Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 
 CI: ladder #85 dispatch follows. Expected: the shim's g_rootfs matches the real tree → binder_proxy_connect succeeds → libbinder clients get REAL proxy fds → the "could not be opened" aborts vanish → zygote/audioserver/cameraserver/drm/gatekeeperd stop crash-looping → the queue advances toward system_server (rung 6). If zygote STILL exits 1: its own abort/exit reason is now visible via the abort-message scan + svclogs.
 
 Honest unverified: no local ARM64 runtime; the /dev/null-fallback fd's negotiation behavior with un-marked fds is inferred — the ROOTFS injection removes the dominant failure path regardless.
+
+## 6-Z305t-28 — checkpoint: the park era is over, the boot fails forward, and the frontier is hwservicemanager's exit(1) crash-loop; the decode plan
+
+State after #80–#86 (runs 34156521892 → 34164191290):
+- 6-Z305t-24/25/26/26b/27 all landed and VERIFIED WORKING: service-stdio capture (svclogs.txt), unconditional logdw→kmsg redirect, the self-describing abort-message dump, and the TWOYI_ROOTFS service-env injection (g_rootfs now correct — the #84 "Binder driver could not be opened" ×9 class is GONE in #86: zero abort messages at all).
+- The boot now reaches: zygote started (+2.8 s, sockets created), the class-main/early_hal fleet launched, zygote's onrestart actions executing. zygote itself gets SIGKILLed/exits 1 in a restart loop; hwservicemanager exits 1 ×4 → "<2>init: critical process 'hwservicemanager' exited 4 times before boot completed" → InitFatalReboot → rung 3 post-mortem (the run ends at the guest's honest reboot).
+- REMAINING INSTRUMENTATION GAP: zero liblog records reach the klog DESPITE the logdw→kmsg redirect firing in ~11 processes (the klog file is 100% init-text; no binary logger_entry blobs, no glog text). The shim's stderr glog mirror works for the services that write stderr (gatekeeperd/dumpstate/camera-provider seen), so the capture channel is proven — the liblog→kmsg write path specifically does not deliver. THE NEXT DECODE: why writev(sockfd-after-dup3(kmsg)) never lands (fd identity? the tracer's writev handling of the dup'd fd? a liblog-side fallback?), and hwservicemanager's exact exit(1) line (its svclog is empty — it logs via liblog only).
+
+Next steps (in order):
+1. Instrument the dup3'd-kmsg write path: the shim, after dup3, performs ONE kmsg write of a marker ("[twoyi_loader] logdw fd test") — if it lands, the fd is good and the miss is liblog-side (its own fd bookkeeping, e.g. it caches the connect result per-priority and never re-connects after our rewrite, or it writev()s a DIFFERENT fd); if it does not land, the tracer is eating the write (6-Z305t-24's /dev/null redirect? the writev translation path?).
+2. hwservicemanager exit(1): check whether it is in the shim-loaded set (the svclog grep capture now names processes by content); if it is, its own ProcessState open fails differently — decode from its klog/svclog lines once (1) fixes visibility.
+3. The "Pointer tag … truncated" aborts (7×) remain parked — bionic tagged-pointer checks firing somewhere in the virtualized environment.
+
+Honest unverified: all of the above is instrument-first; no local ARM64 runtime.
