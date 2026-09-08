@@ -8704,6 +8704,27 @@ fn is_kmsg_path(path: &str) -> bool {
     path.rsplit('/').next() == Some("__kmsg__")
 }
 
+/// 6-Z305t-40: is this path a BINDER device node open? #97 decode: the
+/// guest's servicemanager FATALs with libbinder's verbatim "Binder driver
+/// '/dev/binder' could not be opened. Terminating." and the shim emits ZERO
+/// binder diagnostics for it — the open's fate (which node it resolved to,
+/// what the kernel answered) is the one unlogged link in the virtual-binder
+/// chain. Mirrors is_kmsg_path's shape: exact /dev/binder + binderfs
+/// siblings (vndbinder/hwbinder), plus final-component matching so the
+/// translated {rootfs}/dev/binder form is covered.
+fn is_binder_path(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    if path == "/dev/binder" || path == "/dev/vndbinder" || path == "/dev/hwbinder" {
+        return true;
+    }
+    matches!(
+        path.rsplit('/').next(),
+        Some("binder") | Some("vndbinder") | Some("hwbinder")
+    )
+}
+
 /// 6-Z197: is this guest path one of the canonical Android
 /// first-stage-init CHECKCALL boot directories?
 ///
@@ -13412,6 +13433,10 @@ pub fn run_ptrace_loop(
     // 6-Z305t-38: append-force counter (budget 40) — kmsg write-mode opens
     // whose flags got O_APPEND forced (+O_TRUNC stripped).
     let mut kmsg_append_force_count: u64 = 0;
+    // 6-Z305t-40: binder-open forensics counter (budget 40) — every open of
+    // a binder device node (orig or translated) with its node-existence
+    // check; #97's servicemanager FATAL has zero shim-side evidence.
+    let mut binder_open_diag_count: u64 = 0;
     // 6-Z237: failed-open DIAG counter for guest-/dev paths in the
     // second-stage boot window (loop 400-1000, first 20).
     let mut dev_fail_diag_count: u64 = 0;
@@ -20491,6 +20516,61 @@ pub fn run_ptrace_loop(
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                                // ── 6-Z305t-40: BINDER open forensics ──
+                                //
+                                // #97: servicemanager FATALs "Binder driver
+                                // '/dev/binder' could not be opened" with
+                                // ZERO shim-side binder diagnostics — the
+                                // open's fate is the unlogged link. Log
+                                // orig + translated + flags + the node's
+                                // pre-open existence (stat) at ENTRY; the
+                                // stash carries the translated path to the
+                                // fd-registration block, whose fd-target
+                                // identity the EXIT side can derive the same
+                                // way the kmsg block does — but binder opens
+                                // are few: one ENTRY line per open (budget
+                                // 40) plus a pre-open node check is enough
+                                // to answer ENOENT-vs-EACCES-vs-hook-never-
+                                // engaged in one artifact.
+                                if is_binder_path(&path) || is_binder_path(&translated) {
+                                    use std::os::unix::fs::MetadataExt;
+                                    binder_open_diag_count =
+                                        binder_open_diag_count.saturating_add(1);
+                                    if binder_open_diag_count <= 40 {
+                                        let raw_flags = if syscall_num == abi.open {
+                                            get_syscall_arg(&regs, abi.reg_arg2) as u32
+                                        } else if syscall_num == abi.openat {
+                                            get_syscall_arg(&regs, abi.reg_arg3) as u32
+                                        } else {
+                                            0
+                                        };
+                                        let node_note = match std::fs::metadata(&translated) {
+                                            Ok(md) => format!(
+                                                "node dev={} ino={} mode={:o} ftype={}",
+                                                md.dev(),
+                                                md.ino(),
+                                                std::os::unix::fs::MetadataExt::mode(&md),
+                                                if md.is_file() {
+                                                    "file"
+                                                } else if md.is_dir() {
+                                                    "dir"
+                                                } else {
+                                                    "other"
+                                                }
+                                            ),
+                                            Err(e) => format!("node MISSING ({})", e),
+                                        };
+                                        log(&format!(
+                                            "6-Z305t-40 binder open ENTRY pid={} orig={:?} translated={:?} flags=0x{:x} {} (occurrence {})",
+                                            pid,
+                                            path,
+                                            translated,
+                                            raw_flags,
+                                            node_note,
+                                            binder_open_diag_count
+                                        ));
                                     }
                                 }
                                 // ── Task 6-Z61: strip O_EXCL on the
@@ -34837,6 +34917,38 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // or /dev/__kmsg__backup).
         assert!(!is_kmsg_path("/dev/__kmsg__foo"));
         assert!(!is_kmsg_path("/dev/__kmsg__backup"));
+    }
+
+    // ── 6-Z305t-40: is_binder_path classifier tests (mirror the kmsg set) ──
+    #[test]
+    fn is_binder_path_matches_dev_binder_family() {
+        assert!(is_binder_path("/dev/binder"));
+        assert!(is_binder_path("/dev/vndbinder"));
+        assert!(is_binder_path("/dev/hwbinder"));
+    }
+
+    #[test]
+    fn is_binder_path_matches_translated_rootfs_variant() {
+        // The tracer's translation prepends the rootfs — the final
+        // component still classifies.
+        assert!(is_binder_path("/data/user/0/io.twoyi/rootfs/dev/binder"));
+        assert!(is_binder_path("/data/user/0/io.twoyi/rootfs/dev/hwbinder"));
+    }
+
+    #[test]
+    fn is_binder_path_rejects_non_binder_and_lookalikes() {
+        assert!(!is_binder_path("/dev/null"));
+        assert!(!is_binder_path("/dev/kmsg"));
+        assert!(!is_binder_path("/dev/__kmsg__"));
+        assert!(!is_binder_path("/dev/binderfs")); // the MOUNT DIR, not a node
+                                                   // /dev/binderfs/binder IS a legit binderfs node location — the
+                                                   // final-component rule intentionally matches it (asserted in the
+                                                   // translated-variant test's spirit; not re-asserted here).
+        assert!(!is_binder_path("/dev/binderfoo"));
+        assert!(!is_binder_path("/dev/mybinder"));
+        assert!(!is_binder_path("/init.rc"));
+        assert!(!is_binder_path(""));
+        assert!(!is_binder_path("relative/binder"));
     }
 
     #[cfg(target_arch = "x86_64")]

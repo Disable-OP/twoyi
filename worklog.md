@@ -26715,3 +26715,18 @@ Local verification: workflow YAML sanity-checked; no Rust/C changes.
 CI: ladder #97 dispatch follows. Expected: the crash fleet's VERBATIM abort reasons land in svclogs.txt (the text after each maps dump) — the next minimal fix decodes from real FATAL texts (the rung 3→4→6 frontier: hwservicemanager exit(1) ×4 → InitFatalReboot).
 
 Honest unverified: no local ARM64 runtime; the two-tree relationship (symlink vs bind vs duplicate) awaits #97's dual stat.
+
+## 6-Z305t-40 — #97 decode: the verbatim abort reasons are ON THE RECORD — the crash fleet's full cause map; the frontier is the virtual /dev/binder open (servicemanager FATALs with zero shim-side evidence) + the bionic pointer-tag class (hwservicemanager, the critical-process killer); the tracer now forensics every binder-node open
+
+#97 (74c410b → run 34180231164, rung 3) decode — the 6-Z305t-39 capture delivered the fleet's verbatim FATAL texts (9 files with abort messages):
+- SERVICE → CAUSE MAP: servicemanager(2673) = "Binder driver '/dev/binder' could not be opened. Terminating." (libbinder open_driver FATAL — ZERO shim binder diagnostics in its svclog: the hook never engaged or the node open failed pre-hook); media(2691) + drm(2693) = same binder class; hwservicemanager(2674, THE CRITICAL ×4 REBOOT DRIVER) = "Pointer tag for 0xe9024a60f0b0 was truncated." (bionic tagged-pointer abort — the parked #84 class is now the FRONTIER); lmkd(2672) + audioserver(2690) + surfaceflinger(2692) + cameraserver(2694) = same pointer-tag class; keystore(2695) = "Check failed: chdir(argv[1]) != -1 chdir: /data/misc/keystore: No such file or directory" (a MISSING GUEST DIRECTORY — /data/misc/keystore never created).
+- TWO-TREE QUESTION CLOSED (structural): the svclog maps show the guest's linker + property area at /data/user/0/io.twoyi.debug/profiles/default/rootfs/... while the klog/properties identity held at {data}/rootfs — ONE tree via a symlinked/canonicalized name pair (the kernel shows the resolved target in /proc/pid/maps); #94's "profiles ruled out" verdict stands for FILE IDENTITY, with the naming caveat now on the record.
+- 6-Z305t-40: the tracer logs every open of a binder node (orig + translated + raw flags + the node's pre-open stat: dev/ino/mode/ftype or MISSING-with-errno, budget 40) — one artifact answers ENOENT (node never created) vs EACCES (perms) vs hook-never-engaged (open succeeds but the FATAL persists) for the servicemanager class. Classifier is_binder_path added (+3 unit tests; /dev/binderfs/binder intentionally matches — legit binderfs node location).
+
+Commits: (this commit) `diag(kr64): 6-Z305t-40 — binder-node open forensics …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 786 passed / 0 failed (3 new classifier tests).
+
+CI: ladder #98 dispatch follows. Decision tree: node MISSING ⇒ the dev staging must create /dev/binder (+vndbinder/hwbinder) for the android11 boot shape; node present + open succeeds ⇒ the FATAL is downstream (hwbinder vm/binderfs negotiation — the shim's proxy chain must engage and log); pointer-tag class decodes from caller_pc attribution once the maps capture is widened (next).
+
+Honest unverified: no local ARM64 runtime.
