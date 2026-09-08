@@ -1895,6 +1895,11 @@ static void fill_fscreeninfo(struct fb_fix_screeninfo *f) {
 // =========================================================================
 static char g_preload_path[512] = {0};
 static char g_rootfs_env[512] = {0};
+// 6-Z305t-44: boot mode stamp ("android" | "recovery") — set by the kr64
+// child env chain, re-stamped on every exec so init-forked services inherit
+// it (guest init does NOT forward unknown parent env). Gates the
+// constructor-time open-family GOT repair: full-Android boots only.
+static char g_boot_mode_env[64] = {0};
 
 static void set_preload_path(void) {
     const char *preload = getenv("LD_PRELOAD");
@@ -1908,6 +1913,11 @@ static void set_preload_path(void) {
     if (rootfs) {
         strncpy(g_rootfs_env, rootfs, sizeof(g_rootfs_env) - 1);
     }
+    // 6-Z305t-44: same lifecycle as LD_PRELOAD/TWOYI_ROOTFS.
+    const char *boot_mode = getenv("TWOYI_BOOT_MODE");
+    if (boot_mode) {
+        strncpy(g_boot_mode_env, boot_mode, sizeof(g_boot_mode_env) - 1);
+    }
 }
 
 static void restore_preload_env(void) {
@@ -1916,6 +1926,9 @@ static void restore_preload_env(void) {
     }
     if (g_rootfs_env[0]) {
         setenv("TWOYI_ROOTFS", g_rootfs_env, 1);
+    }
+    if (g_boot_mode_env[0]) {
+        setenv("TWOYI_BOOT_MODE", g_boot_mode_env, 1);
     }
 }
 
@@ -1930,10 +1943,13 @@ int clearenv(void) {
     // Save LD_PRELOAD and TWOYI_ROOTFS before clearing
     char saved_preload[512] = {0};
     char saved_rootfs[512] = {0};
+    char saved_boot_mode[64] = {0};
     const char *preload = getenv("LD_PRELOAD");
     const char *rootfs = getenv("TWOYI_ROOTFS");
+    const char *boot_mode = getenv("TWOYI_BOOT_MODE");
     if (preload) strncpy(saved_preload, preload, sizeof(saved_preload) - 1);
     if (rootfs) strncpy(saved_rootfs, rootfs, sizeof(saved_rootfs) - 1);
+    if (boot_mode) strncpy(saved_boot_mode, boot_mode, sizeof(saved_boot_mode) - 1);
     
     // Call real clearenv
     static int (*real_clearenv)(void) = NULL;
@@ -1954,6 +1970,9 @@ int clearenv(void) {
     if (saved_rootfs[0]) {
         setenv("TWOYI_ROOTFS", saved_rootfs, 1);
     }
+    if (saved_boot_mode[0]) {
+        setenv("TWOYI_BOOT_MODE", saved_boot_mode, 1);
+    }
     
     // Update g_preload_path and g_rootfs_env in case they weren't set
     if (!g_preload_path[0] && saved_preload[0]) {
@@ -1961,6 +1980,9 @@ int clearenv(void) {
     }
     if (!g_rootfs_env[0] && saved_rootfs[0]) {
         strncpy(g_rootfs_env, saved_rootfs, sizeof(g_rootfs_env) - 1);
+    }
+    if (!g_boot_mode_env[0] && saved_boot_mode[0]) {
+        strncpy(g_boot_mode_env, saved_boot_mode, sizeof(g_boot_mode_env) - 1);
     }
     
     write_str(2, "[twoyi_loader] clearenv: preserved LD_PRELOAD + TWOYI_ROOTFS\n");
@@ -1976,7 +1998,8 @@ static void unsetenv_internal(const char *name) {
 }
 
 int unsetenv(const char *name) {
-    if (name && (strcmp(name, "LD_PRELOAD") == 0 || strcmp(name, "TWOYI_ROOTFS") == 0)) {
+    if (name && (strcmp(name, "LD_PRELOAD") == 0 || strcmp(name, "TWOYI_ROOTFS") == 0 ||
+                 strcmp(name, "TWOYI_BOOT_MODE") == 0)) {
         char msg[256];
         int len = snprintf(msg, sizeof(msg),
             "[twoyi_loader] unsetenv(%s) — BLOCKED to preserve loader\n", name);
@@ -6345,6 +6368,474 @@ static int install_sigsys(void) {
 }
 
 // =========================================================================
+// 6-Z305t-44: constructor-time open-family GOT/PLT forensics + repair
+// =========================================================================
+// EVIDENCE (ladder #100, run 34186120271, svc-2697/2717/2721):
+//   * the vendored android11 libbinder.so imports __open_2 (real binary
+//     import table, extracted from the rootfs release and parsed) — NOT
+//     __openat (the 6-Z305t-43 theory); libhidlbase.so likewise.
+//   * the preloads DID load in the crashing services (the shlib
+//     constructor lines are on the svclog record) yet libbinder's
+//     __open_2 PLT slot landed on libc's __open_2 — the raw openat hit
+//     the rdev-0:0 dead node (#99 decode), ENXIO, and the ProcessState
+//     FATAL fired with ZERO shim diagnostics (no [twrp_fb_hook] open
+//     line, no binder_open_fallback line).
+//   * in the SAME run, dumpstate's process (svc-2718) shows __open_2
+//     refs resolving to the fb hook — interposition DOES work for some
+//     modules. The difference is linker-internal scope/section behavior
+//     (linkerconfig namespaces, RTLD_LOCAL groups, BIND_NOW ordering)
+//     that we neither control nor need to model.
+// REPAIR (generic, no ROM identity involved): walk every loaded
+// module's DT_JMPREL/DT_RELA relocations, find open-family
+// JUMP_SLOT/GLOB_DAT slots, log the current owner, and rewrite any slot
+// NOT owned by an interposer to the shlib's hook. The shlib's hooks
+// chain translate → fstab gate → binder proxy fallback → qemu_pipe
+// fallback → real libc, so a rewritten slot gains exactly the semantics
+// every other open call already gets through LD_PRELOAD. Slots already
+// owned by an interposer (fb hook or shlib) are left untouched — the
+// working recovery corpus keeps its exact established path.
+// GATING: TWOYI_BOOT_MODE=android only (recovery boots must not change
+// behavior at all; the var is stamped by the kr64 child env chain and
+// re-stamped on every exec by restore_preload_env()).
+// =========================================================================
+
+#include <link.h>
+#include <elf.h>
+#include <sys/mman.h>
+
+#define GOTFIX_MAX_MODULES 128
+#define GOTFIX_MAX_SLOTS   512
+#define GOTFIX_MAX_PATCH_LOGS  48
+#define GOTFIX_MAX_ALREADY_LOGS 16
+
+struct gotfix_module {
+    uintptr_t lo, hi;
+    char name[160];
+};
+
+struct gotfix_slot {
+    uintptr_t addr;      // absolute address of the GOT slot
+    char sym[24];        // open-family symbol name
+    int mod_idx;         // index into ctx->mods (the module OWNING the slot)
+    uintptr_t old;       // value observed at collection time
+};
+
+struct gotfix_ctx {
+    struct gotfix_module mods[GOTFIX_MAX_MODULES];
+    int nmods;
+    struct gotfix_slot slots[GOTFIX_MAX_SLOTS];
+    int nslots;
+    int slots_truncated;
+    int mods_truncated;
+    // 6-Z305t-44: our OWN module's DEFINED open-family export addresses,
+    // captured from our own .dynsym during the phdr walk. Deterministic —
+    // taking &open-style addresses in C risks binding to a fortify inline
+    // thunk instead of the real export.
+    uintptr_t self_export[7];
+};
+
+static const char *const g_open_family[] = {
+    "open", "open64", "openat", "__openat", "__open_2", "__openat_2", "__open_real",
+};
+
+static int gotfix_family_index(const char *n) {
+    if (!n) return -1;
+    for (unsigned i = 0; i < sizeof(g_open_family) / sizeof(g_open_family[0]); i++) {
+        if (strcmp(n, g_open_family[i]) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static int gotfix_is_family_name(const char *n) {
+    return gotfix_family_index(n) >= 0;
+}
+
+// link-time-vs-absolute guard for .dynamic d_ptr values and relocation
+// r_offsets: Android's linker rewrites d_ptr entries in place (base added)
+// but relocation table contents keep their link-time vaddrs.
+static inline uintptr_t gotfix_abs(uintptr_t base, uintptr_t v) {
+    return (base != 0 && v < base) ? base + v : v;
+}
+
+// Walk one module's .dynsym for DEFINED open-family exports and record
+// their absolute addresses into ctx->self_export. Used for our own shlib
+// module so the patcher always writes the REAL export address (taking
+// &open-style addresses in C risks binding to a fortify inline thunk).
+// Bounded by the module span, DT_STRSZ and a hard entry cap so a missing
+// DT_HASH can never walk off a mapping.
+static void gotfix_capture_self_exports(uintptr_t base, const ElfW(Phdr) *dyn_phdr,
+                                        uintptr_t mod_lo, uintptr_t mod_hi,
+                                        struct gotfix_ctx *ctx) {
+    const ElfW(Dyn) *dyn = (const ElfW(Dyn) *)gotfix_abs(base, dyn_phdr->p_vaddr);
+    uintptr_t symtab = 0, strtab = 0;
+    size_t strsz = 0;
+    for (; dyn->d_tag != DT_NULL; dyn++) {
+        switch (dyn->d_tag) {
+            case DT_SYMTAB: symtab = (uintptr_t)dyn->d_un.d_ptr; break;
+            case DT_STRTAB: strtab = (uintptr_t)dyn->d_un.d_ptr; break;
+            case DT_STRSZ:  strsz = (size_t)dyn->d_un.d_val; break;
+            default: break;
+        }
+    }
+    if (!symtab || !strtab || strsz == 0) return;
+    symtab = gotfix_abs(base, symtab);
+    strtab = gotfix_abs(base, strtab);
+    for (unsigned i = 0; i < 4096; i++) {
+        const ElfW(Sym) *s = &((const ElfW(Sym) *)symtab)[i];
+        if ((uintptr_t)s + sizeof(ElfW(Sym)) > mod_hi) break;  // module span bound
+        if (s->st_name == 0 || s->st_name >= strsz) {
+            // Either the real terminator region or garbage past the table;
+            // exact family matches from inside strtab are still accepted
+            // below only when the entry otherwise looks sane.
+            if (s->st_name >= strsz) break;
+            continue;
+        }
+        const char *nm = (const char *)(strtab + s->st_name);
+        int f = gotfix_family_index(nm);
+        if (f < 0) continue;
+        if (s->st_shndx == 0) continue;  // UND import, not a definition
+        if (ctx->self_export[f] == 0) {
+            ctx->self_export[f] = gotfix_abs(base, (uintptr_t)s->st_value);
+        }
+    }
+}
+
+static int gotfix_skip_module(const char *name, uintptr_t lo, uintptr_t hi) {
+    (void)lo; (void)hi;
+    if (!name || !name[0]) return 0;  // main executable (empty name) — patch it
+    if (strcmp(name, "[vdso]") == 0 || strcmp(name, "[vdso32]") == 0) return 1;
+    const char *base = strrchr(name, '/');
+    base = base ? base + 1 : name;
+    if (strncmp(base, "linker", 6) == 0) return 1;          // linker64/linker
+    if (strcmp(base, "libc.so") == 0) return 1;             // guest libc
+    if (strstr(name, "libgetpid_hook.so")) return 1;         // our preloads
+    if (strstr(name, "libtwrp_fb_hook.so")) return 1;
+    if (strstr(name, "libtwoyi_loader_shlib.so")) return 1;
+    return 0;
+}
+
+// Collect modules + open-family relocation slots. Runs inside the
+// dl_iterate_phdr callback — NO dlsym/malloc here (bionic holds the
+// loader lock for the whole iteration; dlsym would deadlock).
+static int gotfix_collect_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    struct gotfix_ctx *ctx = (struct gotfix_ctx *)data;
+    const ElfW(Phdr) *phdr = info->dlpi_phdr;
+    int phnum = info->dlpi_phnum;
+    uintptr_t base = (uintptr_t)info->dlpi_addr;
+
+    // module span from PT_LOAD segments
+    uintptr_t lo = (uintptr_t)-1, hi = 0;
+    const ElfW(Phdr) *dyn_phdr = NULL;
+    for (int i = 0; i < phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) {
+            uintptr_t s = base + phdr[i].p_vaddr;
+            uintptr_t e = s + phdr[i].p_memsz;
+            if (s < lo) lo = s;
+            if (e > hi) hi = e;
+        } else if (phdr[i].p_type == PT_DYNAMIC) {
+            dyn_phdr = &phdr[i];
+        }
+    }
+    if (lo == (uintptr_t)-1) return 0;
+    // 6-Z305t-44: our OWN module — capture its DEFINED open-family export
+    // addresses, then skip (never patch our own GOT).
+    if (info->dlpi_name && strstr(info->dlpi_name, "libtwoyi_loader_shlib.so")) {
+        if (dyn_phdr) gotfix_capture_self_exports(base, dyn_phdr, lo, hi, ctx);
+        return 0;
+    }
+    if (gotfix_skip_module(info->dlpi_name, lo, hi)) return 0;
+
+    int mod_idx = -1;
+    if (ctx->nmods < GOTFIX_MAX_MODULES) {
+        struct gotfix_module *m = &ctx->mods[ctx->nmods];
+        m->lo = lo; m->hi = hi;
+        strncpy(m->name, info->dlpi_name ? info->dlpi_name : "(main)", sizeof(m->name) - 1);
+        m->name[sizeof(m->name) - 1] = 0;
+        mod_idx = ctx->nmods++;
+    } else {
+        ctx->mods_truncated++;
+        return 0;
+    }
+
+    if (!dyn_phdr) return 0;
+    const ElfW(Dyn) *dyn = (const ElfW(Dyn) *)gotfix_abs(base, dyn_phdr->p_vaddr);
+    uintptr_t symtab = 0, strtab = 0, jmprel = 0, rela = 0;
+    size_t pltrelsz = 0, relasz = 0;
+    for (; dyn->d_tag != DT_NULL; dyn++) {
+        switch (dyn->d_tag) {
+            case DT_SYMTAB:   symtab = (uintptr_t)dyn->d_un.d_ptr; break;
+            case DT_STRTAB:   strtab = (uintptr_t)dyn->d_un.d_ptr; break;
+            case DT_JMPREL:   jmprel = (uintptr_t)dyn->d_un.d_ptr; break;
+            case DT_PLTRELSZ: pltrelsz = (size_t)dyn->d_un.d_val; break;
+            case DT_RELA:     rela = (uintptr_t)dyn->d_un.d_ptr; break;
+            case DT_RELASZ:   relasz = (size_t)dyn->d_un.d_val; break;
+            default: break;
+        }
+    }
+    if (!symtab || !strtab) return 0;
+    symtab = gotfix_abs(base, symtab);
+    strtab = gotfix_abs(base, strtab);
+
+    // scan one relocation table (RELA form — arm64/x86_64)
+    const ElfW(Rela) *r = NULL;
+    size_t nrela = 0;
+    if (jmprel && pltrelsz) {
+        r = (const ElfW(Rela) *)gotfix_abs(base, jmprel);
+        nrela = pltrelsz / sizeof(ElfW(Rela));
+    } else if (rela && relasz) {
+        r = (const ElfW(Rela) *)gotfix_abs(base, rela);
+        nrela = relasz / sizeof(ElfW(Rela));
+    }
+#if defined(__arm__)
+    // 32-bit arm uses REL (no addend)
+    const ElfW(Rel) *r32 = NULL;
+    size_t nrel32 = 0;
+    if (!r && jmprel && pltrelsz) {
+        r32 = (const ElfW(Rel) *)gotfix_abs(base, jmprel);
+        nrel32 = pltrelsz / sizeof(ElfW(Rel));
+    } else if (!r && rela && relasz) {
+        r32 = (const ElfW(Rel) *)gotfix_abs(base, rela);
+        nrel32 = relasz / sizeof(ElfW(Rel));
+    }
+    for (size_t i = 0; i < nrel32; i++) {
+        unsigned sym = ELF32_R_SYM(r32[i].r_info);
+        unsigned type = (unsigned)(r32[i].r_info & 0xff);
+        if (type != R_ARM_JUMP_SLOT && type != R_ARM_GLOB_DAT) continue;
+        const ElfW(Sym) *s = &((const ElfW(Sym) *)symtab)[sym];
+        const char *nm = (const char *)(strtab + s->st_name);
+        if (!gotfix_is_family_name(nm)) continue;
+        if (ctx->nslots < GOTFIX_MAX_SLOTS) {
+            struct gotfix_slot *sl = &ctx->slots[ctx->nslots++];
+            sl->addr = gotfix_abs(base, r32[i].r_offset);
+            strncpy(sl->sym, nm, sizeof(sl->sym) - 1);
+            sl->sym[sizeof(sl->sym) - 1] = 0;
+            sl->mod_idx = mod_idx;
+            sl->old = *(uintptr_t *)sl->addr;
+        } else ctx->slots_truncated++;
+    }
+#endif
+    for (size_t i = 0; i < nrela; i++) {
+        unsigned sym = (unsigned)ELF64_R_SYM(r[i].r_info);
+        unsigned type = (unsigned)(r[i].r_info & 0xffffffffu);
+        unsigned jump = 0, glob = 0;
+#if defined(__aarch64__)
+        jump = R_AARCH64_JUMP_SLOT; glob = R_AARCH64_GLOB_DAT;
+#elif defined(__x86_64__)
+        jump = R_X86_64_JUMP_SLOT;  glob = R_X86_64_GLOB_DAT;
+#elif defined(__i386__)
+        jump = R_386_JUMP_SLOT;     glob = R_386_GLOB_DAT;
+#endif
+        if (!jump || (type != jump && type != glob)) continue;
+        const ElfW(Sym) *s = &((const ElfW(Sym) *)symtab)[sym];
+        const char *nm = (const char *)(strtab + s->st_name);
+        if (!gotfix_is_family_name(nm)) continue;
+        if (ctx->nslots < GOTFIX_MAX_SLOTS) {
+            struct gotfix_slot *sl = &ctx->slots[ctx->nslots++];
+            sl->addr = gotfix_abs(base, r[i].r_offset);
+            strncpy(sl->sym, nm, sizeof(sl->sym) - 1);
+            sl->sym[sizeof(sl->sym) - 1] = 0;
+            sl->mod_idx = mod_idx;
+            sl->old = *(uintptr_t *)sl->addr;
+        } else ctx->slots_truncated++;
+    }
+    return 0;
+}
+
+// Does /proc/self/maps show the page containing `addr` as writable?
+// Raw syscalls only — safe from inside any hook context. Needed so the
+// slot write can restore the ORIGINAL page protection: RELRO pages are
+// mprotected back to R (the lazy resolver must never need to write a
+// RELRO page), while non-RELRO RW pages stay RW for the resolver.
+static int gotfix_page_was_writable(uintptr_t addr) {
+    long psize = sysconf(_SC_PAGESIZE);
+    if (psize <= 0) psize = 4096;
+    uintptr_t page = addr & ~((uintptr_t)psize - 1);
+    int fd = (int)syscall(NR_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
+    if (fd < 0) return 0;
+    char buf[16384];
+    char acc[512];
+    size_t acc_len = 0;
+    int writable = 0;
+    for (;;) {
+        long n = syscall(SYS_read, fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        size_t start = 0;
+        for (size_t i = 0; i < (size_t)n; i++) {
+            if (buf[i] == '\n') {
+                size_t frag = i - start;
+                if (acc_len + frag < sizeof(acc)) {
+                    memcpy(acc + acc_len, buf + start, frag);
+                    acc[acc_len + frag] = 0;
+                    unsigned long long l = 0, h = 0;
+                    char perms[8] = {0};
+                    if (sscanf(acc, "%llx-%llx %7s", &l, &h, perms) == 3 &&
+                        (uintptr_t)l <= page && page < (uintptr_t)h) {
+                        writable = (strchr(perms, 'w') != NULL);
+                        syscall(NR_close, fd);
+                        return writable;
+                    }
+                }
+                acc_len = 0;
+                start = i + 1;
+            }
+        }
+        size_t tail = (size_t)n - start;
+        if (tail >= sizeof(acc)) {
+            acc_len = 0;  // pathological long line — drop it
+        } else {
+            memcpy(acc, buf + start, tail);
+            acc_len = tail;
+        }
+    }
+    syscall(NR_close, fd);
+    return writable;
+}
+
+static int gotfix_write_slot(uintptr_t addr, void *val) {
+    long psize = sysconf(_SC_PAGESIZE);
+    if (psize <= 0) psize = 4096;
+    uintptr_t page = addr & ~((uintptr_t)psize - 1);
+    int was_w = gotfix_page_was_writable(addr);
+    if (!was_w) {
+        if (syscall(SYS_mprotect, (void *)page, (size_t)psize,
+                    PROT_READ | PROT_WRITE) != 0) {
+            return -1;
+        }
+    }
+    *(void **)addr = val;
+    if (!was_w) {
+        syscall(SYS_mprotect, (void *)page, (size_t)psize, PROT_READ);
+    }
+    return 0;
+}
+
+static void gotfix_log(const char *s) {
+    write_str(2, s);
+}
+
+static void gotfix_log_num(long v) {
+    char tmp[24];
+    int p = 0;
+    unsigned long u = (v < 0) ? (unsigned long)(-(v + 1)) + 1UL : (unsigned long)v;
+    if (v < 0) tmp[p++] = '-';
+    char digits[24];
+    int d = 0;
+    do { digits[d++] = (char)('0' + (u % 10)); u /= 10; } while (u);
+    while (d > 0) tmp[p++] = digits[--d];
+    tmp[p] = 0;
+    write_str(2, tmp);
+}
+
+// The repair pass — called from twoyi_init() when TWOYI_BOOT_MODE=android.
+static void patch_open_family_gots(void) {
+    static struct gotfix_ctx ctx_storage;
+    struct gotfix_ctx *ctx = &ctx_storage;
+    memset(ctx, 0, sizeof(*ctx));
+
+    dl_iterate_phdr(gotfix_collect_cb, ctx);
+
+    if (ctx->nslots == 0) {
+        gotfix_log("[twoyi_loader] gotfix-44: no open-family slots found (modules=");
+        gotfix_log_num(ctx->nmods);
+        gotfix_log(")\n");
+        return;
+    }
+
+    // Build the interposer-owned address set OUTSIDE the dl lock:
+    // our own exports (captured from our own .dynsym in the walk) +
+    // whatever RTLD_DEFAULT resolves each family name to (the fb hook's
+    // exports, when it wins the preload race).
+    uintptr_t own[7];
+    memcpy(own, ctx->self_export, sizeof(own));
+    uintptr_t global[7] = {0, 0, 0, 0, 0, 0, 0};
+    if (dlsym) {
+        for (unsigned i = 0; i < 7; i++) {
+            global[i] = (uintptr_t)dlsym(RTLD_DEFAULT, g_open_family[i]);
+        }
+    }
+    int no_self_export = 0;
+    for (unsigned i = 0; i < 7; i++) {
+        if (own[i] == 0) no_self_export++;
+    }
+    if (no_self_export) {
+        gotfix_log("[twoyi_loader] gotfix-44 WARN: missing self-exports=");
+        gotfix_log_num(no_self_export);
+        gotfix_log(" (those families are skipped)\n");
+    }
+
+    int patched = 0, already = 0, failed = 0, skipped = 0, suppressed = 0;
+    for (int i = 0; i < ctx->nslots; i++) {
+        struct gotfix_slot *sl = &ctx->slots[i];
+        int family_idx = gotfix_family_index(sl->sym);
+        if (family_idx < 0) continue;
+        uintptr_t target = own[family_idx];
+        if (target == 0) {
+            // No captured self-export for this family — never write NULL.
+            skipped++;
+            continue;
+        }
+        if (sl->old == own[family_idx] ||
+            (global[family_idx] && sl->old == global[family_idx])) {
+            already++;
+            if (already <= GOTFIX_MAX_ALREADY_LOGS) {
+                const char *mn = (sl->mod_idx >= 0) ? ctx->mods[sl->mod_idx].name : "?";
+                gotfix_log("[twoyi_loader] gotfix-44 ALREADY ");
+                gotfix_log(sl->sym);
+                gotfix_log(" @");
+                gotfix_log(mn);
+                gotfix_log("\n");
+            }
+            continue;
+        }
+        if (gotfix_write_slot(sl->addr, (void *)target) == 0) {
+            patched++;
+            if (patched <= GOTFIX_MAX_PATCH_LOGS) {
+                // attribute the OLD value to a module
+                const char *owner = "unresolved";
+                for (int m = 0; m < ctx->nmods; m++) {
+                    if (sl->old >= ctx->mods[m].lo && sl->old < ctx->mods[m].hi) {
+                        owner = ctx->mods[m].name;
+                        break;
+                    }
+                }
+                const char *mn = (sl->mod_idx >= 0) ? ctx->mods[sl->mod_idx].name : "?";
+                gotfix_log("[twoyi_loader] gotfix-44 PATCH module=");
+                gotfix_log(mn);
+                gotfix_log(" sym=");
+                gotfix_log(sl->sym);
+                gotfix_log(" old=");
+                gotfix_log(owner);
+                gotfix_log("\n");
+            } else suppressed++;
+        } else {
+            failed++;
+        }
+    }
+    gotfix_log("[twoyi_loader] gotfix-44 summary: modules=");
+    gotfix_log_num(ctx->nmods);
+    gotfix_log(" slots=");
+    gotfix_log_num(ctx->nslots);
+    gotfix_log(" patched=");
+    gotfix_log_num(patched);
+    gotfix_log(" already=");
+    gotfix_log_num(already);
+    gotfix_log(" failed=");
+    gotfix_log_num(failed);
+    gotfix_log(" skipped=");
+    gotfix_log_num(skipped);
+    if (suppressed > 0) {
+        gotfix_log(" suppressed=");
+        gotfix_log_num(suppressed);
+    }
+    if (ctx->slots_truncated > 0) {
+        gotfix_log(" slotcap=");
+        gotfix_log_num(ctx->slots_truncated);
+    }
+    gotfix_log("\n");
+}
+
+// =========================================================================
 // .init_array constructor — runs before main()
 // This is the key: when loaded via LD_PRELOAD, this runs before init's main()
 // =========================================================================
@@ -6641,6 +7132,15 @@ static void twoyi_init(void) {
     // in init.rc, which starts class_start core/main (zygote).
     // Since vold exits(0), pre-set this so init triggers zygote startup.
     prop_set("vold.decrypt", "trigger_restart_framework");
+
+    // 6-Z305t-44: constructor-time open-family GOT/PLT forensics + repair.
+    // GATED on TWOYI_BOOT_MODE=android — recovery boots must not change
+    // behavior at all (the working recovery corpus keeps its exact path;
+    // slots already owned by the fb hook are skipped as ALREADY).
+    // See the 6-Z305t-44 block comment for the full evidence chain.
+    if (strcmp(g_boot_mode_env, "android") == 0) {
+        patch_open_family_gots();
+    }
 
     // NOTE: ro.crypto.state/ro.crypto.type are intentionally NOT set here.
     // Setting ro.crypto.state (any value: "encrypted", "unsupported", etc.)
