@@ -26965,3 +26965,14 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. NOTE the new reality: MAP_CREATE now creates REAL host-kernel maps; only PROG_LOAD/OBJ_GET/PIN are virtual. The pin targets /sys/fs/bpf (translated to rootfs) while the maps exist host-side — netd's later BPF_MAP_LOOKUP_ELEM on fake fds returns -ENOENT (empty-map semantics). Watch netd.
   3. Frontier after bpfloader: ZYGOTE (rung 5).
   4. Queued classes: health-hal passthrough dlopen, HIDL EX_TRANSACTION_FAILED (18 in #107).
+
+## 6-Z305t-49e — the arm was STILL gated (49d never escaped); relocated to the EXIT-section top; commit 81dcdae; ladder #112 dispatched
+
+- Ladder #111 (34231257593, 2c248fe/49d): bpfloader exited 2 after 7.19s (progress: maps + pins run), ONE logged prog_load failure (netd.o cgroupsock_inet_create, fd -1), zero E/LibBpfLoader ERRORs — and ZERO 6-Z305t-49b lines AGAIN.
+- Root cause found by reading the file: the 49d "hoist" left the arm INSIDE the `if _forced_ret_opt.is_some() || (abi.execve == 11 && …)` block (the gate opens at what is now 27835; aarch64 → clause false → arm dead). This is the EXACT bug class the 6-Z305j comment documents for the statfs arm ("whole fresh-regs2 block was dead code for the aarch64 guest").
+- FIX 6-Z305t-49e (81dcdae): arm relocated to the TOP of the EXIT section (before the compute_exit_return_value call — the position where 6-Z305j put the selinux-magic arm so it "runs for EVERY EXIT stop on EVERY ABI"); self-contained fresh getregs/setregs; replace window inside the arm. A corrupted intermediate (python s.index(end_marker) matching an earlier occurrence → duplicated region) was recovered via git checkout + a corrected relocation (search FROM si). Verified: single copy, cargo build clean, 792/792, clippy 0 errors.
+- CI: ladder #112 dispatched on 81dcdae.
+- Decision tree for #112:
+  1. bpfloader exit 0 expected: "6-Z305t-49b: bpf(cmd=5 …) faked to 0x6b02xxxx" lines now MUST appear; loadAllElfObjects == 0; bpf.progs_loaded=1.
+  2. Frontier: ZYGOTE (rung 5). app_process exec, zygote seccomp, sockets.
+  3. Watch: netd reading the real maps + fake pins.
