@@ -26951,3 +26951,17 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 - FIX 6-Z305t-49c (016186b): removed the constant (UPDATE_ELEM = 2 falls into the catch-all Some(0) arm; comment added). Local cargo build clean.
 - CI: ladder #110 dispatched on 016186b.
 - LESSON: run `cargo build` (not just clippy/test) before pushing kr64 changes — the CI build profile is stricter.
+
+## 6-Z305t-49d — #110 decode: maps get REAL kernel fds (unprivileged MAP_CREATE allowed!), PROG_LOAD honestly EPERMs, and the 49b arm never fired (gate bug); commit 2c248fe; ladder #111 dispatched
+
+- Ladder #110 (34229717327, 016186b): STILL bpfloader-failed BUT the decode is decisive:
+  - `bpf_create_map name app_uid_stats_map, ret: 9` / clat_egress ret: 8 / stats_map_A ret: 10 etc. — REAL HOST-KERNEL fds: the redroid kernel ALLOWS unprivileged BPF_MAP_CREATE (kernel.unprivileged_bpf_disabled=0). The arm correctly left real successes untouched.
+  - `bpf_prog_load lib call for clatd.o (schedcls_ingress_clat_ether) returned fd: -1 (Operation not permitted)` — PROG_LOAD requires CAP_BPF/CAP_SYS_ADMIN; unprivileged prog load is refused → non-optional program → loadAllElfObjects != 0 → main() return 2 → bpfloader-failed reboot.
+  - ZERO "6-Z305t-49b" lines: MY PLACEMENT BUG — the arm was inside the fresh-regs block gated on `_forced_ret_opt.is_some()`, and 49b had removed bpf from the uniform family → the gate never opened.
+- FIX 6-Z305t-49d (2c248fe): hoisted the bpf arm out of the gate; self-contained fresh getregs/setregs (6-Z60 lesson) + the replace window ((ret<0 && ret>-4096) || ret==0) evaluated inside the arm. So for PROG_LOAD EPERM (-1): arm fires → synthetic fd; for real MAP_CREATE successes: untouched. 792/792 + build clean.
+- CI: ladder #111 dispatched on 2c248fe.
+- Decision tree for #111:
+  1. PROG_LOAD faked to synthetic fd → "non-optional program" loads → pin → chown/chmod (pin files materialized by 49b) → loadAllElfObjects == 0 → bpfloader exits 0 + bpf.progs_loaded=1.
+  2. NOTE the new reality: MAP_CREATE now creates REAL host-kernel maps; only PROG_LOAD/OBJ_GET/PIN are virtual. The pin targets /sys/fs/bpf (translated to rootfs) while the maps exist host-side — netd's later BPF_MAP_LOOKUP_ELEM on fake fds returns -ENOENT (empty-map semantics). Watch netd.
+  3. Frontier after bpfloader: ZYGOTE (rung 5).
+  4. Queued classes: health-hal passthrough dlopen, HIDL EX_TRANSACTION_FAILED (18 in #107).
