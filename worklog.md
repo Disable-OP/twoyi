@@ -27083,3 +27083,13 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 - ALSO QUEUED (next round, after the instrument decodes): (a) exclude zombies from the cgroup.procs member list (read /proc/<pid>/stat state, skip 'Z'); (b) materialize cgroup.procs 0666 so init's pid-move writes land.
 - Local gates: build/fmt/test(792/792)/clippy clean.
 - CI: ladder #116 dispatched with BOTH the 56 kill fix and the 57 instrument.
+
+## 6-Z305t-58 — #116 forensics: the failed-bind fd is UNNAMED at EXIT; kernel semantics (existence-check before permission-check) revives the raw-host-bind theory; readback + dir-listing discriminators added; commit b57e4a8; ladder #117 dispatched
+
+- #116 (34243433368, da61a14): rung 3 — the 57 instrument fired: "bind forensics pid=2655 fd=17/18 raw_ret=-98: fd_link=Some("socket:[43911]") unix_path=(ABSTRACT or unnamed)" — the fd is UNNAMED at EXIT (post-failure state — expected for a failed bind; the instrument shows state, not target).
+- Kernel semantics narrows it: unix_bind() checks the target file's EXISTENCE (EADDRINUSE) BEFORE the mknod permission check (EACCES). So a RAW bind to the HOST's /dev/socket/<name> — where the redroid host's own services hold live-bound files — yields -98 WITHOUT ever hitting EACCES. The 6-Z163 "REWRITTEN" logs are therefore suspect: the scratch setregs is probably being lost within the same stop (a later stale-regs writer), or the stop-phase misclassifies.
+- Two discriminators added (this commit):
+  1. post-setregs READBACK in the bind arm: re-read the child's arg2/arg3 and compare to the scratch pointer/len — a MISMATCH names the clobber class in one line.
+  2. at the 6-Z101 -98 arm: the {rootfs}/dev/socket directory LISTING at failure time — file EXISTS → a stale file survived remove_file (re-creator race); EMPTY → the raw host bind.
+- Also queued (next round): exclude zombies ('Z' state) from the cgroup.procs member list; materialize 0666 so init's pid-move write lands ("Failed to write '3458' ... Permission denied").
+- Local gates: build/fmt/test(792/792)/clippy clean. CI: ladder #117 dispatched on b57e4a8.
