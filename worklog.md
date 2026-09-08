@@ -26813,3 +26813,24 @@ Expected artifact reads for #101 (decision tree):
 - recovery corpus: fb_hook-owned slots stay ALREADY/untouched; TWRP/OrangeFox/PitchBlack/Lineage boots unchanged (TWOYI_BOOT_MODE=recovery never calls the patcher).
 
 Honest unverified: no local ARM64 runtime; the GOT-rewrite theory is exactly one ladder from proof (and its forensics make the next decode mechanical either way).
+
+## 6-Z305t-44c — #102 decode: 44a VERIFIED at absolute zero (pointer-tag class eliminated); 44b never ENGAGED — the execve hook's rebuilt envp dropped TWOYI_BOOT_MODE (the silent-gate cost a ladder); fix: explicit envp carry + always-log gate verdict
+
+#102 (dd04a27 → run 34200662353, rung 3, same init-reboot post-mortem) decode:
+- FIX 44a VERIFIED: "Pointer tag" occurrences 0 in svclogs (was 10) and 0 in dev-__kmsg__ (was 44), no replacement FATAL class. The bionic heap-tagging kill is real and complete.
+- FIX 44b NEVER ENGAGED: zero gotfix-44 lines anywhere (not even the "no open-family slots found" negative), zero binder_open_fallback lines; the binder fleet died exactly as in #100 (svc-2707 servicemanager, svc-2708 hwservicemanager, 2722 audioserver, 2723 media, 2724 surfaceflinger, 2725 drm, 2726 cameraserver; ~236 abort() INTERCEPTED events in klog; hwservicemanager critical ×4 → InitFatalReboot). zygote started but was kill-9'd in the onrestart cascade; system_server never spawned; vold never started.
+- THE PLUMBING BUG, evidenced end-to-end: the kr64 CHILD env list (kr64-app-stderr.log) DID pass TWOYI_BOOT_MODE=android to the guest init — but ZERO services saw it. Root cause: init execs services with an EXPLICIT envp; the shlib's execve hook REBUILDS that envp from the caller's array (dropping/re-adding LD_* only) — setenv() on environ (restore_preload_env) CANNOT touch the explicit envp, and guest init does not forward unknown parent env. TWOYI_SHLIB_NO_PROPS survives only because the hook hardcodes it at new_envp[j+2]. Also confirmed: the constructor RUNS TO COMPLETION in the crashing services ("PLT hooks installed" → "selinuxfs virtual files created" → "pre-created init directories" → "runtime ready") and the shlib's __open_2 hook FIRES for property-context opens in svc-2708 — so the per-call-site interposition difference is real and exactly what the GOT repair addresses; the only missing piece was the gate value.
+- Diagnostic debt paid: the gate was SILENT on the negative path — that cost a full ladder. The gate verdict is now logged unconditionally ("gotfix-44: gate boot_mode='...'").
+
+6-Z305t-44c (fix, shlib): the execve hook's rebuilt envp now CARRIES the boot-mode stamp (strip any caller-provided TWOYI_BOOT_MODE= to keep it duplicate-free, then append the known-good g_boot_mode_env value in a stack buffer, alongside the TWOYI_SHLIB_NO_PROPS carry with correct slot bookkeeping). execveat/execv/execvp/execvpe paths already pass environ or append-only — unaffected.
+
+Commits: `fix(shlib): 6-Z305t-44c — carry TWOYI_BOOT_MODE across the execve hook's rebuilt envp …` + this docs commit. CI: ladder #103 dispatched on main (post-push).
+
+Local verification: gcc -fsyntax-only CLEAN (default + -D__aarch64__); no Rust changes (791 test suite untouched).
+
+Expected artifact reads for #103 (decision tree):
+- EVERY service svclog gains "[twoyi_loader] gotfix-44: gate boot_mode='android'" — if a service shows '(absent)' the carry still has a hole (decode which exec path it used).
+- binder fleet: gotfix-44 PATCH lines for libbinder.so/libhidlbase.so/libhwbinder.so slots (old= attribution answers WHERE they were bound), then binder_open_fallback lines (proxy fd = virtual binder engages; /dev/null fd = proxy lifecycle next).
+- pointer-tag class: stays at zero (44a).
+
+Honest unverified: no local ARM64 runtime; one ladder from proof.
