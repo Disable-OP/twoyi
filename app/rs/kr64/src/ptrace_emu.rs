@@ -3551,14 +3551,11 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.setgroups_nr
         || syscall_nr == abi.setuid_nr
         || syscall_nr == abi.setgid_nr
-    // 6-Z305t-49: bpf() — the bpfloader reboot blocker (ladder #107:
-    // "Reboot start, reason: reboot,bpfloader-failed"; the host seccomp
-    // rejects bpf with EPERM for the rootless app). Uniform fake-0: the
-    // loader checks fd >= 0 for MAP_CREATE/PROG_LOAD (fd 0 qualifies),
-    // pin/attach/close all fake 0, bpfloader exits 0 and sets
-    // bpf.progs_loaded=1. Recovery never calls bpf() — inert for the
-    // corpus. See the ChildAbi.bpf field doc for the full rationale.
-        || (abi.bpf != -1 && syscall_nr == abi.bpf)
+    // 6-Z305t-49b: bpf() is NOT in this uniform family — the dedicated
+    // EXIT arm below (bpf arm, next to the 6-Z99 netlink machinery)
+    // provides per-command returns because the A11 loader REJECTS fd 0
+    // (`if (fd == 0) return -EINVAL;` — Loader.cpp lines 443-444/595-596,
+    // ladder #108 run 34226614249: "Failed to create maps: (ret=-22)").
     {
         Some(0)
     } else {
@@ -12727,6 +12724,16 @@ pub fn run_ptrace_loop(
         std::collections::HashSet<i64>,
     > = std::collections::HashMap::new();
     let mut netlink_fd_next: std::collections::HashMap<libc::pid_t, i32> =
+        std::collections::HashMap::new();
+    // 6-Z305t-49b: fake BPF fds (bpfloader's MAP_CREATE/PROG_LOAD/OBJ_GET)
+    // — same synthetic-base pattern as NETLINK_FAKE_FD_BASE. The base is
+    // disjoint from the netlink range so the two fd spaces never collide.
+    let mut bpf_fd_next: std::collections::HashMap<libc::pid_t, i32> =
+        std::collections::HashMap::new();
+    // 6-Z305t-49b: per-pid set of live fake BPF fds (bounded by the loader
+    // workload: ~100 map/prog fds per boot; close() tracking skipped —
+    // a stale entry only wastes a base slot).
+    let mut bpf_fake_fds: std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>> =
         std::collections::HashMap::new();
     // Rate-limit for recv-on-fake-fd logs (a poll spin can hot-loop).
     let mut netlink_recv_log_count: u32 = 0;
@@ -28098,6 +28105,155 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                 }
+                                // ── 6-Z305t-49b: bpf() virtualization ──
+                                //
+                                // The A11 bpfloader is a reboot_on_failure
+                                // service (ladder #107: "reboot,bpfloader-
+                                // failed"). The uniform fake-0 failed for TWO
+                                // reasons decoded from ladder #108 (run
+                                // 34226614249) against the A11 source
+                                // (system/bpf/libbpf_android/Loader.cpp):
+                                //   1. createMaps/loadProg REJECT fd 0:
+                                //      `if (fd == 0) return -EINVAL;`
+                                //      (lines 443-444 + 595-596) — uniform 0
+                                //      made every map "fail" with -EINVAL.
+                                //   2. After a successful create the loader
+                                //      pins the fd (BPF_OBJ_PIN →
+                                //      /sys/fs/bpf/map_<file>_<name>) and then
+                                //      chown+chmod THAT PATH — in system mode
+                                //      chmod runs FOR REAL (6-Z305t-5), so the
+                                //      pin file must EXIST in the rootfs.
+                                // Per-command emulation (host seccomp always
+                                // rejects bpf() for the rootless app, so only
+                                // failures/zero are replaced; a real success
+                                // is left untouched):
+                                //   MAP_CREATE/PROG_LOAD/OBJ_GET → synthetic
+                                //     fd (0x6b02_0000 base, per-pid counter —
+                                //     the 6-Z99 netlink pattern; disjoint from
+                                //     the netlink range);
+                                //   OBJ_PIN → materialize an empty file at the
+                                //     translated pin path (the /sys/**
+                                //     translate rule lands it under the
+                                //     rootfs) + fake 0 — the loader's own
+                                //     access()-reuse, chown (fchownat fake)
+                                //     and chmod (real, rootfs-owned) then
+                                //     behave exactly like on a real device;
+                                //   LOOKUP/GET_NEXT_KEY/DELETE → -ENOENT (the
+                                //     honest empty-map semantics — never
+                                //     hand back uninitialized buffers);
+                                //   everything else → 0.
+                                // bpfloader then exits 0 and sets
+                                // bpf.progs_loaded=1. Recovery never calls
+                                // bpf() and the arm is gated on !boot_recovery
+                                // anyway (corpus rule).
+                                const BPF_FAKE_FD_BASE: i32 = 0x6b02_0000;
+                                const BPF_MAP_CREATE_CMD: u32 = 0;
+                                const BPF_MAP_LOOKUP_ELEM_CMD: u32 = 1;
+                                const BPF_MAP_UPDATE_ELEM_CMD: u32 = 2;
+                                const BPF_PROG_LOAD_CMD: u32 = 5;
+                                const BPF_OBJ_PIN_CMD: u32 = 6;
+                                const BPF_OBJ_GET_CMD: u32 = 7;
+                                if !boot_recovery
+                                    && abi.bpf != -1
+                                    && syscall_num == abi.bpf
+                                    && (fresh_ret < 0 && fresh_ret > -4096 || fresh_ret == 0)
+                                {
+                                    let cmd = get_syscall_arg(&regs2, abi.reg_arg1) as u32;
+                                    static BPF_ARM_LOG: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let bpf_log_n = BPF_ARM_LOG
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let mut bpf_new_ret: Option<i64> = match cmd {
+                                        BPF_MAP_CREATE_CMD | BPF_PROG_LOAD_CMD
+                                        | BPF_OBJ_GET_CMD => {
+                                            let base =
+                                                bpf_fd_next.entry(pid).or_insert(BPF_FAKE_FD_BASE);
+                                            let fd = *base;
+                                            if *base < 0x6bff_fff0 {
+                                                *base += 1;
+                                            }
+                                            bpf_fake_fds.entry(pid).or_default().insert(fd as i64);
+                                            Some(fd as i64)
+                                        }
+                                        BPF_MAP_LOOKUP_ELEM_CMD => Some(-(libc::ENOENT as i64)),
+                                        BPF_OBJ_PIN_CMD => {
+                                            // attr = arg2; pathname is the FIRST
+                                            // member of the BPF_OBJ_* union
+                                            // (UAPI: __aligned_u64 pathname;
+                                            // __u32 bpf_fd; __u32 file_flags).
+                                            let attr = get_syscall_arg(&regs2, abi.reg_arg2);
+                                            if attr != 0 {
+                                                if let Some(attr_bytes) =
+                                                    read_child_bytes(pid, attr, 8)
+                                                {
+                                                    if attr_bytes.len() == 8 {
+                                                        let path_ptr = u64::from_le_bytes(
+                                                            attr_bytes[0..8]
+                                                                .try_into()
+                                                                .unwrap_or([0u8; 8]),
+                                                        );
+                                                        if path_ptr != 0 {
+                                                            if let Some(guest_path) =
+                                                                read_child_string(pid, path_ptr)
+                                                            {
+                                                                let real_path =
+                                                                    translate_path_via_sandbox(
+                                                                        &sandbox,
+                                                                        rootfs,
+                                                                        &guest_path,
+                                                                    );
+                                                                if let Some(parent) =
+                                                                    std::path::Path::new(&real_path)
+                                                                        .parent()
+                                                                {
+                                                                    let _ = std::fs::create_dir_all(
+                                                                        parent,
+                                                                    );
+                                                                }
+                                                                match std::fs::File::create(
+                                                                    &real_path,
+                                                                ) {
+                                                                    Ok(_) => {
+                                                                        if bpf_log_n < 40 {
+                                                                            log(&format!(
+                                                                                "6-Z305t-49b: BPF_OBJ_PIN materialized {} (guest path {:?})",
+                                                                                real_path, guest_path
+                                                                            ));
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        if bpf_log_n < 40 {
+                                                                            log(&format!(
+                                                                                "6-Z305t-49b: BPF_OBJ_PIN FAILED to materialize {}: {}",
+                                                                                real_path, e
+                                                                            ));
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Some(0)
+                                        }
+                                        _ => Some(0),
+                                    };
+                                    if let Some(new_ret) = bpf_new_ret.take() {
+                                        set_syscall_ret(&mut regs2, &abi, new_ret);
+                                        if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                            log(&format!(
+                                                "6-Z305t-49b FAILED: ptrace_setregs for bpf(cmd={}) ({}): {} — child sees {}",
+                                                cmd, syscall_num, e, fresh_ret
+                                            ));
+                                        } else if bpf_log_n < 40 {
+                                            log(&format!(
+                                                "6-Z305t-49b: bpf(cmd={}, nr={}) returned {} (-errno {}) — faked to {}",
+                                                cmd, syscall_num, fresh_ret, -fresh_ret, new_ret
+                                            ));
+                                        }
+                                    }
+                                }
                                 if let Some(fake_val) = _forced_ret {
                                     // 6-Z268: identity-write elision — when the
                                     // fake is 0 AND the kernel already returned
@@ -34071,26 +34227,26 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
     }
 
     #[test]
-    fn compute_exit_return_value_bpf_returns_zero_6z305t49() {
-        // 6-Z305t-49: bpf() joins the fake-success set — the A11 bpfloader
-        // (reboot_on_failure service) fails at the host-seccomp EPERM and
-        // reboots the guest ("reboot,bpfloader-failed", ladder #107 run
-        // 34224829944). Uniform fake-0: MAP_CREATE/PROG_LOAD return fd 0
-        // (the loader only checks fd >= 0), every other command succeeds;
-        // bpfloader exits 0 and sets bpf.progs_loaded=1. Numbers verified
-        // against the kernel UAPI headers: i386=357, x86_64=321,
-        // aarch64=280, arm32=386. Recovery never calls bpf() — inert for
-        // the corpus.
-        assert_eq!(compute_exit_return_value(357, &ABI_X86_32), Some(0));
+    fn compute_exit_return_value_bpf_not_in_uniform_family_6z305t49b() {
+        // 6-Z305t-49b: bpf() must NOT be in the uniform fake-success
+        // family. Ladder #108 (run 34226614249) proved the uniform fake-0
+        // trips the A11 loader's explicit `if (fd == 0) return -EINVAL;`
+        // checks (Loader.cpp 443-444/595-596) — bpf is handled by the
+        // DEDICATED EXIT arm (per-command returns: MAP_CREATE/PROG_LOAD/
+        // OBJ_GET → synthetic fd from BPF_FAKE_FD_BASE, OBJ_PIN →
+        // rootfs pin-file materialization, LOOKUP/GET_NEXT_KEY/DELETE →
+        // -ENOENT, rest → 0). The uniform family must leave bpf alone so
+        // the dedicated arm's register write survives.
+        assert_eq!(compute_exit_return_value(357, &ABI_X86_32), None);
         assert_eq!(syscall_name(357, &ABI_X86_32), "bpf");
         #[cfg(target_arch = "x86_64")]
         {
-            assert_eq!(compute_exit_return_value(321, &ABI_X86_64), Some(0));
+            assert_eq!(compute_exit_return_value(321, &ABI_X86_64), None);
             assert_eq!(syscall_name(321, &ABI_X86_64), "bpf");
         }
         #[cfg(target_arch = "aarch64")]
         {
-            assert_eq!(compute_exit_return_value(280, &ABI_AARCH64), Some(0));
+            assert_eq!(compute_exit_return_value(280, &ABI_AARCH64), None);
             assert_eq!(syscall_name(280, &ABI_AARCH64), "bpf");
         }
     }
