@@ -27115,3 +27115,14 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   1. "6-Z305t-61: /proc/pressure/memory seeded" lines; libpsi's EACCES gone; lmkd STAYS ALIVE (no "exited with status 0" for lmkd, no critical reboot).
   2. With lmkd alive, the boot proceeds deeper: zygote restarts become the watch; the HIDL EX_TRANSACTION_FAILED fleet (192) is the next rock.
   3. ZYGOTE exit-1 cause: its OWN startup (classpath/apex/seccomp) — decode from its svclog when it survives past socket creation.
+
+## 6-Z305t-62 — the PSI epoll virtualization; commit e773f4f; ladder #122 dispatched
+
+- #121 (34253754752, 7f643e0/61b): the PSI seed SUCCEEDED ("94 bytes, host-backed") but lmkd STILL exited 0 ×5 — the next link: "[glog V/libpsi] epoll_ctl for psi monitor failed; errno=1" — a REGULAR file cannot be epoll'd (EPERM).
+- A11 libpsi decoded (libpsi/psi.cpp): O_WRONLY trigger write to the psi file (works on the backing file), then epoll_ctl(ADD, fd, EPOLLPRI, data.ptr). A faked-in registration would be WORSE: a regular-file fd is ALWAYS ready in epoll → lmkd's kill logic would spin.
+- FIX (e773f4f): (a) PSI fds tracked at open-EXIT (pending_open_translated_path contains /.twoyi-psi/); (b) epoll_ctl on a tracked psi fd → fake 0; (c) epoll_pwait results filtered: EPOLLPRI-only entries zeroed in the child's events array (packed 12-byte stride) + the return shrunk — lmkd's mainloop then waits peacefully forever (the honest container shape: PSI never fires because the HOST manages memory pressure). aarch64-gated; ENTRY stash for the events buffer (x0-x3 clobbered at EXIT); recovery gated off.
+- CI: ladder #122 dispatched on e773f4f.
+- Decision tree for #122:
+  1. "psi fd captured" + "epoll_ctl(ADD psi fd ...) faked to 0" lines; libpsi proceeds; lmkd STAYS ALIVE (no "Service 'lmkd' exited with status 0").
+  2. With the lmkd critical-reboot gate GONE, the boot runs to the next wall — candidates: the HIDL EX_TRANSACTION_FAILED fleet (192), zygote's own startup, the usap/zygote socket env vars.
+  3. Watch for new spin classes (a filtered epoll returning 0 forever must not busy-loop lmkd — its mainloop has other timeouts).
