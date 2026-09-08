@@ -27031,3 +27031,20 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 - THE NEXT INSTRUMENT (smallest, decisive): at bind EXIT in the 6-Z163 arm, read /proc/net/unix (host-side) and look for the bound socket — if the entry shows an "@..." abstract name or no path, log it ("6-Z163 EXIT: socket bound ABSTRACT — rewrite landed off-target"). Also log bind's raw return + errno. One ladder with this instrument settles it.
 - THEN the fix options (in preference order): (a) correct the 6-Z163 in-place write (offset/alignment); (b) if the write is correct but the STOP is misclassified, handle the sockaddr rewrite at the bind EXIT instead (the sockaddr buffer is still intact in child memory at EXIT — read arg2, verify family AF_UNIX, rewrite there, then the REAL bind... cannot re-execute — instead: materialize a real filesystem socket via a tracer-held UnixListener and keep it alive in a map so init's fchmodat and client connects find a real file; the accept-queue caveat: connects queue on the tracer's listener and are never accepted — decode the accept-side impact before choosing this); (c) shlib-side bind hook that bypasses the no_props gate for /dev/socket/* paths only (userspace, race-free — the double-translation hazard does NOT apply to bind because the shlib builds a NEW sockaddr rather than prefixing in place — but the hook must coordinate with the tracer arm to avoid both firing).
 - No commit this round (decode checkpoint). The 52 commit stays (harmless, and correct once the file exists).
+
+## 6-Z305t-54 (decode only) — #114 deep decode: the EADDRINUSE chain — broken process-group kills leave stale socket holders; the 6-Z101 bind fake masks it; no code this round
+
+- The #114 artifact yields the SMOKING GUN: "6-Z101: direct Bind(fd=18) returned -98 (-errno 98) — faked to 0" (×6). The kernel bind FAILED EADDRINUSE and the 6-Z101 EXIT fake masked it — init believed the bind succeeded → fchmodat ENOENT → service exit(1).
+- THE FULL CHAIN (all links evidenced):
+  1. Service crashes (zygote/lmkd/tombstoned — each for its own reasons, e.g. the HIDL plane).
+  2. init kills the service's process group → libprocessgroup FAILS ("Failed to kill process cgroup uid 0 pid 2850 in 227ms, 1 processes remain") — the cgroup fs is virtualized so the cgroup-kill API cannot work; init has no fallback.
+  3. THE OLD SERVICE PROCESS LINGERS, alive, holding its bound /dev/socket/<name> unix socket.
+  4. init's Reap unlink(/dev/socket/<name>) sometimes missed (6-Z210 race) → the socket file SURVIVES with a live binding.
+  5. Next start: 6-Z163 rewrite + remove_file → bind → EADDRINUSE (a live binding on the same path — the remove/rm raced the holder's re-bind or the remove hit a different name form).
+  6. 6-Z101 fakes the bind to 0 → init proceeds → fchmodat ENOENT → exit(1) → crash loop → lmkd critical ×4 → InitFatalReboot.
+- CONSISTENCY CHECK: property_service succeeded early (+848ms, tracer idle, first attempt — nothing to collide with); every later socket create fails with the same shape. lmkd fails at +2366ms (first restart after its first clean exit-0 — its first socket lingered from the first start).
+- RANKED FIXES (next rounds):
+  1. TRACER-SIDE REAL GROUP KILL: when init signals/kills a service's process group (tgkill/kill or the cgroup-kill window), deliver a REAL kill() to every traced member of that group (the tracer owns the full process tree). This kills the LINGERING-HOLDER class at its root — the honest replacement for the virtualized cgroup-kill API.
+  2. UNMASK 6-Z101 for /dev/socket binds (after (1)): an honest EADDRINUSE beats a masked one — init's error path is well-defined.
+  3. (Retained) the 52 fchmodat EXIT catch — still correct once files exist.
+- No commit this round (decode checkpoint). Everything pushed (ae89e67).
