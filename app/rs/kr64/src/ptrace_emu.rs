@@ -6710,6 +6710,16 @@ const SYNTHETIC_FD_BASE: i32 = 0x7e00_0000;
 /// tracer's fake_netlink_fds set ever resolves it.
 const NETLINK_FAKE_FD_BASE: i32 = 0x6b00_0000;
 
+/// 6-Z305t-59: one rewritten bind's forensic record — (guest path,
+/// remove_file outcome, scratch address, expected blob prefix). The CI
+/// clippy (deny clippy::type_complexity) rejects the inline tuple form.
+type PendingBindRecord = (
+    String,
+    std::result::Result<(), std::io::Error>,
+    u64,
+    [u8; 16],
+);
+
 /// Task 6-Z99: which socket-family syscall is this? Used by the EXIT
 /// arms that fake the fd-taking calls on a fake netlink uevent fd.
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -12747,15 +12757,8 @@ pub fn run_ptrace_loop(
     // 6-Z305t-59: the LAST rewritten bind's (guest_path, remove_file result)
     // per pid — consumed at the bind EXIT by the 6-Z101 forensics so every
     // -98 is attributed to its guest path and the remove_file outcome.
-    let mut pending_bind_path: std::collections::HashMap<
-        libc::pid_t,
-        (
-            String,
-            std::result::Result<(), std::io::Error>,
-            u64,
-            [u8; 16],
-        ),
-    > = std::collections::HashMap::new();
+    let mut pending_bind_path: std::collections::HashMap<libc::pid_t, PendingBindRecord> =
+        std::collections::HashMap::new();
     // 6-Z305t-49b: per-pid set of live fake BPF fds (bounded by the loader
     // workload: ~100 map/prog fds per boot; close() tracking skipped —
     // a stale entry only wastes a base slot).
@@ -18716,9 +18719,9 @@ pub fn run_ptrace_loop(
                                                             ));
                                                         }
                                                         None => {
-                                                            log(&format!(
-                                                                "6-Z305t-58: bind rewrite READBACK FAILED (getregs) — cannot verify"
-                                                            ));
+                                                            log(
+                                                                "6-Z305t-58: bind rewrite READBACK FAILED (getregs) — cannot verify",
+                                                            );
                                                         }
                                                     }
                                                     // 6-Z305t-60: stash for the bind-EXIT
@@ -20506,9 +20509,10 @@ pub fn run_ptrace_loop(
                                                 Err(_) => {
                                                     // Host kernel lacks PSI — serve the
                                                     // honest zero-state (no pressure).
-                                                    format!(
-                                                        "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
-                                                    )
+                                                    concat!(
+                                                        "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+                                                        "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                                                        ).to_string()
                                                 }
                                             };
                                             match std::fs::write(backing, content.as_bytes()) {
@@ -29290,7 +29294,7 @@ pub fn run_ptrace_loop(
                                                 sock_dir = if names.is_empty() {
                                                     "(EMPTY)".to_string()
                                                 } else {
-                                                    format!("{}", names.join(","))
+                                                    names.join(",")
                                                 };
                                             }
                                             let bind_src = pending_bind_path
