@@ -8725,6 +8725,17 @@ fn is_binder_path(path: &str) -> bool {
     )
 }
 
+/// 6-Z305t-42: does this ioctl request number belong to the binder ioctl
+/// family? _IOC encodes the type at bits 8-15; the whole binder family
+/// (BINDER_WRITE_READ, BINDER_VERSION, BINDER_SET_MAX_THREADS, …) uses
+/// type 'b' = 0x62. #98: libbinder's "could not be opened" FATAL fires
+/// DOWNSTREAM of a SUCCESSFUL node open (fd 17 on record) — open_driver's
+/// next step is the BINDER_VERSION ioctl, whose fate (ret/errno) decides
+/// the FATAL. Pure for tests.
+fn is_binder_ioctl_req(req: u64) -> bool {
+    (req >> 8) & 0xff == 0x62
+}
+
 /// 6-Z197: is this guest path one of the canonical Android
 /// first-stage-init CHECKCALL boot directories?
 ///
@@ -13437,6 +13448,22 @@ pub fn run_ptrace_loop(
     // a binder device node (orig or translated) with its node-existence
     // check; #97's servicemanager FATAL has zero shim-side evidence.
     let mut binder_open_diag_count: u64 = 0;
+    // 6-Z305t-42: binder fd table — (pid, fd) → the node path the open
+    // resolved to. Populated at the open-EXIT registration when
+    // is_binder_path(p); consumed by the ioctl/mmap ENTRY forensics to
+    // attribute binder ops to real fds. Dies with the process (cleanup at
+    // both forget_dead_pid_state call sites).
+    let mut binder_fds: std::collections::HashMap<(libc::pid_t, i32), String> =
+        std::collections::HashMap::new();
+    // 6-Z305t-42: ENTRY stash for the binder-fd ioctl forensics — consumed
+    // at EXIT to log the REAL return; the BINDER_VERSION fate is the direct
+    // suspect for the open-then-FATAL pair.
+    let mut pending_binder_ioctl: std::collections::HashMap<libc::pid_t, (i32, u64)> =
+        std::collections::HashMap::new();
+    // 6-Z305t-42: ioctl ENTRY budget (120 — the fleet is ~11 processes × a
+    // handful of binder ioctls each) + mmap ENTRY budget (40).
+    let mut binder_ioctl_diag_count: u64 = 0;
+    let mut binder_mmap_diag_count: u64 = 0;
     // 6-Z237: failed-open DIAG counter for guest-/dev paths in the
     // second-stage boot window (loop 400-1000, first 20).
     let mut dev_fail_diag_count: u64 = 0;
@@ -14659,6 +14686,12 @@ pub fn run_ptrace_loop(
                 &mut z296_read_bufs,
                 &mut pending_getpeersec,
             );
+            // 6-Z305t-42: binder fd/ioctl state dies with the process — a
+            // pid-RECYCLED successor must not inherit a stale binder-fd
+            // tracking (the forget_dead_pid_state contract, inline form:
+            // these maps are loop locals like ashmem_fd_sizes).
+            binder_fds.retain(|(p, _), _| *p != pid);
+            pending_binder_ioctl.remove(&pid);
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
             // dead pid + the prop_area_maps entries — see
@@ -14856,6 +14889,12 @@ pub fn run_ptrace_loop(
                 &mut z296_read_bufs,
                 &mut pending_getpeersec,
             );
+            // 6-Z305t-42: binder fd/ioctl state dies with the process — a
+            // pid-RECYCLED successor must not inherit a stale binder-fd
+            // tracking (the forget_dead_pid_state contract, inline form:
+            // these maps are loop locals like ashmem_fd_sizes).
+            binder_fds.retain(|(p, _), _| *p != pid);
+            pending_binder_ioctl.remove(&pid);
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
             // above).
@@ -20548,7 +20587,7 @@ pub fn run_ptrace_loop(
                                         };
                                         let node_note = match std::fs::metadata(&translated) {
                                             Ok(md) => format!(
-                                                "node dev={} ino={} mode={:o} ftype={}",
+                                                "node dev={} ino={} mode={:o} ftype={} rdev={}:{}",
                                                 md.dev(),
                                                 md.ino(),
                                                 std::os::unix::fs::MetadataExt::mode(&md),
@@ -20558,7 +20597,14 @@ pub fn run_ptrace_loop(
                                                     "dir"
                                                 } else {
                                                     "other"
-                                                }
+                                                },
+                                                // 6-Z305t-42: the node's char major:minor —
+                                                // decides whether the open resolves to a
+                                                // driver-backed device (host binder major)
+                                                // or a major the container kernel does
+                                                // not serve (open ENXIO class).
+                                                libc::major(md.rdev()),
+                                                libc::minor(md.rdev())
                                             ),
                                             Err(e) => format!("node MISSING ({})", e),
                                         };
@@ -21529,6 +21575,28 @@ pub fn run_ptrace_loop(
                         n if n == abi.mmap || n == abi.mmap2 => {
                             let flags = get_syscall_arg(&regs, abi.reg_arg4) as i32;
                             let fd = get_syscall_arg(&regs, abi.reg_arg5) as i32;
+                            // ── 6-Z305t-42: binder-fd mmap probe (ENTRY) ──
+                            //
+                            // libbinder's ProcessState mmaps the binder fd
+                            // MAP_SHARED right after BINDER_VERSION succeeds;
+                            // a failure here is the second suspect for the
+                            // open-then-FATAL pair. Log every mmap of a
+                            // tracked binder fd (size/prot/flags/offset + the
+                            // fd target) so the mmap-vs-ioctl split lands on
+                            // the record. Observation only.
+                            if binder_fds.contains_key(&(pid, fd)) && binder_mmap_diag_count < 40 {
+                                binder_mmap_diag_count += 1;
+                                log(&format!(
+                                    "6-Z305t-42 binder mmap ENTRY pid={} fd={} len={:#x} prot={:#x} flags=0x{:x} off={:#x} target={:?}",
+                                    pid,
+                                    fd,
+                                    get_syscall_arg(&regs, abi.reg_arg2),
+                                    get_syscall_arg(&regs, abi.reg_arg3),
+                                    flags,
+                                    get_syscall_arg(&regs, abi.reg_arg6),
+                                    binder_fds.get(&(pid, fd))
+                                ));
+                            }
                             // Task 6-Z2: ALWAYS log mmap2 args so we can see
                             // what the early calls (that return -38 ENOSYS) are.
                             // 6-Z268: rate-capped at 40 — this was UN-gated and
@@ -22601,6 +22669,39 @@ pub fn run_ptrace_loop(
                         let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
                         let req = get_syscall_arg(&regs, abi.reg_arg2);
                         let arg = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                        // ── 6-Z305t-42: binder-fd ioctl forensics (ENTRY) ──
+                        //
+                        // #98: an open of /dev/binder returned fd 17 (SUCCESS)
+                        // yet libbinder still FATALs "could not be opened" —
+                        // that text fires when open_driver's BINDER_VERSION
+                        // ioctl fails (fd closed → -1) or the fd never was a
+                        // real binder device. Log every ioctl on a TRACKED
+                        // binder fd (or any 'b'-family req) with its fd target,
+                        // stash (fd, req), and log the REAL ret at EXIT. NO
+                        // faking — pure observation; ashmem handling below is
+                        // disjoint ('a'-family reqs on ashmem stand-in fds).
+                        let binder_fd_hit = binder_fds.contains_key(&(pid, fd));
+                        if binder_fd_hit || is_binder_ioctl_req(req) {
+                            binder_ioctl_diag_count = binder_ioctl_diag_count.saturating_add(1);
+                            let target = binder_fds.get(&(pid, fd)).cloned().or_else(|| {
+                                std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                                    .ok()
+                                    .map(|t| t.to_string_lossy().into_owned())
+                            });
+                            if binder_ioctl_diag_count <= 120 {
+                                log(&format!(
+                                    "6-Z305t-42 binder ioctl ENTRY pid={} fd={} req={:#x} arg={:#x} tracked_fd={} target={:?} (occurrence {})",
+                                    pid,
+                                    fd,
+                                    req,
+                                    arg,
+                                    binder_fd_hit,
+                                    target,
+                                    binder_ioctl_diag_count
+                                ));
+                            }
+                            pending_binder_ioctl.insert(pid, (fd, req));
+                        }
                         let nr = ashmem_ioctl_nr(req);
                         if nr != 0 && ashmem_fd_sizes.contains_key(&(pid, fd)) {
                             let mut fake_ret: i64 = 0;
@@ -22757,6 +22858,25 @@ pub fn run_ptrace_loop(
                                 pid, e
                             )),
                         }
+                    }
+
+                    // ── 6-Z305t-42: binder-fd ioctl forensics (EXIT side) ──
+                    //
+                    // Consume the ENTRY stash and log the REAL return of every
+                    // binder-fd / 'b'-family ioctl. BINDER_VERSION=0xc0046209
+                    // and BINDER_WRITE_READ=0xc0306201 are the two that decide
+                    // open_driver's FATAL and the first transaction
+                    // respectively.
+                    if let Some((b_fd, b_req)) = pending_binder_ioctl.remove(&pid) {
+                        let b_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        log(&format!(
+                            "6-Z305t-42 binder ioctl EXIT pid={} fd={} req={:#x} ret={} ({})",
+                            pid,
+                            b_fd,
+                            b_req,
+                            b_ret,
+                            if b_ret < 0 { "FAILED" } else { "ok" }
+                        ));
                     }
 
                     // ── 6-Z296: input-read CALLER identification (EXIT side) ──
@@ -23860,6 +23980,26 @@ pub fn run_ptrace_loop(
                                     log(&format!(
                                         "6-Z203: open() returned fd={} for the {} ashmem stand-in — ASHMEM_* ioctls on it will be faked",
                                         ret, p
+                                    ));
+                                }
+                                // ── 6-Z305t-42: track binder-node fds (open EXIT
+                                // success side) ──
+                                // #98: one open returned fd 17 yet libbinder
+                                // FATALs downstream — track every successful
+                                // binder-node fd here so the ioctl/mmap ENTRY
+                                // forensics can attribute ops to it, and log the
+                                // node's char major:minor (decides whether the
+                                // kernel actually serves this device).
+                                if is_binder_path(&p) {
+                                    use std::os::unix::fs::MetadataExt as _;
+                                    let (rd_major, rd_minor) = match std::fs::metadata(&p) {
+                                        Ok(md) => (libc::major(md.rdev()), libc::minor(md.rdev())),
+                                        Err(_) => (0, 0),
+                                    };
+                                    binder_fds.insert((pid, ret as i32), p.clone());
+                                    log(&format!(
+                                        "6-Z305t-42 binder open EXIT pid={} fd={} path={} node rdev={}:{} — fd tracked (ioctl/mmap ops will be forensics'd)",
+                                        pid, ret, p, rd_major, rd_minor
                                     ));
                                 }
                                 // Task 6-Y: track __properties__ fd for
@@ -34933,6 +35073,34 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // component still classifies.
         assert!(is_binder_path("/data/user/0/io.twoyi/rootfs/dev/binder"));
         assert!(is_binder_path("/data/user/0/io.twoyi/rootfs/dev/hwbinder"));
+    }
+
+    // ── 6-Z305t-42: is_binder_ioctl_req classifier tests ──
+    #[test]
+    fn is_binder_ioctl_req_matches_binder_family() {
+        // BINDER_WRITE_READ = _IOWR('b', 1, struct binder_write_read):
+        // dir=3 size=48 type='b'(0x62) nr=1 → 0xc0306201.
+        assert!(is_binder_ioctl_req(0xc0306201));
+        // BINDER_VERSION shape (_IOWR('b', nr, __s32)) — the open_driver
+        // version probe whose fate decides the #98 FATAL.
+        assert!(is_binder_ioctl_req(0xc0046209));
+        // BINDER_SET_MAX_THREADS shape (_IOW('b', 5, …)).
+        assert!(is_binder_ioctl_req(0x40046205));
+        // The type byte alone decides (nr/dir/size bits irrelevant).
+        assert!(is_binder_ioctl_req(0x000062ff));
+    }
+
+    #[test]
+    fn is_binder_ioctl_req_rejects_other_families() {
+        // ASHMEM_SET_NAME = _IOW('a', 1, char[64]) — the 'a' family the
+        // ashmem stand-in handles (must stay disjoint from the binder
+        // branch so the 6-Z203 fake path is never disturbed).
+        assert!(!is_binder_ioctl_req(0x40106101));
+        // TCGETS (0x54 family).
+        assert!(!is_binder_ioctl_req(0x5401));
+        assert!(!is_binder_ioctl_req(0));
+        // 'c' family lookalike.
+        assert!(!is_binder_ioctl_req(0xc0046363));
     }
 
     #[test]
