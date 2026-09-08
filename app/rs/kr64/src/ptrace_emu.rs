@@ -3201,6 +3201,24 @@ fn set_syscall_ret(regs: &mut Regs, abi: &ChildAbi, val: i64) {
 /// - `PR_CAP_AMBIENT` (47): `0` — `IS_SET` reads "not set" (still
 ///   `>= 0`, so `CapAmbientSupported()` stays true, matching a real
 ///   kernel) and the mutating sub-options report success.
+/// - `PR_SET_TAGGED_ADDR_CTRL` (55) / `PR_GET_TAGGED_ADDR_CTRL` (56):
+///   `-EINVAL` — the real-kernel semantic of a 5.4-class arm64 kernel
+///   WITHOUT `CONFIG_ARM64_TAGGED_ADDR_ABI` (the same goldfish kernel
+///   class the bounding-set arm models). 6-Z305t-44: the uniform `0`
+///   here made guest bionic's `SetDefaultHeapTaggingLevel()` believe
+///   the kernel accepts tagged addresses and ENABLE heap pointer
+///   tagging (the fixed 0xB4 top-byte tag on every malloc return;
+///   bionic/libc/bionic/heap_tagging.cpp). The virtualization layers'
+///   pointer handling then trips bionic's tag check on the first
+///   free/realloc of a truncated pointer — `async_safe_fatal("Pointer
+///   tag for %p was truncated.")` — the crash class that killed
+///   hwservicemanager/lmkd/surfaceflinger-class services ×4 and drove
+///   init's critical reboot at ladder rung 3 (runs #97-#100). A kernel
+///   without the prctl keeps `heap_tagging_level = M_HEAP_TAGGING_LEVEL_
+///   NONE`: pointers are never tagged, the check never fires, and every
+///   GSI boots exactly as it does on real tagless hardware. This is a
+///   shared Android semantic (GSIs boot on such kernels), not a ROM
+///   special case.
 /// - everything else (`PR_SET_VMA` naming, `PR_SET_NAME`,
 ///   `PR_SET_DUMPABLE`, the loader's `PR_SET_NO_NEW_PRIVS` /
 ///   `PR_SET_SECCOMP`, `PR_SET_SECUREBITS`...): `0` — the fake-success
@@ -3208,12 +3226,20 @@ fn set_syscall_ret(regs: &mut Regs, abi: &ChildAbi, val: i64) {
 fn emulated_prctl_ret(option: u64, arg2: u64) -> i64 {
     const PR_CAPBSET_READ: u64 = 23;
     const CAP_LAST_CAP_EMULATED: u64 = 38;
+    // 6-Z305t-44: bionic heap pointer tagging must stay OFF — see the
+    // doc block above. PR_SET_TAGGED_ADDR_CTRL = 55, PR_GET_.. = 56
+    // (uapi/linux/prctl.h); a kernel without CONFIG_ARM64_TAGGED_ADDR_ABI
+    // returns -EINVAL for both.
+    const PR_SET_TAGGED_ADDR_CTRL: u64 = 55;
+    const PR_GET_TAGGED_ADDR_CTRL: u64 = 56;
     if option == PR_CAPBSET_READ {
         if arg2 > CAP_LAST_CAP_EMULATED {
             -22 // -EINVAL
         } else {
             1 // in the bounding set
         }
+    } else if option == PR_SET_TAGGED_ADDR_CTRL || option == PR_GET_TAGGED_ADDR_CTRL {
+        -22 // -EINVAL: the emulated 5.4-class kernel has no tagged-addr ABI
     } else {
         // PR_CAP_AMBIENT and all setters: success
         0
@@ -33255,6 +33281,42 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
                 "option {option:#x} must keep the 6-Z147 fake-success (0)"
             );
         }
+    }
+
+    #[test]
+    fn emulated_prctl_ret_rejects_tagged_addr_ctrl() {
+        // 6-Z305t-44 regression guard: PR_SET_TAGGED_ADDR_CTRL (55) and
+        // PR_GET_TAGGED_ADDR_CTRL (56) MUST fail with -EINVAL — the
+        // semantic of a 5.4-class arm64 kernel without
+        // CONFIG_ARM64_TAGGED_ADDR_ABI. The previous uniform 0 told
+        // guest bionic's SetDefaultHeapTaggingLevel() that the kernel
+        // accepts tagged addresses, which ENABLED heap pointer tagging
+        // (0xB4 top-byte tags) — the "Pointer tag for %p was truncated."
+        // abort class that killed the service fleet ×4 and drove init's
+        // critical reboot at ladder rung 3 (runs #97-#100). Both the
+        // SET and GET forms must fail; arg2 must not matter.
+        assert_eq!(
+            emulated_prctl_ret(55, 0),
+            -22,
+            "PR_SET_TAGGED_ADDR_CTRL(arg2=0) must -EINVAL"
+        );
+        assert_eq!(
+            emulated_prctl_ret(55, 1),
+            -22,
+            "PR_SET_TAGGED_ADDR_CTRL(PR_TAGGED_ADDR_ENABLE) must -EINVAL"
+        );
+        assert_eq!(
+            emulated_prctl_ret(56, 0),
+            -22,
+            "PR_GET_TAGGED_ADDR_CTRL must -EINVAL"
+        );
+        // The bionic decision path reads EXACTLY like: prctl(...) == 0
+        // enables tagging. Any non-negative return here would regress
+        // the #97-#100 pointer-tag crash class back into the boot.
+        assert!(
+            emulated_prctl_ret(55, 1) < 0,
+            "tagging-enable prctl must NEVER report success under the emulator"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
