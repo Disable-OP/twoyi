@@ -7713,6 +7713,33 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     e
                 );
             }
+            // 6-Z305t-45: the boot-mode FILE — env-independent stamp for the
+            // shlib's gotfix-44 gate. Ladder #103 (run 34203719213) proved
+            // the exec-env chain drops TWOYI_BOOT_MODE before guest
+            // constructors see it (kr64's own [KR64 CHILD] env log lists the
+            // var, yet all 342 gate verdicts printed '(absent)' while
+            // TWOYI_SHLIB_NO_PROPS from the SAME envp reached 384 processes)
+            // — the same init env-scrub class that 6-Z187b solved for
+            // TWOYI_ROOTFS with /dev/.twoyi-rootfs. The shlib reads
+            // "/dev/.twoyi-boot-mode" through the tracer-translated absolute
+            // path when the env var is missing. Recovery boots stamp
+            // "recovery" so the gate stays off (recovery corpus behavior
+            // unchanged by construction).
+            {
+                let boot_mode_file = format!("{}/dev/.twoyi-boot-mode", cfg.rootfs);
+                let boot_mode = if cfg.boot_recovery {
+                    "recovery"
+                } else {
+                    "android"
+                };
+                if let Err(e) = std::fs::write(&boot_mode_file, format!("{}\n", boot_mode)) {
+                    warning!(
+                        "[KR64][symlinks] failed to write {}: {} (shlib falls back to env only)",
+                        boot_mode_file,
+                        e
+                    );
+                }
+            }
         }
         info!(
             "[KR64][symlinks] materialized {} real symlinks from .symlink sidecars (removed {}, skipped {}, busybox-staged={})",
