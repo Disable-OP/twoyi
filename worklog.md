@@ -26989,3 +26989,20 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. FRONTIER: ZYGOTE (rung 5). init should start 'zygote' → app_process exec → zygote's own startup logs.
   3. WATCH: netd with bpf.progs_loaded unset (A11 TrafficController no-BPF path); health-hal-2-1 passthrough; HIDL EX_TRANSACTION_FAILED ×9-18 (persistent class).
   4. If zygote starts and crashes: decode its abort (classpath/apex/seccomp/UID class).
+
+## 6-Z305t-51 (decode only) — #113: 50 VERIFIED (bpfloader gone; init started ZYGOTE 3×!) — new frontier: init socket creation ENOENT + the HIDL plane; no commit this round
+
+- Ladder #113 (34235112734, 7fe0d38/50): rung 3, InitFatalReboot from "critical process 'lmkd' exited 4 times".
+- **MILESTONE: init started 'zygote' THREE TIMES** (pids 2850/3128/3314, each exit 1) — the boot reached the zygote-start service chain. Zygote's onrestart actions ran ("restart netd" etc.). app_process64 staged + exec'd via the twoyi_stage machinery.
+- Death chain: services crash-loop → lmkd restart×4 (exits 0! — lmkd's early-clean-exit needs decode: PSI/kernel-interface class) → critical reboot.
+- The dominant crash class (192!): HIDL "Attempted to retrieve value from failed HIDL call: Status(EX_TRANSACTION_FAILED)" — audioserver, hidl_memory, system_suspend, drm (+6 "Error while registering drm service"), health passthrough ×12 — the hwservicemanager/HIDL wire plane is the next big rock.
+- Zygote's OWN blocker (exit 1): init could not create its socket — "Could not create socket 'zygote': Failed to fchmodat socket '/dev/socket/zygote': No such file or directory" (also tombstoned_*, dnsproxyd). Evidence trail:
+  - The 6-Z163 bind arm REWROTE the sockaddr in-place for zygote (fd=18 → {rootfs}/dev/socket/zygote) — bind machinery works (property_service socket CREATES fine: "Created socket '/dev/socket/property_service', mode 666").
+  - fchmodat fails ENOENT AFTER a (presumably) successful bind — either the socket file vanished between bind and fchmodat, or the bind did not actually land.
+  - The tracer-side fchmodat ENTRY translation (6-Z258 layer 1) exists but the 6-Z210 missed-ENTRY race (documented in the 6-Z258 comment itself) leaves SOME fchmodats executing RAW against the host → ENOENT. The shlib's fchmodat hook passes RAW under the no_props gate (by design — double-translation hazard, 6-Z305s-e), so it cannot backstop this.
+- NEXT STEPS (in order):
+  1. EXIT-side fchmodat/fchownat ENOENT catch in the tracer: read the path at EXIT (args survive), translate via translate_path_via_sandbox, host-side std::fs::set_permissions on the backing store, fake return 0 — the race-free fallback for the missed-ENTRY class. CAREFUL: only when the real errno is ENOENT/EPERM and the translated path is inside the rootfs; never touch real successes.
+  2. Investigate why the zygote socket file is missing at fchmodat: dump {rootfs}/dev/socket/ contents at the artifact step (add a rootfs-socket listing to the CI artifact) — distinguishes "bind never landed" vs "file removed post-bind" (6-Z163 restore / 6-Z197 illusion interplay).
+  3. HIDL EX_TRANSACTION_FAILED fleet: the wire plane carries AIDL fine (servicemanager works — core daemons live) but HIDL transactions fail — decode one failing call's parcel (hwservicemanager registration? interface chain? 6-Z271 HIDL shim coverage for the A11 shape).
+  4. lmkd exit-0 ×5: A11 lmkd exits cleanly when its kernel interfaces (PSI fds, /proc/meminfo re-reading loop) are unavailable — decode its exact exit path (its svclog) and virtualize the missing kernel interface honestly.
+- No code commit this round — decode-heavy; the next round implements (1) as the smallest fix.
