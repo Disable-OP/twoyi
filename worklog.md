@@ -27093,3 +27093,13 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. at the 6-Z101 -98 arm: the {rootfs}/dev/socket directory LISTING at failure time — file EXISTS → a stale file survived remove_file (re-creator race); EMPTY → the raw host bind.
 - Also queued (next round): exclude zombies ('Z' state) from the cgroup.procs member list; materialize 0666 so init's pid-move write lands ("Failed to write '3458' ... Permission denied").
 - Local gates: build/fmt/test(792/792)/clippy clean. CI: ladder #117 dispatched on b57e4a8.
+
+## 6-Z305t-60 — #118 decode: remove_file=FAILED was benign ENOENT; target absent at -98; the scratch-content forensics added; commit 0804693; ladder #119 dispatched
+
+- #118 (34247341217, 24c662d/59): the stash ties EVERY -98 to its rewritten /dev/socket/* path (lmkd, tombstoned_intercept, tombstoned_java_trace, dnsproxyd) with remove_file=FAILED (benign ENOENT — nothing to remove) and target_now_exists=false.
+- The contradiction: unix_bind returns -98 ONLY when the target file EXISTS (existence check BEFORE the permission check). The rootfs target doesn't exist → the kernel bind did NOT use the rootfs path — despite the 58 READBACK OK. Two candidates remain:
+  1. STOP-PHASE MISCLASSIFICATION: the 6-Z163 arm fired at the bind's EXIT stop (after a RAW bind against the HOST /dev/socket/<name> — the redroid host's own services hold those files — already failed with -98); the scratch write + setregs at "EXIT" affect the NEXT syscall (mostly benign).
+  2. A post-ENTRY scratch writer corrupting the blob between the arm and the syscall execution.
+- INSTRUMENT (this commit): the bind stash now carries (guest_path, rm_res, sa_scratch, expected-blob-prefix[16]) and the -98 forensics re-reads the scratch content: scratch_intact=true + -98 ⇒ (1); scratch_intact=false ⇒ (2). One ladder settles it.
+- 59 also decoded: "Failed to write '3458' to .../cgroup.procs: Permission denied" (the 0444 materialized file blocks init's pid-move) and zombie members in the re-check — both queued for the fix round (0666 + skip 'Z' state).
+- Local gates: build/fmt/test(792/792)/clippy clean. CI: ladder #119 dispatched on 0804693.
