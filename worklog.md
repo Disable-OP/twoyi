@@ -27017,3 +27017,17 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   1. "6-Z305t-52: fchmodat-family EXIT catch" lines for /dev/socket/* — zygote's socket creation must COMPLETE ("Created socket 'zygote', mode 660").
   2. Zygote survival: app_process must get past socket env → zygote's own startup (rung 5 ZYGOTE).
   3. THEN: the HIDL EX_TRANSACTION_FAILED fleet (192 in #113) and lmkd exit-0 loop are the next rocks — likely in either order.
+
+## 6-Z305t-53 (decode only) — #114: the socket-creation root cause narrows to the bind landing in the ABSTRACT namespace; commit 39f6abd (52) verified harmless but insufficient; no code change this round
+
+- Ladder #114 (34237224812, 39f6abd/52): rung 3, same socket-creation failures. The 52 fchmodat EXIT catch did NOT fire (0 lines) because its guard `backing.exists()` is FALSE — **{rootfs}/dev/socket/zygote genuinely does not exist at fchmodat time**.
+- THE DECISIVE EVIDENCE SET (#113 + #114):
+  1. ZERO "Failed to bind socket" lines — init's bind() ALWAYS returns success.
+  2. fchmodat ALWAYS ENOENT for zygote/lmkd/tombstoned/dnsproxyd/fwmarkd/mdns/usap_pool (property_service historically succeeded — created early at +848ms when the tracer was idle).
+  3. The 6-Z163 ENTRY arm logs "bind(fd=18, /dev/socket/zygote) sockaddr REWRITTEN to {rootfs}/dev/socket/zygote (len 110 -> 55)" — the in-place rewrite RAN.
+  4. lmkd fails at +2366ms — BEFORE zygote — the class is systemic, not zygote-specific.
+  5. A11 init service.cpp:270-274 unlinks /dev/socket/<name> at Reap (irrelevant for first start).
+- Inference: bind returns success WITHOUT creating the filesystem file → the only kernel semantic that does that is the ABSTRACT namespace (sun_path[0] == 0). The 6-Z163 in-place write most likely lands one byte off (or the ENTRY stop's regs snapshot mis-targets the sockaddr base), turning the pathname bind into an abstract bind. fchmodat on the (nonexistent) pathname then ENOENTs — everything observed fits, including property_service's early-window success (idle tracer → ENTRY stops caught → rewrite correct → filesystem bind).
+- THE NEXT INSTRUMENT (smallest, decisive): at bind EXIT in the 6-Z163 arm, read /proc/net/unix (host-side) and look for the bound socket — if the entry shows an "@..." abstract name or no path, log it ("6-Z163 EXIT: socket bound ABSTRACT — rewrite landed off-target"). Also log bind's raw return + errno. One ladder with this instrument settles it.
+- THEN the fix options (in preference order): (a) correct the 6-Z163 in-place write (offset/alignment); (b) if the write is correct but the STOP is misclassified, handle the sockaddr rewrite at the bind EXIT instead (the sockaddr buffer is still intact in child memory at EXIT — read arg2, verify family AF_UNIX, rewrite there, then the REAL bind... cannot re-execute — instead: materialize a real filesystem socket via a tracer-held UnixListener and keep it alive in a map so init's fchmodat and client connects find a real file; the accept-queue caveat: connects queue on the tracer's listener and are never accepted — decode the accept-side impact before choosing this); (c) shlib-side bind hook that bypasses the no_props gate for /dev/socket/* paths only (userspace, race-free — the double-translation hazard does NOT apply to bind because the shlib builds a NEW sockaddr rather than prefixing in place — but the hook must coordinate with the tracer arm to avoid both firing).
+- No commit this round (decode checkpoint). The 52 commit stays (harmless, and correct once the file exists).
