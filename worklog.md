@@ -26892,3 +26892,22 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. proxy fd= ⇒ virtual binder engages: servicemanager/vold/lmkd/hwservicemanager survive their ProcessState init → rung 4 (CORE_DAEMONS) minimum; zygote at 5 is the stretch.
   3. If "/dev/null fd=" instead: the proxy lifecycle (BinderProxy bind/connect) is the next blocker — decode kr64 binder.rs binding state.
   4. keystore "Failed to open DB" ×6 and HIDL joinRpcThreadpool ×2 from the #104 fleet remain on the radar AFTER binder.
+
+## 6-Z305t-48 — #106 decode: BINDER PLANE ENGAGED (core daemons up, init reached zygote-start) but update_verifier rebooted at the zygote gate → blocking_services exit(0); commit 9d4d9e4; ladder #107 dispatched
+
+- Ladder #106 (34223210003, 6de9541/47): rung 3, post-mortem init reboot path — but the interior is a BREAKTHROUGH:
+  - 6-Z305t-47 VERIFIED: ZERO "Binder driver could not be opened" FATALs (was 77 in #104, 16 in #105). The binder/qemu fallbacks now fire for every open route.
+  - Core daemon fleet STARTED: servicemanager, hwservicemanager, logd, logd-reinit, ueventd, vold, lmkd, bpfloader, derive_sdk, system_suspend, tombstoned, health-hal-2-1, qemu-props.
+  - SUCCESS exits: apexd 0, apexd-bootstrap 0, apexd-snapshotde 0, boringssl_self_test64(+vendor) 0, lmkd 0, wait_for_keymaster 0, logd-reinit 0.
+  - init processed the zygote-start actions (init.rc:809/832) — the boot frontier IS the zygote gate.
+- Death chain (exact): update_verifier_nonencrypted (pid 2817) "Started with arg 1: nonencrypted" → "Error getting bootctrl module." → A11 update_verifier.cpp:310-313 IBootControl::getService()==nullptr → reboot_device() → "Received sys.powerctl='reboot' from pid: 2817" → orderly shutdown (116 services SIGTERM/SIGKILL) → "Reboot ending, jumping to kernel".
+- Secondary classes observed (NOT the reboot trigger, queued for later ladders):
+  - health-hal-2-1 (pid 2692/2800) exit 1: "Check failed: passthrough != nullptr Cannot find passthrough implementation of health 2.1 HAL for instance default" ×6 + "could not find logical partition system_b: Inappropriate ioctl for device" (main.cpp:239) ×6 — passthrough dlopen of the health impl fails. init tolerates the exit (boot continued) but system_server may need health later; our host battery bridge covers the battery layer.
+  - HIDL "EX_TRANSACTION_FAILED" ×9 — some HIDL call reached the wire and failed; decode when it becomes the frontier.
+- FIX 6-Z305t-48 (9d4d9e4): update_verifier added to the established blocking_services list. Honesty rationale: A11 update_verifier's success end-state IS exit 0 (slot marked successfully booted); the container has no A/B OTA domain; no bootctrl HAL ships in the stock SDK image; the reboot is the REAL failure path for a REAL device with a missing HAL — the virtualized equivalent of "nothing to verify, slot is good" is exit 0. Same class as wait_for_keymaster. Generic across GSIs (basename match covers update_verifier + update_verifier_nonencrypted).
+- CI: ladder #107 dispatched on 9d4d9e4.
+- Decision tree for #107:
+  1. update_verifier must exit 0 ("detected update_verifier — exiting 0 to unblock init" line in its svclog) and NOT set sys.powerctl.
+  2. Boot should proceed INTO zygote: expect "starting service 'zygote'" / app_process exec / zygote's own logs. Rung 5 (ZYGOTE) is the target.
+  3. Watch for zygote-class blockers: seccomp install, /dev/socket creation, apex LD config (linkerconfig ran: "exec 1 (linkerconfig --target bootstrap)"), UID/cgroup (createProcessGroup failures already seen for vendor.light-default), usap, /system/framework boot classpath (dex2oat / profiles).
+  4. health-hal-2-1 + EX_TRANSACTION_FAILED remain on the radar; HIDL fleet (hwservicemanager registration) decode if zygote passes.
