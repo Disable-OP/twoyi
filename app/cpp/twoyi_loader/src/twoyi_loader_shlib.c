@@ -6826,17 +6826,24 @@ static void patch_open_family_gots(void) {
     }
 
     // Build the interposer-owned address set OUTSIDE the dl lock:
-    // our own exports (captured from our own .dynsym in the walk) +
-    // whatever RTLD_DEFAULT resolves each family name to (the fb hook's
-    // exports, when it wins the preload race).
+    // our own exports (captured from our own .dynsym in the walk).
+    //
+    // 6-Z305t-46: the RTLD_DEFAULT set is GONE — ladder #104 (run
+    // 34217045513) proved it harmful: RTLD_DEFAULT resolves the open
+    // family to the FB HOOK's exports (fb_hook precedes this shlib in
+    // LD_PRELOAD order), and the repair treated fb-owned slots as
+    // ALREADY — 81 repair summaries, 1276 ALREADY lines, ZERO PATCH
+    // lines, ZERO binder_open_fallback logs, and the guest still
+    // FATAL'd 77x with "Binder driver ... could not be opened": the fb
+    // hook's open passes every non-fb0 path straight to the REAL open
+    // (ENXIO dead end for /dev/binder). The fb hook's exports can never
+    // provide the binder fallback, so in android mode every non-shlib
+    // slot must be rewritten to THIS shlib's hooks. Recovery stays
+    // untouched BY THE GATE — this whole repair only runs when
+    // boot_mode == "android" (recovery stamps 'recovery'; the corpus
+    // regression gate remains recovery-corpus-nightly).
     uintptr_t own[7];
     memcpy(own, ctx->self_export, sizeof(own));
-    uintptr_t global[7] = {0, 0, 0, 0, 0, 0, 0};
-    if (dlsym) {
-        for (unsigned i = 0; i < 7; i++) {
-            global[i] = (uintptr_t)dlsym(RTLD_DEFAULT, g_open_family[i]);
-        }
-    }
     int no_self_export = 0;
     for (unsigned i = 0; i < 7; i++) {
         if (own[i] == 0) no_self_export++;
@@ -6858,8 +6865,11 @@ static void patch_open_family_gots(void) {
             skipped++;
             continue;
         }
-        if (sl->old == own[family_idx] ||
-            (global[family_idx] && sl->old == global[family_idx])) {
+        // 6-Z305t-46: ALREADY means THIS shlib owns the slot — nothing
+        // else. Slots bound to the fb hook (the RTLD_DEFAULT winner) or
+        // to libc are both rewritten to our exports, because only our
+        // hooks carry the binder proxy fallback.
+        if (sl->old == own[family_idx]) {
             already++;
             if (already <= GOTFIX_MAX_ALREADY_LOGS) {
                 const char *mn = (sl->mod_idx >= 0) ? ctx->mods[sl->mod_idx].name : "?";
