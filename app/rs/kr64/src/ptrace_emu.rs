@@ -28149,7 +28149,10 @@ pub fn run_ptrace_loop(
                                 const BPF_FAKE_FD_BASE: i32 = 0x6b02_0000;
                                 const BPF_MAP_CREATE_CMD: u32 = 0;
                                 const BPF_MAP_LOOKUP_ELEM_CMD: u32 = 1;
-                                const BPF_MAP_UPDATE_ELEM_CMD: u32 = 2;
+                                // (BPF_MAP_UPDATE_ELEM = 2 falls into the
+                                // catch-all Some(0) arm below — no named
+                                // constant needed and an unused one fails the
+                                // CI build's deny(dead_code), ladder #109.)
                                 const BPF_PROG_LOAD_CMD: u32 = 5;
                                 const BPF_OBJ_PIN_CMD: u32 = 6;
                                 const BPF_OBJ_GET_CMD: u32 = 7;
