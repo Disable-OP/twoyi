@@ -26699,3 +26699,19 @@ Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 
 CI: ladder #96 dispatch follows. Expected: fdtest-markers > 0 in klog-forensics.txt (the markers SURVIVE), liblog binary records present in the captured klog, the "6-Z305t-38: kmsg open flags FORCED append-only" lines on the record for the 0x1/0x80001 openers — and WITH the full guest liblog stream finally visible: hwservicemanager's exit(1) reason and zygote's exit(1) reason decode from REAL log lines (the rung-4→6 frontier).
 
 Honest unverified: no local ARM64 runtime; the clobber attribution rests on the #95 flags/size timeline (artifact-backed); the fix's effect is exactly one ladder away.
+
+## 6-Z305t-39 — #96 decode: the append-only fix WORKED (fdtest-markers 0 → 113, the klog grew 188→226 KB, the shim's binary logd-wire records are IN the captured file) — and the svclogs maps dumps exposed the REAL guest tree ({data}/profiles/default/rootfs — the APEX runtime loads from there) plus the crash fleet's fatal maps; the capture now targets the abort messages and the correct profiles path
+
+#96 (36f7181 → run 34178817037, rung 3, frontier unchanged) decode:
+- THE APPEND-ONLY FIX IS CONFIRMED WORKING: klog-forensics.txt shows fdtest-markers=113 (was 0 across #93/#94/#95), size 226756 (was ~188k), and the raw bytes around the markers contain REAL logd-wire binary records tagged twoyi_loader (the shim's diagnostics ride liblog's own wire format now). The #93-era mystery is CLOSED: the klog mirror is an honest append-only merge of all writers.
+- REMAINING VISIBILITY GAPS (per-service map from svclogs): 6 services' shim redirect fully works (fd tests + fd target fstat lines, flags=0x20401 = O_WRONLY|O_APPEND|O_LARGEFILE — the shim's exact request, fstat'd from inside the process); svc-2690's opens ALL FAIL (the PEEK-blind class — its path string is unreadable to the tracer, the raw open ENOENTs against the host, liblog falls through to the real logd socket — the shim's new "logdw kmsg open FAILED errno=-1" line caught it); most services never connect logdw at all (they log nothing via liblog before dying).
+- THE SERVICES STILL DIE IN FATAL MAPS DUMPS (svc-2691/2693/2709/2710 end with full /proc/self/maps) — and their runtime APEX mappings load from /data/user/0/io.twoyi.debug/profiles/default/rootfs/apex/com.android.runtime/ — THE PROFILES TREE IS A REAL SECOND ROOTFS (my #94 'profiles ruled out' check tested {data}/rootfs/profiles/... — the WRONG nesting; {data}/profiles/default/rootfs is the actual per-profile tree the twoyi Java side provisions). Whether the top-level {data}/rootfs is a bind/symlink of it (the ino identity held — so likely the SAME underlying files via two mounts or a symlink) is settled next run by stat'ing BOTH dev/__kmsg__ nodes.
+- THE DECODE PRIZE: the abort-message text (6-Z305t-26's dump — written to fd 2 AFTER the maps) is inside the full svclog files, but the CI capture only greps a pattern WITHOUT 'abort message' — the reason every crash-looping service dies is sitting uncaptured in the container. 6-Z305t-39 fixes the capture: per-file grep + 'abort message|FATAL|exited|cannot|Failed', per-file tail -c 3072 (the abort text follows the maps dump = the file tail), and the klog-forensics now stats {data}/profiles/default/rootfs/dev/__kmsg__ (the CORRECT path) plus lists the profiles-default tree.
+
+Commits: (this commit) `chore(ci): 6-Z305t-39 — svclogs abort-message capture + the correct profiles-tree klog check …`.
+
+Local verification: workflow YAML sanity-checked; no Rust/C changes.
+
+CI: ladder #97 dispatch follows. Expected: the crash fleet's VERBATIM abort reasons land in svclogs.txt (the text after each maps dump) — the next minimal fix decodes from real FATAL texts (the rung 3→4→6 frontier: hwservicemanager exit(1) ×4 → InitFatalReboot).
+
+Honest unverified: no local ARM64 runtime; the two-tree relationship (symlink vs bind vs duplicate) awaits #97's dual stat.
