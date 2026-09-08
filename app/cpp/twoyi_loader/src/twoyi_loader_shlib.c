@@ -4531,7 +4531,19 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     // re-execs run WITH the shlib the hook re-added and WITHOUT the flag
     // → the area flush pre-populates ro.* → every later set dies 0xb).
     int carry_nops = no_props();
-    char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 3 + carry_nops));
+    // 6-Z305t-44c: carry the boot-mode stamp the same way — the rebuilt
+    // envp starts from the CALLER's explicit envp (guest init does NOT
+    // forward unknown parent env) and would otherwise DROP
+    // TWOYI_BOOT_MODE, leaving every service's gotfix gate silently off
+    // (ladder #102 decode: the var reached init via the kr64 child env
+    // but ZERO services saw it — no gotfix-44 lines anywhere).
+    int carry_bootmode = g_boot_mode_env[0] ? 1 : 0;
+    char boot_mode_env[96];
+    if (carry_bootmode) {
+        snprintf(boot_mode_env, sizeof(boot_mode_env), "TWOYI_BOOT_MODE=%s",
+                 g_boot_mode_env);
+    }
+    char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 3 + carry_nops + carry_bootmode));
     if (!new_envp) {
         // Can't allocate — fall back to environ
         if (!real_execve) return syscall(SYS_execve, exec_path, argv, environ);
@@ -4541,13 +4553,25 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     int j = 0;
     for (int i = 0; i < env_count; i++) {
         if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0 &&
-            strncmp(envp[i], "LD_LIBRARY_PATH=", 16) != 0) {
+            strncmp(envp[i], "LD_LIBRARY_PATH=", 16) != 0 &&
+            strncmp(envp[i], "TWOYI_BOOT_MODE=", 16) != 0) {
             new_envp[j++] = (char *)envp[i];
         }
     }
     new_envp[j] = preload_env;
     new_envp[j + 1] = ld_library_path;
-    if (carry_nops) {
+    if (carry_bootmode) {
+        // 6-Z305t-44c: every exec'd child re-learns the boot mode (see the
+        // block comment above) — this is what arms the gotfix-44 gate in
+        // init-forked services.
+        new_envp[j + 2] = boot_mode_env;
+        if (carry_nops) {
+            new_envp[j + 3] = (char *)"TWOYI_SHLIB_NO_PROPS=1";
+            new_envp[j + 4] = NULL;
+        } else {
+            new_envp[j + 3] = NULL;
+        }
+    } else if (carry_nops) {
         // 6-Z305s-j: CARRY the gate across the exec — the rebuilt envp
         // must not silently re-arm the property hooks the caller had
         // disabled (the caller's own env had the flag; this rebuild
@@ -7138,6 +7162,11 @@ static void twoyi_init(void) {
     // behavior at all (the working recovery corpus keeps its exact path;
     // slots already owned by the fb hook are skipped as ALREADY).
     // See the 6-Z305t-44 block comment for the full evidence chain.
+    // ALWAYS log the gate verdict (one line per process) — ladder #102's
+    // silent-skip cost a full ladder to decode.
+    write_str(2, "[twoyi_loader] gotfix-44: gate boot_mode='");
+    write_str(2, g_boot_mode_env[0] ? g_boot_mode_env : "(absent)");
+    write_str(2, "'\n");
     if (strcmp(g_boot_mode_env, "android") == 0) {
         patch_open_family_gots();
     }
