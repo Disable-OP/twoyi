@@ -28105,6 +28105,116 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                 }
+                                if let Some(fake_val) = _forced_ret {
+                                    // 6-Z155: identity-syscall fakes are the
+                                    // arm64-TWRP boot unblocker — always log
+                                    // them (they fire at most a handful of
+                                    // times per guest boot, never in loops).
+                                    let identity_fake = syscall_num == abi.setresuid_nr
+                                        || syscall_num == abi.setresgid_nr
+                                        || syscall_num == abi.setgroups_nr
+                                        || syscall_num == abi.setuid_nr
+                                        || syscall_num == abi.setgid_nr;
+                                    if identity_fake {
+                                        log(&format!(
+                                            "6-Z155: {}() nr={} returned {} (-errno {}) — faked to 0 (untrusted_app cannot change ids; init must believe it is root so the direct /sbin/recovery execve proceeds instead of security_failure() → reboot → rt_sigsuspend park)",
+                                            name, syscall_num, fresh_ret, -fresh_ret
+                                        ));
+                                    }
+                                    if loop_count <= 200 {
+                                        log(&format!(
+                                            "intercepted {}() nr={} at EXIT → faking return {} (6-Z60: syscall failed — fresh_ret={})",
+                                            name, syscall_num, fake_val, fresh_ret
+                                        ));
+                                    }
+                                }
+                                // ── capget: do NOT write to the data buffer.
+                                //
+                                // We previously tried to populate the
+                                // `cap_user_data_t` buffer in the child with
+                                // 0xFFFFFFFF via PTRACE_POKEDATA so init
+                                // would see "all caps granted". That 8-byte
+                                // poke corrupted the child's stack and
+                                // caused a SIGSEGV (signal 11). The buffer
+                                // pointer passed by init may not actually be
+                                // a writable mapped address we can safely
+                                // poke (alignment / stack layout
+                                // assumptions do not hold in practice).
+                                //
+                                // Instead we just fake success (return 0)
+                                // and leave the buffer untouched. The child
+                                // sees "success but no capabilities". This
+                                // may cause init to exit, but it will not
+                                // crash the process with SIGSEGV — which is
+                                // the strictly better failure mode.
+                                if syscall_num == abi.capget && loop_count <= 200 {
+                                    log("capget: faking success (return 0) without writing data buffer — avoids stack-corrupting PTRACE_POKEDATA");
+                                }
+                                // Task 6-Z60: write the syscall-aware fake
+                                // value (NOT the hardcoded 0 the 6-Z52 blanket
+                                // wrote — that is what turned mmap2's real
+                                // 0xEE981000 into NULL and killed init at
+                                // iteration 203). When _forced_ret is None we
+                                // skip the write entirely and PRESERVE the
+                                // kernel's real return value.
+                                //
+                                // ── 6-Z154: mknod / mknodat rootfs stub ──
+                                //
+                                // The SIGSYS-side mknod branch (which creates
+                                // the empty-file stub so the guest's NEXT
+                                // open() succeeds) only runs when the
+                                // zygote's seccomp policy TRAPs the syscall.
+                                // On runtimes whose policy returns ERRNO
+                                // instead (redroid Android 14, arm64 — run
+                                // 32961216041), the REAL kernel executes the
+                                // mknodat and returns -EACCES (no CAP_MKNOD),
+                                // and only this EXIT-side fake runs — so the
+                                // stub must be created HERE too. Idempotent:
+                                // on runtimes where SIGSYS already created
+                                // the stub (x86 emulator API 30), or where
+                                // the real mknod SUCCEEDED (rooted hosts,
+                                // fresh_ret >= 0), we skip — the fs state is
+                                // already correct.
+                                //
+                                // Path arg: mknod → arg1, mknodat → arg2
+                                // (dirfd first, like openat/mkdirat). Arg
+                                // registers are preserved across the syscall
+                                // at the EXIT stop on x86-64 (rdi/rsi/rdx)
+                                // and aarch64 (x0..x5) — the same property
+                                // the "post-execve path" ENTRY log relies
+                                // on for its fresh regs2 re-reads.
+                                if (syscall_num == abi.mknod
+                                    || (abi.mknodat != -1 && syscall_num == abi.mknodat))
+                                    && fresh_ret < 0
+                                {
+                                    let path_idx = if syscall_num == abi.mknod {
+                                        abi.reg_arg1
+                                    } else {
+                                        abi.reg_arg2
+                                    };
+                                    let path_addr = get_syscall_arg(&regs2, path_idx);
+                                    if path_addr != 0 {
+                                        if let Some(path) = read_child_string(pid, path_addr) {
+                                            let real_path =
+                                                translate_path_via_sandbox(&sandbox, rootfs, &path);
+                                            if let Some(parent) =
+                                                std::path::Path::new(&real_path).parent()
+                                            {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            match std::fs::File::create(&real_path) {
+                                                Ok(_) => log(&format!(
+                                                    "6-Z154: mknod-family stub created {} (real syscall returned {} — fake 0 + stub so the guest's next open() succeeds)",
+                                                    real_path, fresh_ret
+                                                )),
+                                                Err(e) => log(&format!(
+                                                    "6-Z154: FAILED to create mknod-family stub {}: {}",
+                                                    real_path, e
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
                                 // ── 6-Z305t-49b: bpf() virtualization ──
                                 //
                                 // The A11 bpfloader is a reboot_on_failure
