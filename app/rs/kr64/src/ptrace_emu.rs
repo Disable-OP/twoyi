@@ -18630,6 +18630,56 @@ pub fn run_ptrace_loop(
                                                         abi.reg_arg3,
                                                         new_len as u64,
                                                     );
+                                                    // 6-Z305t-58: READBACK — re-read the
+                                                    // child's registers to confirm the
+                                                    // sockaddr rewrite STUCK (a later
+                                                    // stale-regs writer within the same
+                                                    // stop would silently revert it; the
+                                                    // ladders #113-#115 EADDRINUSE chain
+                                                    // suggests exactly that class).
+                                                    let mut rb: Regs =
+                                                        unsafe { std::mem::zeroed() };
+                                                    let rb_ok = ptrace_getregs_wide(pid, &mut rb)
+                                                        .map(|_| {
+                                                            (
+                                                                get_syscall_arg(&rb, abi.reg_arg2),
+                                                                get_syscall_arg(&rb, abi.reg_arg3),
+                                                            )
+                                                        })
+                                                        .ok();
+                                                    match rb_ok {
+                                                        Some((a2, a3))
+                                                            if a2 == sa_scratch as u64
+                                                                && a3 == new_len as u64 =>
+                                                        {
+                                                            static BIND_RB_OK:
+                                                                std::sync::atomic::AtomicU64 =
+                                                                std::sync::atomic::AtomicU64::new(
+                                                                    0,
+                                                                );
+                                                            let n = BIND_RB_OK.fetch_add(
+                                                                1,
+                                                                std::sync::atomic::Ordering::Relaxed,
+                                                            );
+                                                            if n < 12 {
+                                                                log(&format!(
+                                                                    "6-Z305t-58: bind rewrite READBACK OK (scratch={:#x} len={}) for {}",
+                                                                    sa_scratch, new_len, host_path
+                                                                ));
+                                                            }
+                                                        }
+                                                        Some((a2, a3)) => {
+                                                            log(&format!(
+                                                                "6-Z305t-58: bind rewrite READBACK MISMATCH — child arg2={:#x} arg3={} want scratch={:#x} len={}: a LATER ENTRY arm clobbered the rewrite",
+                                                                a2, a3, sa_scratch, new_len
+                                                            ));
+                                                        }
+                                                        None => {
+                                                            log(&format!(
+                                                                "6-Z305t-58: bind rewrite READBACK FAILED (getregs) — cannot verify"
+                                                            ));
+                                                        }
+                                                    }
                                                     log(&format!(
                                                         "6-Z163: bind(fd={}, {}) sockaddr REWRITTEN to {} (len {} -> {}) — kernel will bind FOR REAL",
                                                         get_syscall_arg(&regs, abi.reg_arg1),
@@ -28944,10 +28994,38 @@ pub fn run_ptrace_loop(
                                                     }
                                                 }
                                             }
+                                            // 6-Z305t-58: does the rootfs socket
+                                            // dir hold the target right now? If
+                                            // the file EXISTS at -98 time, the
+                                            // rewrite landed but a stale file
+                                            // survived remove_file (a re-creator
+                                            // raced); if it does NOT exist, the
+                                            // kernel bind ran RAW against the
+                                            // HOST /dev/socket/<name> (whose
+                                            // existing file EADDRINUSEs BEFORE
+                                            // the permission check — unix_bind
+                                            // order).
+                                            let mut sock_dir = String::from("(unreadable)");
+                                            if let Ok(rd) =
+                                                std::fs::read_dir(format!("{}/dev/socket", rootfs))
+                                            {
+                                                let mut names: Vec<String> = Vec::new();
+                                                for e in rd.flatten() {
+                                                    names.push(
+                                                        e.file_name().to_string_lossy().to_string(),
+                                                    );
+                                                }
+                                                names.sort();
+                                                sock_dir = if names.is_empty() {
+                                                    "(EMPTY)".to_string()
+                                                } else {
+                                                    format!("{}", names.join(","))
+                                                };
+                                            }
                                             log(&format!(
-                                                "6-Z305t-57: bind forensics pid={} fd={} raw_ret={} (-errno {}): fd_link={:?} inode={:?} unix_path={}",
+                                                "6-Z305t-57: bind forensics pid={} fd={} raw_ret={} (-errno {}): fd_link={:?} inode={:?} unix_path={} rootfs_dev_socket={}",
                                                 pid, fd, ret, -ret,
-                                                fd_link, inode, unix_line
+                                                fd_link, inode, unix_line, sock_dir
                                             ));
                                         }
                                     }
