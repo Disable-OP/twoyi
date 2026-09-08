@@ -27137,3 +27137,10 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. health 2.1 passthrough dlopen (42×) — the impl .so or its deps fail to load.
   3. The cgroup.procs 0666 + zombie-exclusion queued smalls (still pending from 56/59).
 - This closes the session at rung 5 with a fully mapped frontier. All work pushed (fb90ae8 + this worklog commit).
+
+## 6-Z305t-64 — the HIDL rock's first link: IServiceManager::getTransport over hwbinder fails systematically; checkpoint
+
+- The 956 EX_TRANSACTION_FAILEDs begin as: "[glog V/HidlServiceManagement] getService: defaultServiceManager()->getTransport returns Status(EX_TRANSACTION_FAILED)" (139 identical occurrences) — EVERY HAL's first service-lookup (android.hidl.manager@1.0::IServiceManager::getTransport) fails over /dev/hwbinder.
+- The context: hwservicemanager IS a real guest process (SET_CONTEXT_MGR_EXT success observed); the proxy routes hwbinder transactions; the AIDL side (servicemanager) works. So the failure is specific to the HIDL hwservicemanager transaction path — candidates: (a) the proxy's hwbinder-context parcel handling mangles getTransport (the 6-Z271 HIDL shim coverage), (b) hwservicemanager's OWN binder ops fail (it aborts early? its lifecycle needs decoding), (c) the BC/BR frame shapes for hwbinder differ (no SYSTRACE header — the 6-Z271 note).
+- NEXT SESSION: decode hwservicemanager's svclog lifecycle first (does it stay alive? does it register HALs at all?), then instrument ONE getTransport round-trip at the proxy (binder.rs) — the request parcel in, the reply out.
+- Session checkpoint: rung 5 stable, the frontier is one systematic wire-level failure away from the HAL plane. All work pushed.
