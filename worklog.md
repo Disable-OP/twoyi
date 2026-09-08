@@ -26769,3 +26769,21 @@ CI: ladder #99 dispatched on main (both commits). Expected artifact reads:
 - pointer-tag class: untouched this round (caller_pc attribution via widened maps capture is the next instrument once the binder fleet decodes).
 
 Honest unverified: no local ARM64 runtime; every expectation above is one ladder away.
+
+## 6-Z305t-42/43 — #99 decode: keystore gap CONFIRMED CLOSED; the binder FATAL class decoded to the ROOT (rdev 0:0 dead node + the __openat bypass) and the shim now hooks the bionic open() choke point
+
+#99 (5abf722 → run 34184003092, rung 3) decode:
+- 6-Z305t-42b WORKED: keystore's chdir FATAL is GONE from the fleet (zero keystore/chdir/Check-failed lines in svclogs + klog). The loader line "6-Z305t-42b: guest /data/misc/keystore ensured at {rootfs}/data/misc/keystore (0700, chown 1000:1000 failed (expected rootless))" is on the record — the EPERM is the honest rootless shape.
+- The 6-Z305t-42 tracer forensics saw ZERO successful binder opens AND ZERO binder ioctls — which is itself the decode: the fleet dies BEFORE either can happen.
+- THE BINDER ROOT CAUSE CHAIN, fully evidenced: (1) the ladder runs NON-ROOT mode → the parent skips the binderfs mount ("non-root mode — skipping binderfs mount", seccomp SIGSYS guard) → init's mount("binder") is a 6-Z305t-10 no-op-fake → /dev/binderfs/{binder,hwbinder,vndbinder} MISSING (the 6-Z305t-40 ENTRY lines show it verbatim); (2) {rootfs}/dev/{binder,hwbinder} are REAL char nodes with mode 140666 but rdev=0:0 (the new rdev field on the ENTRY line — major 0 serves no driver) → every raw open returns ENXIO; (3) svc-2712 (servicemanager) verbatim: "Opening '/dev/binder' failed: No such device or address" ×2 → abort → FATAL scan "Binder driver '/dev/binder' could not be opened. Terminating."; (4) ZERO binder_open_fallback diagnostics in its svclog — the shim's fallback chain (proxy connect → /dev/null virtual fd, both logged) NEVER RAN.
+- WHY THE SHIM NEVER SAW IT: libbinder's open() compiles to the bionic open() inline, which calls __openat() — a libc-internal symbol. The shim's hook set (open, openat, __open_2, __openat_2, __open_real) does NOT export __openat, so libbinder's PLT resolution bypassed every hook and the raw syscall hit the dead node. (The #98 "fd 17" re-read: a successful open exit requires a non-char node — the #98-era placeholder REGULAR file opened fine and the FATAL moved to the ENOTTY ioctl; #99's node is a TRUE char 0:0 so the FATAL moved BEFORE the ioctl. Same class, two node generations.)
+
+6-Z305t-43 (fix, 7c14f8c): the shim now exports __openat and routes it through openat_hook_common (the openat hook body extracted verbatim — translation, should_block_fstab, binder fallback, qemu_pipe fallback, fb tracking). LD_PRELOAD scope resolves other libraries' __openat refs to the shim FIRST; libc's internal __openat calls are direct (non-PLT) so no recursion. binder_open_fallback hardened: a "real binder" fd now requires S_ISCHR AND st_rdev != 0 (the 0:0 dead-node class can never do binder IPC — close + proxy connect instead). No build changes needed (default visibility; both arm64 + armv7a build.sh lines compile the same file).
+
+Decision tree for #100: the shim's __openat hook now intercepts libbinder's opens → binder_open_fallback runs → binder_proxy_connect({rootfs}/vm0/dev/binder) either WINS (the kr64 virtual binder engages — "6-Z305t-42 binder open EXIT" tracer lines appear for real fds? NO — proxy fds are userspace sockets; the TRACER-level instrument stays quiet for them, but the svclogs gain the fallback/proxy lines and the FATAL text DISAPPEARS) or the proxy is down (the "/dev/null fd=" line appears — then the next blocker is the proxy lifecycle). hwservicemanager's pointer-tag class is SEPARATE (caller_pc attribution still queued). keystore should now show its NEXT failure mode (or survive).
+
+Commits: `fix(shlib): 6-Z305t-43 — hook __openat …` (7c14f8c) + this docs commit. CI: ladder #100 dispatched on main.
+
+Local verification: gcc -fsyntax-only CLEAN; no Rust changes (790/786+4 test suite untouched).
+
+Honest unverified: no local ARM64 runtime; the __openat-interposition theory is inference from the svclog's missing fallback lines + bionic's open()-inline — exactly one ladder from proof.
