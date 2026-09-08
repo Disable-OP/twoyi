@@ -26745,3 +26745,27 @@ Commits: (this commit) `docs(worklog): 6-Z305t-41 — #98 decode …`.
 CI: ladder #99 dispatch follows with the same build (no code change this commit — the worklog rides along; the next code commit is the rdev+ioctl instrument).
 
 Honest unverified: no local ARM64 runtime; the tag-strip hypothesis awaits caller_pc attribution.
+
+## 6-Z305t-42 — the binder fd forensics: rdev + per-(pid,fd) tracking + ENTRY/EXIT ioctl logging (the BINDER_VERSION fate is the fd-17→FATAL link) + the mmap probe; and 6-Z305t-42b — the keystore gap CLOSED (stage /data/misc/keystore)
+
+#98 decode verdicts this round acts on: (1) {rootfs}/dev/binder EXISTS (char dev, mode 140666) and ONE open returned fd 17 — libbinder's "could not be opened. Terminating." therefore fires DOWNSTREAM of a successful open: open_driver's next steps are the BINDER_VERSION ioctl (fails → close + fd=-1 → FATAL) and the ProcessState mmap; the node's major:minor was unknown. (2) keystore's FATAL is a missing guest dir — /data/misc/keystore never staged.
+
+6-Z305t-42 (diag, 0a89fbc): the tracer now answers the whole ioctl/mmap branch in one artifact:
+- rdev on the binder pre-open stat (the 6-Z305t-40 ENTRY line gains rdev=major:minor) — decides driver-backed device vs unserved-major.
+- per-(pid, fd) binder fd table: every successful open whose resolved path is_binder_path registers at the open-EXIT block and logs the node's rdev — fd 17-class successes become attributable.
+- ioctl ENTRY forensics (budget 120): every ioctl on a TRACKED binder fd or any 'b'-family req (_IOC type byte 0x62 — is_binder_ioctl_req, pure + 2 tests: 0xc0306201 BINDER_WRITE_READ matches; ashmem 'a'-family/TCGETS/'c' lookalikes rejected so the 6-Z203 fake path stays disjoint) logs fd/req/arg/tracked/target; the (fd, req) stash is consumed at EXIT to log the REAL return — BINDER_VERSION's fate decides the FATAL. NO faking — observation only.
+- mmap/mmap2 ENTRY probe (budget 40): every mmap of a tracked binder fd logs size/prot/flags/offset + target — catches the second suspect (libbinder's MAP_SHARED of the binder fd).
+- Death hygiene: binder_fds + pending_binder_ioctl cleaned at BOTH forget_dead_pid_state call sites (inline form — the maps are loop locals like ashmem_fd_sizes).
+
+6-Z305t-42b (fix, 5abf722): ensure_guest_keystore_dir(&cfg.rootfs) in the parent pre-boot flow (right after normalize_linkerconfig_perms) — create_dir_all({rootfs}/data/misc/keystore), chmod 0700, best-effort chown 1000:1000 (succeeds in the root/namespaces ladder where init's setuid really lands keystore2 at uid 1000; on-device rootless the chown EPERMs harmlessly and the tree is app-owned). Guest /data maps to {rootfs}/data (vfs.rs), so this is a staging gap, not a keystore bug. Idempotent (existing dir never wiped; +2 tests).
+
+Commits: `diag(kr64): 6-Z305t-42 — binder fd ioctl/mmap forensics …` (0a89fbc) + `fix(boot): 6-Z305t-42b — stage guest /data/misc/keystore …` (5abf722).
+
+Local verification: cargo fmt CLEAN; clippy -D warnings CLEAN; cargo test --lib 790 passed / 0 failed (786 + 4 new).
+
+CI: ladder #99 dispatched on main (both commits). Expected artifact reads:
+- keystore: NO MORE chdir FATAL — its svclog shows either progress past chdir (mkdirs + keymaster keys under /data/misc/keystore/user/0) or the NEXT gap (SELinux denial class would surface honestly).
+- binder fleet: "6-Z305t-42 binder open EXIT … node rdev=major:minor" — if rdev=10:237 (or the container binderfs major) the open resolves to a REAL binder driver; if 0:0/unserved → the node is a dead stub. "binder ioctl ENTRY … req=0xc0046209" + "binder ioctl EXIT … ret=" — ret<0 names the errno (ENOTTY/EACCES/ENOSYS) that closes fd and drives the FATAL; ret=0 with the FATAL persisting shifts the hunt to the mmap lines. The ladder's 3-shape retry map (orig vs host-absolute) now pairs with per-shape fd fates.
+- pointer-tag class: untouched this round (caller_pc attribution via widened maps capture is the next instrument once the binder fleet decodes).
+
+Honest unverified: no local ARM64 runtime; every expectation above is one ladder away.
