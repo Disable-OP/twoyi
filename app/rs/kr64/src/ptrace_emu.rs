@@ -759,6 +759,24 @@ struct ChildAbi {
     // end; like unshare(CLONE_NEWNS) it needs CAP_SYS_ADMIN and must be
     // faked on the virtualized-namespace container path.
     setns: i64,
+    // 6-Z305t-49: bpf(cmd, attr, size) — the eBPF syscall the A11
+    // bpfloader needs. Rootless container reality: the HOST seccomp
+    // (redroid app policy) rejects bpf with ERRNO(EPERM) and the tracer
+    // must fake it or init's `reboot_on_failure` bpfloader service
+    // reboots the guest (ladder #107, run 34224829944: "Reboot start,
+    // reason: reboot,bpfloader-failed"). Uniform fake-0 semantics:
+    // BPF_MAP_CREATE/BPF_PROG_LOAD return 0 (a valid fd number — the
+    // loader only checks fd >= 0, then pins/attaches/closes it, all of
+    // which fake 0 too); every other bpf command fakes 0. bpfloader
+    // then sets bpf.progs_loaded=1 and exits 0 — the honest container
+    // shape for "no real BPF programs can run" (guest networking is
+    // host-bridged; no BPF enforcement is possible or needed).
+    // Verified against the kernel UAPI headers on this box:
+    //   i386:    __NR_bpf = 357  (unistd_32.h)
+    //   x86_64:  __NR_bpf = 321  (unistd_64.h)
+    //   aarch64: __NR_bpf = 280  (asm-generic/unistd.h)
+    //   arm32:   __NR_bpf = 386  (asm-generic/unistd.h, 32-bit table)
+    bpf: i64,
     // mknod(pathname, mode, dev) — TWRP init calls this for /dev/null,
     // /dev/zero, /dev/urandom etc. during early boot. As untrusted_app
     // it returns EPERM (no CAP_MKNOD), and init's fatal-config-error
@@ -1533,6 +1551,7 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     mkdirat: 258,
     unshare: 272,
     setns: 308, // x86_64 setns
+    bpf: 321,   // x86_64 __NR_bpf (unistd_64.h; 6-Z305t-49)
     // x86_64 mknod = 133 (per /usr/include/x86_64-linux-gnu/asm/
     // unistd_64.h, verified directly against the kernel's UAPI
     // header in Task 5-X). Pre-5-X this field was MISSING — added
@@ -1851,6 +1870,7 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     mkdirat: 296,
     unshare: 310,
     setns: 346, // i386 setns
+    bpf: 357,   // i386 __NR_bpf (unistd_32.h; 6-Z305t-49)
     // i386 mknod = 14 (per /usr/include/x86_64-linux-gnu/asm/
     // unistd_32.h: __NR_mknod 14, verified directly against the
     // kernel's UAPI header in Task 5-X). Pre-5-X this field was
@@ -2239,6 +2259,7 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     mkdirat: 34,
     unshare: 97,
     setns: 268, // aarch64 setns (asm-generic __NR_setns; run 34001424252 window-traced the real nr=268)
+    bpf: 280,   // aarch64 __NR_bpf (asm-generic/unistd.h; 6-Z305t-49)
     // aarch64 mknod = -1 (SENTINEL "not present on this ABI"). The
     // asm-generic/unistd.h table (used by aarch64) has NO plain
     // `mknod` — only `mknodat = 33` (verified directly against
@@ -2554,6 +2575,7 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     mkdirat: 323,
     unshare: 337,
     setns: 375, // arm32 setns
+    bpf: 386,   // arm32 __NR_bpf (asm-generic 32-bit table; 6-Z305t-49)
     mknod: 14,
     // 6-Z305j: arm32 xattr numbers per arch/arm/tools/syscall.tbl —
     // the PREVIOUS values (226/227/228) were the I386 numbers copied
@@ -3529,6 +3551,14 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.setgroups_nr
         || syscall_nr == abi.setuid_nr
         || syscall_nr == abi.setgid_nr
+    // 6-Z305t-49: bpf() — the bpfloader reboot blocker (ladder #107:
+    // "Reboot start, reason: reboot,bpfloader-failed"; the host seccomp
+    // rejects bpf with EPERM for the rootless app). Uniform fake-0: the
+    // loader checks fd >= 0 for MAP_CREATE/PROG_LOAD (fd 0 qualifies),
+    // pin/attach/close all fake 0, bpfloader exits 0 and sets
+    // bpf.progs_loaded=1. Recovery never calls bpf() — inert for the
+    // corpus. See the ChildAbi.bpf field doc for the full rationale.
+        || (abi.bpf != -1 && syscall_nr == abi.bpf)
     {
         Some(0)
     } else {
@@ -4060,6 +4090,11 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "rt_sigprocmask"
     } else if nr == abi.mount {
         "mount"
+    } else if abi.bpf != -1 && nr == abi.bpf {
+        // 6-Z305t-49: label the eBPF syscall so the trace shows "bpf"
+        // instead of "[unknown]" (the 5-X lesson: unknown labels make
+        // the next decode needlessly expensive).
+        "bpf"
     } else if nr == abi.mknod {
         // Added in Task 5-X. Pre-5-X, syscall 14 on i386 was labelled
         // "[unknown]" (because no field matched it — the i386
@@ -34033,6 +34068,31 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // The aarch64 mknod SENTINEL (-1) must still match nothing
         // real — and mknodat must NOT collide with i386 mkdirat (296).
         assert_eq!(compute_exit_return_value(296, &ABI_X86_32), None);
+    }
+
+    #[test]
+    fn compute_exit_return_value_bpf_returns_zero_6z305t49() {
+        // 6-Z305t-49: bpf() joins the fake-success set — the A11 bpfloader
+        // (reboot_on_failure service) fails at the host-seccomp EPERM and
+        // reboots the guest ("reboot,bpfloader-failed", ladder #107 run
+        // 34224829944). Uniform fake-0: MAP_CREATE/PROG_LOAD return fd 0
+        // (the loader only checks fd >= 0), every other command succeeds;
+        // bpfloader exits 0 and sets bpf.progs_loaded=1. Numbers verified
+        // against the kernel UAPI headers: i386=357, x86_64=321,
+        // aarch64=280, arm32=386. Recovery never calls bpf() — inert for
+        // the corpus.
+        assert_eq!(compute_exit_return_value(357, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(357, &ABI_X86_32), "bpf");
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(compute_exit_return_value(321, &ABI_X86_64), Some(0));
+            assert_eq!(syscall_name(321, &ABI_X86_64), "bpf");
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(compute_exit_return_value(280, &ABI_AARCH64), Some(0));
+            assert_eq!(syscall_name(280, &ABI_AARCH64), "bpf");
+        }
     }
 
     #[test]
