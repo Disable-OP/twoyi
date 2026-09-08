@@ -13400,6 +13400,15 @@ pub fn run_ptrace_loop(
     // 6-Z234: passthrough (untranslated) open DIAG counter, second-stage
     // property window (loop_count 500-700) only.
     let mut passthrough_open_diag_count: u64 = 0;
+    // 6-Z305t-36: klog node open-path forensics counters. ENTRY side stats
+    // the translated path pre-open (budget 20); EXIT side pairs the return
+    // value with the fd's ACTUAL st_dev/st_ino via /proc/<pid>/fd/<n>
+    // (budget 20, independent so one side can never starve the other).
+    let mut kmsg_open_diag_entry_count: u64 = 0;
+    let mut kmsg_open_diag_exit_count: u64 = 0;
+    // 6-Z305t-36: kmsg-shaped UNLINK counter (budget 10) — names who
+    // removes the klog node mid-boot (the node-replacement hypothesis).
+    let mut kmsg_unlink_diag_count: u64 = 0;
     // 6-Z237: failed-open DIAG counter for guest-/dev paths in the
     // second-stage boot window (loop 400-1000, first 20).
     let mut dev_fail_diag_count: u64 = 0;
@@ -20336,6 +20345,54 @@ pub fn run_ptrace_loop(
                                 // is cleared at the matching open EXIT.
                                 if is_kmsg_path(&path) || is_kmsg_path(&translated) {
                                     pending_kmsg_open_pid = Some(pid); // 6-Z83: per-pid
+                                                                       // ── 6-Z305t-36: klog node open-path
+                                                                       // FORENSICS (ENTRY side) ──
+                                                                       //
+                                                                       // Ladder #93: the shlib's logdw→kmsg fd
+                                                                       // tests fire in 11 processes (write=37
+                                                                       // writev=37 — the writes EXECUTE) yet the
+                                                                       // marker bytes never appear in the captured
+                                                                       // {data}/rootfs/dev/__kmsg__ (whole-file
+                                                                       // grep). Leading hypothesis: the node this
+                                                                       // open resolves to is NOT the node the
+                                                                       // artifact later reads (per-VM-generation
+                                                                       // staging remove+recreate, the 6-Z154
+                                                                       // mknod-stub File::create truncation, or a
+                                                                       // profiles-layer indirection). Instrument:
+                                                                       // pre-open stat of the TRANSLATED path —
+                                                                       // st_dev/st_ino/size at open time. The
+                                                                       // EXIT-side block pairs this with the fd's
+                                                                       // ACTUAL (post-open) dev/ino; the CI
+                                                                       // klog-forensics capture stats both
+                                                                       // candidate files so the three-way join
+                                                                       // (open-time ino vs fd ino vs artifact
+                                                                       // ino) settles file identity with data.
+                                                                       // Budget 20/boot — 11 known openers + head
+                                                                       //room, then silence.
+                                    {
+                                        use std::os::unix::fs::MetadataExt;
+                                        kmsg_open_diag_entry_count =
+                                            kmsg_open_diag_entry_count.saturating_add(1);
+                                        if kmsg_open_diag_entry_count <= 20 {
+                                            let stat_note = match std::fs::metadata(&translated) {
+                                                Ok(md) => format!(
+                                                    "pre-open dev={} ino={} size={}",
+                                                    md.dev(),
+                                                    md.ino(),
+                                                    md.len()
+                                                ),
+                                                Err(e) => format!("pre-open stat FAILED {}", e),
+                                            };
+                                            log(&format!(
+                                                "6-Z305t-36 kmsg open ENTRY pid={} orig={:?} translated={:?} {} (occurrence {})",
+                                                pid,
+                                                path,
+                                                translated,
+                                                stat_note,
+                                                kmsg_open_diag_entry_count
+                                            ));
+                                        }
+                                    }
                                 }
                                 // ── Task 6-Z61: strip O_EXCL on the
                                 // properties open ──
@@ -21454,6 +21511,48 @@ pub fn run_ptrace_loop(
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated =
                                     translate_path_via_sandbox(&sandbox, rootfs, &path);
+                                // ── 6-Z305t-36: klog node REMOVAL forensics ──
+                                //
+                                // Ladder #93: the shlib's kmsg fd tests fire
+                                // (write=37 writev=37) yet the bytes never
+                                // reach the captured artifact file. Leading
+                                // hypothesis: the node is REPLACED mid-boot
+                                // (guest klog_init's classic
+                                // mknod→open→unlink dance translated onto
+                                // {rootfs}/dev/__kmsg__, the 6-Z154 mknod
+                                // stub's truncating File::create, or the
+                                // per-VM-generation staging remove+recreate) —
+                                // openers before the replacement write to an
+                                // inode nobody later reads. Log every
+                                // kmsg-shaped unlink with its pre-unlink
+                                // stat so the timeline names the remover.
+                                // Budget 10.
+                                if is_kmsg_path(&path) || is_kmsg_path(&translated) {
+                                    use std::os::unix::fs::MetadataExt;
+                                    kmsg_unlink_diag_count =
+                                        kmsg_unlink_diag_count.saturating_add(1);
+                                    if kmsg_unlink_diag_count <= 10 {
+                                        let stat_note = match std::fs::metadata(&translated) {
+                                            Ok(md) => format!(
+                                                "pre-unlink dev={} ino={} size={}",
+                                                md.dev(),
+                                                md.ino(),
+                                                md.len()
+                                            ),
+                                            Err(e) => {
+                                                format!("pre-unlink stat FAILED {}", e)
+                                            }
+                                        };
+                                        log(&format!(
+                                            "6-Z305t-36 kmsg UNLINK pid={} orig={:?} translated={:?} {} (occurrence {})",
+                                            pid,
+                                            path,
+                                            translated,
+                                            stat_note,
+                                            kmsg_unlink_diag_count
+                                        ));
+                                    }
+                                }
                                 if translated != path
                                     && !write_translated_path(
                                         pid,
@@ -23207,6 +23306,65 @@ pub fn run_ptrace_loop(
                             ));
                         }
                         pending_kmsg_open_pid = None;
+                    }
+                    // ── 6-Z305t-36: klog node open-path FORENSICS (EXIT
+                    // side) ──
+                    //
+                    // Pairs with the ENTRY-side pre-open stat: on success,
+                    // stat the fd's ACTUAL open file description via
+                    // /proc/<pid>/fd/<fd> — its st_dev/st_ino is WHAT THE
+                    // WRITES WILL HIT, regardless of how the open resolved.
+                    // On failure, ALWAYS log the errno (the post-unlink
+                    // ENOENT class — #93's leading hypothesis — is exactly a
+                    // klog open that STARTS failing mid-boot, and today that
+                    // failure leaves zero trace). Deliberately OUTSIDE the
+                    // ret>=0 fd-registration block above so failures are
+                    // instrumented identically; path taken from the ENTRY
+                    // stash (present for BOTH outcomes). The three-way join
+                    // (ENTRY pre-open ino / EXIT fd ino / CI klog-forensics
+                    // artifact-file ino) settles whether the fd-test bytes
+                    // landed in a file the artifact never reads. Budget 20.
+                    if syscall_num == abi.open
+                        || syscall_num == abi.openat
+                        || syscall_num == abi.openat2
+                    {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        let orig = pending_open_original_path
+                            .get(&pid)
+                            .cloned()
+                            .unwrap_or_default();
+                        let p = pending_open_translated_path
+                            .get(&pid)
+                            .cloned()
+                            .unwrap_or_default();
+                        if is_kmsg_path(&orig) || is_kmsg_path(&p) {
+                            use std::os::unix::fs::MetadataExt;
+                            kmsg_open_diag_exit_count = kmsg_open_diag_exit_count.saturating_add(1);
+                            if kmsg_open_diag_exit_count <= 20 {
+                                let fd_note = if ret >= 0 {
+                                    match std::fs::metadata(format!("/proc/{}/fd/{}", pid, ret)) {
+                                        Ok(md) => format!(
+                                            "fd-target dev={} ino={} size={}",
+                                            md.dev(),
+                                            md.ino(),
+                                            md.len()
+                                        ),
+                                        Err(e) => format!("fd-target stat FAILED {}", e),
+                                    }
+                                } else {
+                                    format!("open FAILED errno={}", -ret)
+                                };
+                                log(&format!(
+                                    "6-Z305t-36 kmsg open EXIT pid={} orig={:?} translated={:?} ret={} {} (occurrence {})",
+                                    pid,
+                                    orig,
+                                    p,
+                                    ret,
+                                    fd_note,
+                                    kmsg_open_diag_exit_count
+                                ));
+                            }
+                        }
                     }
                     // 6-Z132: close() EXIT — invalidate the fd→path maps.
                     // fd numbers are recycled: a stale entry makes the

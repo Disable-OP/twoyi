@@ -3343,6 +3343,24 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
                 if (kmsg_fd >= 0)
                     syscall(SYS_lseek, kmsg_fd, 0, 2 /*SEEK_END*/);
             }
+            /* 6-Z305t-36: the open-RESULT is on the record again (the
+             * 6-Z305t-30-era diagnostic was dropped in the 32/33/34
+             * reworks — #93 could not tell a successful open into a
+             * foreign file apart from a FAILED open falling through to
+             * the real logd socket, and both leave the artifact mute).
+             * FAILED + fall-through ⇒ liblog writes land in logd's ring
+             * (invisible); succeeded ⇒ the fd's file identity is settled
+             * by the tracer's per-open dev/ino forensics instead. */
+            if (kmsg_fd < 0) {
+                static unsigned char kmsg_fail_diag = 2;
+                if (kmsg_fail_diag > 0) {
+                    kmsg_fail_diag--;
+                    char fmsg[128];
+                    snprintf(fmsg, sizeof(fmsg),
+                             "[twoyi_loader] logdw kmsg open FAILED errno=%d\n", kmsg_fd);
+                    write_str(2, fmsg);
+                }
+            }
             if (kmsg_fd >= 0) {
                 syscall(SYS_dup3, kmsg_fd, sockfd, 0);
                 syscall(SYS_close, kmsg_fd);
