@@ -26976,3 +26976,16 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   1. bpfloader exit 0 expected: "6-Z305t-49b: bpf(cmd=5 …) faked to 0x6b02xxxx" lines now MUST appear; loadAllElfObjects == 0; bpf.progs_loaded=1.
   2. Frontier: ZYGOTE (rung 5). app_process exec, zygote seccomp, sockets.
   3. Watch: netd reading the real maps + fake pins.
+
+## 6-Z305t-50 — #112 decode: 49e arm WORKS (4 MAP_CREATE fakes) but OBJ_PIN calls never reach the EXIT dispatcher (SIGSYS-swallowed) → bpfloader to blocking_services; commit 7fe0d38; ladder #113 dispatched
+
+- Ladder #112 (34233376797, 81dcdae/49e): rung 3, bpfloader-failed again — but:
+  - 49e VERIFIED: 4× "bpf(cmd=0) returned 0 — faked to 0x6b02xxxx" — the arm fires at the EXIT-section top. (The fresh_ret==0 shape means those MAP_CREATEs were SIGSYS-faked to 0 and the arm upgraded them to proper synthetic fds — the fd==0 hazard catch working.)
+  - The loader's BPF_OBJ_PIN calls are INVISIBLE: only 4 nr=280 events in the whole run; clatd.o's map created REAL (fd 7) then "Failed to create maps: (ret=-2)" (ENOENT from pin — `if (ret) return -errno`). The pin's bpf() never reaches the EXIT dispatcher — the host seccomp/SIGSYS interception path handles it elsewhere.
+- Decision: after 4 bpf-focused ladders (#107-#112), the tracer-plumbing rabbit hole loses to the mission (BOOT ANDROID). bpfloader joins blocking_services: exit 0 = the honest "no BPF enforcement domain in this rootless container" end-state; bpf.progs_loaded unset = the no-BPF-kernel shape netd handles; generic across GSIs. The 49e arm stays for other bpf callers.
+- CI: ladder #113 dispatched on 7fe0d38.
+- Decision tree for #113:
+  1. bpfloader exits 0 via the constructor ("detected bpfloader — exiting 0 to unblock init" in its svclog) — NO reboot at load_bpf_programs.
+  2. FRONTIER: ZYGOTE (rung 5). init should start 'zygote' → app_process exec → zygote's own startup logs.
+  3. WATCH: netd with bpf.progs_loaded unset (A11 TrafficController no-BPF path); health-hal-2-1 passthrough; HIDL EX_TRANSACTION_FAILED ×9-18 (persistent class).
+  4. If zygote starts and crashes: decode its abort (classpath/apex/seccomp/UID class).
