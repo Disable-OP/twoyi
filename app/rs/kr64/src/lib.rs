@@ -5428,6 +5428,59 @@ fn normalize_linkerconfig_perms(rootfs: &str) {
     }
 }
 
+/// 6-Z305t-42b: ensure the guest's /data/misc/keystore directory exists
+/// with real-Android semantics. #97 verbatim svclog: keystore(2695)
+/// FATALs "Check failed: chdir(argv[1]) != -1 chdir: /data/misc/keystore:
+/// No such file or directory" — the guest tree simply lacks the dir, so
+/// keystore2 dies pre-main and joins the crash fleet. The guest /data
+/// maps to {rootfs}/data (vfs.rs: "/data/* → the rootfs copy"), so this
+/// is a boot-time staging gap, not a keystore bug: create
+/// {rootfs}/data/misc/keystore, chmod 0700 (the real dir's mode), and
+/// best-effort chown to system:system (1000:1000 — succeeds in the
+/// root/namespaces ladder where init's setuid really lands keystore2 at
+/// uid 1000; on-device rootless the tree is already app-owned and the
+/// chown EPERMs harmlessly into the log). Idempotent: an existing dir is
+/// never wiped or recreated — only the mode/owner are re-asserted.
+fn ensure_guest_keystore_dir(rootfs: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let keystore_dir = format!("{}/data/misc/keystore", rootfs);
+    if let Err(e) = std::fs::create_dir_all(&keystore_dir) {
+        info!(
+            "[KR64] PARENT: 6-Z305t-42b: create_dir_all({}) failed: {} (errno={}) — keystore2's chdir will keep failing",
+            keystore_dir,
+            e,
+            e.raw_os_error().unwrap_or(0)
+        );
+        return;
+    }
+    // chown system:system — best-effort (root-only; EPERM is the expected
+    // rootless outcome and is logged at the same level as the success path
+    // keeps the artifact honest about which shape ran).
+    let chown_note = match std::ffi::CString::new(keystore_dir.as_str()) {
+        Ok(c_path) => {
+            let r = unsafe { libc::chown(c_path.as_ptr(), 1000, 1000) };
+            if r == 0 {
+                "chown 1000:1000 ok".to_string()
+            } else {
+                let err = std::io::Error::last_os_error();
+                format!("chown 1000:1000 failed (expected rootless): {}", err)
+            }
+        }
+        Err(_) => "chown skipped (non-UTF8 rootfs path)".to_string(),
+    };
+    if let Err(e) = std::fs::set_permissions(&keystore_dir, std::fs::Permissions::from_mode(0o700))
+    {
+        info!(
+            "[KR64] PARENT: 6-Z305t-42b: chmod 0700 {} failed: {}",
+            keystore_dir, e
+        );
+    }
+    info!(
+        "[KR64] PARENT: 6-Z305t-42b: guest /data/misc/keystore ensured at {} (0700, {}) — keystore2's chdir(argv[1]) can no longer ENOENT",
+        keystore_dir, chown_note
+    );
+}
+
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // 6-Z305t-3: 6-Z305s-a set umask(0o022) in the CHILD only (pre-execve
     // of init). Guest file creations the TRACER performs itself (emulated
@@ -6182,6 +6235,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ---------------------------------------------------------------
     flatten_apex_payloads(&cfg);
     normalize_linkerconfig_perms(&cfg.rootfs);
+    // 6-Z305t-42b: keystore2's chdir("/data/misc/keystore") ENOENTs when
+    // the guest tree lacks the dir (#97 verbatim FATAL). Stage it with
+    // real-Android semantics (0700, system:system best-effort) — the same
+    // staging-side pattern as the linkerconfig perms pass above.
+    ensure_guest_keystore_dir(&cfg.rootfs);
 
     // ---------------------------------------------------------------
     // Step 4: set up mount namespace + bind mounts + tmpfs.
@@ -17759,6 +17817,47 @@ mod tests {
             (staged, already),
             (0, 0),
             "symlinked ROM source must not be staged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 6-Z305t-42b: ensure_guest_keystore_dir ──
+    #[test]
+    fn ensure_guest_keystore_dir_creates_missing_dir() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z305t42-ks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rootfs = dir.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("system")).unwrap();
+
+        ensure_guest_keystore_dir(rootfs.to_str().unwrap());
+
+        let ks = rootfs.join("data/misc/keystore");
+        assert!(ks.is_dir(), "keystore dir must be staged");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&ks).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o700,
+            0o700,
+            "owner rwx must be set (chdir + file creation): {:o}",
+            mode
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_guest_keystore_dir_is_idempotent_never_wipes() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z305t42-k2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rootfs = dir.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("data/misc/keystore")).unwrap();
+        let marker = rootfs.join("data/misc/keystore/keys.blob");
+        std::fs::write(&marker, b"keep").unwrap();
+
+        ensure_guest_keystore_dir(rootfs.to_str().unwrap());
+
+        assert!(
+            marker.exists(),
+            "existing keystore dir must never be recreated/wiped"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
