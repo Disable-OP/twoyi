@@ -6066,6 +6066,20 @@ int __open_2(const char *path, int flags) {
 #else
     else fd = (int)syscall(NR_openat, AT_FDCWD, path, flags);
 #endif
+    // 6-Z305t-47: binder fallback must be should_translate-INDEPENDENT.
+    // Ladder #105 (run 34221353387): the 46 patcher correctly pointed
+    // libbinder's open-family slots HERE (556 PATCH lines), yet ZERO
+    // binder_open_fallback logs fired and 16 services still FATAL'd
+    // "Binder driver could not be opened" — under the NO_PROPS gate
+    // should_translate() returns 0 for /dev/binder (the tracer owns ALL
+    // translation in the android boot), so this hook's fallback sat in
+    // the dead should_translate branch while libbinder's fortified opens
+    // took THIS pass-through branch. Mirror the __openat_2 shape (which
+    // already has the check in BOTH branches).
+    if (is_binder_device_path(path)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return binder_open_fallback(path, fd, saved_errno);
+    }
     // qemu_pipe device open fallback (6-Z116; mirrors binder_open_fallback).
     // /dev/qemu_pipe stays on host per should_translate (the /dev/ catch-all
     // returns 0 — see line ~2890), so the real open above hits the host's
@@ -6231,6 +6245,13 @@ int __open_real(const char *pathname, int flags, ...) {
 #else
     else fd = (int)syscall(NR_openat, AT_FDCWD, pathname, flags, mode);
 #endif
+    // 6-Z305t-47: binder fallback in the pass-through branch too — same
+    // #105 evidence as __open_2 above (should_translate is dead under the
+    // NO_PROPS gate; only the shlib hooks carry the binder proxy).
+    if (is_binder_device_path(pathname)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return binder_open_fallback(pathname, fd, saved_errno);
+    }
     // qemu_pipe device open fallback (6-Z116; mirrors binder_open_fallback).
     // See the __open_2 pass-through branch above for the rationale
     // (should_translate=0 → host's /dev/qemu_pipe → ENOENT → connect).
