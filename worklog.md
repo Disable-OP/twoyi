@@ -27103,3 +27103,15 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 - INSTRUMENT (this commit): the bind stash now carries (guest_path, rm_res, sa_scratch, expected-blob-prefix[16]) and the -98 forensics re-reads the scratch content: scratch_intact=true + -98 ⇒ (1); scratch_intact=false ⇒ (2). One ladder settles it.
 - 59 also decoded: "Failed to write '3458' to .../cgroup.procs: Permission denied" (the 0444 materialized file blocks init's pid-move) and zombie members in the re-check — both queued for the fix round (0666 + skip 'Z' state).
 - Local gates: build/fmt/test(792/792)/clippy clean. CI: ladder #119 dispatched on 0804693.
+
+## 6-Z305t-61 — lmkd exit-0 decoded from the A11 source; /proc/pressure virtualized with host-seeded PSI; commit 87a116b; ladder #120 dispatched
+
+- #119 also delivered: ALL four -98 binds had target_now_exists=true — the double-execution shape (exec #1 succeeds and creates the file, exec #2 EADDRINUSEs and gets masked — benign while the file exists). The bind instrument story is complete; the socket wall for FIRST attempts is down (files create; "Created socket 'lmkd'" appears in the klog).
+- lmkd's exit-0 FULLY decoded from the A11 source (system/memory/lmkd/lmkd.cpp:3215-3261): main() is `if (!init()) { ...; mainloop(); } ... return 0;` — init() FAILING SKIPS mainloop and returns 0. init() failed because libpsi logged "No kernel psi monitor support (errno=13)" — the app uid EACCESes opening the HOST's root-owned /proc/pressure/*. Every ladder since #113: lmkd exits 0 ×4 → "critical process 'lmkd' exited 4 times" → InitFatalReboot.
+- FIX (87a116b): /proc/pressure/** → rootfs-backed (vfs rule before the /proc passthrough), open-ENTRY seeded ONCE from the HOST's real PSI numbers (kr64 IS the guest's kernel substitute — the host kernel's PSI values ARE the container's) with an honest zero-state fallback for hosts lacking PSI. With PSI readable, lmkd's init() succeeds → mainloop() → lmkd stays alive → the critical-reboot gate is gone.
+- ALSO from #115 (queued): the cgroup.procs 0666 (init's pid-move write "Failed to write '3458' ... Permission denied") + zombie exclusion ("1 processes remain") — next round.
+- CI: ladder #120 dispatched on 87a116b.
+- Decision tree for #120:
+  1. "6-Z305t-61: /proc/pressure/memory seeded" lines; libpsi's EACCES gone; lmkd STAYS ALIVE (no "exited with status 0" for lmkd, no critical reboot).
+  2. With lmkd alive, the boot proceeds deeper: zygote restarts become the watch; the HIDL EX_TRANSACTION_FAILED fleet (192) is the next rock.
+  3. ZYGOTE exit-1 cause: its OWN startup (classpath/apex/seccomp) — decode from its svclog when it survives past socket creation.
