@@ -27071,3 +27071,15 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. Crash-restart cycles become clean: no lingering holders → binds succeed → fchmodat ENOENT class gone → zygote survives restarts (rung 5 ZYGOTE).
   3. If zygote now survives its first restart, the frontier is its OWN startup (classpath/apex/seccomp) and the HIDL EX_TRANSACTION_FAILED fleet (192) + lmkd's early exit-0 (PSI class) become the next rocks.
   4. RISKS: the subtree BFS uses /proc PPid chains — threads (CLONE_THREAD clones) appear as members; kill(tid, SIGKILL) is process-wide so semantics hold. Stale members (exited pids) just ESRCH — tolerated by libprocessgroup.
+
+## 6-Z305t-57 — #115 decode: kills WORK for most services (cgroup.procs fix verified!); the socket wall is EADDRINUSE-only (no EACCES) — forensics instrument added; commit (this); ladder #116 dispatched
+
+- Ladder #115 (34241019985, 800f18b/56): rung 3, lmkd critical ×4 reboot — BUT:
+  - **6-Z305t-56 VERIFIED**: 48 "cgroup.procs materialized" lines with real member pids, and the klog now shows "Successfully killed process cgroup uid 1047 pid 3065 in 0ms" for cameraserver/media/wificond/lmkd — the kill loop WORKS via the guest's own libprocessgroup path.
+  - Remaining kill failures (78 → narrowed): "1 processes remain" — the re-check counts ZOMBIES (traced processes killed but not yet reaped; a zombie still has /proc/<pid> + its PPid chain, so the BFS includes it; a zombie holds NO fds so it is harmless to exclude — the kernel's real cgroup.procs excludes dead pids too). Also: "Failed to write '3458' to .../cgroup.procs: Permission denied" — the materialized file is 0444; createProcessGroup's pid-move write needs it writable.
+  - lmkd's exit-0 decoded: it ALSO dies at socket creation — "Failed to fchmodat socket '/dev/socket/lmkd'" (same class as zygote/tombstoned).
+  - ALL bind failures are -98 EADDRINUSE (18×), ZERO EACCES. A filesystem-path EADDRINUSE after the 6-Z163 arm's remove_file is impossible → the kernel bind is NOT running against the rewritten path despite the "REWRITTEN" logs. Candidates: the rewrite's setregs is lost to a later stale-regs writer in the same stop, or the stop-phase misclassification runs the arm at EXIT.
+- INSTRUMENT ADDED (this commit): at the 6-Z101 bind-fake arm, BEFORE masking — join the child's fd → /proc/<pid>/fd/<n> → socket:[inode] → /proc/net/unix path. One line per failing bind (cap 20): "6-Z305t-57: bind forensics pid= fd= raw_ret=: fd_link= inode= unix_path=". If unix_path shows the HOST /dev/socket/<name> → the raw bind ran (rewrite lost); "(ABSTRACT or unnamed)" → the abstract-namespace theory; the rootfs path → a genuine stale holder.
+- ALSO QUEUED (next round, after the instrument decodes): (a) exclude zombies from the cgroup.procs member list (read /proc/<pid>/stat state, skip 'Z'); (b) materialize cgroup.procs 0666 so init's pid-move writes land.
+- Local gates: build/fmt/test(792/792)/clippy clean.
+- CI: ladder #116 dispatched with BOTH the 56 kill fix and the 57 instrument.
