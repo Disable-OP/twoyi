@@ -26619,3 +26619,16 @@ The LAST open instrument question: the service liblog→klog stream. #89 PROVED 
 Current frontier (unchanged): hwservicemanager exit(1) ×4 → critical-process InitFatalReboot; zygote exit(1) restart loop; the "Pointer tag … truncated" abort class (7×, parked).
 
 Honest unverified: no local ARM64 runtime; the writev-delivery mystery is the one open instrument question and does not block (the write() class is proven).
+
+## 6-Z305t-35 — session close: #93 decode — the fd tests fire (write=37 writev=37 ×11 processes) and the bytes still do not reach the captured klog; the one remaining mystery is WHERE the tracer-resolved /dev/__kmsg__ open lands, and the next session's precise instrument
+
+#93 (617ea61 → run 34171815447) decode:
+- The #89-proven configuration (guest-absolute open + the write() test) did NOT reproduce: the fd tests fire in 11 processes (write=37 writev=37 — the writes EXECUTE successfully) and the marker text is absent from the captured {data}/rootfs/dev/__kmsg__ (whole-file grep).
+- The difference vs #89 can only be in WHERE the tracer-resolved open of "/dev/__kmsg__" lands: the leading hypothesis is the vfs klog node's open-path materialization (a per-open backing file / a truncate-on-open / a profiles-layer indirection — the guest's real rootfs is {data}/profiles/default/rootfs while the artifact reads {data}/rootfs). The #89 marker's presence in the captured file remains unexplained under this hypothesis (possibly the profile tree and the top-level tree were the SAME file for that one run's timing), which is exactly why the next instrument must settle it with data.
+
+NEXT SESSION (6-Z305t-36, precise):
+1. The tracer logs the TRANSLATED host path + the ST_DEV/ST_INO of every openat whose translated path is_kmsg_path() (one line per open, budget 20): the artifact then states definitively which file each opener's fd points at and whether the openers disagree.
+2. The CI svclogs capture additionally reads {data}/profiles/default/rootfs/dev/__kmsg__ (if it exists) alongside the top-level one — the two-file hypothesis is answered by presence/absence of the fd-test markers in each.
+3. With the file identity settled, the service liblog stream lands (or is redirected) and hwservicemanager's exit(1) + zygote's exit(1) decode from real log lines.
+
+Session totals: 22 commits (8c6b16e → 617ea61 + this one), all gates green, every change generic (no ROM hacks), recovery behavior preserved (all system-mode gates), rootless constraints intact, abort/ptrace safety extended (the die policy is bounded by init's restart semantics).
