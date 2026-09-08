@@ -27126,3 +27126,14 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   1. "psi fd captured" + "epoll_ctl(ADD psi fd ...) faked to 0" lines; libpsi proceeds; lmkd STAYS ALIVE (no "Service 'lmkd' exited with status 0").
   2. With the lmkd critical-reboot gate GONE, the boot runs to the next wall — candidates: the HIDL EX_TRANSACTION_FAILED fleet (192), zygote's own startup, the usap/zygote socket env vars.
   3. Watch for new spin classes (a filtered epoll returning 0 forever must not busy-loop lmkd — its mainloop has other timeouts).
+
+## 6-Z305t-63 — **RUNG 5 ZYGOTE REACHED** — the kill/PSI chain worked end-to-end; the HIDL plane is the new rock (956x EX_TRANSACTION_FAILED); checkpoint
+
+- Ladder #122 (34256447502, e773f4f/62): **RUNG 5 — "zygote spawned"** — the classifier's stage meaning confirms zygote was STARTED. lmkd: ZERO exits (the PSI epoll virtualization held: "psi fd captured" ×N, "epoll_ctl(ADD psi fd) faked to 0"). The critical-reboot gate is GONE.
+- The full chain that unblocked rung 5 (this session's arc): binder plane (45-47) → update_verifier (48) → bpfloader (49-series, 50) → process-group kills via virtual cgroup.procs (56) → lmkd PSI (61,61b) + libpsi epoll (62).
+- THE NEW ROCK: **956× "Attempted to retrieve value from failed HIDL call: Status(EX_TRANSACTION_FAILED)"** — the HIDL wire plane fails at scale while the AIDL side (servicemanager/lmkd/core daemons) works. Plus: health 2.1 passthrough ×42, drm registration ×34, eglQueryString ×8 (graphics!), zygote exit 1 ×2 (of 6 starts — it may now be restart-resilient).
+- NEXT SESSION (ranked):
+  1. HIDL EX_TRANSACTION_FAILED: decode ONE failing transaction end-to-end (which interface, which call, what the proxy answers vs what libhwbinder expects). The 6-Z271 HIDL parcel support exists — the A11 GSI's hwbinder traffic is the first REAL HIDL workload the proxy has carried.
+  2. health 2.1 passthrough dlopen (42×) — the impl .so or its deps fail to load.
+  3. The cgroup.procs 0666 + zombie-exclusion queued smalls (still pending from 56/59).
+- This closes the session at rung 5 with a fully mapped frontier. All work pushed (fb90ae8 + this worklog commit).
