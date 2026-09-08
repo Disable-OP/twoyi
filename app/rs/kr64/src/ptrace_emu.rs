@@ -28881,6 +28881,76 @@ pub fn run_ptrace_loop(
                                     // The fake-netlink-fd `if` branch
                                     // still wins first for fake fds — no
                                     // double fake.
+                                    // ── 6-Z305t-57: bind-failure FORENSICS ──
+                                    //
+                                    // Ladders #113-#115: the guest's
+                                    // /dev/socket/* binds keep failing -98
+                                    // (EADDRINUSE) even though the 6-Z163
+                                    // ENTRY rewrite logs "REWRITTEN" and
+                                    // remove_file'd the target — a
+                                    // filesystem-path EADDRINUSE is
+                                    // impossible on a just-removed path, so
+                                    // the kernel bind must be running against
+                                    // a DIFFERENT address than the rewrite
+                                    // intended (the raw HOST /dev/socket/<name>
+                                    // — where the redroid host's own services
+                                    // hold live binds — or the abstract
+                                    // namespace). The registers-as-seen-by-
+                                    // the-kernel question needs a
+                                    // kernel-authoritative answer: join the
+                                    // CHILD's fd → socket inode →
+                                    // /proc/net/unix path. Capped at 20.
+                                    {
+                                        static BIND_FORENSICS_LOG: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        let bfn = BIND_FORENSICS_LOG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if op == NetlinkOp::Bind && bfn < 20 {
+                                            let fd_link: Option<String> = std::fs::read_link(
+                                                format!("/proc/{}/fd/{}", pid, fd),
+                                            )
+                                            .ok()
+                                            .map(|l| l.to_string_lossy().to_string());
+                                            let inode = fd_link.as_deref().and_then(|l| {
+                                                let ls = l.to_string();
+                                                ls.strip_prefix("socket:[")
+                                                    .and_then(|rest| rest.strip_suffix(']'))
+                                                    .map(|s| s.to_string())
+                                            });
+                                            let mut unix_line = String::from("(not found)");
+                                            if let Some(ino) = &inode {
+                                                if let Ok(unix_txt) =
+                                                    std::fs::read_to_string("/proc/net/unix")
+                                                {
+                                                    for line in unix_txt.lines().skip(1) {
+                                                        // Format: Num: RefCount Protocol Flags Type State Inode Path
+                                                        let cols: Vec<&str> =
+                                                            line.split_whitespace().collect();
+                                                        if cols.len() >= 7
+                                                            && cols[6] == ino.as_str()
+                                                        {
+                                                            unix_line = cols
+                                                                .iter()
+                                                                .skip(7)
+                                                                .cloned()
+                                                                .collect::<Vec<_>>()
+                                                                .join(" ");
+                                                            if unix_line.is_empty() {
+                                                                unix_line = "(ABSTRACT or unnamed)"
+                                                                    .to_string();
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            log(&format!(
+                                                "6-Z305t-57: bind forensics pid={} fd={} raw_ret={} (-errno {}): fd_link={:?} inode={:?} unix_path={}",
+                                                pid, fd, ret, -ret,
+                                                fd_link, inode, unix_line
+                                            ));
+                                        }
+                                    }
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
                                     if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                         set_syscall_ret(&mut regs2, &abi, 0);
