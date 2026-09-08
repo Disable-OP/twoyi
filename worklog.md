@@ -26834,3 +26834,28 @@ Expected artifact reads for #103 (decision tree):
 - pointer-tag class: stays at zero (44a).
 
 Honest unverified: no local ARM64 runtime; one ladder from proof.
+
+## 6-Z305t-45 — #103 decode: the boot-mode ENV CHAIN is provably insufficient → file-based stamp (the 6-Z187b pattern); commits d1abd0e + 4700be5; ladder #104 dispatched
+
+- Ladder #103 (34203719213, df46f43/44c): rung 3 PROPERTY_SERVICE, guest exited via init critical-reboot (Reboot ending, jumping to kernel) — same rung as #100, but the decode finally explains WHY 44b/44c never engaged.
+- #103 decode (evidence-first, from kr64-app-stderr DIAG write reconstruction):
+  - kr64's [KR64 CHILD] env log PROVES init's exec envp contained TWOYI_BOOT_MODE=android (line: TWOYI_BOOT_MODE=android in the var list).
+  - Yet ALL 342 gotfix-44 gate verdicts printed '(absent)' — zero 'android' value writes anywhere (direct fd writes, glog-wrapped writes, writev iov samples all checked).
+  - While TWOYI_SHLIB_NO_PROPS — a var from the SAME kr64 envp — was seen by 384 processes ("TWOYI_SHLIB_NO_PROPS set — property hooks delegate to bionic"). It survives because the exec-hook rebuild never strips it (passthrough), and/or carry_nops re-adds it.
+  - Conclusion: guest init rebuilds/scrubs its child env across stages (first-stage clearenv, selinux_setup/second_stage re-execs, service exec env) in ways the exec hooks cannot always observe; TWOYI_BOOT_MODE gets stripped by the 44c rebuild and re-added only when the execing process captured it — and the capture never happens because the var is dropped BEFORE any constructor that matters sees it. The 44c carry was necessary but not sufficient — the ENV layer itself is the unreliable component.
+  - Same class as the 6-Z187b precedent: "the UI recovery is exec'd by INIT, whose service env does NOT carry TWOYI_ROOTFS (getenv returned NULL)".
+- FIX 6-Z305t-45 (d1abd0e): mirror the PROVEN 6-Z187b file mechanism, env-independent:
+  - kr64 writes {rootfs}/dev/.twoyi-boot-mode ("android" | "recovery\n") next to /dev/.twoyi-rootfs before the first exec (lib.rs, symlinks materialization block; recovery stamps "recovery" → gate stays off → recovery corpus unchanged by construction).
+  - shlib set_preload_path(): when getenv(TWOYI_BOOT_MODE) misses, read /dev/.twoyi-boot-mode via twoyi_sys_open2 (raw NR_openat, tracer-translated absolute path) + NR_read + NR_close; same fallback for g_rootfs_env from /dev/.twoyi-rootfs.
+  - Constructor g_rootfs resolution reordered (set_preload_path FIRST): env → file → legacy hardcoded default. Init-descendant processes with scrubbed env stop resolving "/data/data/io.twoyi/rootfs" (wrong app id) which silently broke every {rootfs}-prefixed retry in the hooks.
+  - Gate verdict now logs the stamp SOURCE: "gotfix-44: gate boot_mode='android' (src=env|file|none)" — one-line layer attribution for the next decode.
+- Pre-flight verification: gcc -fsyntax-only clean (x86_64 + aarch64 variants); cargo fmt/clippy clean; cargo test 791/791.
+- 6-Z305t-45b (4700be5): deflaked a pre-existing cross-test race found during local testing — apex_payload_temp_path_uses_tmpdir_when_set mutates process-global TMPDIR and remove_dir_all's its dir while extract_apex_payload_img_extracts_stored_entry_from_real_zip resolved temp_dir() concurrently (flaky "does not exist"); shared module-level TMPDIR_LOCK for temp_dir()-sensitive tests.
+- Housekeeping: cancelled 4 redundant queued 'UI E2E Test (ARM64)' runs on old HEAD dd04a27 (cron duplication was hogging the arm64 runner — #103 sat queued >1h).
+- CI: ladder #104 (34217045513) dispatched on 4700be5 AFTER push. kr64 CI runs on push.
+- Decision tree for #104 decode:
+  1. EVERY svclog gate verdict should read boot_mode='android' — src=env in init phases, src=file wherever the env was scrubbed. Any (src=none) verdict = the file read failed (check .twoyi-boot-mode existence in the rootfs listing artifact).
+  2. Expect gotfix-44 PATCH lines for libbinder.so/libhidlbase.so open-family slots, then binder_open_fallback: proxy fd= (virtual binder engages; servicemanager/vold/lmkd survive) — pointer-tag must stay 0 (44a regression watch).
+  3. If the fleet survives binder: zygote, apexd/linkerconfig (apex dirs flattened by kr64 6-Z305t; linkerconfig reads /apex/com.android.vndk.v30), system_server in dependency order; build the boot timeline from KLOG-TIMELINE + property-values.txt.
+  4. Recovery regression: TWOYI_BOOT_MODE=recovery → file stamp 'recovery' → gate off; the recovery-corpus-nightly workflow is the regression gate; also the exec-hook carry now stamps TWOYI_BOOT_MODE=recovery into rebuilt envp (inert to guests — only our shlib reads it).
+- Risks: the file lives on {rootfs}/dev — guest init's fake tmpfs mount on /dev keeps the underlying dir visible (proven by fb_hook's .twoyi-rootfs reads in the recovery corpus). If init's first stage WIPES /dev in some future ROM, both file mechanisms fail together — watch for (src=none) verdicts.
