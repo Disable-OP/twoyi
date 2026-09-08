@@ -20460,6 +20460,141 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                 }
+                                // ── 6-Z305t-56: virtual cgroup.procs /
+                                // cgroup.threads — REAL member pids ──
+                                //
+                                // The guest's process-group KILL path reads
+                                // each service group's cgroup.procs:
+                                // init's KillProcessGroup → libprocessgroup
+                                // killProcessGroup() iterates the pids listed
+                                // in the group's cgroup.procs and kill()s
+                                // each. A11 layout: /acct/uid_<u>/pid_<n>/
+                                // cgroup.procs (the legacy controller init
+                                // mounts at /acct — evidenced by "Failed to
+                                // make and chown /acct/uid_9999" and
+                                // createProcessGroup(9999, 2822) in every
+                                // ladder). In the container those files do
+                                // not exist → the kill loop kills NOTHING →
+                                // crashed services LINGER alive holding
+                                // their bound /dev/socket paths → the next
+                                // start's bind EADDRINUSEs (masked by the
+                                // 6-Z101 fake) → fchmodat ENOENT → crash
+                                // loops → lmkd critical ×4 → InitFatalReboot
+                                // (ladders #113/#114, runs 34235112734 /
+                                // 34237224812).
+                                //
+                                // THE FIX: materialize cgroup.procs (and
+                                // cgroup.threads) at open-ENTRY with the
+                                // REAL member pids of the group, taken from
+                                // the tracer's own tracked process tree: the
+                                // group root (the pid_<N> path segment) plus
+                                // every tracked pid whose /proc PPid chain
+                                // reaches it. libprocessgroup then performs
+                                // the kill()s ITSELF — real kills of real
+                                // same-uid processes, the guest's own code
+                                // path doing the work (the honest
+                                // virtualization doctrine; no tracer kill
+                                // injection). Refreshed on EVERY open so the
+                                // kill loop always sees the current tree.
+                                // Recovery gated off (corpus rule).
+                                if !boot_recovery
+                                    && (translated.contains("/acct/")
+                                        || translated.contains("/sys/fs/cgroup/"))
+                                    && (translated.ends_with("/cgroup.procs")
+                                        || translated.ends_with("/cgroup.threads"))
+                                {
+                                    let group_pid: Option<libc::pid_t> =
+                                        translated.split('/').rev().find_map(|seg| {
+                                            seg.strip_prefix("pid_")
+                                                .and_then(|n| n.parse::<libc::pid_t>().ok())
+                                        });
+                                    if let Some(group_pid) = group_pid {
+                                        // Build the parent map of the tracked
+                                        // tree (one /proc read per tracked pid —
+                                        // the kill path reads once per group).
+                                        let tracked: std::collections::HashSet<libc::pid_t> =
+                                            tracked_pids.iter().copied().collect();
+                                        let mut parents: std::collections::HashMap<
+                                            libc::pid_t,
+                                            libc::pid_t,
+                                        > = std::collections::HashMap::new();
+                                        for &tp in tracked_pids.iter() {
+                                            if let Some(pp) = proc_ppid(tp) {
+                                                parents.insert(tp, pp);
+                                            }
+                                        }
+                                        // BFS from the group root over tracked
+                                        // descendants only.
+                                        let mut members: Vec<libc::pid_t> = Vec::new();
+                                        if tracked.contains(&group_pid)
+                                            && std::path::Path::new(&format!("/proc/{}", group_pid))
+                                                .exists()
+                                        {
+                                            members.push(group_pid);
+                                        }
+                                        let mut frontier: Vec<libc::pid_t> = members.clone();
+                                        while let Some(&cur) = frontier.first() {
+                                            frontier.remove(0);
+                                            for &tp in tracked_pids.iter() {
+                                                if parents.get(&tp) == Some(&cur)
+                                                    && !members.contains(&tp)
+                                                {
+                                                    members.push(tp);
+                                                    frontier.push(tp);
+                                                }
+                                            }
+                                        }
+                                        members.sort_unstable();
+                                        if !members.is_empty() {
+                                            let mut content = String::new();
+                                            for m in &members {
+                                                content.push_str(&m.to_string());
+                                                content.push('\n');
+                                            }
+                                            let backing = std::path::Path::new(&translated);
+                                            if let Some(parent) = backing.parent() {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            match std::fs::write(backing, content.as_bytes()) {
+                                                Ok(()) => {
+                                                    use std::os::unix::fs::PermissionsExt;
+                                                    let _ = std::fs::set_permissions(
+                                                        backing,
+                                                        std::fs::Permissions::from_mode(0o444),
+                                                    );
+                                                    static CGROUP_PROCS_LOG:
+                                                        std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    let n = CGROUP_PROCS_LOG.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if n < 24 {
+                                                        log(&format!(
+                                                            "6-Z305t-56: cgroup.procs materialized {} (group root {}) with {} real member pids: {:?}",
+                                                            translated, group_pid, members.len(), members
+                                                        ));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    static CGROUP_PROCS_ERR_LOG:
+                                                        std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    let en = CGROUP_PROCS_ERR_LOG.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if en < 24 {
+                                                        log(&format!(
+                                                            "6-Z305t-56: cgroup.procs materialize FAILED {}: {}",
+                                                            translated, e
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 // ── Task 6-U: KLOG fd tracking (ENTRY side) ──
                                 //
                                 // If this open()'s path (original OR
