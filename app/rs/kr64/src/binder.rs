@@ -900,8 +900,16 @@ pub const HIDL_TRANSPORT_EMPTY: u8 = 0;
 pub const HIDL_TRANSPORT_HWBINDER: u8 = 1;
 /// PASSTHROUGH is answered by the passthrough dlopen path, never by this
 /// registry (a HIDL passthrough HAL never appears as a wire service).
-#[allow(dead_code)]
 pub const HIDL_TRANSPORT_PASSTHROUGH: u8 = 2;
+
+/// Wire value → display name for the getTransport log lines.
+fn transport_name(t: u8) -> &'static str {
+    match t {
+        HIDL_TRANSPORT_HWBINDER => "HWBINDER",
+        HIDL_TRANSPORT_PASSTHROUGH => "PASSTHROUGH",
+        _ => "EMPTY",
+    }
+}
 
 // ============================================================================
 // Flat-binder-object type constants (kernel `B_PACK_CHARS(c1,c2,c3,0x85)`).
@@ -4119,16 +4127,23 @@ fn servicemanager_hidl(
         // (EMPTY=0, HWBINDER=1, PASSTHROUGH=2) marshals as ONE byte
         // (hwbinder::Parcel::writeUint8 = write(&val,1), no padding).
         //
-        // Honest registry answer: HWBINDER iff the fq/instance key is in
-        // the bus registry (a guest HAL registered it via addWithChain /
-        // add, or it is an in-proxy virtual service), EMPTY otherwise —
-        // the same statuses the real hwservicemanager returns for
-        // unknown/unregistered services. A miss flows into
-        // getRawServiceInternal's clean nullptr path ("service not
-        // available") instead of the abort storm; under VINTF enforcement
-        // a registering HAL's pre-check (ServiceManagement.cpp:874) then
-        // fails CLEANLY for unmanifested services — the VINTF-manifest
-        // virtualization is the next rock, not this round.
+        // 6-Z305t-66 answered from the BUS REGISTRY ONLY; 6-Z305t-67 adds
+        // the VINTF-manifest consult (crate::vintf): the A11
+        // hwservicemanager answers getTransport from the device's VINTF
+        // manifests — hwsm ServiceManager.cpp:414 delegates to the free
+        // getTransport (hwsm Vintf.cpp:36) which consults the FRAMEWORK
+        // manifest first, then the DEVICE manifest; its service map is
+        // NEVER consulted, so an unregistered but manifest-declared
+        // service answers HWBINDER before it ever runs. That answer is
+        // BOTH sides' gate: the registration pre-check
+        // (registerAsServiceInternal, ServiceManagement.cpp:872 —
+        // "must be in VINTF manifest in order to register/get" at :878)
+        // and every client's transport discovery (getRawServiceInternal,
+        // :779 — EMPTY + PRODUCT_ENFORCE_VINTF_MANIFEST makes the service
+        // unreachable even while running). The bus fallback below is the
+        // container's deliberate superset for in-proxy virtual services
+        // (kernel-provided, exist before any guest runs — see vintf.rs
+        // header); invalid fq names answer EMPTY per Vintf.cpp's gates.
         HIDL_SM_GET_TRANSPORT => {
             let fq = match reader.read_hidl_string() {
                 Some(s) => s,
@@ -4139,19 +4154,29 @@ fn servicemanager_hidl(
                 None => return TransactionResult::Failed,
             };
             let key = format!("{}/{}", fq, name);
-            let hit = {
-                let b = bus.lock().expect("binder bus poisoned");
-                b.services.contains_key(&key)
+            let (transport, source) = match crate::vintf::parse_fq(&fq) {
+                None => (HIDL_TRANSPORT_EMPTY, "invalid-fq"),
+                Some(_) => match crate::vintf::lookup(&fq, &name) {
+                    Some(t) => (t, "manifest"),
+                    None => {
+                        let hit = {
+                            let b = bus.lock().expect("binder bus poisoned");
+                            b.services.contains_key(&key)
+                        };
+                        if hit {
+                            (HIDL_TRANSPORT_HWBINDER, "bus")
+                        } else {
+                            (HIDL_TRANSPORT_EMPTY, "no-entry")
+                        }
+                    }
+                },
             };
-            writer.write_u8(if hit {
-                HIDL_TRANSPORT_HWBINDER
-            } else {
-                HIDL_TRANSPORT_EMPTY
-            });
+            writer.write_u8(transport);
             info!(
-                "[KR64][binder][svc] HIDL getTransport({}) → {}",
+                "[KR64][binder][svc] HIDL getTransport({}) → {} ({})",
                 key,
-                if hit { "HWBINDER" } else { "EMPTY" }
+                transport_name(transport),
+                source
             );
         }
         HIDL_SM_ADD => {

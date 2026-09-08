@@ -74,6 +74,7 @@ pub mod seccomp;
 pub mod sensors;
 pub mod symlinks;
 pub mod vfs;
+pub mod vintf;
 
 use std::ffi::CString;
 use std::os::unix::fs::symlink;
@@ -5745,6 +5746,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // from the guest. The handle is held for the lifetime of `run()`
     // so the proxy is shut down when the guest exits.
     // ---------------------------------------------------------------
+    // 6-Z305t-67: the HIDL servicemanager's getTransport consults the
+    // guest rootfs's VINTF manifests (the hwservicemanager analogue —
+    // see app/rs/kr64/src/vintf.rs). Recorded once here; parsed lazily
+    // on the first lookup so early boot pays nothing.
+    vintf::set_rootfs(&cfg.rootfs);
     let _binder_handle = match binder::create_binder_device(&cfg.rootfs, cfg.vmid)
         .and_then(|path| binder::BinderProxy::new(cfg.vmid, &path))
         .and_then(|proxy| proxy.spawn())
