@@ -1297,6 +1297,18 @@ pub fn read_libdl_asset(cfg: &crate::Config) -> Option<(String, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // 6-Z305t-45 (test infra): shared lock for tests that touch the
+    // process-global TMPDIR. apex_payload_temp_path_uses_tmpdir_when_set
+    // mutates the env for its body and DELETES its temp dir on cleanup;
+    // any other test that resolves std::env::temp_dir() concurrently can
+    // capture the mutated value and then race the remove_dir_all
+    // (observed locally: extract_apex_payload_img_extracts_stored_entry_
+    // from_real_zip computed its fixture path under the mutated TMPDIR
+    // and failed flakily with "does not exist"). Every test that calls
+    // std::env::temp_dir() takes this lock.
+    static TMPDIR_LOCK: Mutex<()> = Mutex::new(());
 
     // ========================================================================
     // Tests for is_real_libdl (validation gate).
@@ -1829,12 +1841,9 @@ mod tests {
         // Integration test: with TMPDIR set to a writable temp dir,
         // apex_payload_temp_path() should return a path under TMPDIR
         // and create_dir_all should make the parent exist.
-        // We set TMPDIR for this test only — Rust's test runner may
-        // run tests in parallel, so we use a per-test unique subdir
-        // to avoid races on the same env var.
-        use std::sync::Mutex;
-        static TMPDIR_LOCK: Mutex<()> = Mutex::new(());
-
+        // We set TMPDIR for this test only — Rust's test runner runs
+        // tests in parallel, so the lock is the module-level TMPDIR_LOCK
+        // shared with every other temp_dir()-sensitive test (6-Z305t-45).
         let _guard = TMPDIR_LOCK.lock().unwrap();
         let prev = std::env::var("TMPDIR").ok();
         let test_tmp = std::env::temp_dir().join("twoyi-apex-test-tmpdir-5N");
@@ -2022,6 +2031,10 @@ mod tests {
     fn extract_apex_payload_img_extracts_stored_entry_from_real_zip() {
         // Build a ZIP with apex_payload.img entry, write it to a temp
         // file, and verify extraction works end-to-end (file → bytes).
+        // 6-Z305t-45: hold TMPDIR_LOCK — the fixture path comes from
+        // std::env::temp_dir(), which is unstable while
+        // apex_payload_temp_path_uses_tmpdir_when_set has TMPDIR mutated.
+        let _guard = TMPDIR_LOCK.lock().unwrap();
         let content = b"fake ext4 image content for end-to-end test";
         let zip = build_minimal_stored_zip("apex_payload.img", content);
         let tmp = std::env::temp_dir().join("twoyi-apex-test-real.zip");
