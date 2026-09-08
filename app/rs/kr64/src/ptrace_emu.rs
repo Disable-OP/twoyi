@@ -27924,6 +27924,97 @@ pub fn run_ptrace_loop(
                             }
                         }
                     }
+                    // ── 6-Z305t-52: fchmodat/fchownat EXIT-side ENOENT/EACCES catch ──
+                    //
+                    // The guest socket bootstrap fails ENOENT at fchmodat:
+                    // "Could not create socket 'zygote': Failed to fchmodat
+                    // socket '/dev/socket/zygote': No such file or
+                    // directory" (ladder #113, run 34235112734 — zygote
+                    // exit(1) ×3). The 6-Z258 layer-1 ENTRY translation is
+                    // correct but the 6-Z210 missed-ENTRY race (documented
+                    // in the 6-Z258 comment itself) lets SOME fchmodats
+                    // execute RAW against the host root → ENOENT. The
+                    // shlib hook cannot backstop (it passes RAW under the
+                    // no_props gate by design — 6-Z305s-e double-
+                    // translation hazard).
+                    //
+                    // This EXIT arm is the race-free fallback: when the
+                    // real fchmodat FAILED (negative return) and the path
+                    // resolves INTO the rootfs and the backing file EXISTS
+                    // there, perform the chmod HOST-SIDE and fake 0. A
+                    // genuinely-missing guest file keeps its real ENOENT
+                    // (the host-side chmod fails → preserve the kernel
+                    // return — honesty preserved). Real successes are
+                    // untouched. Recovery gated off (corpus rule).
+                    //
+                    // Placement: EXIT-section top (the 6-Z305j position) —
+                    // runs for EVERY EXIT stop on EVERY ABI, immune to the
+                    // compute-table gates (the 49e lesson).
+                    // fchownat needs NO catch: it sits in the uniform
+                    // family (fake 0 at EXIT in every mode — the epilogue
+                    // forces 0 regardless of the raw errno), so the
+                    // missed-ENTRY race is already covered for it. Only
+                    // fchmodat runs REAL in system mode (the 6-Z305t-5
+                    // carve-out) and therefore needs this backstop.
+                    if !boot_recovery && syscall_num == abi.fchmodat {
+                        let fch_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if fch_ret < 0 && fch_ret > -4096 {
+                            let dirfd = syscall_dirfd(get_syscall_arg(&regs, abi.reg_arg1));
+                            if dirfd == AT_FDCWD {
+                                let path_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                if path_addr != 0 {
+                                    if let Some(path) = read_child_string(pid, path_addr) {
+                                        if path.starts_with('/') {
+                                            let real_path =
+                                                translate_path_via_sandbox(&sandbox, rootfs, &path);
+                                            let backing = std::path::Path::new(&real_path);
+                                            if backing.exists() {
+                                                let mode =
+                                                    get_syscall_arg(&regs, abi.reg_arg3) as u32;
+                                                let perms =
+                                                    std::os::unix::fs::PermissionsExt::from_mode(
+                                                        mode & 0o7777,
+                                                    );
+                                                match std::fs::set_permissions(backing, perms) {
+                                                    Ok(_) => {
+                                                        let mut fch_regs: Regs =
+                                                            unsafe { std::mem::zeroed() };
+                                                        if let Ok(fch_len) =
+                                                            ptrace_getregs_wide(pid, &mut fch_regs)
+                                                        {
+                                                            set_syscall_ret(&mut fch_regs, &abi, 0);
+                                                            let _ = ptrace_setregs(
+                                                                pid, &fch_regs, fch_len,
+                                                            );
+                                                            static FCHMOD_CATCH_LOG:
+                                                                std::sync::atomic::AtomicU64 =
+                                                                std::sync::atomic::AtomicU64::new(
+                                                                    0,
+                                                                );
+                                                            let n = FCHMOD_CATCH_LOG.fetch_add(
+                                                                1,
+                                                                std::sync::atomic::Ordering::Relaxed,
+                                                            );
+                                                            if n < 40 {
+                                                                log(&format!(
+                                                                    "6-Z305t-52: fchmodat-family EXIT catch: {} ({:#o}) on {} — real return {} (-errno {}) was the missed-ENTRY raw path; host-side chmod applied",
+                                                                    path, mode, real_path, fch_ret, -fch_ret
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        // Backing chmod failed —
+                                                        // preserve the real errno.
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let mut _forced_ret_opt = compute_exit_return_value(syscall_num, &abi);
                     // 6-Z305t-5: in SYSTEM mode the chmod/fchmod/fchmodat
                     // family runs FOR REAL — the 5-T-era blanket fake-success
