@@ -7045,6 +7045,28 @@ static void twoyi_init(void) {
                 "wait_for_keymaster",
                 "wait_for_gatekeeper",
                 "vdc",  // vdc communicates with vold via binder
+                // 6-Z305t-50: ladder #112 (run 34233376797) — bpfloader
+                // STILL rebooted the guest ("reboot,bpfloader-failed",
+                // exit 2 = loadAllElfObjects != 0) after 49b/49d/49e gave
+                // the tracer a working per-command bpf arm (4 MAP_CREATE
+                // fakes observed). Decode: the loader's BPF_OBJ_PIN calls
+                // never surface as tracer-visible bpf EXIT stops at all
+                // (only 4 nr=280 events in the whole run; the pin fails
+                // ENOENT inside createMaps → loadProg → -2 → critical
+                // failure), i.e. the host seccomp/SIGSYS interception
+                // path swallows them BEFORE the EXIT dispatcher — the
+                // per-command arm cannot see them. Rationale for exit 0:
+                // the container has NO BPF ENFORCEMENT DOMAIN AT ALL
+                // (rootless — BPF programs could never enforce anything,
+                // networking is host-bridged), so the honest virtualized
+                // end-state of "load BPF programs" is "nothing to load,
+                // success" — the same class as update_verifier (48).
+                // bpf.progs_loaded stays UNSET, which is exactly the
+                // no-BPF-kernel shape netd's TrafficController already
+                // handles. Generic across GSIs (bpfloader is standard
+                // AOSP). The tracer's bpf arm (49e) stays — it keeps
+                // OTHER bpf callers sane (defense in depth).
+                "bpfloader",
                 // 6-Z305t-48: ladder #106 (run 34223210003) — update_verifier
                 // REBOOTED the guest at the zygote-start gate. A11 source
                 // (update_verifier.cpp:310-313): IBootControl::getService()
