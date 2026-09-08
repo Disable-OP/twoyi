@@ -1232,6 +1232,19 @@ impl SandboxPolicy {
                 &path["/proc/sys/".len()..]
             );
         }
+        // 6-Z305t-61: /proc/pressure/** — the PSI files. libpsi (lmkd's
+        // monitor) opens /proc/pressure/{cpu,memory,io}; the HOST's files
+        // are root-owned (0400) so the app's open EACCESes — run #119:
+        // "[glog V/libpsi] No kernel psi monitor support (errno=13)" →
+        // lmkd init() fails → main() SKIPS mainloop → clean return 0 →
+        // "critical process 'lmkd' exited 4 times" → InitFatalReboot.
+        // Back them with rootfs files seeded from the host's real values
+        // (the same trust discipline as the 6-Z305i sysctl store: kr64 IS
+        // the guest's kernel substitute; the host kernel's real PSI
+        // numbers ARE the container's PSI numbers).
+        if path.starts_with("/proc/pressure/") || path == "/proc/pressure" {
+            return format!("{}{}", self.rootfs.to_string_lossy(), path);
+        }
         // /proc/<pid>/{maps,status,cmdline,auxv} → /proc/self/… (the
         // synthetic generators the VFS registered).
         if path.starts_with("/proc/") {

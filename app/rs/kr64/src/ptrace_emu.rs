@@ -20453,6 +20453,77 @@ pub fn run_ptrace_loop(
                                 // seed ONCE from the host's real sysctl;
                                 // unreadable host value → revert to the raw
                                 // host passthrough (honest failure).
+                                // ── 6-Z305t-61: /proc/pressure backing files ──
+                                // libpsi (lmkd) EACCESes on the HOST's root-owned
+                                // /proc/pressure/* → lmkd init() fails → clean
+                                // exit 0 → "critical process 'lmkd' exited 4
+                                // times" → InitFatalReboot (run #119). The
+                                // vfs rule translates /proc/pressure/** into
+                                // the rootfs; seed each file ONCE from the
+                                // host's real PSI numbers (kr64 IS the guest's
+                                // kernel substitute — the host kernel's real
+                                // PSI numbers ARE the container's), with an
+                                // honest zero-state fallback for hosts whose
+                                // kernel lacks PSI.
+                                let pressure_prefix =
+                                    format!("{}/proc/pressure/", rootfs.trim_end_matches('/'));
+                                if let Some(rel) = translated.strip_prefix(&pressure_prefix) {
+                                    if !rel.is_empty() && !rel.contains("..") {
+                                        let backing = std::path::Path::new(&translated);
+                                        if !backing.exists() {
+                                            if let Some(parent) = backing.parent() {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            let host_val = std::fs::read_to_string(format!(
+                                                "/proc/pressure/{}",
+                                                rel
+                                            ));
+                                            let content = match host_val {
+                                                Ok(v) => v,
+                                                Err(_) => {
+                                                    // Host kernel lacks PSI — serve the
+                                                    // honest zero-state (no pressure).
+                                                    format!(
+                                                        "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                                                    )
+                                                }
+                                            };
+                                            match std::fs::write(backing, content.as_bytes()) {
+                                                Ok(()) => {
+                                                    static PSI_SEED_LOG:
+                                                        std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    let n = PSI_SEED_LOG.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if n < 8 {
+                                                        log(&format!(
+                                                            "6-Z305t-61: /proc/pressure/{} seeded ({} bytes, host-backed or zero-state)",
+                                                            rel,
+                                                            content.len()
+                                                        ));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    static PSI_SEED_ERR_LOG:
+                                                        std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    let en = PSI_SEED_ERR_LOG.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if en < 8 {
+                                                        log(&format!(
+                                                            "6-Z305t-61: /proc/pressure/{} seed FAILED: {}",
+                                                            rel, e
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 let sysctl_prefix =
                                     format!("{}/dev/.twoyi-sysctl/", rootfs.trim_end_matches('/'));
                                 if let Some(rel) = translated.strip_prefix(&sysctl_prefix) {
