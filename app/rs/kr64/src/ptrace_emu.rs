@@ -13409,6 +13409,9 @@ pub fn run_ptrace_loop(
     // 6-Z305t-36: kmsg-shaped UNLINK counter (budget 10) — names who
     // removes the klog node mid-boot (the node-replacement hypothesis).
     let mut kmsg_unlink_diag_count: u64 = 0;
+    // 6-Z305t-38: append-force counter (budget 40) — kmsg write-mode opens
+    // whose flags got O_APPEND forced (+O_TRUNC stripped).
+    let mut kmsg_append_force_count: u64 = 0;
     // 6-Z237: failed-open DIAG counter for guest-/dev paths in the
     // second-stage boot window (loop 400-1000, first 20).
     let mut dev_fail_diag_count: u64 = 0;
@@ -20405,6 +20408,88 @@ pub fn run_ptrace_loop(
                                                 stat_note,
                                                 kmsg_open_diag_entry_count
                                             ));
+                                        }
+                                    }
+                                    // ── 6-Z305t-38: the klog mirror is
+                                    // APPEND-ONLY — force O_APPEND on every
+                                    // write-mode kmsg open ──
+                                    //
+                                    // THE #93→#95 ROOT CAUSE. The real
+                                    // /dev/kmsg is a char device whose
+                                    // write() ALWAYS appends a record
+                                    // (drivers/char/mem.c write_kmsg) — file
+                                    // position is irrelevant. The file mirror
+                                    // {rootfs}/dev/__kmsg__ silently broke
+                                    // that semantic: ladders #94/#95 PROVED
+                                    // the shim's O_APPEND writers deliver
+                                    // (fd tests + real liblog lines, dup3
+                                    // verified, fstat verified ino=artifact)
+                                    // while liblog's OWN kmsg fallback (pids
+                                    // 2697/2698) opens /dev/kmsg with PLAIN
+                                    // O_WRONLY (flags=0x1) — every fresh open
+                                    // starts at offset 0 and CLOBBERS THE
+                                    // FILE FROM BYTE ZERO as it advances,
+                                    // wiping every append-writer's bytes
+                                    // (the fd-test markers included) and
+                                    // leaving "100% init text" artifacts.
+                                    // This is also the faithful-emulation
+                                    // fix, not a hack: making the mirror
+                                    // append-only for ALL writers replicates
+                                    // the char device's contract.
+                                    //
+                                    // Rewrite in the live registers (the
+                                    // 6-Z61 O_EXCL-strip pattern): force
+                                    // O_APPEND on write-mode opens, strip
+                                    // O_TRUNC (a kmsg mirror must never
+                                    // truncate — the flag is meaningless on
+                                    // the char device). O_APPEND/O_TRUNC are
+                                    // 0x400/0x200 on BOTH supported ABIs
+                                    // (x86_64 fcntl.h and asm-generic agree).
+                                    // openat2 carries flags in a `struct
+                                    // open_how` POINTER — rewriting it needs
+                                    // a process_vm write; left untouched (the
+                                    // boot fleet uses open/openat only — the
+                                    // EXIT forensics line will surface any
+                                    // openat2 kmsg open via its flags=0
+                                    // marker).
+                                    {
+                                        const O_APPEND_FLAG: u64 = 0x400;
+                                        const O_TRUNC_FLAG: u64 = 0x200;
+                                        const O_WRONLY_FLAG: u64 = 0x1;
+                                        const O_RDWR_FLAG: u64 = 0x2;
+                                        let flags_reg = if syscall_num == abi.open {
+                                            Some(abi.reg_arg2)
+                                        } else if syscall_num == abi.openat {
+                                            Some(abi.reg_arg3)
+                                        } else {
+                                            None // openat2: struct pointer — skip
+                                        };
+                                        if let Some(flags_reg) = flags_reg {
+                                            let cur = get_syscall_arg(&regs, flags_reg);
+                                            let is_write_mode =
+                                                cur & (O_WRONLY_FLAG | O_RDWR_FLAG) != 0;
+                                            if is_write_mode
+                                                && (cur & O_APPEND_FLAG == 0
+                                                    || cur & O_TRUNC_FLAG != 0)
+                                            {
+                                                let new_flags =
+                                                    (cur | O_APPEND_FLAG) & !O_TRUNC_FLAG;
+                                                set_syscall_arg(&mut regs, flags_reg, new_flags);
+                                                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                                    kmsg_append_force_count =
+                                                        kmsg_append_force_count.saturating_add(1);
+                                                    if kmsg_append_force_count <= 40 {
+                                                        log(&format!(
+                                                            "6-Z305t-38: kmsg open flags FORCED append-only pid={} orig={:?} 0x{:x} -> 0x{:x} (occurrence {})",
+                                                            pid,
+                                                            path,
+                                                            cur,
+                                                            new_flags,
+                                                            kmsg_append_force_count
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
