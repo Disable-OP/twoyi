@@ -431,10 +431,11 @@ jobs:
           # stderr — these files name the failing lines verbatim.
           timeout 30 sudo docker exec redroid sh -c \
             "d=/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs; \
-             ls -la \$d 2>/dev/null | head -50; \
+             ls -la \$d 2>/dev/null | head -80; \
              for f in \$d/svc-*.log; do \
                [ -f \$f ] && echo \"== \$(basename \$f) (\$(stat -c%s \$f) bytes) ==\" && \
-               grep -aE 'linker|CANNOT LINK|cannot locate|not found|WARNING|virtualization|binder_open_fallback|proxy|TWOYI_ROOTFS|logdw' \$f | head -24; \
+               grep -aE 'linker|CANNOT LINK|cannot locate|not found|WARNING|virtualization|binder_open_fallback|proxy|TWOYI_ROOTFS|logdw|abort message|abort\(\) INTERCEPTED|FATAL|exited|cannot|Failed|failed' \$f | grep -av 'anon:' | head -30; \
+               echo \"-- tail 3072 --\"; tail -c 3072 \$f | grep -av 'anon:' | tail -24; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs.txt 2>&1 || true
           # ── 6-Z305t-36: klog node FILE-IDENTITY forensics ──────────────
@@ -458,13 +459,15 @@ jobs:
                grep -a 'twoyi_loader' \$f 2>/dev/null | tail -5; \
                echo '── tail (cat -v, last 1536 bytes) ──'; tail -c 1536 \$f | cat -v; \
              else echo 'MISSING'; fi; \
-             echo; echo '── profiles-default rootfs klog node ──'; \
-             pf=/data/user/0/io.twoyi.debug/rootfs/profiles/default/rootfs/dev/__kmsg__; \
+             echo; echo '── profiles-default rootfs klog node (6-Z305t-39: the CORRECT path — #96 maps dumps prove the guest runtime loads from {data}/profiles/default/rootfs) ──'; \
+             pf=/data/user/0/io.twoyi.debug/profiles/default/rootfs/dev/__kmsg__; \
              if [ -e \$pf ]; then stat -c 'dev=%d ino=%i size=%s mtime=%y' \$pf; \
                echo \"fdtest-markers=\$(grep -ac 'logdw kmsg fd test' \$pf 2>/dev/null)\"; \
                grep -a 'twoyi_loader' \$pf 2>/dev/null | tail -5; \
-               echo '── tail (cat -v, last 1536 bytes) ──'; tail -c 1536 \$pf | cat -v; \
-             else echo 'MISSING (profiles indirection ruled out for the klog)'; fi; \
+             else echo 'MISSING at {data}/profiles/default/rootfs/dev/__kmsg__'; fi; \
+             echo; echo '── profiles-default rootfs tree check ──'; \
+             ls -la /data/user/0/io.twoyi.debug/profiles/default/rootfs/ 2>/dev/null | head -14; \
+             ls -la /data/user/0/io.twoyi.debug/profiles/default/rootfs/dev/__kmsg__ /data/user/0/io.twoyi.debug/profiles/default/rootfs/dev/twoyi-svclogs 2>/dev/null; \
              echo; echo '── profiles tree (existence check) ──'; \
              ls -la /data/user/0/io.twoyi.debug/profiles/ 2>/dev/null || echo 'no profiles dir'; \
              ls -la /data/user/0/io.twoyi.debug/rootfs/profiles/ 2>/dev/null | head -10; \
