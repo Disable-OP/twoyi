@@ -5191,11 +5191,15 @@ static int should_block_fstab(const char *path) {
 }
 
 // openat PLT interposition
-int openat(int dirfd, const char *path, int flags, ...) {
-    mode_t mode = 0;
-    if (flags & O_CREAT) {
-        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
-    }
+// 6-Z305t-43: the BODY of the openat hook is shared with the new __openat
+// hook (openat_hook_common) — bionic's open() funnels through __openat, so
+// every hook that only covers open/openat/__open_2/__openat_2/__open_real
+// is bypassed by code calling the bionic open() inline (libbinder's
+// ProcessState::open_driver — the #99 decode: "Opening '/dev/binder'
+// failed: No such device or address" with ZERO shim-side evidence, then
+// the FATAL). Both openat() and __openat() now route through ONE body.
+static int openat_hook_common(int dirfd, const char *path, int flags,
+                              mode_t mode) {
     init_real_funcs();
 
     // Block fstab files for init only → first_stage_mount is skipped.
@@ -5269,6 +5273,45 @@ int openat(int dirfd, const char *path, int flags, ...) {
         return qemu_pipe_open_fallback(path, fd, saved_errno);
     }
     return track_fb_fd(path, fd);
+}
+
+// openat PLT interposition (public symbol — unchanged behavior).
+int openat(int dirfd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+    }
+    return openat_hook_common(dirfd, path, flags, mode);
+}
+
+// 6-Z305t-43: __openat PLT interposition — THE bionic open() choke point.
+//
+// #99 decode (ladder, svc-2712 = servicemanager): libbinder's
+// ProcessState::open_driver logged "Opening '/dev/binder' failed: No such
+// device or address" (ENXIO — the {rootfs}/dev/binder char node carries
+// rdev 0:0, a major the kernel serves with nothing) and then FATALed
+// "Binder driver '/dev/binder' could not be opened. Terminating." — with
+// ZERO binder_open_fallback diagnostics in its svclog. The fallback
+// (proxy connect, then the /dev/null virtual fd with its own log line)
+// NEVER RAN: libbinder's open() compiles to the bionic open() inline,
+// which calls __openat() — a libc-internal symbol the hook set (open,
+// openat, __open_2, __openat_2, __open_real) does NOT export. The raw
+// openat syscall therefore hit the dead node directly.
+//
+// Fix: export __openat from the shim (LD_PRELOAD scope resolves other
+// libraries' __openat refs here FIRST) and route it through the SAME
+// body as openat() — translation, binder fallback, qemu_pipe fallback.
+// The proxy connect then wins for every libbinder-family client and the
+// kr64 virtual binder engages (real binder WIRE semantics, no fake
+// success). Recursion is impossible: libc's INTERNAL open/openat calls
+// to __openat are direct (non-PLT) and our body calls the dlsym'd real
+// __openat / raw syscalls only.
+int __openat(int dirfd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+    }
+    return openat_hook_common(dirfd, path, flags, mode);
 }
 
 // open PLT interposition (for code that uses open() instead of openat())
@@ -5606,8 +5649,15 @@ static int binder_open_fallback(const char *path, int real_fd, int saved_errno) 
         if (!binder_fd_is_proxy(real_fd)) {
             struct stat st;
             memset(&st, 0, sizeof(st));
+            // 6-Z305t-43 hardening: a char node with rdev 0:0 is the
+            // dead-stub class (#99 decode: {rootfs}/dev/binder mode 140666
+            // rdev 0:0 — major 0 serves no driver; the kernel ENXIOs raw
+            // opens). An fd that DID open on such a node (tracer-faked
+            // success class) can never do binder IPC — treat it like the
+            // regular-file placeholder: close it and connect to the proxy.
             int is_real_binder =
-                (fstat(real_fd, &st) == 0 && S_ISCHR(st.st_mode));
+                (fstat(real_fd, &st) == 0 && S_ISCHR(st.st_mode) &&
+                 st.st_rdev != 0);
             if (!is_real_binder) {
                 syscall(NR_close, real_fd);
                 int pfd = binder_proxy_connect(path);
