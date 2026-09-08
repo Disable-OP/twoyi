@@ -12735,7 +12735,12 @@ pub fn run_ptrace_loop(
     // -98 is attributed to its guest path and the remove_file outcome.
     let mut pending_bind_path: std::collections::HashMap<
         libc::pid_t,
-        (String, std::result::Result<(), std::io::Error>),
+        (
+            String,
+            std::result::Result<(), std::io::Error>,
+            u64,
+            [u8; 16],
+        ),
     > = std::collections::HashMap::new();
     // 6-Z305t-49b: per-pid set of live fake BPF fds (bounded by the loader
     // workload: ~100 map/prog fds per boot; close() tracking skipped —
@@ -18565,8 +18570,6 @@ pub fn run_ptrace_loop(
                                             // EADDRINUSEs on it (existence check
                                             // before permission check).
                                             let rm_res = std::fs::remove_file(&host_path);
-                                            pending_bind_path
-                                                .insert(pid, (guest_path.clone(), rm_res));
                                             // Scratch write (the area was
                                             // re-reserved at THIS ENTRY stop
                                             // — see the reservation block —
@@ -18695,6 +18698,23 @@ pub fn run_ptrace_loop(
                                                             ));
                                                         }
                                                     }
+                                                    // 6-Z305t-60: stash for the bind-EXIT
+                                                    // forensics (scratch address + the
+                                                    // expected blob prefix).
+                                                    let mut expect = [0u8; 16];
+                                                    for (i, b) in new_sa.iter().take(16).enumerate()
+                                                    {
+                                                        expect[i] = *b;
+                                                    }
+                                                    pending_bind_path.insert(
+                                                        pid,
+                                                        (
+                                                            guest_path.clone(),
+                                                            rm_res,
+                                                            sa_scratch,
+                                                            expect,
+                                                        ),
+                                                    );
                                                     log(&format!(
                                                         "6-Z163: bind(fd={}, {}) sockaddr REWRITTEN to {} (len {} -> {}) — kernel will bind FOR REAL",
                                                         get_syscall_arg(&regs, abi.reg_arg1),
@@ -29039,16 +29059,31 @@ pub fn run_ptrace_loop(
                                             }
                                             let bind_src = pending_bind_path
                                                 .remove(&pid)
-                                                .map(|(gp, rm)| {
+                                                .map(|(gp, rm, scratch, expect)| {
                                                     let now_exists = std::path::Path::new(
                                                         &translate_path(rootfs, &gp),
                                                     )
                                                     .exists();
+                                                    // 6-Z305t-60: read the scratch blob
+                                                    // NOW — intact ⇒ the kernel saw the
+                                                    // correct sockaddr and the -98 came
+                                                    // from the FS path (contradiction ⇒
+                                                    // stop-phase misclassification: the
+                                                    // arm ran at EXIT after a RAW bind
+                                                    // already failed); DIFFERS ⇒ a later
+                                                    // writer rewrote the scratch.
+                                                    let now: Option<Vec<u8>> =
+                                                        read_child_bytes(pid, scratch, 16);
+                                                    let intact =
+                                                        now.as_deref() == Some(&expect[..]);
                                                     format!(
-                                                        "guest_path={} remove_file={} target_now_exists={}",
+                                                        "guest_path={} remove_file={} target_now_exists={} scratch_intact={} scratch_now={:?} expect={:?}",
                                                         gp,
                                                         if rm.is_ok() { "ok" } else { "FAILED" },
-                                                        now_exists
+                                                        now_exists,
+                                                        intact,
+                                                        now,
+                                                        &expect[..]
                                                     )
                                                 })
                                                 .unwrap_or_else(|| {
