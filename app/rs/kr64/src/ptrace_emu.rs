@@ -12730,6 +12730,20 @@ pub fn run_ptrace_loop(
     // disjoint from the netlink range so the two fd spaces never collide.
     let mut bpf_fd_next: std::collections::HashMap<libc::pid_t, i32> =
         std::collections::HashMap::new();
+    // 6-Z305t-62: PSI fds — fds opened on the .twoyi-psi backing files
+    // (libpsi's trigger-registration fd). A REGULAR file cannot be
+    // epoll'd (EPERM — "[glog V/libpsi] epoll_ctl for psi monitor
+    // failed; errno=1") and, once faked in, would report READY on every
+    // epoll_pwait (regular files are always ready) → an lmkd kill-storm.
+    // Both are handled below: epoll_ctl faked to 0, and EPOLLPRI entries
+    // filtered out of epoll_pwait results (libpsi registers EPOLLPRI-only:
+    // psi.cpp "epev.events = EPOLLPRI; epev.data.ptr = data").
+    let mut psi_fds: std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>> =
+        std::collections::HashMap::new();
+    // 6-Z305t-62: in-flight epoll_pwait (events buffer, maxevents) per pid —
+    // aarch64 clobbers x0-x3 at EXIT, so the ENTRY stop stashes them.
+    let mut pending_epoll_pwait: std::collections::HashMap<libc::pid_t, (u64, u64)> =
+        std::collections::HashMap::new();
     // 6-Z305t-59: the LAST rewritten bind's (guest_path, remove_file result)
     // per pid — consumed at the bind EXIT by the 6-Z101 forensics so every
     // -98 is attributed to its guest path and the remove_file outcome.
@@ -18329,6 +18343,15 @@ pub fn run_ptrace_loop(
                                 }
                                 _ => {}
                             }
+                        }
+                        // ── 6-Z305t-62: epoll_pwait ENTRY stash ──
+                        // aarch64 clobbers x0-x3 at the syscall EXIT, so the
+                        // events-buffer pointer and maxevents must be stashed
+                        // at ENTRY for the EXIT-side EPOLLPRI filter below.
+                        if !boot_recovery && abi.execve == 221 && syscall_num == 22 {
+                            let ev_buf = get_syscall_arg(&regs, abi.reg_arg2);
+                            let maxev = get_syscall_arg(&regs, abi.reg_arg3);
+                            pending_epoll_pwait.insert(pid, (ev_buf, maxev));
                         }
                         // ── 6-Z163: AF_UNIX bind() sun_path rewrite (TWRP
                         // mode, direct-bind ABIs only) — see the helpers'
@@ -24092,6 +24115,21 @@ pub fn run_ptrace_loop(
                             // returns are errors.
                             if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
                                 open_fd_paths.insert(ret as i32, p.clone());
+                                // 6-Z305t-62: track PSI backing-file fds (for the
+                                // epoll_ctl fake + the EPOLLPRI filter below).
+                                if p.contains("/.twoyi-psi/") && ret >= 0 {
+                                    psi_fds.entry(pid).or_default().insert(ret as i64);
+                                    static PSI_FD_LOG: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let n = PSI_FD_LOG
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n < 8 {
+                                        log(&format!(
+                                            "6-Z305t-62: psi fd captured pid={} fd={} path={}",
+                                            pid, ret, p
+                                        ));
+                                    }
+                                }
                                 // ── 6-Z305c: realpath-trace open DIAG ──
                                 // bionic realpath (android-11) = open(path,
                                 // O_PATH) + fstat + readlink(/proc/self/fd)
@@ -28210,6 +28248,133 @@ pub fn run_ptrace_loop(
                                     "6-Z305t-49b: bpf(cmd={}, nr={}) returned {} (-errno {}) — faked to {}",
                                     cmd, syscall_num, bpf_fresh_ret, -bpf_fresh_ret, new_ret
                                 ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // ── 6-Z305t-62: PSI epoll virtualization ──
+                    //
+                    // libpsi registers the .twoyi-psi backing-file fd with
+                    // epoll_ctl(EPOLL_CTL_ADD, ..., EPOLLPRI, ...) — the
+                    // kernel refuses epoll on a REGULAR file (EPERM) →
+                    // "[glog V/libpsi] epoll_ctl for psi monitor failed;
+                    // errno=1" → lmkd init() fails → clean exit 0 →
+                    // "critical process 'lmkd' exited 4 times" →
+                    // InitFatalReboot (ladders #119-#121).
+                    //
+                    // Two arms:
+                    //   a) epoll_ctl on a tracked psi fd → fake 0 (the
+                    //      registration "succeeds").
+                    //   b) epoll_pwait results: filter OUT the psi entries
+                    //      (libpsi registers EPOLLPRI-only — psi.cpp line 82
+                    //      "epev.events = EPOLLPRI; epev.data.ptr = data") —
+                    //      a regular-file fd would otherwise report READY on
+                    //      every wait (regular files are always ready) and
+                    //      spin lmkd's kill logic. Zero the EPOLLPRI entries
+                    //      in the child's events array and shrink the return.
+                    //   Recovery gated off (corpus rule).
+                    if !boot_recovery && abi.execve == 221 {
+                        let is_ctl = syscall_num == 21;
+                        let is_pwait = syscall_num == 22;
+                        if is_ctl || is_pwait {
+                            let epi_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            if is_ctl && epi_ret == -(libc::EPERM as i64) {
+                                let target_fd = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                                if psi_fds.get(&pid).map_or(false, |s| s.contains(&target_fd)) {
+                                    let mut epi_regs: Regs = unsafe { std::mem::zeroed() };
+                                    if let Ok(epi_len) = ptrace_getregs_wide(pid, &mut epi_regs) {
+                                        set_syscall_ret(&mut epi_regs, &abi, 0);
+                                        if let Err(e) = ptrace_setregs(pid, &epi_regs, epi_len) {
+                                            log(&format!(
+                                                "6-Z305t-62: epoll_ctl fake setregs FAILED: {}",
+                                                e
+                                            ));
+                                        } else {
+                                            static PSI_CTL_LOG: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            let n = PSI_CTL_LOG
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if n < 8 {
+                                                log(&format!(
+                                                    "6-Z305t-62: epoll_ctl(ADD psi fd {}) returned -EPERM — faked to 0 (libpsi registration succeeds)",
+                                                    target_fd
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if is_pwait && epi_ret > 0 {
+                                if let Some(&(ev_buf, maxev)) = pending_epoll_pwait.get(&pid) {
+                                    if ev_buf != 0 && maxev > 0 {
+                                        // struct epoll_event (packed): u32 events @0, u64 data @8, stride 12.
+                                        let stride = 12usize;
+                                        let count = epi_ret as usize;
+                                        if count <= maxev as usize {
+                                            let mut buf = match read_child_bytes(
+                                                pid,
+                                                ev_buf,
+                                                count * stride,
+                                            ) {
+                                                Some(b) => b,
+                                                None => {
+                                                    log(&format!(
+                                                            "6-Z305t-62: epoll_pwait filter: events read FAILED ({} entries)",
+                                                            count
+                                                        ));
+                                                    // Skip the filter this round —
+                                                    // fall through with the raw return
+                                                    // (no rewrite).
+                                                    return 0;
+                                                }
+                                            };
+                                            let mut removed = 0usize;
+                                            for i in 0..count {
+                                                let off = i * stride;
+                                                let events = u32::from_ne_bytes(
+                                                    buf[off..off + 4]
+                                                        .try_into()
+                                                        .unwrap_or([0u8; 4]),
+                                                );
+                                                if events == 0x8 {
+                                                    // EPOLLPRI-only entry = a PSI
+                                                    // monitor event — the regular-
+                                                    // file backing store is never
+                                                    // under pressure; zero it.
+                                                    for b in buf[off..off + stride].iter_mut() {
+                                                        *b = 0;
+                                                    }
+                                                    removed += 1;
+                                                }
+                                            }
+                                            if removed > 0 {
+                                                let mut epi_regs: Regs =
+                                                    unsafe { std::mem::zeroed() };
+                                                if let Ok(epi_len) =
+                                                    ptrace_getregs_wide(pid, &mut epi_regs)
+                                                {
+                                                    let new_ret = epi_ret - removed as i64;
+                                                    set_syscall_ret(&mut epi_regs, &abi, new_ret);
+                                                    let _ = ptrace_setregs(pid, &epi_regs, epi_len);
+                                                    let _ = write_child_bytes_injection(
+                                                        pid, ev_buf, &buf, &mut None,
+                                                    );
+                                                    static PSI_FILTER_LOG:
+                                                        std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    let n = PSI_FILTER_LOG.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    if n < 8 {
+                                                        log(&format!(
+                                                            "6-Z305t-62: epoll_pwait returned {} ready — filtered {} EPOLLPRI (psi) entries, new ret {}",
+                                                            epi_ret, removed, new_ret
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
