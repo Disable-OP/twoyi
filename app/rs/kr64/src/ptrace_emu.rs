@@ -27772,6 +27772,158 @@ pub fn run_ptrace_loop(
                             }
                         }
                     }
+                    // ── 6-Z305t-49b: bpf() virtualization ──
+                    //
+                    // The A11 bpfloader is a reboot_on_failure
+                    // service (ladder #107: "reboot,bpfloader-
+                    // failed"). The uniform fake-0 failed for TWO
+                    // reasons decoded from ladder #108 (run
+                    // 34226614249) against the A11 source
+                    // (system/bpf/libbpf_android/Loader.cpp):
+                    //   1. createMaps/loadProg REJECT fd 0:
+                    //      `if (fd == 0) return -EINVAL;`
+                    //      (lines 443-444 + 595-596) — uniform 0
+                    //      made every map "fail" with -EINVAL.
+                    //   2. After a successful create the loader
+                    //      pins the fd (BPF_OBJ_PIN →
+                    //      /sys/fs/bpf/map_<file>_<name>) and then
+                    //      chown+chmod THAT PATH — in system mode
+                    //      chmod runs FOR REAL (6-Z305t-5), so the
+                    //      pin file must EXIST in the rootfs.
+                    // Per-command emulation (host seccomp always
+                    // rejects bpf() for the rootless app, so only
+                    // failures/zero are replaced; a real success
+                    // is left untouched):
+                    //   MAP_CREATE/PROG_LOAD/OBJ_GET → synthetic
+                    //     fd (0x6b02_0000 base, per-pid counter —
+                    //     the 6-Z99 netlink pattern; disjoint from
+                    //     the netlink range);
+                    //   OBJ_PIN → materialize an empty file at the
+                    //     translated pin path (the /sys/**
+                    //     translate rule lands it under the
+                    //     rootfs) + fake 0 — the loader's own
+                    //     access()-reuse, chown (fchownat fake)
+                    //     and chmod (real, rootfs-owned) then
+                    //     behave exactly like on a real device;
+                    //   LOOKUP/GET_NEXT_KEY/DELETE → -ENOENT (the
+                    //     honest empty-map semantics — never
+                    //     hand back uninitialized buffers);
+                    //   everything else → 0.
+                    // bpfloader then exits 0 and sets
+                    // bpf.progs_loaded=1. Recovery never calls
+                    // bpf() and the arm is gated on !boot_recovery
+                    // anyway (corpus rule).
+                    const BPF_FAKE_FD_BASE: i32 = 0x6b02_0000;
+                    const BPF_MAP_CREATE_CMD: u32 = 0;
+                    const BPF_MAP_LOOKUP_ELEM_CMD: u32 = 1;
+                    // (BPF_MAP_UPDATE_ELEM = 2 falls into the
+                    // catch-all Some(0) arm below — no named
+                    // constant needed and an unused one fails the
+                    // CI build's deny(dead_code), ladder #109.)
+                    const BPF_PROG_LOAD_CMD: u32 = 5;
+                    const BPF_OBJ_PIN_CMD: u32 = 6;
+                    const BPF_OBJ_GET_CMD: u32 = 7;
+                    if !boot_recovery && abi.bpf != -1 && syscall_num == abi.bpf {
+                        // Fresh EXIT-stop state (6-Z60 lesson): read the
+                        // return register fresh; args survive the syscall.
+                        let mut bpf_regs: Regs = unsafe { std::mem::zeroed() };
+                        if let Ok(bpf_len) = ptrace_getregs_wide(pid, &mut bpf_regs) {
+                            let bpf_fresh_ret = get_syscall_arg(&bpf_regs, abi.reg_ret) as i64;
+                            if (bpf_fresh_ret < 0 && bpf_fresh_ret > -4096) || bpf_fresh_ret == 0 {
+                                let cmd = get_syscall_arg(&bpf_regs, abi.reg_arg1) as u32;
+                                static BPF_ARM_LOG: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let bpf_log_n =
+                                    BPF_ARM_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let mut bpf_new_ret: Option<i64> = match cmd {
+                                    BPF_MAP_CREATE_CMD | BPF_PROG_LOAD_CMD | BPF_OBJ_GET_CMD => {
+                                        let base =
+                                            bpf_fd_next.entry(pid).or_insert(BPF_FAKE_FD_BASE);
+                                        let fd = *base;
+                                        if *base < 0x6bff_fff0 {
+                                            *base += 1;
+                                        }
+                                        bpf_fake_fds.entry(pid).or_default().insert(fd as i64);
+                                        Some(fd as i64)
+                                    }
+                                    BPF_MAP_LOOKUP_ELEM_CMD => Some(-(libc::ENOENT as i64)),
+                                    BPF_OBJ_PIN_CMD => {
+                                        // attr = arg2; pathname is the FIRST
+                                        // member of the BPF_OBJ_* union
+                                        // (UAPI: __aligned_u64 pathname;
+                                        // __u32 bpf_fd; __u32 file_flags).
+                                        let attr = get_syscall_arg(&bpf_regs, abi.reg_arg2);
+                                        if attr != 0 {
+                                            if let Some(attr_bytes) = read_child_bytes(pid, attr, 8)
+                                            {
+                                                if attr_bytes.len() == 8 {
+                                                    let path_ptr = u64::from_le_bytes(
+                                                        attr_bytes[0..8]
+                                                            .try_into()
+                                                            .unwrap_or([0u8; 8]),
+                                                    );
+                                                    if path_ptr != 0 {
+                                                        if let Some(guest_path) =
+                                                            read_child_string(pid, path_ptr)
+                                                        {
+                                                            let real_path =
+                                                                translate_path_via_sandbox(
+                                                                    &sandbox,
+                                                                    rootfs,
+                                                                    &guest_path,
+                                                                );
+                                                            if let Some(parent) =
+                                                                std::path::Path::new(&real_path)
+                                                                    .parent()
+                                                            {
+                                                                let _ =
+                                                                    std::fs::create_dir_all(parent);
+                                                            }
+                                                            match std::fs::File::create(&real_path)
+                                                            {
+                                                                Ok(_) => {
+                                                                    if bpf_log_n < 40 {
+                                                                        log(&format!(
+                                                                    "6-Z305t-49b: BPF_OBJ_PIN materialized {} (guest path {:?})",
+                                                                    real_path, guest_path
+                                                                ));
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    if bpf_log_n < 40 {
+                                                                        log(&format!(
+                                                                    "6-Z305t-49b: BPF_OBJ_PIN FAILED to materialize {}: {}",
+                                                                    real_path, e
+                                                                ));
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Some(0)
+                                    }
+                                    _ => Some(0),
+                                };
+                                if let Some(new_ret) = bpf_new_ret.take() {
+                                    set_syscall_ret(&mut bpf_regs, &abi, new_ret);
+                                    if let Err(e) = ptrace_setregs(pid, &bpf_regs, bpf_len) {
+                                        log(&format!(
+                                    "6-Z305t-49b FAILED: ptrace_setregs for bpf(cmd={}) ({}): {} — child sees {}",
+                                    cmd, syscall_num, e, bpf_fresh_ret
+                                ));
+                                    } else if bpf_log_n < 40 {
+                                        log(&format!(
+                                    "6-Z305t-49b: bpf(cmd={}, nr={}) returned {} (-errno {}) — faked to {}",
+                                    cmd, syscall_num, bpf_fresh_ret, -bpf_fresh_ret, new_ret
+                                ));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let mut _forced_ret_opt = compute_exit_return_value(syscall_num, &abi);
                     // 6-Z305t-5: in SYSTEM mode the chmod/fchmod/fchmodat
                     // family runs FOR REAL — the 5-T-era blanket fake-success
@@ -28212,158 +28364,6 @@ pub fn run_ptrace_loop(
                                                     real_path, e
                                                 )),
                                             }
-                                        }
-                                    }
-                                }
-                                // ── 6-Z305t-49b: bpf() virtualization ──
-                                //
-                                // The A11 bpfloader is a reboot_on_failure
-                                // service (ladder #107: "reboot,bpfloader-
-                                // failed"). The uniform fake-0 failed for TWO
-                                // reasons decoded from ladder #108 (run
-                                // 34226614249) against the A11 source
-                                // (system/bpf/libbpf_android/Loader.cpp):
-                                //   1. createMaps/loadProg REJECT fd 0:
-                                //      `if (fd == 0) return -EINVAL;`
-                                //      (lines 443-444 + 595-596) — uniform 0
-                                //      made every map "fail" with -EINVAL.
-                                //   2. After a successful create the loader
-                                //      pins the fd (BPF_OBJ_PIN →
-                                //      /sys/fs/bpf/map_<file>_<name>) and then
-                                //      chown+chmod THAT PATH — in system mode
-                                //      chmod runs FOR REAL (6-Z305t-5), so the
-                                //      pin file must EXIST in the rootfs.
-                                // Per-command emulation (host seccomp always
-                                // rejects bpf() for the rootless app, so only
-                                // failures/zero are replaced; a real success
-                                // is left untouched):
-                                //   MAP_CREATE/PROG_LOAD/OBJ_GET → synthetic
-                                //     fd (0x6b02_0000 base, per-pid counter —
-                                //     the 6-Z99 netlink pattern; disjoint from
-                                //     the netlink range);
-                                //   OBJ_PIN → materialize an empty file at the
-                                //     translated pin path (the /sys/**
-                                //     translate rule lands it under the
-                                //     rootfs) + fake 0 — the loader's own
-                                //     access()-reuse, chown (fchownat fake)
-                                //     and chmod (real, rootfs-owned) then
-                                //     behave exactly like on a real device;
-                                //   LOOKUP/GET_NEXT_KEY/DELETE → -ENOENT (the
-                                //     honest empty-map semantics — never
-                                //     hand back uninitialized buffers);
-                                //   everything else → 0.
-                                // bpfloader then exits 0 and sets
-                                // bpf.progs_loaded=1. Recovery never calls
-                                // bpf() and the arm is gated on !boot_recovery
-                                // anyway (corpus rule).
-                                const BPF_FAKE_FD_BASE: i32 = 0x6b02_0000;
-                                const BPF_MAP_CREATE_CMD: u32 = 0;
-                                const BPF_MAP_LOOKUP_ELEM_CMD: u32 = 1;
-                                // (BPF_MAP_UPDATE_ELEM = 2 falls into the
-                                // catch-all Some(0) arm below — no named
-                                // constant needed and an unused one fails the
-                                // CI build's deny(dead_code), ladder #109.)
-                                const BPF_PROG_LOAD_CMD: u32 = 5;
-                                const BPF_OBJ_PIN_CMD: u32 = 6;
-                                const BPF_OBJ_GET_CMD: u32 = 7;
-                                if !boot_recovery
-                                    && abi.bpf != -1
-                                    && syscall_num == abi.bpf
-                                    && (fresh_ret < 0 && fresh_ret > -4096 || fresh_ret == 0)
-                                {
-                                    let cmd = get_syscall_arg(&regs2, abi.reg_arg1) as u32;
-                                    static BPF_ARM_LOG: std::sync::atomic::AtomicU64 =
-                                        std::sync::atomic::AtomicU64::new(0);
-                                    let bpf_log_n = BPF_ARM_LOG
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let mut bpf_new_ret: Option<i64> = match cmd {
-                                        BPF_MAP_CREATE_CMD | BPF_PROG_LOAD_CMD
-                                        | BPF_OBJ_GET_CMD => {
-                                            let base =
-                                                bpf_fd_next.entry(pid).or_insert(BPF_FAKE_FD_BASE);
-                                            let fd = *base;
-                                            if *base < 0x6bff_fff0 {
-                                                *base += 1;
-                                            }
-                                            bpf_fake_fds.entry(pid).or_default().insert(fd as i64);
-                                            Some(fd as i64)
-                                        }
-                                        BPF_MAP_LOOKUP_ELEM_CMD => Some(-(libc::ENOENT as i64)),
-                                        BPF_OBJ_PIN_CMD => {
-                                            // attr = arg2; pathname is the FIRST
-                                            // member of the BPF_OBJ_* union
-                                            // (UAPI: __aligned_u64 pathname;
-                                            // __u32 bpf_fd; __u32 file_flags).
-                                            let attr = get_syscall_arg(&regs2, abi.reg_arg2);
-                                            if attr != 0 {
-                                                if let Some(attr_bytes) =
-                                                    read_child_bytes(pid, attr, 8)
-                                                {
-                                                    if attr_bytes.len() == 8 {
-                                                        let path_ptr = u64::from_le_bytes(
-                                                            attr_bytes[0..8]
-                                                                .try_into()
-                                                                .unwrap_or([0u8; 8]),
-                                                        );
-                                                        if path_ptr != 0 {
-                                                            if let Some(guest_path) =
-                                                                read_child_string(pid, path_ptr)
-                                                            {
-                                                                let real_path =
-                                                                    translate_path_via_sandbox(
-                                                                        &sandbox,
-                                                                        rootfs,
-                                                                        &guest_path,
-                                                                    );
-                                                                if let Some(parent) =
-                                                                    std::path::Path::new(&real_path)
-                                                                        .parent()
-                                                                {
-                                                                    let _ = std::fs::create_dir_all(
-                                                                        parent,
-                                                                    );
-                                                                }
-                                                                match std::fs::File::create(
-                                                                    &real_path,
-                                                                ) {
-                                                                    Ok(_) => {
-                                                                        if bpf_log_n < 40 {
-                                                                            log(&format!(
-                                                                                "6-Z305t-49b: BPF_OBJ_PIN materialized {} (guest path {:?})",
-                                                                                real_path, guest_path
-                                                                            ));
-                                                                        }
-                                                                    }
-                                                                    Err(e) => {
-                                                                        if bpf_log_n < 40 {
-                                                                            log(&format!(
-                                                                                "6-Z305t-49b: BPF_OBJ_PIN FAILED to materialize {}: {}",
-                                                                                real_path, e
-                                                                            ));
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            Some(0)
-                                        }
-                                        _ => Some(0),
-                                    };
-                                    if let Some(new_ret) = bpf_new_ret.take() {
-                                        set_syscall_ret(&mut regs2, &abi, new_ret);
-                                        if let Err(e) = ptrace_setregs(pid, &regs2, len) {
-                                            log(&format!(
-                                                "6-Z305t-49b FAILED: ptrace_setregs for bpf(cmd={}) ({}): {} — child sees {}",
-                                                cmd, syscall_num, e, fresh_ret
-                                            ));
-                                        } else if bpf_log_n < 40 {
-                                            log(&format!(
-                                                "6-Z305t-49b: bpf(cmd={}, nr={}) returned {} (-errno {}) — faked to {}",
-                                                cmd, syscall_num, fresh_ret, -fresh_ret, new_ret
-                                            ));
                                         }
                                     }
                                 }
