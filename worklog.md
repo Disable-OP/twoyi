@@ -27048,3 +27048,10 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. UNMASK 6-Z101 for /dev/socket binds (after (1)): an honest EADDRINUSE beats a masked one — init's error path is well-defined.
   3. (Retained) the 52 fchmodat EXIT catch — still correct once files exist.
 - No commit this round (decode checkpoint). Everything pushed (ae89e67).
+
+## 6-Z305t-55 (implementation plan) — the honest process-group-kill fix: serve REAL member pids from the virtualized cgroup.procs
+
+- Mechanism (from the A11 source + libprocessgroup semantics): init's KillProcessGroup → libprocessgroup killProcessGroup() iterates the pids listed in the service's cgroup `cgroup.procs` file and kill()s each. In the container the cgroup fs is virtualized with EMPTY files → zero kills → "Failed to kill process cgroup … 1 processes remain" → crashed services LINGER holding their bound /dev/socket paths → EADDRINUSE (masked by 6-Z101) → fchmodat ENOENT → crash loops → lmkd critical ×4 → InitFatalReboot (#113/#114).
+- THE FIX (next round, ~100 lines + tests): make the virtualized cgroup.procs files serve the REAL member pids from the tracer's process tree. A11 layout: /sys/fs/cgroup/uid_<uid>/pid_<pid>/cgroup.procs (and the /acct legacy spelling) — the group DIRECTORY NAME encodes the pid; the tracer's tree (tracked_pids + parents) supplies the subtree members. libprocessgroup then performs the kill()s ITSELF — real kills of real same-uid processes; no tracer kill injection; the guest's own code path does the work (the honest virtualization doctrine).
+- AFTER that lands: unmask 6-Z101 for /dev/socket binds (an honest EADDRINUSE is diagnosable; the masked one corrupts init's socket state), keep the 52 fchmodat catch, then re-run the ladder — zygote should survive past its first crash-restart cycle and the HIDL/lmkd classes become the frontier.
+- This closes the 6-Z305t session arc: binder plane ✅, core daemons ✅, apexd ✅, bpfloader ✅, update_verifier ✅, zygote STARTS ✅ — the wall is the service-crash-restart lifecycle (kill/reap/socket-cleanup), which the cgroup.procs fix addresses at its root.
