@@ -26911,3 +26911,18 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. Boot should proceed INTO zygote: expect "starting service 'zygote'" / app_process exec / zygote's own logs. Rung 5 (ZYGOTE) is the target.
   3. Watch for zygote-class blockers: seccomp install, /dev/socket creation, apex LD config (linkerconfig ran: "exec 1 (linkerconfig --target bootstrap)"), UID/cgroup (createProcessGroup failures already seen for vendor.light-default), usap, /system/framework boot classpath (dex2oat / profiles).
   4. health-hal-2-1 + EX_TRANSACTION_FAILED remain on the radar; HIDL fleet (hwservicemanager registration) decode if zygote passes.
+
+## 6-Z305t-49 — #107 decode: 48 VERIFIED (past update_verifier) but bpfloader rebooted ('reboot,bpfloader-failed') → bpf() joins the tracer fake-success family; commit c716690; ladder #108 dispatched
+
+- Ladder #107 (34224829944, 9d4d9e4/48): rung 3, init reboot path — BUT:
+  - 6-Z305t-48 VERIFIED: NO sys.powerctl from update_verifier (zero "Received sys.powerctl" lines from it; no "Error getting bootctrl module" reboot chain).
+  - New death: "Reboot start, reason: reboot,bpfloader-failed" — bpfloader is a reboot_on_failure service (bpfloader.rc); the rootless container's host seccomp rejects bpf() with EPERM.
+  - The HIDL EX_TRANSACTION_FAILED class grew (9→18), health passthrough CHECK ×6, health's system_b ENOTTY ×3 — all BELOW the bpfloader gate, queued.
+- FIX 6-Z305t-49 (c716690): bpf() in the tracer's EXIT fake-success family — ChildAbi.bpf per-ABI (i386=357, x86_64=321, aarch64=280, arm32=386, verified against /usr/include kernel UAPI headers), uniform fake-0 semantics (MAP_CREATE/PROG_LOAD → fd 0, loader only checks fd>=0; pin/attach → 0; bpfloader sets bpf.progs_loaded=1, exits 0), syscall_name label arm, +1 regression test. 792/792 local (fmt/clippy/test).
+- Honest-semantics note: fake bpf = "no real BPF programs can run" — the container's networking is host-bridged; BPF enforcement is impossible rootless. Same doctrine as the SELinux fake-success.
+- CI: ladder #108 dispatched on c716690.
+- Decision tree for #108:
+  1. bpfloader must exit 0 ("intercepted bpf() nr=280 at EXIT → faking return 0" trace lines; "bpf.progs_loaded" set).
+  2. Boot frontier: zygote/app_process (rung 5 target). Watch: seccomp install by zygote, /dev/socket creation, SELinux context restore, classpath dex opt, UID forks.
+  3. RISKS: netd starts AFTER bpfloader and checks pinned maps in /sys/fs/bpf — none exist (fake pin created nothing). If netd hard-fails on missing maps it becomes the next blocker (netd is critical → InitFatalReboot); decode then: either netd tolerates missing maps (A11 netd checks bpf.progs_loaded property + map paths, skips gracefully) or we need fake pin-file creation.
+  4. health-hal-2-1 passthrough + HIDL EX_TRANSACTION_FAILED classes remain queued.
