@@ -26926,3 +26926,21 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. Boot frontier: zygote/app_process (rung 5 target). Watch: seccomp install by zygote, /dev/socket creation, SELinux context restore, classpath dex opt, UID forks.
   3. RISKS: netd starts AFTER bpfloader and checks pinned maps in /sys/fs/bpf — none exist (fake pin created nothing). If netd hard-fails on missing maps it becomes the next blocker (netd is critical → InitFatalReboot); decode then: either netd tolerates missing maps (A11 netd checks bpf.progs_loaded property + map paths, skips gracefully) or we need fake pin-file creation.
   4. health-hal-2-1 passthrough + HIDL EX_TRANSACTION_FAILED classes remain queued.
+
+## 6-Z305t-49b — #108 decode: uniform bpf fake-0 tripped the loader's explicit fd==0 rejection → dedicated per-command bpf arm; commit 60f8ef6; ladder #109 dispatched
+
+- Ladder #108 (34226614249, c716690/49): STILL "reboot,bpfloader-failed" — but the fake FIRED: "bpf_create_map name clat_ingress_map/cookie_tag_map, ret: 0" then "Failed to create maps: (ret=-22) in netd.o".
+- Decode against the A11 source (system/bpf/libbpf_android/Loader.cpp fetched from android.googlesource.com):
+  - createMaps/loadProg BOTH contain `if (fd < 0) return fd; if (fd == 0) return -EINVAL;` — uniform fake-0 = fd 0 = EXPLICITLY REJECTED (-22) at the very first map.
+  - Additionally, after create the loader pins (BPF_OBJ_PIN → /sys/fs/bpf/map_<file>_<name>) then chown+chmod THAT PATH — chmod runs FOR REAL in system mode (6-Z305t-5), so the pin file must exist in the rootfs.
+- FIX 6-Z305t-49b (60f8ef6): dedicated bpf EXIT arm (6-Z99 netlink machinery pattern):
+  - MAP_CREATE/PROG_LOAD/OBJ_GET → synthetic fd (BPF_FAKE_FD_BASE 0x6b02_0000, per-pid counter, disjoint from netlink range).
+  - OBJ_PIN → materialize an empty file at the translated pin path (the /sys/** translate rule lands it under {rootfs}/sys/fs/bpf) + fake 0 — the loader's access()-reuse, chown (fchownat fake) and chmod (real, rootfs-owned) then behave exactly like on a real device.
+  - LOOKUP/GET_NEXT_KEY/DELETE → -ENOENT (honest empty-map semantics).
+  - Everything else → 0. Replaces only failures/zero (real success untouched). Gated !boot_recovery. bpf REMOVED from the uniform family (its register write would otherwise be stomped by the family's Some(0)).
+  - Test updated (family must NOT match bpf; label arm kept). 792/792 local.
+- CI: ladder #109 dispatched on 60f8ef6.
+- Decision tree for #109:
+  1. bpfloader must exit 0: expect "6-Z305t-49b: bpf(cmd=0/5...) faked to 0x6b02xxxx" + "BPF_OBJ_PIN materialized {rootfs}/sys/fs/bpf/map_..." lines, then "bpf.progs_loaded" property set.
+  2. Boot frontier: ZYGOTE (rung 5). app_process exec, seccomp install, /dev/socket creation, boot classpath.
+  3. RISKS: netd now reads the pinned "maps" — LOOKUPs return -ENOENT; if netd treats that as fatal (it is critical-class) the next fix is honest map-shape emulation. Also health-hal-2-1 passthrough dlopen + HIDL EX_TRANSACTION_FAILED remain queued.
