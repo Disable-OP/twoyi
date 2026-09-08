@@ -872,11 +872,36 @@ pub const INTERFACE_TRANSACTION: u32 = u32::from_be_bytes(*b"_NTF");
 /// declaration order, FIRST_CALL_TRANSACTION = 1): get = 1, add = 2.
 pub const HIDL_SM_GET: u32 = 1;
 pub const HIDL_SM_ADD: u32 = 2;
-/// 6-Z276: `android.hidl.manager.V1_0.IServiceManager` method codes
-/// (hidl-generated order: get, add, getTransport,
-/// registerForNotifications, unregisterForNotifications, …).
-pub const HIDL_SM_REGISTER_FOR_NOTIFICATIONS: u32 = 4;
-pub const HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS: u32 = 5;
+/// 6-Z305t-66: `getTransport(string fqName, string name) generates
+/// (Transport transport)` — code 3, EVERY HAL's first service lookup
+/// (getRawServiceInternal, transport/ServiceManagement.cpp:779). The
+/// pre-6-Z305t-66 map had NO arm for it → the catch-all BR_FAILED_REPLY →
+/// libhwbinder surfaced Status(EX_TRANSACTION_FAILED) at every getService
+/// site (139 logs / 956 aborts, ladder #122 — the HIDL fleet killer).
+pub const HIDL_SM_GET_TRANSPORT: u32 = 3;
+/// 6-Z276/6-Z305t-66: `registerForNotifications` — code 6. The old map
+/// guessed 4, which is `list`'s code (the arm never fired on the real
+/// wire; nothing on the A11 boot path calls list()).
+pub const HIDL_SM_REGISTER_FOR_NOTIFICATIONS: u32 = 6;
+/// manager@1.1 `unregisterForNotifications` — code 9 (1.0's 8 methods
+/// precede it; the old map guessed 5 = `listByInterface`'s code).
+pub const HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS: u32 = 9;
+/// manager@1.2 `addWithChain(string name, interface service,
+/// vec<string> chain)` — code 12, THE registration call the A11 GSI's
+/// HALs make (registerAsServiceInternal, ServiceManagement.cpp:884:
+/// `service->interfaceChain → sm->addWithChain(name, service, chain)` via
+/// defaultServiceManager1_2). The chain carries the fqNames the 1.0 add()
+/// wire lacks, so the registry keys "fq/instance" like hwservicemanager.
+pub const HIDL_SM_ADD_WITH_CHAIN: u32 = 12;
+/// `android.hidl.manager@1.0::IServiceManager.Transport` — `enum Transport
+/// : uint8_t` (IServiceManager.hal android-11.0.0_r1:76-80) marshals as
+/// ONE byte (hwbinder::Parcel::writeUint8 = write(&val, 1), no padding).
+pub const HIDL_TRANSPORT_EMPTY: u8 = 0;
+pub const HIDL_TRANSPORT_HWBINDER: u8 = 1;
+/// PASSTHROUGH is answered by the passthrough dlopen path, never by this
+/// registry (a HIDL passthrough HAL never appears as a wire service).
+#[allow(dead_code)]
+pub const HIDL_TRANSPORT_PASSTHROUGH: u8 = 2;
 
 // ============================================================================
 // Flat-binder-object type constants (kernel `B_PACK_CHARS(c1,c2,c3,0x85)`).
@@ -1304,6 +1329,15 @@ impl ParcelWriter {
     #[allow(dead_code)]
     fn write_u32(&mut self, v: u32) {
         self.data.extend_from_slice(&v.to_ne_bytes());
+    }
+
+    /// HIDL sub-int base types marshal at their RAW width — NO alignment
+    /// padding (hwbinder::Parcel::writeUint8 = write(&val, 1); the client's
+    /// readUint8/readBool/readEnum-as-uint8 read 1 byte at the current
+    /// position). Used for the getTransport Transport byte and the HIDL
+    /// bool replies (writeBool = writeInt8, 1 byte — vs AIDL's i32 bool).
+    fn write_u8(&mut self, v: u8) {
+        self.data.push(v);
     }
 
     /// 6-Z276: write a HIDL `hidl_string` (libhwbinder `writeHidlString`):
@@ -3982,15 +4016,32 @@ fn servicemanager_proxy(
 /// HIDL `android.hidl.manager.V1_0.IServiceManager` transactions (libhwbinder
 /// parcels — no SYST header tag, hidl_string args).
 ///
-/// Only the subset the guest actually uses is implemented:
+/// The A11 boot-path subset is implemented, codes per the authoritative
+/// android-11.0.0_r1 IServiceManager.hal (1.0: get=1, add=2, getTransport=3,
+/// list=4, listByInterface=5, registerForNotifications=6, debugDump=7,
+/// registerPassthroughClient=8; 1.1 appends unregisterForNotifications=9;
+/// 1.2 appends registerClientCallback=10, unregisterClientCallback=11,
+/// addWithChain=12, listManifestByInterface=13, tryUnregister=14 — the
+/// pre-6-Z305t-66 map guessed register=4/unregister=5 and had NO
+/// getTransport, which failed the whole HIDL fleet):
 /// * `get` (code 1): `get(fqName, name)` — registry lookup of
 ///   `"fqName/name"`; hit → flat handle, miss → null binder (HIDL reads the
 ///   object at offsets[0], so the AIDL status prefix is skipped naturally).
-/// * `add` (code 2): register a HIDL service name with the caller as owner
-///   (no HIDL HAL processes exist in the recovery guest today, but the
-///   path keeps hwservicemanager-shaped traffic coherent).
-/// * everything else → `BR_FAILED_REPLY` (unchanged from the pre-bus
-///   behaviour, minus the header mangling).
+/// * `add` (code 2): the 1.0 registration shape — register the HIDL service
+///   name with the caller as owner (kept for older guests; the A11 GSI
+///   registers via addWithChain below).
+/// * `getTransport` (code 3): honest registry answer — HWBINDER(1) iff the
+///   `"fq/instance"` key is registered (guest addWithChain/add or an
+///   in-proxy virtual service), EMPTY(0) otherwise, as a single u8 after
+///   the status. A miss flows into getRawServiceInternal's clean nullptr
+///   path instead of the EX_TRANSACTION_FAILED abort storm.
+/// * `registerForNotifications` (code 6) / `unregisterForNotifications`
+///   (code 9): watcher registry + onRegistration callbacks.
+/// * `addWithChain` (code 12): THE A11 registration — registers under
+///   `"chain[0]/name"` and fires the onRegistration callbacks.
+/// * everything else → `BR_FAILED_REPLY` (honest — list/listByInterface/
+///   debugDump/registerPassthroughClient/… are not exercised by the boot
+///   path yet; they decode from the next ladder if they surface).
 fn servicemanager_hidl(
     code: u32,
     parcel: &[u8],
@@ -4052,6 +4103,56 @@ fn servicemanager_hidl(
                     info!("[KR64][binder][svc] HIDL get({}) miss → null binder", key);
                 }
             }
+        }
+        // A11 `android.hidl.manager@1.0::IServiceManager.getTransport` —
+        // EVERY HAL's first service lookup (getRawServiceInternal,
+        // transport/ServiceManagement.cpp:779: `sm->getTransport(descriptor,
+        // instance)`). The pre-6-Z305t-66 proxy had NO arm for it → the
+        // catch-all BR_FAILED_REPLY → libhwbinder surfaced
+        // Status(EX_TRANSACTION_FAILED) → 139 getService sites aborted
+        // (956 "Attempted to retrieve value from failed HIDL call" events,
+        // ladder #122) — the HIDL fleet killer.
+        //
+        // Wire (IServiceManager.hal android-11.0.0_r1:90): request
+        // `[hdr][hidl_string fqName][hidl_string name]`; reply
+        // `[status ok][u8 transport]` — `enum Transport : uint8_t`
+        // (EMPTY=0, HWBINDER=1, PASSTHROUGH=2) marshals as ONE byte
+        // (hwbinder::Parcel::writeUint8 = write(&val,1), no padding).
+        //
+        // Honest registry answer: HWBINDER iff the fq/instance key is in
+        // the bus registry (a guest HAL registered it via addWithChain /
+        // add, or it is an in-proxy virtual service), EMPTY otherwise —
+        // the same statuses the real hwservicemanager returns for
+        // unknown/unregistered services. A miss flows into
+        // getRawServiceInternal's clean nullptr path ("service not
+        // available") instead of the abort storm; under VINTF enforcement
+        // a registering HAL's pre-check (ServiceManagement.cpp:874) then
+        // fails CLEANLY for unmanifested services — the VINTF-manifest
+        // virtualization is the next rock, not this round.
+        HIDL_SM_GET_TRANSPORT => {
+            let fq = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let name = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let key = format!("{}/{}", fq, name);
+            let hit = {
+                let b = bus.lock().expect("binder bus poisoned");
+                b.services.contains_key(&key)
+            };
+            writer.write_u8(if hit {
+                HIDL_TRANSPORT_HWBINDER
+            } else {
+                HIDL_TRANSPORT_EMPTY
+            });
+            info!(
+                "[KR64][binder][svc] HIDL getTransport({}) → {}",
+                key,
+                if hit { "HWBINDER" } else { "EMPTY" }
+            );
         }
         HIDL_SM_ADD => {
             let name = match reader.read_hidl_string() {
@@ -4122,8 +4223,9 @@ fn servicemanager_hidl(
             } else {
                 false
             };
-            // Reply: bool registered = true (the registration itself took).
-            writer.write_i32(1);
+            // Reply: bool registered = true (the registration itself took;
+            // HIDL bool = 1 byte, hwbinder::Parcel::writeBool = writeInt8).
+            writer.write_u8(1);
             info!(
                 "[KR64][binder][svc] 6-Z276: HIDL registerForNotifications({}) conn={} — {}",
                 key,
@@ -4154,8 +4256,64 @@ fn servicemanager_hidl(
                     key, conn_id
                 );
             }
-            // Reply: bool success = true.
-            writer.write_i32(1);
+            // Reply: bool success = true (HIDL bool = 1 byte).
+            writer.write_u8(1);
+        }
+        // A11 `android.hidl.manager@1.2::IServiceManager.addWithChain` —
+        // THE registration call the A11 GSI's HALs make
+        // (registerAsServiceInternal, ServiceManagement.cpp:884:
+        // `service->interfaceChain → sm->addWithChain(name, service, chain)`
+        // via defaultServiceManager1_2). The chain carries the fqNames the
+        // 1.0 add() wire lacks, so the registry keys "fq/instance" exactly
+        // like hwservicemanager (and like ensure_virtual_services already
+        // does on the AIDL side).
+        //
+        // Wire (manager@1.2 IServiceManager.hal:69 — parameter order):
+        // request `[hdr][hidl_string name][flat service][i32 chain len]
+        // [hidl_string × len]` (name BEFORE the interface object);
+        // reply `[status ok][u8 1]` (HIDL bool = 1 byte).
+        HIDL_SM_ADD_WITH_CHAIN => {
+            let name = match reader.read_hidl_string() {
+                Some(s) => s,
+                None => return TransactionResult::Failed,
+            };
+            let flat = reader.read_flat_binder();
+            let (ptr, cookie) = match &flat {
+                Some(f) => (f.binder, f.cookie),
+                None => (0, 0),
+            };
+            // hidl_vec wire: [i32 count][elements…].
+            let count = match reader.read_i32() {
+                Some(c) if c > 0 && c <= 128 => c as usize,
+                _ => return TransactionResult::Failed,
+            };
+            let mut chain = Vec::with_capacity(count);
+            for _ in 0..count {
+                match reader.read_hidl_string() {
+                    Some(s) => chain.push(s),
+                    None => return TransactionResult::Failed,
+                }
+            }
+            // Register under the CONCRETE interface (chain[0]) — every boot
+            // lookup names it. hwservicemanager also indexes the parent
+            // interfaces, but the fleet's lookups always name the concrete
+            // fq, so a single key keeps the handle space 1:1 with services.
+            let fq = chain[0].clone();
+            let key = format!("{}/{}", fq, name);
+            let handle = {
+                let mut b = bus.lock().expect("binder bus poisoned");
+                let h = b.add_guest_service(&key, conn_id, ptr, cookie);
+                // 6-Z276: fire the HIDL IServiceNotification.onRegistration
+                // callbacks for the newly registered key (the same helper
+                // the 1.0 add arm uses).
+                b.fire_registration_callbacks(&key, h, false);
+                h
+            };
+            writer.write_u8(1); // bool success = true
+            info!(
+                "[KR64][binder][svc] HIDL addWithChain({}) → handle 0x{:08x} (conn={}, chain={:?})",
+                key, handle, conn_id, chain
+            );
         }
         _ => {
             return TransactionResult::Failed;
@@ -7917,5 +8075,129 @@ mod tests {
             "pure guest services die with their owner"
         );
         assert!(!b.by_handle.contains_key(&svc_handle));
+    }
+
+    /// 6-Z305t-66: the armed HIDL servicemanager codes against the
+    /// authoritative android-11.0.0_r1 IServiceManager.hal method order
+    /// (1.0: get, add, getTransport, list, listByInterface,
+    /// registerForNotifications, debugDump, registerPassthroughClient;
+    /// 1.1 appends unregisterForNotifications; 1.2 appends
+    /// registerClientCallback, unregisterClientCallback, addWithChain,
+    /// listManifestByInterface, tryUnregister). The pre-6-Z305t-66 map had
+    /// register/unregister on 4/5 (list/listByInterface's codes) and NO
+    /// getTransport — the 956 EX_TRANSACTION_FAILED fleet killer.
+    #[test]
+    fn hidl_sm_codes_match_a11_iservice_manager_hal() {
+        assert_eq!(HIDL_SM_GET, 1);
+        assert_eq!(HIDL_SM_ADD, 2);
+        assert_eq!(HIDL_SM_GET_TRANSPORT, 3);
+        assert_eq!(HIDL_SM_REGISTER_FOR_NOTIFICATIONS, 6);
+        assert_eq!(HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS, 9);
+        assert_eq!(HIDL_SM_ADD_WITH_CHAIN, 12);
+        assert_eq!(HIDL_TRANSPORT_EMPTY, 0);
+        assert_eq!(HIDL_TRANSPORT_HWBINDER, 1);
+    }
+
+    /// Build a HIDL servicemanager request parcel:
+    /// `[strict][work][string16 descriptor][args…]` (libhwbinder writes NO
+    /// SYST/VNDR header tag — the discriminator peeks word 2).
+    fn hidl_sm_request(descriptor: &str, args: &dyn Fn(&mut ParcelWriter)) -> Vec<u8> {
+        let mut w = ParcelWriter::new();
+        w.write_i32(0); // strict-mode policy
+        w.write_i32(-1); // work source (kUnsetWorkSource)
+        w.write_string16(descriptor);
+        args(&mut w);
+        let (data, _) = w.into_parts();
+        data
+    }
+
+    /// getTransport for an UNREGISTERED service must answer the honest
+    /// EMPTY(0) as a single u8 after the status — NOT the pre-6-Z305t-66
+    /// BR_FAILED_REPLY that surfaced as Status(EX_TRANSACTION_FAILED).
+    #[test]
+    fn hidl_get_transport_unregistered_replies_empty_u8() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|w| {
+            w.write_hidl_string("android.hardware.foo@1.0::IFoo");
+            w.write_hidl_string("default");
+        });
+        match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { data, offsets } => {
+                assert!(offsets.is_empty(), "no binder objects in the reply");
+                // [status ok][u8 EMPTY] — 5 bytes exactly.
+                assert_eq!(data, vec![0, 0, 0, 0, 0]);
+            }
+            _ => panic!("getTransport must Reply, not Fail/CompleteOnly"),
+        }
+    }
+
+    /// getTransport for a REGISTERED service answers HWBINDER(1) — the
+    /// same status the real hwservicemanager returns for a binderized
+    /// registration; the client then proceeds to get() (code 1).
+    #[test]
+    fn hidl_get_transport_registered_replies_hwbinder_u8() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        bus.lock().expect("bus").add_guest_service(
+            "android.hardware.foo@1.0::IFoo/default",
+            PROXY_CONN_ID,
+            0xdead,
+            0xbeef,
+        );
+        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|w| {
+            w.write_hidl_string("android.hardware.foo@1.0::IFoo");
+            w.write_hidl_string("default");
+        });
+        match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { data, offsets } => {
+                assert!(offsets.is_empty());
+                // [status ok][u8 HWBINDER].
+                assert_eq!(data, vec![0, 0, 0, 0, 1]);
+            }
+            _ => panic!("getTransport must Reply, not Fail/CompleteOnly"),
+        }
+    }
+
+    /// The A11 registration call (addWithChain, code 12): name FIRST, then
+    /// the flat service object, then the chain vec — and the registry key
+    /// becomes "chain[0]/name" so a follow-up getTransport hits.
+    #[test]
+    fn hidl_add_with_chain_registers_fq_instance_key() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let req = hidl_sm_request("android.hidl.manager@1.2::IServiceManager", &|w| {
+            w.write_hidl_string("default"); // name (BEFORE the interface)
+            w.write_flat_binder(&FlatBinderObject {
+                r#type: BINDER_TYPE_HANDLE,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0x1234,
+                cookie: 0x5678,
+            });
+            w.write_i32(2); // chain count
+            w.write_hidl_string("android.hardware.foo@1.2::IFoo"); // concrete
+            w.write_hidl_string("android.hidl.base@1.0::IBase"); // parent
+        });
+        match servicemanager_hidl(HIDL_SM_ADD_WITH_CHAIN, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { data, offsets } => {
+                assert!(offsets.is_empty());
+                // [status ok][u8 true] — HIDL bool is 1 byte.
+                assert_eq!(data, vec![0, 0, 0, 0, 1]);
+            }
+            _ => panic!("addWithChain must Reply, not Fail/CompleteOnly"),
+        }
+        // The registry key is fq/instance — the key every lookup uses.
+        assert!(bus
+            .lock()
+            .expect("bus")
+            .services
+            .contains_key("android.hardware.foo@1.2::IFoo/default"));
+
+        // …and a follow-up getTransport now answers HWBINDER end-to-end.
+        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|w| {
+            w.write_hidl_string("android.hardware.foo@1.2::IFoo");
+            w.write_hidl_string("default");
+        });
+        match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { data, .. } => assert_eq!(data, vec![0, 0, 0, 0, 1]),
+            _ => panic!("getTransport must Reply"),
+        }
     }
 }
