@@ -3379,6 +3379,39 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
                 iov[0].iov_len = sizeof(fdtest) - 1;
                 long wrv = syscall(SYS_writev, sockfd,
                                    (long)(struct iovec *)iov, 1);
+                /* 6-Z305t-37: the fd's ACTUAL identity at the write
+                 * moment, stated BY THE PROCESS ITSELF (no tracer
+                 * interpretation of register dumps between stops).
+                 * Ladder #94 proved: the tracer-side opens resolve to
+                 * the artifact inode (fd-target stat), dup3 returns 3,
+                 * writev returns 37 — yet the bytes never reach the
+                 * file. Two unknowns remain: WHICH file the dup'd fd
+                 * points at when the writes execute (raw fstat:
+                 * asm-generic struct stat — st_dev@0, st_ino@8,
+                 * st_size@48), and WHAT mode the open actually
+                 * carried (F_GETFL — #94's win-dump showed a kmsg
+                 * open with flags=0 O_RDONLY where the shim asked
+                 * O_WRONLY|O_APPEND). Both answers ride fd 2 → the
+                 * svclog capture. */
+                {
+                    unsigned long stbuf[16];
+                    __builtin_memset(stbuf, 0, sizeof(stbuf));
+                    long fr = -1;
+                    int fl = -1;
+#ifdef SYS_fstat
+                    fr = syscall(SYS_fstat, sockfd, stbuf);
+#endif
+#ifdef SYS_fcntl
+                    fl = (int)syscall(SYS_fcntl, sockfd, 3 /*F_GETFL*/);
+#endif
+                    char msg[192];
+                    snprintf(msg, sizeof(msg),
+                             "[twoyi_loader] logdw fd target: fstat=%ld "
+                             "dev=%lu ino=%lu size=%lu flags=0x%x\n",
+                             fr, stbuf[0], stbuf[1], stbuf[6],
+                             (unsigned)fl);
+                    write_str(2, msg);
+                }
                 {
                     char msg[160];
                     snprintf(msg, sizeof(msg),

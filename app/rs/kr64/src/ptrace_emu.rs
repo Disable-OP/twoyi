@@ -20345,7 +20345,7 @@ pub fn run_ptrace_loop(
                                 // is cleared at the matching open EXIT.
                                 if is_kmsg_path(&path) || is_kmsg_path(&translated) {
                                     pending_kmsg_open_pid = Some(pid); // 6-Z83: per-pid
-                                                                       // ── 6-Z305t-36: klog node open-path
+                                                                       // ── 6-Z305t-36/37: klog node open-path
                                                                        // FORENSICS (ENTRY side) ──
                                                                        //
                                                                        // Ladder #93: the shlib's logdw→kmsg fd
@@ -20353,33 +20353,47 @@ pub fn run_ptrace_loop(
                                                                        // writev=37 — the writes EXECUTE) yet the
                                                                        // marker bytes never appear in the captured
                                                                        // {data}/rootfs/dev/__kmsg__ (whole-file
-                                                                       // grep). Leading hypothesis: the node this
-                                                                       // open resolves to is NOT the node the
-                                                                       // artifact later reads (per-VM-generation
-                                                                       // staging remove+recreate, the 6-Z154
-                                                                       // mknod-stub File::create truncation, or a
-                                                                       // profiles-layer indirection). Instrument:
-                                                                       // pre-open stat of the TRANSLATED path —
-                                                                       // st_dev/st_ino/size at open time. The
-                                                                       // EXIT-side block pairs this with the fd's
-                                                                       // ACTUAL (post-open) dev/ino; the CI
-                                                                       // klog-forensics capture stats both
-                                                                       // candidate files so the three-way join
-                                                                       // (open-time ino vs fd ino vs artifact
-                                                                       // ino) settles file identity with data.
-                                                                       // Budget 20/boot — 11 known openers + head
-                                                                       //room, then silence.
+                                                                       // grep). Instrument: pre-open stat of the
+                                                                       // TRANSLATED path — st_dev/st_ino/size at
+                                                                       // open time — plus the RAW open flags (x2
+                                                                       // at ENTRY: #94's win-dump showed a kmsg
+                                                                       // open executing with flags=0 O_RDONLY
+                                                                       // where the shim asked O_WRONLY|O_APPEND,
+                                                                       // and the O_RDONLY identity was never
+                                                                       // settled). The EXIT-side block pairs this
+                                                                       // with the fd's ACTUAL (post-open) dev/
+                                                                       // ino; the CI klog-forensics capture stats
+                                                                       // both candidate files so the three-way
+                                                                       // join (open-time ino vs fd ino vs
+                                                                       // artifact ino) settles file identity with
+                                                                       // data.
+                                                                       // Budget 200/boot — #94's 20-cap ran out at
+                                                                       // +2.4 s and blinded the WHOLE fd-test
+                                                                       // fleet (+20 s..+130 s); 200 covers the
+                                                                       // full boot's klog opens at ~2 lines each.
                                     {
                                         use std::os::unix::fs::MetadataExt;
+                                        // Raw flags from the live registers
+                                        // (open → arg2, openat → arg3;
+                                        // openat2's arg3 is a pointer — print
+                                        // 0 for it rather than deref).
+                                        let raw_flags = if syscall_num == abi.open {
+                                            get_syscall_arg(&regs, abi.reg_arg2) as u32
+                                        } else if syscall_num == abi.openat {
+                                            get_syscall_arg(&regs, abi.reg_arg3) as u32
+                                        } else {
+                                            0
+                                        };
                                         kmsg_open_diag_entry_count =
                                             kmsg_open_diag_entry_count.saturating_add(1);
-                                        if kmsg_open_diag_entry_count <= 20 {
+                                        if kmsg_open_diag_entry_count <= 200 {
                                             let stat_note = match std::fs::metadata(&translated) {
                                                 Ok(md) => format!(
-                                                    "pre-open dev={} ino={} size={}",
+                                                    "pre-open dev={} ino={} size={} flags=0x{:x}",
                                                     md.dev(),
                                                     md.ino(),
-                                                    md.len()
+                                                    md.len(),
+                                                    raw_flags
                                                 ),
                                                 Err(e) => format!("pre-open stat FAILED {}", e),
                                             };
@@ -23323,7 +23337,9 @@ pub fn run_ptrace_loop(
                     // stash (present for BOTH outcomes). The three-way join
                     // (ENTRY pre-open ino / EXIT fd ino / CI klog-forensics
                     // artifact-file ino) settles whether the fd-test bytes
-                    // landed in a file the artifact never reads. Budget 20.
+                    // landed in a file the artifact never reads. Budget
+                    // 200 (matches the ENTRY side — #94's 20-cap ran out at
+                    // +2.4 s and blinded the fd-test fleet).
                     if syscall_num == abi.open
                         || syscall_num == abi.openat
                         || syscall_num == abi.openat2
@@ -23340,7 +23356,7 @@ pub fn run_ptrace_loop(
                         if is_kmsg_path(&orig) || is_kmsg_path(&p) {
                             use std::os::unix::fs::MetadataExt;
                             kmsg_open_diag_exit_count = kmsg_open_diag_exit_count.saturating_add(1);
-                            if kmsg_open_diag_exit_count <= 20 {
+                            if kmsg_open_diag_exit_count <= 200 {
                                 let fd_note = if ret >= 0 {
                                     match std::fs::metadata(format!("/proc/{}/fd/{}", pid, ret)) {
                                         Ok(md) => format!(

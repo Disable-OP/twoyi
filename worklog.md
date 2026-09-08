@@ -26658,3 +26658,29 @@ CI: ladder #94 dispatch follows. Expected readings (any of which closes the #93 
 With the file identity settled, the service liblog stream lands in the captured klog and hwservicemanager's exit(1) + zygote's exit(1) decode from real log lines (the rung-4→6 frontier stays as of 6-Z305t-35).
 
 Honest unverified: no local ARM64 runtime; every hypothesis above is instrument-first and the artifact decides.
+
+## 6-Z305t-37 — #94 decode: the instrument delivered — profiles RULED OUT, one generation, file identity PROVEN (ino 6296225 end-to-end), dup3 PROVEN (ret=3), writev PROVEN (ret=37 + real liblog lines ret=20/76/125) — and the service bytes are STILL absent from the file: the contradiction is now between "fd targets the artifact inode at open time" and "the file never receives the bytes"; the write-moment fd identity is the last unknown and 6-Z305t-37 instruments it from INSIDE the process
+
+#94 (3d79459 → run 34174502434, rung 3 PROPERTY_SERVICE, frontier unchanged) decode — the 6-Z305t-36 forensics lines landed in kr64.log (52 MB, 336k lines — the REAL log source; the 12k-line docker-exec tails only cover the last ~12 s of boot and miss everything):
+- PROFILES INDIRECTION RULED OUT: no profiles-default rootfs tree exists (klog-forensics.txt: "MISSING (profiles indirection ruled out)"); the top-level {data}/rootfs/dev/__kmsg__ IS the node: dev=2049 ino=6296225 size=188870 at pull.
+- ONE kr64 generation ("ptrace loop started" ×1 at +543 ms): the per-VM-generation replacement hypothesis is DEAD for this run. The mknod stub created the node ONCE at +554 ms (real mknod -17 EEXIST → stub File::create → size 0, matching the first ENTRY pre-open stat); ZERO kmsg-shaped unlinks (the guest klog_init unlink dance never touched it).
+- FILE IDENTITY PROVEN: every traced kmsg open — init (pid 2662, orig /dev/kmsg) AND services (2687/2688/2694/2695, incl. the shim's orig /dev/__kmsg__ form) — resolved pre-open AND fd-target to the SAME dev=2049 ino=6296225, with the size growing monotonically (0 → 27063 by +2.4 s → 188870 at pull). The artifact file, the tracer's opens, and the CI stat are ONE file.
+- WRITES PROVEN DELIVERED: win-E/X pairs for pid 2688: openat → ret=4, dup3(0x4,0x3,0x0) → ret=3, writev(fd=3) → ret=37 (the fd test), then REAL liblog log lines writev(fd=3) → ret=20/76/125 — all through fd 3 = the dup3'd description of the fd my instrument proved targets ino=6296225.
+- YET: fdtest-markers=0, zero twoyi_loader strings, and ZERO liblog binary records in the 188870-byte artifact — it is 100% init/ueventd/logd TEXT. The service bytes (fd tests AND real log lines) never reached the file despite every observable above.
+- BUDGET LESSON: the 6-Z305t-36 cap (20) exhausted at +2.4 s — the ENTIRE fd-test fleet (+20 s..+130 s crash-loops) had its opens UNLOGGED. The only kmsg open the win-dump caught near a fd test (+1279 ms, pid 2688) executed with flags=0x0 (O_RDONLY!) from the shim's stack path and returned fd 4 — while the shim asks O_WRONLY|O_APPEND (0x401) — and the shim's own 0x401 openat appears NOWHERE in the dump window. Either the flags argument was rewritten in flight, or that O_RDONLY open is a different caller (logd's klog reader opens /dev/kmsg O_RDONLY — but this path read /dev/__kmsg__), and the O_RDONLY fd 4 would make the writev(3) EBADF — which ret=37 contradicts. The register-dump interpretation chain has hit its resolution limit.
+
+6-Z305t-37 instrument (this commit) — the write-moment fd identity, stated BY THE PROCESS ITSELF:
+1. shlib: right after the fd tests, raw SYS_fstat(sockfd) + SYS_fcntl(sockfd, F_GETFL) (both #ifdef-guarded — arm32 has no SYS_fstat) → "[twoyi_loader] logdw fd target: fstat=%ld dev=%lu ino=%lu size=%lu flags=0x%x" on fd 2 → svclogs. ino=6296225 at write time ⇒ the writes DID target the artifact file and the mystery moves to the kernel/fs layer; any OTHER ino/dev ⇒ the dup'd fd points somewhere else at write time and the open-path chain is lying somewhere the tracer cannot see. flags=0x401 ⇒ the shim's open executed as asked; flags=0x0 ⇒ the tracer (or something) rewrote the flags register in flight — a NEW tracer bug class, immediately actionable.
+2. kr64: the kmsg open ENTRY line now carries the RAW flags (x2 live-register read, not the rom-path stale value) and both ENTRY+EXIT budgets are 20 → 200 — the full boot's klog-open map, no blind window.
+
+Commits: (this commit) `diag(shlib): 6-Z305t-37 — write-moment fd identity probe …`.
+
+Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 783 passed / 0 failed. C brace balance delta unchanged vs HEAD.
+
+CI: ladder #95 dispatch follows. Decision tree:
+- fd-target fstat ino == 6296225 ∧ flags=0x401 ⇒ kernel-level vanishing (next: strace-grade per-write verification — the tracer stats /proc/<pid>/fd/<fd> at write EXIT for tracked kmsg fds).
+- fd-target fstat ino ≠ 6296225 ⇒ the dup3'd description ≠ the opened fd (the dup3 chain is being intercepted/redirected between stops) — walk the full-boot open map (budget 200) to find the interloper.
+- flags=0x0 ⇒ a register-rewrite bug in the tracer's open ENTRY handling for the shim's opens — likely the same class that makes the shim's own 0x401 open invisible in the win-dump.
+The honest frontier remains rung 3: hwservicemanager exit(1) ×4 → InitFatalReboot; the liblog visibility decode is the prerequisite for the zygote/hwservicemanager exit(1) lines.
+
+Honest unverified: no local ARM64 runtime; every reading above is artifact-backed, every hypothesis awaits ladder #95.
