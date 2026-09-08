@@ -27055,3 +27055,19 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 - THE FIX (next round, ~100 lines + tests): make the virtualized cgroup.procs files serve the REAL member pids from the tracer's process tree. A11 layout: /sys/fs/cgroup/uid_<uid>/pid_<pid>/cgroup.procs (and the /acct legacy spelling) — the group DIRECTORY NAME encodes the pid; the tracer's tree (tracked_pids + parents) supplies the subtree members. libprocessgroup then performs the kill()s ITSELF — real kills of real same-uid processes; no tracer kill injection; the guest's own code path does the work (the honest virtualization doctrine).
 - AFTER that lands: unmask 6-Z101 for /dev/socket binds (an honest EADDRINUSE is diagnosable; the masked one corrupts init's socket state), keep the 52 fchmodat catch, then re-run the ladder — zygote should survive past its first crash-restart cycle and the HIDL/lmkd classes become the frontier.
 - This closes the 6-Z305t session arc: binder plane ✅, core daemons ✅, apexd ✅, bpfloader ✅, update_verifier ✅, zygote STARTS ✅ — the wall is the service-crash-restart lifecycle (kill/reap/socket-cleanup), which the cgroup.procs fix addresses at its root.
+
+## 6-Z305t-56 — the honest process-group-kill fix IMPLEMENTED: virtual cgroup.procs serves real member pids; commit 800f18b; ladder #115 dispatched
+
+- Implemented the 55 plan: an open-ENTRY materialization arm (EXIT-section top's sibling, the 6-Z305j/sysctl position) — when a translated open targets a cgroup.procs/cgroup.threads file under /acct/ or /sys/fs/cgroup/ with a pid_<N> segment:
+  - the group root (N) + every tracked pid whose /proc PPid chain reaches it (BFS over the tracked set, refreshed per open) are written into the backing file (one pid per line, 0444, dirs auto-created);
+  - libprocessgroup's killProcessGroup() then reads REAL pids and performs the kill()s ITSELF — real kills of real same-uid processes via the guest's own code path (no tracer kill injection — the honest virtualization doctrine);
+  - self-sufficient: create_dir_all covers the createProcessGroup failures ("Failed to make and chown /acct/uid_9999");
+  - recovery gated off (corpus rule); logs capped (24 materialize + 24 error lines).
+- /acct/** reaches the arm via translate_guest's catch-all (everything else → the rootfs) — verified in vfs.rs.
+- Local gates: cargo build/fmt/clippy clean, 792/792.
+- CI: ladder #115 dispatched on 800f18b.
+- Decision tree for #115:
+  1. "6-Z305t-56: cgroup.procs materialized ... with N real member pids" lines at kill time; "Failed to kill process cgroup" GONE (libprocessgroup kills land).
+  2. Crash-restart cycles become clean: no lingering holders → binds succeed → fchmodat ENOENT class gone → zygote survives restarts (rung 5 ZYGOTE).
+  3. If zygote now survives its first restart, the frontier is its OWN startup (classpath/apex/seccomp) and the HIDL EX_TRANSACTION_FAILED fleet (192) + lmkd's early exit-0 (PSI class) become the next rocks.
+  4. RISKS: the subtree BFS uses /proc PPid chains — threads (CLONE_THREAD clones) appear as members; kill(tid, SIGKILL) is process-wide so semantics hold. Stale members (exited pids) just ESRCH — tolerated by libprocessgroup.
