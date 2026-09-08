@@ -12730,6 +12730,13 @@ pub fn run_ptrace_loop(
     // disjoint from the netlink range so the two fd spaces never collide.
     let mut bpf_fd_next: std::collections::HashMap<libc::pid_t, i32> =
         std::collections::HashMap::new();
+    // 6-Z305t-59: the LAST rewritten bind's (guest_path, remove_file result)
+    // per pid — consumed at the bind EXIT by the 6-Z101 forensics so every
+    // -98 is attributed to its guest path and the remove_file outcome.
+    let mut pending_bind_path: std::collections::HashMap<
+        libc::pid_t,
+        (String, std::result::Result<(), std::io::Error>),
+    > = std::collections::HashMap::new();
     // 6-Z305t-49b: per-pid set of live fake BPF fds (bounded by the loader
     // workload: ~100 map/prog fds per boot; close() tracking skipped —
     // a stale entry only wastes a base slot).
@@ -18551,7 +18558,15 @@ pub fn run_ptrace_loop(
                                             {
                                                 let _ = std::fs::create_dir_all(dir);
                                             }
-                                            let _ = std::fs::remove_file(&host_path);
+                                            // 6-Z305t-59: capture the remove result —
+                                            // a FAILED remove leaves the previous
+                                            // instance's (dead-binding) socket file
+                                            // in place and the kernel bind then
+                                            // EADDRINUSEs on it (existence check
+                                            // before permission check).
+                                            let rm_res = std::fs::remove_file(&host_path);
+                                            pending_bind_path
+                                                .insert(pid, (guest_path.clone(), rm_res));
                                             // Scratch write (the area was
                                             // re-reserved at THIS ENTRY stop
                                             // — see the reservation block —
@@ -29022,10 +29037,27 @@ pub fn run_ptrace_loop(
                                                     format!("{}", names.join(","))
                                                 };
                                             }
+                                            let bind_src = pending_bind_path
+                                                .remove(&pid)
+                                                .map(|(gp, rm)| {
+                                                    let now_exists = std::path::Path::new(
+                                                        &translate_path(rootfs, &gp),
+                                                    )
+                                                    .exists();
+                                                    format!(
+                                                        "guest_path={} remove_file={} target_now_exists={}",
+                                                        gp,
+                                                        if rm.is_ok() { "ok" } else { "FAILED" },
+                                                        now_exists
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    "(no stash — this bind was NOT rewritten)".to_string()
+                                                });
                                             log(&format!(
-                                                "6-Z305t-57: bind forensics pid={} fd={} raw_ret={} (-errno {}): fd_link={:?} inode={:?} unix_path={} rootfs_dev_socket={}",
+                                                "6-Z305t-57: bind forensics pid={} fd={} raw_ret={} (-errno {}): fd_link={:?} inode={:?} unix_path={} rootfs_dev_socket={} BIND={}",
                                                 pid, fd, ret, -ret,
-                                                fd_link, inode, unix_line, sock_dir
+                                                fd_link, inode, unix_line, sock_dir, bind_src
                                             ));
                                         }
                                     }
