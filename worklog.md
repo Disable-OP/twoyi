@@ -26877,3 +26877,18 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. Then "binder_open_fallback: ... -> proxy fd=" — the virtual binder engages (servicemanager SET_CONTEXT_MGR, vold/lmkd/servicemanager survive).
   3. Pointer-tag stays 0 (44a regression watch). keystore DB FATAL and HIDL joinRpcThreadpool are the NEXT classes after binder.
   4. Rung target: 4 CORE_DAEMONS minimum; if zygote comes up, 5.
+
+## 6-Z305t-47 — #105 decode: 46 patcher worked (556 PATCH lines) but __open_2/__open_real carry the binder fallback only inside the dead should_translate branch → fixed; commit 6de9541; ladder #106 dispatched
+
+- Ladder #105 (34221353387, 9a9b4bd/46): rung 3, post-mortem "kr64 child zombie in ps" (different death mode than #103/#104's init critical-reboot).
+- #105 decode:
+  - 6-Z305t-46 VERIFIED: 556 gotfix-44 PATCH lines — the open-family slots ARE rewritten to the shlib's exports now (the RTLD_DEFAULT ALREADY shield is gone).
+  - BUT ZERO binder_open_fallback logs and 16 binder-open FATALs (11 generic + 5 '/dev/binder'), 70 starting-service events, pointer-tag 0 (44a regression watch holds).
+  - Root cause (code read, conclusive): under the NO_PROPS gate (armed in every android-boot process — the TRACER owns all translation), should_translate() returns 0 for /dev/binder. The open/openat/__openat/__openat_2 hooks check is_binder_device_path in BOTH branches, but __open_2 and __open_real only inside the should_translate branch. libbinder's fortified open() routes through __open_2 → passthrough branch → real open (tracer-translated to the rdev 0:0 dead node) → ENXIO → FATAL, no fallback, no log.
+- FIX 6-Z305t-47 (6de9541): binder fallback added to the pass-through branches of __open_2 and __open_real (mirrors __openat_2's both-branch shape). gcc -fsyntax-only x86_64+aarch64 clean.
+- CI: ladder #106 dispatched on 6de9541 after push.
+- Decision tree for #106:
+  1. binder_open_fallback lines MUST appear now (proxy fd= or /dev/null fd= per service).
+  2. proxy fd= ⇒ virtual binder engages: servicemanager/vold/lmkd/hwservicemanager survive their ProcessState init → rung 4 (CORE_DAEMONS) minimum; zygote at 5 is the stretch.
+  3. If "/dev/null fd=" instead: the proxy lifecycle (BinderProxy bind/connect) is the next blocker — decode kr64 binder.rs binding state.
+  4. keystore "Failed to open DB" ×6 and HIDL joinRpcThreadpool ×2 from the #104 fleet remain on the radar AFTER binder.
