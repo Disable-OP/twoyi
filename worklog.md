@@ -27006,3 +27006,14 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   3. HIDL EX_TRANSACTION_FAILED fleet: the wire plane carries AIDL fine (servicemanager works — core daemons live) but HIDL transactions fail — decode one failing call's parcel (hwservicemanager registration? interface chain? 6-Z271 HIDL shim coverage for the A11 shape).
   4. lmkd exit-0 ×5: A11 lmkd exits cleanly when its kernel interfaces (PSI fds, /proc/meminfo re-reading loop) are unavailable — decode its exact exit path (its svclog) and virtualize the missing kernel interface honestly.
 - No code commit this round — decode-heavy; the next round implements (1) as the smallest fix.
+
+## 6-Z305t-52 — the EXIT-side fchmodat race-free catch; commit 39f6abd; ladder #114 dispatched
+
+- Implemented the top-ranked next step from the 51 decode: an EXIT-side catch at the EXIT-section top — when a REAL fchmodat fails (negative return, system mode), the path resolves into the rootfs AND the backing file exists there → host-side set_permissions + fake 0. Genuinely-missing files keep their real ENOENT. fchownat excluded (the uniform family already forces 0 for it in every mode — the race is covered there). Recovery gated off.
+- This unblocks init's socket bootstrap (zygote/tombstoned/dnsproxyd socket fchmodats) regardless of the 6-Z210 missed-ENTRY race.
+- Local gates: cargo build/fmt/clippy clean, 792/792.
+- CI: ladder #114 dispatched on 39f6abd.
+- Decision tree for #114:
+  1. "6-Z305t-52: fchmodat-family EXIT catch" lines for /dev/socket/* — zygote's socket creation must COMPLETE ("Created socket 'zygote', mode 660").
+  2. Zygote survival: app_process must get past socket env → zygote's own startup (rung 5 ZYGOTE).
+  3. THEN: the HIDL EX_TRANSACTION_FAILED fleet (192 in #113) and lmkd exit-0 loop are the next rocks — likely in either order.
