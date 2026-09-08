@@ -26730,3 +26730,18 @@ Local verification: cargo fmt CLEAN, clippy -D warnings CLEAN, cargo test --lib 
 CI: ladder #98 dispatch follows. Decision tree: node MISSING ⇒ the dev staging must create /dev/binder (+vndbinder/hwbinder) for the android11 boot shape; node present + open succeeds ⇒ the FATAL is downstream (hwbinder vm/binderfs negotiation — the shim's proxy chain must engage and log); pointer-tag class decodes from caller_pc attribution once the maps capture is widened (next).
 
 Honest unverified: no local ARM64 runtime.
+
+## 6-Z305t-41 — #98 decode: the binder node EXISTS (char dev, mode 140666), the shim's retry ladder FIRES (3 shapes), one open even returns fd 17 — the FATAL is downstream — and the path pointers carry TOP-BYTE TAGS (0xb4/0xc3): the binder class and the bionic "Pointer tag truncated" class are likely ONE root cause (tag-stripping in the interception layers)
+
+#98 (d2b9764 → run 34181543663, rung 3) decode — the 6-Z305t-40 binder forensics (40 occurrences, budget consumed):
+- THE NODE EXISTS: {rootfs}/dev/binder = dev=2049 ino=6295102 mode=140666 (S_IFCHR|0666 — a REAL char-device node, not the 6-Z154 stub's regular file). The binderfs path init tries first (/dev/binderfs/{binder,hwbinder,vndbinder}) is MISSING (never staged).
+- THE SHIM'S RETRY LADDER FIRES per service: orig "/dev/binder" ×2 + the host-absolute "{rootfs}/dev/binder" ×1 (the established 6-Z305t-27-era ladder) — pid 2675=servicemanager, 2676=hwservicemanager, 2698=drm, 2697/2771/2774/2778=hwbinder clients, 2704-2723=binder clients — EVERY binder client executes the ladder. The shim IS engaged; its proxy chain just doesn't win.
+- ONE OPEN'S EXIT IS ON RECORD: +2255 ms pid 2675 openat(AT_FDCWD, 0xc36bf9521403, O_RDWR|O_CLOEXEC) → ret=17 (SUCCESS — fd 17!) — the FATAL text "could not be opened" is therefore DOWNSTREAM of a successful open: libbinder's BINDER_VERSION ioctl or the mmap on the returned fd fails (the node's major/minor is unknown — the next instrument logs rdev; the mknod'd char node may point at a major the container kernel doesn't serve, or the mmap2 rewrite to MAP_ANONYMOUS poisons libbinder's mmap).
+- THE TAGGED-POINTER CONNECTION: the observed path pointers carry top-byte tags (0xb400fdbae3a2a510 — the classic arm64 heap-tag shape; 0xc36bf9521403) — and hwservicemanager's critical-FATAL is "Pointer tag for 0x… was truncated". Hypothesis: the interception layers (the tracer's in-place path rewrites / the shim's PLT hops) STRIP the top-byte tag from pointers that bionic then validates → the abort. The binder ladder + the tag class may share this root. NEXT: (a) log rdev for binder nodes + the ioctl(nr=29)/mmap2 fate of binder fds; (b) attribute the pointer-tag abort's caller_pc module (widen the maps capture — full named mappings per aborting service); (c) audit the shim's pointer hop paths for tag preservation.
+- Also on the record: keystore's fix is trivial (mkdir /data/misc/keystore — a guest-tree provisioning gap, likely the 6-Z197 CHECKCALL mkdir family's EEXIST handling or a missing dir in the android11 rootfs assembly).
+
+Commits: (this commit) `docs(worklog): 6-Z305t-41 — #98 decode …`.
+
+CI: ladder #99 dispatch follows with the same build (no code change this commit — the worklog rides along; the next code commit is the rdev+ioctl instrument).
+
+Honest unverified: no local ARM64 runtime; the tag-strip hypothesis awaits caller_pc attribution.
