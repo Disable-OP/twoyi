@@ -7045,6 +7045,22 @@ static void twoyi_init(void) {
                 "wait_for_keymaster",
                 "wait_for_gatekeeper",
                 "vdc",  // vdc communicates with vold via binder
+                // 6-Z305t-48: ladder #106 (run 34223210003) — update_verifier
+                // REBOOTED the guest at the zygote-start gate. A11 source
+                // (update_verifier.cpp:310-313): IBootControl::getService()
+                // == nullptr → LOG(ERROR) "Error getting bootctrl module."
+                // → reboot_device() (android_reboot → sys.powerctl=reboot,
+                // observed verbatim: "Received sys.powerctl='reboot' from
+                // pid: 2817"). The stock SDK image ships the boot HIDL
+                // CLIENT lib but no bootctrl HAL service, and the fleet's
+                // passthrough dlopens are separately broken (health 2.1
+                // CHECK failed ×6). The container has NO A/B OTA domain at
+                // all — update_verifier's success end-state is exactly
+                // exit 0 ("the current slot is marked as having booted
+                // successfully"); exit 0 here is the honest virtualization,
+                // same class as wait_for_keymaster (the real semantics of
+                // "ready" with nothing to wait for), generic across GSIs.
+                "update_verifier",
                 NULL
             };
 
