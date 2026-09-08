@@ -26859,3 +26859,21 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   3. If the fleet survives binder: zygote, apexd/linkerconfig (apex dirs flattened by kr64 6-Z305t; linkerconfig reads /apex/com.android.vndk.v30), system_server in dependency order; build the boot timeline from KLOG-TIMELINE + property-values.txt.
   4. Recovery regression: TWOYI_BOOT_MODE=recovery → file stamp 'recovery' → gate off; the recovery-corpus-nightly workflow is the regression gate; also the exec-hook carry now stamps TWOYI_BOOT_MODE=recovery into rebuilt envp (inert to guests — only our shlib reads it).
 - Risks: the file lives on {rootfs}/dev — guest init's fake tmpfs mount on /dev keeps the underlying dir visible (proven by fb_hook's .twoyi-rootfs reads in the recovery corpus). If init's first stage WIPES /dev in some future ROM, both file mechanisms fail together — watch for (src=none) verdicts.
+
+## 6-Z305t-46 — #104 decode: 45 WORKED (file stamp reached the fleet) but the 44b ALREADY clause shielded the fb-hook-owned binder slots → rewritten; commit 9a9b4bd; ladder #105 dispatched
+
+- Ladder #104 (34217045513, 4700be5/45): rung 3 PROPERTY_SERVICE, init critical-reboot — BUT the interior changed completely:
+  - 6-Z305t-45 VERIFIED: 117 gate verdicts read 'android' (74 glog-wrapped + 43 direct), 56 with (src=file) — the /dev/.twoyi-boot-mode file fallback reached exactly the processes the env chain scrubbed; ZERO '(absent)' verdicts (#103: 342).
+  - init progressed deep into the service storm: 317 "starting service" events (media, wificond, mediametrics, mediaextractor, iorapd, incidentd, cameraserver, audioserver ×12+).
+  - The gotfix-44 repair ran in 81 processes: 1276 ALREADY lines, ZERO PATCH lines, ZERO binder_open_fallback logs.
+- #104 decode (the bug):
+  - The 44b repair's ALREADY condition was `old == own[fam] || (global[fam] && old == global[fam])` where global = dlsym(RTLD_DEFAULT). RTLD_DEFAULT resolves the open family to the FB HOOK's exports (fb_hook precedes the shlib in LD_PRELOAD order) — fb-owned slots were classified ALREADY and skipped.
+  - The fb hook's open passes every non-fb0 path to the REAL open → ENXIO dead end: the fleet still FATAL'd 77x ("Binder driver could not be opened" ×44, "'/dev/binder'" ×25, "'/dev/vndbinder'" ×8) + keystore "Failed to open DB" ×6 + "HIDL joinRpcThreadpool" ×2.
+  - Design-error lesson: "leave fb-hook-owned slots untouched" was redundant protection FOR RECOVERY — but the GATE already provides that (the repair runs only when boot_mode == "android"). For ANDROID mode, fb-owned slots are precisely the ones that must be rewritten.
+- FIX 6-Z305t-46 (9a9b4bd): ALREADY now means ONLY this shlib owns the slot; fb-hook-owned and libc-owned slots alike are rewritten to the shlib's hooks (the only exports with the binder proxy fallback). RTLD_DEFAULT set deleted. Local gates: gcc -fsyntax-only x86_64+aarch64 clean.
+- CI: ladder #105 dispatched on 9a9b4bd after push.
+- Decision tree for #105:
+  1. Expect "gotfix-44 PATCH module=/system/lib64/libbinder.so sym=__open_2 old=<fb-hook-or-libc>" lines (and open/openat family) per service.
+  2. Then "binder_open_fallback: ... -> proxy fd=" — the virtual binder engages (servicemanager SET_CONTEXT_MGR, vold/lmkd/servicemanager survive).
+  3. Pointer-tag stays 0 (44a regression watch). keystore DB FATAL and HIDL joinRpcThreadpool are the NEXT classes after binder.
+  4. Rung target: 4 CORE_DAEMONS minimum; if zygote comes up, 5.
