@@ -1899,7 +1899,26 @@ static char g_rootfs_env[512] = {0};
 // child env chain, re-stamped on every exec so init-forked services inherit
 // it (guest init does NOT forward unknown parent env). Gates the
 // constructor-time open-family GOT repair: full-Android boots only.
+//
+// 6-Z305t-45: the ENV CHAIN IS PROVABLY INSUFFICIENT. Ladder #103 (run
+// 34203719213): kr64 passed TWOYI_BOOT_MODE=android in init's exec envp
+// (the [KR64 CHILD] env log shows it), yet ALL 342 gate verdicts printed
+// '(absent)' while TWOYI_SHLIB_NO_PROPS — a var from the SAME envp — was
+// seen by 384 processes: guest init rebuilds/scrubs its child env across
+// stages in ways our exec hooks cannot always observe. This is the exact
+// class that already broke TWOYI_ROOTFS for init-descendant processes
+// (6-Z187b: "init, whose service env does NOT carry TWOYI_ROOTFS").
+// FIX: mirror the PROVEN 6-Z187b file mechanism — kr64 stamps the boot
+// mode into {rootfs}/dev/.twoyi-boot-mode (next to /dev/.twoyi-rootfs)
+// and the constructor reads it via the tracer-translated absolute path
+// "/dev/.twoyi-boot-mode" whenever the env var is missing. Recovery
+// boots stamp "recovery", so the gate stays off and the recovery corpus
+// is unchanged by construction.
 static char g_boot_mode_env[64] = {0};
+// 0=absent, 1=env, 2=file — provenance for the gotfix-44 gate-verdict log
+// (#102's silent negative path cost a full ladder; #103's verdict needed a
+// source attribution to decode in one pass).
+static int g_boot_mode_src = 0;
 
 static void set_preload_path(void) {
     const char *preload = getenv("LD_PRELOAD");
@@ -1917,6 +1936,46 @@ static void set_preload_path(void) {
     const char *boot_mode = getenv("TWOYI_BOOT_MODE");
     if (boot_mode) {
         strncpy(g_boot_mode_env, boot_mode, sizeof(g_boot_mode_env) - 1);
+        g_boot_mode_src = 1;
+    }
+    // 6-Z305t-45: file fallback for BOTH stamps. Init-descendant processes
+    // may lack the env vars entirely (#103 evidence above) — the file is
+    // written by kr64 before the first exec and read through the absolute
+    // guest path /dev/.twoyi-boot-mode (tracer translates to
+    // {rootfs}/dev/.twoyi-boot-mode in every mode; the mount() fake keeps
+    // the underlying rootfs/dev visible — same trust as 6-Z187b).
+    if (!g_rootfs_env[0]) {
+        int rfd = (int)twoyi_sys_open2("/dev/.twoyi-rootfs", O_RDONLY);
+        if (rfd >= 0) {
+            char rbuf[512];
+            long rn = syscall(NR_read, rfd, rbuf, sizeof(rbuf) - 1);
+            syscall(NR_close, rfd);
+            if (rn > 0) {
+                rbuf[rn] = 0;
+                char *nl = strchr(rbuf, '\n');
+                if (nl) *nl = 0;
+                if (rbuf[0] == '/') {
+                    strncpy(g_rootfs_env, rbuf, sizeof(g_rootfs_env) - 1);
+                }
+            }
+        }
+    }
+    if (!g_boot_mode_env[0]) {
+        int bfd = (int)twoyi_sys_open2("/dev/.twoyi-boot-mode", O_RDONLY);
+        if (bfd >= 0) {
+            char bbuf[32];
+            long bn = syscall(NR_read, bfd, bbuf, sizeof(bbuf) - 1);
+            syscall(NR_close, bfd);
+            if (bn > 0) {
+                bbuf[bn] = 0;
+                char *nl = strchr(bbuf, '\n');
+                if (nl) *nl = 0;
+                if (bbuf[0]) {
+                    strncpy(g_boot_mode_env, bbuf, sizeof(g_boot_mode_env) - 1);
+                    g_boot_mode_src = 2;
+                }
+            }
+        }
     }
 }
 
@@ -6874,12 +6933,21 @@ static void twoyi_init(void) {
         g_real_pid = (int)syscall(SYS_getpid);
     }
 
-    // Get rootfs path from env
-    g_rootfs = getenv("TWOYI_ROOTFS");
-    if (!g_rootfs) g_rootfs = "/data/data/io.twoyi/rootfs";
-
-    // Save LD_PRELOAD path so we can restore it before execv/execve
+    // Save LD_PRELOAD path so we can restore it before execv/execve.
+    // 6-Z305t-45: set_preload_path() now ALSO captures the file-based
+    // fallbacks (/dev/.twoyi-rootfs, /dev/.twoyi-boot-mode) — it must run
+    // BEFORE the g_rootfs resolution below, so init-descendant processes
+    // whose env lacks TWOYI_ROOTFS (the #103 fleet; 6-Z187b class) resolve
+    // the rootfs from kr64's stamped file instead of the stale hardcoded
+    // default (which breaks every {rootfs}-prefixed retry in the hooks).
     set_preload_path();
+
+    // Get rootfs path from env (env → file → legacy default)
+    g_rootfs = getenv("TWOYI_ROOTFS");
+    if (!g_rootfs || !g_rootfs[0]) {
+        g_rootfs = g_rootfs_env[0] ? g_rootfs_env : NULL;
+    }
+    if (!g_rootfs) g_rootfs = "/data/data/io.twoyi/rootfs";
 
     // DIAGNOSTIC: log the LD_PRELOAD value and TWOYI_ROOTFS so we can
     // verify the loader is being loaded with the right env in every
@@ -7164,9 +7232,19 @@ static void twoyi_init(void) {
     // See the 6-Z305t-44 block comment for the full evidence chain.
     // ALWAYS log the gate verdict (one line per process) — ladder #102's
     // silent-skip cost a full ladder to decode.
+    // 6-Z305t-45: the verdict now carries the stamp SOURCE (env=kr64 child
+    // env chain, file=/dev/.twoyi-boot-mode, none=neither) — #103's all-
+    // (absent) verdict was only decodable by reconstructing write streams;
+    // the source tells the next decode which layer dropped it in one line.
     write_str(2, "[twoyi_loader] gotfix-44: gate boot_mode='");
     write_str(2, g_boot_mode_env[0] ? g_boot_mode_env : "(absent)");
-    write_str(2, "'\n");
+    if (g_boot_mode_src == 1) {
+        write_str(2, "' (src=env)\n");
+    } else if (g_boot_mode_src == 2) {
+        write_str(2, "' (src=file)\n");
+    } else {
+        write_str(2, "' (src=none)\n");
+    }
     if (strcmp(g_boot_mode_env, "android") == 0) {
         patch_open_family_gots();
     }
