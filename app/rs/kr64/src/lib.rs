@@ -10839,6 +10839,27 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 },
             }
         }
+        // 6-Z305t-44: stamp the boot mode into the guest env chain. The
+        // shlib's constructor-time open-family GOT repair (6-Z305t-44)
+        // engages ONLY for full-Android boots (TWOYI_BOOT_MODE=android);
+        // recovery boots must keep their exact established behavior.
+        // The shlib's exec hooks re-stamp the var on every exec (same
+        // mechanism as LD_PRELOAD/TWOYI_ROOTFS), so every init-forked
+        // service inherits it — guest init itself does NOT forward
+        // unknown parent env to service children.
+        {
+            let boot_mode = if cfg.boot_recovery {
+                "recovery"
+            } else {
+                "android"
+            };
+            match CString::new(format!("TWOYI_BOOT_MODE={}", boot_mode)) {
+                Ok(c) => env_vars.push(c),
+                Err(_) => unsafe {
+                    safe_write_err(b"[KR64 CHILD] WARN: TWOYI_BOOT_MODE push failed\n");
+                },
+            }
+        }
         if skip_preload {
             unsafe {
                 if cfg.boot_recovery {
