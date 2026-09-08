@@ -20466,7 +20466,7 @@ pub fn run_ptrace_loop(
                                 // honest zero-state fallback for hosts whose
                                 // kernel lacks PSI.
                                 let pressure_prefix =
-                                    format!("{}/proc/pressure/", rootfs.trim_end_matches('/'));
+                                    format!("{}/dev/.twoyi-psi/", rootfs.trim_end_matches('/'));
                                 if let Some(rel) = translated.strip_prefix(&pressure_prefix) {
                                     if !rel.is_empty() && !rel.contains("..") {
                                         let backing = std::path::Path::new(&translated);

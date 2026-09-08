@@ -1238,12 +1238,18 @@ impl SandboxPolicy {
         // "[glog V/libpsi] No kernel psi monitor support (errno=13)" →
         // lmkd init() fails → main() SKIPS mainloop → clean return 0 →
         // "critical process 'lmkd' exited 4 times" → InitFatalReboot.
-        // Back them with rootfs files seeded from the host's real values
-        // (the same trust discipline as the 6-Z305i sysctl store: kr64 IS
-        // the guest's kernel substitute; the host kernel's real PSI
-        // numbers ARE the container's PSI numbers).
+        // Back them with the {rootfs}/dev/.twoyi-psi store (the 6-Z305i
+        // sysctl-store pattern — /dev is app-writable; {rootfs}/proc is
+        // 0555 from the ROM image and cannot hold new files) seeded from
+        // the host's real values (the same trust discipline as the sysctl
+        // store: kr64 IS the guest's kernel substitute; the host kernel's
+        // real PSI numbers ARE the container's PSI numbers).
         if path.starts_with("/proc/pressure/") || path == "/proc/pressure" {
-            return format!("{}{}", self.rootfs.to_string_lossy(), path);
+            return format!(
+                "{}/dev/.twoyi-psi/{}",
+                self.rootfs.to_string_lossy(),
+                path.trim_start_matches("/proc/pressure/")
+            );
         }
         // /proc/<pid>/{maps,status,cmdline,auxv} → /proc/self/… (the
         // synthetic generators the VFS registered).
