@@ -26944,3 +26944,10 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   1. bpfloader must exit 0: expect "6-Z305t-49b: bpf(cmd=0/5...) faked to 0x6b02xxxx" + "BPF_OBJ_PIN materialized {rootfs}/sys/fs/bpf/map_..." lines, then "bpf.progs_loaded" property set.
   2. Boot frontier: ZYGOTE (rung 5). app_process exec, seccomp install, /dev/socket creation, boot classpath.
   3. RISKS: netd now reads the pinned "maps" — LOOKUPs return -ENOENT; if netd treats that as fatal (it is critical-class) the next fix is honest map-shape emulation. Also health-hal-2-1 passthrough dlopen + HIDL EX_TRANSACTION_FAILED remain queued.
+
+## 6-Z305t-49c — #109 CI fix: unused constant; commit 016186b; ladder #110 dispatched
+
+- Ladder #109 failed at BUILD (not boot): `constant BPF_MAP_UPDATE_ELEM_CMD is never used` — the crate builds with deny(dead_code) in CI; local cargo clippy --all-targets did not surface it (the arm is inside a large fn — the lint fires only in the CI's cargo-xdk profile).
+- FIX 6-Z305t-49c (016186b): removed the constant (UPDATE_ELEM = 2 falls into the catch-all Some(0) arm; comment added). Local cargo build clean.
+- CI: ladder #110 dispatched on 016186b.
+- LESSON: run `cargo build` (not just clippy/test) before pushing kr64 changes — the CI build profile is stricter.
