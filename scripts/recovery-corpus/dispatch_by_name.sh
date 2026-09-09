@@ -52,7 +52,8 @@ for e in entries:
     if not e['url']:
         print('  SKIP {} (no url)'.format(e['name']))
         continue
-    inputs = {'recovery_name': e['name'], 'recovery_url': e['url'],
+    # 6-Z305t-68 anti-runaway gate: every dispatch MUST confirm.
+    inputs = {'confirm_dispatch': 'yes', 'recovery_name': e['name'], 'recovery_url': e['url'],
               'boot_wait_seconds': boot_wait}
     if e['referer']:
         inputs['recovery_referer'] = e['referer']
