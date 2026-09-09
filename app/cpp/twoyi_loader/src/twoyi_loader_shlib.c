@@ -6962,7 +6962,16 @@ static int gotfix_write_slot(uintptr_t addr, void *val) {
     return 0;
 }
 
+// 6-Z305t-71e: quiet gate for the re-repair rounds (see
+// gotfix_dlopen_window_thread). Constructor pass keeps it 0 (verbose).
+// Declared BEFORE gotfix_log (the gate is consulted there).
+static int g_gotfix_quiet;
+
 static void gotfix_log(const char *s) {
+    // 6-Z305t-71e: the dlopen-window re-repair thread re-runs the pass
+    // quietly — a 120-round poll must never own the svc log (the same
+    // bounded-diagnostics discipline as the tracer's stop_log_allow).
+    if (g_gotfix_quiet) return;
     write_str(2, s);
 }
 
@@ -6976,7 +6985,68 @@ static void gotfix_log_num(long v) {
     do { digits[d++] = (char)('0' + (u % 10)); u /= 10; } while (u);
     while (d > 0) tmp[p++] = digits[--d];
     tmp[p] = 0;
+    if (g_gotfix_quiet) return;
     write_str(2, tmp);
+}
+
+// 6-Z305t-71e: count the currently-loaded modules (cheap dl walk) so the
+// re-repair thread only runs the full pass when a dlopen ADDED a module.
+static int gotfix_count_modules_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)info; (void)size;
+    (*(int *)data)++;
+    return 0;
+}
+
+static int gotfix_count_modules(void) {
+    int n = 0;
+    dl_iterate_phdr(gotfix_count_modules_cb, &n);
+    return n;
+}
+
+// forward decl — the re-repair thread re-runs the constructor-time pass
+// (defined below; the thread body needs the prototype).
+static void patch_open_family_gots(void);
+
+// ── 6-Z305t-71e: the dlopen-window GOT re-repair ──────────────────
+//
+// Ladders #131/#134/#135: SurfaceFlinger aborts "connect: failed to
+// connect to opengles pipe" and the shlib's qemu_pipe_open_fallback
+// NEVER runs, while the binder fallback (libbinder = exec-time
+// DT_NEEDED) works in the same process. The goldfish EGL stack
+// (libEGL_emulation.so and its siblings) is DLOPEN'D at runtime by
+// libEGL's Loader — its open-family GOT slots resolve straight to
+// bionic inside the emulation linker namespace, so the constructor-time
+// patch_open_family_gots() (exec-time link map only) can never cover
+// it, and the raw openat("/dev/qemu_pipe") ENXIOs on the proxy's bound
+// socket file. (The tracer-side pidfd_getfd injection is unavailable
+// here: the HOST's app seccomp allowlist returns silent EPERM for
+// pidfd_open/pidfd_getfd — ladder #135's probe: UNAVAILABLE,
+// sigsys_fired=false.)
+//
+// Fix: a bounded background thread re-runs the (idempotent) repair pass
+// whenever the module COUNT grows — i.e., exactly when a dlopen landed —
+// for the first 60s of process life. Quiet unless it patched something:
+// the per-slot logs are gated by g_gotfix_quiet; each productive round
+// leaves one line. Per-slot GOT writes are single aligned pointer
+// stores (atomic in practice on arm64/x86_64); the pass already handles
+// already-patched slots as ALREADY.
+static void *gotfix_dlopen_window_thread(void *arg) {
+    (void)arg;
+    int last_mods = gotfix_count_modules();
+    for (int round = 0; round < 120; round++) { // 120 × 500ms = 60s window
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 500 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+        int mods = gotfix_count_modules();
+        if (mods <= last_mods) continue; // no dlopen since the last round
+        last_mods = mods;
+        g_gotfix_quiet = 1;
+        patch_open_family_gots();
+        g_gotfix_quiet = 0;
+        write_str(2, "[twoyi_loader] gotfix-44: dlopen-window re-repair ran (module count grew)\n");
+    }
+    return NULL;
 }
 
 // The repair pass — called from twoyi_init() when TWOYI_BOOT_MODE=android.
@@ -7464,6 +7534,17 @@ static void twoyi_init(void) {
     }
     if (strcmp(g_boot_mode_env, "android") == 0) {
         patch_open_family_gots();
+        // 6-Z305t-71e: cover the dlopen window (the goldfish EGL stack
+        // loads after this constructor — see the thread's block comment).
+        {
+            pthread_t gotfix_poll_tid;
+            if (pthread_create(&gotfix_poll_tid, NULL,
+                               gotfix_dlopen_window_thread, NULL) == 0) {
+                pthread_detach(gotfix_poll_tid);
+            } else {
+                write_str(2, "[twoyi_loader] gotfix-44: dlopen-window re-repair thread FAILED to spawn\n");
+            }
+        }
     }
 
     // NOTE: ro.crypto.state/ro.crypto.type are intentionally NOT set here.
