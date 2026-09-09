@@ -7192,6 +7192,35 @@ static void patch_open_family_gots(void) {
 // =========================================================================
 __attribute__((constructor(101)))
 static void twoyi_init(void) {
+    // 6-Z305t-75: STDIN BELT — ensure fd 0 is OPEN in every guest
+    // process. Android 11's libcore ZygoteHooks.onEndPreload() clones
+    // the standard FileDescriptors for fork:
+    //     FileDescriptor.in.cloneForFork();  out;  err;
+    // where cloneForFork() is Os.fcntlInt(fd, F_DUPFD_CLOEXEC, 0) and
+    // an EBADF throws RuntimeException — the ladder-#145 zygote wall:
+    // "java.lang.RuntimeException: android.system.ErrnoException: fcntl
+    // failed: EBADF (Bad file descriptor) at
+    // java.io.FileDescriptor.cloneForFork(FileDescriptor.java:184) at
+    // dalvik.system.ZygoteHooks.onEndPreload(ZygoteHooks.java:79)" →
+    // "System zygote died with exception" → exit(0) right after
+    // "Preloading shared libraries..." (the zygote's fd 0 was free —
+    // the post-death /proc/self/stat open returned fd=0). On a real
+    // device init points each service's stdin at /dev/null; the twoyi
+    // spawn path leaves fd 0 closed. Give every guest process a REAL
+    // /dev/null on fd 0 (honest fd, real dup — no fakes): if F_GETFD
+    // says 0 is closed, open /dev/null through the normal translating
+    // open and dup it to 0. No-op where fd 0 is already open (recovery
+    // corpus path untouched).
+    if (syscall(SYS_fcntl, 0, F_GETFD, 0) < 0) {
+        int nfd = twoyi_sys_open("/dev/null", O_RDWR, 0);
+        if (nfd >= 0) {
+            if (nfd != 0) {
+                syscall(SYS_dup3, nfd, 0, 0);
+                syscall(NR_close, nfd);
+            }
+        }
+    }
+
     // 6-Z139: capture the REAL pid FIRST, before any hook could
     // recurse (getpid is interposed to return 1 — the fake init pid —
     // by getpid_hook.so, so only a raw syscall sees the truth here).
