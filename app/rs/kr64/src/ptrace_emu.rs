@@ -12785,6 +12785,12 @@ pub fn run_ptrace_loop(
     // only advances on syscall stops — event-stop storms would undercount
     // ages and mask violations).
     let mut iter_count: u64 = 0;
+    // 6-Z305t-75d: per-pid budget + global cap for the STDIO-CLOSER
+    // TRACER (close(0/1/2) observation — see the entry arm).
+    let mut close_diag_budget: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
+    static CLOSE_DIAG_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let close_diag_total = &CLOSE_DIAG_TOTAL;
     // 6-Z266: real-tgid cache for the kill-family fake-pid translation.
     // Filled lazily per tracee (one /proc/<pid>/status read per pid per
     // boot); cleared never — tracee tgids are immutable for the life of
@@ -20538,16 +20544,29 @@ pub fn run_ptrace_loop(
                         // the CALLER's pc attributed to its module (the
                         // stall-forensics maps walk), budgeted at the
                         // first 48 events per run (the floods never own
-                        // the log). close() executes natively — this arm
-                        // is pure observation, zero rewrites.
+                        // the log). 75d-RUN-1 EVIDENCE: the global budget
+                        // filled with EARLY services (linker64 closing
+                        // 0/1/2 at exec, a libc close(2,1,0) pattern)
+                        // before the zygote ever started — the budget is
+                        // PER-PID now (8 events per pid, global cap 600)
+                        // and close_range(436) is traced too (a
+                        // close_range(0, 2) bypasses a close()-only net).
+                        // close() executes natively — pure observation,
+                        // zero rewrites.
                         n if abi.close_nr != -1 && n == abi.close_nr => {
                             let close_fd = get_syscall_arg(&regs, abi.reg_arg1);
                             if close_fd <= 2 {
-                                static CLOSE_DIAG: std::sync::atomic::AtomicU64 =
-                                    std::sync::atomic::AtomicU64::new(0);
-                                let cnt =
-                                    CLOSE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if cnt < 48 {
+                                let cnt = {
+                                    let c = close_diag_budget.entry(pid).or_insert(0);
+                                    *c += 1;
+                                    *c
+                                };
+                                if cnt <= 8
+                                    && close_diag_total.load(std::sync::atomic::Ordering::Relaxed)
+                                        < 600
+                                {
+                                    close_diag_total
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     // pc: aarch64 user_pt_regs index 32
                                     // (regs[0..30], sp=31, pc=32); x86_64
                                     // user_regs_struct rip = index 16.
@@ -20566,6 +20585,39 @@ pub fn run_ptrace_loop(
                                     log(&format!(
                                         "6-Z305t-75d: pid={} close(fd={}) pc={:#x} maps[pc]={}",
                                         pid, close_fd, pc_val, region
+                                    ));
+                                }
+                            }
+                        }
+                        n if n == 436 => {
+                            // close_range(first, last, flags) — if the
+                            // range covers ANY standard descriptor, NAME
+                            // the caller. asm-generic/x86_64/arm32 all
+                            // number close_range 436.
+                            let first = get_syscall_arg(&regs, abi.reg_arg1);
+                            let last = get_syscall_arg(&regs, abi.reg_arg2);
+                            if first <= 2 && last >= first {
+                                static CLOSE_RANGE_DIAG: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if CLOSE_RANGE_DIAG
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    < 24
+                                {
+                                    #[cfg(target_arch = "aarch64")]
+                                    let pc_val =
+                                        unsafe { *(&regs as *const Regs as *const u64).add(32) };
+                                    #[cfg(target_arch = "x86_64")]
+                                    let pc_val =
+                                        unsafe { *(&regs as *const Regs as *const u64).add(16) };
+                                    #[cfg(not(any(
+                                        target_arch = "aarch64",
+                                        target_arch = "x86_64"
+                                    )))]
+                                    let pc_val: u64 = 0;
+                                    let region = maps_region_for_pc(pid, pc_val);
+                                    log(&format!(
+                                        "6-Z305t-75d: pid={} close_range({}, {}) pc={:#x} maps[pc]={}",
+                                        pid, first, last, pc_val, region
                                     ));
                                 }
                             }
