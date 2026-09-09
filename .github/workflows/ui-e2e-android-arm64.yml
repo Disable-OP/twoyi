@@ -467,7 +467,13 @@ jobs:
           timeout 40 sudo docker exec redroid sh -c \
             "d=/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs; \
              cd \$d 2>/dev/null || exit 0; \
-             ls -S svc-*.log 2>/dev/null | head -20 | while read f; do \
+             echo '##### TOP-3 FULL #####'; \
+             ls -S svc-*.log 2>/dev/null | head -3 | while read f; do \
+               echo \"== RAW-FULL \$f (\$(stat -c%s \$f) bytes) ==\"; \
+               cat \$f; \
+             done; \
+             echo '##### NEXT-17 HEAD+TAIL #####'; \
+             ls -S svc-*.log 2>/dev/null | sed -n '4,20p' | while read f; do \
                echo \"== RAW \$f (\$(stat -c%s \$f) bytes) ==\"; \
                head -c 32768 \$f; \
                echo; echo '...[SNIP-MIDDLE]...'; echo; \
