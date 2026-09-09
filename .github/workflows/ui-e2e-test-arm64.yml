@@ -116,6 +116,19 @@ name: UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
 'on':
   workflow_dispatch:
     inputs:
+      # ┌────────────────────────────────────────────────────────────────┐
+      # │ 6-Z305t-68 CIRCUIT BREAKER (runaway-dispatch incident,         │
+      # │ 2026-09-09 08:00Z): an automated session spammed ~400 dispatches│
+      # │ of this workflow in ~6 minutes, hogging the ubuntu-24.04-arm    │
+      # │ runner queue and starving the Android Boot Ladder. Required     │
+      # │ dispatch inputs with no default make dispatch calls FAIL with   │
+      # │ 422 unless the caller EXPLICITLY passes confirm_dispatch: "yes" │
+      # │ — a looping dispatcher that fires blind cannot queue work here. │
+      # │ Intentional runs pass  confirm_dispatch: "yes".                 │
+      # └────────────────────────────────────────────────────────────────┘
+      confirm_dispatch:
+        description: 'Anti-runaway gate: dispatches MUST pass the literal string "yes" (no default)'
+        required: true
       boot_wait_seconds:
         description: 'How long to wait for the TWRP container to boot before capturing the final screenshot (seconds)'
         required: false
