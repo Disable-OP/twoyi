@@ -3190,6 +3190,49 @@ fn z305h_flip_milestone(run: u64) -> bool {
     matches!(run, 2 | 64 | 512 | 2048 | 8192)
 }
 
+/// 6-Z305t-71: budget guard for repeating stop-class diagnostics keyed
+/// by `(site, pid)` — a `pid` of 0 marks a GLOBAL budget for classes
+/// whose occurrences are distinct-pid by nature (a crash-loop fleet
+/// never reuses a pid, so a per-pid key could never bound it). Returns
+/// `Some(occurrence#)` when this occurrence may log: the first 2
+/// always, then every `every`-th (so a spin keeps a visible rate line
+/// while never owning the artifact again — ladder #131: one repeating
+/// class alone produced 7,348,781 lines / ~735MB of stderr).
+fn stop_log_allow(
+    map: &mut std::collections::HashMap<(u8, libc::pid_t), u64>,
+    site: u8,
+    pid: libc::pid_t,
+    every: u64,
+) -> Option<u64> {
+    const STOP_LOG_BASE: u64 = 2;
+    let e = map.entry((site, pid)).or_insert(0);
+    *e = e.wrapping_add(1);
+    if *e <= STOP_LOG_BASE || (*e - STOP_LOG_BASE) % every == 0 {
+        Some(*e)
+    } else {
+        None
+    }
+}
+
+/// 6-Z305t-71: force_sig mask emulation for the plain-SIGTRAP delivery
+/// fix — a kernel-FORCED fatal trap ignores the block mask (the kernel
+/// resets the disposition to SIG_DFL and UNBLOCKS the signal before
+/// queueing it). Returns the mask with the SIGTRAP bit cleared when the
+/// tracee blocks SIGTRAP (→ PTRACE_SETSIGMASK this back), `None` when
+/// it doesn't (no SETSIGMASK needed). Without the unblock, re-injecting
+/// into a blocked mask parks the signal pending and the trapping
+/// instruction re-executes forever (ladder #131: init execs services
+/// with a near-fully-blocked inherited mask — execve PRESERVES it —
+/// so every forced-trap service child needed exactly this).
+fn sigtrap_force_mask(mask: u64) -> Option<u64> {
+    let bit = 1u64 << (libc::SIGTRAP - 1);
+    if mask & bit != 0 {
+        Some(mask & !bit)
+    } else {
+        None
+    }
+}
+
 /// Set the return value of a syscall in registers.
 ///
 /// On x86_64 this writes `rax` (the kernel's "syscall return value"
@@ -13744,6 +13787,33 @@ pub fn run_ptrace_loop(
     // (the InitAborter contract fix — see the pending_getpid EXIT arm).
     let mut z305i_getpid_diag: u64 = 0;
 
+    // ── 6-Z305t-71: bounded stop-class diagnostics ────────────────────
+    //
+    // Ladder #131's kr64-app-stderr artifact hit 799MB for ONE 180s boot:
+    // a single repeating stop class ("SIGTRAP stop (no 0x80)" — the
+    // consume-resume loop against a REGENERATING guest trap, fixed below
+    // by DELIVERING the trap) alone emitted 7,348,781 lines / ~735MB, the
+    // ESRCH ping-pong lines added ~7.5k more, and the per-death
+    // "last 50 ALL syscalls" history dumps fired once per crashing
+    // service generation (~1600 × ~55 lines). Every repeating class now
+    // runs on a budget keyed by (site, pid) — pid=0 entries are GLOBAL
+    // budgets for classes whose occurrences are distinct-pid by nature
+    // (per-pid keys could never bound a crash-loop fleet): the first 2
+    // occurrences always log, afterwards only every `every`-th (with the
+    // running total), so a regression can never own the artifact again
+    // and a spin still leaves a visible rate line.
+    let mut stop_log_budget: std::collections::HashMap<(u8, libc::pid_t), u64> =
+        std::collections::HashMap::new();
+    // Occurrence-site ids for the stop_log_budget keys.
+    const SITE_PLAIN_SIGTRAP: u8 = 1;
+    const SITE_ESRCH_RESUME: u8 = 2;
+    const SITE_ESRCH_RUNNING: u8 = 3;
+    const SITE_ESRCH_SWITCH: u8 = 4;
+    const SITE_ESRCH_RUNNING_SKIP: u8 = 5;
+    const SITE_DUMP_BEFORE_ESRCH: u8 = 6;
+    const SITE_DUMP_BEFORE_EXIT: u8 = 7;
+    const SITE_DUMP_AT_EXIT: u8 = 8;
+
     // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
     // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
     // because the kernel uses TIF_IA32 (set at exec time), not CS, to select
@@ -14127,17 +14197,30 @@ pub fn run_ptrace_loop(
             let e = std::io::Error::last_os_error();
             // ESRCH = child already exited — not an error, just done.
             if e.raw_os_error() == Some(libc::ESRCH) {
-                log(&format!(
-                    "PTRACE_SYSCALL: child {} already exited (ESRCH)",
-                    current_pid
-                ));
+                // 6-Z305t-71: bounded — the resume-vs-RUNNING-tracee
+                // ping-pong logged every bounce (ladder #131: 1533×).
+                if let Some(total) =
+                    stop_log_allow(&mut stop_log_budget, SITE_ESRCH_RESUME, current_pid, 4096)
+                {
+                    log(&format!(
+                        "PTRACE_SYSCALL: child {} already exited (ESRCH) [occurrence #{} of this pid]",
+                        current_pid, total
+                    ));
+                }
                 // Print the rolling SIGSYS history before reaping — the
                 // main WIFEXITED/WIFSIGNALED branches below won't run
                 // on this path, so without this log we'd lose the
                 // "last N intercepted syscalls" diagnostic when the
                 // child dies between a syscall-exit-stop and our
                 // next PTRACE_SYSCALL.
-                if !recent_sigsys.is_empty() {
+                // 6-Z305t-71: the two history dumps below are GLOBAL-budget
+                // (pid key 0) — their occurrences are distinct-pid by
+                // nature (every crashing service generation dumped ~55
+                // lines here), so a per-pid budget could not bound a
+                // crash-loop fleet. First 8 dumps, then every 512th.
+                let dump_before_esrch =
+                    stop_log_allow(&mut stop_log_budget, SITE_DUMP_BEFORE_ESRCH, 0, 512);
+                if dump_before_esrch.is_some() && !recent_sigsys.is_empty() {
                     let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
                     log(&format!(
                         "last {} SIGSYS-intercepted syscalls before ESRCH (oldest->newest): {:?}",
@@ -14152,14 +14235,16 @@ pub fn run_ptrace_loop(
                 // call whose -ENOENT return value is what made init
                 // decide to exit(1). Without this log we only ever
                 // see the SIGSYS side of the picture.
-                if !recent_all_syscalls.is_empty() {
-                    log(&format!(
-                        "last {} ALL syscalls before ESRCH (intercepted + unintercepted, oldest->newest): {}",
-                        recent_all_syscalls.len(),
-                        format_syscall_buffer(&recent_all_syscalls, abi)
-                    ));
-                } else {
-                    log("no syscalls recorded in all-syscalls buffer before ESRCH");
+                if dump_before_esrch.is_some() {
+                    if !recent_all_syscalls.is_empty() {
+                        log(&format!(
+                            "last {} ALL syscalls before ESRCH (intercepted + unintercepted, oldest->newest): {}",
+                            recent_all_syscalls.len(),
+                            format_syscall_buffer(&recent_all_syscalls, abi)
+                        ));
+                    } else {
+                        log("no syscalls recorded in all-syscalls buffer before ESRCH");
+                    }
                 }
                 // ── Task 6-Z89 FIX 1d: REAL reaping + all-children-gone ──
                 //
@@ -14382,16 +14467,33 @@ pub fn run_ptrace_loop(
                         ));
                     }
                     Reaped::AliveStopped(status) => {
-                        log(&format!(
-                            "6-Z89: ESRCH pid {} is ALIVE — the reap loop consumed a pending ptrace stop (status {:#x}); keeping it tracked and resuming it via the scan below",
-                            esrch_pid, status
-                        ));
+                        // 6-Z305t-71: bounded (ladder #131 ping-pong).
+                        if let Some(total) = stop_log_allow(
+                            &mut stop_log_budget,
+                            SITE_ESRCH_RUNNING,
+                            esrch_pid,
+                            4096,
+                        ) {
+                            log(&format!(
+                                "6-Z89: ESRCH pid {} is ALIVE — the reap loop consumed a pending ptrace stop (status {:#x}); keeping it tracked and resuming it via the scan below [occurrence #{}]",
+                                esrch_pid, status, total
+                            ));
+                        }
                     }
                     Reaped::Running => {
-                        log(&format!(
-                            "6-Z89: ESRCH pid {} is ALIVE and RUNNING (restart-of-a-running-tracee ESRCH); keeping it tracked — its next stop will be picked up",
-                            esrch_pid
-                        ));
+                        // 6-Z305t-71: bounded (ladder #131: 3066× on the
+                        // restart-of-a-running-tracee ESRCH bounce).
+                        if let Some(total) = stop_log_allow(
+                            &mut stop_log_budget,
+                            SITE_ESRCH_RUNNING,
+                            esrch_pid,
+                            4096,
+                        ) {
+                            log(&format!(
+                                "6-Z89: ESRCH pid {} is ALIVE and RUNNING (restart-of-a-running-tracee ESRCH); keeping it tracked — its next stop will be picked up [occurrence #{}]",
+                                esrch_pid, total
+                            ));
+                        }
                     }
                     Reaped::Gone => {
                         // ECHILD: already reaped elsewhere (reparented)
@@ -14418,17 +14520,23 @@ pub fn run_ptrace_loop(
                     // ESRCH'd pid was init, the loop keeps serving the
                     // surviving traced sibling — the 6-Z67 `init_dead`
                     // flag is gone; the tracked-set scan carries this.)
-                    log(&format!(
-                        "6-Z89: ESRCH on pid {} but traced child {} is STILL ALIVE (fresh /proc probe over {} tracked pids) — switching the ptrace loop to it{}",
-                        esrch_pid,
-                        live_pid,
-                        tracked_pids.len(),
-                        if esrch_pid == init_pid && esrch_pid_dead {
-                            " (init dead — Task 6-Z67 semantics, generalised to all children)"
-                        } else {
-                            ""
-                        }
-                    ));
+                    // 6-Z305t-71: bounded (ladder #131: 3204× switch line).
+                    if let Some(total) =
+                        stop_log_allow(&mut stop_log_budget, SITE_ESRCH_SWITCH, esrch_pid, 4096)
+                    {
+                        log(&format!(
+                            "6-Z89: ESRCH on pid {} but traced child {} is STILL ALIVE (fresh /proc probe over {} tracked pids) — switching the ptrace loop to it{} [occurrence #{}]",
+                            esrch_pid,
+                            live_pid,
+                            tracked_pids.len(),
+                            if esrch_pid == init_pid && esrch_pid_dead {
+                                " (init dead — Task 6-Z67 semantics, generalised to all children)"
+                            } else {
+                                ""
+                            },
+                            total
+                        ));
+                    }
                     current_pid = live_pid;
                     // 6-Z122 (run 32745030268 livelock): when the switch
                     // target IS the RUNNING ESRCH'd pid itself, do NOT
@@ -14442,10 +14550,18 @@ pub fn run_ptrace_loop(
                     // waitpid and the child's next stop arrives there.
                     if live_pid == esrch_pid && matches!(reaped, Reaped::Running) {
                         skip_next_resume = true;
-                        log(&format!(
-                            "6-Z122: ESRCH'd pid {} is RUNNING (not stopped) — next iteration skips the resume and waits for its next stop (no PTRACE_SYSCALL ping-pong)",
-                            esrch_pid
-                        ));
+                        // 6-Z305t-71: bounded (ladder #131: 1148×).
+                        if let Some(total) = stop_log_allow(
+                            &mut stop_log_budget,
+                            SITE_ESRCH_RUNNING_SKIP,
+                            esrch_pid,
+                            4096,
+                        ) {
+                            log(&format!(
+                                "6-Z122: ESRCH'd pid {} is RUNNING (not stopped) — next iteration skips the resume and waits for its next stop (no PTRACE_SYSCALL ping-pong) [occurrence #{}]",
+                                esrch_pid, total
+                            ));
+                        }
                     }
                     continue;
                 }
@@ -14800,15 +14916,26 @@ pub fn run_ptrace_loop(
             // iteration 177" issue: the last few SIGSYS numbers tell us
             // which seccomp-blocked syscall (mount? chroot? unshare?)
             // init was retrying right before it gave up and exited.
-            if recent_sigsys.is_empty() {
-                log("no SIGSYS interceptions recorded during this run");
-            } else {
-                let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
-                log(&format!(
-                    "last {} SIGSYS-intercepted syscalls (oldest->newest): {:?}",
-                    collected.len(),
-                    collected
-                ));
+            // 6-Z305t-71: BOTH death-dump blocks below are GLOBAL-budget
+            // (pid key 0) — every crash-looped service generation is a
+            // DISTINCT pid, so per-pid budgeting could not bound the
+            // ~1600 × ~55-line dumps ladder #131 accumulated. The first
+            // 8 deaths still dump fully; afterwards every 512th keeps a
+            // rate heartbeat (the svclogs per-service stderr capture
+            // carries the per-generation evidence regardless).
+            let dump_before_exit =
+                stop_log_allow(&mut stop_log_budget, SITE_DUMP_BEFORE_EXIT, 0, 512);
+            if dump_before_exit.is_some() {
+                if recent_sigsys.is_empty() {
+                    log("no SIGSYS interceptions recorded during this run");
+                } else {
+                    let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
+                    log(&format!(
+                        "last {} SIGSYS-intercepted syscalls (oldest->newest): {:?}",
+                        collected.len(),
+                        collected
+                    ));
+                }
             }
             // Print the rolling ALL-syscalls history so we can see the
             // last few UNintercepted syscalls init made before exiting.
@@ -14816,14 +14943,16 @@ pub fn run_ptrace_loop(
             // down WHY init gave up: the last unintercepted syscall
             // before exit(1) is typically the one whose error return
             // (e.g. openat() → -ENOENT) triggered the exit.
-            if !recent_all_syscalls.is_empty() {
-                log(&format!(
-                    "last {} ALL syscalls before exit (intercepted + unintercepted, oldest->newest): {}",
-                    recent_all_syscalls.len(),
-                    format_syscall_buffer(&recent_all_syscalls, abi)
-                ));
-            } else {
-                log("no syscalls recorded in all-syscalls buffer before exit");
+            if dump_before_exit.is_some() {
+                if !recent_all_syscalls.is_empty() {
+                    log(&format!(
+                        "last {} ALL syscalls before exit (intercepted + unintercepted, oldest->newest): {}",
+                        recent_all_syscalls.len(),
+                        format_syscall_buffer(&recent_all_syscalls, abi)
+                    ));
+                } else {
+                    log("no syscalls recorded in all-syscalls buffer before exit");
+                }
             }
             // Task 6-S (original policy): only init's exit terminates
             // `run_ptrace_loop`; a forked child (recovery, ueventd,
@@ -15137,15 +15266,25 @@ pub fn run_ptrace_loop(
             // FORK/CLONE/VFORK we use PTRACE_GETEVENTMSG on the parent
             // to read the new child's PID — purely diagnostic, since
             // the kernel auto-attaches us to the new child regardless.
-            // DIAGNOSTIC (6-R): log every SIGTRAP-family stop (with and without 0x80)
-            // to diagnose why PTRACE_EVENT_FORK is never observed.
+            // DIAGNOSTIC (6-R): log SIGTRAP-family stops (with and without
+            // 0x80) to diagnose why PTRACE_EVENT_FORK is never observed.
+            // 6-Z305t-71: BOUNDED — this line fired on EVERY plain SIGTRAP
+            // stop, and the consume-resume storm (the delivery fix in the
+            // plain-SIGTRAP dispatcher arm below) produced 7.35M
+            // occurrences / ~735MB in ladder #131 alone. First 2 per pid,
+            // then every 65536th with the running total.
             if sig == libc::SIGTRAP {
-                log(&format!(
-                    "SIGTRAP stop (no 0x80) on pid={}: status=0x{:08x}, ptrace_event={}",
-                    pid,
-                    status as u32,
-                    (status as u32) >> 16
-                ));
+                if let Some(total) =
+                    stop_log_allow(&mut stop_log_budget, SITE_PLAIN_SIGTRAP, pid, 65536)
+                {
+                    log(&format!(
+                        "SIGTRAP stop (no 0x80) on pid={}: status=0x{:08x}, ptrace_event={} [occurrence #{} of this pid]",
+                        pid,
+                        status as u32,
+                        (status as u32) >> 16,
+                        total
+                    ));
+                }
             }
 
             let ptrace_event: u32 = ((status as u32) >> 16) & 0xFFFF;
@@ -15598,18 +15737,25 @@ pub fn run_ptrace_loop(
                             .rev()
                             .cloned()
                             .collect();
-                        if tail.is_empty() {
-                            log(&format!(
-                                "6-Z78: no syscalls in all-syscalls ring at EXIT of pid {}",
-                                pid
-                            ));
-                        } else {
-                            log(&format!(
-                                "last {} ALL syscalls at EXIT of pid {} (oldest->newest): {}",
-                                tail.len(),
-                                pid,
-                                format_syscall_buffer(&tail, abi)
-                            ));
+                        // 6-Z305t-71: bounded — the PTRACE_EVENT_EXIT dump
+                        // fires once per dying process; a crash-loop fleet
+                        // made it ~1600 × 5-line dumps. GLOBAL budget
+                        // (pid key 0): first 8, then every 512th.
+                        if stop_log_allow(&mut stop_log_budget, SITE_DUMP_AT_EXIT, 0, 512).is_some()
+                        {
+                            if tail.is_empty() {
+                                log(&format!(
+                                    "6-Z78: no syscalls in all-syscalls ring at EXIT of pid {}",
+                                    pid
+                                ));
+                            } else {
+                                log(&format!(
+                                    "last {} ALL syscalls at EXIT of pid {} (oldest->newest): {}",
+                                    tail.len(),
+                                    pid,
+                                    format_syscall_buffer(&tail, abi)
+                                ));
+                            }
                         }
                         continue;
                     }
@@ -30486,6 +30632,197 @@ pub fn run_ptrace_loop(
                         }
                     }
                 }
+
+                // ── 6-Z305t-71: DELIVER the trap — kernel-honest semantics ──
+                //
+                // The old arm fell out of the dispatcher WITHOUT setting
+                // resume_signal: it consumed the stop and resumed with 0
+                // ("the trap is consumed without being re-injected").
+                // Correct ONLY for tracer-injected one-shot traps (the
+                // 6-Z43 int3 above, which still continues inside its
+                // block). A kernel-FORCED trap from a REGENERATING
+                // condition (a BRK the guest has no handler for, a forced
+                // fatal SIGTRAP) re-executes the SAME instruction on every
+                // consume-resume: stop → consume → stop → consume, FOREVER.
+                //
+                // Ladder #131: exactly that loop — two guest daemons
+                // (traced + traced_probes, the fork-exec children of init,
+                // which execs with init's near-fully-blocked signal mask —
+                // execve PRESERVES the mask) produced 7,348,781 stops /
+                // ~735MB of kr64 stderr in ~110s while the tracer served
+                // nobody else (libkr64 pegged state R; the whole service
+                // fleet crash-looped on syscall-service starvation).
+                //
+                // A real kernel DELIVERS forced signals with force_sig()
+                // semantics: the disposition becomes SIG_DFL AND the
+                // signal is UNBLOCKED. We emulate both halves:
+                //   (1) if the child blocks SIGTRAP (init's inherited
+                //       mask), PTRACE_SETSIGMASK-unblock it — a plain
+                //       re-injection into a blocked mask would park the
+                //       signal pending and the trap would spin forever;
+                //   (2) resume with the signal delivered — SIG_DFL kills
+                //       the process honestly (the guest's own init reaps
+                //       it and its restart backoff respawns the service),
+                //       a registered handler runs and makes progress.
+                // Either way the loop ENDS. The one-time per-pid
+                // instrument below names the trap (class, pc, image,
+                // mask) so the crash itself is decodable from the
+                // artifact — bounded, first stop only.
+                if let Some(total) =
+                    stop_log_allow(&mut stop_log_budget, SITE_PLAIN_SIGTRAP, pid, 65536)
+                {
+                    if total == 1 {
+                        // (a) siginfo — the trap class (raw-byte reads, the
+                        // libc siginfo_t binding is union-opaque here; the
+                        // SIGSEGV arm below uses the same offsets).
+                        let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                        let si_r = unsafe {
+                            libc::ptrace(
+                                0x4202, // PTRACE_GETSIGINFO
+                                pid,
+                                0,
+                                &mut si as *mut _ as libc::c_long,
+                            )
+                        };
+                        if si_r == 0 {
+                            let si_ptr = &si as *const libc::siginfo_t as *const u8;
+                            let si_code = unsafe { *si_ptr.add(8) as i32 };
+                            log(&format!(
+                                "6-Z305t-71 SIGTRAP siginfo: si_code={} (0x80=SI_KERNEL forced, 1=TRAP_BRKPT brk, 2=TRAP_TRACE, 4=TRAP_HWBKPT)",
+                                si_code
+                            ));
+                        } else {
+                            log(&format!(
+                                "6-Z305t-71 SIGTRAP siginfo: PTRACE_GETSIGINFO failed: {}",
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        // (b) regs — pc/sp + the syscall slot through the
+                        // child's ABI view (the cached ABI is an Option at
+                        // this dispatch depth — fall back to the aarch64
+                        // default layout for the sample only).
+                        let mut regs0: Regs = unsafe { std::mem::zeroed() };
+                        let pc = if ptrace_getregs_wide(pid, &mut regs0).is_ok() {
+                            // The cached ABI is an Option at this dispatch
+                            // depth; the aarch64 const is aarch64-host-only,
+                            // so the diagnostic fallback is per-host.
+                            #[cfg(target_arch = "aarch64")]
+                            let abi_view = abi.clone().unwrap_or(ABI_AARCH64);
+                            #[cfg(not(target_arch = "aarch64"))]
+                            #[allow(clippy::clone_on_copy)]
+                            let abi_view = abi.clone().unwrap_or(ABI_X86_64);
+                            let pc_val = guest_pc_of(&regs0);
+                            log(&format!(
+                                "6-Z305t-71 SIGTRAP regs: pc={:#x} sp={:#x} nr-slot={} arg1={:#x} arg2={:#x}",
+                                pc_val,
+                                get_syscall_arg(&regs0, abi_view.reg_sp),
+                                get_syscall_num(&regs0, &abi_view),
+                                get_syscall_arg(&regs0, abi_view.reg_arg1),
+                                get_syscall_arg(&regs0, abi_view.reg_arg2),
+                            ));
+                            pc_val
+                        } else {
+                            0
+                        };
+                        // (c) identity + signal mask — names the image and
+                        // records whether SIGTRAP was blocked (the forced
+                        // unblock below matters exactly then).
+                        let exe = std::fs::read_link(format!("/proc/{}/exe", pid))
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| "<unreadable>".to_string());
+                        let mut sigmask_note = String::new();
+                        if let Ok(st) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+                            for line in st.lines() {
+                                if line.starts_with("SigBlk:")
+                                    || line.starts_with("SigIgn:")
+                                    || line.starts_with("SigCgt:")
+                                    || line.starts_with("SigPnd:")
+                                {
+                                    sigmask_note.push_str(line.trim());
+                                    sigmask_note.push(' ');
+                                }
+                            }
+                        }
+                        log(&format!(
+                            "6-Z305t-71 SIGTRAP pid={} exe={} {}",
+                            pid, exe, sigmask_note
+                        ));
+                        // (d) the maps line containing pc — which code
+                        // region traps.
+                        if pc != 0 {
+                            if let Ok(maps) = std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                            {
+                                if let Some(line) = maps.lines().find(|l| {
+                                    if let Some((range, _)) = l.split_once(' ') {
+                                        if let Some((lo, hi)) = range.split_once('-') {
+                                            if let (Ok(lo), Ok(hi)) = (
+                                                u64::from_str_radix(lo, 16),
+                                                u64::from_str_radix(hi, 16),
+                                            ) {
+                                                return pc >= lo && pc < hi;
+                                            }
+                                        }
+                                    }
+                                    false
+                                }) {
+                                    log(&format!("6-Z305t-71 SIGTRAP pc-map: {}", line.trim()));
+                                }
+                            }
+                        }
+                    }
+                    if total <= 2 || (total - 2) % 65536 == 0 {
+                        log(&format!(
+                            "6-Z305t-71 SIGTRAP deliver: pid={} — kernel-forced trap DELIVERED (was consume-resumed forever) [stop occurrence #{} of this pid]",
+                            pid, total
+                        ));
+                    }
+                }
+                // force_sig half (1): unblock SIGTRAP in the tracee when
+                // its mask blocks it (PTRACE_GETSIGMASK=0x420a /
+                // PTRACE_SETSIGMASK=0x420b, kernel sigset = 64 bits).
+                let mut sigmask: u64 = 0;
+                let get_mask_r = unsafe {
+                    libc::ptrace(
+                        0x420au32,
+                        pid,
+                        8usize as *mut libc::c_void,
+                        &mut sigmask as *mut u64 as libc::c_long,
+                    )
+                };
+                if get_mask_r == 0 {
+                    if let Some(cleared) = sigtrap_force_mask(sigmask) {
+                        let set_r = unsafe {
+                            libc::ptrace(
+                                0x420bu32,
+                                pid,
+                                8usize as *mut libc::c_void,
+                                cleared as libc::c_long,
+                            )
+                        };
+                        let unblock_note = if set_r == 0 {
+                            "unblocked"
+                        } else {
+                            "UNBLOCK FAILED (the re-injection may park pending)"
+                        };
+                        let unblock_total = stop_log_allow(
+                            &mut stop_log_budget,
+                            SITE_PLAIN_SIGTRAP + 100,
+                            pid,
+                            4096,
+                        );
+                        if unblock_total.is_some() {
+                            log(&format!(
+                                "6-Z305t-71 SIGTRAP unblock: pid={} blocked-mask={:#x} SIGTRAP {} (force_sig semantics)",
+                                pid, sigmask, unblock_note
+                            ));
+                        }
+                    }
+                }
+                // force_sig half (2): deliver. The loop-top PTRACE_SYSCALL
+                // injects this signal into the resume, exactly like the
+                // generic real-signal arm below.
+                resume_signal = sig;
+                continue;
             } else if sig == libc::SIGSYS {
                 // SIGSYS (signal 31) is raised by the kernel when the
                 // child calls a syscall blocked by a SECCOMP_RET_TRAP
@@ -32126,6 +32463,77 @@ pub fn run_ptrace_loop(
 
 #[cfg(test)]
 mod tests {
+    // ── 6-Z305t-71: the bounded stop-class diagnostics ───────────────
+    //
+    // Ladder #131's 799MB kr64-app-stderr artifact (one 180s boot) had a
+    // single owner: 7,348,781 "SIGTRAP stop (no 0x80)" lines from the
+    // consume-resume loop against a regenerating guest trap. The budget
+    // guard is the regression fence for the LOGGING side (first 2 + every
+    // `every`-th), and `sigtrap_force_mask` pins the force_sig semantics
+    // of the DELIVERY fix (kernel-forced fatal traps unblock the signal).
+
+    #[test]
+    fn z305t71_stop_log_budget_first_two_then_heartbeat() {
+        let mut m = std::collections::HashMap::new();
+        // First 2 occurrences always log.
+        assert_eq!(stop_log_allow(&mut m, 1, 4121, 65536), Some(1));
+        assert_eq!(stop_log_allow(&mut m, 1, 4121, 65536), Some(2));
+        // The next occurrences are silent until base+every…
+        for i in 3..=65537 {
+            assert_eq!(
+                stop_log_allow(&mut m, 1, 4121, 65536),
+                None,
+                "occurrence {} must be budgeted away",
+                i
+            );
+        }
+        // …and occurrence 65538 (= 2 + 65536, the first multiple of
+        // 65536 after the base) resumes the heartbeat with the total.
+        let total = stop_log_allow(&mut m, 1, 4121, 65536).expect("65538th must log");
+        assert_eq!(total, 65538);
+        // A different (site, pid) key has its OWN budget.
+        assert_eq!(stop_log_allow(&mut m, 1, 4122, 65536), Some(1));
+        assert_eq!(stop_log_allow(&mut m, 2, 4121, 65536), Some(1));
+    }
+
+    #[test]
+    fn z305t71_stop_log_budget_global_key_bounds_a_crash_loop_fleet() {
+        // The death-dump sites use pid=0 (GLOBAL budget): distinct-pid
+        // crash-loop generations must share ONE budget, or a fleet of
+        // ~1600 one-shot pids re-dumps 55 lines each (~1600 × 55 lines in
+        // ladder #131) with every pid seeing "its" first occurrence.
+        let mut m = std::collections::HashMap::new();
+        assert_eq!(stop_log_allow(&mut m, 7, 0, 512), Some(1));
+        assert_eq!(stop_log_allow(&mut m, 7, 0, 512), Some(2));
+        // 511 more distinct crashing pids, same global key:
+        for _ in 0..511 {
+            assert_eq!(stop_log_allow(&mut m, 7, 0, 512), None);
+        }
+        // Occurrence 512+2 → wait: 2 base + 511 silent + this one = 514,
+        // and (514 - 2) % 512 = 0 → the heartbeat fires with the total.
+        assert_eq!(stop_log_allow(&mut m, 7, 0, 512), Some(514));
+        // A different site id is a separate global budget.
+        assert_eq!(stop_log_allow(&mut m, 8, 0, 512), Some(1));
+    }
+
+    #[test]
+    fn z305t71_sigtrap_force_mask_force_sig_semantics() {
+        // init execs services with a near-fully-blocked inherited mask
+        // (execve PRESERVES the mask): bit for SIGTRAP (5) set among the
+        // RT range. force_sig clears ONLY the trap's bit.
+        let init_like_mask: u64 = u64::MAX; // everything blocked
+        let cleared = sigtrap_force_mask(init_like_mask).expect("blocked trap must unblock");
+        assert_eq!(cleared & (1 << (libc::SIGTRAP - 1)), 0, "SIGTRAP cleared");
+        assert_ne!(cleared, 0, "every OTHER signal stays blocked");
+        assert_eq!(cleared, init_like_mask & !(1u64 << (libc::SIGTRAP - 1)));
+        // A mask without SIGTRAP needs no SETSIGMASK.
+        let no_trap: u64 = !(1u64 << (libc::SIGTRAP - 1));
+        assert_eq!(sigtrap_force_mask(no_trap), None);
+        // Exactly-one-bit masks round-trip.
+        assert_eq!(sigtrap_force_mask(1u64 << (libc::SIGTRAP - 1)), Some(0));
+        assert_eq!(sigtrap_force_mask(0), None);
+    }
+
     use super::*;
 
     // ── 6-Z305s-m: the fail-closed connect arm's scope gate ──────────
