@@ -13192,6 +13192,32 @@ pub fn run_ptrace_loop(
     // (fake fired, EXIT showed nr=172 getpid with ret=-1).
     let mut z305f_unshare_pids: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // 6-Z305y: the ZYGOTE STDIO PIN. `z305y_stdio_pin_pid` is the pid
+    // that exec'd app_process(64) with --zygote in argv (armed at the
+    // execve arm below); `z305y_zclose_pending` holds pids whose
+    // in-flight close(0/1/2) was rewritten to getpid so the EXIT side
+    // can force ret=0 (bionic close() returns 0).
+    //
+    // WHY: ladder #155 (6a63d7b, rung 7) proved the zygote's fd 0 keeps
+    // being destroyed and re-captured despite the shlib's 6-Z305t-75g
+    // libc-level STDIO FLOOR — the churn arrives via closes that never
+    // PLT-bind to the shlib (raw_syscall1(SYS_close) inside
+    // libtwrp_fb_hook, libc-internal closes, and the dynamic linker's
+    // own dlopen bookkeeping closes; #155's 6-Z305t-75d trace caught
+    // close(fd=0) from all three at +13.8s). Each successful raw close
+    // frees fd 0 and the NEXT open in the zygote reclaims it — #155's
+    // final fd table had fd 0 → /system/usr/hyphen-data/hyph-as.hyb,
+    // and the forkSystemServer child's fd whitelist then died
+    // "Not whitelisted (28)" on a sibling leaked hyb fd. Pinning the
+    // close AT THE SYSCALL LAYER (rewriting it to getpid, which the
+    // 6-Z147/6-Z305f precedents establish as the honest no-op rewrite)
+    // makes the floor unbypassable for the zygote — exactly what a
+    // supervisor does for a daemon's stdio. Service children are NOT
+    // pinned: init's service stdio wiring (dup2 of the svclog pipes
+    // onto 0/1/2) is legitimate and must keep working.
+    let mut z305y_stdio_pin_pid: Option<libc::pid_t> = None;
+    let mut z305y_zclose_pending: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
     // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
     // 0) — the EXIT arm turns the returned REAL fd into a tracked
@@ -17854,6 +17880,48 @@ pub fn run_ptrace_loop(
                                 // ABIs only (the `abi.execve != 11` gate of
                                 // this block; aarch64 execve=221,
                                 // x86_64 execve=59).
+                                //
+                                // 6-Z305y: the zygote pin arms HERE — the
+                                // exec is app_process64/app_process (the
+                                // zygote binary) and its argv carries
+                                // --zygote (the same signature the shlib's
+                                // 6-Z305t-76 socket constructor matches).
+                                // From this point every close(0/1/2) this
+                                // pid issues is rewritten to getpid at the
+                                // syscall layer (see the close ENTRY arm).
+                                if !boot_recovery
+                                    && past_first_execve
+                                    && (orig.ends_with("/app_process64")
+                                        || orig.ends_with("/app_process"))
+                                {
+                                    let argv_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                    let mut is_zygote = false;
+                                    if argv_addr != 0 {
+                                        for i in 0..8u64 {
+                                            match read_child_u64(
+                                                pid,
+                                                argv_addr + i * std::mem::size_of::<u64>() as u64,
+                                            ) {
+                                                Some(0) | None => break,
+                                                Some(w) => {
+                                                    if let Some(s) = read_child_string(pid, w) {
+                                                        if s == "--zygote" {
+                                                            is_zygote = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if is_zygote {
+                                        z305y_stdio_pin_pid = Some(pid);
+                                        log(&format!(
+                                            "6-Z305y: zygote pin ARMED for pid={} (exec \"{}\" with --zygote) — stdio close(0/1/2) will be rewritten to getpid",
+                                            pid, orig
+                                        ));
+                                    }
+                                }
                                 if !boot_recovery
                                     && past_first_execve
                                     && !z305s_skip_exec_path(&orig)
@@ -20744,6 +20812,44 @@ pub fn run_ptrace_loop(
                                         "6-Z305t-75d: pid={} close(fd={}) pc={:#x} maps[pc]={}",
                                         pid, close_fd, pc_val, region
                                     ));
+                                }
+                                // 6-Z305y: THE ZYGOTE STDIO PIN at the
+                                // syscall layer. The libc-level floor
+                                // (6-Z305t-75g) is bypassed by raw closes
+                                // (the fb hook's raw_syscall1(SYS_close),
+                                // libc internals, the dynamic linker's
+                                // dlopen bookkeeping — #155's 75d trace
+                                // caught all three closing fd 0 at +13.8s);
+                                // every freed fd 0 is re-captured by the
+                                // zygote's NEXT open and the forkSystemServer
+                                // child's fd whitelist then dies on the
+                                // rebound stdio. For the zygote pid ONLY
+                                // (service children keep their legitimate
+                                // stdio wiring), rewrite close(0/1/2) to
+                                // getpid — the 6-Z147/6-Z305f no-op-rewrite
+                                // precedent — and force ret=0 at EXIT so
+                                // bionic's close() sees success, identical
+                                // semantics to the libc-level floor.
+                                if z305y_stdio_pin_pid == Some(pid) {
+                                    static Z305Y_PIN_LOGGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let ln = Z305Y_PIN_LOGGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if ln < 24 {
+                                        log(&format!(
+                                            "6-Z305y: pin close(fd={}) pid={} → getpid rewrite (stdio floor at the syscall layer) [#{}]",
+                                            close_fd, pid, ln + 1
+                                        ));
+                                    }
+                                    set_syscall_num(&mut regs, &abi, abi.getpid);
+                                    if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                        z305y_zclose_pending.insert(pid);
+                                    } else {
+                                        log(&format!(
+                                            "6-Z305y: pin setregs FAILED pid={} — the close will execute",
+                                            pid
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -27557,6 +27663,16 @@ pub fn run_ptrace_loop(
                     // stale by definition — drop it with our marker.
                     if z305f_unshare_pids.remove(&pid) {
                         prctl_rewritten_args.remove(&pid);
+                        let mut regs_u: Regs = unsafe { std::mem::zeroed() };
+                        if ptrace_getregs_wide(pid, &mut regs_u).is_ok() {
+                            set_syscall_ret(&mut regs_u, &abi, 0);
+                            let _ = ptrace_setregs(pid, &regs_u, iov_len);
+                        }
+                    }
+                    // 6-Z305y: the zygote's pinned stdio close (rewritten to
+                    // getpid at ENTRY) must return 0 — the bionic close()
+                    // contract the libc-level floor also preserves.
+                    if z305y_zclose_pending.remove(&pid) {
                         let mut regs_u: Regs = unsafe { std::mem::zeroed() };
                         if ptrace_getregs_wide(pid, &mut regs_u).is_ok() {
                             set_syscall_ret(&mut regs_u, &abi, 0);
