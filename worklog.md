@@ -27203,3 +27203,17 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. Rung 8 = SYSTEMUI_LAUNCHER; rung 9 = BOOT_COMPLETED. surfaceflinger spawned in #124 — with registrations alive, system_server's HAL dependencies (gralloc/fb via HIDL?) resolve further.
   3. New surface: real routed HIDL service↔client traffic (requests AND replies now SG-correct); watch the routed-transaction arms (virtual-service INTERFACE_TRANSACTION etc.) for the next honest divergence.
   4. If a new abort signature appears: the svc-PID section in svclogs.txt + the conn= exchange lines (read_consumed/trailer size) + the bounded entry diags pin the call within one run.
+
+## 6-Z305t-69 — the registration vec + two honest-answer gaps; commit 4b0619b; ladder dispatched
+
+- Ladder #125 (34333358763 on 4e6712b = 68b): the NOT_ENOUGH_DATA storm is GONE (0×); getTransport healthy (301 HWBINDER-manifest + 165 honest EMPTY); rung 7 held (SURFACEFLINGER); the bounded diags exposed the next three rocks in ONE run:
+  1. `parse-fail (addWithChain.chain) code=12 dsize=308 offs=7 sg=6 (144B, [16, 8, 16, 32, 43, 29])` — the REAL hidl_vec<hidl_string> wire: NO per-element struct objects. Layout: [PTR vec struct 16B {ptr,size}][PTR array child(parent=vec, offset 0), len=count×16][PTR chars_j child(parent=THE ARRAY, offset=j*16)] — element structs live INSIDE the array SG buffer. The -68 parser expected per-element struct+chars pairs → EVERY addWithChain died at the chain parse → ZERO registrations → the fleet could not come up. FIX: read_vec_string_arg rewritten (parent-index + j*16 integrity checks); HidlReqBuilder emits the real shape.
+  2. `parse-fail (catch-all) code=8` — registerPassthroughClient (oneway bookkeeping) → BR_FAILED_REPLY on a ONEWAY transaction. FIX: honest arm (record + bounded log) + a GENERIC oneway guard at the BC arm (oneway → TC only, always — kills the stale-BR_REPLY desync class for every oneway SM/virtual-service call).
+  3. 53× "Failed HIDL return status not checked" aborts at +11383ms (conn=23 = cameraserver) — listManifestByInterface (code 13) catch-all → unchecked failed Return → fatal. FIX: the REAL SG-shaped reply via the new ParcelWriter::write_ptr_object: vec<Instance{fqName,instance}> filtered from the bus registry by exact fq; parent indices wire-exact (array.parent=vec object, chars.parent=array, offsets j*32+0/+16); the SG bytes ride the v3 resp trailer, the loader applies the receiver pointer fixup (68 machinery). TransactionResult::Reply now carries sg end-to-end.
+- Tests +1 (811/811): hidl_list_manifest_by_interface_builds_sg_reply asserts the PTR/parent/offset layout byte-exact (it caught a parent-index bug in the arm before push). fmt + clippy -D warnings clean.
+- The TWRP recovery gate: GREEN on post-68 code (34328571962 on a3f34d4; the earlier flood-window failure was the recovery-image DOWNLOAD step rate-limited by ~400 concurrent flood downloads — not a boot regression).
+- DECISION TREE for the next ladder (#126):
+  1. "HIDL addWithChain(…) → handle" lines appear; the vendor HAL fleet registers; the exit-waves (hidl_memory, system_suspend, cameraserver, vold) should thin out.
+  2. cameraserver's listManifestByInterface returns entries (or honest empty) — no more unchecked-abort deaths.
+  3. Rung 8 = SYSTEMUI_LAUNCHER: with registrations alive, system_server's HIDL deps resolve; SurfaceFlinger's gralloc/composer chain is the watch.
+  4. If a NEW abort signature appears: the svclogs section + the conn= trailer size + the entry diag pin it in one run — the instrument is now fully armed.
