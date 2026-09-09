@@ -188,13 +188,38 @@ class Ext4:
         return node
 
     def _extent_blocks(self, inode):
-        """Yield (file_block_offset, fs_block_nr, n_blocks)."""
+        """Yield (file_block_offset, fs_block_nr, n_blocks).
+
+        6-Z305t-74 FIX (ladder #144 decode): the previous version pushed
+        `(base + ei_block, ...)` for interior nodes and yielded
+        `base + ee_block` at the leaves — treating the interior index
+        entries' ei_block as a BASE to ADD. That is WRONG per the ext4
+        spec: BOTH ei_block (index entries) and ee_block (leaf extents)
+        hold the LOGICAL BLOCK NUMBER IN THE FILE, ABSOLUTE at every
+        tree level; ei_block is only the b-tree SEARCH KEY (the minimum
+        file block covered by that subtree), and the kernel's
+        ext4_ext_find_extent uses it for binary search, never as an
+        offset base. With the addition, every leaf after the first got
+        its ee_block DOUBLED (leaf N's ee_blocks ≈ N×leaf_span added to
+        the same values again), so read_file's writes landed past EOF
+        and were dropped: the assembled file kept its inode size but had
+        a ZEROED TAIL. framework-res.apk (48.5MB — the biggest file in
+        the image, spanning 9 leaves; its extent tree root is depth=2)
+        lost its zip central directory + EOCD → the Android-11 zygote's
+        AssetManager "Zip: EOCD not found, framework-res.apk is not
+        zip" → "System zygote died with exception" → zygote exit(0)
+        before forkSystemServer (ladder #143/#144: rung 7, zygote
+        fleet + preload OK until GsmAlphabet.<clinit> →
+        Resources.getSystem()). framework.jar (29MB) survived because
+        its tree happened to fit the first leaf. Any file whose extent
+        tree spans more than one leaf was corrupted by this bug.
+        """
         hdr = inode["i_block"]
         n_entries = struct.unpack_from("<H", hdr, 2)[0]
         depth = struct.unpack_from("<H", hdr, 6)[0]
-        stack = [(0, hdr, n_entries, depth)]
+        stack = [(hdr, n_entries, depth)]
         while stack:
-            base, node, entries, d = stack.pop()
+            node, entries, d = stack.pop()
             for i in range(entries):
                 off = 12 + i * 12
                 if d == 0:
@@ -205,7 +230,9 @@ class Ext4:
                     start_lo = struct.unpack_from("<I", node, off + 8)[0]
                     start = (start_hi << 32) | start_lo
                     if start:
-                        yield (base + ee_block, start, ee_len)
+                        # ee_block is the ABSOLUTE logical block in the
+                        # file — no base addition (see the FIX note).
+                        yield (ee_block, start, ee_len)
                 else:
                     # struct ext4_extent_idx: ei_block(4) leaf_lo(4) leaf_hi(2)
                     ei_block = struct.unpack_from("<I", node, off)[0]
@@ -217,7 +244,11 @@ class Ext4:
                     raw = self._read_fs_block(leaf)
                     n = struct.unpack_from("<H", raw, 2)[0]
                     d2 = struct.unpack_from("<H", raw, 6)[0]
-                    stack.append((base + ei_block, raw, n, d2))
+                    # 6-Z305t-74: no base addition — ei_block is the
+                    # subtree's minimum ABSOLUTE logical block (a search
+                    # key), and the child node's entries are absolute
+                    # too. Push only the node payload.
+                    stack.append((raw, n, d2))
 
     def _read_fs_block(self, nr):
         self.f.seek(nr * self.block_size)
