@@ -15051,6 +15051,27 @@ pub fn run_ptrace_loop(
             // iteration 177" issue: the last few SIGSYS numbers tell us
             // which seccomp-blocked syscall (mount? chroot? unshare?)
             // init was retrying right before it gave up and exited.
+            // ── 6-Z305t-71j: exit(1) deaths carry an abort message too ──
+            // The fb hook INTERCEPTS abort() in every guest process and
+            // exits(1) WITHOUT raising a signal (the shlib-side scan line
+            // + maps dump land in the svc log, whose middle section the
+            // artifact budget truncates — ladder #139's zygote: 100KB
+            // maps dump in the unseen middle, exit status 1, ZERO
+            // signal-delivery stops so the 71i signal-side reader cannot
+            // fire). The mapping still exists at the WIFEXITED stop:
+            // read it BEFORE the reaping paths.
+            if let Some(abort_msg) = read_bionic_abort_message(pid) {
+                if let Some(total) = stop_log_allow(&mut stop_log_budget, SITE_ABORT_MSG, pid, 4096)
+                {
+                    log(&format!(
+                        "6-Z305t-71j: pid={} exited status={} — bionic abort message: {:?} [occurrence #{} of this pid]",
+                        pid,
+                        libc::WEXITSTATUS(status),
+                        abort_msg,
+                        total
+                    ));
+                }
+            }
             // 6-Z305t-71: BOTH death-dump blocks below are GLOBAL-budget
             // (pid key 0) — every crash-looped service generation is a
             // DISTINCT pid, so per-pid budgeting could not bound the
