@@ -21037,7 +21037,12 @@ pub fn run_ptrace_loop(
                                 // injection: the tracer connects to the proxy and injects
                                 // the connected fd; the matching EXIT overrides the
                                 // honest ENXIO with it (see pending_qpipe_fd).
-                                if qpipe_fd_injection && path == "/dev/qemu_pipe" {
+                                // 6-Z305t-71g: the A11 ranchu goldfish stack opens
+                                // /dev/goldfish_pipe FIRST (its init.rc symlink to
+                                // /dev/qemu_pipe fails under the tracer) — cover it.
+                                if qpipe_fd_injection
+                                    && (path == "/dev/qemu_pipe" || path == "/dev/goldfish_pipe")
+                                {
                                     match qpipe_proxy_inject(pid, rootfs) {
                                         Ok(child_fd) => {
                                             pending_qpipe_fd.insert(pid, child_fd);
