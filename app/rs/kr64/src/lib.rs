@@ -3019,6 +3019,60 @@ pub const AOSP_LD_PRELOAD_ENV: &str =
 /// exist for every lib the guest actually ships.
 pub const AOSP_SERVICE_LD_LIBRARY_PATH: &str = "/dev";
 
+/// 6-Z305w: the LD_LIBRARY_PATH chain for VENDOR-partition guest execs
+/// (exec paths under /vendor/, /odm/ or /product/).
+///
+/// Ladder #154 (afd2550) decode: the graphics HALs
+/// (`/vendor/bin/hw/android.hardware.graphics.allocator@3.0-service`,
+/// `...composer@2.3-service`) exit(1) with
+/// `CANNOT LINK EXECUTABLE "…" (libdrm.so …)` every generation, and
+/// their rc `onrestart` lines run `restart surfaceflinger` (killing the
+/// RUNNING SF) whose own onrestart runs `restart zygote` — killing the
+/// HEALTHY zygote ~6 s into every generation, before it can fork
+/// system_server. That is genuine AOSP onrestart semantics (init.rc:
+/// surfaceflinger.rc:6 `onrestart restart zygote`) — the wall is the
+/// HALs' own CANNOT LINK, not the onrestart design.
+///
+/// The HAL needs vendor-partition libs (libdrm.so, libOpenglSystemCommon.so,
+/// libOpenglCodecCommon.so, …) that live in /vendor/lib64 (libdrm also in
+/// /system/lib64). The guest linker resolves them through the
+/// /linkerconfig/ld.config.txt namespace table, whose `dir.<section>`
+/// exec-path matching (bionic linker_config.cpp read_binary_config) runs
+/// `access()`+`realpath()` on the dir patterns and a string-prefix
+/// `file_is_under_dir(binary_path, dir)` match — under the twoyi path
+/// illusion those two legs can land on DIFFERENT namespaces of paths
+/// (host-realpath vs guest-string), and a mismatch leaves a vendor exec
+/// in the (default) namespace whose search paths do not include
+/// /vendor/lib64. This chain makes the lib locations reachable through
+/// the LD_LIBRARY_PATH leg INDEPENDENT of which section the config match
+/// picks: bionic linker_main.cpp parse_LD_LIBRARY_PATH lands the entries
+/// in the default namespace's ld_library_paths (searched BEFORE the
+/// config's default_library_paths, unisolated-namespace accessible).
+///
+/// `/dev` stays FIRST (the 5-L real-libdl requirement of the preload
+/// chain — see AOSP_SERVICE_LD_LIBRARY_PATH). /system/lib64 is LAST so a
+/// vendor variant is always preferred over the system variant (the
+/// variant-order failure mode). Entries for dirs the rootfs lacks are
+/// silently dropped by bionic's resolve_paths (realpath miss) — this is
+/// a search-chain, not a contract.
+pub const AOSP_SERVICE_LD_LIBRARY_PATH_VENDOR: &str =
+    "/dev:/vendor/lib64:/vendor/lib64/hw:/odm/lib64:/odm/lib64/hw:/product/lib64:/system/lib64";
+
+/// 6-Z305w: pure per-exec LD_LIBRARY_PATH selector for the 6-Z305s envp
+/// injection. Vendor-partition execs (staged from /vendor|/odm|/product
+/// binaries) get the vendor chain; everything else keeps the proven
+/// `/dev` chain. Pure so it is unit-testable in isolation.
+pub fn aosp_service_ld_library_path_for(orig_exec_path: &str) -> &'static str {
+    if orig_exec_path.starts_with("/vendor/")
+        || orig_exec_path.starts_with("/odm/")
+        || orig_exec_path.starts_with("/product/")
+    {
+        AOSP_SERVICE_LD_LIBRARY_PATH_VENDOR
+    } else {
+        AOSP_SERVICE_LD_LIBRARY_PATH
+    }
+}
+
 /// 6-Z305s: the LD_PRELOAD chain VALUE (no `LD_PRELOAD=` prefix) the
 /// tracer injects into guest execve envps that lack one — the same
 /// effective chain the init execve env carries (compat shim prepended
