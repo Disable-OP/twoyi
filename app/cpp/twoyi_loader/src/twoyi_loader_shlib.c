@@ -7067,6 +7067,41 @@ static void *gotfix_dlopen_window_thread(void *arg) {
     return NULL;
 }
 
+// ── 6-Z305t-75: the STDIN WATCHDOG ────────────────────────────────
+//
+// Ladder #146: the constructor-time stdin belt (below) opened fd 0
+// once, yet the zygote STILL died at ZygoteHooks.onEndPreload with
+// "fcntl failed: EBADF" on FileDescriptor.in — fd 0 was free again at
+// death (the post-mortem /proc/self/stat open returned fd=0). So
+// SOMETHING between the constructor and end-of-preload closes fd 0
+// (init's SetupStdio opens /dev/null O_CLOEXEC and dup2s 0/1/2 — the
+// unique_fd closes the original; under the twoyi spawn path some leg
+// of that dance leaves 0 closed, or a later rebind closes it). Rather
+// than chase the closer, KEEP fd 0 REPAIRED: this watchdog re-checks
+// every 500ms for the first 120s of the process (preload takes single
+// digit seconds) and re-opens a REAL /dev/null onto fd 0 whenever it
+// finds it closed. Honest fds only — never a fake. Android mode only
+// (recovery keeps its byte-identical behavior; its stdio works).
+static void *stdin_watchdog_thread(void *arg) {
+    (void)arg;
+    for (int round = 0; round < 240; round++) { // 240 × 500ms = 120s
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 500 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+        if (syscall(SYS_fcntl, 0, F_GETFD, 0) >= 0) continue;
+        int nfd = (int)twoyi_sys_open("/dev/null", O_RDWR, 0);
+        if (nfd >= 0) {
+            if (nfd != 0) {
+                syscall(SYS_dup3, nfd, 0, 0);
+                syscall(NR_close, nfd);
+            }
+            write_str(2, "[twoyi_loader] 6-Z305t-75: stdin watchdog repaired fd0\n");
+        }
+    }
+    return NULL;
+}
+
 // The repair pass — called from twoyi_init() when TWOYI_BOOT_MODE=android.
 static void patch_open_family_gots(void) {
     static struct gotfix_ctx ctx_storage;
@@ -7218,6 +7253,7 @@ static void twoyi_init(void) {
                 syscall(SYS_dup3, nfd, 0, 0);
                 syscall(NR_close, nfd);
             }
+            write_str(2, "[twoyi_loader] 6-Z305t-75: stdin belt repaired fd0 at constructor\n");
         }
     }
 
@@ -7591,6 +7627,17 @@ static void twoyi_init(void) {
                 pthread_detach(gotfix_poll_tid);
             } else {
                 write_str(2, "[twoyi_loader] gotfix-44: dlopen-window re-repair thread FAILED to spawn\n");
+            }
+        }
+        // 6-Z305t-75: keep fd 0 alive through the zygote's preload (see
+        // the stdin watchdog block comment above).
+        {
+            pthread_t stdin_watch_tid;
+            if (pthread_create(&stdin_watch_tid, NULL,
+                               stdin_watchdog_thread, NULL) == 0) {
+                pthread_detach(stdin_watch_tid);
+            } else {
+                write_str(2, "[twoyi_loader] 6-Z305t-75: stdin watchdog FAILED to spawn\n");
             }
         }
     }
