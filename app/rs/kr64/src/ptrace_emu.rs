@@ -1429,15 +1429,23 @@ struct ChildAbi {
     // fstatfs64=269 leave 270 free; the rt_sig* families (174-179 on
     // i386/arm32) do not overlap anything already carried.
     //
-    // tkill (x86_64=200, aarch64=130, arm32=130, i386=239) is
-    // deliberately NOT translated: it takes a bare tid (no tgid), the
-    // getpid fake never reaches its arguments, and bionic never issues
-    // it. kill(0, …) / kill(-1, …) are left untouched: 0 means "my
-    // process group" (kernel-native, correct), and negative-pid
-    // broadcast policy belongs to the 6-Z185 sandbox backstop, not to
-    // pid translation.
+    // tkill (x86_64=200, aarch64=130, arm32=238, i386=238 — 6-Z305u
+    // correction of the old arm32=130/i386=239 guesses, verified per
+    // table) is deliberately NOT translated: it takes a bare tid (no
+    // tgid), the getpid fake never reaches its arguments, and bionic
+    // never issues it. kill(0, …) / kill(-1, …) are left untouched: 0
+    // means "my process group" (kernel-native, correct), and
+    // negative-pid broadcast policy belongs to the 6-Z185 sandbox
+    // backstop, not to pid translation.
     kill_nr: i64,
     tgkill_nr: i64,
+    // 6-Z305u: tkill CARRIED for the KILL-TRACE arm (logging only — the
+    // no-translation policy above is unchanged). VERIFIED per table:
+    // x86_64=200 (syscall_64.tbl), i386=238 (syscall_32.tbl),
+    // aarch64=130 (asm-generic/unistd.h), arm32=238
+    // (arch/arm/tools/syscall.tbl — arm32 keeps its own table; the
+    // asm-generic numbers do NOT apply to it).
+    tkill_nr: i64,
     rt_sigqueueinfo_nr: i64,
     // ── 6-Z305t-72: the prctl syscall number, PER ABI ────────────────
     //
@@ -1764,8 +1772,10 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     reg_sp: 19, // rsp
     // 6-Z266 kill-family numbers (see the field docs on ChildAbi):
     // x86_64 kill=62, tgkill=234, rt_sigqueueinfo=129.
+    // 6-Z305u: tkill=200 (syscall_64.tbl).
     kill_nr: 62,
     tgkill_nr: 234,
+    tkill_nr: 200,
     rt_sigqueueinfo_nr: 129,
     prctl: 157,
 };
@@ -2178,6 +2188,8 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // statfs64/fstatfs64 here, so tgkill uses 270).
     kill_nr: 37,
     tgkill_nr: 270,
+    // 6-Z305u: i386 tkill=238 (syscall_32.tbl).
+    tkill_nr: 238,
     rt_sigqueueinfo_nr: 178,
     prctl: 172, // i386 prctl=172 — no getpid collision (i386 getpid=20)
 };
@@ -2551,16 +2563,16 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // aarch64 (asm-generic) kill=129, tgkill=131, rt_sigqueueinfo=138.
     // THIS is the table that fires for the user's OrangeFox R12
     // lavender storm (bionic raise() = tgkill(1, tid, sig)).
+    // 6-Z305u: tkill=130 (asm-generic/unistd.h).
     kill_nr: 129,
     tgkill_nr: 131,
+    tkill_nr: 130,
     rt_sigqueueinfo_nr: 138,
     // 6-Z305t-72: aarch64 prctl=167. NOT 172 — on aarch64 172 is
     // getpid; the old cross-ABI literal union poisoned every arm64
     // getpid with emulated_prctl_ret(0,0)==0 (the zygote wall).
     prctl: 167,
 };
-
-// ── 6-Z228: ABI_ARM32 — ELF32 EM_ARM children on an arm64 host ─────
 //
 // AArch32 compat mode (CONFIG_COMPAT): the kernel exposes the 72-byte
 // arm user_regs_struct via NT_PRSTATUS; ptrace_getregs_arm32 widens it
@@ -2718,6 +2730,9 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     // for tgkill).
     kill_nr: 37,
     tgkill_nr: 268,
+    // 6-Z305u: arm32 tkill=238 (arch/arm/tools/syscall.tbl — arm32 keeps
+    // its own table; kill=37/tgkill=268 are the legacy EABI slots).
+    tkill_nr: 238,
     rt_sigqueueinfo_nr: 178,
     prctl: 172, // arm32 prctl=172 — no getpid collision (arm32 getpid=20)
 };
@@ -12356,13 +12371,26 @@ enum StopRingEvent {
 
 static STOP_RING: std::sync::Mutex<std::collections::VecDeque<StopRingEvent>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
-/// Cap: 6000 lines ≈ the last ~3000 resume+stop pairs (~700 KB).
-const STOP_RING_CAP: usize = 6000;
-/// Dumps are rate-limited: at most one per reason-window per 5 s and a
-/// hard lifetime budget per boot, so a hot anomaly site can never turn
-/// the ring into a new flood source.
-const STOP_RING_DUMP_MIN_INTERVAL_MS: u64 = 5000;
-const STOP_RING_MAX_DUMPS: u64 = 24;
+/// Cap: the ring's event history before it starts evicting.
+/// 6-Z305v (ladder #154 stderr budget post-mortem): 6000 → 1200
+/// events. #154 rendered ~144k ring lines (~100 MB — the run's
+/// dominant stderr family) as 24 dumps × ~6000 events, with EVERY
+/// resumed pid's 100+-entry tracked_pids Debug riding the RESUME
+/// lines (~800 B each) and the repeated onrestart kill cycle feeding
+/// the ring faster than the 5 s dump gate could throttle. The
+/// correlation VALUE sits in the last few hundred pairs — the deep
+/// history was pure artifact weight.
+const STOP_RING_CAP: usize = 1200;
+/// Dumps are rate-limited: at most one per reason-window per interval
+/// and a hard lifetime budget per boot, so a hot anomaly site can
+/// never turn the ring into a new flood source.
+/// 6-Z305v: 24 → 3 lifetime dumps and 5 s → 15 s min interval — #154
+/// consumed the whole 24 budget on the repeated onrestart kill cycle
+/// (~1 dump per kill window, one every ~6 s) and the dumps WERE the
+/// 100 MB. 3 dumps × 1200 events × truncated lines ≈ <1 MB while
+/// still capturing the FIRST anomaly windows of the run.
+const STOP_RING_DUMP_MIN_INTERVAL_MS: u64 = 15000;
+const STOP_RING_MAX_DUMPS: u64 = 3;
 static STOP_RING_LAST_DUMP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static STOP_RING_DUMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -12383,7 +12411,22 @@ fn stop_ring_push_event(ev: StopRingEvent) {
 /// purpose (which children the tracer knew about) the dump-time
 /// snapshot is equivalent and costs nothing per stop. `{:?}` on a
 /// slice renders identically to the old Vec Debug.
+/// 6-Z305v: the tracked_pids Debug was the byte bomb of ladder #154 —
+/// 117 tracked pids ⇒ ~800-byte RESUME lines ⇒ ~100 MB of dumps. The
+/// correlation needs the list's existence + head, not all entries:
+/// keep the first 12 and append `…(+N more)`. Byte-identical to the
+/// legacy format whenever tracked.len() ≤ 12 (early-boot windows).
 fn stop_ring_event_render(ev: StopRingEvent, tracked: &[libc::pid_t]) -> String {
+    const TRACKED_RENDER_MAX: usize = 12;
+    let tracked_str = if tracked.len() <= TRACKED_RENDER_MAX {
+        format!("{:?}", tracked)
+    } else {
+        format!(
+            "{:?}…(+{} more)",
+            &tracked[..TRACKED_RENDER_MAX],
+            tracked.len() - TRACKED_RENDER_MAX
+        )
+    };
     match ev {
         StopRingEvent::Resume {
             seq,
@@ -12391,8 +12434,8 @@ fn stop_ring_event_render(ev: StopRingEvent, tracked: &[libc::pid_t]) -> String 
             loop_count,
             resume_signal,
         } => format!(
-            "6-Z213 RESUME #{}: pid={} loop_count={} resume_signal={} tracked_pids={:?}",
-            seq, pid, loop_count, resume_signal, tracked
+            "6-Z213 RESUME #{}: pid={} loop_count={} resume_signal={} tracked_pids={}",
+            seq, pid, loop_count, resume_signal, tracked_str
         ),
         StopRingEvent::RawStop {
             seq,
@@ -16852,6 +16895,113 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // ── 6-Z305u: KILL-TRACE — bounded kill/tkill/tgkill
+                    // attribution at ENTRY ─────────────────────────────
+                    //
+                    // Ladder #154 (afd2550) named the rung-5 zygote wall
+                    // at the KLOG layer: init's
+                    // "Command 'restart zygote' action=onrestart
+                    // (<Service 'surfaceflinger' onrestart>:1)" fired
+                    // BEFORE the zygote death reap — the onrestart chain
+                    // (gralloc/hwcomposer die → their rc onrestart runs
+                    // `restart surfaceflinger` → the running SF is
+                    // SIGKILLed → SF's onrestart runs `restart zygote` →
+                    // the RUNNING zygote is SIGKILLed) murders the
+                    // healthy zygote every ~6 s before it can fork
+                    // system_server. But the tracer plane had NO
+                    // syscall-level record of the actual kill(2)
+                    // invocations, so (a) the onrestart attribution
+                    // rested on init's own klog lines alone and (b) a
+                    // HOST-side killer (host lmkd / kernel OOM — the
+                    // #154 worklog's candidate list) could not be
+                    // DISPROVEN by absence of evidence.
+                    //
+                    // This arm closes both: every guest kill-family call
+                    // is logged with sender pid + comm + target + sig.
+                    // A guest pid that dies by signal N with NO matching
+                    // KILL-TRACE line proves a NON-GUEST sender (host
+                    // process or kernel) — decisive either way. Logging
+                    // ONLY — no argument rewriting, no behavior change.
+                    //
+                    // Bounded: first 6 lines per (sender, family, target,
+                    // sig) key + a 400-line global budget. kill-family
+                    // calls are rare in a boot (dozens), so the budget is
+                    // generous in practice but cannot flood even under a
+                    // kill-loop pathology.
+                    if syscall_num == abi.kill_nr
+                        || syscall_num == abi.tkill_nr
+                        || syscall_num == abi.tgkill_nr
+                    {
+                        // (sender-pid, syscall-nr, target, sig) → occurrence
+                        // count for the per-key cap below.
+                        type KillTraceKey = (i32, i64, i64, i64);
+                        static KILL_TRACE_LINES: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        static KILL_TRACE_KEYS: std::sync::Mutex<
+                            Option<std::collections::HashMap<KillTraceKey, u64>>,
+                        > = std::sync::Mutex::new(None);
+                        const KILL_TRACE_GLOBAL_CAP: u64 = 400;
+                        const KILL_TRACE_PER_KEY_CAP: u64 = 6;
+                        // kill(pid, sig): a1=pid-or-group, a2=sig
+                        // tkill(tid, sig): a1=tid, a2=sig
+                        // tgkill(tgid, tid, sig): a1=tgid, a2=tid, a3=sig
+                        let a1 = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                        let a2 = get_syscall_arg(&regs, abi.reg_arg2) as i64;
+                        let a3 = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                        let (call, call_key, target, sig) = if syscall_num == abi.tgkill_nr {
+                            ("tgkill", abi.tgkill_nr, a2, a3)
+                        } else if syscall_num == abi.tkill_nr {
+                            ("tkill", abi.tkill_nr, a1, a2)
+                        } else {
+                            ("kill", abi.kill_nr, a1, a2)
+                        };
+                        let key = (pid as i32, call_key, target, sig);
+                        let lines =
+                            KILL_TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if lines < KILL_TRACE_GLOBAL_CAP {
+                            let mut seen: u64 = 1;
+                            let mut bookkeeping_ok = true;
+                            if let Ok(mut guard) = KILL_TRACE_KEYS.lock() {
+                                let m = guard.get_or_insert_with(std::collections::HashMap::new);
+                                let c = m.entry(key).or_insert(0);
+                                *c += 1;
+                                seen = *c;
+                            } else {
+                                bookkeeping_ok = false;
+                            }
+                            if !bookkeeping_ok || seen <= KILL_TRACE_PER_KEY_CAP {
+                                let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                    .unwrap_or_default();
+                                let comm = comm.trim_end();
+                                let group_note = if target < 0 {
+                                    " (process-group kill)"
+                                } else if target == 0 {
+                                    " (own process-group kill)"
+                                } else {
+                                    ""
+                                };
+                                let args = if call == "tgkill" {
+                                    format!("tgid={}, tid={}", a1, a2)
+                                } else if call == "tkill" {
+                                    format!("tid={}", a1)
+                                } else {
+                                    format!("pid={}", a1)
+                                };
+                                log(&format!(
+                                    "6-Z305u KILL-TRACE: pid={} comm=\"{}\" {}({}, sig={}){} [key #{}, global #{}]",
+                                    pid,
+                                    comm,
+                                    call,
+                                    args,
+                                    sig,
+                                    group_note,
+                                    seen,
+                                    lines + 1
+                                ));
+                            }
+                        }
+                    }
+
                     // ── 6-Z199: ENTRY-side arg1 (fd) stash for
                     // EXIT-side consumers ──
                     //
@@ -17799,9 +17949,17 @@ pub fn run_ptrace_loop(
                                                         sp_now.wrapping_sub(24 * 1024u64) & !7u64;
                                                     let preload_str =
                                                         format!("LD_PRELOAD={}", chain);
+                                                    // 6-Z305w: vendor-partition execs
+                                                    // (/vendor|/odm|/product binaries)
+                                                    // get the vendor LD_LIBRARY_PATH chain
+                                                    // — the graphics HALs' CANNOT LINK wall
+                                                    // and the onrestart murder cascade it
+                                                    // feeds (see aosp_service_ld_library_path_for).
                                                     let ldlib_str = format!(
                                                         "LD_LIBRARY_PATH={}",
-                                                        crate::AOSP_SERVICE_LD_LIBRARY_PATH
+                                                        crate::aosp_service_ld_library_path_for(
+                                                            &orig
+                                                        )
                                                     );
                                                     // 6-Z305s-d: +1 slot for the
                                                     // TWOYI_SHLIB_NO_PROPS gate string.
@@ -38625,6 +38783,74 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // LIBC-versioned DT_NEEDED never hits the 5848-byte bootstrap
         // stub at /system/lib64/libdl.so.
         assert!(crate::AOSP_SERVICE_LD_LIBRARY_PATH.starts_with("/dev"));
+    }
+
+    #[test]
+    fn z305w_vendor_ld_library_path_selector() {
+        // 6-Z305w: vendor-partition execs get the vendor chain; system
+        // execs keep the proven /dev chain. The chain keeps /dev FIRST
+        // (the 5-L real-libdl preload requirement) and /system/lib64
+        // LAST (vendor variants win the search order).
+        // (a) The two ladder-#154 murderers.
+        assert_eq!(
+            crate::aosp_service_ld_library_path_for(
+                "/vendor/bin/hw/android.hardware.graphics.allocator@3.0-service",
+            ),
+            crate::AOSP_SERVICE_LD_LIBRARY_PATH_VENDOR
+        );
+        assert_eq!(
+            crate::aosp_service_ld_library_path_for(
+                "/vendor/bin/hw/android.hardware.graphics.composer@2.3-service",
+            ),
+            crate::AOSP_SERVICE_LD_LIBRARY_PATH_VENDOR
+        );
+        // (b) odm + product spellings also match.
+        assert_eq!(
+            crate::aosp_service_ld_library_path_for("/odm/bin/some_hal"),
+            crate::AOSP_SERVICE_LD_LIBRARY_PATH_VENDOR
+        );
+        assert_eq!(
+            crate::aosp_service_ld_library_path_for("/product/bin/productservice"),
+            crate::AOSP_SERVICE_LD_LIBRARY_PATH_VENDOR
+        );
+        // (c) System / core execs keep the /dev chain.
+        assert_eq!(
+            crate::aosp_service_ld_library_path_for("/system/bin/lmkd"),
+            crate::AOSP_SERVICE_LD_LIBRARY_PATH
+        );
+        assert_eq!(
+            crate::aosp_service_ld_library_path_for("/system/bin/app_process64"),
+            crate::AOSP_SERVICE_LD_LIBRARY_PATH
+        );
+        assert_eq!(
+            crate::aosp_service_ld_library_path_for("/init"),
+            crate::AOSP_SERVICE_LD_LIBRARY_PATH
+        );
+        // (d) "vendor" as a NAME COMPONENT is not the partition: no
+        // prefix-bug false positives.
+        assert_eq!(
+            crate::aosp_service_ld_library_path_for("/system/bin/vendor_tool"),
+            crate::AOSP_SERVICE_LD_LIBRARY_PATH
+        );
+        // (e) The vendor chain shape: /dev first, /system/lib64 last,
+        // every entry a rootfs directory that exists (lib64 dirs).
+        let v = crate::AOSP_SERVICE_LD_LIBRARY_PATH_VENDOR;
+        assert!(v.starts_with("/dev:"));
+        assert!(v.ends_with(":/system/lib64"));
+        for dir in v.split(':') {
+            assert!(
+                dir == "/dev" || dir.ends_with("/lib64") || dir.ends_with("/lib64/hw"),
+                "unexpected chain entry {}",
+                dir
+            );
+        }
+        // (f) The ABI table stays kill-exact (6-Z305u companion checks).
+        assert_eq!(ABI_X86_64.kill_nr, 62);
+        assert_eq!(ABI_X86_64.tkill_nr, 200);
+        assert_eq!(ABI_X86_64.tgkill_nr, 234);
+        assert_eq!(ABI_X86_32.kill_nr, 37);
+        assert_eq!(ABI_X86_32.tkill_nr, 238);
+        assert_eq!(ABI_X86_32.tgkill_nr, 270);
     }
 
     #[test]
