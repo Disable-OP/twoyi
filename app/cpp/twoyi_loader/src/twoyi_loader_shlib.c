@@ -6030,7 +6030,15 @@ static int is_qemu_pipe_device_path(const char *path) {
     // tree (verified by grep), but the matcher accepts /dev/gpu_pipe for
     // forward-compat with vendor forks that rename the device. /dev/gld_pipe
     // is NOT matched (looks like a typo; no AOSP reference).
+    // 6-Z305t-71g (ladder #137 RAW svclog decode): the A11 ranchu image's
+    // goldfish stack opens /dev/goldfish_pipe FIRST — init.ranchu.rc's
+    // `symlink /dev/goldfish_pipe /dev/qemu_pipe` fails under the tracer
+    // (Permission denied), so /dev/goldfish_pipe stays ENOENT and the
+    // whole GL transport never dialed: "Could not open '/dev/goldfish_
+    // pipe': No such file or directory" → "connect: failed to connect to
+    // opengles pipe". The fallback (proxy connect) must cover the path.
     return (strcmp(path, "/dev/qemu_pipe") == 0 ||
+            strcmp(path, "/dev/goldfish_pipe") == 0 ||
             strcmp(path, "/dev/gpu_pipe") == 0);
 }
 
