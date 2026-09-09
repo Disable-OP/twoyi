@@ -6966,6 +6966,9 @@ static int gotfix_write_slot(uintptr_t addr, void *val) {
 // gotfix_dlopen_window_thread). Constructor pass keeps it 0 (verbose).
 // Declared BEFORE gotfix_log (the gate is consulted there).
 static int g_gotfix_quiet;
+// 6-Z305t-71e: total PATCH operations (constructor + re-repair rounds) —
+// the re-repair summary line reports the per-round delta.
+static long g_gotfix_patch_count;
 
 static void gotfix_log(const char *s) {
     // 6-Z305t-71e: the dlopen-window re-repair thread re-runs the pass
@@ -7041,10 +7044,17 @@ static void *gotfix_dlopen_window_thread(void *arg) {
         int mods = gotfix_count_modules();
         if (mods <= last_mods) continue; // no dlopen since the last round
         last_mods = mods;
+        long before_patches = g_gotfix_patch_count;
         g_gotfix_quiet = 1;
         patch_open_family_gots();
         g_gotfix_quiet = 0;
-        write_str(2, "[twoyi_loader] gotfix-44: dlopen-window re-repair ran (module count grew)\n");
+        {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] gotfix-44: dlopen-window re-repair ran (modules=%d, new_patches=%ld)\n",
+                     mods, g_gotfix_patch_count - before_patches);
+            write_str(2, msg);
+        }
     }
     return NULL;
 }
@@ -7132,6 +7142,7 @@ static void patch_open_family_gots(void) {
                     }
                 }
                 const char *mn = (sl->mod_idx >= 0) ? ctx->mods[sl->mod_idx].name : "?";
+                g_gotfix_patch_count++; // 6-Z305t-71e: re-repair summary metric
                 gotfix_log("[twoyi_loader] gotfix-44 PATCH module=");
                 gotfix_log(mn);
                 gotfix_log(" sym=");

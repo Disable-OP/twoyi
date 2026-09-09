@@ -458,6 +458,20 @@ jobs:
                echo \"-- tail 3072 --\"; tail -c 3072 \$f | grep -av 'anon:' | tail -24; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs.txt 2>&1 || true
+          # ── 6-Z305t-71f: RAW svc logs for the loudest services ──────
+          # The filtered svclogs.txt (grep + tail-24) hides everything
+          # between — ladder #136's SF log (100KB) was unreadable exactly
+          # where the decode needed it (gotfix re-repair + the goldfish
+          # open sequence). Copy the top-20 largest svc logs RAW (≤64KB
+          # each, bounded) into the artifact bundle.
+          timeout 40 sudo docker exec redroid sh -c \
+            "d=/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs; \
+             cd \$d 2>/dev/null || exit 0; \
+             ls -S svc-*.log 2>/dev/null | head -20 | while read f; do \
+               echo \"== RAW \$f (\$(stat -c%s \$f) bytes) ==\"; \
+               head -c 65536 \$f; \
+             done" \
+            > /tmp/ui-e2e-artifacts/svclogs-raw-top20.txt 2>&1 || true
           # ── 6-Z305t-36: klog node FILE-IDENTITY forensics ──────────────
           # Ladder #93: the shlib's kmsg fd tests fire (write=37 writev=37
           # ×11 processes) yet the marker bytes never appear in the captured
