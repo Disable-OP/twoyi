@@ -4463,7 +4463,10 @@ impl<'a> HidlParcel<'a> {
             } if c.len() >= 16 => c,
             _ => return None,
         };
-        let count = u64::from_ne_bytes(vs[8..16].try_into().ok()?) as usize;
+        // 6-Z305t-69e: the ladder-#129 dump shows the vec struct is
+        // 16B {ptr, u32 size, u32 owns/pad} — the count is a u32 at
+        // offset 8 (a u64 read made count = 0x1_00000002 → >128 → fail).
+        let count = u32::from_ne_bytes(vs[8..12].try_into().ok()?) as usize;
         if count > 128 {
             return None;
         }
@@ -4940,18 +4943,21 @@ fn servicemanager_hidl(
                     return TransactionResult::Failed;
                 }
             };
-            // 6-Z305t-69b: the REAL wire's object order has the service
-            // flat AFTER the chain vec (ladder #126: 'parse-fail
-            // (addWithChain.chain)' with sg=[16,8,16,32,43,29] — the
-            // positional flat-first read swallowed the vec struct into
-            // the tolerated-None flat slot). Parse TYPE-DRIVEN with
-            // backtracking: try (flat, vec), then (vec, flat).
-            let save = (p.obj_idx, p.ptr_seq);
+            // 6-Z305t-69c: the ladder-#129 OBJECT DUMP settled the wire
+            // (offs(7) = [name struct, name chars, FLAT, vec struct,
+            // array(par=vec), chars0(par=array,0), chars1(par=array,16)],
+            // sg=[16,8,16,32,43,29]) — the .hal declaration order IS the
+            // wire order. The -69b flat-first backtracking was WRONG (it
+            // tried the flat at the post-name cursor, consumed the name
+            // struct, then misread the name chars as the vec struct).
+            // Keep ONE fallback: if (flat, vec) fails after the name,
+            // restore the post-name cursor and try (vec, flat).
+            let after_name = (p.obj_idx, p.ptr_seq);
             let mut flat = p.read_binder_arg();
             let mut chain = p.read_vec_string_arg();
             if chain.is_none() {
-                p.obj_idx = save.0;
-                p.ptr_seq = save.1;
+                p.obj_idx = after_name.0;
+                p.ptr_seq = after_name.1;
                 chain = p.read_vec_string_arg();
                 if chain.is_some() {
                     flat = p.read_binder_arg();
@@ -5058,7 +5064,7 @@ fn servicemanager_hidl(
             // hidl_vec<Instance> wire (Instance = 2 packed hidl_string
             // structs = 32 bytes per element).
             let mut vs = vec![0u8; 16];
-            vs[8..16].copy_from_slice(&(count as u64).to_ne_bytes());
+            vs[8..12].copy_from_slice(&(count as u32).to_ne_bytes());
             let vec_idx = writer.next_object_index();
             writer.write_ptr_object(vs, None, 0);
             // The ARRAY's parent = the VEC struct object; the chars'
@@ -9012,7 +9018,8 @@ mod tests {
         /// buffer is a child of THE ARRAY at j*16.
         fn vec_string_arg(&mut self, v: &[&str]) {
             let mut vs = vec![0u8; 16];
-            vs[8..16].copy_from_slice(&(v.len() as u64).to_ne_bytes());
+            vs[8..12].copy_from_slice(&(v.len() as u32).to_ne_bytes());
+            vs[12..16].copy_from_slice(&1u32.to_ne_bytes()); // owns+pad
             let vec_idx = (self.offsets.len() / 8) as u64;
             self.push_ptr(&vs, false, 0, 0);
             let arr = vec![0u8; v.len() * 16];
@@ -9264,6 +9271,134 @@ mod tests {
         let (_t3, _f3, _p3, _l3, par3, po3) = obj_at(3);
         assert_eq!(par3, 1);
         assert_eq!(po3, 16); // instance at element offset 16
+    }
+
+    /// Reproduction of the ladder-#129 code=12 wire dump (byte-exact from
+    /// the object diag): the parse MUST succeed — this test pins whatever
+    /// diverges between the real loader blob and our model.
+    #[test]
+    fn repro_ladder_code12_wire() {
+        let mut data: Vec<u8> = Vec::new();
+        // token (42 bytes, padded to 44)
+        data.extend_from_slice(b"android.hidl.manager@1.2::IServiceManager\0");
+        data.extend_from_slice(&[0, 0]);
+        assert_eq!(data.len(), 44);
+        // obj0 @44: name struct PTR
+        data.extend_from_slice(&BINDER_TYPE_PTR.to_ne_bytes());
+        data.extend_from_slice(&0u32.to_ne_bytes());
+        data.extend_from_slice(&0xffffd6495b30u64.to_ne_bytes());
+        data.extend_from_slice(&16u64.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes());
+        // obj1 @84: name chars PTR
+        data.extend_from_slice(&BINDER_TYPE_PTR.to_ne_bytes());
+        data.extend_from_slice(&BINDER_BUFFER_FLAG_HAS_PARENT.to_ne_bytes());
+        data.extend_from_slice(&0xf986606015d0u64.to_ne_bytes());
+        data.extend_from_slice(&8u64.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes());
+        // obj2 @124: the flat (24 bytes)
+        data.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data.extend_from_slice(&0x900u32.to_ne_bytes());
+        data.extend_from_slice(&0xf98670610790u64.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes());
+        // obj3 @148: vec struct PTR
+        data.extend_from_slice(&BINDER_TYPE_PTR.to_ne_bytes());
+        data.extend_from_slice(&0u32.to_ne_bytes());
+        data.extend_from_slice(&0xffffd6495ba8u64.to_ne_bytes());
+        data.extend_from_slice(&16u64.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes());
+        // obj4 @188: array PTR
+        data.extend_from_slice(&BINDER_TYPE_PTR.to_ne_bytes());
+        data.extend_from_slice(&BINDER_BUFFER_FLAG_HAS_PARENT.to_ne_bytes());
+        data.extend_from_slice(&0xf98680602118u64.to_ne_bytes());
+        data.extend_from_slice(&32u64.to_ne_bytes());
+        data.extend_from_slice(&3u64.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes());
+        // obj5 @228: chars0 PTR
+        data.extend_from_slice(&BINDER_TYPE_PTR.to_ne_bytes());
+        data.extend_from_slice(&BINDER_BUFFER_FLAG_HAS_PARENT.to_ne_bytes());
+        data.extend_from_slice(&0xf98680602610u64.to_ne_bytes());
+        data.extend_from_slice(&43u64.to_ne_bytes());
+        data.extend_from_slice(&4u64.to_ne_bytes());
+        data.extend_from_slice(&0u64.to_ne_bytes());
+        // obj6 @268: chars1 PTR
+        data.extend_from_slice(&BINDER_TYPE_PTR.to_ne_bytes());
+        data.extend_from_slice(&BINDER_BUFFER_FLAG_HAS_PARENT.to_ne_bytes());
+        data.extend_from_slice(&0xf98670610490u64.to_ne_bytes());
+        data.extend_from_slice(&29u64.to_ne_bytes());
+        data.extend_from_slice(&4u64.to_ne_bytes());
+        data.extend_from_slice(&16u64.to_ne_bytes());
+        assert_eq!(data.len(), 308);
+
+        let mut sg0 = Vec::new();
+        sg0.extend_from_slice(&0xf986606015d0u64.to_ne_bytes());
+        sg0.extend_from_slice(&7u32.to_ne_bytes());
+        sg0.extend_from_slice(&1u32.to_ne_bytes());
+        let sg1 = b"default\0".to_vec();
+        let mut sg2 = Vec::new();
+        sg2.extend_from_slice(&0xf98680602118u64.to_ne_bytes());
+        sg2.extend_from_slice(&2u32.to_ne_bytes());
+        sg2.extend_from_slice(&1u32.to_ne_bytes());
+        let mut sg3 = Vec::new();
+        sg3.extend_from_slice(&0xf98680602610u64.to_ne_bytes());
+        sg3.extend_from_slice(&42u32.to_ne_bytes());
+        sg3.extend_from_slice(&1u32.to_ne_bytes());
+        sg3.extend_from_slice(&0xf98670610490u64.to_ne_bytes());
+        sg3.extend_from_slice(&28u32.to_ne_bytes());
+        sg3.extend_from_slice(&1u32.to_ne_bytes());
+        let sg4 = b"android.hardware.atrace@1.0::IAtraceDevice\0".to_vec();
+        let sg5 = b"android.hidl.base@1.0::IBase\0".to_vec();
+        let sg = vec![
+            SgBuf {
+                client_ptr: 0xffffd6495b30,
+                data: sg0,
+            },
+            SgBuf {
+                client_ptr: 0xf986606015d0,
+                data: sg1,
+            },
+            SgBuf {
+                client_ptr: 0xffffd6495ba8,
+                data: sg2,
+            },
+            SgBuf {
+                client_ptr: 0xf98680602118,
+                data: sg3,
+            },
+            SgBuf {
+                client_ptr: 0xf98680602610,
+                data: sg4,
+            },
+            SgBuf {
+                client_ptr: 0xf98670610490,
+                data: sg5,
+            },
+        ];
+        let offsets: Vec<u8> = [44u64, 84, 124, 148, 188, 228, 268]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        let blob = RequestBlob { data, offsets, sg };
+
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        match servicemanager_hidl(HIDL_SM_ADD_WITH_CHAIN, &blob, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { .. } => {}
+            other => panic!(
+                "repro must Reply, got {:?}",
+                match other {
+                    TransactionResult::Failed => "Failed",
+                    TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::Reply { .. } => unreachable!(),
+                }
+            ),
+        }
+        assert!(bus
+            .lock()
+            .expect("bus")
+            .services
+            .contains_key("android.hardware.atrace@1.0::IAtraceDevice/default"));
     }
 
     /// HONESTY under the v2 wire (no SG section): the string bytes are
