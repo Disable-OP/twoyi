@@ -118,6 +118,9 @@ name: UI E2E Test (ARM64 AOSP via redroid on ubuntu-24.04-arm)
 'on':
   workflow_dispatch:
     inputs:
+      confirm_dispatch:
+        description: 'Anti-runaway gate: dispatches MUST pass the literal string "yes" (no default)'
+        required: true
       boot_wait_seconds:
         description: 'How long to wait for the guest Android to boot (seconds)'
         required: false

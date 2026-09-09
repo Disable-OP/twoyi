@@ -46,6 +46,9 @@ name: Android Boot Ladder (ARM64 via redroid on ubuntu-24.04-arm)
 'on':
   workflow_dispatch:
     inputs:
+      confirm_dispatch:
+        description: 'Anti-runaway gate: dispatches MUST pass the literal string "yes" (no default)'
+        required: true
       boot_wait_seconds:
         description: 'HARD CAP (wall-clock) on the boot watch (seconds). Stall-adaptive: exits early once the guest freezes for stall_seconds — default 180 keeps the whole cycle ≈10 min'
         required: false
