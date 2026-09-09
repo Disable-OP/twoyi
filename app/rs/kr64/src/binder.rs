@@ -1363,13 +1363,24 @@ impl ParcelWriter {
         self.data.extend_from_slice(&v.to_ne_bytes());
     }
 
-    /// HIDL sub-int base types marshal at their RAW width — NO alignment
-    /// padding (hwbinder::Parcel::writeUint8 = write(&val, 1); the client's
-    /// readUint8/readBool/readEnum-as-uint8 read 1 byte at the current
-    /// position). Used for the getTransport Transport byte and the HIDL
-    /// bool replies (writeBool = writeInt8, 1 byte — vs AIDL's i32 bool).
+    /// HIDL sub-int write (hwbinder `writeUint8`/`writeBool` = writeInt8).
+    /// 6-Z305t-68b: the write MUST 4-byte-pad the parcel position —
+    /// libhwbinder's `writeInplace` advances `mDataPos` by `pad_size(len)`
+    /// (the real server's reply data_size INCLUDES the pad), and the
+    /// client's `Parcel::read` checks `mDataPos + pad_size(len) <=
+    /// mDataSize` — an unpadded u8 reply made EVERY getTransport reply
+    /// underrun client-side (mDataPos(4) + pad_size(1)(4) = 8 > 5) →
+    /// Status(EX_TRANSACTION_FAILED, NOT_ENOUGH_DATA) → the 1292-abort
+    /// storm of ladder #124 (every HWBINDER/EMPTY getTransport answer
+    /// killed its caller at `Transport transport = sm->getTransport(...)`
+    /// — the Return::value() abort, ServiceManagement.cpp:873).
+    /// Used for the getTransport Transport byte and the HIDL bool replies
+    /// (writeBool = writeInt8 — vs AIDL's i32 bool).
     fn write_u8(&mut self, v: u8) {
         self.data.push(v);
+        while self.data.len() % 4 != 0 {
+            self.data.push(0);
+        }
     }
 
     /// 6-Z276: write a HIDL `hidl_string` (libhwbinder `writeHidlString`):
@@ -8697,8 +8708,9 @@ mod tests {
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
             TransactionResult::Reply { data, offsets } => {
                 assert!(offsets.is_empty(), "no binder objects in the reply");
-                // [status ok][u8 EMPTY] — 5 bytes exactly.
-                assert_eq!(data, vec![0, 0, 0, 0, 0]);
+                // [status ok][u8 EMPTY][3 pad] — the u8 write pads the
+                // parcel position (libhwbinder writeInplace semantics).
+                assert_eq!(data, vec![0, 0, 0, 0, 0, 0, 0, 0]);
             }
             _ => panic!("getTransport must Reply, not Fail/CompleteOnly"),
         }
@@ -8723,8 +8735,8 @@ mod tests {
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
             TransactionResult::Reply { data, offsets } => {
                 assert!(offsets.is_empty());
-                // [status ok][u8 HWBINDER].
-                assert_eq!(data, vec![0, 0, 0, 0, 1]);
+                // [status ok][u8 HWBINDER][3 pad].
+                assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0]);
             }
             _ => panic!("getTransport must Reply, not Fail/CompleteOnly"),
         }
@@ -8752,8 +8764,9 @@ mod tests {
         match servicemanager_hidl(HIDL_SM_ADD_WITH_CHAIN, &req, &bus, PROXY_CONN_ID) {
             TransactionResult::Reply { data, offsets } => {
                 assert!(offsets.is_empty());
-                // [status ok][u8 true] — HIDL bool is 1 byte.
-                assert_eq!(data, vec![0, 0, 0, 0, 1]);
+                // [status ok][u8 true][3 pad] — HIDL bool is 1 byte,
+                // padded by write_u8 (writeInplace semantics).
+                assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0]);
             }
             _ => panic!("addWithChain must Reply, not Fail/CompleteOnly"),
         }
@@ -8770,7 +8783,9 @@ mod tests {
             b.string_arg("default");
         });
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
-            TransactionResult::Reply { data, .. } => assert_eq!(data, vec![0, 0, 0, 0, 1]),
+            TransactionResult::Reply { data, .. } => {
+                assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0])
+            }
             _ => panic!("getTransport must Reply"),
         }
     }
