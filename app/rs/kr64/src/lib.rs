@@ -11061,6 +11061,72 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         spawn_touch_accept_thread(device_set.touch, cfg.clone());
     }
 
+    // ── 6-Z305t-71: qemu_pipe GL proxy + key/event/gb/gb2 accept threads
+    // move HERE (from the dead zone after the ptrace branch's early
+    // return) so they run during EVERY boot, rootless included.
+    //
+    // qemu_pipe -> real GL command proxy (Phase 1 of the dispatcher plan).
+    // The proxy accepts guest connections, reads the "pipe:opengles"
+    // channel-name handshake, connects to the renderer's Unix socket
+    // at {rootfs}/opengles, and pumps bytes bidirectionally. This is the
+    // transport SurfaceFlinger's goldfish EGL host connection dials via
+    // the shlib's /dev/qemu_pipe open fallback — without a live accept
+    // thread the connect lands in a void and SF aborts ("connect: failed
+    // to connect to opengles pipe"), which pinned the boot at rung 7.
+    //
+    // After pivot_root (use_namespaces=true), the rootfs IS the root "/",
+    // so the renderer socket at {rootfs}/opengles is now at /opengles.
+    // Pass "" as the rootfs prefix so the proxy constructs "/opengles".
+    // Without pivot_root, pass the full rootfs path.
+    let proxy_rootfs = if cfg.use_namespaces {
+        String::new() // chroot-relative: format!("{}/{}", "", "opengles") = "/opengles"
+    } else {
+        cfg.rootfs.clone()
+    };
+    let _qemu_pipe_proxy = {
+        let mut dev = device_set.qemu_pipe;
+        let listener = match dev.take_listener() {
+            Some(l) => l,
+            None => {
+                error!("[KR64] qemu_pipe listener already taken -- cannot start proxy");
+                return 1;
+            }
+        };
+        match qemu_pipe::spawn_qemu_pipe_proxy(listener, dev.path.clone(), proxy_rootfs) {
+            Ok(h) => {
+                info!(
+                    "[KR64] qemu_pipe proxy listening at {} (rootfs={})",
+                    h.path(),
+                    cfg.rootfs
+                );
+                Some(h)
+            }
+            Err(e) => {
+                error!("[KR64] failed to start qemu_pipe proxy: {}", e);
+                None
+            }
+        }
+    };
+
+    // Spawn one accept thread per remaining device socket. For the MVP
+    // each thread just accepts connections and immediately closes them
+    // (echoing a single byte so the guest sees SOME response). The
+    // production version will dispatch to per-device handlers:
+    //   touch     -> input::touch_server
+    //   key       -> input::key_server
+    //   event     -> TwoyiSocketServer (event IPC)
+    //   gb/gb2    -> openglrenderer::gralloc
+    //
+    // NOTE: `device_set.touch` is no longer passed here — it was
+    // consumed by `spawn_touch_accept_thread` above (which sends the
+    // DeviceInfo header + streams encoded InputEvents, using the
+    // helpers from 2-B's commit `370b8ee`). The other four devices
+    // still use the generic stub.
+    spawn_accept_thread(device_set.key, "key");
+    spawn_accept_thread(device_set.event, "event");
+    spawn_accept_thread(device_set.gb.gb, "gb");
+    spawn_accept_thread(device_set.gb.gb2, "gb2");
+
     // ── PTRACE SYSCALL EMULATION (non-root TWRP boot) ──
     //
     // In non-root mode, the child called PTRACE_TRACEME + raise(SIGSTOP)
@@ -11646,65 +11712,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // but we hold the handle to avoid a compiler warning)
     let _ = enforce_thread;
 
-    // qemu_pipe -> real GL command proxy (Phase 1 of the dispatcher plan).
-    // The proxy accepts guest connections, reads the "pipe:opengles"
-    // channel-name handshake, connects to the renderer's Unix socket
-    // at {rootfs}/opengles, and pumps bytes bidirectionally. This
-    // replaces the old MVP stub that wrote a single 0 byte and closed.
-    // See download/QEMU_PIPE_DISPATCHER_PLAN.md for the full design.
-    //
-    // After pivot_root (use_namespaces=true), the rootfs IS the root "/",
-    // so the renderer socket at {rootfs}/opengles is now at /opengles.
-    // Pass "" as the rootfs prefix so the proxy constructs "/opengles".
-    // Without pivot_root, pass the full rootfs path.
-    let proxy_rootfs = if cfg.use_namespaces {
-        String::new() // chroot-relative: format!("{}/{}", "", "opengles") = "/opengles"
-    } else {
-        cfg.rootfs.clone()
-    };
-    let _qemu_pipe_proxy = {
-        let mut dev = device_set.qemu_pipe;
-        let listener = match dev.take_listener() {
-            Some(l) => l,
-            None => {
-                error!("[KR64] qemu_pipe listener already taken -- cannot start proxy");
-                return 1;
-            }
-        };
-        match qemu_pipe::spawn_qemu_pipe_proxy(listener, dev.path.clone(), proxy_rootfs) {
-            Ok(h) => {
-                info!(
-                    "[KR64] qemu_pipe proxy listening at {} (rootfs={})",
-                    h.path(),
-                    cfg.rootfs
-                );
-                Some(h)
-            }
-            Err(e) => {
-                error!("[KR64] failed to start qemu_pipe proxy: {}", e);
-                None
-            }
-        }
-    };
-
-    // Spawn one accept thread per remaining device socket. For the MVP
-    // each thread just accepts connections and immediately closes them
-    // (echoing a single byte so the guest sees SOME response). The
-    // production version will dispatch to per-device handlers:
-    //   touch     -> input::touch_server
-    //   key       -> input::key_server
-    //   event     -> TwoyiSocketServer (event IPC)
-    //   gb/gb2    -> openglrenderer::gralloc
-    //
-    // NOTE: `device_set.touch` is no longer passed here — it was
-    // consumed by `spawn_touch_accept_thread` above (which sends the
-    // DeviceInfo header + streams encoded InputEvents, using the
-    // helpers from 2-B's commit `370b8ee`). The other four devices
-    // still use the generic stub.
-    spawn_accept_thread(device_set.key, "key");
-    spawn_accept_thread(device_set.event, "event");
-    spawn_accept_thread(device_set.gb.gb, "gb");
-    spawn_accept_thread(device_set.gb.gb2, "gb2");
+    // 6-Z305t-71 (ladder #131 decode): the qemu_pipe GL proxy AND the
+    // key/event/gb/gb2 accept threads used to live HERE — AFTER the
+    // ptrace-emulation branch's early `return`, which is the ONLY path a
+    // rootless boot (use_namespaces=false) ever takes. They were DEAD
+    // CODE for every real boot: the listener sat bound-but-unaccepted for
+    // the guest's whole lifetime, so SurfaceFlinger's /dev/qemu_pipe
+    // shlib fallback connected into a void ("connect: failed to connect
+    // to opengles pipe" → abort → rung 7 forever, no bootanimation, no
+    // launcher) and the goldfish gralloc's gb/gb2 channels were equally
+    // dead. They now spawn in the PARENT right next to
+    // `spawn_touch_accept_thread` (pre-ptrace-loop — see that block for
+    // the full rationale; the early-return branch runs BELOW this point).
 
     // ---------------------------------------------------------------
     // Step 6: wait for the guest to exit (with graceful SIGTERM handling).
