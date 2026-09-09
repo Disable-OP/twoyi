@@ -1857,6 +1857,85 @@ static void fb_fd_clear(int fd) {
     pthread_mutex_unlock(&g_fb_fd_lock);
 }
 
+// ---------------------------------------------------------------------------
+// 6-Z305x: PRELOAD-TRANSIENT FD LIFECYCLE INSTRUMENT (bounded)
+//
+// Ladder #155 (6a63d7b) reached rung 7 (SURFACEFLINGER): the 6-Z305w
+// vendor LD_LIBRARY_PATH chain fixed the gralloc/composer CANNOT LINK
+// wall, the onrestart murder cascade stopped, the zygote survived its
+// whole life, and system_server FORKED — then died immediately:
+//   JNI FatalError called: (system_server)
+//   Not whitelisted (28): /system/usr/hyphen-data/hyph-as.hyb
+// That is the Zygote child's fd sanitization (frameworks/base/core/jni/
+// fd_utils.cpp FileDescriptorWhitelist::IsAllowed — an EXACT-MATCH list
+// plus framework/apex-jar prefix rules; /system/usr/** and /system/
+// fonts/** are NOT whitelisted). On a REAL device the zygote's fd table
+// at forkSystemServer carries NO hyphenation/font fd: Hyphenator.init()
+// and the font preload open each file, mmap, and close. Here SOME close
+// never ran (or a dup leaked), leaving fd 28 → hyph-as.hyb open at
+// fork (and the known fd-0 churn later rebinding fd 0 → hyph-as.hyb —
+// the 6-Z305t-14b STALL-FD snapshot in the same run).
+//
+// This instrument names the leaker at the source: every open whose path
+// lands under /system/fonts/ or /system/usr/hyphen-data/ is recorded
+// with its fd; every close() of a recorded fd logs the pair. An OPEN
+// with NO matching CLOSE in the artifact = the leak, with the fd and
+// path. Bounded: 32 open lines and an 80-line total budget per
+// process; the table itself holds 96 entries (far above the ~80
+// transient preload opens the zygote issues).
+// ---------------------------------------------------------------------------
+
+#define PRELOAD_FD_MAX 96
+struct preload_fd_ent { int fd; char path[80]; };
+static struct preload_fd_ent g_preload_fds[PRELOAD_FD_MAX];
+static int g_preload_fd_n;
+static int g_preload_fd_log;
+static pthread_mutex_t g_preload_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int preload_fd_is_tracked_path(const char *path) {
+    return path != NULL &&
+        (strncmp(path, "/system/fonts/", 14) == 0 ||
+         strncmp(path, "/system/usr/hyphen-data/", 24) == 0);
+}
+
+static void preload_fd_track(const char *path, int fd) {
+    if (fd < 0 || !preload_fd_is_tracked_path(path)) return;
+    pthread_mutex_lock(&g_preload_fd_lock);
+    if (g_preload_fd_n < PRELOAD_FD_MAX) {
+        struct preload_fd_ent *e = &g_preload_fds[g_preload_fd_n++];
+        e->fd = fd;
+        snprintf(e->path, sizeof(e->path), "%s", path);
+    }
+    if (g_preload_fd_log < 32) {
+        g_preload_fd_log++;
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] 6-Z305x PRELOAD-FD: open(%s) -> fd=%d [tracked %d]\n",
+            path, fd, g_preload_fd_n);
+        write_str(2, msg);
+    }
+    pthread_mutex_unlock(&g_preload_fd_lock);
+}
+
+static void preload_fd_note_close(int fd) {
+    pthread_mutex_lock(&g_preload_fd_lock);
+    for (int i = 0; i < g_preload_fd_n; i++) {
+        if (g_preload_fds[i].fd == fd) {
+            if (g_preload_fd_log < 80) {
+                g_preload_fd_log++;
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                    "[twoyi_loader] 6-Z305x PRELOAD-FD: close(fd=%d) -> %s [tracked %d]\n",
+                    fd, g_preload_fds[i].path, g_preload_fd_n);
+                write_str(2, msg);
+            }
+            g_preload_fds[i] = g_preload_fds[--g_preload_fd_n];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_preload_fd_lock);
+}
+
 // 6-Z222: forward declaration — the ioctl hook (below) calls this to
 // self-heal untracked fb0 fds; the definition lives next to the open64
 // hooks near the end of this file.
@@ -1876,6 +1955,9 @@ static int is_fb_path(const char *path) {
 // ioctl hook. Returns the fd unchanged (so it can be used inline as
 // `return track_fb_fd(path, fd);`).
 static int track_fb_fd(const char *path, int fd) {
+    // 6-Z305x: record the preload-transient fd (fonts / hyphen-data) so
+    // the fork-gate whitelist leak names its owner in the artifact.
+    preload_fd_track(path, fd);
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
         char msg[256];
@@ -3411,6 +3493,9 @@ int close(int fd) {
     bp_thread_conn_close_for_binder(fd);
     qemu_pipe_fd_clear_proxy(fd);
     fb_fd_clear(fd);
+    // 6-Z305x: note the close of a tracked preload-transient fd — the
+    // open/close pairing is the leak evidence for the fork whitelist.
+    preload_fd_note_close(fd);
     if (real_close) return real_close(fd);
     return (int)syscall(NR_close, fd);
 }
