@@ -4520,9 +4520,14 @@ impl<'a> HidlParcel<'a> {
 /// + SG contents (hex, first 32B). The addWithChain chain-vec wire has
 /// survived three decode rounds; this dump ends the guessing in one run.
 fn hidl_sm_object_diag(code: u32, blob: &RequestBlob) {
+    // Budget ONLY the codes whose wire is still being decoded (the
+    // -69c global budget was eaten by codes 3/8 before code=12 ran).
+    if code != HIDL_SM_ADD_WITH_CHAIN && code != HIDL_SM_LIST_MANIFEST_BY_INTERFACE {
+        return;
+    }
     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n >= 2 || blob.offsets.len() % 8 != 0 {
+    if n >= 3 || blob.offsets.len() % 8 != 0 {
         return;
     }
     let offs: Vec<u64> = blob
@@ -4531,6 +4536,7 @@ fn hidl_sm_object_diag(code: u32, blob: &RequestBlob) {
         .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
         .collect();
     let mut s = String::new();
+    let mut ptr_count = 0usize;
     for (i, off) in offs.iter().enumerate() {
         let o = *off as usize;
         if o + 4 > blob.data.len() {
@@ -4538,6 +4544,9 @@ fn hidl_sm_object_diag(code: u32, blob: &RequestBlob) {
             continue;
         }
         let typ = u32::from_ne_bytes(blob.data[o..o + 4].try_into().unwrap());
+        if typ == BINDER_TYPE_PTR {
+            ptr_count += 1;
+        }
         if typ == BINDER_TYPE_PTR && o + 40 <= blob.data.len() {
             let flags = u32::from_ne_bytes(blob.data[o + 4..o + 8].try_into().unwrap());
             let ptr = u64::from_ne_bytes(blob.data[o + 8..o + 16].try_into().unwrap());
@@ -4574,7 +4583,7 @@ fn hidl_sm_object_diag(code: u32, blob: &RequestBlob) {
         blob.data.len(),
         offs.len(),
         s,
-        if offs.len() == blob.sg.len() + 1 {
+        if ptr_count == blob.sg.len() {
             ""
         } else {
             " PTR/SG-MISMATCH"
