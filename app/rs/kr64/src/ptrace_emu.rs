@@ -1428,6 +1428,30 @@ struct ChildAbi {
     kill_nr: i64,
     tgkill_nr: i64,
     rt_sigqueueinfo_nr: i64,
+    // ── 6-Z305t-72: the prctl syscall number, PER ABI ────────────────
+    //
+    // The 6-Z147 prctl→getpid ENTRY rewrite used to match the literal
+    // expression `nr == 157 || nr == 172 || nr == 167` — the prctl
+    // numbers across ALL ABIs AT ONCE. That cross-ABI union is WRONG
+    // per-ABI: on aarch64, prctl=167 but **getpid=172** — so every
+    // genuine getpid() on an arm64 guest matched the arm32 prctl
+    // literal, was stashed in prctl_rewritten_args with garbage args
+    // (0, 0), and had its EXIT return overwritten by
+    // emulated_prctl_ret(0, 0) == 0. The zygote's libc-init
+    // `main_thread.tid = __getpid()` therefore cached 0, bionic's
+    // gettid() returned the poisoned cache (its pid cache guards 0,
+    // its tid cache only guards -1), and ART's first recursive-mutex
+    // lock taken with Thread::Current() == nullptr (Heap::Heap →
+    // CumulativeLogger ctor → Reset()) took the IsExclusiveHeld
+    // fast-path (owner 0 == GetTid() 0), SKIPPING the CAS — the first
+    // unlock then saw the held-bit unset and FATALed
+    // "Unexpected state_ in unlock 0 for CumulativeLoggerLockconcurrent
+    // copying" ×45 generations. init survived only because the
+    // later pending_getpid consumption overwrites the poisoned return
+    // with 1 for the init anchor. Ladder #142 decode; the fix makes
+    // the rewrite arm ABI-exact via this field:
+    //   x86_64: prctl=157, aarch64: prctl=167, i386/arm32: prctl=172.
+    prctl: i64,
 }
 
 // x86_64 user_regs_struct field order (as u64 array indices):
@@ -1729,6 +1753,7 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     kill_nr: 62,
     tgkill_nr: 234,
     rt_sigqueueinfo_nr: 129,
+    prctl: 157,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -2137,6 +2162,7 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     kill_nr: 37,
     tgkill_nr: 270,
     rt_sigqueueinfo_nr: 178,
+    prctl: 172, // i386 prctl=172 — no getpid collision (i386 getpid=20)
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -2505,6 +2531,10 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     kill_nr: 129,
     tgkill_nr: 131,
     rt_sigqueueinfo_nr: 138,
+    // 6-Z305t-72: aarch64 prctl=167. NOT 172 — on aarch64 172 is
+    // getpid; the old cross-ABI literal union poisoned every arm64
+    // getpid with emulated_prctl_ret(0,0)==0 (the zygote wall).
+    prctl: 167,
 };
 
 // ── 6-Z228: ABI_ARM32 — ELF32 EM_ARM children on an arm64 host ─────
@@ -2661,6 +2691,7 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     kill_nr: 37,
     tgkill_nr: 268,
     rt_sigqueueinfo_nr: 178,
+    prctl: 172, // arm32 prctl=172 — no getpid collision (arm32 getpid=20)
 };
 
 /// Detect whether the traced child is a 32-bit (i386) or 64-bit (x86_64)
@@ -19380,7 +19411,11 @@ pub fn run_ptrace_loop(
                         // PR_SET_VMA=0x53564d41, PR_SET_NAME=15, PR_SET_VMA
                         // sub-option arrives in arg2), arg2=arg2 (the
                         // PR_SET_VMA sub-option / first payload word).
-                        if syscall_num == 157 || syscall_num == 172 || syscall_num == 167 {
+                        // 6-Z305t-72: ABI-EXACT match via abi.prctl — the
+                        // old cross-ABI literal union also matched nr=172
+                        // on aarch64 (getpid!) and poisoned every arm64
+                        // getpid's return (see the ChildAbi.prctl doc).
+                        if syscall_num == abi.prctl {
                             post_execve_prctl_log_count =
                                 post_execve_prctl_log_count.saturating_add(1);
                             if post_execve_prctl_log_count <= 40 {
@@ -19405,7 +19440,8 @@ pub fn run_ptrace_loop(
                         // DETECTOR — any non-prctl syscall ENTRY resets
                         // the per-pid run; every 500th consecutive prctl
                         // logs ONE SPIN-DETECTED line with the last rip.
-                        if syscall_num == 157 || syscall_num == 172 || syscall_num == 167 {
+                        // 6-Z305t-72: ABI-exact (see ChildAbi.prctl).
+                        if syscall_num == abi.prctl {
                             // 6-Z149: deep prctl sampling. The Z148 run
                             // proved the spin's rip is libc's prctl
                             // syscall INSTRUCTION (every caller shares
@@ -19610,7 +19646,19 @@ pub fn run_ptrace_loop(
                         // using (option, arg2) captured here BEFORE
                         // the nr rewrite (arg registers are live at
                         // the ENTRY stop).
-                        if syscall_num == 157 || syscall_num == 172 || syscall_num == 167 {
+                        // 6-Z305t-72: THE ZYGOTE-WALL FIX — ABI-exact
+                        // prctl match via abi.prctl. The old union
+                        // (157|172|167) ALSO matched nr=172 on aarch64
+                        // (= getpid): every genuine arm64 getpid was
+                        // stashed with args (0,0) and had its return
+                        // overwritten by emulated_prctl_ret(0,0)==0 at
+                        // EXIT → zygote main_thread.tid cached 0 →
+                        // bionic gettid()==0 → ART's recursive-mutex
+                        // IsExclusiveHeld fast-path (owner 0 == tid 0)
+                        // skipped the CAS → CumulativeLoggerLock
+                        // "Unexpected state_ in unlock 0" FATAL per
+                        // generation (ladder #142 decode).
+                        if syscall_num == abi.prctl {
                             let prctl_option = get_syscall_arg(&regs, abi.reg_arg1);
                             let prctl_arg2 = get_syscall_arg(&regs, abi.reg_arg2);
                             set_syscall_num(&mut regs, &abi, abi.getpid);
@@ -34167,6 +34215,48 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             ABI_ARM32.tgkill_nr,
             ABI_ARM32.rt_sigqueueinfo_nr,
         );
+    }
+
+    // ── 6-Z305t-72: the prctl ABI number must NEVER collide with getpid ──
+    //
+    // THE ZYGOTE WALL LOCK. Ladder #142 (run 34377903469, rung 4/5):
+    // the zygote FATALed every generation with "Unexpected state_ in
+    // unlock 0 for CumulativeLoggerLockconcurrent copying" + "(Aborting
+    // thread was not attached to runtime!)" + "no native stack frames
+    // for thread 0". Decode: ART's GetTid() was 0 because bionic's tid
+    // cache (pthread_internal_t.tid, seeded ONCE at libc init from the
+    // raw getpid) held 0 — the 6-Z147 prctl ENTRY rewrite matched the
+    // cross-ABI literal union (157|172|167), and on an arm64 guest
+    // nr=172 IS getpid: every genuine getpid was stashed with garbage
+    // args (0,0) and had its return overwritten by
+    // emulated_prctl_ret(0,0)==0. init survived only because the later
+    // pending_getpid consumption rewrites the poisoned return to 1 for
+    // the init anchor. These tests pin abi.prctl per-ABI and assert the
+    // no-getpid-collision invariant on every table that exists for the
+    // host.
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prctl_abi_number_never_collides_with_getpid_x86_64_6z305t72() {
+        // x86_64: prctl=157, getpid=39; i386 compat: prctl=172, getpid=20.
+        assert_eq!(ABI_X86_64.prctl, 157);
+        assert_ne!(ABI_X86_64.prctl, ABI_X86_64.getpid);
+        assert_eq!(ABI_X86_32.prctl, 172);
+        assert_ne!(ABI_X86_32.prctl, ABI_X86_32.getpid);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn prctl_abi_number_never_collides_with_getpid_aarch64_arm32_6z305t72() {
+        // aarch64: prctl=167, getpid=172 — 172 must NEVER feed the
+        // prctl rewrite on this ABI (that collision WAS the wall).
+        assert_eq!(ABI_AARCH64.prctl, 167);
+        assert_eq!(ABI_AARCH64.getpid, 172);
+        assert_ne!(ABI_AARCH64.prctl, ABI_AARCH64.getpid);
+        // arm32 compat: prctl=172, getpid=20 — 172 is correct here
+        // precisely BECAUSE arm32 getpid is 20, not 172.
+        assert_eq!(ABI_ARM32.prctl, 172);
+        assert_ne!(ABI_ARM32.prctl, ABI_ARM32.getpid);
     }
 
     #[test]

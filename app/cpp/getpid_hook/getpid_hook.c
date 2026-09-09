@@ -72,3 +72,24 @@ pid_t getpid(void) {
 pid_t getppid(void) {
     return (pid_t)syscall(SYS_getppid);
 }
+
+// 6-Z305t-72: gettid() must NEVER read bionic's cached tid. The cache
+// (pthread_internal_t.tid) is seeded once at libc init from the raw
+// getpid syscall — bionic guards its PID cache against a 0 value but
+// the TID cache only against -1 — so a single poisoned getpid return
+// permanently pins gettid() to 0 for that process. That was the
+// ladder-#142 zygote wall: the tracer's 6-Z147 prctl rewrite matched
+// the cross-ABI literal union (157|172|167), which on aarch64 ALSO
+// matched nr=172 (= getpid) and overwrote every arm64 getpid's return
+// with emulated_prctl_ret(0,0)==0; ART's first recursive-mutex lock
+// taken with Thread::Current()==nullptr then took the IsExclusiveHeld
+// fast-path (fresh-mutex owner 0 == GetTid() 0), skipped the futex CAS,
+// and the first unlock FATALed "Unexpected state_ in unlock 0 for
+// CumulativeLoggerLock…" every generation. The raw syscall can never
+// return 0 for a live thread, so this interposer is immune to the
+// entire cache-poison class. ART calls the public gettid() symbol
+// (libartbase utils.cc GetTid()), so this preload export (first in
+// LD_PRELOAD order) covers every guest library including libart.
+pid_t gettid(void) {
+    return (pid_t)syscall(SYS_gettid);
+}
