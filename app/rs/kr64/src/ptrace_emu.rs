@@ -30780,10 +30780,16 @@ pub fn run_ptrace_loop(
                 // force_sig half (1): unblock SIGTRAP in the tracee when
                 // its mask blocks it (PTRACE_GETSIGMASK=0x420a /
                 // PTRACE_SETSIGMASK=0x420b, kernel sigset = 64 bits).
+                // NOTE: the request constants stay UNANNOTATED literals —
+                // libc's ptrace is `request: c_int, ...` (variadic) on the
+                // android targets and `(c_uint, pid_t, *mut c_void,
+                // c_long)` on gnu x86_64; inference picks the right type
+                // per target (a `u32` suffix breaks the android build —
+                // ladder #132's job failure).
                 let mut sigmask: u64 = 0;
                 let get_mask_r = unsafe {
                     libc::ptrace(
-                        0x420au32,
+                        0x420a,
                         pid,
                         8usize as *mut libc::c_void,
                         &mut sigmask as *mut u64 as libc::c_long,
@@ -30793,7 +30799,7 @@ pub fn run_ptrace_loop(
                     if let Some(cleared) = sigtrap_force_mask(sigmask) {
                         let set_r = unsafe {
                             libc::ptrace(
-                                0x420bu32,
+                                0x420b,
                                 pid,
                                 8usize as *mut libc::c_void,
                                 cleared as libc::c_long,
