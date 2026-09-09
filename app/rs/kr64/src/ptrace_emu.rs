@@ -20525,6 +20525,51 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
+                        // ── 6-Z305t-75d: the STDIO-CLOSER TRACER ─────
+                        //
+                        // The zygote dies at ZygoteHooks.onEndPreload
+                        // (FileDescriptor.in/out/err cloneForFork →
+                        // fcntl(F_DUPFD_CLOEXEC) EBADF) despite the
+                        // loader's stdio belt + watchdog keeping fds
+                        // 0/1/2 repaired. SOMETHING in the guest closes
+                        // a standard descriptor after the belt runs and
+                        // before endPreload. This arm NAMES the closer:
+                        // every guest close() on fd 0/1/2 is logged with
+                        // the CALLER's pc attributed to its module (the
+                        // stall-forensics maps walk), budgeted at the
+                        // first 48 events per run (the floods never own
+                        // the log). close() executes natively — this arm
+                        // is pure observation, zero rewrites.
+                        n if abi.close_nr != -1 && n == abi.close_nr => {
+                            let close_fd = get_syscall_arg(&regs, abi.reg_arg1);
+                            if close_fd <= 2 {
+                                static CLOSE_DIAG: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let cnt =
+                                    CLOSE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if cnt < 48 {
+                                    // pc: aarch64 user_pt_regs index 32
+                                    // (regs[0..30], sp=31, pc=32); x86_64
+                                    // user_regs_struct rip = index 16.
+                                    #[cfg(target_arch = "aarch64")]
+                                    let pc_val =
+                                        unsafe { *(&regs as *const Regs as *const u64).add(32) };
+                                    #[cfg(target_arch = "x86_64")]
+                                    let pc_val =
+                                        unsafe { *(&regs as *const Regs as *const u64).add(16) };
+                                    #[cfg(not(any(
+                                        target_arch = "aarch64",
+                                        target_arch = "x86_64"
+                                    )))]
+                                    let pc_val: u64 = 0;
+                                    let region = maps_region_for_pc(pid, pc_val);
+                                    log(&format!(
+                                        "6-Z305t-75d: pid={} close(fd={}) pc={:#x} maps[pc]={}",
+                                        pid, close_fd, pc_val, region
+                                    ));
+                                }
+                            }
+                        }
                         n if n == abi.getpid => {
                             pending_getpid.insert(pid);
                             if loop_count <= 20 {
