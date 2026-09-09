@@ -20589,7 +20589,7 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
-                        n if n == 436 => {
+                        436 => {
                             // close_range(first, last, flags) — if the
                             // range covers ANY standard descriptor, NAME
                             // the caller. asm-generic/x86_64/arm32 all
