@@ -7089,14 +7089,28 @@ static void *stdin_watchdog_thread(void *arg) {
         ts.tv_sec = 0;
         ts.tv_nsec = 500 * 1000 * 1000;
         nanosleep(&ts, NULL);
-        if (syscall(SYS_fcntl, 0, F_GETFD, 0) >= 0) continue;
-        int nfd = (int)twoyi_sys_open("/dev/null", O_RDWR, 0);
-        if (nfd >= 0) {
-            if (nfd != 0) {
-                syscall(SYS_dup3, nfd, 0, 0);
-                syscall(NR_close, nfd);
+        int repaired = 0;
+        // 6-Z305t-75c: cover ALL THREE standard descriptors — ladder #147
+        // showed fd-0-only repairs did not stop the onEndPreload EBADF:
+        // nobody writes to fd 1 in the guest (all logging goes to fd 2),
+        // so a closed STDOUT is invisible until cloneForFork() probes it.
+        for (int fd = 0; fd <= 2; fd++) {
+            if (syscall(SYS_fcntl, fd, F_GETFD, 0) >= 0) continue;
+            int nfd = (int)twoyi_sys_open("/dev/null", O_RDWR, 0);
+            if (nfd >= 0) {
+                if (nfd != fd) {
+                    syscall(SYS_dup3, nfd, fd, 0);
+                    syscall(NR_close, nfd);
+                }
+                repaired |= 1 << fd;
             }
-            write_str(2, "[twoyi_loader] 6-Z305t-75: stdin watchdog repaired fd0\n");
+        }
+        if (repaired) {
+            char msg[96];
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] 6-Z305t-75: stdio watchdog repaired fd mask=0x%x\n",
+                     repaired);
+            write_str(2, msg);
         }
     }
     return NULL;
@@ -7227,9 +7241,9 @@ static void patch_open_family_gots(void) {
 // =========================================================================
 __attribute__((constructor(101)))
 static void twoyi_init(void) {
-    // 6-Z305t-75: STDIN BELT — ensure fd 0 is OPEN in every guest
-    // process. Android 11's libcore ZygoteHooks.onEndPreload() clones
-    // the standard FileDescriptors for fork:
+    // 6-Z305t-75: STANDARD-DESCRIPTOR BELT — ensure fds 0/1/2 are OPEN
+    // in every guest process. Android 11's libcore ZygoteHooks
+    // .onEndPreload() clones the standard FileDescriptors for fork:
     //     FileDescriptor.in.cloneForFork();  out;  err;
     // where cloneForFork() is Os.fcntlInt(fd, F_DUPFD_CLOEXEC, 0) and
     // an EBADF throws RuntimeException — the ladder-#145 zygote wall:
@@ -7238,22 +7252,32 @@ static void twoyi_init(void) {
     // java.io.FileDescriptor.cloneForFork(FileDescriptor.java:184) at
     // dalvik.system.ZygoteHooks.onEndPreload(ZygoteHooks.java:79)" →
     // "System zygote died with exception" → exit(0) right after
-    // "Preloading shared libraries..." (the zygote's fd 0 was free —
-    // the post-death /proc/self/stat open returned fd=0). On a real
-    // device init points each service's stdin at /dev/null; the twoyi
-    // spawn path leaves fd 0 closed. Give every guest process a REAL
-    // /dev/null on fd 0 (honest fd, real dup — no fakes): if F_GETFD
-    // says 0 is closed, open /dev/null through the normal translating
-    // open and dup it to 0. No-op where fd 0 is already open (recovery
+    // "Preloading shared libraries...". On a real device init points
+    // each service's stdio at /dev/null (SetupStdio, O_CLOEXEC originals
+    // dup2'd onto 0/1/2); the twoyi spawn path leaves some of them
+    // closed. Give every guest process REAL /dev/null fds (honest fds,
+    // real dups — no fakes): any of 0/1/2 that F_GETFD says is closed
+    // gets a fresh open. No-op where all three are open (recovery
     // corpus path untouched).
-    if (syscall(SYS_fcntl, 0, F_GETFD, 0) < 0) {
-        int nfd = twoyi_sys_open("/dev/null", O_RDWR, 0);
-        if (nfd >= 0) {
-            if (nfd != 0) {
-                syscall(SYS_dup3, nfd, 0, 0);
-                syscall(NR_close, nfd);
+    {
+        int repaired = 0;
+        for (int fd = 0; fd <= 2; fd++) {
+            if (syscall(SYS_fcntl, fd, F_GETFD, 0) >= 0) continue;
+            int nfd = twoyi_sys_open("/dev/null", O_RDWR, 0);
+            if (nfd >= 0) {
+                if (nfd != fd) {
+                    syscall(SYS_dup3, nfd, fd, 0);
+                    syscall(NR_close, nfd);
+                }
+                repaired |= 1 << fd;
             }
-            write_str(2, "[twoyi_loader] 6-Z305t-75: stdin belt repaired fd0 at constructor\n");
+        }
+        if (repaired) {
+            char msg[96];
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] 6-Z305t-75: stdio belt repaired fd mask=0x%x at constructor\n",
+                     repaired);
+            write_str(2, msg);
         }
     }
 
