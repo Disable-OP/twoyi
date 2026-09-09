@@ -27217,3 +27217,11 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
   2. cameraserver's listManifestByInterface returns entries (or honest empty) — no more unchecked-abort deaths.
   3. Rung 8 = SYSTEMUI_LAUNCHER: with registrations alive, system_server's HIDL deps resolve; SurfaceFlinger's gralloc/composer chain is the watch.
   4. If a NEW abort signature appears: the svclogs section + the conn= trailer size + the entry diag pin it in one run — the instrument is now fully armed.
+
+## 6-Z305t-69b — the service flat rides AFTER the chain vec; commit f38fb9c; ladder dispatched
+
+- Ladder #126 (34337126064 on 4b0619b = 69): ZERO aborts (the 68/68b/69 fixes all held — no EX_TRANSACTION_FAILED of any flavor, listManifestByInterface + registerPassthroughClient answered, the oneway guard clean) but STILL zero addWithChain registrations: "parse-fail (addWithChain.chain) code=12 dsize=308 offs=7 sg=6".
+- DECODE: object-count arithmetic (token 44 + 6×40 + flat 24 = 308) pins 6 PTR objects + 1 flat. The parse-fail STAGE (chain, not name) + the tolerated-None flat read = the positional read consumed the VEC STRUCT as the (missing) flat, advancing ptr_seq → the chain parse then read the ARRAY as the vec struct → garbage count → fail. The REAL wire's object order is [name struct, name chars, vec struct, array, chars0, chars1, FLAT-LAST] — consistent with registerForNotifications' trailing flat (dsize=228 = 44+4×40+24) — NOT the .hal declaration order (name, service, chain).
+- FIX: type-driven arg parsing with cursor backtracking in the addWithChain arm: try (flat, vec) → on chain-parse failure restore (obj_idx, ptr_seq) and try (vec, flat). Honest Failed only when neither order parses.
+- Tests +1 (812/812): hidl_add_with_chain_flat_after_vec_wire_order locks the ladder's real wire order. fmt + clippy -D warnings clean.
+- DECISION TREE #127: "HIDL addWithChain(…) → handle" registrations MUST appear; the vendor HAL fleet comes up; rung 8 (SYSTEMUI_LAUNCHER) is the next gate; watch the routed HIDL service↔client traffic (request+reply SG both live now) for the next honest divergence.
