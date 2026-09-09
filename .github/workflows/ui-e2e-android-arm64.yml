@@ -480,6 +480,28 @@ jobs:
                echo \"fdtest-markers=\$(grep -ac 'logdw kmsg fd test' \$tf 2>/dev/null)\"; \
              else echo 'MISSING'; fi" \
             > /tmp/ui-e2e-artifacts/klog-forensics.txt 2>&1 || true
+          # ── 6-Z305t-71: linker-namespace forensics (the gralloc wall) ──
+          # Ladder #131: vendor.gralloc-3-0 dies CANNOT LINK "library
+          # libdrm.so ... not accessible for the namespace (default)" —
+          # libdrm.so EXISTS at /system/lib64, so the "(default)" name
+          # means the vendor binary ran WITHOUT the linkerconfig-generated
+          # namespace config. Bounded dump of BOTH candidate /linkerconfig
+          # trees + the LD_CONFIG_FILE-relevant files, so the next run
+          # answers "does the guest linker SEE a namespace config" with
+          # presence/absence alone.
+          timeout 30 sudo docker exec redroid sh -c \
+            "for base in /data/user/0/io.twoyi.debug/rootfs /data/user/0/io.twoyi.debug/profiles/default/rootfs; do \
+               echo \"== \$base/linkerconfig ==\"; \
+               ls -la \$base/linkerconfig/ 2>/dev/null || echo MISSING; \
+               for f in ld.config.txt ld.config.legacy.txt bootstrap/ld.config.txt; do \
+                 p=\$base/linkerconfig/\$f; \
+                 if [ -e \$p ]; then echo \"-- \$f (\$(stat -c%s \$p) bytes) head --\"; head -c 1500 \$p; echo; \
+                 else echo \"-- \$f MISSING\"; fi; \
+               done; \
+               echo '-- system/etc/ld.config.txt candidates --'; \
+               ls -la \$base/system/etc/ld.config*.txt \$base/etc/ld.config*.txt 2>/dev/null || echo 'no static ld.config variants'; \
+             done" \
+            > /tmp/ui-e2e-artifacts/linkerconfig-forensics.txt 2>&1 || true
           sleep 5
           timeout 45 sudo docker exec redroid /system/bin/sh -c \
             "/system/bin/screencap -p /data/local/tmp/final-2.png 2>/dev/null && cat /data/local/tmp/final-2.png" \
