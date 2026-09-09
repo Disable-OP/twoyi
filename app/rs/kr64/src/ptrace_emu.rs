@@ -1298,11 +1298,22 @@ struct ChildAbi {
     // these in `ChildAbi` — plain `setuid`/`setgid` (x86_64 only),
     // `setresuid`/`setresgid` (all three ABIs), and `setgroups` (all
     // three ABIs). init must never see EPERM from these.
+    // 6-Z305t-73: + setreuid/setregid — the ANDROID-11 ZYGOTE's
+    // ZygoteInit.preloadClasses drop-root pair (`Os.setregid(ROOT_GID,
+    // UNPRIVILEGED_GID); Os.setreuid(ROOT_UID, UNPRIVILEGED_UID);` —
+    // gated on the fake-root getuid/getgid==0 the 6-Z155 family
+    // already provides; a real EPERM on either throws
+    // "RuntimeException: Failed to drop root" → the VM shuts down and
+    // the zygote exits 0 before forking system_server — ladder #143:
+    // rung 5 held, ZERO CumulativeLoggerLock aborts, zygote fleet up,
+    // but "Service 'zygote' exited with status 0" ×N).
     setuid_nr: i64,
     setgid_nr: i64,
     setresuid_nr: i64,
     setresgid_nr: i64,
     setgroups_nr: i64,
+    setreuid_nr: i64,
+    setregid_nr: i64,
     // 6-Z156: getxattr-family numbers — lgetxattr("security.selinux")
     // returning -ENODATA is FATAL for the old omni libselinux baked into
     // static arm64 TWRP ramdisk inits (restorecon_sb does selabel_lookup
@@ -1726,6 +1737,9 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     setresuid_nr: 117,
     setresgid_nr: 119,
     setgroups_nr: 116,
+    // 6-Z305t-73: x86_64 setreuid=113, setregid=114 (asm/unistd_64.h).
+    setreuid_nr: 113,
+    setregid_nr: 114,
     getxattr_nr: 191,
     lgetxattr_nr: 192,
     fgetxattr_nr: 193,
@@ -2124,6 +2138,9 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     setresuid_nr: 208,
     setresgid_nr: 210,
     setgroups_nr: 81,
+    // 6-Z305t-73: i386 setreuid=70, setregid=71 (unistd_32.h).
+    setreuid_nr: 70,
+    setregid_nr: 71,
     getxattr_nr: 229,
     lgetxattr_nr: 230,
     fgetxattr_nr: 231,
@@ -2501,6 +2518,12 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     setresuid_nr: 147,
     setresgid_nr: 149,
     setgroups_nr: 159,
+    // 6-Z305t-73: aarch64 (asm-generic) setregid=143, setreuid=145 —
+    // NOTE the order: setregid(143) comes BEFORE setgid(144) in the
+    // asm-generic table; 143/145 collide with no other guest-class
+    // number on this ABI.
+    setreuid_nr: 145,
+    setregid_nr: 143,
     getxattr_nr: 8,
     lgetxattr_nr: 9,
     fgetxattr_nr: 10,
@@ -2664,6 +2687,11 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     setresuid_nr: 208, // setresuid32
     setresgid_nr: 210, // setresgid32
     setgroups_nr: 206, // setgroups32
+    // 6-Z305t-73: arm32 (EABI) setreuid=70, setregid=71 — same numbers
+    // as i386 (arch/arm/tools/syscall.tbl); no collision (arm32
+    // getpid=20).
+    setreuid_nr: 70,
+    setregid_nr: 71,
     // 6-Z305j: corrected from the i386 values (229/230/231) — arm32
     // (arch/arm/tools/syscall.tbl) has getxattr=385, lgetxattr=386,
     // fgetxattr=387 in the same 382..393 private range as setxattr.
@@ -3703,6 +3731,20 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.setgroups_nr
         || syscall_nr == abi.setuid_nr
         || syscall_nr == abi.setgid_nr
+        // 6-Z305t-73: the ANDROID-11 ZYGOTE's drop-root pair —
+        // ZygoteInit.preloadClasses does Os.setregid(ROOT_GID,
+        // UNPRIVILEGED_GID); Os.setreuid(ROOT_UID, UNPRIVILEGED_UID);)
+        // behind a getuid()==0 && getgid()==0 gate that the 6-Z155
+        // fake-root family already satisfies. The real kernel answers
+        // -EPERM (untrusted_app cannot change ids) → "RuntimeException:
+        // Failed to drop root" → VM shutdown → zygote exit(0) BEFORE
+        // forking system_server (ladder #143: rung 5, ZERO
+        // CumulativeLoggerLock aborts, full HAL fleet up, zygote
+        // exiting 0 ×N). Same honesty as the rest of this family: the
+        // traced child keeps its real host ids; only the RETURN VALUE
+        // is faked.
+        || syscall_nr == abi.setreuid_nr
+        || syscall_nr == abi.setregid_nr
     // 6-Z305t-49b: bpf() is NOT in this uniform family — the dedicated
     // EXIT arm below (bpf arm, next to the 6-Z99 netlink machinery)
     // provides per-command returns because the A11 loader REJECTS fd 0
@@ -29182,7 +29224,9 @@ pub fn run_ptrace_loop(
                                         || syscall_num == abi.setresgid_nr
                                         || syscall_num == abi.setgroups_nr
                                         || syscall_num == abi.setuid_nr
-                                        || syscall_num == abi.setgid_nr;
+                                        || syscall_num == abi.setgid_nr
+                                        || syscall_num == abi.setreuid_nr
+                                        || syscall_num == abi.setregid_nr;
                                     if identity_fake {
                                         log(&format!(
                                             "6-Z155: {}() nr={} returned {} (-errno {}) — faked to 0 (untrusted_app cannot change ids; init must believe it is root so the direct /sbin/recovery execve proceeds instead of security_failure() → reboot → rt_sigsuspend park)",
@@ -29292,7 +29336,9 @@ pub fn run_ptrace_loop(
                                         || syscall_num == abi.setresgid_nr
                                         || syscall_num == abi.setgroups_nr
                                         || syscall_num == abi.setuid_nr
-                                        || syscall_num == abi.setgid_nr;
+                                        || syscall_num == abi.setgid_nr
+                                        || syscall_num == abi.setreuid_nr
+                                        || syscall_num == abi.setregid_nr;
                                     if identity_fake {
                                         log(&format!(
                                             "6-Z155: {}() nr={} returned {} (-errno {}) — faked to 0 (untrusted_app cannot change ids; init must believe it is root so the direct /sbin/recovery execve proceeds instead of security_failure() → reboot → rt_sigsuspend park)",
@@ -34257,6 +34303,43 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // precisely BECAUSE arm32 getpid is 20, not 172.
         assert_eq!(ABI_ARM32.prctl, 172);
         assert_ne!(ABI_ARM32.prctl, ABI_ARM32.getpid);
+    }
+
+    // ── 6-Z305t-73: setreuid/setregid (the Android-11 zygote drop-root
+    // pair) join the 6-Z155 identity-fake family — per-ABI numbers
+    // locked, no collision with the identity getters or prctl. ──
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn setreuid_setregid_abi_numbers_x86_64_6z305t73() {
+        // x86_64: setreuid=113, setregid=114 (asm/unistd_64.h).
+        assert_eq!(ABI_X86_64.setreuid_nr, 113);
+        assert_eq!(ABI_X86_64.setregid_nr, 114);
+        assert_ne!(ABI_X86_64.setregid_nr, ABI_X86_64.getpid);
+        assert_ne!(ABI_X86_64.setregid_nr, ABI_X86_64.prctl);
+        // i386 compat: setreuid=70, setregid=71 (unistd_32.h).
+        assert_eq!(ABI_X86_32.setreuid_nr, 70);
+        assert_eq!(ABI_X86_32.setregid_nr, 71);
+        assert_ne!(ABI_X86_32.setregid_nr, ABI_X86_32.getpid);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn setreuid_setregid_abi_numbers_aarch64_arm32_6z305t73() {
+        // asm-generic: setregid=143 comes BEFORE setgid=144; setreuid=145.
+        // The ladder-#143 zygote wall (ZygoteInit.preloadClasses
+        // "Failed to drop root" → exit(0) before forking system_server)
+        // is exactly Os.setregid → EPERM on this ABI.
+        assert_eq!(ABI_AARCH64.setregid_nr, 143);
+        assert_eq!(ABI_AARCH64.setreuid_nr, 145);
+        assert_eq!(ABI_AARCH64.setgid_nr, 144);
+        assert_ne!(ABI_AARCH64.setregid_nr, ABI_AARCH64.setgid_nr);
+        assert_ne!(ABI_AARCH64.setregid_nr, ABI_AARCH64.getpid);
+        assert_ne!(ABI_AARCH64.setregid_nr, ABI_AARCH64.prctl);
+        // arm32 compat: setreuid=70, setregid=71 (EABI = i386 numbers).
+        assert_eq!(ABI_ARM32.setreuid_nr, 70);
+        assert_eq!(ABI_ARM32.setregid_nr, 71);
+        assert_ne!(ABI_ARM32.setregid_nr, ABI_ARM32.getpid);
     }
 
     #[test]
