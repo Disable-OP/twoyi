@@ -27382,3 +27382,9 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 - FIX (35d6788): the shlib constructor (runs before main in EVERY guest process) probes `fcntl(0, F_GETFD)` and, if closed, opens a REAL /dev/null via the translating open and dup3s it to 0 — honest fd, no fakes, no-op where fd 0 is open (recovery path untouched). Host-verified the logic with real syscalls (works open/closed both ways).
 - Gates: 818/818 rust (unchanged), C host-symptom checks OK (NDK build in CI).
 - EXPECTATION for #146: zygote finishes preload (shared libraries + resources) → ZygoteInit.main → registerZygoteSocket → **forkSystemServer → rung 6 SYSTEM_SERVER** → system_server's own HIDL/binder hub work (the 94-registrations baseline from the earlier ladders) → rung 8 SystemUI/launcher.
+
+## 6-Z305t-75b — ladder #146: the EBADF wall PERSISTS (fd 0 closed AGAIN between constructor and endPreload); STDIN WATCHDOG added; #147 dispatched
+
+- #146 (35d6788): the constructor belt did NOT hold — the zygote died identically at onEndPreload (fcntl EBADF), and fd 0 was free again at death. Something in the spawn→preload window closes fd 0 (init's SetupStdio opens /dev/null O_CLOEXEC and dup2s 0/1/2; under the twoyi spawn path a leg of that dance — or a later rebind — leaves 0 closed even after the belt's post-exec repair).
+- Rather than chase the closer: the shlib now spawns a STDIN WATCHDOG thread (android mode only; 240 × 500ms = 120s window; re-opens a REAL /dev/null onto fd 0 whenever F_GETFD(0) fails; one bounded stderr line per repair). The zygote's preload takes single-digit seconds — a 500ms re-check interval intercepts any closer long before endPreload. Belt diagnostic line added.
+- #147 dispatched. If the death persists DESPITE "stdin watchdog repaired fd0" lines appearing, the closer is tighter than 500ms or the failing fd is NOT 0 (out/err) — next step would be a cloneForFork-targeted probe.
