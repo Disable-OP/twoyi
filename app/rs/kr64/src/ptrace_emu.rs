@@ -3275,6 +3275,42 @@ fn qpipe_proxy_inject(pid: libc::pid_t, rootfs: &str) -> std::io::Result<i32> {
     r
 }
 
+/// 6-Z305t-71i: decode bionic's abort message at a fatal-signal stop.
+///
+/// The debuggerd crash_dump CANNOT attach to any guest process — every
+/// tracee is already traced by kr64 ("crash_dump failed to dump
+/// process" / "failed to attach to thread … already traced by", ladder
+/// #138) — so the svc-log tail is the only classic carrier of the crash
+/// reason and it gets truncated by artifact budgeting. The
+/// kernel-honest equivalent: bionic's aborter writes the message into
+/// an anonymous mapping NAMED "abort message" via PR_SET_VMA (proven
+/// in the tracer's own 6-Z149 prctl-deep samples: name='abort
+/// message'). Layout is bionic's abort_msg_t { size_t size; char msg[];
+/// } — size counts the header, msg is NUL-terminated text.
+fn read_bionic_abort_message(pid: libc::pid_t) -> Option<String> {
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
+    let line = maps.lines().find(|l| l.contains("[anon:abort message]"))?;
+    let lo = line.split('-').next()?.parse::<u64>().ok()?;
+    let raw = read_child_bytes(pid, lo, 4096)?;
+    if raw.len() < 8 {
+        return None;
+    }
+    let total = u64::from_le_bytes(raw[0..8].try_into().ok()?) as usize;
+    let msg_len = total.saturating_sub(8).min(512).min(raw.len() - 8);
+    if msg_len == 0 {
+        return None;
+    }
+    let msg: String = String::from_utf8_lossy(&raw[8..8 + msg_len])
+        .chars()
+        .take_while(|&c| c != '\0')
+        .collect();
+    if msg.is_empty() {
+        None
+    } else {
+        Some(msg)
+    }
+}
+
 /// Set the return value of a syscall in registers.
 ///
 /// On x86_64 this writes `rax` (the kernel's "syscall return value"
@@ -13909,6 +13945,8 @@ pub fn run_ptrace_loop(
     const SITE_DIAG_WRITE: u8 = 12;
     const SITE_QPIPE_INJECT: u8 = 13;
     const SITE_QPIPE_INJECT_FAIL: u8 = 14;
+    const SITE_ABORT_MSG: u8 = 15;
+    const SITE_SIGSEGV_MAPS: u8 = 16;
 
     // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
     // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
@@ -32637,20 +32675,54 @@ pub fn run_ptrace_loop(
                                 }
                                 // Task 6-Z37: dump /proc/<pid>/maps to identify
                                 // which library contains the crash address.
-                                let maps_path = format!("/proc/{}/maps", pid);
-                                if let Ok(maps) = std::fs::read_to_string(&maps_path) {
-                                    log("=== /proc/<pid>/maps (crash diagnostic) ===");
-                                    for line in maps.lines() {
-                                        // Log ALL entries — we need to see the full
-                                        // memory map to find which library contains
-                                        // the crash address rip.
-                                        log(&format!("  MAPS: {}", line));
+                                // 6-Z305t-71i: bounded — the fleet crash-loop
+                                // made the ALL-entries dump a flood (166KB
+                                // svc logs, ladder #138); once per pid keeps
+                                // the crash-address decode.
+                                if let Some(maps_total) = stop_log_allow(
+                                    &mut stop_log_budget,
+                                    SITE_SIGSEGV_MAPS,
+                                    pid,
+                                    4096,
+                                ) {
+                                    let maps_path = format!("/proc/{}/maps", pid);
+                                    if let Ok(maps) = std::fs::read_to_string(&maps_path) {
+                                        log(&format!(
+                                        "=== /proc/<pid>/maps (crash diagnostic) [occurrence #{} of this pid] ===",
+                                        maps_total
+                                    ));
+                                        for line in maps.lines() {
+                                            // Log ALL entries — we need to see the full
+                                            // memory map to find which library contains
+                                            // the crash address rip.
+                                            log(&format!("  MAPS: {}", line));
+                                        }
+                                        log("=== end /proc/<pid>/maps ===");
+                                    } else {
+                                        log("SIGSEGV: could not read /proc/<pid>/maps");
                                     }
-                                    log("=== end /proc/<pid>/maps ===");
-                                } else {
-                                    log("SIGSEGV: could not read /proc/<pid>/maps");
                                 }
                             }
+                        }
+                    }
+                }
+
+                // ── 6-Z305t-71i: bionic abort-message forensics ──
+                // crash_dump can never attach (already traced by kr64), so
+                // decode the crash from the tracee's own 'abort message'
+                // mapping at the fatal-signal stop — once per pid.
+                if matches!(
+                    sig,
+                    libc::SIGABRT | libc::SIGBUS | libc::SIGILL | libc::SIGFPE | libc::SIGSEGV
+                ) {
+                    if let Some(abort_msg) = read_bionic_abort_message(pid) {
+                        if let Some(total) =
+                            stop_log_allow(&mut stop_log_budget, SITE_ABORT_MSG, pid, 4096)
+                        {
+                            log(&format!(
+                                "6-Z305t-71i: pid={} fatal signal {} — bionic abort message: {:?} [occurrence #{} of this pid]",
+                                pid, sig, abort_msg, total
+                            ));
                         }
                     }
                 }
