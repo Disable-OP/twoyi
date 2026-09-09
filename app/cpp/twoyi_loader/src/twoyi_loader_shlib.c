@@ -7682,6 +7682,82 @@ static void twoyi_init(void) {
         write_str(2, "' (src=none)\n");
     }
     if (strcmp(g_boot_mode_env, "android") == 0) {
+        // ── 6-Z305t-76: THE ZYGOTE LISTENING SOCKET ──────────────────
+        //
+        // Ladder #152: the zygote's FULL PRELOAD now completes
+        // (endPreload passed — the stdio floor held), and ZygoteInit
+        // .registerZygoteSocket died with "RuntimeException: Socket
+        // unset or invalid: ANDROID_SOCKET_zygote / Caused by:
+        // NumberFormatException: s == null". The Java side reads
+        // System.getenv("ANDROID_SOCKET_zygote") DIRECTLY (then
+        // Integer.parseInt), so the libcutils hook's fake fd 3 can
+        // never help: the ENV must exist in the process that will run
+        // ZygoteInit.main, pointing at a REAL LISTENING socket bound
+        // where app processes expect it ({rootfs}/dev/socket/zygote —
+        // the app-side LocalSocket connect path resolves through the
+        // same translation).
+        //
+        // On a real device init creates the socket from the `socket
+        // zygote stream ...` rc directive and publishes the fd via
+        // ANDROID_SOCKET_zygote. Under the twoyi spawn path the env
+        // var does not reach the zygote's exec (the shlib's execve
+        // rebuild). So the ZYGOTE ITSELF (detected by --zygote in its
+        // final exec argv — this constructor runs post-exec with the
+        // real argv) creates its own REAL listening AF_UNIX socket on
+        // the translated path and publishes the env var honestly:
+        // a real socket, a real fd, a real env value.
+        {
+            char cmdline[256];
+            int cl_fd = (int)syscall(NR_openat, (long)AT_FDCWD,
+                                     "/proc/self/cmdline", O_RDONLY, 0);
+            ssize_t cl_n = -1;
+            if (cl_fd >= 0) {
+                cl_n = syscall(NR_read, cl_fd, cmdline, sizeof(cmdline) - 1);
+                syscall(NR_close, cl_fd);
+            }
+            if (cl_n > 0) {
+                cmdline[cl_n] = 0;
+                // argv array: NUL-separated; look for the --zygote token
+                int is_zygote = 0;
+                for (ssize_t i = 0; i < cl_n;) {
+                    size_t len = strnlen(cmdline + i, (size_t)(cl_n - i));
+                    if (len == 0) { i++; continue; }
+                    if (strncmp(cmdline + i, "--zygote", len) == 0) {
+                        is_zygote = 1;
+                        break;
+                    }
+                    i += (ssize_t)len + 1;
+                }
+                if (is_zygote && g_rootfs) {
+                    char sock_path[512];
+                    snprintf(sock_path, sizeof(sock_path),
+                             "%s/dev/socket/zygote", g_rootfs);
+                    int sfd = (int)syscall(SYS_socket, AF_UNIX,
+                                           SOCK_STREAM | SOCK_CLOEXEC, 0);
+                    if (sfd >= 0) {
+                        struct sockaddr_un sa;
+                        memset(&sa, 0, sizeof(sa));
+                        sa.sun_family = AF_UNIX;
+                        strncpy(sa.sun_path, sock_path, sizeof(sa.sun_path) - 1);
+                        // init created a stale socket FILE for this name;
+                        // a listener must own a FRESH inode.
+                        unlink(sock_path);
+                        if (syscall(SYS_bind, sfd, &sa, sizeof(sa)) == 0) {
+                            if (syscall(SYS_listen, sfd, 8) == 0) {
+                                char val[16];
+                                snprintf(val, sizeof(val), "%d", sfd);
+                                setenv("ANDROID_SOCKET_zygote", val, 1);
+                                write_str(2, "[twoyi_loader] 6-Z305t-76: zygote socket bound+listening, ANDROID_SOCKET_zygote published\n");
+                            } else {
+                                write_str(2, "[twoyi_loader] 6-Z305t-76: zygote socket listen FAILED\n");
+                            }
+                        } else {
+                            write_str(2, "[twoyi_loader] 6-Z305t-76: zygote socket bind FAILED\n");
+                        }
+                    }
+                }
+            }
+        }
         patch_open_family_gots();
         // 6-Z305t-71e: cover the dlopen window (the goldfish EGL stack
         // loads after this constructor — see the thread's block comment).
