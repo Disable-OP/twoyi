@@ -76,18 +76,18 @@ name: Android Boot Ladder (ARM64 via redroid on ubuntu-24.04-arm)
       rootfs_release_tag:
         description: 'Release tag holding the vendored pure-stock Android 11 rootfs'
         required: false
-        default: 'android11-aosp-arm64-rsr1'
+        default: 'android11-aosp-arm64-rsr2'
       rootfs_asset_name:
         description: 'Asset name of the vendored rootfs tar.gz'
         required: false
-        default: 'twoyi-android11-aosp-arm64-rsr1.tar.gz'
+        default: 'twoyi-android11-aosp-arm64-rsr2.tar.gz'
       expect_rung:
         description: 'Minimum ladder rung the run must reach for the job to exit 0 (0 = never fail on the ladder; diagnostic mode). Rungs: 1 ROOTFS_READY, 2 INIT, 3 PROPS, 4 DAEMONS, 5 ZYGOTE, 6 SYSTEM_SERVER, 7 SURFACEFLINGER, 8 SYSTEMUI, 9 BOOT_COMPLETED'
         required: false
         default: '0'
 
 concurrency:
-  group: ui-e2e-android-arm64-${{ github.ref }}-${{ github.event.inputs.rootfs_release_tag || 'android11-aosp-arm64-rsr1' }}
+  group: ui-e2e-android-arm64-${{ github.ref }}-${{ github.event.inputs.rootfs_release_tag || 'android11-aosp-arm64-rsr2' }}
   cancel-in-progress: true
 
 env:
