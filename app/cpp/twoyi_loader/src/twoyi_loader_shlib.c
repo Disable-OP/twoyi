@@ -453,6 +453,12 @@ static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 //      BC_FREE_BUFFER (kernel-true lifecycle).
 // ---------------------------------------------------------------------------
 #define BP_WIRE_V2_MAGIC 0x30325657u   /* "WV20" little-endian */
+// 6-Z305t-68: the HIDL wire's BINDER_TYPE_PTR SG-buffer capture.
+#define BP_WIRE_V3_MAGIC    0x30335657u       /* "WV30" little-endian */
+#define BP_BINDER_TYPE_PTR  0x70742a85u       /* B_PACK_CHARS('p','t','*',0x85) */
+#define BP_SG_BUF_MAX       (256u * 1024u)    // per-PTR-object cap
+#define BP_SG_TOTAL_MAX     (384u * 1024u)    // per-transaction SG cap
+#define BP_SG_MAX_BUFS      128u              // per-transaction PTR count cap
 #define BP_BR_REPLY      0x80407203u   /* _IOR('r', 3, binder_transaction_data=64) */
 #define BP_BR_TRANSACTION 0x80407202u  /* _IOR('r', 2, 64) — 6-Z271 server delivery */
 #define BP_TR_DATA_PTR_OFF     48u     /* binder_transaction_data.data.ptr.buffer */
@@ -538,7 +544,13 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
     if (tail_len < 8) return;
     uint32_t magic;
     memcpy(&magic, tail, 4);
-    if (magic != BP_WIRE_V2_MAGIC) return;
+    // 6-Z305t-68: v3 resp blobs carry a [u32 sg_count] header plus the
+    // BINDER_TYPE_PTR contents — the kernel's SG region for routed HIDL
+    // transactions. The backing becomes [data][offsets][sg] and every PTR
+    // object's `buffer` field is fixed up to its SG copy (the kernel's
+    // receiver-side pointer fixup).
+    if (magic != BP_WIRE_V2_MAGIC && magic != BP_WIRE_V3_MAGIC) return;
+    int is_v3 = (magic == BP_WIRE_V3_MAGIC);
     uint32_t blob_count;
     memcpy(&blob_count, tail + 4, 4);
     const uint8_t *p = tail + 8;
@@ -579,7 +591,38 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
             memcpy(&dlen, p, 4);
             memcpy(&olen, p + 4, 4);
             p += 8; rem -= 8;
+            uint32_t sg_count = 0;
+            if (is_v3) {
+                if (rem < 4) return;
+                memcpy(&sg_count, p, 4);
+                p += 4; rem -= 4;
+            }
             if (rem < (uint64_t)dlen + olen) return;
+            // Pre-scan the SG section (it trails [data][offsets]): record
+            // each entry's byte offset in the trailer, its packed
+            // destination offset in the backing, and its length.
+            const uint8_t *sg_p = p + (uint64_t)dlen + olen;
+            uint64_t sg_rem = rem - (uint64_t)dlen - olen;
+            uint64_t sg_src[BP_SG_MAX_BUFS];
+            uint64_t sg_dst[BP_SG_MAX_BUFS];
+            uint32_t sg_len[BP_SG_MAX_BUFS];
+            uint32_t sg_seen = 0;
+            uint64_t sg_pack = 0;
+            int sg_bad = 0;
+            for (uint32_t s = 0; s < sg_count; s++) {
+                if (sg_seen >= BP_SG_MAX_BUFS || sg_rem < 12) { sg_bad = 1; break; }
+                uint32_t blen;
+                memcpy(&blen, sg_p + 8, 4);
+                if (sg_rem < 12 + (uint64_t)blen) { sg_bad = 1; break; }
+                sg_src[sg_seen] = (uint64_t)(sg_p + 12 - p);
+                sg_dst[sg_seen] = sg_pack;
+                sg_len[sg_seen] = blen;
+                sg_seen++;
+                sg_pack += blen;
+                sg_p += 12 + blen;
+                sg_rem -= 12 + blen;
+            }
+            if (sg_bad) return; /* trailer desync — stop consuming */
             // 6-Z271w: first-REPLY-per-process blob dump — the client-side
             // parse of our SM getService reply returned NULL (keystore2's
             // NAME_NOT_FOUND panic chain) while the proxy-side parse was
@@ -601,12 +644,41 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 snprintf(dump + off, sizeof(dump) - off, "\n");
                 write_str(2, dump);
             }
-            // [data][offsets] in one allocation; offsets_ptr = base + dlen.
-            uint8_t *back = (uint8_t *)malloc((size_t)(dlen + olen ? dlen + olen : 1));
+            // [data][offsets][sg region] in one allocation; offsets_ptr =
+            // base + dlen; every BINDER_TYPE_PTR object's `buffer` field is
+            // fixed up to point at its SG copy (the kernel's receiver-side
+            // pointer fixup — the client dereferences it as its own memory).
+            uint64_t sg_total = sg_pack;
+            uint64_t sg_pad = (sg_total > 0) ? (8 - (((uint64_t)dlen + olen) % 8)) % 8 : 0;
+            uint64_t back_len = (uint64_t)dlen + olen + sg_pad + sg_total;
+            uint8_t *back = (uint8_t *)malloc((size_t)(back_len ? back_len : 1));
             if (back) {
                 if (dlen) memcpy(back, p, dlen);
                 if (olen) memcpy(back + dlen, p + dlen, olen);
-                bp_alloc_register(back, (uint64_t)dlen + olen);
+                if (sg_total > 0) {
+                    for (uint32_t s = 0; s < sg_seen; s++)
+                        memcpy(back + (uint64_t)dlen + olen + sg_pad + sg_dst[s],
+                               p + sg_src[s], sg_len[s]);
+                    // Fix up every BINDER_TYPE_PTR object's buffer field in
+                    // the WRITTEN copy — walk the offsets array in order
+                    // (the same order the entries were captured in).
+                    uint32_t fixed = 0;
+                    for (uint64_t j = 0; j + 8 <= (uint64_t)olen && fixed < sg_seen;
+                         j += 8) {
+                        uint64_t obj_off;
+                        memcpy(&obj_off, back + dlen + j, 8);
+                        if (obj_off > (uint64_t)dlen || obj_off + 40 > (uint64_t)dlen)
+                            continue;
+                        uint32_t typ;
+                        memcpy(&typ, back + obj_off, 4);
+                        if (typ != BP_BINDER_TYPE_PTR) continue;
+                        uint64_t target = (uint64_t)(uintptr_t)(back + (uint64_t)dlen +
+                                            olen + sg_pad + sg_dst[fixed]);
+                        memcpy(back + obj_off + 8, &target, 8);
+                        fixed++;
+                    }
+                }
+                bp_alloc_register(back, back_len);
                 uint64_t data_ptr = (uint64_t)(uintptr_t)back;
                 uint64_t offsets_ptr = (uint64_t)(uintptr_t)(back + dlen);
                 memcpy(stream + pos + 4 + BP_TR_DATA_PTR_OFF, &data_ptr, 8);
@@ -696,7 +768,8 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
             }
             // On malloc failure the tr keeps data_ptr=0 (the pre-6-Z265
             // behavior) — no worse than before.
-            p += dlen + olen; rem -= (uint64_t)dlen + olen;
+            p += (uint64_t)dlen + olen + sg_pad + sg_total;
+            rem -= (uint64_t)dlen + olen + sg_pad + sg_total;
             blob_idx++;
         }
         pos += 4 + sz;
@@ -1367,16 +1440,61 @@ static unsigned char *bp_build_v2_request_trailer(
     uint32_t n = bp_scan_tx_blobs(stream, ws, descs);
     if (n == 0) return NULL;
 
+    // 6-Z305t-68: per-blob BINDER_TYPE_PTR SG capture. The HIDL wire
+    // carries hidl_string/hidl_vec contents OUT of the main parcel —
+    // writeBuffer/writeEmbeddedBuffer emit binder_buffer_object refs to
+    // the SENDER's memory and the real kernel copies each (buffer,length)
+    // verbatim into the receiver's transaction buffer (the scatter-gather
+    // region of BC_TRANSACTION_SG, copied in offsets-array order) and
+    // fixes the object's buffer pointer up to the receiver's copy. We run
+    // IN the guest process, so the bytes are directly memcpy-able.
+    // First pass: walk each blob's offsets array, count/size its PTR
+    // objects (any cap trip → sg_count 0 for that blob = honest parse
+    // failure downstream, identical to the pre-68 behavior).
+    uint32_t sg_counts[BP_BLOB_MAX_CMDS];
+    uint64_t sg_totals[BP_BLOB_MAX_CMDS];
     uint64_t total = 8;
-    for (uint32_t i = 0; i < n; i++)
-        total += 8 + descs[i].data_len + descs[i].offsets_len;
+    for (uint32_t i = 0; i < n; i++) {
+        sg_counts[i] = 0;
+        sg_totals[i] = 0;
+        total += 12 + descs[i].data_len + descs[i].offsets_len;
+        const uint8_t *d = (const uint8_t *)(uintptr_t)descs[i].data_ptr;
+        const uint8_t *o = (const uint8_t *)(uintptr_t)descs[i].offsets_ptr;
+        uint32_t cnt = 0;
+        uint64_t sum = 0;
+        int tripped = 0;
+        for (uint64_t j = 0; d != NULL && o != NULL && j + 8 <= descs[i].offsets_len;
+             j += 8) {
+            uint64_t obj_off;
+            memcpy(&obj_off, o + j, 8);
+            if (obj_off > descs[i].data_len || obj_off + 40 > descs[i].data_len)
+                continue;
+            uint32_t typ;
+            memcpy(&typ, d + obj_off, 4);
+            if (typ != BP_BINDER_TYPE_PTR) continue;
+            uint64_t blen;
+            memcpy(&blen, d + obj_off + 16, 8);
+            if (blen > BP_SG_BUF_MAX || cnt >= BP_SG_MAX_BUFS ||
+                sum + blen > BP_SG_TOTAL_MAX) {
+                tripped = 1;
+                break;
+            }
+            cnt++;
+            sum += blen;
+        }
+        if (!tripped && cnt > 0) {
+            sg_counts[i] = cnt;
+            sg_totals[i] = sum;
+        }
+        total += sg_totals[i] + (uint64_t)sg_counts[i] * 12;
+    }
     // Frame budget: 8-byte wire header + stream + this trailer + slack.
     if (total + 8 + ws + 64 > BP_MAX_FRAME) return NULL;
 
     unsigned char *tr = (unsigned char *)malloc((size_t)total);
     if (!tr) return NULL;
     size_t off = 0;
-    uint32_t magic = BP_WIRE_V2_MAGIC;
+    uint32_t magic = BP_WIRE_V3_MAGIC;
     memcpy(tr + off, &magic, 4);
     off += 4;
     memcpy(tr + off, &n, 4);
@@ -1384,9 +1502,12 @@ static unsigned char *bp_build_v2_request_trailer(
     for (uint32_t i = 0; i < n; i++) {
         uint32_t dl = (uint32_t)descs[i].data_len;
         uint32_t ol = (uint32_t)descs[i].offsets_len;
+        uint32_t sc = sg_counts[i];
         memcpy(tr + off, &dl, 4);
         off += 4;
         memcpy(tr + off, &ol, 4);
+        off += 4;
+        memcpy(tr + off, &sc, 4);
         off += 4;
         if (dl > 0) {
             memcpy(tr + off, (const void *)(uintptr_t)descs[i].data_ptr, dl);
@@ -1395,6 +1516,33 @@ static unsigned char *bp_build_v2_request_trailer(
         if (ol > 0) {
             memcpy(tr + off, (const void *)(uintptr_t)descs[i].offsets_ptr, ol);
             off += ol;
+        }
+        if (sc == 0) continue;
+        // Second pass over the same offsets array — the capture order IS
+        // the kernel's SG copy order (offsets-array object order).
+        const uint8_t *d = (const uint8_t *)(uintptr_t)descs[i].data_ptr;
+        const uint8_t *o = (const uint8_t *)(uintptr_t)descs[i].offsets_ptr;
+        for (uint64_t j = 0; d != NULL && o != NULL && j + 8 <= descs[i].offsets_len;
+             j += 8) {
+            uint64_t obj_off;
+            memcpy(&obj_off, o + j, 8);
+            if (obj_off > descs[i].data_len || obj_off + 40 > descs[i].data_len)
+                continue;
+            uint32_t typ;
+            memcpy(&typ, d + obj_off, 4);
+            if (typ != BP_BINDER_TYPE_PTR) continue;
+            uint64_t bptr, blen;
+            memcpy(&bptr, d + obj_off + 8, 8);
+            memcpy(&blen, d + obj_off + 16, 8);
+            memcpy(tr + off, &bptr, 8);
+            off += 8;
+            uint32_t b32 = (uint32_t)blen;
+            memcpy(tr + off, &b32, 4);
+            off += 4;
+            if (blen > 0) {
+                memcpy(tr + off, (const void *)(uintptr_t)bptr, blen);
+                off += blen;
+            }
         }
     }
     *out_len = (uint32_t)total;
