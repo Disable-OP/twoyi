@@ -3366,7 +3366,41 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 // 6-Z113: also clears the binder PROXY fd class (same reasoning — a
 // recycled fd number must not be treated as a connected proxy socket).
 // 6-Z116: also clears the qemu_pipe PROXY fd class (same reasoning).
+
+// 6-Z305t-75g: the STDIO FLOOR mask — bit N set means fd N (0/1/2) was
+// filled by the constructor belt with a REAL /dev/null dup and is
+// PROTECTED against close() (see the close() hook below). Set only by
+// the belt; never cleared for the life of the process.
+static int g_stdio_floor_mask;
+
 int close(int fd) {
+    // 6-Z305t-75g: THE STDIO FLOOR — fds 0/1/2 that the constructor belt
+    // filled with REAL /dev/null dups are PROTECTED: a close() on them
+    // returns success WITHOUT closing. Evidence (ladder #151 closer
+    // tracer): the zygote's fd 0 was closed and re-opened in a 3-4ms
+    // churn (close(fd=0) from libtwrp_fb_hook.so and libc) — every close
+    // of fd 0 destroys whatever the belt/watchdog put there, and the
+    // next open() reclaims fd 0, so the churn is self-sustaining and the
+    // 500ms watchdog can never win. ZygoteHooks.onEndPreload's
+    // cloneForFork(F_DUPFD_CLOEXEC) then hits EBADF and the zygote
+    // exits 0 before forkSystemServer. The floor fds stay REAL
+    // descriptors (honest fd values, real dup targets); the guest is
+    // only prevented from destroying the stdio floor — exactly what a
+    // supervisor does for a daemon's stdio.
+    if (fd >= 0 && fd <= 2) {
+        static int floor_log_count = 0;
+        if (g_stdio_floor_mask & (1 << fd)) {
+            if (floor_log_count < 12) {
+                floor_log_count++;
+                char msg[96];
+                snprintf(msg, sizeof(msg),
+                         "[twoyi_loader] 6-Z305t-75g: close(fd=%d) on the stdio floor refused (protected /dev/null)\n",
+                         fd);
+                write_str(2, msg);
+            }
+            return 0;
+        }
+    }
     static int (*real_close)(int) = NULL;
     if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
     binder_fd_clear(fd);
@@ -7262,6 +7296,13 @@ static void twoyi_init(void) {
     {
         int repaired = 0;
         for (int fd = 0; fd <= 2; fd++) {
+            // 6-Z305t-75g: the floor covers ALL of 0/1/2 — whether the fd
+            // was closed (repaired with a fresh /dev/null) or already
+            // open (whatever the spawn path put there: the svc log, a
+            // /dev/null, ...). The stdio contract is that 0/1/2 exist for
+            // the life of the process; the closer tracer (ladder #151)
+            // showed the churn closing them either way.
+            g_stdio_floor_mask |= 1 << fd;
             if (syscall(SYS_fcntl, fd, F_GETFD, 0) >= 0) continue;
             int nfd = twoyi_sys_open("/dev/null", O_RDWR, 0);
             if (nfd >= 0) {
