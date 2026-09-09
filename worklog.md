@@ -27442,3 +27442,21 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 - vold (SIGABRT), health-hal (SIGABRT), camera-provider (SIGSEGV), drm-widevine (Check failed: drmFactory->registerAsService("widevine")), sensors (SIGPIPE 13), thermal (SIGSEGV 11), neuralnetworks/tombstoned (exit 1) still die — none of them murder the zygote/SF (their onrestarts don't touch them), but they are honest next walls.
 - 6-Z305t-16 ENTRY-consumption diagnostics still cap at 24/pid (fine).
 - onRegistration callbacks remain legacy-shaped (acceptable; decode when the trace demands).
+
+---
+## 6-Z305x/y — ladder #155 decoded: RUNG 7 (+2) — the vendor LD_LIBRARY_PATH fix held end-to-end (gralloc/composer link, the onrestart cascade never fired, the zygote lived, SF spawned AND survived, system_server FORKED); the new wall is the zygote's leaked hyphenation fd at the forkSystemServer whitelist
+
+- RUNG 7 (SURFACEFLINGER), result.json verdict on 6a63d7b. The #154 killer chain is GONE: zero 'restart zygote' klog lines, zero zygote deaths, one zygote generation (pid 2903) alive the whole boot; KILL-TRACE (6-Z305u) shows only init's own process-group kills of finished oneshot execs — no guest murder, no host-killer signature. The kr64 stderr also shrank 100MB → 40MB (the 6-Z305v ring caps; remaining budget dominated by the wide DIAG families — further capping only if the next decode needs it).
+- NEW WALL, VERBATIM (svc-2903, the zygote's own svc log — the forked child inherits its stderr): `[glog F/abort] JNI FatalError called: (system_server) Not whitelisted (28): /system/usr/hyphen-data/hyph-as.hyb` — the forkSystemServer child's fd sanitization (frameworks/base/core/jni/fd_utils.cpp FileDescriptorWhitelist::IsAllowed: EXACT-MATCH list + /system/framework/*.jar + /apex/com.android.art/javalib/*.jar prefix rules; /system/usr/** NOT whitelisted). On a real device the zygote's fd table at fork carries NO hyb fd (Hyphenator.init opens→mmaps→closes each). Two pieces of #155 evidence: (a) fd 28 → hyph-as.hyb open at fork (a leaked close); (b) the 6-Z305t-14b STALL-FD snapshot had fd 0 → hyph-as.hyb — the fd-0 churn REBOUND stdio onto a hyphenation file.
+- THE CHURN MECHANISM NAMED: #155's 6-Z305t-75d raw-close trace caught close(fd=0) from libtwrp_fb_hook (raw_syscall1(SYS_close)), libc internals, AND the dynamic linker's dlopen bookkeeping at +13.8s — all BYPASS the shlib's 6-Z305t-75g libc-level STDIO FLOOR (they never PLT-bind to it). Each raw close frees fd 0; the zygote's next open reclaims it (this run: a hyb file).
+- FIX 6-Z305y (the zygote stdio pin at the syscall layer): the tracer arms the pin on the zygote exec (app_process(64) with --zygote in argv — the same signature the shlib's 6-Z305t-76 socket constructor matches) and rewrites every close(0/1/2) of that pid to getpid at ENTRY (the 6-Z147/6-Z305f no-op-rewrite precedent), forcing ret=0 at EXIT. The floor's semantics, now unbypassable, scoped to the zygote pid ONLY — init's service stdio dup2 wiring in forked children is untouched.
+- INSTRUMENT 6-Z305x (name the fd-28 leaker): the shlib now records every open under /system/fonts/ or /system/usr/hyphen-data/ with its fd and logs the close of each tracked fd (bounded 32 open + 80 total lines/pid). Next run's artifact shows the open-without-close pair directly.
+- Gates: fmt + clippy -D warnings clean; 819/819. Commit ea9735b pushed.
+- NEXT: dispatch #156; success signal = NO 'Not whitelisted' abort, system_server survives → rung 6 evidence lands, then rung 8 (SystemUI/launcher) becomes the gate. If 'Not whitelisted' persists with a DIFFERENT fd/path, the 6-Z305x pairs name the remaining leak source.
+
+## Next Steps (priority order)
+
+1. Dispatch ladder #156 (ea9735b) and analyze: (a) the 6-Z305x PRELOAD-FD pairs (leaker named?), (b) 'Not whitelisted' gone?, (c) system_server rung evidence via result.json only.
+2. If system_server survives, expect the rung 8 gates: SystemUI/launcher spawn needs the SF display chain + bootanim — watch the opengles renderer sessions and the composer's HWC2 surface.
+3. webDevReview cron exists (job 370515, fixed_rate 3600s, payload "Continue"). Keep active; do not duplicate.
+4. Dispatch discipline: confirm_dispatch=yes ALWAYS; rungs via result.json only; HOST vs GUEST log separation always.
