@@ -27388,3 +27388,10 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 - #146 (35d6788): the constructor belt did NOT hold — the zygote died identically at onEndPreload (fcntl EBADF), and fd 0 was free again at death. Something in the spawn→preload window closes fd 0 (init's SetupStdio opens /dev/null O_CLOEXEC and dup2s 0/1/2; under the twoyi spawn path a leg of that dance — or a later rebind — leaves 0 closed even after the belt's post-exec repair).
 - Rather than chase the closer: the shlib now spawns a STDIN WATCHDOG thread (android mode only; 240 × 500ms = 120s window; re-opens a REAL /dev/null onto fd 0 whenever F_GETFD(0) fails; one bounded stderr line per repair). The zygote's preload takes single-digit seconds — a 500ms re-check interval intercepts any closer long before endPreload. Belt diagnostic line added.
 - #147 dispatched. If the death persists DESPITE "stdin watchdog repaired fd0" lines appearing, the closer is tighter than 500ms or the failing fd is NOT 0 (out/err) — next step would be a cloneForFork-targeted probe.
+
+## 6-Z305t-75d — ladder #148 decode: FULL preload now completes (ZygoteInit 2336ms: classes 1430ms + resources 38ms + shared libs), death STILL at onEndPreload EBADF; watchdog repaired fd0 (mask=0x1) yet the wall holds → THE CLOSER TRACER; #149 dispatched
+
+- #148 (c5374dd): the fd-0-only watchdog DID repair fd 0 in the zygote ("repaired fd mask=0x1" mid-preload) — and the death STILL happened. The failing fd is therefore (a) re-closed inside a <500ms window, (b) NOT fd 0 (fd 1: nobody writes stdout in the guest — invisible; the 75c run covers all three), or (c) something else entirely.
+- 75c (this): belt+watchdog now probe/repair fds 0/1/2.
+- 75d (this): the DECISIVE instrument — the tracer logs every guest close(0/1/2) (budget 48/run) with caller pc → module attribution (maps walk). Whatever closes a stdio descriptor gets NAMED (libc fclose? libandroid_runtime? emugl? the shlib itself?).
+- #149 dispatched on 75d. Expectation: "6-Z305t-75d: pid=N close(fd=X) pc=… maps[pc]=…" names the closer → the follow-up fix targets it directly.
