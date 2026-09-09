@@ -469,7 +469,9 @@ jobs:
              cd \$d 2>/dev/null || exit 0; \
              ls -S svc-*.log 2>/dev/null | head -20 | while read f; do \
                echo \"== RAW \$f (\$(stat -c%s \$f) bytes) ==\"; \
-               head -c 65536 \$f; \
+               head -c 32768 \$f; \
+               echo; echo '...[SNIP-MIDDLE]...'; echo; \
+               tail -c 32768 \$f; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs-raw-top20.txt 2>&1 || true
           # ── 6-Z305t-36: klog node FILE-IDENTITY forensics ──────────────
