@@ -13813,6 +13813,10 @@ pub fn run_ptrace_loop(
     const SITE_DUMP_BEFORE_ESRCH: u8 = 6;
     const SITE_DUMP_BEFORE_EXIT: u8 = 7;
     const SITE_DUMP_AT_EXIT: u8 = 8;
+    const SITE_MKDIR_TRANSLATED: u8 = 9;
+    const SITE_READLINK_REWRITE: u8 = 10;
+    const SITE_WINDOW_TRACE: u8 = 11;
+    const SITE_DIAG_WRITE: u8 = 12;
 
     // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
     // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
@@ -16376,25 +16380,34 @@ pub fn run_ptrace_loop(
                 let z305h_is_mprotect = abi.mprotect_nr >= 0 && syscall_num == abi.mprotect_nr;
                 if z305c_window_countdown > 0 {
                     z305c_window_countdown -= 1;
+                    // 6-Z305t-71: the window re-arms on every service death;
+                    // GLOBAL budget (pid key 0) — a crash-loop fleet is
+                    // distinct-pid by nature (~21K win lines in #133).
+                    let window_may_log =
+                        stop_log_allow(&mut stop_log_budget, SITE_WINDOW_TRACE, 0, 4096);
                     if is_entry && !z305h_is_mprotect {
-                        log(&format!(
-                            "6-Z305c win E pid={} nr={} {} a=({:#x},{:#x},{:#x},{:#x},{:#x})",
-                            pid,
-                            syscall_num,
-                            syscall_name(syscall_num, &abi),
-                            get_syscall_arg(&regs, abi.reg_arg1),
-                            get_syscall_arg(&regs, abi.reg_arg2),
-                            get_syscall_arg(&regs, abi.reg_arg3),
-                            get_syscall_arg(&regs, abi.reg_arg4),
-                            get_syscall_arg(&regs, abi.reg_arg5),
-                        ));
+                        if window_may_log.is_some() {
+                            log(&format!(
+                                "6-Z305c win E pid={} nr={} {} a=({:#x},{:#x},{:#x},{:#x},{:#x})",
+                                pid,
+                                syscall_num,
+                                syscall_name(syscall_num, &abi),
+                                get_syscall_arg(&regs, abi.reg_arg1),
+                                get_syscall_arg(&regs, abi.reg_arg2),
+                                get_syscall_arg(&regs, abi.reg_arg3),
+                                get_syscall_arg(&regs, abi.reg_arg4),
+                                get_syscall_arg(&regs, abi.reg_arg5),
+                            ));
+                        }
                     } else if !is_entry && !z305h_is_mprotect {
-                        log(&format!(
-                            "6-Z305c win X pid={} nr={} ret={}",
-                            pid,
-                            syscall_num,
-                            get_syscall_arg(&regs, abi.reg_ret) as i64
-                        ));
+                        if window_may_log.is_some() {
+                            log(&format!(
+                                "6-Z305c win X pid={} nr={} ret={}",
+                                pid,
+                                syscall_num,
+                                get_syscall_arg(&regs, abi.reg_ret) as i64
+                            ));
+                        }
                     }
                 }
 
@@ -22588,10 +22601,21 @@ pub fn run_ptrace_loop(
                                         } else {
                                             0
                                         };
-                                        log(&format!(
-                                            "{} translated: {} -> {} (created: {})",
-                                            name, path, translated, created
-                                        ));
+                                        // 6-Z305t-71: bounded — this fired on
+                                        // EVERY translated mkdir/mkdirat;
+                                        // the boot's repeated mkdir waves
+                                        // made it ~50K lines in ladder #133.
+                                        if let Some(total) = stop_log_allow(
+                                            &mut stop_log_budget,
+                                            SITE_MKDIR_TRANSLATED,
+                                            pid,
+                                            4096,
+                                        ) {
+                                            log(&format!(
+                                                "{} translated: {} -> {} (created: {}) [occurrence #{} of this pid]",
+                                                name, path, translated, created, total
+                                            ));
+                                        }
                                         // ── 6-Z197: fresh-ramdisk illusion
                                         // for first-stage boot dirs ──
                                         //
@@ -25008,10 +25032,20 @@ pub fn run_ptrace_loop(
                                         ));
                                     }
                                     if let Some(guest) = z305c_guest {
-                                        log(&format!(
-                                            "6-Z200b: readlink target {} rewritten to guest path {} (host-path illusion)",
-                                            target, guest
-                                        ));
+                                        // 6-Z305t-71: bounded — every
+                                        // fd-readlink rewrite logged; ~50K
+                                        // lines in ladder #133's boot.
+                                        if let Some(total) = stop_log_allow(
+                                            &mut stop_log_budget,
+                                            SITE_READLINK_REWRITE,
+                                            pid,
+                                            4096,
+                                        ) {
+                                            log(&format!(
+                                                "6-Z200b: readlink target {} rewritten to guest path {} (host-path illusion) [occurrence #{} of this pid]",
+                                                target, guest, total
+                                            ));
+                                        }
                                         let out = guest.into_bytes();
                                         if out.len() <= ret as usize {
                                             // readlink does NOT
@@ -26033,35 +26067,48 @@ pub fn run_ptrace_loop(
                             let captured = read_child_bytes(pid, buf_addr, to_read);
                             let is_klog = kmsg_fd == Some(fd);
                             let prefix = if is_klog { "DIAG KLOG" } else { "DIAG write" };
-                            match captured {
-                                Some(bytes) => {
-                                    // 6-Z131: cap the LOGGED capture at
-                                    // 2048 chars. The raw capture is
-                                    // already bounded (<= 256 bytes
-                                    // above), but the {:?} escaping
-                                    // below expands control chars ~6x,
-                                    // and the app-side FileLogger tee
-                                    // must never see another huge line
-                                    // (run 32786386000 OOM).
-                                    let captured_str = String::from_utf8_lossy(&bytes);
-                                    let captured_str = crate::cap_log_line(&captured_str, 2048);
-                                    log(&format!(
-                                        "{}(fd={}, ret={}): {:?}",
-                                        prefix, fd, ret, captured_str
-                                    ));
+                            // 6-Z305t-71: bounded for the plain "DIAG write"
+                            // class (~55K lines in #133's first minutes via
+                            // the follow-window + glog gates). The KLOG
+                            // mirror stays UNBUDGETED — it is the boot
+                            // timeline's raw source.
+                            let write_may_log = if is_klog {
+                                true
+                            } else {
+                                stop_log_allow(&mut stop_log_budget, SITE_DIAG_WRITE, pid, 4096)
+                                    .is_some()
+                            };
+                            if write_may_log {
+                                match captured {
+                                    Some(bytes) => {
+                                        // 6-Z131: cap the LOGGED capture at
+                                        // 2048 chars. The raw capture is
+                                        // already bounded (<= 256 bytes
+                                        // above), but the {:?} escaping
+                                        // below expands control chars ~6x,
+                                        // and the app-side FileLogger tee
+                                        // must never see another huge line
+                                        // (run 32786386000 OOM).
+                                        let captured_str = String::from_utf8_lossy(&bytes);
+                                        let captured_str = crate::cap_log_line(&captured_str, 2048);
+                                        log(&format!(
+                                            "{}(fd={}, ret={}): {:?}",
+                                            prefix, fd, ret, captured_str
+                                        ));
+                                    }
+                                    None => {
+                                        // PTRACE_PEEKDATA failed on the
+                                        // very first word (EIO / unmapped
+                                        // address). Log the failure
+                                        // explicitly so it is greppable
+                                        // but do NOT crash the loop.
+                                        log(&format!(
+                                            "{}(fd={}, ret={}): <buffer read failed: EIO>",
+                                            prefix, fd, ret
+                                        ));
+                                    }
                                 }
-                                None => {
-                                    // PTRACE_PEEKDATA failed on the
-                                    // very first word (EIO / unmapped
-                                    // address). Log the failure
-                                    // explicitly so it is greppable
-                                    // but do NOT crash the loop.
-                                    log(&format!(
-                                        "{}(fd={}, ret={}): <buffer read failed: EIO>",
-                                        prefix, fd, ret
-                                    ));
-                                }
-                            }
+                            } // 6-Z305t-71: write_may_log gate
                         }
                     }
 
