@@ -19696,6 +19696,29 @@ pub fn run_ptrace_loop(
                             || nr == abi.wait4_nr
                             || nr == abi.exit_group_nr
                         {
+                            // ── 6-Z305t-71j-fix: read the abort message at the
+                            // exit_group ENTRY (the process is still ALIVE —
+                            // mm intact). The WIFEXITED-side read can never
+                            // fire: by that stop the process is a ZOMBIE and
+                            // /proc/<pid>/maps is empty (ladder #140's zero
+                            // 71j lines). fb-hook-intercepted aborts exit(1)
+                            // without a signal stop, so THIS is the last
+                            // tracer-visible moment the mapping exists.
+                            if nr == abi.exit_group_nr {
+                                if let Some(abort_msg) = read_bionic_abort_message(pid) {
+                                    if let Some(total) = stop_log_allow(
+                                        &mut stop_log_budget,
+                                        SITE_ABORT_MSG,
+                                        pid,
+                                        4096,
+                                    ) {
+                                        log(&format!(
+                                            "6-Z305t-71k: pid={} exit_group — bionic abort message: {:?} [occurrence #{} of this pid]",
+                                            pid, abort_msg, total
+                                        ));
+                                    }
+                                }
+                            }
                             let name = if nr == abi.clone_nr {
                                 "clone"
                             } else if nr == abi.fork_nr {
