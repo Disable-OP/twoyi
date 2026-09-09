@@ -157,6 +157,17 @@
 //! v2 response: [u32 read_size][read_size BR_* bytes]
 //!              [u32 WIRE_V2_MAGIC][u32 blob_count]
 //!              (blob_count ×) [u32 data_len][u32 offsets_len][data][offsets]
+//!
+//! v3 request : v2 + a [u32 sg_count] header per blob and, after
+//!              [data][offsets], sg_count ×
+//!              [u64 client_ptr][u32 len][len bytes] — the BINDER_TYPE_PTR
+//!              SG-buffer contents (6-Z305t-68: the HIDL wire carries
+//!              hidl_string/hidl_vec bytes OUT of the main parcel).
+//! v3 response: v2 + the same per-blob [u32 sg_count] header + SG bytes;
+//!              the loader reassembles [data][offsets][sg] into the
+//!              guest's backing buffer and fixes every PTR object's
+//!              `buffer` field to its SG copy (the kernel's receiver-side
+//!              pointer fixup).
 //! ```
 //!
 //! * A payload that ends exactly after the BC stream is v1 (6-Z113
@@ -1079,6 +1090,40 @@ pub const MAX_QUEUED_ITEMS: usize = 256;
 /// Bytes are `'W' 'V' '2' '0'` in native-endian word order.
 pub const WIRE_V2_MAGIC: u32 = u32::from_ne_bytes(*b"WV20");
 
+/// 6-Z305t-68: v3 adds a per-blob BINDER_TYPE_PTR SG-buffer section —
+/// the HIDL wire carries `hidl_string`/`hidl_vec` contents OUT of the
+/// main parcel (libhwbinder `writeBuffer`/`writeEmbeddedBuffer` emit
+/// `binder_buffer_object`s whose bytes the real kernel copies into the
+/// receiver's buffer as the scatter-gather region of
+/// `BC_TRANSACTION_SG`). The loader captures those bytes; the proxy
+/// reassembles them so `servicemanager_hidl` can resolve real string
+/// arguments. v3 per blob:
+/// `[u32 data_len][u32 offsets_len][u32 sg_count][data][offsets]`
+/// then `sg_count × [u64 client_ptr][u32 len][len bytes]` — the PTR
+/// contents in offsets-array order (the kernel's copy order). v2
+/// requests still parse (sg empty → HIDL string args fail honestly).
+/// Bytes are `'W' 'V' '3' '0'` in native-endian word order.
+pub const WIRE_V3_MAGIC: u32 = u32::from_ne_bytes(*b"WV30");
+
+/// `BINDER_BUFFER_FLAG_HAS_PARENT` — kernel uapi binder.h.
+pub const BINDER_BUFFER_FLAG_HAS_PARENT: u32 = 0x01;
+
+/// One loader-captured `BINDER_TYPE_PTR` buffer (the SG region the real
+/// kernel copies verbatim into the receiver's transaction buffer and
+/// fixes up — kernel uapi: "A binder_buffer object represents an object
+/// that the binder kernel driver can copy verbatim to the target
+/// address space").
+#[derive(Debug, Clone)]
+pub struct SgBuf {
+    /// The SENDER's buffer address (`binder_buffer_object.buffer`). The
+    /// proxy matches SG entries to PTR objects by CAPTURE ORDER (the
+    /// kernel's copy order) and cross-checks this pointer when non-zero.
+    pub client_ptr: u64,
+    /// The captured bytes (`binder_buffer_object.length` bytes, capped
+    /// loader-side).
+    pub data: Vec<u8>,
+}
+
 /// AIDL interface-token header tag for `/dev/binder` clients
 /// (`Parcel::writeInterfaceToken`): `B_PACK_CHARS('S','Y','S','T')` —
 /// big-endian char packing, so the wire u32 is 0x53595354. NOTE: this
@@ -1288,27 +1333,6 @@ impl<'a> ParcelReader<'a> {
         let iface = self.read_string16()?;
         Some((strict, work, tag, iface))
     }
-
-    /// Read a HIDL `hidl_string` (libhwbinder `writeHidlString`):
-    /// `[i32 len][len bytes][NUL][zero-pad to 4-byte alignment]`.
-    /// Null (`len < 0`) reads as an empty string.
-    fn read_hidl_string(&mut self) -> Option<String> {
-        let len = self.read_i32()?;
-        if len <= 0 {
-            return Some(String::new());
-        }
-        let len = len as usize;
-        if self.pos + len + 1 > self.buf.len() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&self.buf[self.pos..self.pos + len]).into_owned();
-        self.pos += len;
-        self.pos += 1; // trailing NUL
-        while self.pos < self.buf.len() && self.pos % 4 != 0 {
-            self.pos += 1;
-        }
-        Some(s)
-    }
 }
 
 /// Builder for a libbinder Parcel byte buffer + its companion offsets
@@ -1474,8 +1498,10 @@ impl ParcelWriter {
 /// objects in their kernel-listed order.
 struct RequestBlob {
     data: Vec<u8>,
-    #[allow(dead_code)]
     offsets: Vec<u8>,
+    /// 6-Z305t-68: the BINDER_TYPE_PTR SG-buffer contents (v3 wire).
+    /// Empty for v2 requests — HIDL string arguments then fail honestly.
+    sg: Vec<SgBuf>,
 }
 
 impl Clone for RequestBlob {
@@ -1483,6 +1509,7 @@ impl Clone for RequestBlob {
         RequestBlob {
             data: self.data.clone(),
             offsets: self.offsets.clone(),
+            sg: self.sg.clone(),
         }
     }
 }
@@ -1671,8 +1698,14 @@ enum InboxItem {
 /// LATER read — possibly after the SAME thread serviced the transaction
 /// itself (self-transaction) or while it is mid-nested-call.
 enum DeferredReply {
-    /// `[BR_REPLY][binder_transaction_data]` + the blob trailer.
-    Reply { data: Vec<u8>, offsets: Vec<u8> },
+    /// `[BR_REPLY][binder_transaction_data]` + the blob trailer. `sg`
+    /// carries the BINDER_TYPE_PTR contents of routed HIDL replies
+    /// (6-Z305t-68 — the same kernel SG-copy semantic as requests).
+    Reply {
+        data: Vec<u8>,
+        offsets: Vec<u8>,
+        sg: Vec<SgBuf>,
+    },
     /// `[BR_FAILED_REPLY]` (reply timeout / server died).
     Failed,
 }
@@ -1967,7 +2000,11 @@ impl BusState {
                 one_way: true,
                 sender_pid: 0,
                 sender_euid: 0,
-                blob: Some(RequestBlob { data, offsets }),
+                blob: Some(RequestBlob {
+                    data,
+                    offsets,
+                    sg: Vec::new(),
+                }),
                 ptr: w.ptr,
                 cookie: w.cookie,
             };
@@ -2948,18 +2985,21 @@ fn handle_write_read(
     }
     let write_buf = &payload[8..8 + write_size];
 
-    // Parse the optional v2 trailer (6-Z114 §4.4):
-    //   [u32 WIRE_V2_MAGIC][u32 blob_count]
-    //   (blob_count ×) [u32 data_len][u32 offsets_len][data_len bytes][offsets_len bytes]
+    // Parse the optional v2/v3 trailer (6-Z114 §4.4 + 6-Z305t-68):
+    //   v2: [u32 WIRE_V2_MAGIC][u32 blob_count]
+    //       (blob_count ×) [u32 data_len][u32 offsets_len][data][offsets]
+    //   v3: same shape plus [u32 sg_count] in each blob header and the
+    //       BINDER_TYPE_PTR contents appended after [data][offsets].
     // A request that ends exactly after the BC stream is v1 (z113 client —
-    // byte-compatible, no parcel blobs). A v2 request inlines the parcel
+    // byte-compatible, no parcel blobs). A v2/v3 request inlines the parcel
     // bytes the proxy needs to actually parse BC_TRANSACTION data.
     let mut off = 8 + write_size;
     let mut req_blobs: Vec<RequestBlob> = Vec::new();
     let mut is_v2 = false;
     if off + 8 <= payload.len() {
         let magic = u32::from_ne_bytes(payload[off..off + 4].try_into().unwrap());
-        if magic == WIRE_V2_MAGIC {
+        if magic == WIRE_V2_MAGIC || magic == WIRE_V3_MAGIC {
+            let is_v3 = magic == WIRE_V3_MAGIC;
             is_v2 = true;
             off += 4;
             let count = u32::from_ne_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
@@ -2973,6 +3013,16 @@ fn handle_write_read(
                 let offsets_len =
                     u32::from_ne_bytes(payload[off + 4..off + 8].try_into().unwrap()) as usize;
                 off += 8;
+                let sg_count: usize = if is_v3 {
+                    if off + 4 > payload.len() {
+                        break;
+                    }
+                    let c = u32::from_ne_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+                    off += 4;
+                    c
+                } else {
+                    0
+                };
                 if off + data_len + offsets_len > payload.len() {
                     break;
                 }
@@ -2980,7 +3030,35 @@ fn handle_write_read(
                 off += data_len;
                 let offsets = payload[off..off + offsets_len].to_vec();
                 off += offsets_len;
-                req_blobs.push(RequestBlob { data, offsets });
+                let mut sg: Vec<SgBuf> = Vec::new();
+                if is_v3 {
+                    let mut ok = true;
+                    for _ in 0..sg_count {
+                        if off + 12 > payload.len() {
+                            ok = false;
+                            break;
+                        }
+                        let client_ptr =
+                            u64::from_ne_bytes(payload[off..off + 8].try_into().unwrap());
+                        let blen =
+                            u32::from_ne_bytes(payload[off + 8..off + 12].try_into().unwrap())
+                                as usize;
+                        off += 12;
+                        if off + blen > payload.len() {
+                            ok = false;
+                            break;
+                        }
+                        sg.push(SgBuf {
+                            client_ptr,
+                            data: payload[off..off + blen].to_vec(),
+                        });
+                        off += blen;
+                    }
+                    if !ok {
+                        break; // truncated SG section — stop consuming blobs
+                    }
+                }
+                req_blobs.push(RequestBlob { data, offsets, sg });
             }
         }
     }
@@ -2988,7 +3066,7 @@ fn handle_write_read(
     // Walk the BC_* stream. The i-th v2 blob pairs with the i-th
     // BC_TRANSACTION/BC_REPLY/`*_SG` command in stream order.
     let mut read_buf: Vec<u8> = Vec::new();
-    let mut resp_blobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut resp_blobs: Vec<RequestBlob> = Vec::new();
     let mut blob_idx = 0usize;
     let mut consumed = 0usize;
     while consumed + 4 <= write_buf.len() {
@@ -3070,7 +3148,11 @@ fn handle_write_read(
                         // then loops to read BR_REPLY.
                         push_br_transaction_complete(&mut read_buf);
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
-                        resp_blobs.push((data, offsets));
+                        resp_blobs.push(RequestBlob {
+                            data,
+                            offsets,
+                            sg: Vec::new(),
+                        });
                     }
                 }
             }
@@ -3093,9 +3175,9 @@ fn handle_write_read(
                 };
                 match inflight {
                     Some(txn_id) => {
-                        let (data, offsets) = match reply_blob {
-                            Some(rb) => (rb.data, rb.offsets),
-                            None => (Vec::new(), Vec::new()),
+                        let (data, offsets, sg) = match reply_blob {
+                            Some(rb) => (rb.data, rb.offsets, rb.sg),
+                            None => (Vec::new(), Vec::new(), Vec::new()),
                         };
                         // 6-Z271i: kernel-true deferred resolution — the
                         // requester is no longer blocked inside its ioctl;
@@ -3116,8 +3198,11 @@ fn handle_write_read(
                                 let mut b = bus.lock().expect("binder bus poisoned");
                                 match b.conns.get_mut(&rc) {
                                     Some(rbx) => {
-                                        rbx.reply_queue
-                                            .push_back(DeferredReply::Reply { data, offsets });
+                                        rbx.reply_queue.push_back(DeferredReply::Reply {
+                                            data,
+                                            offsets,
+                                            sg,
+                                        });
                                     }
                                     None => {
                                         warning!(
@@ -3247,9 +3332,9 @@ fn handle_write_read(
                 .and_then(|bx| bx.reply_queue.pop_front())
         } {
             match dr {
-                DeferredReply::Reply { data, offsets } => {
+                DeferredReply::Reply { data, offsets, sg } => {
                     push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
-                    resp_blobs.push((data, offsets));
+                    resp_blobs.push(RequestBlob { data, offsets, sg });
                 }
                 DeferredReply::Failed => {
                     push_br_failed_reply(&mut read_buf);
@@ -3367,7 +3452,7 @@ fn handle_write_read(
                         os,
                     );
                     if let Some(blob) = tx.blob {
-                        resp_blobs.push((blob.data, blob.offsets));
+                        resp_blobs.push(blob);
                     }
                     info!(
                     "[KR64][binder][vm{}] delivered transaction conn={} <- conn={} code={} oneway={} (tx #{})",
@@ -3395,13 +3480,24 @@ fn handle_write_read(
     resp_payload.extend_from_slice(&(read_buf.len() as u32).to_ne_bytes());
     resp_payload.extend_from_slice(&read_buf);
     if is_v2 || !resp_blobs.is_empty() {
-        resp_payload.extend_from_slice(&WIRE_V2_MAGIC.to_ne_bytes());
+        // 6-Z305t-68: v3 resp trailer — per blob [dl][ol][sg_count]
+        // [data][offsets][sg entries (u64 ptr][u32 len][bytes])]. The
+        // loader reassembles [data][offsets][sg] into one backing buffer
+        // and fixes each BINDER_TYPE_PTR object's `buffer` field to its
+        // SG copy (the kernel's receiver-side pointer fixup).
+        resp_payload.extend_from_slice(&WIRE_V3_MAGIC.to_ne_bytes());
         resp_payload.extend_from_slice(&(resp_blobs.len() as u32).to_ne_bytes());
-        for (data, offsets) in &resp_blobs {
-            resp_payload.extend_from_slice(&(data.len() as u32).to_ne_bytes());
-            resp_payload.extend_from_slice(&(offsets.len() as u32).to_ne_bytes());
-            resp_payload.extend_from_slice(data);
-            resp_payload.extend_from_slice(offsets);
+        for blob in &resp_blobs {
+            resp_payload.extend_from_slice(&(blob.data.len() as u32).to_ne_bytes());
+            resp_payload.extend_from_slice(&(blob.offsets.len() as u32).to_ne_bytes());
+            resp_payload.extend_from_slice(&(blob.sg.len() as u32).to_ne_bytes());
+            resp_payload.extend_from_slice(&blob.data);
+            resp_payload.extend_from_slice(&blob.offsets);
+            for b in &blob.sg {
+                resp_payload.extend_from_slice(&b.client_ptr.to_ne_bytes());
+                resp_payload.extend_from_slice(&(b.data.len() as u32).to_ne_bytes());
+                resp_payload.extend_from_slice(&b.data);
+            }
         }
     }
 
@@ -3759,7 +3855,7 @@ fn servicemanager_proxy(
     };
 
     if !is_aidl {
-        return servicemanager_hidl(code, parcel, bus, conn_id);
+        return servicemanager_hidl(code, blob, bus, conn_id);
     }
 
     let mut reader = ParcelReader::new(parcel);
@@ -4021,52 +4117,359 @@ fn servicemanager_proxy(
     TransactionResult::Reply { data, offsets }
 }
 
-/// HIDL `android.hidl.manager.V1_0.IServiceManager` transactions (libhwbinder
-/// parcels — no SYST header tag, hidl_string args).
-///
-/// The A11 boot-path subset is implemented, codes per the authoritative
-/// android-11.0.0_r1 IServiceManager.hal (1.0: get=1, add=2, getTransport=3,
-/// list=4, listByInterface=5, registerForNotifications=6, debugDump=7,
-/// registerPassthroughClient=8; 1.1 appends unregisterForNotifications=9;
-/// 1.2 appends registerClientCallback=10, unregisterClientCallback=11,
-/// addWithChain=12, listManifestByInterface=13, tryUnregister=14 — the
-/// pre-6-Z305t-66 map guessed register=4/unregister=5 and had NO
-/// getTransport, which failed the whole HIDL fleet):
-/// * `get` (code 1): `get(fqName, name)` — registry lookup of
-///   `"fqName/name"`; hit → flat handle, miss → null binder (HIDL reads the
-///   object at offsets[0], so the AIDL status prefix is skipped naturally).
-/// * `add` (code 2): the 1.0 registration shape — register the HIDL service
-///   name with the caller as owner (kept for older guests; the A11 GSI
-///   registers via addWithChain below).
-/// * `getTransport` (code 3): honest registry answer — HWBINDER(1) iff the
-///   `"fq/instance"` key is registered (guest addWithChain/add or an
-///   in-proxy virtual service), EMPTY(0) otherwise, as a single u8 after
-///   the status. A miss flows into getRawServiceInternal's clean nullptr
-///   path instead of the EX_TRANSACTION_FAILED abort storm.
-/// * `registerForNotifications` (code 6) / `unregisterForNotifications`
-///   (code 9): watcher registry + onRegistration callbacks.
-/// * `addWithChain` (code 12): THE A11 registration — registers under
-///   `"chain[0]/name"` and fires the onRegistration callbacks.
-/// * everything else → `BR_FAILED_REPLY` (honest — list/listByInterface/
-///   debugDump/registerPassthroughClient/… are not exercised by the boot
-///   path yet; they decode from the next ladder if they surface).
+// HIDL `android.hidl.manager@1.0::IServiceManager` transactions (libhwbinder
+// parcels — no SYST header tag).
+//
+// 6-Z305t-68 — THE REAL WIRE, decoded from the authoritative
+// android-11.0.0_r1 sources (system/libhwbinder/Parcel.cpp,
+// system/libhidl/base/HidlSupport.{h,cpp} + transport/HidlBinderSupport.{h,
+// cpp}, system/tools/hidl StringType emit, kernel uapi binder.h):
+//
+// * interface token: libhwbinder `writeInterfaceToken` = `writeCString` —
+//   the descriptor as a NUL-terminated char string, NO length prefix, then
+//   4-byte alignment. (The pre-68 parser read a string16 here — its first
+//   i32 read consumed `"andr"` as a ~1.9e9 length — so EVERY HIDL SM
+//   transaction failed silently at the token, hit the catch-all
+//   BR_FAILED_REPLY, and surfaced as the 1269-abort
+//   Status(EX_TRANSACTION_FAILED) storm of ladders #122/#123. The
+//   -66/-67 arms were correct downstream but never once reached: the
+//   ladder artifacts show ZERO `HIDL getTransport`/`HIDL addWithChain`
+//   logs and ZERO VINTF pre-checks against ~404 code=3 transactions.)
+// * `hidl_string` argument: TWO `BINDER_TYPE_PTR` objects. The generated
+//   code does `writeBuffer(&s, sizeof(hidl_string)=16)` (object A — the
+//   `{ptr, u32 size, bool owns}` STRUCT) then `writeEmbeddedToParcel(s)`
+//   = `writeEmbeddedBuffer(s.c_str(), s.size()+1, parent=A,
+//   parent_offset=kOffsetOfBuffer=0)` (object B — chars+NUL). The BYTES
+//   ARE NOT IN THE MAIN PARCEL: `writeBuffer` emits a
+//   `binder_buffer_object` referencing the SENDER's memory; the real
+//   kernel copies each PTR object's (buffer,length) VERBATIM into the
+//   receiver's transaction buffer (the scatter-gather region of
+//   `BC_TRANSACTION_SG`) and fixes the object's `buffer` pointer up to
+//   the receiver's copy. The loader now replicates that copy (v3 wire,
+//   `WIRE_V3_MAGIC`); the proxy resolves PTR contents by offsets-array
+//   ORDER (the kernel's copy order) with a sender-pointer cross-check.
+//   Ladder #123 note: the v2 blob carried the main parcel ONLY — even a
+//   byte-perfect main-parcel parse could never recover `fq`/`name`.
+// * binder-object argument: an INLINE `flat_binder_object` listed in the
+//   offsets array (`writeStrongBinder` → `writeObject(flat)`).
+// * `hidl_vec<hidl_string>`: PTR(vec struct {ptr, size, owns}) +
+//   PTR(array, HAS_PARENT parent_offset=0, content = count × 16) + per
+//   element PTR(struct)+PTR(chars) — exactly the generated receiver's
+//   read walk (readBuffer(vec) → readEmbeddedBuffer(array) → per element
+//   readBuffer(struct) → readEmbeddedFromParcel(chars)).
+//
+// The A11 boot-path arms (codes per android-11.0.0_r1 IServiceManager.hal
+// — 1.0: get=1, add=2, getTransport=3, list=4, listByInterface=5,
+// registerForNotifications=6, debugDump=7, registerPassthroughClient=8;
+// 1.1 appends unregisterForNotifications=9; 1.2 appends addWithChain=12):
+// * `get` (code 1): registry lookup of `"fqName/name"`; hit → flat
+//   handle, miss → null binder (HIDL reads the object at offsets[0], so
+//   the status prefix is skipped naturally).
+// * `add` (code 2): the 1.0 shape — registers the INSTANCE name bare
+//   (kept for older guests; the A11 GSI registers via addWithChain).
+// * `getTransport` (code 3): honest VINTF/bus answer — HWBINDER(1) iff
+//   the manifest declares it or `"fq/instance"` is registered, EMPTY(0)
+//   otherwise, single u8 after the status.
+// * `registerForNotifications` (6) / `unregisterForNotifications` (9):
+//   watcher registry + onRegistration callbacks.
+// * `addWithChain` (code 12): THE A11 registration — registers under
+//   `"chain[0]/name"` and fires the onRegistration callbacks.
+// * everything else → `BR_FAILED_REPLY` (honest, now with a bounded
+//   diagnostic naming the code — list/listByInterface/debugDump/
+//   registerPassthroughClient/… are not exercised by the boot path yet).
+
+/// One parsed offsets-array object: SG-backed `BINDER_TYPE_PTR` or an
+/// inline flat binder.
+enum HidlObj<'a> {
+    /// SG-backed buffer; `content` is None when the loader could not
+    /// capture it (honest parse failure downstream).
+    Ptr {
+        content: Option<&'a [u8]>,
+        has_parent: bool,
+        parent: u64,
+        parent_offset: u64,
+    },
+    Binder(FlatBinderObject),
+}
+
+/// Positional + offsets-array reader over a REAL libhwbinder request
+/// parcel (wire notes above). The token is read positionally; every
+/// argument walks the offsets array in order — the kernel's
+/// object-processing order, which is also the loader's SG capture order.
+struct HidlParcel<'a> {
+    data: &'a [u8],
+    offsets: Vec<u64>,
+    sg: &'a [SgBuf],
+    pos: usize,
+    obj_idx: usize,
+    ptr_seq: usize,
+}
+
+impl<'a> HidlParcel<'a> {
+    fn new(blob: &'a RequestBlob) -> Option<Self> {
+        if blob.offsets.len() % 8 != 0 {
+            return None;
+        }
+        let offsets = blob
+            .offsets
+            .chunks_exact(8)
+            .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        Some(HidlParcel {
+            data: &blob.data,
+            offsets,
+            sg: &blob.sg,
+            pos: 0,
+            obj_idx: 0,
+            ptr_seq: 0,
+        })
+    }
+
+    /// libhwbinder token: `readCString` + align4 (writeInterfaceToken =
+    /// writeCString — NO length prefix, NOT a string16).
+    fn token(&mut self) -> Option<String> {
+        let start = self.pos;
+        if start >= self.data.len() {
+            return None;
+        }
+        let nul = self.data[start..].iter().position(|&b| b == 0)? + start;
+        let s = String::from_utf8_lossy(&self.data[start..nul]).into_owned();
+        self.pos = nul + 1;
+        self.pos += (4 - self.pos % 4) % 4;
+        Some(s)
+    }
+
+    /// Next object from the offsets array (kernel processing order =
+    /// loader SG capture order).
+    fn next_object(&mut self) -> Option<HidlObj<'a>> {
+        let off = *self.offsets.get(self.obj_idx)? as usize;
+        self.obj_idx += 1;
+        if off + 4 > self.data.len() {
+            return None;
+        }
+        let typ = u32::from_ne_bytes(self.data[off..off + 4].try_into().ok()?);
+        if typ == BINDER_TYPE_PTR {
+            // struct binder_buffer_object: hdr u32 | flags u32 | buffer
+            // u64 | length u64 | parent u64 | parent_offset u64 = 40B.
+            if off + 40 > self.data.len() {
+                return None;
+            }
+            let flags = u32::from_ne_bytes(self.data[off + 4..off + 8].try_into().ok()?);
+            let client_ptr = u64::from_ne_bytes(self.data[off + 8..off + 16].try_into().ok()?);
+            let length = u64::from_ne_bytes(self.data[off + 16..off + 24].try_into().ok()?);
+            let parent = u64::from_ne_bytes(self.data[off + 24..off + 32].try_into().ok()?);
+            let parent_offset = u64::from_ne_bytes(self.data[off + 32..off + 40].try_into().ok()?);
+            let content = self.sg.get(self.ptr_seq).and_then(|b| {
+                // Cross-check the sender pointer (0 = the loader could not
+                // read it — accept the order match alone).
+                if b.client_ptr != 0 && b.client_ptr != client_ptr {
+                    return None;
+                }
+                if b.data.len() as u64 >= length {
+                    Some(&b.data[..length as usize])
+                } else {
+                    None
+                }
+            });
+            self.ptr_seq += 1;
+            Some(HidlObj::Ptr {
+                content,
+                has_parent: flags & BINDER_BUFFER_FLAG_HAS_PARENT != 0,
+                parent,
+                parent_offset,
+            })
+        } else if matches!(
+            typ,
+            BINDER_TYPE_BINDER
+                | BINDER_TYPE_WEAK_BINDER
+                | BINDER_TYPE_HANDLE
+                | BINDER_TYPE_WEAK_HANDLE
+        ) {
+            // struct flat_binder_object: hdr u32 | flags u32 |
+            // binder/handle u64 | cookie u64 = 24B.
+            if off + 24 > self.data.len() {
+                return None;
+            }
+            let flags = u32::from_ne_bytes(self.data[off + 4..off + 8].try_into().ok()?);
+            let binder = u64::from_ne_bytes(self.data[off + 8..off + 16].try_into().ok()?);
+            let cookie = u64::from_ne_bytes(self.data[off + 16..off + 24].try_into().ok()?);
+            Some(HidlObj::Binder(FlatBinderObject {
+                r#type: typ,
+                flags,
+                binder,
+                cookie,
+            }))
+        } else {
+            None
+        }
+    }
+
+    /// A `hidl_string` argument: [PTR struct(16B)][PTR chars child]. The
+    /// chars object's `parent` must be the struct object's offsets-array
+    /// index and its `parent_offset` must be `hidl_string::kOffsetOfBuffer`
+    /// (0) — the kernel's parent fixup semantics, used as an integrity
+    /// check.
+    fn read_string_arg(&mut self) -> Option<String> {
+        let struct_idx = self.obj_idx;
+        let st = match self.next_object()? {
+            HidlObj::Ptr {
+                content: Some(c),
+                has_parent: false,
+                parent: 0,
+                ..
+            } if c.len() >= 12 => c,
+            _ => return None,
+        };
+        let size = u32::from_ne_bytes(st[8..12].try_into().ok()?) as usize;
+        match self.next_object()? {
+            HidlObj::Ptr {
+                content: Some(ch),
+                has_parent: true,
+                parent,
+                parent_offset: 0,
+                ..
+            } => {
+                if parent != struct_idx as u64 || ch.len() < size + 1 || ch[size] != 0 {
+                    return None;
+                }
+                Some(String::from_utf8_lossy(&ch[..size]).into_owned())
+            }
+            _ => None,
+        }
+    }
+
+    /// A binder-object argument: an inline flat.
+    fn read_binder_arg(&mut self) -> Option<FlatBinderObject> {
+        match self.next_object()? {
+            HidlObj::Binder(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// `hidl_vec<hidl_string>`: [PTR vec struct][PTR array] +
+    /// count × ([PTR struct][PTR chars]).
+    fn read_vec_string_arg(&mut self) -> Option<Vec<String>> {
+        let vs = match self.next_object()? {
+            HidlObj::Ptr {
+                content: Some(c),
+                has_parent: false,
+                ..
+            } if c.len() >= 16 => c,
+            _ => return None,
+        };
+        let count = u64::from_ne_bytes(vs[8..16].try_into().ok()?) as usize;
+        if count > 128 {
+            return None;
+        }
+        let vec_idx = self.obj_idx - 1;
+        let arr_len = match self.next_object()? {
+            HidlObj::Ptr {
+                content: Some(c),
+                has_parent: true,
+                parent,
+                parent_offset: 0,
+                ..
+            } => {
+                if parent != vec_idx as u64 {
+                    return None;
+                }
+                c.len()
+            }
+            _ => return None,
+        };
+        if arr_len < count * 16 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.read_string_arg()?);
+        }
+        Some(out)
+    }
+}
+
+/// Bounded HIDL SM entry diagnostics: the first 8 transactions per code
+/// carry a parcel head + SG summary, then one sampled line per 500th.
+/// The pre-68 runs were BLIND here (the AIDL head-dump sat behind the
+/// is_aidl gate and HIDL parse failures were silent), which is why the
+/// wrong-wire decode took three ladders to converge.
+fn hidl_sm_entry_diag(code: u32, blob: &RequestBlob) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u64>>> =
+        std::sync::OnceLock::new();
+    let seen = match SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+    {
+        Ok(mut m) => *m.entry(code).and_modify(|c| *c += 1).or_insert(1),
+        Err(_) => 0,
+    };
+    if seen > 8 && seen % 500 != 0 {
+        return;
+    }
+    let mut head = String::new();
+    for b in blob.data.iter().take(16) {
+        head.push_str(&format!("{:02x} ", b));
+    }
+    let sg_total: usize = blob.sg.iter().map(|b| b.data.len()).sum();
+    let sg_lens: Vec<usize> = blob.sg.iter().map(|b| b.data.len()).collect();
+    info!(
+        "[KR64][binder][svc] HIDL SM code={} dsize={} offs={} sg={} ({}B, {:?}) head={} [tx #{}{}]",
+        code,
+        blob.data.len(),
+        blob.offsets.len() / 8,
+        blob.sg.len(),
+        sg_total,
+        &sg_lens[..sg_lens.len().min(6)],
+        head,
+        seen,
+        if seen <= 8 { "" } else { " sampled" }
+    );
+}
+
+/// Bounded parse-failure diagnostic (first 8 per boot): names the stage
+/// so the next ladder decodes the exact wire divergence in one run.
+fn hidl_sm_parse_fail_diag(stage: &str, code: u32, blob: &RequestBlob) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 8 {
+        return;
+    }
+    let mut head = String::new();
+    for b in blob.data.iter().take(16) {
+        head.push_str(&format!("{:02x} ", b));
+    }
+    warning!(
+        "[KR64][binder][svc] HIDL SM parse-fail ({}) code={} dsize={} offs={} sg={}: head={}",
+        stage,
+        code,
+        blob.data.len(),
+        blob.offsets.len() / 8,
+        blob.sg.len(),
+        head
+    );
+}
+
 fn servicemanager_hidl(
     code: u32,
-    parcel: &[u8],
+    blob: &RequestBlob,
     bus: &Arc<Mutex<BusState>>,
     conn_id: ConnId,
 ) -> TransactionResult {
-    let mut reader = ParcelReader::new(parcel);
-    // HIDL header: [i32 strict][i32 work][string16 descriptor].
-    let _strict = match reader.read_i32() {
-        Some(v) => v,
-        None => return TransactionResult::Failed,
+    hidl_sm_entry_diag(code, blob);
+    let mut p = match HidlParcel::new(blob) {
+        Some(p) => p,
+        None => {
+            hidl_sm_parse_fail_diag("offsets", code, blob);
+            return TransactionResult::Failed;
+        }
     };
-    let _work = match reader.read_i32() {
-        Some(v) => v,
-        None => return TransactionResult::Failed,
+    let _descriptor = match p.token() {
+        Some(t) => t,
+        None => {
+            hidl_sm_parse_fail_diag("token", code, blob);
+            return TransactionResult::Failed;
+        }
     };
-    let _iface = reader.read_string16();
 
     let mut writer = ParcelWriter::new();
     // HIDL replies carry no AIDL exception prefix; the object (if any)
@@ -4076,13 +4479,19 @@ fn servicemanager_hidl(
 
     match code {
         HIDL_SM_GET => {
-            let fq = match reader.read_hidl_string() {
+            let fq = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("get.fq", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
-            let name = match reader.read_hidl_string() {
+            let name = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("get.name", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
             let key = format!("{}/{}", fq, name);
             let b = bus.lock().expect("binder bus poisoned");
@@ -4122,7 +4531,7 @@ fn servicemanager_hidl(
         // ladder #122) — the HIDL fleet killer.
         //
         // Wire (IServiceManager.hal android-11.0.0_r1:90): request
-        // `[hdr][hidl_string fqName][hidl_string name]`; reply
+        // `[hidl_string fqName][hidl_string name]`; reply
         // `[status ok][u8 transport]` — `enum Transport : uint8_t`
         // (EMPTY=0, HWBINDER=1, PASSTHROUGH=2) marshals as ONE byte
         // (hwbinder::Parcel::writeUint8 = write(&val,1), no padding).
@@ -4144,14 +4553,23 @@ fn servicemanager_hidl(
         // container's deliberate superset for in-proxy virtual services
         // (kernel-provided, exist before any guest runs — see vintf.rs
         // header); invalid fq names answer EMPTY per Vintf.cpp's gates.
+        //
+        // 6-Z305t-68: the arms finally RUN — the token + string args now
+        // parse the real wire (C-string token, PTR/SG string objects).
         HIDL_SM_GET_TRANSPORT => {
-            let fq = match reader.read_hidl_string() {
+            let fq = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("getTransport.fq", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
-            let name = match reader.read_hidl_string() {
+            let name = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("getTransport.name", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
             let key = format!("{}/{}", fq, name);
             let (transport, source) = match crate::vintf::parse_fq(&fq) {
@@ -4180,11 +4598,14 @@ fn servicemanager_hidl(
             );
         }
         HIDL_SM_ADD => {
-            let name = match reader.read_hidl_string() {
+            let name = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("add.name", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
-            let flat = reader.read_flat_binder();
+            let flat = p.read_binder_arg();
             let (ptr, cookie) = match &flat {
                 Some(f) => (f.binder, f.cookie),
                 None => (0, 0),
@@ -4197,7 +4618,7 @@ fn servicemanager_hidl(
                     name, h, conn_id
                 );
                 // 6-Z276: fire the HIDL IServiceNotification.onRegistration
-                // callbacks BEFORE releasing the bus lock (the fire helper
+                // callbacks while holding the bus lock (the fire helper
                 // re-locks internally in the AIDL path — here we hold the
                 // lock, so call the same method on the guard's target).
                 b.fire_registration_callbacks(&name, h, false);
@@ -4211,15 +4632,21 @@ fn servicemanager_hidl(
             // 6-Z276: args = [hidl_string fqName][hidl_string name][flat
             // callback]. The HIDL registry key is "fqName/instance". The
             // flat is the watcher's local IServiceNotification object.
-            let fq = match reader.read_hidl_string() {
+            let fq = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("registerForNotifications.fq", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
-            let inst = match reader.read_hidl_string() {
+            let inst = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("registerForNotifications.name", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
-            let flat = reader.read_flat_binder();
+            let flat = p.read_binder_arg();
             let key = format!("{}/{}", fq, inst);
             let registered = if let Some(f) = flat {
                 let mut b = bus.lock().expect("binder bus poisoned");
@@ -4263,15 +4690,21 @@ fn servicemanager_hidl(
             );
         }
         HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS => {
-            let fq = match reader.read_hidl_string() {
+            let fq = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("unregisterForNotifications.fq", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
-            let inst = match reader.read_hidl_string() {
+            let inst = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("unregisterForNotifications.name", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
-            let flat = reader.read_flat_binder();
+            let flat = p.read_binder_arg();
             if let Some(f) = flat {
                 let key = format!("{}/{}", fq, inst);
                 let mut b = bus.lock().expect("binder bus poisoned");
@@ -4294,30 +4727,32 @@ fn servicemanager_hidl(
         // does on the AIDL side).
         //
         // Wire (manager@1.2 IServiceManager.hal:69 — parameter order):
-        // request `[hdr][hidl_string name][flat service][i32 chain len]
-        // [hidl_string × len]` (name BEFORE the interface object);
+        // request `[hidl_string name][IBinder service — inline flat]
+        // [hidl_vec<hidl_string> chain]` (name BEFORE the interface object);
         // reply `[status ok][u8 1]` (HIDL bool = 1 byte).
         HIDL_SM_ADD_WITH_CHAIN => {
-            let name = match reader.read_hidl_string() {
+            let name = match p.read_string_arg() {
                 Some(s) => s,
-                None => return TransactionResult::Failed,
+                None => {
+                    hidl_sm_parse_fail_diag("addWithChain.name", code, blob);
+                    return TransactionResult::Failed;
+                }
             };
-            let flat = reader.read_flat_binder();
+            let flat = p.read_binder_arg();
             let (ptr, cookie) = match &flat {
                 Some(f) => (f.binder, f.cookie),
                 None => (0, 0),
             };
-            // hidl_vec wire: [i32 count][elements…].
-            let count = match reader.read_i32() {
-                Some(c) if c > 0 && c <= 128 => c as usize,
-                _ => return TransactionResult::Failed,
-            };
-            let mut chain = Vec::with_capacity(count);
-            for _ in 0..count {
-                match reader.read_hidl_string() {
-                    Some(s) => chain.push(s),
-                    None => return TransactionResult::Failed,
+            let chain = match p.read_vec_string_arg() {
+                Some(v) => v,
+                None => {
+                    hidl_sm_parse_fail_diag("addWithChain.chain", code, blob);
+                    return TransactionResult::Failed;
                 }
+            };
+            if chain.is_empty() {
+                hidl_sm_parse_fail_diag("addWithChain.empty-chain", code, blob);
+                return TransactionResult::Failed;
             }
             // Register under the CONCRETE interface (chain[0]) — every boot
             // lookup names it. hwservicemanager also indexes the parent
@@ -4341,6 +4776,7 @@ fn servicemanager_hidl(
             );
         }
         _ => {
+            hidl_sm_parse_fail_diag("catch-all", code, blob);
             return TransactionResult::Failed;
         }
     }
@@ -5626,7 +6062,7 @@ mod tests {
         let tail = &resp[4 + read_size..];
         assert!(tail.len() >= 8, "v1 response must carry the blob trailer");
         let magic = u32::from_ne_bytes(tail[0..4].try_into().unwrap());
-        assert_eq!(magic, WIRE_V2_MAGIC, "trailer magic");
+        assert_eq!(magic, WIRE_V3_MAGIC, "trailer magic (6-Z305t-68 resp v3)");
         let count = u32::from_ne_bytes(tail[4..8].try_into().unwrap());
         assert_eq!(count, 1, "one reply blob");
         let dlen = u32::from_ne_bytes(tail[8..12].try_into().unwrap()) as usize;
@@ -5635,14 +6071,14 @@ mod tests {
         assert_eq!(dlen, 32, "status-ok (4) + flat (24) + stability i32 (4)");
         assert_eq!(olen, 8, "one offsets entry (binder_size_t = u64)");
         assert!(
-            tail.len() >= 16 + dlen + olen,
+            tail.len() >= 20 + dlen + olen,
             "trailer must carry the full blob bytes"
         );
         // Reply must parse as AIDL Status::ok (EX_NONE = 0)…
-        let status = i32::from_ne_bytes(tail[16..20].try_into().unwrap());
+        let status = i32::from_ne_bytes(tail[20..24].try_into().unwrap());
         assert_eq!(status, 0, "EX_NONE");
         // …followed by a BINDER_TYPE_BINDER null-binder flat object.
-        let ftype = u32::from_ne_bytes(tail[20..24].try_into().unwrap());
+        let ftype = u32::from_ne_bytes(tail[24..28].try_into().unwrap());
         assert_eq!(ftype, BINDER_TYPE_BINDER, "null binder (service miss)");
 
         drop(stream);
@@ -5951,7 +6387,7 @@ mod tests {
         // Locate the v2 trailer and verify the blob.
         let mut off = 4 + read_size;
         let magic = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap());
-        assert_eq!(magic, WIRE_V2_MAGIC, "response must be v2");
+        assert_eq!(magic, WIRE_V3_MAGIC, "response must be v3");
         off += 4;
         let blob_count = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap());
         assert_eq!(blob_count, 1, "ADD response carries one reply blob");
@@ -5960,7 +6396,7 @@ mod tests {
         let off_len = u32::from_ne_bytes(resp[off + 4..off + 8].try_into().unwrap()) as usize;
         assert_eq!(data_len, 4, "ADD reply = [i32 0] status only");
         assert_eq!(off_len, 0, "ADD reply has no flat objects");
-        let status = i32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
+        let status = i32::from_ne_bytes(resp[off + 12..off + 16].try_into().unwrap());
         assert_eq!(status, 0, "ADD reply status = EX_NONE");
 
         // ---- BC_TRANSACTION GET_SERVICE "my_svc" ----
@@ -5983,7 +6419,7 @@ mod tests {
         let mut off2 = 4 + read_size2;
         assert_eq!(
             u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()),
-            WIRE_V2_MAGIC
+            WIRE_V3_MAGIC
         );
         off2 += 4;
         assert_eq!(
@@ -5999,7 +6435,7 @@ mod tests {
             "GET reply = [i32 0 status] + 24-byte flat + i32 stability (6-Z271x)"
         );
         assert_eq!(off_len2, 8, "GET reply offsets = one u64 offset");
-        let blob2 = &resp2[off2 + 8..off2 + 8 + data_len2];
+        let blob2 = &resp2[off2 + 12..off2 + 12 + data_len2];
         let status2 = i32::from_ne_bytes(blob2[0..4].try_into().unwrap());
         assert_eq!(status2, 0, "GET reply status = EX_NONE");
         // Flat-object layout (24 bytes): u32 type, u32 flags, u64 binder, u64 cookie.
@@ -6029,7 +6465,7 @@ mod tests {
         );
         // The reply offsets array must list the flat object's offset (= 4,
         // after the i32 status prefix).
-        let reply_offsets = &resp2[off2 + 8 + data_len2..off2 + 8 + data_len2 + off_len2];
+        let reply_offsets = &resp2[off2 + 12 + data_len2..off2 + 12 + data_len2 + off_len2];
         let listed_off = u64::from_ne_bytes(reply_offsets[..].try_into().unwrap());
         assert_eq!(
             listed_off, 4,
@@ -6076,7 +6512,7 @@ mod tests {
         let mut off = 4 + read_size;
         assert_eq!(
             u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()),
-            WIRE_V2_MAGIC
+            WIRE_V3_MAGIC
         );
         off += 8; // magic(4) + blob_count(4)
         let data_len = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
@@ -6087,7 +6523,7 @@ mod tests {
             "miss reply = [i32 0] + null flat + stability i32"
         );
         assert_eq!(off_len, 8, "null flat object still listed in offsets");
-        let blob = &resp[off + 8..off + 8 + data_len];
+        let blob = &resp[off + 12..off + 12 + data_len];
         let status = i32::from_ne_bytes(blob[0..4].try_into().unwrap());
         assert_eq!(
             status, 0,
@@ -6196,7 +6632,7 @@ mod tests {
         let read_size2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
         let off2 = 4 + read_size2 + 8; // skip [read_size][BR stream][magic][count]
         let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
-        let blob2 = &resp2[off2 + 8..off2 + 8 + dl2];
+        let blob2 = &resp2[off2 + 12..off2 + 12 + dl2];
         let routed_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
         assert_eq!(
             routed_handle,
@@ -6260,7 +6696,7 @@ mod tests {
         assert_eq!(data_size, tx_data.len() as u64, "delivered parcel size");
         // Trailer blob carries the request parcel bytes.
         let magic_a = u32::from_ne_bytes(resp_a[4 + read_a..4 + read_a + 4].try_into().unwrap());
-        assert_eq!(magic_a, WIRE_V2_MAGIC, "delivery carries v2 trailer");
+        assert_eq!(magic_a, WIRE_V3_MAGIC, "delivery carries v3 trailer");
 
         // ---- Connection A: BC_REPLY (with its own blob) ----
         let reply_data: &[u8] = b"pong-reply";
@@ -6294,7 +6730,7 @@ mod tests {
         let off_b = 4 + read_b + 8;
         let dl_b = u32::from_ne_bytes(resp_b[off_b..off_b + 4].try_into().unwrap()) as usize;
         assert_eq!(dl_b, reply_data.len(), "reply blob = A's parcel bytes");
-        let got = &resp_b[off_b + 8..off_b + 8 + dl_b];
+        let got = &resp_b[off_b + 12..off_b + 12 + dl_b];
         assert_eq!(got, reply_data, "B receives A's exact reply payload");
 
         drop(stream_a);
@@ -6370,7 +6806,7 @@ mod tests {
         let read_size2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
         let off2 = 4 + read_size2 + 8;
         let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
-        let blob2 = &resp2[off2 + 8..off2 + 8 + dl2];
+        let blob2 = &resp2[off2 + 12..off2 + 12 + dl2];
         let routed_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
 
         // ---- Conn B: transact(code=42) — completes in-ioctl, parks ----
@@ -6438,7 +6874,7 @@ mod tests {
         let off_b = 4 + read_b + 8;
         let dl_b = u32::from_ne_bytes(resp_b[off_b..off_b + 4].try_into().unwrap()) as usize;
         assert_eq!(dl_b, reply_data.len());
-        let got = &resp_b[off_b + 8..off_b + 8 + dl_b];
+        let got = &resp_b[off_b + 12..off_b + 12 + dl_b];
         assert_eq!(got, reply_data, "reply bytes exact");
 
         drop(stream_a);
@@ -6494,7 +6930,7 @@ mod tests {
         let rs2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
         let o2 = 4 + rs2 + 8;
         let dl2 = u32::from_ne_bytes(resp2[o2..o2 + 4].try_into().unwrap()) as usize;
-        let blob2 = &resp2[o2 + 8..o2 + 8 + dl2];
+        let blob2 = &resp2[o2 + 12..o2 + 12 + dl2];
         let self_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
         assert_eq!(
             self_handle,
@@ -6570,7 +7006,7 @@ mod tests {
         let o5 = 4 + rs5 + 8;
         let dl5 = u32::from_ne_bytes(resp5[o5..o5 + 4].try_into().unwrap()) as usize;
         assert_eq!(dl5, rep.len());
-        assert_eq!(&resp5[o5 + 8..o5 + 8 + dl5], rep, "own reply bytes exact");
+        assert_eq!(&resp5[o5 + 12..o5 + 12 + dl5], rep, "own reply bytes exact");
 
         drop(stream);
         drop(_handle);
@@ -6625,7 +7061,7 @@ mod tests {
             let rs = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
             let off = 4 + rs + 8;
             let dl = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
-            let blob = &resp[off + 8..off + 8 + dl];
+            let blob = &resp[off + 12..off + 12 + dl];
             u64::from_ne_bytes(blob[12..20].try_into().unwrap()) as u32
         };
         let read_only = |s: &mut UnixStream| -> Vec<u8> {
@@ -6718,7 +7154,7 @@ mod tests {
         let o_b = 4 + rs_b + 8;
         let dl_b = u32::from_ne_bytes(resp_b2[o_b..o_b + 4].try_into().unwrap()) as usize;
         assert_eq!(
-            &resp_b2[o_b + 8..o_b + 8 + dl_b],
+            &resp_b2[o_b + 12..o_b + 12 + dl_b],
             b"outer-rep",
             "outer bytes exact"
         );
@@ -6775,7 +7211,7 @@ mod tests {
         let rs2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
         let o3 = 4 + rs2 + 8;
         let dl2 = u32::from_ne_bytes(resp2[o3..o3 + 4].try_into().unwrap()) as usize;
-        let blob2 = &resp2[o3 + 8..o3 + 8 + dl2];
+        let blob2 = &resp2[o3 + 12..o3 + 12 + dl2];
         let h = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
 
         let mut tx = [0u8; 64];
@@ -6855,7 +7291,7 @@ mod tests {
             let rs = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
             let off = 4 + rs + 8;
             let dl = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
-            let blob = &resp[off + 8..off + 8 + dl];
+            let blob = &resp[off + 12..off + 12 + dl];
             u64::from_ne_bytes(blob[12..20].try_into().unwrap()) as u32
         };
         let read_only = |s: &mut UnixStream| -> Vec<u8> {
@@ -6956,7 +7392,7 @@ mod tests {
             4 + 24 + 4,
             "hit reply = status + flat handle + stability (6-Z271x)"
         );
-        let blob = &resp[off + 8..off + 8 + dl];
+        let blob = &resp[off + 12..off + 12 + dl];
         let flat_type = u32::from_ne_bytes(blob[4..8].try_into().unwrap());
         assert_eq!(flat_type, BINDER_TYPE_HANDLE, "virtual service HIT");
         let vhandle = u64::from_ne_bytes(blob[12..20].try_into().unwrap()) as u32;
@@ -6976,7 +7412,7 @@ mod tests {
         let read2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
         let off2 = 4 + read2 + 8;
         let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
-        let blob2 = &resp2[off2 + 8..off2 + 8 + dl2];
+        let blob2 = &resp2[off2 + 12..off2 + 12 + dl2];
         assert_eq!(dl2, 8, "getCapabilities reply = status + i32 caps");
         let status = i32::from_ne_bytes(blob2[0..4].try_into().unwrap());
         let caps = i32::from_ne_bytes(blob2[4..8].try_into().unwrap());
@@ -7022,7 +7458,7 @@ mod tests {
         let off = 4 + read_size + 8;
         let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
         assert_eq!(dlen, 32, "hit blob = EX_NONE(4) + flat(24) + stability(4)");
-        let blob = &resp[off + 8..off + 8 + dlen];
+        let blob = &resp[off + 12..off + 12 + dlen];
         // Client walk 1: Status::readFromParcel consumes EX_NONE at 0.
         assert_eq!(
             i32::from_ne_bytes(blob[0..4].try_into().unwrap()),
@@ -7071,7 +7507,7 @@ mod tests {
             dlen2, 32,
             "miss blob = EX_NONE(4) + null flat(24) + stability(4)"
         );
-        let blob2 = &resp2[off2 + 8..off2 + 8 + dlen2];
+        let blob2 = &resp2[off2 + 12..off2 + 12 + dlen2];
         let flat_type2 = u32::from_ne_bytes(blob2[4..8].try_into().unwrap());
         assert_eq!(flat_type2, BINDER_TYPE_BINDER, "miss → null binder");
         let null_stability = i32::from_ne_bytes(blob2[28..32].try_into().unwrap());
@@ -7106,7 +7542,11 @@ mod tests {
             req.write_string16("android.hardware.vibrator.IVibrator");
             req.write_i32(timeout_ms); // on(in int timeoutMs)
             let (data, offsets) = req.into_parts();
-            RequestBlob { data, offsets }
+            RequestBlob {
+                data,
+                offsets,
+                sg: Vec::new(),
+            }
         };
         // on(5000) with the real client shape → forwarded to the host.
         match virtual_service_transaction(
@@ -7162,7 +7602,11 @@ mod tests {
             req.write_i32(effect); // perform(in Effect effect, ...
             req.write_i32(strength); // ... in EffectStrength strength, ...
             let (data, offsets) = req.into_parts();
-            RequestBlob { data, offsets }
+            RequestBlob {
+                data,
+                offsets,
+                sg: Vec::new(),
+            }
         };
         let read_reply = |res: TransactionResult| -> (i32, i32) {
             match res {
@@ -7289,7 +7733,7 @@ mod tests {
             let off = 4 + read_size + 8;
             let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
             let olen = u32::from_ne_bytes(resp[off + 4..off + 8].try_into().unwrap()) as usize;
-            let blob = resp[off + 8..off + 8 + dlen + olen].to_vec();
+            let blob = resp[off + 12..off + 12 + dlen + olen].to_vec();
             (dlen, blob[..dlen].to_vec(), olen, blob[dlen..].to_vec())
         };
 
@@ -7350,7 +7794,7 @@ mod tests {
             let off = 4 + read_size + 8;
             let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
             assert_eq!(dlen, 32);
-            let blob = &resp[off + 8..off + 8 + dlen];
+            let blob = &resp[off + 12..off + 12 + dlen];
             i32::from_ne_bytes(blob[28..32].try_into().unwrap())
         };
 
@@ -7392,7 +7836,7 @@ mod tests {
             let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
             let off = 4 + read_size + 8;
             let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
-            let blob = &resp[off + 8..off + 8 + dlen];
+            let blob = &resp[off + 12..off + 12 + dlen];
             i32::from_ne_bytes(blob[28..32].try_into().unwrap())
         };
         assert_eq!(
@@ -7449,7 +7893,7 @@ mod tests {
         let off = 4 + read_size + 8;
         let dlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
         let olen = u32::from_ne_bytes(resp[off + 4..off + 8].try_into().unwrap()) as usize;
-        let blob = resp[off + 8..off + 8 + dlen + olen].to_vec();
+        let blob = resp[off + 12..off + 12 + dlen + olen].to_vec();
         (blob[..dlen].to_vec(), blob[dlen..].to_vec())
     }
 
@@ -8123,28 +8567,132 @@ mod tests {
         assert_eq!(HIDL_TRANSPORT_HWBINDER, 1);
     }
 
-    /// Build a HIDL servicemanager request parcel:
-    /// `[strict][work][string16 descriptor][args…]` (libhwbinder writes NO
-    /// SYST/VNDR header tag — the discriminator peeks word 2).
-    fn hidl_sm_request(descriptor: &str, args: &dyn Fn(&mut ParcelWriter)) -> Vec<u8> {
-        let mut w = ParcelWriter::new();
-        w.write_i32(0); // strict-mode policy
-        w.write_i32(-1); // work source (kUnsetWorkSource)
-        w.write_string16(descriptor);
-        args(&mut w);
-        let (data, _) = w.into_parts();
-        data
+    /// Build a HIDL servicemanager request the way libhwbinder + hidl-gen
+    /// ACTUALLY put it on the wire (android-11.0.0_r1, the 6-Z305t-68
+    /// decode): a C-string interface token, then per hidl_string argument
+    /// TWO BINDER_TYPE_PTR objects (the 16-byte {ptr,size,owns} struct and
+    /// the chars+NUL child — both SG-captured), binder arguments as inline
+    /// flats, and hidl_vec<hidl_string> as vec-struct + array + per-element
+    /// pairs. This is the exact shape the ladder's v2 blobs could never
+    /// parse (the string bytes were never in the main parcel).
+    struct HidlReqBuilder {
+        data: Vec<u8>,
+        offsets: Vec<u8>,
+        sg: Vec<SgBuf>,
+        seq: u64,
+    }
+
+    impl HidlReqBuilder {
+        fn new(descriptor: &str) -> Self {
+            let mut data = Vec::new();
+            data.extend_from_slice(descriptor.as_bytes());
+            data.push(0);
+            while data.len() % 4 != 0 {
+                data.push(0);
+            }
+            HidlReqBuilder {
+                data,
+                offsets: Vec::new(),
+                sg: Vec::new(),
+                seq: 0,
+            }
+        }
+
+        fn push_ptr(
+            &mut self,
+            content: &[u8],
+            has_parent: bool,
+            parent_idx: u64,
+            parent_offset: u64,
+        ) {
+            self.seq += 1;
+            let fake_ptr = 0x7000_0000_0000_0000u64 + self.seq * 0x1000;
+            let off = self.data.len() as u64;
+            let flags = if has_parent {
+                BINDER_BUFFER_FLAG_HAS_PARENT
+            } else {
+                0
+            };
+            self.data.extend_from_slice(&BINDER_TYPE_PTR.to_ne_bytes());
+            self.data.extend_from_slice(&flags.to_ne_bytes());
+            self.data.extend_from_slice(&fake_ptr.to_ne_bytes());
+            self.data
+                .extend_from_slice(&(content.len() as u64).to_ne_bytes());
+            self.data.extend_from_slice(&parent_idx.to_ne_bytes());
+            self.data.extend_from_slice(&parent_offset.to_ne_bytes());
+            self.offsets.extend_from_slice(&off.to_ne_bytes());
+            self.sg.push(SgBuf {
+                client_ptr: fake_ptr,
+                data: content.to_vec(),
+            });
+        }
+
+        fn push_flat(&mut self, f: &FlatBinderObject) {
+            let off = self.data.len() as u64;
+            self.data.extend_from_slice(&f.r#type.to_ne_bytes());
+            self.data.extend_from_slice(&f.flags.to_ne_bytes());
+            self.data.extend_from_slice(&f.binder.to_ne_bytes());
+            self.data.extend_from_slice(&f.cookie.to_ne_bytes());
+            self.offsets.extend_from_slice(&off.to_ne_bytes());
+        }
+
+        /// A hidl_string argument: [PTR struct][PTR chars child].
+        fn string_arg(&mut self, s: &str) {
+            let mut st = vec![0u8; 16];
+            st[8..12].copy_from_slice(&(s.len() as u32).to_ne_bytes());
+            let idx = (self.offsets.len() / 8) as u64;
+            self.push_ptr(&st, false, 0, 0);
+            let mut ch = s.as_bytes().to_vec();
+            ch.push(0);
+            self.push_ptr(&ch, true, idx, 0);
+        }
+
+        /// A binder-object argument: an inline flat.
+        fn binder_arg(&mut self, f: &FlatBinderObject) {
+            self.push_flat(f);
+        }
+
+        /// hidl_vec<hidl_string>: [PTR vec struct][PTR array] +
+        /// per element [PTR struct][PTR chars].
+        fn vec_string_arg(&mut self, v: &[&str]) {
+            let mut vs = vec![0u8; 24];
+            vs[8..16].copy_from_slice(&(v.len() as u64).to_ne_bytes());
+            let idx = (self.offsets.len() / 8) as u64;
+            self.push_ptr(&vs, false, 0, 0);
+            let arr = vec![0u8; v.len() * 16];
+            self.push_ptr(&arr, true, idx, 0);
+            for s in v {
+                self.string_arg(s);
+            }
+        }
+
+        fn build(self) -> RequestBlob {
+            RequestBlob {
+                data: self.data,
+                offsets: self.offsets,
+                sg: self.sg,
+            }
+        }
+    }
+
+    fn hidl_sm_request(descriptor: &str, args: &dyn Fn(&mut HidlReqBuilder)) -> RequestBlob {
+        let mut b = HidlReqBuilder::new(descriptor);
+        args(&mut b);
+        b.build()
     }
 
     /// getTransport for an UNREGISTERED service must answer the honest
     /// EMPTY(0) as a single u8 after the status — NOT the pre-6-Z305t-66
-    /// BR_FAILED_REPLY that surfaced as Status(EX_TRANSACTION_FAILED).
+    /// BR_FAILED_REPLY that surfaced as Status(EX_TRANSACTION_FAILED),
+    /// and NOT the silent token-parse failure of ladders #122/#123 (the
+    /// pre-68 parser read the C-string token as a string16 → the first
+    /// i32 consumed "andr" → ~1.9e9 length → silent Failed).
     #[test]
     fn hidl_get_transport_unregistered_replies_empty_u8() {
         let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
-        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|w| {
-            w.write_hidl_string("android.hardware.foo@1.0::IFoo");
-            w.write_hidl_string("default");
+        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|b| {
+            b.string_arg("android.hardware.foo@1.0::IFoo");
+            b.string_arg("default");
         });
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
             TransactionResult::Reply { data, offsets } => {
@@ -8168,9 +8716,9 @@ mod tests {
             0xdead,
             0xbeef,
         );
-        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|w| {
-            w.write_hidl_string("android.hardware.foo@1.0::IFoo");
-            w.write_hidl_string("default");
+        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|b| {
+            b.string_arg("android.hardware.foo@1.0::IFoo");
+            b.string_arg("default");
         });
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
             TransactionResult::Reply { data, offsets } => {
@@ -8188,17 +8736,18 @@ mod tests {
     #[test]
     fn hidl_add_with_chain_registers_fq_instance_key() {
         let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
-        let req = hidl_sm_request("android.hidl.manager@1.2::IServiceManager", &|w| {
-            w.write_hidl_string("default"); // name (BEFORE the interface)
-            w.write_flat_binder(&FlatBinderObject {
+        let req = hidl_sm_request("android.hidl.manager@1.2::IServiceManager", &|b| {
+            b.string_arg("default"); // name (BEFORE the interface)
+            b.binder_arg(&FlatBinderObject {
                 r#type: BINDER_TYPE_HANDLE,
                 flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
                 binder: 0x1234,
                 cookie: 0x5678,
             });
-            w.write_i32(2); // chain count
-            w.write_hidl_string("android.hardware.foo@1.2::IFoo"); // concrete
-            w.write_hidl_string("android.hidl.base@1.0::IBase"); // parent
+            b.vec_string_arg(&[
+                "android.hardware.foo@1.2::IFoo", // concrete
+                "android.hidl.base@1.0::IBase",   // parent
+            ]);
         });
         match servicemanager_hidl(HIDL_SM_ADD_WITH_CHAIN, &req, &bus, PROXY_CONN_ID) {
             TransactionResult::Reply { data, offsets } => {
@@ -8216,13 +8765,85 @@ mod tests {
             .contains_key("android.hardware.foo@1.2::IFoo/default"));
 
         // …and a follow-up getTransport now answers HWBINDER end-to-end.
-        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|w| {
-            w.write_hidl_string("android.hardware.foo@1.2::IFoo");
-            w.write_hidl_string("default");
+        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|b| {
+            b.string_arg("android.hardware.foo@1.2::IFoo");
+            b.string_arg("default");
         });
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
             TransactionResult::Reply { data, .. } => assert_eq!(data, vec![0, 0, 0, 0, 1]),
             _ => panic!("getTransport must Reply"),
+        }
+    }
+
+    /// The 1.0 add shape registers under the BARE instance name (real
+    /// hwservicemanager keys by fq/instance — it decodes the chain from
+    /// the OBJECT; the container's 1.0-add fallback keys bare, documented
+    /// limitation for pre-1.2 guests).
+    #[test]
+    fn hidl_add_registers_bare_instance_name() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let req = hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|b| {
+            b.string_arg("myinstance");
+            b.binder_arg(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0x7777,
+                cookie: 0x8888,
+            });
+        });
+        match servicemanager_hidl(HIDL_SM_ADD, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { data, offsets } => {
+                assert!(offsets.is_empty());
+                // [status ok][i32 true] — the legacy i32 bool reply shape.
+                assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+            }
+            _ => panic!("add must Reply, not Fail/CompleteOnly"),
+        }
+        assert!(bus.lock().expect("bus").services.contains_key("myinstance"));
+    }
+
+    /// HONESTY under the v2 wire (no SG section): the string bytes are
+    /// NOT in the main parcel, so the parse must FAIL (never fabricate an
+    /// answer from bytes that are not there) — the exact pre-68 behavior,
+    /// now explicit and bounded-diagnosed instead of silent.
+    #[test]
+    fn hidl_v2_blob_without_sg_fails_honestly() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|b| {
+            b.string_arg("android.hardware.foo@1.0::IFoo");
+            b.string_arg("default");
+        });
+        let req = RequestBlob {
+            data: req.data,
+            offsets: req.offsets,
+            sg: Vec::new(),
+        };
+        match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Failed => {}
+            _ => panic!("a v2 blob without SG must fail honestly, not fabricate"),
+        }
+    }
+
+    /// HONESTY under a corrupted SG region (the chars entry is missing):
+    /// fail — the struct's size cannot be verified against any chars.
+    #[test]
+    fn hidl_missing_chars_sg_fails_honestly() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let req = hidl_sm_request("android.hidl.manager@1.1::IServiceManager", &|b| {
+            b.string_arg("android.hardware.foo@1.0::IFoo");
+            b.string_arg("default");
+        });
+        // Drop the FIRST SG entry (the fq struct) — the ptr cross-check
+        // now sees order-mismatched pointers (struct expects fake_ptr #1,
+        // gets #2) → content None → parse fail.
+        let req = RequestBlob {
+            data: req.data,
+            offsets: req.offsets,
+            sg: req.sg[1..].to_vec(),
+        };
+        match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Failed => {}
+            _ => panic!("a corrupted SG region must fail honestly"),
         }
     }
 }
