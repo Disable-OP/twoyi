@@ -4515,6 +4515,76 @@ impl<'a> HidlParcel<'a> {
 /// The pre-68 runs were BLIND here (the AIDL head-dump sat behind the
 /// is_aidl gate and HIDL parse failures were silent), which is why the
 /// wrong-wire decode took three ladders to converge.
+/// 6-Z305t-69c: FULL-fidelity object dump for the first N transactions of
+/// a code — offsets array (type/flags/len/parent/parent_offset per object)
+/// + SG contents (hex, first 32B). The addWithChain chain-vec wire has
+/// survived three decode rounds; this dump ends the guessing in one run.
+fn hidl_sm_object_diag(code: u32, blob: &RequestBlob) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 2 || blob.offsets.len() % 8 != 0 {
+        return;
+    }
+    let offs: Vec<u64> = blob
+        .offsets
+        .chunks_exact(8)
+        .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
+        .collect();
+    let mut s = String::new();
+    for (i, off) in offs.iter().enumerate() {
+        let o = *off as usize;
+        if o + 4 > blob.data.len() {
+            s.push_str(&format!(" [{}:OOB@{}]", i, o));
+            continue;
+        }
+        let typ = u32::from_ne_bytes(blob.data[o..o + 4].try_into().unwrap());
+        if typ == BINDER_TYPE_PTR && o + 40 <= blob.data.len() {
+            let flags = u32::from_ne_bytes(blob.data[o + 4..o + 8].try_into().unwrap());
+            let ptr = u64::from_ne_bytes(blob.data[o + 8..o + 16].try_into().unwrap());
+            let len = u64::from_ne_bytes(blob.data[o + 16..o + 24].try_into().unwrap());
+            let par = u64::from_ne_bytes(blob.data[o + 24..o + 32].try_into().unwrap());
+            let poff = u64::from_ne_bytes(blob.data[o + 32..o + 40].try_into().unwrap());
+            s.push_str(&format!(
+                " [{}:PTR@{} fl={} ptr={:#x} len={} par={} poff={}]",
+                i, o, flags, ptr, len, par, poff
+            ));
+        } else if o + 24 <= blob.data.len() {
+            let flags = u32::from_ne_bytes(blob.data[o + 4..o + 8].try_into().unwrap());
+            let binder = u64::from_ne_bytes(blob.data[o + 8..o + 16].try_into().unwrap());
+            s.push_str(&format!(
+                " [{}:{:#x}@{} fl={} binder={:#x}]",
+                i, typ, o, flags, binder
+            ));
+        } else {
+            s.push_str(&format!(" [{}:SHORT@{}]", i, o));
+        }
+    }
+    let sg_lens: Vec<usize> = blob.sg.iter().map(|b| b.data.len()).collect();
+    let mut sg_hex = String::new();
+    for (i, b) in blob.sg.iter().take(6).enumerate() {
+        let mut h = String::new();
+        for x in b.data.iter().take(24) {
+            h.push_str(&format!("{:02x}", x));
+        }
+        sg_hex.push_str(&format!(" sg{}[{}]={}", i, b.data.len(), h));
+    }
+    info!(
+        "[KR64][binder][svc] HIDL SM OBJECTS code={} dsize={} offs({})={}{} sg({})={:?}{}",
+        code,
+        blob.data.len(),
+        offs.len(),
+        s,
+        if offs.len() == blob.sg.len() + 1 {
+            ""
+        } else {
+            " PTR/SG-MISMATCH"
+        },
+        blob.sg.len(),
+        sg_lens,
+        sg_hex
+    );
+}
+
 fn hidl_sm_entry_diag(code: u32, blob: &RequestBlob) {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u64>>> =
         std::sync::OnceLock::new();
@@ -4578,6 +4648,7 @@ fn servicemanager_hidl(
     conn_id: ConnId,
 ) -> TransactionResult {
     hidl_sm_entry_diag(code, blob);
+    hidl_sm_object_diag(code, blob);
     let mut p = match HidlParcel::new(blob) {
         Some(p) => p,
         None => {
