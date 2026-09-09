@@ -7729,9 +7729,19 @@ static void twoyi_init(void) {
                     i += (ssize_t)len + 1;
                 }
                 if (is_zygote && g_rootfs) {
+                    // 6-Z305t-76b: BOTH zygote sockets — init.zygote64_32.rc
+                    // declares `socket zygote ...` AND `socket
+                    // usap_pool_primary ...`; registerZygoteSocket needs
+                    // the former, the USAP pool setup the latter (ladder
+                    // #153 died on the second after the first passed).
+                    static const char *zygote_sockets[] = { "zygote", "usap_pool_primary" };
+                    for (unsigned si = 0; si < sizeof(zygote_sockets) / sizeof(zygote_sockets[0]); si++) {
+                    const char *sname = zygote_sockets[si];
+                    char env_name[64];
+                    snprintf(env_name, sizeof(env_name), "ANDROID_SOCKET_%s", sname);
                     char sock_path[512];
                     snprintf(sock_path, sizeof(sock_path),
-                             "%s/dev/socket/zygote", g_rootfs);
+                             "%s/dev/socket/%s", g_rootfs, sname);
                     int sfd = (int)syscall(SYS_socket, AF_UNIX,
                                            SOCK_STREAM | SOCK_CLOEXEC, 0);
                     if (sfd >= 0) {
@@ -7746,14 +7756,19 @@ static void twoyi_init(void) {
                             if (syscall(SYS_listen, sfd, 8) == 0) {
                                 char val[16];
                                 snprintf(val, sizeof(val), "%d", sfd);
-                                setenv("ANDROID_SOCKET_zygote", val, 1);
-                                write_str(2, "[twoyi_loader] 6-Z305t-76: zygote socket bound+listening, ANDROID_SOCKET_zygote published\n");
+                                setenv(env_name, val, 1);
+                                char msg2[160];
+                                snprintf(msg2, sizeof(msg2),
+                                         "[twoyi_loader] 6-Z305t-76: zygote socket %s bound+listening, %s=%s published\n",
+                                         sname, env_name, val);
+                                write_str(2, msg2);
                             } else {
                                 write_str(2, "[twoyi_loader] 6-Z305t-76: zygote socket listen FAILED\n");
                             }
                         } else {
                             write_str(2, "[twoyi_loader] 6-Z305t-76: zygote socket bind FAILED\n");
                         }
+                    }
                     }
                 }
             }
