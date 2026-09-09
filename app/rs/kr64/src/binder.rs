@@ -4860,12 +4860,28 @@ fn servicemanager_hidl(
                     return TransactionResult::Failed;
                 }
             };
-            let flat = p.read_binder_arg();
+            // 6-Z305t-69b: the REAL wire's object order has the service
+            // flat AFTER the chain vec (ladder #126: 'parse-fail
+            // (addWithChain.chain)' with sg=[16,8,16,32,43,29] — the
+            // positional flat-first read swallowed the vec struct into
+            // the tolerated-None flat slot). Parse TYPE-DRIVEN with
+            // backtracking: try (flat, vec), then (vec, flat).
+            let save = (p.obj_idx, p.ptr_seq);
+            let mut flat = p.read_binder_arg();
+            let mut chain = p.read_vec_string_arg();
+            if chain.is_none() {
+                p.obj_idx = save.0;
+                p.ptr_seq = save.1;
+                chain = p.read_vec_string_arg();
+                if chain.is_some() {
+                    flat = p.read_binder_arg();
+                }
+            }
             let (ptr, cookie) = match &flat {
                 Some(f) => (f.binder, f.cookie),
                 None => (0, 0),
             };
-            let chain = match p.read_vec_string_arg() {
+            let chain = match chain {
                 Some(v) => v,
                 None => {
                     hidl_sm_parse_fail_diag("addWithChain.chain", code, blob);
@@ -9067,6 +9083,38 @@ mod tests {
             _ => panic!("add must Reply, not Fail/CompleteOnly"),
         }
         assert!(bus.lock().expect("bus").services.contains_key("myinstance"));
+    }
+
+    /// The REAL addWithChain wire has the service flat AFTER the chain
+    /// vec (ladder #126 sg=[16,8,16,32,43,29]): the type-driven backtracking
+    /// parse must register "chain[0]/name" from either order.
+    #[test]
+    fn hidl_add_with_chain_flat_after_vec_wire_order() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let req = hidl_sm_request("android.hidl.manager@1.2::IServiceManager", &|b| {
+            b.string_arg("default");
+            b.vec_string_arg(&[
+                "android.hardware.audio@6.0::IDevicesFactory", // 42+1 = 43
+                "android.hidl.base@1.0::IBase",                // 28+1 = 29
+            ]);
+            b.binder_arg(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0xABCD,
+                cookie: 0x1234,
+            });
+        });
+        match servicemanager_hidl(HIDL_SM_ADD_WITH_CHAIN, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { data, .. } => {
+                assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0])
+            }
+            _ => panic!("addWithChain must Reply (flat-after-vec wire order)"),
+        }
+        assert!(bus
+            .lock()
+            .expect("bus")
+            .services
+            .contains_key("android.hardware.audio@6.0::IDevicesFactory/default"));
     }
 
     /// listManifestByInterface (code 13) answers the REAL vec<Instance>
