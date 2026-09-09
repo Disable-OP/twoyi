@@ -3233,6 +3233,48 @@ fn sigtrap_force_mask(mask: u64) -> Option<u64> {
     }
 }
 
+/// 6-Z305t-71: inject a duplicate of `tracer_fd` into the TRACEE's fd
+/// table and return the fd number the tracee will see. pidfd_open(434)
+/// + pidfd_getfd(438): the tracer holds the attach right (it IS the
+/// tracer), and the seccomp filter in front of kr64 is a small
+/// denylist (default ALLOW) — the startup probe in the tracer loop
+/// verifies both syscalls honestly before any injection is armed.
+/// The tracer's own copy of the fd is closed by the caller right after;
+/// the tracee's duplicate is an independent descriptor.
+fn pidfd_inject_fd(pid: libc::pid_t, tracer_fd: i32) -> std::io::Result<i32> {
+    // Unannotated syscall numbers: pidfd_open=434 / pidfd_getfd=438 on
+    // every ABI this crate builds for (arm64/aarch32/x86_64/i386 all
+    // unified syscall numbering for the newer calls).
+    let pidfd = unsafe { libc::syscall(434, pid as libc::c_long) };
+    if pidfd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let child_fd =
+        unsafe { libc::syscall(438, pidfd, tracer_fd as libc::c_long, 0 as libc::c_long) };
+    unsafe { libc::close(pidfd as i32) };
+    if child_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(child_fd as i32)
+}
+
+/// 6-Z305t-71: the tracer-side half of the /dev/qemu_pipe raw-open
+/// injection — connect to the kr64 qemu_pipe proxy listener the way a
+/// patched guest would (the shlib's qemu_pipe_proxy_connect), then hand
+/// the connected socket to the tracee via pidfd_inject_fd. The proxy's
+/// accept thread picks the session up, reads the guest's
+/// "pipe:opengles" handshake from the guest's fd, and relays to
+/// libOpenglRender's {rootfs}/opengles socket.
+fn qpipe_proxy_inject(pid: libc::pid_t, rootfs: &str) -> std::io::Result<i32> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let proxy_path = format!("{}/dev/qemu_pipe", rootfs);
+    let sock = UnixStream::connect(&proxy_path)?;
+    let r = pidfd_inject_fd(pid, sock.as_raw_fd());
+    drop(sock); // close the tracer copy; the tracee's duplicate is independent
+    r
+}
+
 /// Set the return value of a syscall in registers.
 ///
 /// On x86_64 this writes `rax` (the kernel's "syscall return value"
@@ -7304,6 +7346,7 @@ fn forget_dead_pid_state(
     pending_epoll_readback: &mut std::collections::HashMap<libc::pid_t, (i64, u64, usize)>,
     pending_mount_enodev: &mut std::collections::HashSet<libc::pid_t>,
     pending_open_translated_path: &mut std::collections::HashMap<libc::pid_t, String>,
+    pending_qpipe_fd: &mut std::collections::HashMap<libc::pid_t, i32>,
     open_fd_owner_paths: &mut std::collections::HashMap<(libc::pid_t, i32), String>,
     accept4_einval_streak: &mut std::collections::HashMap<libc::pid_t, u64>,
     esrch_streak: &mut std::collections::HashMap<libc::pid_t, u32>,
@@ -7338,6 +7381,9 @@ fn forget_dead_pid_state(
     pending_epoll_readback.remove(&pid);
     pending_mount_enodev.remove(&pid);
     pending_open_translated_path.remove(&pid);
+    // 6-Z305t-71: a stale injected /dev/qemu_pipe fd would override the
+    // recycled pid's first open-family EXIT with a dead connection.
+    pending_qpipe_fd.remove(&pid);
     open_fd_owner_paths.retain(|(p, _), _| *p != pid);
     accept4_einval_streak.remove(&pid);
     esrch_streak.remove(&pid);
@@ -13040,6 +13086,50 @@ pub fn run_ptrace_loop(
     //   the declaration.
     let mut kmsg_fd: Option<i32> = None;
     let mut pending_kmsg_open_pid: Option<libc::pid_t> = None; // 6-Z83: per-pid
+
+    // ── 6-Z305t-71: /dev/qemu_pipe raw-open fd injection ──────────────
+    //
+    // Ladder #131 + #134: SurfaceFlinger aborts "connect: failed to
+    // connect to opengles pipe" and the shlib's qemu_pipe_open_fallback
+    // NEVER runs — the goldfish EGL libraries are dlopen'd AFTER the
+    // shlib's constructor-time GOT repair, so their open() resolves
+    // straight to bionic (linker-namespace bypass) and the raw openat
+    // hits the proxy's bound SOCKET file → ENXIO → qemu_pipe_open fails
+    // → SF aborts. The virtual-kernel answer: at the raw open's ENTRY
+    // the tracer connects to the proxy ITSELF and pidfd_getfd-injects
+    // the connected fd into the tracee; at EXIT the honest ENXIO is
+    // overridden with the connected fd. Hook- and namespace-proof.
+    let mut pending_qpipe_fd: std::collections::HashMap<libc::pid_t, i32> =
+        std::collections::HashMap::new();
+    let qpipe_fd_injection: bool = {
+        let before = KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut ok = false;
+        // Probe pidfd_open + pidfd_getfd against SELF (fd 0 — read-only
+        // dup, closed immediately). SIGSYS-survivable: the 6-Z62 catcher
+        // bumps KR64_SIGSYS_HITS instead of dying, and the probe result
+        // honestly disables the feature.
+        let pidfd = unsafe { libc::syscall(434, libc::getpid() as libc::c_long) };
+        if pidfd >= 0 {
+            let g = unsafe { libc::syscall(438, pidfd, 0 as libc::c_long, 0 as libc::c_long) };
+            if g >= 0 {
+                unsafe { libc::close(g as i32) };
+                ok = true;
+            }
+            unsafe { libc::close(pidfd as i32) };
+        }
+        let sigsys = KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed) > before;
+        log(&format!(
+            "6-Z305t-71: qemu_pipe fd-injection probe: pidfd_open/pidfd_getfd {} (sigsys_fired={}) — {}",
+            if ok { "available" } else { "UNAVAILABLE" },
+            sigsys,
+            if ok && !sigsys {
+                "raw open(/dev/qemu_pipe) will receive a live proxy connection"
+            } else {
+                "shlib hook path only (hooked modules keep their fallback)"
+            }
+        ));
+        ok && !sigsys
+    };
     let mut post_execve_write_count: u64 = 0;
     // 6-Z301: glog-redirect budget — writes whose payload starts with
     // "[glog " come from the twoyi_loader shlib's logdw→/dev/__kmsg__
@@ -13817,6 +13907,8 @@ pub fn run_ptrace_loop(
     const SITE_READLINK_REWRITE: u8 = 10;
     const SITE_WINDOW_TRACE: u8 = 11;
     const SITE_DIAG_WRITE: u8 = 12;
+    const SITE_QPIPE_INJECT: u8 = 13;
+    const SITE_QPIPE_INJECT_FAIL: u8 = 14;
 
     // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
     // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
@@ -14888,6 +14980,7 @@ pub fn run_ptrace_loop(
                 &mut pending_epoll_readback,
                 &mut pending_mount_enodev,
                 &mut pending_open_translated_path,
+                &mut pending_qpipe_fd,
                 &mut open_fd_owner_paths,
                 &mut accept4_einval_streak,
                 &mut esrch_streak,
@@ -15104,6 +15197,7 @@ pub fn run_ptrace_loop(
                 &mut pending_epoll_readback,
                 &mut pending_mount_enodev,
                 &mut pending_open_translated_path,
+                &mut pending_qpipe_fd,
                 &mut open_fd_owner_paths,
                 &mut accept4_einval_streak,
                 &mut esrch_streak,
@@ -20933,6 +21027,43 @@ pub fn run_ptrace_loop(
                                                         ));
                                                     }
                                                 }
+                                            }
+                                        }
+                                    }
+                                }
+                                // ── 6-Z305t-71: /dev/qemu_pipe raw-open injection (ENTRY side) ──
+                                // The goldfish EGL modules dlopen'd after the shlib's GOT
+                                // repair reach this raw syscall unhooked. Arm the fd
+                                // injection: the tracer connects to the proxy and injects
+                                // the connected fd; the matching EXIT overrides the
+                                // honest ENXIO with it (see pending_qpipe_fd).
+                                if qpipe_fd_injection && path == "/dev/qemu_pipe" {
+                                    match qpipe_proxy_inject(pid, rootfs) {
+                                        Ok(child_fd) => {
+                                            pending_qpipe_fd.insert(pid, child_fd);
+                                            if let Some(total) = stop_log_allow(
+                                                &mut stop_log_budget,
+                                                SITE_QPIPE_INJECT,
+                                                pid,
+                                                4096,
+                                            ) {
+                                                log(&format!(
+                                                    "6-Z305t-71: open(/dev/qemu_pipe) ENTRY pid={} — proxy connected, fd={} injected [occurrence #{} of this pid]",
+                                                    pid, child_fd, total
+                                                ));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if let Some(total) = stop_log_allow(
+                                                &mut stop_log_budget,
+                                                SITE_QPIPE_INJECT_FAIL,
+                                                pid,
+                                                4096,
+                                            ) {
+                                                log(&format!(
+                                                    "6-Z305t-71: open(/dev/qemu_pipe) ENTRY pid={} — fd injection UNAVAILABLE: {} — the raw ENXIO stands [occurrence #{} of this pid]",
+                                                    pid, e, total
+                                                ));
                                             }
                                         }
                                     }
@@ -28832,7 +28963,23 @@ pub fn run_ptrace_loop(
                                 // path. (The fresh_ret-gated -38/-9 arms
                                 // below still cover the NOT-matched i386
                                 // syscalls exactly as before.)
-                                let forced_value: Option<i64> = if syscall_num == abi.mount
+                                let forced_value: Option<i64> = if pending_qpipe_fd
+                                    .contains_key(&pid)
+                                    && (syscall_num == abi.open
+                                        || syscall_num == abi.openat
+                                        || (abi.openat2 != -1 && syscall_num == abi.openat2))
+                                {
+                                    // ── 6-Z305t-71: the injected /dev/qemu_pipe fd —
+                                    // the raw open ENXIOs on the proxy socket file;
+                                    // the guest instead receives the live connected
+                                    // socket the tracer injected at ENTRY.
+                                    let child_fd = pending_qpipe_fd.remove(&pid).unwrap_or(-1);
+                                    if child_fd >= 0 {
+                                        Some(child_fd as i64)
+                                    } else {
+                                        None
+                                    }
+                                } else if syscall_num == abi.mount
                                     && pending_mount_enodev.remove(&pid)
                                 {
                                     // ── 6-Z168: honest -ENODEV for block-storage mounts ──
@@ -38508,6 +38655,12 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // Sanity: all four maps have the pid entry before cleanup
         // (5 = a real kernel fd, 0x6b000000+ = synthetic fake fds).
         fake_propserv_fds.entry(pid).or_default().insert(5);
+        // 6-Z305t-71: the injected /dev/qemu_pipe fd map joins the
+        // forget contract — a stale entry would override the recycled
+        // pid's first open-family EXIT with a dead connection.
+        let mut pending_qpipe_fd: std::collections::HashMap<libc::pid_t, i32> =
+            std::collections::HashMap::new();
+        pending_qpipe_fd.insert(pid, 7);
         assert!(in_syscall_map.contains_key(&pid));
         assert!(fake_netlink_fds.contains_key(&pid));
         assert!(netlink_fd_next.contains_key(&pid));
@@ -38523,6 +38676,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             &mut pending_epoll_readback,
             &mut pending_mount_enodev,
             &mut pending_open_translated_path,
+            &mut pending_qpipe_fd,
             &mut open_fd_owner_paths,
             &mut accept4_einval_streak,
             &mut esrch_streak,
@@ -38540,6 +38694,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         );
         // All four maps no longer have the pid entry — pid-RECYCLED
         // successor inherits NOTHING.
+        assert!(!pending_qpipe_fd.contains_key(&pid));
         assert!(!in_syscall_map.contains_key(&pid));
         assert!(!fake_netlink_fds.contains_key(&pid));
         assert!(!netlink_fd_next.contains_key(&pid));
