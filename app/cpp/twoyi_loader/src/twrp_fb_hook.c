@@ -3639,6 +3639,25 @@ static void fatal_evidence_once(const char *kind, void *pc) {
     write_str(2, " INTERCEPTED *** caller_pc=0x");
     write_hex64(2, (unsigned long long)(unsigned long)pc);
     write_str(2, "\n");
+    /* 6-Z305t-72: bounded identity diagnostic — one line per process
+     * death (this function is g_fatal_entered-guarded). The ladder-#142
+     * zygote wall was ART printing "…for thread 0" while dying:
+     * bionic's gettid() read a tid cache poisoned to 0 (the tracer's
+     * cross-ABI prctl/getpid rewrite collision zeroed the getpid that
+     * seeds main_thread.tid at libc init). This line names the RAW
+     * kernel tid/pid at death: a real tid here while ART's dump says
+     * "thread 0" would point at a still-poisoned cache; "0x0" here
+     * would mean the raw syscall layer itself is being rewritten
+     * (tracer-side). Costs one raw syscall pair per death. */
+    {
+        unsigned long long diag_tid = (unsigned long long)raw_syscall1(SYS_gettid, 0);
+        unsigned long long diag_pid = (unsigned long long)raw_syscall1(SYS_getpid, 0);
+        write_str(2, "[twrp_fb_hook] abort-diag: raw tid=0x");
+        write_hex64(2, diag_tid);
+        write_str(2, " raw pid=0x");
+        write_hex64(2, diag_pid);
+        write_str(2, "\n");
+    }
     fatal_dump_maps();
     /* 6-Z305t-19: the kmsg mirror — the only channel services have.
      * 6-Z305t-20: carries the RESOLVED die-mode state so the artifact
