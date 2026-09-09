@@ -897,6 +897,8 @@ pub const HIDL_SM_REGISTER_FOR_NOTIFICATIONS: u32 = 6;
 /// manager@1.1 `unregisterForNotifications` — code 9 (1.0's 8 methods
 /// precede it; the old map guessed 5 = `listByInterface`'s code).
 pub const HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS: u32 = 9;
+/// 1.0 `oneway registerPassthroughClient(string fqName, string name)`.
+pub const HIDL_SM_REGISTER_PASSTHROUGH_CLIENT: u32 = 8;
 /// manager@1.2 `addWithChain(string name, interface service,
 /// vec<string> chain)` — code 12, THE registration call the A11 GSI's
 /// HALs make (registerAsServiceInternal, ServiceManagement.cpp:884:
@@ -904,6 +906,8 @@ pub const HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS: u32 = 9;
 /// defaultServiceManager1_2). The chain carries the fqNames the 1.0 add()
 /// wire lacks, so the registry keys "fq/instance" like hwservicemanager.
 pub const HIDL_SM_ADD_WITH_CHAIN: u32 = 12;
+/// 1.2 `listManifestByInterface(string fqName) generates (vec<Instance>)`.
+pub const HIDL_SM_LIST_MANIFEST_BY_INTERFACE: u32 = 13;
 /// `android.hidl.manager@1.0::IServiceManager.Transport` — `enum Transport
 /// : uint8_t` (IServiceManager.hal android-11.0.0_r1:76-80) marshals as
 /// ONE byte (hwbinder::Parcel::writeUint8 = write(&val, 1), no padding).
@@ -1344,6 +1348,11 @@ impl<'a> ParcelReader<'a> {
 struct ParcelWriter {
     data: Vec<u8>,
     offsets: Vec<u8>,
+    /// 6-Z305t-69: BINDER_TYPE_PTR contents for SG-shaped replies (the
+    /// kernel copies these verbatim into the receiver's buffer and fixes
+    /// the object's `buffer` pointer — the loader replicates that from
+    /// the v3 resp trailer). Order = offsets-array object order.
+    sg: Vec<SgBuf>,
 }
 
 impl ParcelWriter {
@@ -1351,6 +1360,7 @@ impl ParcelWriter {
         ParcelWriter {
             data: Vec::new(),
             offsets: Vec::new(),
+            sg: Vec::new(),
         }
     }
 
@@ -1488,9 +1498,54 @@ impl ParcelWriter {
         self.data.len()
     }
 
+    /// The NEXT offsets-array index (for parent linkage of later objects).
+    fn next_object_index(&self) -> usize {
+        self.offsets.len() / 8
+    }
+
     /// Consume the writer, returning `(data, offsets)`.
     fn into_parts(self) -> (Vec<u8>, Vec<u8>) {
         (self.data, self.offsets)
+    }
+
+    /// 6-Z305t-69: data + offsets + the SG region (for SG-shaped replies).
+    fn into_parts_with_sg(self) -> (Vec<u8>, Vec<u8>, Vec<SgBuf>) {
+        (self.data, self.offsets, self.sg)
+    }
+
+    /// Write a `binder_buffer_object` (BINDER_TYPE_PTR) whose bytes ride
+    /// the SG region — the HIDL buffer model for reply values
+    /// (writeBuffer/writeEmbeddedBuffer emulation). Returns the object's
+    /// offsets-array index for parent linkage.
+    fn write_ptr_object(
+        &mut self,
+        content: Vec<u8>,
+        parent_idx: Option<usize>,
+        parent_offset: u64,
+    ) -> usize {
+        let idx = self.offsets.len() / 8;
+        let off = self.data.len() as u64;
+        let flags = if parent_idx.is_some() {
+            BINDER_BUFFER_FLAG_HAS_PARENT
+        } else {
+            0
+        };
+        // The buffer pointer the receiver sees is fixed up loader-side to
+        // point at the SG copy — the proxy writes 0 ("unresolved").
+        self.data.extend_from_slice(&BINDER_TYPE_PTR.to_ne_bytes());
+        self.data.extend_from_slice(&flags.to_ne_bytes());
+        self.data.extend_from_slice(&0u64.to_ne_bytes());
+        self.data
+            .extend_from_slice(&(content.len() as u64).to_ne_bytes());
+        self.data
+            .extend_from_slice(&(parent_idx.map(|p| p as u64).unwrap_or(0)).to_ne_bytes());
+        self.data.extend_from_slice(&parent_offset.to_ne_bytes());
+        self.offsets.extend_from_slice(&off.to_ne_bytes());
+        self.sg.push(SgBuf {
+            client_ptr: 0,
+            data: content,
+        });
+        idx
     }
 }
 
@@ -3142,6 +3197,19 @@ fn handle_write_read(
                     None
                 };
                 let result = handle_transaction(cmd_payload, vm_id, bus, conn_id, req_blob);
+                // Kernel semantics (6-Z305t-69): a ONEWAY transaction is
+                // acked with BR_TRANSACTION_COMPLETE only — NEVER a reply.
+                // A Reply result for a oneway SM/virtual-service call
+                // previously leaked a stale BR_REPLY into the client's
+                // read stream, desynchronizing its next transact.
+                let result = if u32::from_ne_bytes(cmd_payload[20..24].try_into().unwrap())
+                    & TF_ONE_WAY
+                    != 0
+                {
+                    TransactionResult::CompleteOnly
+                } else {
+                    result
+                };
                 match result {
                     TransactionResult::Failed => {
                         push_br_failed_reply(&mut read_buf);
@@ -3153,17 +3221,13 @@ fn handle_write_read(
                         // reply/failure surfaces on a later read.
                         push_br_transaction_complete(&mut read_buf);
                     }
-                    TransactionResult::Reply { data, offsets } => {
+                    TransactionResult::Reply { data, offsets, sg } => {
                         // Kernel-true batch (6-Z114 §4.5): the client's
                         // `waitForResponse` consumes BR_TRANSACTION_COMPLETE
                         // then loops to read BR_REPLY.
                         push_br_transaction_complete(&mut read_buf);
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
-                        resp_blobs.push(RequestBlob {
-                            data,
-                            offsets,
-                            sg: Vec::new(),
-                        });
+                        resp_blobs.push(RequestBlob { data, offsets, sg });
                     }
                 }
             }
@@ -3537,7 +3601,14 @@ enum TransactionResult {
     /// v1 real-libbinder requests — the hook backs tr.data_ptr with them).
     /// Used only by the IN-IOCTL handlers (servicemanager, virtual
     /// services, PING) — routed guest-owned transactions are deferred.
-    Reply { data: Vec<u8>, offsets: Vec<u8> },
+    /// `sg` carries BINDER_TYPE_PTR contents for SG-shaped replies
+    /// (6-Z305t-69: listManifestByInterface's hidl_vec<hidl_string-ish>
+    /// result — the loader reassembles + fixes the pointers up).
+    Reply {
+        data: Vec<u8>,
+        offsets: Vec<u8>,
+        sg: Vec<SgBuf>,
+    },
     /// Transaction accepted with no in-ioctl reply: one-way, or a routed
     /// sync call whose `BC_REPLY` resolves on the requester's LATER read
     /// (kernel semantics — 6-Z271i deferred resolution).
@@ -3584,7 +3655,11 @@ fn handle_transaction(
         let mut w = ParcelWriter::new();
         w.write_status_ok();
         let (data, offsets) = w.into_parts();
-        return TransactionResult::Reply { data, offsets };
+        return TransactionResult::Reply {
+            data,
+            offsets,
+            sg: Vec::new(),
+        };
     }
 
     // 6-Z272f: `IBinder::INTERFACE_TRANSACTION` (0x5f4e5446, "_NTF") —
@@ -3606,7 +3681,11 @@ fn handle_transaction(
             let mut w = ParcelWriter::new();
             w.write_string16(SVC_MGR_IFACE_DESCRIPTOR);
             let (data, offsets) = w.into_parts();
-            return TransactionResult::Reply { data, offsets };
+            return TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            };
         }
         let virtual_kind = {
             let b = bus.lock().expect("binder bus poisoned");
@@ -3623,7 +3702,11 @@ fn handle_transaction(
                 "[KR64][binder][svc] INTERFACE_TRANSACTION → {} descriptor",
                 kind.descriptor()
             );
-            return TransactionResult::Reply { data, offsets };
+            return TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            };
         }
         // Guest-owned service: fall through to the routing below — the
         // owner's BBinder answers like any other transaction.
@@ -4125,7 +4208,11 @@ fn servicemanager_proxy(
     }
 
     let (data, offsets) = writer.into_parts();
-    TransactionResult::Reply { data, offsets }
+    TransactionResult::Reply {
+        data,
+        offsets,
+        sg: Vec::new(),
+    }
 }
 
 // HIDL `android.hidl.manager@1.0::IServiceManager` transactions (libhwbinder
@@ -4357,13 +4444,21 @@ impl<'a> HidlParcel<'a> {
         }
     }
 
-    /// `hidl_vec<hidl_string>`: [PTR vec struct][PTR array] +
-    /// count × ([PTR struct][PTR chars]).
+    /// `hidl_vec<hidl_string>` — the REAL A11 wire (6-Z305t-69, decoded
+    /// from ladder #125's bounded entry diag: code=12 sg=[16, 8, 16, 32,
+    /// 43, 29] offs=7):
+    /// `[PTR vec struct 16B {ptr, size}][PTR array child, parent_offset 0,
+    /// len = count×16]` then `count × [PTR chars_j, parent = THE ARRAY,
+    /// parent_offset = j*16]` — the element STRUCTS live INSIDE the array
+    /// SG buffer (there are NO per-element struct objects), and each
+    /// element's chars buffer is a child of the ARRAY at j*sizeof
+    /// (hidl_string) + kOffsetOfBuffer(0).
     fn read_vec_string_arg(&mut self) -> Option<Vec<String>> {
         let vs = match self.next_object()? {
             HidlObj::Ptr {
                 content: Some(c),
                 has_parent: false,
+                parent: 0,
                 ..
             } if c.len() >= 16 => c,
             _ => return None,
@@ -4372,8 +4467,9 @@ impl<'a> HidlParcel<'a> {
         if count > 128 {
             return None;
         }
+        // The ARRAY's parent is the VEC STRUCT (just consumed).
         let vec_idx = self.obj_idx - 1;
-        let arr_len = match self.next_object()? {
+        match self.next_object()? {
             HidlObj::Ptr {
                 content: Some(c),
                 has_parent: true,
@@ -4381,19 +4477,34 @@ impl<'a> HidlParcel<'a> {
                 parent_offset: 0,
                 ..
             } => {
-                if parent != vec_idx as u64 {
+                if parent != vec_idx as u64 || c.len() < count * 16 {
                     return None;
                 }
-                c.len()
             }
             _ => return None,
-        };
-        if arr_len < count * 16 {
-            return None;
         }
+        // Each element's chars buffer's parent is THE ARRAY.
+        let array_idx = self.obj_idx as u64 - 1;
         let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
-            out.push(self.read_string_arg()?);
+        for j in 0..count {
+            match self.next_object()? {
+                HidlObj::Ptr {
+                    content: Some(ch),
+                    has_parent: true,
+                    parent,
+                    parent_offset,
+                    ..
+                } => {
+                    if parent != array_idx || parent_offset != (j * 16) as u64 {
+                        return None;
+                    }
+                    if ch.is_empty() || ch[ch.len() - 1] != 0 {
+                        return None;
+                    }
+                    out.push(String::from_utf8_lossy(&ch[..ch.len() - 1]).into_owned());
+                }
+                _ => return None,
+            }
         }
         Some(out)
     }
@@ -4786,14 +4897,99 @@ fn servicemanager_hidl(
                 key, handle, conn_id, chain
             );
         }
+        // A11 `android.hidl.manager@1.0::IServiceManager
+        // .registerPassthroughClient(string fqName, string name)` (code 8)
+        // — a ONEWAY bookkeeping call passthrough-mode clients make; the
+        // real hwservicemanager records the caller and returns nothing.
+        // The 68b catch-all Failed made the sender's waitForResponse
+        // surface BR_FAILED_REPLY for a oneway transaction (kernel
+        // semantics: oneway NEVER gets a reply). Honest container shape:
+        // we ARE the servicemanager — record the key (bounded log).
+        HIDL_SM_REGISTER_PASSTHROUGH_CLIENT => {
+            let fq = match p.read_string_arg() {
+                Some(s) => s,
+                None => {
+                    hidl_sm_parse_fail_diag("registerPassthroughClient.fq", code, blob);
+                    return TransactionResult::Failed;
+                }
+            };
+            let inst = match p.read_string_arg() {
+                Some(s) => s,
+                None => {
+                    hidl_sm_parse_fail_diag("registerPassthroughClient.name", code, blob);
+                    return TransactionResult::Failed;
+                }
+            };
+            info!(
+                "[KR64][binder][svc] HIDL registerPassthroughClient({}/{} conn={}) — recorded",
+                fq, inst, conn_id
+            );
+            // oneway: the reply bytes are dropped at the BC arm (TC only).
+        }
+        // A11 `android.hidl.manager@1.2::IServiceManager
+        // .listManifestByInterface(string fqName) generates
+        // (vec<Instance> instances)` (code 13) — the caller (e.g.
+        // cameraserver enumerating camera providers) aborts on an
+        // unchecked failed Return when this fails ("Failed HIDL return
+        // status not checked", 53× in ladder #125), so the honest answer
+        // is the REAL shape: every bus-registered "fq/instance" whose fq
+        // matches, marshaled as vec<Instance{hidl_string fqName,
+        // hidl_string instance}> — [status ok][PTR vec struct {ptr,size}]
+        // [PTR array child 0][PTR chars per field, parent = THE ARRAY,
+        // parent_offset = j*32 (+0 fqName, +16 instance)]. The SG bytes
+        // ride the v3 resp trailer and the loader applies the receiver
+        // pointer fixup (the 6-Z305t-68 machinery).
+        HIDL_SM_LIST_MANIFEST_BY_INTERFACE => {
+            let fq = match p.read_string_arg() {
+                Some(s) => s,
+                None => {
+                    hidl_sm_parse_fail_diag("listManifestByInterface.fq", code, blob);
+                    return TransactionResult::Failed;
+                }
+            };
+            let pairs: Vec<(String, String)> = {
+                let b = bus.lock().expect("binder bus poisoned");
+                b.services
+                    .keys()
+                    .filter_map(|k| {
+                        let (f, i) = k.split_once('/')?;
+                        (f == fq).then(|| (f.to_string(), i.to_string()))
+                    })
+                    .take(128)
+                    .collect()
+            };
+            let count = pairs.len();
+            // hidl_vec<Instance> wire (Instance = 2 packed hidl_string
+            // structs = 32 bytes per element).
+            let mut vs = vec![0u8; 16];
+            vs[8..16].copy_from_slice(&(count as u64).to_ne_bytes());
+            let vec_idx = writer.next_object_index();
+            writer.write_ptr_object(vs, None, 0);
+            // The ARRAY's parent = the VEC struct object; the chars'
+            // parent = the ARRAY object (indices the client validates).
+            let arr_idx = writer.next_object_index();
+            writer.write_ptr_object(vec![0u8; count * 32], Some(vec_idx), 0);
+            for (j, (f, i)) in pairs.iter().enumerate() {
+                let mut fc = f.as_bytes().to_vec();
+                fc.push(0);
+                writer.write_ptr_object(fc, Some(arr_idx), (j * 32) as u64);
+                let mut ic = i.as_bytes().to_vec();
+                ic.push(0);
+                writer.write_ptr_object(ic, Some(arr_idx), (j * 32 + 16) as u64);
+            }
+            info!(
+                "[KR64][binder][svc] HIDL listManifestByInterface({}) → {} entries",
+                fq, count
+            );
+        }
         _ => {
             hidl_sm_parse_fail_diag("catch-all", code, blob);
             return TransactionResult::Failed;
         }
     }
 
-    let (data, offsets) = writer.into_parts();
-    TransactionResult::Reply { data, offsets }
+    let (data, offsets, sg) = writer.into_parts_with_sg();
+    TransactionResult::Reply { data, offsets, sg }
 }
 
 /// Legacy v1 path (no parcel blob): the loader could not inline the
@@ -4832,7 +5028,11 @@ fn servicemanager_legacy(code: u32) -> TransactionResult {
         _ => return TransactionResult::Failed,
     }
     let (data, offsets) = writer.into_parts();
-    TransactionResult::Reply { data, offsets }
+    TransactionResult::Reply {
+        data,
+        offsets,
+        sg: Vec::new(),
+    }
 }
 
 // ============================================================================
@@ -4893,7 +5093,11 @@ fn virtual_error_reply(exception: i32, service_code: i32) -> TransactionResult {
         }
     }
     let (data, offsets) = w.into_parts();
-    TransactionResult::Reply { data, offsets }
+    TransactionResult::Reply {
+        data,
+        offsets,
+        sg: Vec::new(),
+    }
 }
 
 /// Dispatch a transaction to an in-proxy virtual service.
@@ -4922,14 +5126,22 @@ fn virtual_service_transaction(
                 VirtualService::Health => 4,
             });
             let (data, offsets) = w.into_parts();
-            return TransactionResult::Reply { data, offsets };
+            return TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            };
         }
         0xFFFF_FFFE => {
             let mut w = ParcelWriter::new();
             w.write_status_ok();
             w.write_string16("ffffffff");
             let (data, offsets) = w.into_parts();
-            return TransactionResult::Reply { data, offsets };
+            return TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            };
         }
         _ => {}
     }
@@ -5033,7 +5245,11 @@ fn virtual_health_with_values(
         w.write_status_ok();
         w.write_i32(v);
         let (data, offsets) = w.into_parts();
-        TransactionResult::Reply { data, offsets }
+        TransactionResult::Reply {
+            data,
+            offsets,
+            sg: Vec::new(),
+        }
     };
 
     match code {
@@ -5097,7 +5313,11 @@ fn virtual_health_with_values(
             w.write_nullable_string16_none(); // batterySerialNumber
             w.write_i32(0); // batteryPartStatus = UNSUPPORTED
             let (data, offsets) = w.into_parts();
-            TransactionResult::Reply { data, offsets }
+            TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            }
         }
         _ => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
     }
@@ -5179,7 +5399,11 @@ fn virtual_health_info(vals: &crate::battery::GuestBatteryValues) -> Transaction
     w.write_i32(1); // chargingState = NORMAL
     w.write_i32(1); // chargingPolicy = DEFAULT
     let (data, offsets) = w.into_parts();
-    TransactionResult::Reply { data, offsets }
+    TransactionResult::Reply {
+        data,
+        offsets,
+        sg: Vec::new(),
+    }
 }
 
 /// Synthetic effect set for the virtual IVibrator (6-Z300): the NON-deprecated
@@ -5254,7 +5478,11 @@ fn virtual_vibrator(code: u32, reader: &mut ParcelReader) -> TransactionResult {
             w.write_status_ok();
             w.write_i32(0);
             let (data, offsets) = w.into_parts();
-            TransactionResult::Reply { data, offsets }
+            TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            }
         }
         2 => {
             // off() → cancel the host vibration.
@@ -5307,7 +5535,11 @@ fn virtual_vibrator(code: u32, reader: &mut ParcelReader) -> TransactionResult {
                 }
             }
             let (data, offsets) = w.into_parts();
-            TransactionResult::Reply { data, offsets }
+            TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            }
         }
         5 => {
             // getSupportedEffects → Effect[] (length-prefixed i32 array)
@@ -5320,7 +5552,11 @@ fn virtual_vibrator(code: u32, reader: &mut ParcelReader) -> TransactionResult {
                 w.write_i32(e);
             }
             let (data, offsets) = w.into_parts();
-            TransactionResult::Reply { data, offsets }
+            TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            }
         }
         6 | 7 => {
             // setAmplitude / setExternalControl → unsupported (caps = 0).
@@ -5382,7 +5618,11 @@ fn virtual_keymint(code: u32, _reader: &mut ParcelReader) -> TransactionResult {
                 w.write_i32(0); // timestampTokenRequired = false
             });
             let (data, offsets) = w.into_parts();
-            TransactionResult::Reply { data, offsets }
+            TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            }
         }
         2 => {
             // addRngEntropy(byte[] data) → accepted (a software
@@ -5446,7 +5686,11 @@ fn virtual_sharedsecret(code: u32, _reader: &mut ParcelReader) -> TransactionRes
                 }
             });
             let (data, offsets) = w.into_parts();
-            TransactionResult::Reply { data, offsets }
+            TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            }
         }
         2 => {
             // computeSharedSecret → 32 deterministic bytes (no seed
@@ -5463,7 +5707,11 @@ fn virtual_sharedsecret(code: u32, _reader: &mut ParcelReader) -> TransactionRes
                 w.data.push(0);
             }
             let (data, offsets) = w.into_parts();
-            TransactionResult::Reply { data, offsets }
+            TransactionResult::Reply {
+                data,
+                offsets,
+                sg: Vec::new(),
+            }
         }
         _ => virtual_error_reply(EX_UNSUPPORTED_OPERATION, 0),
     }
@@ -8005,7 +8253,7 @@ mod tests {
     #[test]
     fn z272h_service_specific_error_full_status_wire() {
         let result = virtual_error_reply(EX_SERVICE_SPECIFIC, KM_ERROR_HARDWARE_TYPE_UNAVAILABLE);
-        let TransactionResult::Reply { data, offsets } = result else {
+        let TransactionResult::Reply { data, offsets, .. } = result else {
             panic!("error reply must be a Reply");
         };
         assert!(offsets.is_empty());
@@ -8663,17 +8911,21 @@ mod tests {
             self.push_flat(f);
         }
 
-        /// hidl_vec<hidl_string>: [PTR vec struct][PTR array] +
-        /// per element [PTR struct][PTR chars].
+        /// hidl_vec<hidl_string> — the REAL A11 shape (6-Z305t-69): the
+        /// element structs live INSIDE the array SG; each element's chars
+        /// buffer is a child of THE ARRAY at j*16.
         fn vec_string_arg(&mut self, v: &[&str]) {
-            let mut vs = vec![0u8; 24];
+            let mut vs = vec![0u8; 16];
             vs[8..16].copy_from_slice(&(v.len() as u64).to_ne_bytes());
-            let idx = (self.offsets.len() / 8) as u64;
+            let vec_idx = (self.offsets.len() / 8) as u64;
             self.push_ptr(&vs, false, 0, 0);
             let arr = vec![0u8; v.len() * 16];
-            self.push_ptr(&arr, true, idx, 0);
-            for s in v {
-                self.string_arg(s);
+            let arr_idx = (self.offsets.len() / 8) as u64;
+            self.push_ptr(&arr, true, vec_idx, 0);
+            for (j, s) in v.iter().enumerate() {
+                let mut ch = s.as_bytes().to_vec();
+                ch.push(0);
+                self.push_ptr(&ch, true, arr_idx, (j * 16) as u64);
             }
         }
 
@@ -8706,7 +8958,7 @@ mod tests {
             b.string_arg("default");
         });
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
-            TransactionResult::Reply { data, offsets } => {
+            TransactionResult::Reply { data, offsets, .. } => {
                 assert!(offsets.is_empty(), "no binder objects in the reply");
                 // [status ok][u8 EMPTY][3 pad] — the u8 write pads the
                 // parcel position (libhwbinder writeInplace semantics).
@@ -8733,7 +8985,7 @@ mod tests {
             b.string_arg("default");
         });
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
-            TransactionResult::Reply { data, offsets } => {
+            TransactionResult::Reply { data, offsets, .. } => {
                 assert!(offsets.is_empty());
                 // [status ok][u8 HWBINDER][3 pad].
                 assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0]);
@@ -8762,7 +9014,7 @@ mod tests {
             ]);
         });
         match servicemanager_hidl(HIDL_SM_ADD_WITH_CHAIN, &req, &bus, PROXY_CONN_ID) {
-            TransactionResult::Reply { data, offsets } => {
+            TransactionResult::Reply { data, offsets, .. } => {
                 assert!(offsets.is_empty());
                 // [status ok][u8 true][3 pad] — HIDL bool is 1 byte,
                 // padded by write_u8 (writeInplace semantics).
@@ -8807,7 +9059,7 @@ mod tests {
             });
         });
         match servicemanager_hidl(HIDL_SM_ADD, &req, &bus, PROXY_CONN_ID) {
-            TransactionResult::Reply { data, offsets } => {
+            TransactionResult::Reply { data, offsets, .. } => {
                 assert!(offsets.is_empty());
                 // [status ok][i32 true] — the legacy i32 bool reply shape.
                 assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0]);
@@ -8815,6 +9067,75 @@ mod tests {
             _ => panic!("add must Reply, not Fail/CompleteOnly"),
         }
         assert!(bus.lock().expect("bus").services.contains_key("myinstance"));
+    }
+
+    /// listManifestByInterface (code 13) answers the REAL vec<Instance>
+    /// shape: [status ok][PTR vec struct {0,count}][PTR array child 0][PTR
+    /// chars per field, parent = the array, offset j*32 (+0/+16)] — and
+    /// the reply's SG section rides the v3 resp trailer so the loader can
+    /// apply the receiver pointer fixup.
+    #[test]
+    fn hidl_list_manifest_by_interface_builds_sg_reply() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        bus.lock().expect("bus").add_guest_service(
+            "android.hardware.camera.provider@2.6::ICameraProvider/legacy/0",
+            PROXY_CONN_ID,
+            0x11,
+            0x22,
+        );
+        let req = hidl_sm_request("android.hidl.manager@1.2::IServiceManager", &|b| {
+            b.string_arg("android.hardware.camera.provider@2.6::ICameraProvider");
+        });
+        let result = servicemanager_hidl(
+            HIDL_SM_LIST_MANIFEST_BY_INTERFACE,
+            &req,
+            &bus,
+            PROXY_CONN_ID,
+        );
+        let TransactionResult::Reply { data, offsets, sg } = result else {
+            panic!("listManifestByInterface must Reply");
+        };
+        // status(4) + vec-struct PTR(40) + array PTR(40) + 2 field chars
+        // PTR(80) = 164 (one Instance = fqName + instance).
+        assert_eq!(data.len(), 164);
+        // offsets: 4 objects, u64 each.
+        assert_eq!(offsets.len(), 32);
+        // SG: [vec struct 16, array 32 (1 instance × 32), fq chars, inst chars].
+        let lens: Vec<usize> = sg.iter().map(|b| b.data.len()).collect();
+        assert_eq!(lens, vec![16, 32, 54, 9]); // 53+1 fq, 8+1 instance
+                                               // vec struct: {ptr=0, size=1}.
+        assert_eq!(u64::from_ne_bytes(sg[0].data[8..16].try_into().unwrap()), 1);
+        // The vec-struct PTR object carries NO parent; the array PTR has
+        // parent = the vec object's index, offset 0; the chars objects'
+        // parent = the ARRAY's index.
+        let obj_at = |i: usize| -> (u32, u32, u64, u64, u64, u64) {
+            let off = u64::from_ne_bytes(offsets[i * 8..(i + 1) * 8].try_into().unwrap()) as usize;
+            (
+                u32::from_ne_bytes(data[off..off + 4].try_into().unwrap()),
+                u32::from_ne_bytes(data[off + 4..off + 8].try_into().unwrap()),
+                u64::from_ne_bytes(data[off + 8..off + 16].try_into().unwrap()),
+                u64::from_ne_bytes(data[off + 16..off + 24].try_into().unwrap()),
+                u64::from_ne_bytes(data[off + 24..off + 32].try_into().unwrap()),
+                u64::from_ne_bytes(data[off + 32..off + 40].try_into().unwrap()),
+            )
+        };
+        let (t0, f0, _p0, l0, _par0, _po0) = obj_at(0);
+        assert_eq!(t0, BINDER_TYPE_PTR);
+        assert_eq!(f0, 0); // no parent
+        assert_eq!(l0, 16);
+        let (t1, f1, _p1, l1, par1, po1) = obj_at(1);
+        assert_eq!(t1, BINDER_TYPE_PTR);
+        assert_eq!(f1, BINDER_BUFFER_FLAG_HAS_PARENT);
+        assert_eq!(l1, 32);
+        assert_eq!(par1, 0); // parent = vec object (index 0)
+        assert_eq!(po1, 0);
+        let (_t2, f2, _p2, _l2, par2, po2) = obj_at(2);
+        assert_eq!(f2, BINDER_BUFFER_FLAG_HAS_PARENT);
+        assert_eq!(par2, 1); // parent = the ARRAY (index 1)
+        assert_eq!(po2, 0); // fqName at element offset 0
+        let (_t3, _f3, _p3, _l3, par3, po3) = obj_at(3);
+        assert_eq!(par3, 1);
+        assert_eq!(po3, 16); // instance at element offset 16
     }
 
     /// HONESTY under the v2 wire (no SG section): the string bytes are
