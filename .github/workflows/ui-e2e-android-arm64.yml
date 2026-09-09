@@ -303,6 +303,23 @@ jobs:
           set -e
           ADB="adb -s localhost:5555"
           $ADB shell settings put global immersive_mode_confirmations confirmed || true
+          # ── 6-Z305t-71: neutralize the HOST's phantom process killer ──
+          # Ladder #133 decode: from +134s the redroid HOST's ActivityManager
+          # "Trimming phantom processes" SIGKILLed the GUEST fleet (init,
+          # logd, lmkd, servicemanager, hwservicemanager, keymaster, … are
+          # all "phantom" children of io.twoyi.debug to the HOST's AMS),
+          # capping the rung at 3 post-mortem. The guest fleet only got
+          # ALIVE enough to cross the 32-phantom watermark THIS run (the
+          # -71 fixes: honest trap deaths → init restart waves churn more
+          # live children; in #131 the fleet was deader and never trimmed).
+          # This is HOST TESTBENCH policy, not guest/ROM logic — the same
+          # class as the immersive_mode line above. Verify, don't trust:
+          # the get must print 2147483647.
+          $ADB shell settings put global settings_enable_monitor_phantom_procs false || true
+          $ADB shell device_config set_sync_disabled_for_tests persistent || true
+          $ADB shell device_config put activity_manager max_phantom_processes 2147483647 || true
+          echo "  phantom-killer: max_phantom_processes=$($ADB shell device_config get activity_manager max_phantom_processes 2>/dev/null | tr -d '\r')"
+          $ADB shell settings put global settings_enable_monitor_phantom_procs false || true
           APK=$(ls app/build/outputs/apk/debuggable/*.apk | head -1)
           $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
           echo "  ✓ APK installed"
