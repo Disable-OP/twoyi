@@ -27395,3 +27395,10 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 - 75c (this): belt+watchdog now probe/repair fds 0/1/2.
 - 75d (this): the DECISIVE instrument — the tracer logs every guest close(0/1/2) (budget 48/run) with caller pc → module attribution (maps walk). Whatever closes a stdio descriptor gets NAMED (libc fclose? libandroid_runtime? emugl? the shlib itself?).
 - #149 dispatched on 75d. Expectation: "6-Z305t-75d: pid=N close(fd=X) pc=… maps[pc]=…" names the closer → the follow-up fix targets it directly.
+
+## 6-Z305t-75e — closer-tracer v2: per-pid budget (8/pid, cap 600) + close_range(436) traced; #150 dispatched
+
+- #149 (75d v1) delivered the mechanism but the GLOBAL 48-event budget filled with EARLY services before the zygote started. Run-1 evidence (still valuable): **linker64 closes fd 0/1/2 at exec** (its own open/close pairing when stdio was closed at spawn — pc=linker64+0x31000, three sequential closes) and a **libc close(2,1,0) reverse-order pattern** on some services. Both consistent with "stdio closed at spawn; whoever opens gets fd 0/1/2 and closes them after use".
+- v2: per-pid 8-event budget (global cap 600) so the zygote's own closes get captured, + close_range(436) tracing (a close_range(0,2) bypasses a close()-only net; 436 on asm-generic/x86_64/arm32 alike).
+- Local clippy (redundant guard on the literal arm) fixed post-push (5859178); #150 (934f16b) carries the full v2 code (CI has no clippy gate; the guard was style-only).
+- #150 dispatched. The zygote's own close(0/1/2)/close_range events will name the pre-endPreload closer with module+offset.

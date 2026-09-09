@@ -20622,6 +20622,40 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
+                        // 6-Z305t-75f: dup3(aarch64=33)/dup2(x86_64=33) —
+                        // newfd in arg2. A dup ONTO fd 0/1/2 CLOSES the
+                        // previous standard descriptor without any close()
+                        // syscall — the one blind spot left in the fd-0
+                        // lifecycle net (the zygote's fd 0 vanished
+                        // between watchdog repairs with ZERO traced
+                        // close(0) events — a rebinding dup is the only
+                        // remaining mechanism).
+                        33 if abi.close_nr == 57 => {
+                            let newfd = get_syscall_arg(&regs, abi.reg_arg2);
+                            if newfd <= 2 {
+                                static DUP_DIAG: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if DUP_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24
+                                {
+                                    #[cfg(target_arch = "aarch64")]
+                                    let pc_val =
+                                        unsafe { *(&regs as *const Regs as *const u64).add(32) };
+                                    #[cfg(target_arch = "x86_64")]
+                                    let pc_val =
+                                        unsafe { *(&regs as *const Regs as *const u64).add(16) };
+                                    #[cfg(not(any(
+                                        target_arch = "aarch64",
+                                        target_arch = "x86_64"
+                                    )))]
+                                    let pc_val: u64 = 0;
+                                    let region = maps_region_for_pc(pid, pc_val);
+                                    log(&format!(
+                                        "6-Z305t-75d: pid={} dup(newfd={}) pc={:#x} maps[pc]={}",
+                                        pid, newfd, pc_val, region
+                                    ));
+                                }
+                            }
+                        }
                         n if n == abi.getpid => {
                             pending_getpid.insert(pid);
                             if loop_count <= 20 {
