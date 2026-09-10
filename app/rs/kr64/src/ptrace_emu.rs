@@ -13465,6 +13465,12 @@ pub fn run_ptrace_loop(
     // re-dump the same file).
     let mut z306t_exit_dumped: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // 6-Z306y: per-pid syscall trail (last 32 numbers) for direct zygote
+    // fork children — the global recent_all_syscalls ring interleaves
+    // every traced pid, so a child's exit trail needs its own buffer.
+    // Only fork-children pids record (2-3 per boot; negligible overhead).
+    let mut z306y_trail: std::collections::HashMap<libc::pid_t, std::collections::VecDeque<i64>> =
+        std::collections::HashMap::new();
     // 6-Z306g: tid -> tgid cache for the thread-aware lineage check.
     let mut z306_lineage_tgid_cache: std::collections::HashMap<libc::pid_t, libc::pid_t> =
         std::collections::HashMap::new();
@@ -20809,8 +20815,40 @@ pub fn run_ptrace_loop(
                                         std::sync::atomic::AtomicU64::new(0);
                                     if SS_EXIT_DUMPED
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                        < 2
+                                        < 4
                                     {
+                                        // 6-Z306y: the child's OWN last-32
+                                        // syscall trail — the #191 decode
+                                        // showed a silent graceful teardown
+                                        // ~86ms after the installd.dexopt
+                                        // binder call; the trail names the
+                                        // exact syscall sequence between the
+                                        // call and the exit (binder ioctl
+                                        // replies, munmaps, futexes...).
+                                        if let Some(trail) = z306y_trail.get(&pid) {
+                                            let names: Vec<String> = trail
+                                                .iter()
+                                                .map(|&n| syscall_name(n, &abi).trim().to_string())
+                                                .collect();
+                                            log(&format!(
+                                                "6-Z306y: fork-child pid={} last {} syscalls (oldest->newest): {}",
+                                                pid,
+                                                trail.len(),
+                                                names.join(", ")
+                                            ));
+                                        }
+                                        // 6-Z306y: the child's REMAINING open
+                                        // fds at exit — a closed binder fd vs
+                                        // a held dexopt fd distinguishes a
+                                        // clean Java return from an abort.
+                                        let audit = z306_audit_fds(pid, rootfs, rootfs);
+                                        if !audit.is_empty() {
+                                            log(&format!(
+                                                "6-Z306y: fork-child pid={} remaining non-whitelisted fds: {}",
+                                                pid,
+                                                audit.join(" | ")
+                                            ));
+                                        }
                                         let svc_path =
                                             format!("{}/dev/twoyi-svclogs/svc-{}.log", rootfs, pid);
                                         match std::fs::metadata(&svc_path) {
@@ -20864,6 +20902,18 @@ pub fn run_ptrace_loop(
                     {
                         let lineage_306x = z306_zygote_lineage.contains(&pid);
                         if lineage_306x {
+                            // 6-Z306y: record the per-pid trail for direct
+                            // fork children (before any other probe so the
+                            // exit-time dump includes the exit_group itself).
+                            if z306_zygote_fork_children.contains(&pid) {
+                                let trail = z306y_trail.entry(pid).or_insert_with(|| {
+                                    std::collections::VecDeque::with_capacity(32)
+                                });
+                                if trail.len() >= 32 {
+                                    trail.pop_front();
+                                }
+                                trail.push_back(syscall_num);
+                            }
                             if syscall_num == abi.prctl
                                 && get_syscall_arg(&regs, abi.reg_arg1) == 15
                             {
