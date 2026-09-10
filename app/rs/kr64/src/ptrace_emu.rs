@@ -17038,8 +17038,11 @@ pub fn run_ptrace_loop(
                     // itself is exempt — the zygote's preload NEEDS those
                     // files). Opens are rare relative to all syscalls, so
                     // the per-open string read is negligible.
-                    if z306_zygote_lineage.contains(&pid)
-                        && z305y_stdio_pin_pid != Some(pid)
+                    if z306_in_zygote_lineage(
+                        pid,
+                        &z306_zygote_lineage,
+                        &mut z306_lineage_tgid_cache,
+                    ) && z305y_stdio_pin_pid != Some(pid)
                         && ((abi.openat != -1 && syscall_num == abi.openat)
                             || (abi.open != -1 && syscall_num == abi.open))
                     {
