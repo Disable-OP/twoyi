@@ -27499,3 +27499,21 @@ Stage Summary:
 - The rung-6 wall is now a precise, single-mechanism problem: leaked preload fds (fonts + hyphen-data) at forkSystemServer + the fatal-path futex wedge that hides the abort. 6-Z306 removes the leak at the only ground truth the whitelist reads (the kernel fd table).
 - #160 in flight. Success signal: "6-Z306: fork gate clean" + NO "Not whitelisted" anywhere + system_server in the guest ps subtree -> rung 6 (SYSTEM_SERVER) lands; then rung 8 (SystemUI/launcher) is next.
 - Risks: (1) additional leak families beyond fonts/hyphen-data would be named by the whitelist + the gate's leaks={:?} log — widening the family list is a one-line change; (2) if the zygote's OTHER threads wedge the fatal path again for a different abort, the freeze signature (futex + write(fd=2) + no INTERCEPTED) will identify it; (3) the fd-0 churn root cause (pre-pin closes at exec) remains open but is invisible to the whitelist once the gate closes fd 0's leak target.
+
+---
+Task ID: 8
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladder #160 (first 6-Z306 run), fix the newly exposed child-side leak window + the binder conn cap, dispatch #161.
+
+Work Log:
+- Ladder #160 (e79c5d0) = rung 7 again, but DECODE WINS: the 6-Z306 parent gate fired ("fork gate clean — pid=2919 clone(flags=0x1200011) leaks=0") and "Not whitelisted" never appeared in the merged logs — yet the forked system_server child (3139) STILL aborted "Not whitelisted (28): hyph-as.hyb" (in svc-2919.log; the child inherited the zygote's stderr) and froze the same fatal-log futex way.
+- Kernel-truth timeline: parent table CLEAN at the gate scan (+15.127s) AND at +158s (STALL-FD: 23 fds, no fd 28; fd 0 = hyph only POST-fork — the pin's first close(0) rewrite = +15.462s, the churn is post-fork). The child made ~30 syscalls before the fatal (its first-24 ENTRY lines: 2 openat→write→close→write cycles + writes; no hyph opens via tracked hooks).
+- Conclusion: a transient preload-fd re-open in the ~3ms window between the gate's ENTRY scan and the kernel's fd-table copy (zygote post-preload cleanup threads are live and un-stopped there) landed in the CHILD's inherited table. The whitelist reads /proc/self/fd = REAL host procfs (no fd-dir synthesis — proc_emu only writes static /proc files; /proc/self/fd %d is listed under "NOT here yet").
+- Fixed 6-Z306c (930bf70): arm a child-side gate at PTRACE_EVENT_FORK/VFORK for children of the pinned zygote; at the child's first syscall ENTRYs re-scan its OWN kernel fd table and inject closes (shared hijack machinery) until one scan comes back clean; hard-disarm at 256 scanned ENTRYs. Serves app-fork children too (their fork runs the same ParseFd whitelist).
+- ALSO root-caused + fixed 6-Z306b (585a85f): [KR64][binder][vm0] connection over cap (64) dropped at +31s — the guest opens one binder fd PER PROCESS PER CONTEXT (binder+hwbinder+vndbinder); mediaserver/mediaextractor/audioserver crash-looped on open_driver EPIPE; system_server would have died the same way at rung 6+. MAX_PROXY_CONNECTIONS 64 → 512 (accept-side counter + drop path remain).
+- Gates: fmt + clippy -D warnings clean; 823/823. Pushed 585a85f + 930bf70; dispatched #161 (id 34432251606) on 930bf70 with boot_wait_seconds=360.
+
+Stage Summary:
+- The whitelist wall now has BOTH layers covered: parent gate (fork-time leak) + child gate (fork-instantaneous transient) + the binder cap raised (the next wall for a surviving system_server).
+- #161 in flight. Success signals: "6-Z306c: child gate clean" + system_server ALIVE in the guest ps subtree + rung 6 SYSTEM_SERVER in result.json; watch for the media family no longer crash-looping on binder.
+- Risks: if the child's leak re-opens after the child-gate disarms (a raw open post-fork pre-check not seen by hooks), the artifact's 6-Z306c lines will show clean-then-reject timing and the gate window must widen; the abort-path futex wedge remains the fallback signature for ANY future fatal.
