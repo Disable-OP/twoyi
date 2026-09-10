@@ -12872,6 +12872,15 @@ pub fn run_ptrace_loop(
         crate::vfs::SandboxPolicy::with_staging(rootfs, data_dir).with_system_mode(!boot_recovery);
     let mut pending_sandbox_deny: std::collections::HashMap<libc::pid_t, i64> =
         std::collections::HashMap::new();
+    // 6-Z306p: pids whose current syscall is prctl(PR_CAPBSET_DROP).
+    // Ladder #180: the forked system_server died at Zygote.cpp:665 —
+    // 'prctl(PR_CAPBSET_DROP, 0) failed: Operation not permitted' — the
+    // container's fake root lacks CAP_SETPCAP, so the stock A11 zygote's
+    // bounding-set drop loop EPERMs and JNI-FatalErrors the child. The
+    // EXIT-side RETURN rewrite is a proven primitive; ENTRY stashes the
+    // pid, EXIT forces the (negative) return to 0.
+    let mut pending_capbset_fix: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     let mut sandbox_deny_count: u64 = 0;
     // Task 6-Z54: per-child in_syscall tracking. The global `in_syscall` flag
     // causes DESYNC when switching between init and the recovery child. This
@@ -20279,6 +20288,24 @@ pub fn run_ptrace_loop(
                         // logs ONE SPIN-DETECTED line with the last rip.
                         // 6-Z305t-72: ABI-exact (see ChildAbi.prctl).
                         if syscall_num == abi.prctl {
+                            // ── 6-Z306p: PR_CAPBSET_DROP stash ──
+                            // The forked system_server's SpecializeCommon
+                            // drops every bounding capability; in the
+                            // unprivileged container each drop EPERMs and
+                            // the stock code FatalErrors the child
+                            // (#180: 'Zygote.cpp:665: prctl(
+                            // PR_CAPBSET_DROP, 0) failed: Operation not
+                            // permitted'). Stash the pid; the EXIT arm
+                            // below forces a negative return to 0 — the
+                            // bounding set is the container's either way,
+                            // and dropping from it is pure hardening.
+                            {
+                                const PR_CAPBSET_DROP: u64 = 24;
+                                let opt306p = get_syscall_arg(&regs, abi.reg_arg1);
+                                if opt306p == PR_CAPBSET_DROP {
+                                    pending_capbset_fix.insert(pid);
+                                }
+                            }
                             // ── 6-Z306o: abort-message content dump ──
                             // Ladder #173: 44 aborts (+130-156s) whose
                             // messages were NOT captured by the DIAG
@@ -24738,6 +24765,37 @@ pub fn run_ptrace_loop(
                 } else {
                     // ── Syscall EXIT ──
                     in_syscall = false;
+
+                    // ── 6-Z306p: consume a pending PR_CAPBSET_DROP ──
+                    //
+                    // The kernel just executed the real prctl; in the
+                    // unprivileged container the bounding-set drop EPERMs
+                    // (EPERM) and the stock Zygote.cpp:665 FatalErrors the
+                    // forked system_server. Force the return to 0 when it
+                    // was negative — the bounding set is the container's
+                    // either way, and the drop is pure hardening that the
+                    // guest has no way to verify. (Bounded log: this fires
+                    // ~38 times per specialize.)
+                    if pending_capbset_fix.remove(&pid) {
+                        let mut regs306p: Regs = unsafe { std::mem::zeroed() };
+                        if ptrace_getregs_wide(pid, &mut regs306p).is_ok() {
+                            let ret306p = get_syscall_arg(&regs306p, abi.reg_ret) as i64;
+                            if ret306p < 0 {
+                                static CAPBSET_FIX_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let cn = CAPBSET_FIX_LOGGED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if cn < 8 {
+                                    log(&format!(
+                                        "6-Z306p: prctl(PR_CAPBSET_DROP) EPERM {} → faked 0 for pid={} (container lacks CAP_SETPCAP)",
+                                        ret306p, pid
+                                    ));
+                                }
+                                set_syscall_ret(&mut regs306p, &abi, 0);
+                                let _ = ptrace_setregs(pid, &regs306p, std::mem::size_of::<Regs>());
+                            }
+                        }
+                    }
 
                     // ── Security fix 6-Z185: consume a pending sandbox DENY ──
                     //
