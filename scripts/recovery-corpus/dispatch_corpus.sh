@@ -4,7 +4,14 @@
 # workflow_dispatch runs. Recovery images in different concurrency groups
 # run in parallel automatically (the workflow groups by recovery_name).
 #
-# Usage: dispatch_corpus.sh <pr|nightly|all|NAME> [boot_wait_seconds]
+# Usage: dispatch_corpus.sh <pr|nightly|all|NAME> [boot_wait_seconds] [max_dispatch]
+#
+# max_dispatch (6-Z306k): hard cap on the number of dispatched runs per
+# invocation, 0 = unlimited. Default 0 (explicit callers decide). The
+# NIGHTLY schedule passes a cap — on 2026-09-10 the nightly tier had
+# grown to 617 entries and the resulting 2-minute dispatch burst queued
+# ~617 E2E runs that hogged the shared ubuntu-24.04-arm runner pool for
+# days and starved the Android Boot Ladder (#171 sat behind the flood).
 #
 # Requires: ~/.git-credentials with https://Disable-OP:<TOKEN>@github.com
 #           python3 with PyYAML (falls back to a naive parser if missing)
@@ -13,6 +20,7 @@ REPO="Disable-OP/twoyi"
 WF="ui-e2e-test-arm64.yml"
 SELECT="${1:?usage: dispatch_corpus.sh <pr|nightly|all|NAME> [boot_wait]}"
 BOOT_WAIT="${2:-60}"
+MAX_DISPATCH="${3:-0}"
 
 TOKEN=$(sed -n 's|https://Disable-OP:\([^@]*\)@github.com|\1|p' ~/.git-credentials)
 # 6-Z225: GITHUB_TOKEN fallback (same as dispatch_by_name.sh) — the dev
@@ -107,6 +115,17 @@ EOF
 
 COUNT=$(echo "$ENTRIES" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
 echo "dispatching $COUNT corpus run(s) for tier/selector '$SELECT'"
+
+# 6-Z306k: truncate to the cap AFTER the count is reported so the log
+# shows the honest tier size AND the applied cap.
+if [ "$MAX_DISPATCH" -gt 0 ] && [ "$COUNT" -gt "$MAX_DISPATCH" ]; then
+  echo "6-Z306k cap: dispatching only the first $MAX_DISPATCH of $COUNT entr(ies)"
+  ENTRIES=$(echo "$ENTRIES" | python3 -c "
+import json, sys
+entries = json.load(sys.stdin)[:int(sys.argv[1])]
+print(json.dumps(entries))" "$MAX_DISPATCH")
+  COUNT=$MAX_DISPATCH
+fi
 
 echo "$ENTRIES" | python3 -c "
 import json, sys, subprocess, os
