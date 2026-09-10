@@ -13283,6 +13283,12 @@ pub fn run_ptrace_loop(
     let mut z306_budget: std::collections::HashMap<libc::pid_t, u32> =
         std::collections::HashMap::new();
     let z306_budget_cap: u32 = 64;
+    // 6-Z306c: children of the pinned zygote still being swept — value =
+    // how many scanned ENTRYs so far (hard-disarm at 256). Disarmed
+    // early once a scan comes back clean.
+    let mut z306_childgate: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    let z306_childgate_scan_cap: u32 = 256;
     // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
     // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
     // 0) — the EXIT arm turns the returned REAL fd into a tracked
@@ -15711,6 +15717,37 @@ pub fn run_ptrace_loop(
                                 "PTRACE_EVENT_{}: parent {} forked — new child PID {} (auto-attached by kernel; will receive its stops via waitpid(-1))",
                                 event_name, pid, new_child_id
                             ));
+                            // ── 6-Z306c: arm the CHILD-SIDE fork gate ──
+                            //
+                            // Ladder #160 decode: the PARENT-side gate at
+                            // the clone ENTRY scanned CLEAN (leaks=0) and
+                            // the fork proceeded, yet the forked
+                            // system_server child STILL aborted
+                            // "Not whitelisted (28): hyph-as.hyb" ~330ms
+                            // later — a transient preload-fd re-open in
+                            // the ~3ms window between the gate's scan and
+                            // the kernel's fd-table copy (the zygote's
+                            // post-preload cleanup threads are live and
+                            // un-stopped in that window) landed in the
+                            // CHILD's inherited table. The kernel-table
+                            // scans at +158s show the PARENT clean again —
+                            // the leak was fork-instantaneous. Fix: for
+                            // every child of the pinned zygote, re-scan
+                            // the child's OWN kernel fd table at its
+                            // first syscall ENTRYs and inject closes
+                            // (same hijack machinery as the parent gate)
+                            // until one scan comes back clean — so the
+                            // whitelist's readdir of /proc/self/fd sees
+                            // the repaired table no matter how the leak
+                            // arose (inherited transient, window churn,
+                            // or a pre-check child open).
+                            if !boot_recovery
+                                && z305y_stdio_pin_pid == Some(pid)
+                                && (ev == libc::PTRACE_EVENT_FORK as u32
+                                    || ev == libc::PTRACE_EVENT_VFORK as u32)
+                            {
+                                z306_childgate.insert(new_child_id as libc::pid_t, 0u32);
+                            }
                         } else {
                             log(&format!(
                                 "PTRACE_EVENT_{}: parent {} forked — PTRACE_GETEVENTMSG failed: {} (new child is still auto-attached; will receive its stops via waitpid(-1))",
@@ -16968,6 +17005,79 @@ pub fn run_ptrace_loop(
                 if is_entry {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
+
+                    // ── 6-Z306c: the CHILD-SIDE gate ──
+                    //
+                    // For every process-fork child of the pinned zygote
+                    // (armed at its PTRACE_EVENT_FORK), re-scan the
+                    // CHILD's own kernel fd table at its first syscall
+                    // ENTRYs and inject closes (shared hijack machinery
+                    // with the parent gate) until one scan comes back
+                    // clean. Covers the fork-instantaneous transient
+                    // leak #160 proved (parent clean at the ENTRY scan,
+                    // child inherited fd 28 = hyph 3ms later).
+                    if z306_childgate.contains_key(&pid) && !z306_forkgate.contains_key(&pid) {
+                        let scans = z306_childgate.get(&pid).copied().unwrap_or(0);
+                        if scans >= z306_childgate_scan_cap {
+                            z306_childgate.remove(&pid);
+                            log(&format!(
+                                "6-Z306c: child gate HARD-DISARMED for pid={} after {} scanned ENTRYs (never saw a clean table — the leak source outlives the sweep)",
+                                pid, scans
+                            ));
+                        } else {
+                            let leaked = z306_scan_leaked_preload_fds(pid);
+                            if leaked.is_empty() {
+                                z306_childgate.remove(&pid);
+                                log(&format!(
+                                    "6-Z306c: child gate clean — pid={} after {} scanned ENTRYs (fd table repaired before the forkSystemServer whitelist reads it)",
+                                    pid, scans + 1
+                                ));
+                            } else {
+                                z306_childgate.insert(pid, scans + 1);
+                                let done = z306_budget.entry(pid).or_insert(0);
+                                if *done >= z306_budget_cap {
+                                    static Z306C_CAP_LOGGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z306C_CAP_LOGGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        < 4
+                                    {
+                                        log(&format!(
+                                            "6-Z306c: budget cap {} reached for child pid={} — proceeding with leaks {:?}",
+                                            z306_budget_cap, pid, leaked
+                                        ));
+                                    }
+                                } else {
+                                    let fd0 = leaked[0];
+                                    *done += 1;
+                                    let closes_done = *done;
+                                    log(&format!(
+                                        "6-Z306c: child gate — pid={} (scan #{}) leaks={:?} — injecting close({})",
+                                        pid, scans + 1, leaked, fd0
+                                    ));
+                                    let gate = Z306ForkGate {
+                                        saved: regs,
+                                        fd: fd0,
+                                        closes_done,
+                                    };
+                                    let mut r = regs;
+                                    set_syscall_num(&mut r, &abi, abi.close_nr);
+                                    set_syscall_arg(&mut r, abi.reg_arg1, fd0 as u64);
+                                    match ptrace_setregs(pid, &r, iov_len) {
+                                        Ok(()) => {
+                                            z306_forkgate.insert(pid, gate);
+                                        }
+                                        Err(e) => {
+                                            log(&format!(
+                                                "6-Z306c: setregs FAILED pid={} ({}) — syscall proceeds with the leak",
+                                                pid, e
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // ── 6-Z306: the ZYGOTE FORK-GATE FD SWEEP (ENTRY side) ──
                     //
