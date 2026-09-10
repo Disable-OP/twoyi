@@ -13407,7 +13407,19 @@ pub fn run_ptrace_loop(
     // /dev/null -> svclog redirect: their /dev/null opens must stay REAL
     // /dev/null (whitelisted by the forkSystemServer fd check), and no
     // svc-log fd may ever enter a table the whitelist reads.
+    // 6-Z306s: direct process-fork children of the PINNED zygote — the
+    // first one IS system_server (a --start-system-server zygote forks it
+    // immediately at runSelectLoop). Identity that survives to exit_group:
+    // comm gets renamed ("Shutdown thread") and the staged-exe cmdline
+    // does not carry the flag through the host view.
+    let mut z306_zygote_fork_children: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     let mut z306_zygote_lineage: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    // 6-Z306t: pids whose nonzero-exit svclog tail was already dumped
+    // (1 dump/pid — threads sharing a tgid or re-entry paths must not
+    // re-dump the same file).
+    let mut z306t_exit_dumped: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     // 6-Z306g: tid -> tgid cache for the thread-aware lineage check.
     let mut z306_lineage_tgid_cache: std::collections::HashMap<libc::pid_t, libc::pid_t> =
@@ -15883,6 +15895,7 @@ pub fn run_ptrace_loop(
                                 {
                                     z306_zygote_lineage.insert(new_child_id as libc::pid_t);
                                     z306_childgate.insert(new_child_id as libc::pid_t, 0u32);
+                                    z306_zygote_fork_children.insert(new_child_id as libc::pid_t);
                                 }
                             }
                         } else {
@@ -20738,18 +20751,15 @@ pub fn run_ptrace_loop(
                             // Dump the svclog tail here (once per pid,
                             // 1.5 KiB, UTF-8-safe truncation).
                             if nr == abi.exit_group_nr {
-                                // #187 lesson: the main thread RENAMES itself
-                                // to "Shutdown thread" while running the Java
-                                // shutdown sequence, so comm != "system_server"
-                                // at the exit stop. The identity that survives
-                                // is the cmdline (--start-system-server is a
-                                // zygote-spawn flag only system_server has).
-                                let is_ss306s = {
-                                    let cl =
-                                        std::fs::read_to_string(format!("/proc/{}/cmdline", pid))
-                                            .unwrap_or_default();
-                                    cl.contains("start-system-server")
-                                };
+                                // #187/#188 lesson: comm is renamed
+                                // ("Shutdown thread") AND the host cmdline
+                                // (staged-exe path) does not carry
+                                // --start-system-server — the durable
+                                // identity is the fork bookkeeping: this pid
+                                // is a direct process-fork child of the
+                                // pinned zygote (the first such child IS
+                                // system_server; the dump cap is 2).
+                                let is_ss306s = z306_zygote_fork_children.contains(&pid);
                                 if is_ss306s {
                                     static SS_EXIT_DUMPED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
@@ -20784,6 +20794,74 @@ pub fn run_ptrace_loop(
                                                 ));
                                             }
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── 6-Z306t: GENERIC nonzero-exit svclog tail dump ──
+                    //
+                    // #188's lesson generalised: a service that exits with a
+                    // nonzero status by its OWN choice (no abort VMA, no
+                    // SIGABRT — so neither the 6-Z306o abort-VMA dump nor the
+                    // LOGFATAL writev capture names it) has its only dying
+                    // words on its stderr = the svclog file. installd's
+                    // "Could not open selinux status; exiting." (exit(1),
+                    // ~7.3s per generation, ZERO kmsg output) was invisible
+                    // in #188 because its svclog missed the artifact pack.
+                    // On every exit_group ENTRY with a nonzero code, dump
+                    // ≤1KiB of this pid's svclog tail straight into the
+                    // tracer log (bounded: 1 dump/pid, ≥2500ms between
+                    // dumps, 24/run — ~24KiB worst case, rate-limit keeps
+                    // the HAL crash-loop waves from eating the budget).
+                    if syscall_num == abi.exit_group_nr {
+                        let exit_code_306t = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                        if exit_code_306t != 0 && !z306t_exit_dumped.contains(&pid) {
+                            static Z306T_COUNT: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            static Z306T_LAST_MS: std::sync::atomic::AtomicI64 =
+                                std::sync::atomic::AtomicI64::new(0);
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            let last = Z306T_LAST_MS.load(std::sync::atomic::Ordering::Relaxed);
+                            if now_ms - last >= 2500
+                                && Z306T_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    < 24
+                            {
+                                Z306T_LAST_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                z306t_exit_dumped.insert(pid);
+                                let svc_path =
+                                    format!("{}/dev/twoyi-svclogs/svc-{}.log", rootfs, pid);
+                                match std::fs::metadata(&svc_path) {
+                                    Ok(m) if m.len() > 0 => {
+                                        let len = m.len() as usize;
+                                        let skip = len.saturating_sub(1024);
+                                        let tail = std::fs::read(&svc_path)
+                                            .map(|b| b[skip.min(b.len())..].to_vec())
+                                            .unwrap_or_default();
+                                        let text =
+                                            String::from_utf8_lossy(&tail).replace('\n', " | ");
+                                        let shown = text.get(..900).unwrap_or(&text);
+                                        log(&format!(
+                                            "6-Z306t: pid={} exit_group(code={}) svclog tail ({} of {} bytes): {}",
+                                            pid,
+                                            exit_code_306t,
+                                            tail.len(),
+                                            len,
+                                            shown
+                                        ));
+                                    }
+                                    _ => {
+                                        // No (or empty) svclog: record the exit
+                                        // code once so the class is at least
+                                        // visible in the log.
+                                        log(&format!(
+                                            "6-Z306t: pid={} exit_group(code={}) — no svclog content",
+                                            pid, exit_code_306t
+                                        ));
                                     }
                                 }
                             }
