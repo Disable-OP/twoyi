@@ -1070,10 +1070,19 @@ pub const BINDER_THREAD_POOL_SIZE: usize = 4;
 pub const PROXY_HANDLE_BASE: u32 = 0;
 
 /// Maximum concurrent guest connections (one thread each). The guest's
-/// `libbinder.so` opens one binder fd per process (`ProcessState`),
-/// and a booting GSI has dozens of processes; 64 is comfortably above
-/// that and bounded so a misbehaving guest can't thread-bomb the daemon.
-pub const MAX_PROXY_CONNECTIONS: usize = 64;
+/// `libbinder.so` opens one binder fd PER PROCESS PER CONTEXT —
+/// `/dev/binder` + `/dev/hwbinder` + `/dev/vndbinder` (up to 3 each), and
+/// a booting A11 GSI crosses 100 processes (system_server alone adds
+/// binder + vndbinder + its async binder threads). Ladder #159 hit the
+/// old 64-cap at +31s: `[KR64][binder][vm0] connection over cap (64)
+/// dropped` — every service starting after that (mediaserver,
+/// mediaextractor, audioserver …) lost its open_driver → EPIPE →
+/// "Binder driver '/dev/binder' could not be opened. Terminating." —
+/// and system_server would have died the same way at the next rung.
+/// 512 = ~3 contexts × ~150 processes with 2-3× headroom, still bounded
+/// so a misbehaving guest can't thread-bomb the daemon (the accept-side
+/// counter + drop path remain).
+pub const MAX_PROXY_CONNECTIONS: usize = 512;
 
 /// How long a pure-read `BINDER_WRITE_READ` blocks on its connection
 /// queue before yielding `BR_NOOP` (the S1b blocking-idle analogue of
