@@ -4180,6 +4180,45 @@ int setsockcreatecon_raw(const char *context) {
     return 0;
 }
 
+// 6-Z306r (#182 decode): selinux_android_setcontext — the ANDROID-specific
+// libselinux wrapper the zygote's SpecializeCommon calls for every forked
+// child (Zygote.cpp:1776). Unlike setexeccon (already faked above), this
+// wrapper reads seapp_contexts, computes the domain, and WRITES it to
+// /sys/fs/selinux/context — a write the emulated selinuxfs cannot honor,
+// so the forked system_server died with:
+//   'JNI FatalError called: (system_server) frameworks/base/core/jni/
+//    com_android_internal_os_Zygote.cpp:1776: selinux_android_setcontext
+//    (1000, 1, "(null)", "(null)") failed'
+// The emulated environment has no enforcing SELinux (6-Z143 fakes the
+// selinuxfs; getcon returns u:r:init:s0), so the context transition is a
+// no-op by definition here. Fake the full wrapper: bounded log, return 0.
+int selinux_android_setcontext(uid_t uid, int isSystemServer,
+                               const char *seinfo, const char *pkgname) {
+    static int logged;
+    if (logged < 4) {
+        logged++;
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] 6-Z306r selinux_android_setcontext(uid=%u, ss=%d, seinfo=%s, pkg=%s) → faked 0 (no enforcing SELinux in the emulated env)\n",
+            (unsigned)uid, isSystemServer,
+            seinfo ? seinfo : "(null)", pkgname ? pkgname : "(null)");
+        write_str(2, msg);
+    }
+    return 0;
+}
+
+int selinux_android_setcontext_raw(uid_t uid, int isSystemServer,
+                                   const char *seinfo, const char *pkgname) {
+    (void)uid; (void)isSystemServer; (void)seinfo; (void)pkgname;
+    return 0;
+}
+
+int selinux_android_setfilecon(const char *pkgpath, const char *seinfo,
+                               const char *pkgname) {
+    (void)pkgpath; (void)seinfo; (void)pkgname;
+    return 0;
+}
+
 int security_compute_create(const char *scon, const char *tcon,
                             security_class_t tclass, char **newcon) {
     (void)scon; (void)tclass;
