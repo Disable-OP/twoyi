@@ -2810,19 +2810,25 @@ int rt_tgsigqueueinfo(int tgid, int tid, int sig, void *uinfo) {
     return syscall(SYS_rt_tgsigqueueinfo, tgid, tid, sig, uinfo);
 }
 
-// Hook android_get_control_socket — return a fake fd.
+// Hook android_get_control_socket — return a WORKING listening socket.
 // lmkd and other services call this to get the socket fd that init
 // created for them via "socket" in the .rc file. The fd is normally
 // passed via ANDROID_SOCKET_<name> env var. If the env var is missing
-// (e.g., because our exec hooks stripped it), the function returns -1
-// and the service exits.
+// (init's socket creation failed — its fchmodat on the translated
+// socket path ENOENTs raw, ladder #181), the stock fallback returned
+// the constant fd 3: lmkd's listen() got ENOTSOCK, its epoll_ctl got
+// EINVAL (errno 22), init() returned false, and lmkd exited 0 — four
+// times → "critical process 'lmkd' exited 4 times before boot
+// completed" → InitFatalReboot → the rung-3 reboot collapse of #181.
 //
-// Fix: return a fake fd (3) so the service thinks it has the socket.
-// The service will then bind/listen on this fd. Since the fd is not
-// a real socket, bind/listen will fail, but the service may continue
-// running (or at least not exit immediately).
+// 6-Z306q FIX: when the env var is missing, create a REAL listening
+// AF_UNIX socket bound to an abstract name ("twoyi-fake-<name>") and
+// return it. listen() succeeds, epoll_ctl succeeds, so the service's
+// init() completes and it stays ALIVE parked in its poll loop (no
+// client will ever connect — that's fine: lmkd's job is to exist for
+// system_server's ActivityManagerService to talk to, and PSI/socket
+// kills arrive through OTHER fds). Bounded: one failure log per name.
 int android_get_control_socket(const char *name) {
-    (void)name;
     // Check if the env var exists first
     char env_name[128];
     snprintf(env_name, sizeof(env_name), "ANDROID_SOCKET_%s", name);
@@ -2832,10 +2838,35 @@ int android_get_control_socket(const char *name) {
         int fd = atoi(val);
         if (fd >= 0) return fd;
     }
-    // Env var missing — return a fake fd
+    // Env var missing — build a real listening abstract socket.
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd >= 0) {
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        // Abstract namespace (sun_path[0] = 0): no filesystem node, no
+        // path translation, no collision with the host /dev/socket.
+        snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1,
+                 "twoyi-fake-ctl-%s", name ? name : "anon");
+        socklen_t alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
+                                     1 + strlen(addr.sun_path + 1));
+        if (bind(fd, (struct sockaddr *)&addr, alen) == 0 &&
+            listen(fd, 1) == 0) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                "[twoyi_loader] 6-Z306q android_get_control_socket(%s) — env var missing, serving abstract listening fd %d\n",
+                name ? name : "anon", fd);
+            write_str(2, msg);
+            return fd;
+        }
+        close(fd);
+    }
+    // Socket creation failed too — last resort: fd 3 (the old behavior;
+    // listen/epoll will fail and the service exits as before).
     char msg[256];
     snprintf(msg, sizeof(msg),
-        "[twoyi_loader] android_get_control_socket(%s) — env var missing, returning fake fd 3\n", name);
+        "[twoyi_loader] android_get_control_socket(%s) — env var missing, abstract socket failed, returning fake fd 3\n",
+        name ? name : "anon");
     write_str(2, msg);
     return 3;  // fake fd
 }
