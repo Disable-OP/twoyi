@@ -5363,7 +5363,9 @@ fn flatten_apex_payloads(cfg: &Config) {
         // fleet-wide → boringssl reboot_on_failure rebooted the guest,
         // ladder 34104378680). The prefix mismatch vs a persisted v1
         // marker forces a one-time re-extraction with mode preservation.
-        let want = format!("v2:{}:{}", meta.len(), mtime);
+        // "v3:" (6-Z306n): re-extract + apply the CFI-slowpath neutering
+        // to the staged libdl.so — persisted v2 trees predate the patch.
+        let want = format!("v3:{}:{}", meta.len(), mtime);
         let dst = format!("{}/{}", apex_stage_root, apex_name);
         let marker = format!("{}/.twoyi_extracted", dst);
         if let Ok(c) = std::fs::read_to_string(&marker) {
@@ -5418,6 +5420,45 @@ fn flatten_one_apex(
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     let n = img.extract_tree("/", dst).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&tmp);
+
+    // 6-Z306n: neuter the CFI slowpath in the apex-staged libdl.so.
+    // This copy is the libdl instance VENDOR namespaces resolve to;
+    // its __cfi_shadow_base stays NULL (only the linker's own instance
+    // gets __cfi_init), so every failed CFI fast-path check crashed the
+    // process (ladder #171/#172 vendor-HAL SIGSEGV storm). Best-effort:
+    // a missing file or non-aarch64 payload logs nothing — the marker
+    // is still written so we don't re-extract every boot.
+    let staged_libdl = format!("{}/lib64/bionic/libdl.so", dst);
+    if Path::new(&staged_libdl).exists() {
+        match std::fs::read(&staged_libdl) {
+            Ok(mut so) => {
+                let patches = apex_extract::neuter_cfi_slowpath(&mut so);
+                if !patches.is_empty() {
+                    if let Err(e) = std::fs::write(&staged_libdl, &so) {
+                        warning!(
+                            "[KR64][apex] 6-Z306n: patch write failed for {}: {}",
+                            staged_libdl,
+                            e
+                        );
+                    } else {
+                        info!(
+                            "[KR64][apex] 6-Z306n: neutered {} CFI slowpath symbol(s) in {}",
+                            patches.len(),
+                            staged_libdl
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warning!(
+                    "[KR64][apex] 6-Z306n: read failed for {}: {} — CFI slowpath left intact",
+                    staged_libdl,
+                    e
+                );
+            }
+        }
+    }
+
     std::fs::write(marker, format!("{}\n", marker_val)).map_err(|e| e.to_string())?;
     Ok(n)
 }
@@ -6197,7 +6238,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // emulator (open /dev/loopN returns ENXIO for all N 0..31 per 5-U),
     // but kept as a defensive fallback for future environments where
     // loop devices DO work.
-    let real_libdl: Option<(String, Vec<u8>)> = if cfg.boot_recovery {
+    let mut real_libdl: Option<(String, Vec<u8>)> = if cfg.boot_recovery {
         info!("[KR64] TWRP boot: skipping APEX libdl.so extraction (init is statically linked, doesn't need libdl.so)");
         None
     } else {
@@ -6273,6 +6314,32 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
     };
+
+    // 6-Z306n: neuter the CFI slowpath in the bytes we serve as
+    // /dev/libdl.so. The linker initializes the CFI shadow on the libdl
+    // instance it resolves — but ANY OTHER load of a libdl.so (the
+    // apex-staged copies vendor namespaces resolve to) keeps
+    // __cfi_shadow_base NULL and crashes the process on the first
+    // failed CFI fast-path check (ladder #171/#172: 706 SIGSEGVs, all
+    // inside __cfi_slowpath at libdl+0x1128). A no-op slowpath treats
+    // CFI as not-enforced — the honest semantics for an emulated
+    // environment that cannot maintain the shadow contract across
+    // multiple libdl instances. Idempotent; see the 6-Z306n block in
+    // apex_extract.rs for the full decode.
+    if let Some((_, ref mut bytes)) = real_libdl {
+        let patches = apex_extract::neuter_cfi_slowpath(bytes);
+        if !patches.is_empty() {
+            info!(
+                "[KR64] 6-Z306n: neutered {} CFI slowpath symbol(s) in the /dev libdl.so bytes ({})",
+                patches.len(),
+                patches
+                    .iter()
+                    .map(|p| format!("{}@{:#x}{}", p.symbol, p.file_offset, if p.already_neutered { " (already)" } else { "" }))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
 
     // ---------------------------------------------------------------
     // 6-Z305t-2: flattened-APEX boot prep + linkerconfig perms.
