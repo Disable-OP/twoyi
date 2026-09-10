@@ -395,12 +395,16 @@ static inline int twoyi_sys_fstatat(int dirfd, const char *path,
 // write_str line ALREADY reaches the artifact via the fd-2 svclog leg
 // (and the tmp-log leg below), so the logd leg was redundant even
 // before it became the deadlock trigger.
-// 6-Z306j-b: belt-and-braces — a thread-local re-entry guard. If any
-// future code path re-enters write_str through the open hooks (the
-// tmp-log open itself goes through twoyi_sys_open), the re-entrant
-// call degrades to the raw fd write only. No recursion can self-
-// deadlock the logger again.
-static __thread int in_write_str;
+// 6-Z306j-b: belt-and-braces re-entry guard. Ladder #170 regression
+// decoded: the v2 guard used `static __thread` — a TLS variable — and
+// EVERY staged executable (qemu-props, the HALs) began SIGSEGVing in
+// libdl.so (bionic arm64's TLS dynamic-resolution home) at its first
+// write_str call: 39 → 391 pc-in-libdl crashes, boot fell to rung 4.
+// The twoyi staged-exec loader context cannot host an added preload TLS
+// module. TLS IS BANNED in this shlib. A plain static int is enough:
+// the recursion being guarded is same-thread, and cross-thread
+// interleavings only ever cost a log line's tmp-file leg.
+static volatile int in_write_str;
 
 static void write_str(int fd, const char *s) {
     if (!s) return;
