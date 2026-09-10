@@ -34,6 +34,10 @@ name: Recovery Corpus (Nightly)
         description: 'Boot wait per image (seconds)'
         required: false
         default: '60'
+      max_dispatch:
+        description: 'Hard cap on dispatched runs (6-Z306k; 0 = unlimited)'
+        required: false
+        default: '100'
 
 concurrency:
   group: recovery-corpus-nightly
@@ -70,9 +74,16 @@ jobs:
       - name: Dispatch every manifest entry in the tier
         run: |
           chmod +x scripts/recovery-corpus/dispatch_corpus.sh
+          # 6-Z306k: cap the nightly burst. On 2026-09-10 the nightly tier
+          # (617 entries) was dispatched in one 2-minute burst; the queued
+          # flood hogged the shared arm runner pool and starved the Android
+          # Boot Ladder (#171 sat behind ~617 queued E2E runs). Cap at 100
+          # per night — the manifest is walked front-to-back, so raise the
+          # cap or use explicit batch:N:M selectors to go deeper.
           ./scripts/recovery-corpus/dispatch_corpus.sh \
             "${{ github.event.inputs.tier || 'nightly' }}" \
-            "${{ github.event.inputs.boot_wait_seconds || '60' }}"
+            "${{ github.event.inputs.boot_wait_seconds || '60' }}" \
+            "${{ github.event.inputs.max_dispatch || '100' }}"
 
       - name: Record the dispatch window start
         run: |
