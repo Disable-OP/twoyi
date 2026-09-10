@@ -17025,6 +17025,60 @@ pub fn run_ptrace_loop(
                     // appears before the check's opendir("/proc/self/
                     // fd") is closed at the NEXT ENTRY, before the
                     // readdir.
+                    // ── 6-Z306f-b: the PERSISTENT lineage open-deny ──
+                    //
+                    // Ladder #164: the capped child window (256 ENTRYs)
+                    // closed BEFORE the child's raw hyph open — the deny
+                    // never fired. The deny must key on the PERSISTENT
+                    // zygote lineage (z306_zygote_lineage) and run at
+                    // EVERY open/openat of a lineage child (the pin pid
+                    // itself is exempt — the zygote's preload NEEDS those
+                    // files). Opens are rare relative to all syscalls, so
+                    // the per-open string read is negligible.
+                    if z306_zygote_lineage.contains(&pid)
+                        && z305y_stdio_pin_pid != Some(pid)
+                        && ((abi.openat != -1 && syscall_num == abi.openat)
+                            || (abi.open != -1 && syscall_num == abi.open))
+                    {
+                        let path_arg = if syscall_num == abi.openat {
+                            abi.reg_arg2
+                        } else {
+                            abi.reg_arg1
+                        };
+                        let paddr = get_syscall_arg(&regs, path_arg);
+                        if paddr != 0 {
+                            if let Some(pp) = read_child_string(pid, paddr) {
+                                if pp.starts_with("/system/fonts/")
+                                    || pp.starts_with("/system/usr/hyphen-data/")
+                                {
+                                    static Z306FB_DENY_LOGGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let dn = Z306FB_DENY_LOGGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if dn < 16 {
+                                        log(&format!(
+                                            "6-Z306f: lineage open DENIED (whitelist-leak class) pid={} path={:?} → getpid rewrite, -ENOENT at exit",
+                                            pid, pp
+                                        ));
+                                    }
+                                    let mut r = regs;
+                                    set_syscall_num(&mut r, &abi, abi.getpid);
+                                    match ptrace_setregs(pid, &r, iov_len) {
+                                        Ok(()) => {
+                                            pending_sandbox_deny.insert(pid, -2);
+                                        }
+                                        Err(e) => {
+                                            log(&format!(
+                                                "6-Z306f: deny setregs FAILED pid={} ({}) — open proceeds",
+                                                pid, e
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if z306_childgate.contains_key(&pid) {
                         let scans = z306_childgate.get(&pid).copied().unwrap_or(0);
                         if scans >= z306_childgate_scan_cap {
@@ -33616,12 +33670,14 @@ pub fn z306_fd_target_class(target: &str, rootfs: &str, rootfs_canonical: &str) 
     {
         return None;
     }
-    const Z306_ALLOW_EXACT: [&str; 5] = [
+    const Z306_ALLOW_EXACT: [&str; 7] = [
         "/dev/null",
         "/dev/urandom",
         "/dev/random",
         "/dev/ion",
         "/dev/tty",
+        "/dev/pmsg0", // liblog's pmsg logger holds this for the process lifetime
+        "/dev/alarm",
     ];
     const Z306_ALLOW_PREFIXES: [&str; 14] = [
         "/dev/socket/",
