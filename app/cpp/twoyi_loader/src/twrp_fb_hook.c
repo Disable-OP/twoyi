@@ -2964,7 +2964,50 @@ int __openat_2(int dirfd, const char *path, int flags) {
 // ---------------------------------------------------------------------------
 // close() PLT interposition — clear fd tracking when an fb0 fd is closed.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 6-Z305x: PRELOAD-FD close-identity logger (bounded).
+//
+// Ladder #156 decode: the zygote's forkSystemServer whitelist check
+// (fd_utils.cpp ParseFd SKIPS fds 0/1/2 — "they're handled specially
+// post-fork anyway") rejected fd 29 → /system/usr/hyphen-data/hyph-as.hyb
+// — a REAL leaked fd above stdio. The shlib-side tracker saw the opens
+// but only a MINORITY of the closes: most guest close() calls bind to
+// THIS hook (the first close exporter in the LD_PRELOAD scope) and take
+// the raw-syscall path, never reaching the shlib's close hook — so the
+// shlib tracker's close-matching undercounts (96 stale entries at
+// watermark, fd 29/30 recycling across ~130 preload files).
+//
+// This logger runs HERE — in the hook every guest close() reaches — and
+// records the REAL /proc/self/fd identity of every closed fd that is
+// (or was ever) a preload-transient file. Paired with the shlib's open
+// lines, the artifact then shows which open never got its close.
+// ---------------------------------------------------------------------------
+static int z305x_close_log_count = 0;
+
+static void z305x_preload_fd_note_close(int fd) {
+    if (fd < 3 || z305x_close_log_count >= 200) return;
+    char real[160];
+    real[0] = '\0';
+    char linkpath[64];
+    snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
+    long n = syscall(SYS_readlinkat, AT_FDCWD, linkpath, real,
+                     (long)(sizeof(real) - 1));
+    if (n < 0) n = 0;
+    real[n] = '\0';
+    if (n > 0 &&
+        (strncmp(real, "/system/fonts/", 14) == 0 ||
+         strncmp(real, "/system/usr/hyphen-data/", 24) == 0)) {
+        z305x_close_log_count++;
+        write_str(2, "[twrp_fb_hook] 6-Z305x PRELOAD-FD close(fd=");
+        write_num(2, fd);
+        write_str(2, ") real=");
+        write_str(2, real);
+        write_str(2, "\n");
+    }
+}
+
 int close(int fd) {
+    z305x_preload_fd_note_close(fd);
     if (in_fd_is_tracked(fd)) {
         struct inbr_slot *s = inbr_slot_for(fd);
         if (s) {
