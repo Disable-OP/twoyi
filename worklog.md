@@ -27546,3 +27546,17 @@ Work Log:
 
 Stage Summary:
 - The whitelist wall is now covered by the stock-semantics classifier at three points (fork gate, child window, check-moment opendir trigger). #163 in flight; the next expected wall = whatever system_server hits AFTER a clean fork (binder cap already raised to 512).
+
+---
+Task ID: 11
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladder #163 (first aggressive-gate run), remove the broken injection, fix the leak classes at their sources (6-Z306f/g), dispatch #164.
+
+Work Log:
+- #163 (ef35876): the aggressive fork gate FIRED with real leaks (leaks=[6,28]) and injected close(6) — but "close(6) done ret=Some(3160)" = the fork's OWN return: the kernel executed the clone with its ORIGINAL regs. The clone-entry regs-hijack does not take on aarch64 in this tracer, and the stash-restore then re-armed the clone (a latent double-fork). The injection is removed.
+- 6-Z306g: zygote (pin pid) + every zygote process-fork child EXEMPT from the 6-Z305t-24 /dev/null -> svclog redirect — their /dev/null opens stay REAL /dev/null (A11-whitelisted), killing the #162 fatal class (fd 28 = foreign svclog) at the source.
+- 6-Z306f: in the child window, hyphen/fonts opens are DENIED with the PROVEN 6-Z185 pattern (rewrite to getpid at ENTRY, fake -ENOENT at EXIT) — honest semantics (Hyphenator.init catches and skips, like AOSP for absent hybs); the fd NEVER EXISTS.
+- The gates are now passive AUDITS with fd -> guest-path naming. 825/825, fmt+clippy clean. Pushed d6854b5; dispatched #164.
+
+Stage Summary:
+- All whitelist-leak classes are now closed at their sources with proven primitives; the audits name any residue. #164 in flight.
