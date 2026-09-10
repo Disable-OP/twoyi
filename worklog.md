@@ -27645,3 +27645,17 @@ Work Log:
 
 Stage Summary:
 - If #170 clears the +150s wall, the zygote should reach runSelectLoop and fork system_server (rung 8 territory). If a word=2 hang RETURNS at a new site, it is guest-native (not interposer) and needs the 6-Z306j /proc thread census (state/wchan/syscall per sibling) as the next probe. Open walls: ART daemon cascade death (deterministic, still unexplained — possibly benign for boot if the zygote proceeds), sensors multihal self-deadlock.
+
+---
+Task ID: 18
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladder #170 (rung 4 regression), isolate the variable, dispatch #171.
+
+Work Log:
+- #170 collapsed to rung 4: a ~10x-amplified pre-existing SIGSEGV storm (38→372 _vendor_bin_hw_ libdl-pc crashes, same per-crash signature) swept the HALs; init's reap/cgroup-kill machinery (with BROKEN guest /acct cgroups — materialize FAILED EACCES) then killed SURFACEFLINGER and the LIVE zygote (SIG9, 3 generations, ~8-12s each). No OOM/llkd/lmkd lines anywhere; the killer attribution stops at init's KillProcessGroup.
+- Killed my own first theory with data: the shlib's NEW __thread guard was NOT the cause — #169's shlib already carried 4 emutls __thread vars + __emutls_get_address (15 emutls syms) and worked; #170 added exactly one more, mechanically identical. Also: the #168/#169 zygotes were FROZEN by the futex hang at +150s — the #170 zygote RAN (865k stop/resume cycles, actively writing) until an EXTERNAL SIGKILL — the kill may simply be the previously-unreachable next wall.
+- 6-Z306j-b (f45b517): guard switched to a plain volatile int (no __thread at all). #171 dispatched — isolates the variable: same code as #170 minus __thread.
+- Decision rule for #171: rung 7 + zygote stall at +150s ⇒ #170's collapse was variance (proceed to the stall/next-wall work). Another collapse ⇒ the write_str logd-leg removal is implicated via boot-speedup → revert the leg and attack the deadlock tracer-side.
+
+Stage Summary:
+- Baseline instability quantified: the guest's early boot has a systemic _vendor_bin_hw_ libdl crash-loop (pre-existing, every run) that init's broken-cgroup reap machinery turns into cross-service SIGKILL chaos when the volume spikes. Candidate future fix: identify the crashing /vendor/bin/hw binary by its staged name + maps and fix its dlopen path; or harden init's cgroup kill (acct materialize EACCES).
