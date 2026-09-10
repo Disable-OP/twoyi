@@ -27586,3 +27586,16 @@ Work Log:
 
 Stage Summary:
 - The svclog-fd leak chain is now fully mapped: /dev/null write-side opens by ZYGOTE THREADS were the last unexempted source. #166 in flight; remaining named walls after this: the inherited /system/etc/preloaded-classes fd (exec-time zygote leak; needs either a working entry-stop rewrite primitive or served-open close semantics) and the general entry-stop rewrite mystery (pin rewrites appear never to take on this aarch64 kernel).
+
+---
+Task ID: 14
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladders #166/#167, fix the tgid parser + the deny's lineage check, dispatch #168.
+
+Work Log:
+- #166 (672b2db): the fork-gate audit shows the ZYGOTE's table CLEAN of svclogs at fork (the thread-aware exemption worked) — yet the check rejected fd 29 = svc-2986.log: the CHILD's own THREAD opened /dev/null and the tgid lookup FAILED — my parser read /proc/<tid>/stat field 4 which is PPID (stat carries no tgid for threads!). Fixed: /proc/<tid>/status "Tgid:" (672b2db→d895ec3).
+- #167 (0d5fd3f): the svclog class is GONE at fork (audit: only fd 28 = /system/etc/preloaded-classes) — but the check rejected hyph-as again and the deny fired 0 times: the DENY still used raw lineage contains() — the child's THREAD-executed raw hyph open (tid ∉ set) slipped past. Fixed: the deny now uses the same tgid-aware lookup (2dac1f8).
+- Both fixed, 825/825; pushed; dispatched #168 (on 2dac1f8).
+
+Stage Summary:
+- The svclog leak chain is fully closed at the source (group-wide exemption incl. threads). The hyphen/fonts deny is now thread-aware. EXPECTED NEXT WALL for #168: the INHERITED /system/etc/preloaded-classes fd (fd 28 at fork — an exec-time zygote leak, named verbatim by the audit). Fixing it needs either (a) understanding why the reader's kernel-level close never runs (suspect: the tracer's served-open close semantics swallow the tracee-side close), or (b) solving the entry-stop syscall-rewrite mystery (the 6-Z305y pin rewrites appear never to take on this aarch64 kernel).
