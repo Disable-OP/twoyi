@@ -7237,10 +7237,14 @@ static void *gotfix_dlopen_window_thread(void *arg) {
 static void *stdin_watchdog_thread(void *arg) {
     (void)arg;
     for (int round = 0; round < 240; round++) { // 240 × 500ms = 120s
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 500 * 1000 * 1000;
-        nanosleep(&ts, NULL);
+        // 6-Z305t-75d: REPAIR FIRST, sleep LAST. The v1 loop slept 500ms
+        // before its first repair pass — ladder #168: the zygote's own
+        // hyph-as.hyb preload open won the race for the freed stdio slot
+        // fd 0 inside that first sleep (the close(0)→getpid stdio-floor
+        // pin then kept the hyphen file pinned at fd 0, and every forked
+        // child would inherit it — the whitelist-leak class). The round-0
+        // repair now closes the window to ~0: slot 0 is re-filled with a
+        // real /dev/null BEFORE the guest's preload opens can take it.
         int repaired = 0;
         // 6-Z305t-75c: cover ALL THREE standard descriptors — ladder #147
         // showed fd-0-only repairs did not stop the onEndPreload EBADF:
@@ -7264,6 +7268,10 @@ static void *stdin_watchdog_thread(void *arg) {
                      repaired);
             write_str(2, msg);
         }
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 500 * 1000 * 1000;
+        nanosleep(&ts, NULL);
     }
     return NULL;
 }
