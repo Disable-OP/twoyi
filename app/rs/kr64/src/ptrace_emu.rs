@@ -33668,7 +33668,10 @@ pub fn run_ptrace_loop(
                                             } else {
                                                 // two 4-byte aarch64 instrs per peek
                                                 let b = w as u64;
-                                                words.push(format!("{:08x}", (b & 0xffff_ffff) as u32));
+                                                words.push(format!(
+                                                    "{:08x}",
+                                                    (b & 0xffff_ffff) as u32
+                                                ));
                                                 words.push(format!("{:08x}", (b >> 32) as u32));
                                             }
                                         }
