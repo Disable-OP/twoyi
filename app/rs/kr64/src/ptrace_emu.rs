@@ -17010,30 +17010,77 @@ pub fn run_ptrace_loop(
                     //
                     // For every process-fork child of the pinned zygote
                     // (armed at its PTRACE_EVENT_FORK), re-scan the
-                    // CHILD's own kernel fd table at its first syscall
-                    // ENTRYs and inject closes (shared hijack machinery
-                    // with the parent gate) until one scan comes back
-                    // clean. Covers the fork-instantaneous transient
-                    // leak #160 proved (parent clean at the ENTRY scan,
-                    // child inherited fd 28 = hyph 3ms later).
+                    // CHILD's own kernel fd table at EVERY syscall ENTRY
+                    // inside the window (cap 256) and inject closes
+                    // (shared hijack machinery with the parent gate).
+                    //
+                    // Ladder #161 decode: the v1 gate disarmed on the
+                    // FIRST clean scan (ENTRY #1) — and the child STILL
+                    // aborted "Not whitelisted (28): hyph-as.hyb" — the
+                    // child RAW-OPENED the leak file itself between its
+                    // first syscall and the whitelist check (a hook-
+                    // bypassing open — the same bypass family as the
+                    // close-bypass). The scan therefore must be
+                    // CONTINUOUS across the window: any leak that
+                    // appears before the check's opendir("/proc/self/
+                    // fd") is closed at the NEXT ENTRY, before the
+                    // readdir.
                     if z306_childgate.contains_key(&pid) && !z306_forkgate.contains_key(&pid) {
                         let scans = z306_childgate.get(&pid).copied().unwrap_or(0);
                         if scans >= z306_childgate_scan_cap {
                             z306_childgate.remove(&pid);
                             log(&format!(
-                                "6-Z306c: child gate HARD-DISARMED for pid={} after {} scanned ENTRYs (never saw a clean table — the leak source outlives the sweep)",
+                                "6-Z306c: child gate window closed for pid={} after {} scanned ENTRYs",
                                 pid, scans
                             ));
                         } else {
+                            z306_childgate.insert(pid, scans + 1);
+                            // 6-Z306c-v2: name every open/openat path in
+                            // the window — the #161 wall was a RAW (hook-
+                            // bypassing) open; this names it verbatim.
+                            if (abi.openat != -1 && syscall_num == abi.openat)
+                                || (abi.open != -1 && syscall_num == abi.open)
+                            {
+                                static Z306C_OPEN_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z306C_OPEN_LOGGED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    < 48
+                                {
+                                    let path_arg = if syscall_num == abi.openat {
+                                        abi.reg_arg2
+                                    } else {
+                                        abi.reg_arg1
+                                    };
+                                    let paddr = get_syscall_arg(&regs, path_arg);
+                                    let p = if paddr != 0 {
+                                        read_child_string(pid, paddr)
+                                    } else {
+                                        None
+                                    };
+                                    log(&format!(
+                                        "6-Z306c: child open pid={} nr={} path={:?} (stop #{})",
+                                        pid,
+                                        syscall_num,
+                                        p,
+                                        scans + 1
+                                    ));
+                                }
+                            }
                             let leaked = z306_scan_leaked_preload_fds(pid);
                             if leaked.is_empty() {
-                                z306_childgate.remove(&pid);
-                                log(&format!(
-                                    "6-Z306c: child gate clean — pid={} after {} scanned ENTRYs (fd table repaired before the forkSystemServer whitelist reads it)",
-                                    pid, scans + 1
-                                ));
+                                static Z306C_CLEAN_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z306C_CLEAN_LOGGED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    < 6
+                                {
+                                    log(&format!(
+                                        "6-Z306c: child gate scan #{} — pid={} clean (sweep continues)",
+                                        scans + 1, pid
+                                    ));
+                                }
                             } else {
-                                z306_childgate.insert(pid, scans + 1);
                                 let done = z306_budget.entry(pid).or_insert(0);
                                 if *done >= z306_budget_cap {
                                     static Z306C_CAP_LOGGED: std::sync::atomic::AtomicU64 =
