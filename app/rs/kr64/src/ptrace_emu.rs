@@ -13218,6 +13218,71 @@ pub fn run_ptrace_loop(
     let mut z305y_stdio_pin_pid: Option<libc::pid_t> = None;
     let mut z305y_zclose_pending: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // ── 6-Z306: the ZYGOTE FORK-GATE FD SWEEP ────────────────────────
+    //
+    // Ladder #159 (e4e978a) decode: the zygote preloads FAST (12110
+    // classes in 1265ms — the whole ART preload pipeline works), binds
+    // the zygote sockets, calls endPreload(), then forkSystemServer's
+    // parent-side fd check (FileDescriptorTable::Create /
+    // FileDescriptorWhitelist::IsAllowed — stock AOSP android-11
+    // behavior) rejects a leaked preload fd:
+    //   "JNI FatalError called: (system_server) Not whitelisted (28):
+    //    /system/usr/hyphen-data/hyph-as.hyb"
+    // The zygote never reaches its abort() hook (no INTERCEPTED line,
+    // no die-loop kmsg pair for this pid): the fatal LOG(FATAL) write
+    // itself wedges on a futex (liblog's global writer lock — FUTEX_
+    // WAIT_BITSET|PRIVATE, val=2, held across a tracer stall window),
+    // so the zygote FREEZES instead of dying — no restart, no
+    // system_server, rung 6 never lands. The STALL-FD probe proves the
+    // leak is REAL kernel state: fd 0 → hyph-as.hyb (the 6-Z305y-pinned
+    // churn slot) at +158s.
+    //
+    // Every close-path fix so far (shlib floor 6-Z305t-75g, syscall pin
+    // 6-Z305y, close-chain unification 6-Z305z) repairs closes that GO
+    // THROUGH a hook layer; #157's close-identity evidence showed the
+    // hyphen preload's close never reaches ANY hook (bound straight to
+    // libc). Chasing that last binding is unbounded work — the
+    // guaranteed fix is GROUND-TRUTH-SIDE: at the zygote's process-fork
+    // ENTRY (clone with SIGCHLD, no CLONE_VM/FS/FILES/SIGHAND/THREAD —
+    // bionic fork() = clone on aarch64), the tracer reads the REAL
+    // /proc/<pid>/fd (same source the STALL-FD probe uses — hook- and
+    // namespace-proof), and for every fd whose readlink target is a
+    // leaked preload artifact (rootfs /system/fonts/ or
+    // /system/usr/hyphen-data/ — the two families #156/#157 tracked as
+    // the leak) HIJACKS the clone in place: stash the full ENTRY regs,
+    // rewrite (nr, arg1) → close(fd), let it execute, then restore the
+    // stashed regs at the injected close's EXIT so the fork re-executes
+    // on the next resume. Each round closes ≥1 fd and re-enters the
+    // gate (the scan drives termination idempotently). The injected
+    // syscall bypasses every interposer (they read the STALE
+    // `syscall_num` = clone) including the 6-Z305y pin — which would
+    // otherwise stomp an injected close(0) — and the phase
+    // classification stays correct via the kernel's
+    // PTRACE_GET_SYSCALL_INFO (6-Z68), not the parity flag.
+    //
+    // HONESTY: this is not a whitelist masquerade — the guest's own
+    // kernel-level fd table is repaired with REAL close() syscalls the
+    // loader should have made; a physical device's zygote has these
+    // fds closed at fork too (the whitelist is stock behavior we must
+    // satisfy genuinely, and fonts/hyphen fds are mmap-or-read
+    // consumed: closing them is the real-device semantics).
+    struct Z306ForkGate {
+        // Full ENTRY registers of the intercepted clone (pc = the svc
+        // instruction itself on aarch64 — restoring them wholesale at
+        // the injected close's EXIT re-aims the SAME svc).
+        saved: Regs,
+        // The fd whose close() is currently in flight (logged at EXIT).
+        fd: i64,
+        // How many closes this fork attempt has injected (bounded).
+        closes_done: u32,
+    }
+    let mut z306_forkgate: std::collections::HashMap<libc::pid_t, Z306ForkGate> =
+        std::collections::HashMap::new();
+    // Per-pid close budget across re-entries of the gate (reset when a
+    // clone passes through clean). Bounds a pathological rescan loop.
+    let mut z306_budget: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    let z306_budget_cap: u32 = 64;
     // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
     // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
     // 0) — the EXIT arm turns the returned REAL fd into a tracked
@@ -16903,6 +16968,92 @@ pub fn run_ptrace_loop(
                 if is_entry {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
+
+                    // ── 6-Z306: the ZYGOTE FORK-GATE FD SWEEP (ENTRY side) ──
+                    //
+                    // Runs FIRST in the ENTRY branch: when it hijacks the
+                    // clone, every interposer below still reads the STALE
+                    // `syscall_num` (clone) and touches nothing (no
+                    // interposer targets clone), so the injected close()
+                    // sails through untouched — including the 6-Z305y pin,
+                    // which would otherwise rewrite an injected close(0)
+                    // back to getpid and defeat the sweep.
+                    //
+                    // Placement contract: z306_forkgate MUST be empty here
+                    // (the EXIT arm removes the entry before the restored
+                    // clone re-enters as a fresh ENTRY stop). The restore
+                    // at EXIT re-aims the same svc instruction, the clone
+                    // re-executes, the gate re-scans, and either injects
+                    // the next leaked fd or lets the fork pass clean.
+                    if !z306_forkgate.contains_key(&pid)
+                        && z305y_stdio_pin_pid == Some(pid)
+                        && abi.close_nr != -1
+                        && syscall_num == abi.clone_nr
+                    {
+                        let clone_flags = get_syscall_arg(&regs, abi.reg_arg1);
+                        if z306_flags_are_process_fork(clone_flags) {
+                            let leaked = z306_scan_leaked_preload_fds(pid);
+                            if leaked.is_empty() {
+                                // Clean pass-through — reset this pid's
+                                // close budget.
+                                z306_budget.remove(&pid);
+                                static Z306_CLEAN_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z306_CLEAN_LOGGED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    < 12
+                                {
+                                    log(&format!(
+                                        "6-Z306: fork gate clean — pid={} clone(flags={:#x}) leaks=0 (fork proceeds)",
+                                        pid, clone_flags
+                                    ));
+                                }
+                            } else {
+                                let done = z306_budget.entry(pid).or_insert(0);
+                                if *done >= z306_budget_cap {
+                                    static Z306_CAP_LOGGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z306_CAP_LOGGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        < 4
+                                    {
+                                        log(&format!(
+                                            "6-Z306: budget cap {} reached for pid={} — fork proceeds with leaks {:?}",
+                                            z306_budget_cap, pid, leaked
+                                        ));
+                                    }
+                                } else {
+                                    let fd0 = leaked[0];
+                                    *done += 1;
+                                    let closes_done = *done;
+                                    log(&format!(
+                                        "6-Z306: fork gate — pid={} clone(flags={:#x}) leaks={:?} — injecting close({}) (round {})",
+                                        pid, clone_flags, leaked, fd0, closes_done
+                                    ));
+                                    let gate = Z306ForkGate {
+                                        saved: regs,
+                                        fd: fd0,
+                                        closes_done,
+                                    };
+                                    let mut r = regs;
+                                    set_syscall_num(&mut r, &abi, abi.close_nr);
+                                    set_syscall_arg(&mut r, abi.reg_arg1, fd0 as u64);
+                                    match ptrace_setregs(pid, &r, iov_len) {
+                                        Ok(()) => {
+                                            z306_forkgate.insert(pid, gate);
+                                        }
+                                        Err(e) => {
+                                            log(&format!(
+                                                "6-Z306: setregs FAILED pid={} ({}) — clone proceeds with the leak",
+                                                pid, e
+                                            ));
+                                            z306_budget.remove(&pid);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // 6-Z305t-16: per-tid ENTRY-consumption forensics —
                     // pairs each consumed ENTRY with its loop-top resume
@@ -24091,6 +24242,43 @@ pub fn run_ptrace_loop(
                 } else {
                     // ── Syscall EXIT ──
                     in_syscall = false;
+
+                    // ── 6-Z306: the injected preload-leak close() returned —
+                    // restore the stashed clone ENTRY regs ──
+                    //
+                    // Runs FIRST in the EXIT branch (before every other
+                    // interposer): the stop being processed here is the
+                    // close(fd) we injected at the fork gate (the kernel's
+                    // definitive phase — 6-Z68 — classified it as EXIT; the
+                    // parity flag independently agrees since the ENTRY arm
+                    // set in_syscall=true for it). Restoring the SAVED regs
+                    // wholesale re-aims the ORIGINAL svc instruction (pc was
+                    // stashed pointing at it), so the loop-top PTRACE_SYSCALL
+                    // re-executes the clone; its fresh ENTRY stop re-enters
+                    // the gate above, which re-scans and either injects the
+                    // next leaked fd or lets the fork pass clean.
+                    if let Some(gate) = z306_forkgate.remove(&pid) {
+                        let mut regs_done: Regs = unsafe { std::mem::zeroed() };
+                        let close_ret = match ptrace_getregs_wide(pid, &mut regs_done) {
+                            Ok(_) => Some(get_syscall_arg(&regs_done, abi.reg_ret) as i64),
+                            Err(_) => None,
+                        };
+                        let regs_r = gate.saved;
+                        match ptrace_setregs(pid, &regs_r, iov_len) {
+                            Ok(()) => {
+                                log(&format!(
+                                    "6-Z306: close({}) done ret={:?} — clone regs restored (closes_done={}) — fork re-enters the gate",
+                                    gate.fd, close_ret, gate.closes_done
+                                ));
+                            }
+                            Err(e) => {
+                                log(&format!(
+                                    "6-Z306: RESTORE setregs FAILED pid={} ({}) — the fork will NOT re-execute correctly; state lost",
+                                    pid, e
+                                ));
+                            }
+                        }
+                    }
 
                     // ── Security fix 6-Z185: consume a pending sandbox DENY ──
                     //
@@ -33281,8 +33469,145 @@ pub fn run_ptrace_loop(
     }
 }
 
+/// 6-Z306: does a /proc/<pid>/fd/N readlink target name a LEAKED PRELOAD
+/// artifact the fork-gate sweep must close before the zygote forks
+/// system_server?
+///
+/// Pure predicate (unit-tested). The readlink targets are the TRACED,
+/// TRANSLATED host paths (e.g.
+/// /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/usr/
+/// hyphen-data/hyph-as.hyb) — the same strings the 6-Z305t-14b STALL-FD
+/// probe and the #159 ladder evidence show. Match the two #156/#157
+/// leak families by SUBSTRING with a trailing slash so sibling
+/// directories (fonts2/, hyphen-data-old/) can never match, and so the
+/// file NAME is free (any .hyb / any font file qualifies).
+///
+/// Deliberately NOT matched: apex jars, framework jars, sockets, pipes,
+/// /dev/null, svc logs — those are either whitelisted by the AOSP
+/// FileDescriptorWhitelist or legitimate stdio/sync machinery.
+fn z306_fd_target_is_preload_leak(target: &str) -> bool {
+    target.contains("/rootfs/system/fonts/") || target.contains("/rootfs/system/usr/hyphen-data/")
+}
+
+/// 6-Z306: is this clone() flags word a PROCESS fork (the forkSystemServer
+/// / runSelectLoop app fork) rather than a thread creation?
+///
+/// Pure predicate (unit-tested). bionic's fork() on aarch64 issues
+/// clone(SIGCHLD, 0, NULL, NULL, 0) — flags == SIGCHLD (17). Threads
+/// carry CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD (and
+/// more). A process fork for our purposes = SIGCHLD present AND none of
+/// the memory/fd/signal-sharing bits set.
+fn z306_flags_are_process_fork(flags: u64) -> bool {
+    const Z306_SIGCHLD: u64 = 17;
+    const Z306_SHARE_MASK: u64 = 0x0000_0100 // CLONE_VM
+        | 0x0000_0200 // CLONE_FS
+        | 0x0000_0400 // CLONE_FILES
+        | 0x0000_0800 // CLONE_SIGHAND
+        | 0x0001_0000; // CLONE_THREAD
+    (flags & Z306_SIGCHLD) != 0 && (flags & Z306_SHARE_MASK) == 0
+}
+
+/// 6-Z306: scan the REAL kernel fd table of `pid` (host-side /proc —
+/// the same hook-proof source the 6-Z305t-14b STALL-FD probe reads) for
+/// leaked preload fds. Bounded to fds 0..=64 (the zygote's live table at
+/// fork time per #159's STALL-FD snapshot: 23 entries). Sorted ascending
+/// so the gate closes the LOWEST leaked fd first (stable, observable
+/// order in the artifact).
+fn z306_scan_leaked_preload_fds(pid: libc::pid_t) -> Vec<i64> {
+    let mut out = Vec::new();
+    for fd in 0..=64i64 {
+        if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
+            if z306_fd_target_is_preload_leak(&target.to_string_lossy()) {
+                out.push(fd);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    // ── 6-Z306: the fork-gate fd sweep ──────────────────────────────
+    //
+    // Ladder #159 (e4e978a): the zygote froze inside its fatal-log write
+    // on "Not whitelisted (28): hyph-as.hyb" — a REAL leaked preload fd
+    // (STALL-FD: fd 0 → hyph-as.hyb in the kernel table). The sweep
+    // closes the leak families at the zygote's process-fork with
+    // injected close() syscalls. These tests pin the two pure
+    // predicates the gate's correctness rides on: the leak matcher
+    // (translated readlink targets) and the process-fork flags filter.
+
+    #[test]
+    fn z306_leak_matcher_hits_translated_preload_paths() {
+        // The exact evidence strings from ladder #159 (translated host
+        // paths of the guest rootfs).
+        assert!(z306_fd_target_is_preload_leak(
+            "/data/user/0/io.twoyi.debug/profiles/default/rootfs/system/usr/hyphen-data/hyph-as.hyb"
+        ));
+        assert!(z306_fd_target_is_preload_leak(
+            "/data/user/0/io.twoyi.debug/rootfs/system/fonts/NotoSansCJK-Regular.ttc"
+        ));
+        // Any file name inside the families matches (the matcher keys on
+        // the directory, not the extension).
+        assert!(z306_fd_target_is_preload_leak(
+            "/x/rootfs/system/usr/hyphen-data/hyph-af.hyb"
+        ));
+    }
+
+    #[test]
+    fn z306_leak_matcher_rejects_legitimate_zygote_fds() {
+        // Whitelisted apex/framework jars must NEVER match (#159's live
+        // table: fds 8-23 = apex + framework jars).
+        assert!(!z306_fd_target_is_preload_leak(
+            "/data/user/0/io.twoyi.debug/rootfs/apex/com.android.art/javalib/core-oj.jar"
+        ));
+        assert!(!z306_fd_target_is_preload_leak(
+            "/data/user/0/io.twoyi.debug/rootfs/system/framework/framework.jar"
+        ));
+        // stdio + sockets + transient probe dirs must not match.
+        assert!(!z306_fd_target_is_preload_leak("socket:[50294]"));
+        assert!(!z306_fd_target_is_preload_leak("/dev/null"));
+        assert!(!z306_fd_target_is_preload_leak("/proc/2873/fd"));
+        // svc logs (the zygote's stderr) are legitimate.
+        assert!(!z306_fd_target_is_preload_leak(
+            "/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs/svc-2873.log"
+        ));
+    }
+
+    #[test]
+    fn z306_leak_matcher_prefix_superstring_trap() {
+        // The trailing-slash substring must not match sibling directories
+        // (the 6-Z305t-76 exact-vs-superstring lesson).
+        assert!(!z306_fd_target_is_preload_leak(
+            "/x/rootfs/system/fonts2/NotoSans.ttf"
+        ));
+        assert!(!z306_fd_target_is_preload_leak(
+            "/x/rootfs/system/usr/hyphen-data-old/hyph-en.hyb"
+        ));
+        // And a superstring NAME still matches inside the real dirs.
+        assert!(z306_fd_target_is_preload_leak(
+            "/x/rootfs/system/fonts/fonts2/NotoSans.ttf"
+        ));
+    }
+
+    #[test]
+    fn z306_process_fork_flags() {
+        // bionic fork() on aarch64: clone(SIGCHLD, ...) — the forkSystemServer
+        // and runSelectLoop app forks.
+        assert!(z306_flags_are_process_fork(17));
+        assert!(z306_flags_are_process_fork(17 | 0x10_0000_0000)); // extra non-sharing flag (CLONE_NEWCGROUP class) stays a fork
+                                                                   // Thread creation always shares memory/fds/signals.
+        assert!(!z306_flags_are_process_fork(
+            17 | 0x100 | 0x400 | 0x800 | 0x1_0000
+        ));
+        // CLONE_VM without SIGCHLD (weird but must never gate).
+        assert!(!z306_flags_are_process_fork(0x100));
+        // CLONE_PARENT'd threads (no SIGCHLD).
+        assert!(!z306_flags_are_process_fork(
+            0x100 | 0x400 | 0x1_0000 | 0x800
+        ));
+    }
+
     // ── 6-Z305t-71: the bounded stop-class diagnostics ───────────────
     //
     // Ladder #131's 799MB kr64-app-stderr artifact (one 180s boot) had a
