@@ -3474,7 +3474,16 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 // the belt; never cleared for the life of the process.
 static int g_stdio_floor_mask;
 
-int close(int fd) {
+// 6-Z305z: the close hook body under a UNIQUE export name. The fb hook
+// (the first close exporter in the LD_PRELOAD scope) must chain into
+// THIS implementation — its own real_close resolution hits the
+// old-bionic RTLD_NEXT quirk (6-Z246) and falls back to a RAW close
+// syscall that bypasses the STDIO FLOOR, the binder/qemu/fb fd
+// bookkeeping and the 6-Z305x tracker (the ladder #155/#156/#157
+// fd-drift: closes that freed fd numbers invisibly to every hook
+// layer while preload-transient fds leaked past the fork whitelist).
+// A unique symbol makes the cross-hook call quirk-proof.
+int __twoyi_shlib_close(int fd) {
     // 6-Z305t-75g: THE STDIO FLOOR — fds 0/1/2 that the constructor belt
     // filled with REAL /dev/null dups are PROTECTED: a close() on them
     // returns success WITHOUT closing. Evidence (ladder #151 closer
@@ -3517,6 +3526,11 @@ int close(int fd) {
     preload_fd_note_close(fd);
     if (real_close) return real_close(fd);
     return (int)syscall(NR_close, fd);
+}
+
+// The PLT hook — chains to the unique-named body above.
+int close(int fd) {
+    return __twoyi_shlib_close(fd);
 }
 
 // Hook setsockopt — for AF_NETLINK options (vold only), return success
