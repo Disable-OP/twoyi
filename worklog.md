@@ -27560,3 +27560,17 @@ Work Log:
 
 Stage Summary:
 - All whitelist-leak classes are now closed at their sources with proven primitives; the audits name any residue. #164 in flight.
+
+---
+Task ID: 12
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladders #164/#163-audit data, widen the deny to the persistent lineage, dispatch #165.
+
+Work Log:
+- #164 (d6854b5): the fork-gate AUDIT finally names the REAL fork-time table: fd 6 -> /dev/pmsg0 (classifier false positive — the real A11 whitelist allows /dev/pmsg0; liblog holds it for life) and fd 28 -> /system/etc/preloaded-classes (the zygote's own exec-time leak). The check STILL rejected hyph-as — the child's raw hyph open happened AFTER the capped 256-ENTRY window closed (0 DENIED lines).
+- 6-Z306f-b (cb3c9ee): the hyphen/fonts open-deny now keys on the PERSISTENT z306_zygote_lineage set at EVERY lineage-child open/openat (pin pid exempt — the preload needs those files); /dev/pmsg0 + /dev/alarm added to allow-exact. 825/825.
+- Pushed cb3c9ee; dispatched #165.
+
+Stage Summary:
+- OPEN WALL (named, needs the next session): the INHERITED /system/etc/preloaded-classes fd (fd 28 at fork) — an exec-time zygote leak. The deny can't fix inherited fds; the clone-entry injection is proven not to take. Candidate fixes for next session: (a) make the zygote's OWN preload reads close honestly (find why no kernel close ever runs for the served/stdio reads), or (b) revisit why entry-stop syscall-number rewrites (set_syscall_num + SETREGS + PTRACE_SYSCALL) do not take on this aarch64 kernel (the 6-Z305y pin evidence suggests they never did) — that single primitive unblocks the entire close-at-fork class.
+- #165 in flight (id will be in the actions list; run on cb3c9ee).
