@@ -9963,10 +9963,85 @@ fn stall_forensic_dump(pid: libc::pid_t) {
             Some(w) => {
                 let desc = if w & 0x4000_0000 != 0 {
                     format!("PI/robust word — held by tid={}", w & !0x4000_0000)
-                } else if w == 2 {
-                    "bionic mutex locked-WITH-WAITERS — a sibling thread holds it (check sibling STALL lines)".to_string()
-                } else if w == 1 {
-                    "bionic mutex locked (no waiters bit) — holder not self-identified".to_string()
+                } else if w == 2 || w == 1 {
+                    // 6-Z306i (#168 decode): a NORMAL bionic mutex keeps its
+                    // holder's tid in the pthread_mutex_internal_t
+                    // owner_tid field — LP64 layout: state @+0 (the word
+                    // we just read), pads @+4/+6, owner_tid @+8; 32-bit
+                    // ABIs put owner_tid @+4. Ladder #168's zygote main
+                    // futex-hung on word=2 with NO sibling STALL lines —
+                    // the holder was invisible (dead, or userspace-stuck
+                    // making no syscalls). Validating the candidate tids
+                    // against /proc/<pid>/task/<tid> decides it: an ALIVE
+                    // owner names its comm + wchan (userspace-spinner
+                    // suspect); a DEAD owner proves the abandoned-mutex
+                    // deadlock. Bounded: one 16-byte pvm read + up to two
+                    // /proc probes per stall tick, lines capped.
+                    static Z306I_OWNER_LOGGED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let mut desc = format!(
+                        "bionic mutex locked{} — owner probe:",
+                        if w == 2 { "-WITH-WAITERS" } else { "" }
+                    );
+                    match read_child_bytes(pid, a0, 16) {
+                        Some(b) if b.len() == 16 => {
+                            desc.push_str(&format!(
+                                " raw[0..16]={}",
+                                b.iter().map(|x| format!("{:02x}", x)).collect::<String>()
+                            ));
+                            for &off in &[8usize, 4usize] {
+                                let cand = u32::from_ne_bytes(
+                                    b[off..off + 4].try_into().unwrap(),
+                                );
+                                if cand == 0 || cand > 0x100_0000 {
+                                    continue;
+                                }
+                                let task_dir =
+                                    format!("/proc/{}/task/{}", pid, cand);
+                                if std::path::Path::new(&task_dir).exists() {
+                                    let comm = std::fs::read_to_string(format!(
+                                        "{}/comm", task_dir
+                                    ))
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .to_string();
+                                    let wch = std::fs::read_to_string(format!(
+                                        "{}/wchan", task_dir
+                                    ))
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .to_string();
+                                    desc.push_str(&format!(
+                                        " owner@+{}=tid {} ALIVE comm={:?} wchan={:?}",
+                                        off, cand, comm, wch
+                                    ));
+                                } else {
+                                    desc.push_str(&format!(
+                                        " owner@+{}=tid {} DEAD (abandoned mutex)",
+                                        off, cand
+                                    ));
+                                }
+                            }
+                            if Z306I_OWNER_LOGGED.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) < 64
+                            {
+                                crate::trace_log_line(&format!(
+                                    "6-Z306i STALL-OWNER: pid={} uaddr={:#x} {}",
+                                    pid, a0, desc
+                                ));
+                            }
+                            format!(
+                                "bionic mutex locked{} — a sibling thread holds it (check sibling STALL lines + 6-Z306i STALL-OWNER)",
+                                if w == 2 { "-WITH-WAITERS" } else { "" }
+                            )
+                        }
+                        _ => {
+                            "bionic mutex locked-WITH-WAITERS — a sibling thread holds it (check sibling STALL lines; owner bytes unreadable)"
+                                .to_string()
+                        }
+                    }
                 } else if w != 0 {
                     format!("nonzero word {:#x} (possibly tid={} holder)", w, w)
                 } else {
@@ -17034,18 +17109,33 @@ pub fn run_ptrace_loop(
                     // closed BEFORE the child's raw hyph open — the deny
                     // never fired. The deny must key on the PERSISTENT
                     // zygote lineage (z306_zygote_lineage) and run at
-                    // EVERY open/openat of a lineage child (the pin pid
-                    // itself is exempt — the zygote's preload NEEDS those
-                    // files). Opens are rare relative to all syscalls, so
-                    // the per-open string read is negligible.
+                    // EVERY open/openat of a lineage child.
+                    //
+                    // 6-Z306f-c2 (#168 decode): the pin pid is no longer
+                    // blanket-exempt. Ladder #168's zygote main STOLE the
+                    // freed stdio slot fd 0 with its OWN hyph-as.hyb open
+                    // (the stdin watchdog's 500ms tick lost the race), the
+                    // close(0)→getpid stdio-floor pin then kept that fd
+                    // alive forever, and every forked child would inherit
+                    // it — the exact whitelist-leak class this deny
+                    // exists for. The hyphen stage is also where main's
+                    // log path (shlib hook → liblog → libbase → art
+                    // mutex) deadlocked at +151s, blocking the
+                    // system_server fork. So the pin pid now denies
+                    // HYPHEN-DATA opens with the same honest -ENOENT
+                    // (AOSP already takes that path for hyph-af.hyb,
+                    // which ships absent). FONTS stay allowed for the
+                    // zygote's own preload — they are legitimate reads
+                    // that the preload closes; only lineage CHILDREN
+                    // deny fonts.
                     if z306_in_zygote_lineage(
                         pid,
                         &z306_zygote_lineage,
                         &mut z306_lineage_tgid_cache,
-                    ) && z305y_stdio_pin_pid != Some(pid)
-                        && ((abi.openat != -1 && syscall_num == abi.openat)
-                            || (abi.open != -1 && syscall_num == abi.open))
+                    ) && ((abi.openat != -1 && syscall_num == abi.openat)
+                        || (abi.open != -1 && syscall_num == abi.open))
                     {
+                        let z306_is_pin_pid = z305y_stdio_pin_pid == Some(pid);
                         let path_arg = if syscall_num == abi.openat {
                             abi.reg_arg2
                         } else {
@@ -17054,17 +17144,18 @@ pub fn run_ptrace_loop(
                         let paddr = get_syscall_arg(&regs, path_arg);
                         if paddr != 0 {
                             if let Some(pp) = read_child_string(pid, paddr) {
-                                if pp.starts_with("/system/fonts/")
-                                    || pp.starts_with("/system/usr/hyphen-data/")
-                                {
+                                let deny_hyphen = pp.starts_with("/system/usr/hyphen-data/");
+                                let deny_fonts =
+                                    pp.starts_with("/system/fonts/") && !z306_is_pin_pid;
+                                if deny_hyphen || deny_fonts {
                                     static Z306FB_DENY_LOGGED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
                                     let dn = Z306FB_DENY_LOGGED
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if dn < 16 {
                                         log(&format!(
-                                            "6-Z306f: lineage open DENIED (whitelist-leak class) pid={} path={:?} → getpid rewrite, -ENOENT at exit",
-                                            pid, pp
+                                            "6-Z306f: lineage open DENIED (whitelist-leak class, pin={}) pid={} path={:?} → getpid rewrite, -ENOENT at exit",
+                                            z306_is_pin_pid, pid, pp
                                         ));
                                     }
                                     let mut r = regs;
