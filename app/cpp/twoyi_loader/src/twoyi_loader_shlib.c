@@ -4213,11 +4213,9 @@ int selinux_android_setcontext_raw(uid_t uid, int isSystemServer,
     return 0;
 }
 
-int selinux_android_setfilecon(const char *pkgpath, const char *seinfo,
-                               const char *pkgname) {
-    (void)pkgpath; (void)seinfo; (void)pkgname;
-    return 0;
-}
+// NOTE: selinux_android_setfilecon already exists below (the older
+// (path, seinfo, uid) libselinux variant) — do NOT redefine it here.
+
 
 int security_compute_create(const char *scon, const char *tcon,
                             security_class_t tclass, char **newcon) {
