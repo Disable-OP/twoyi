@@ -13266,29 +13266,20 @@ pub fn run_ptrace_loop(
     // fds closed at fork too (the whitelist is stock behavior we must
     // satisfy genuinely, and fonts/hyphen fds are mmap-or-read
     // consumed: closing them is the real-device semantics).
-    struct Z306ForkGate {
-        // Full ENTRY registers of the intercepted clone (pc = the svc
-        // instruction itself on aarch64 — restoring them wholesale at
-        // the injected close's EXIT re-aims the SAME svc).
-        saved: Regs,
-        // The fd whose close() is currently in flight (logged at EXIT).
-        fd: i64,
-        // How many closes this fork attempt has injected (bounded).
-        closes_done: u32,
-    }
-    let mut z306_forkgate: std::collections::HashMap<libc::pid_t, Z306ForkGate> =
-        std::collections::HashMap::new();
-    // Per-pid close budget across re-entries of the gate (reset when a
-    // clone passes through clean). Bounds a pathological rescan loop.
-    let mut z306_budget: std::collections::HashMap<libc::pid_t, u32> =
-        std::collections::HashMap::new();
-    let z306_budget_cap: u32 = 64;
     // 6-Z306c: children of the pinned zygote still being swept — value =
-    // how many scanned ENTRYs so far (hard-disarm at 256). Disarmed
-    // early once a scan comes back clean.
+    // how many scanned ENTRYs so far (hard cap). The window arms at the
+    // child's PTRACE_EVENT_FORK and also marks the ZYGOTE LINEAGE for the
+    // 6-Z306g svclog-redirect exemption.
     let mut z306_childgate: std::collections::HashMap<libc::pid_t, u32> =
         std::collections::HashMap::new();
     let z306_childgate_scan_cap: u32 = 256;
+    // 6-Z306g: EVERY pid ever forked by the pinned zygote (and the pin pid
+    // itself) — these processes are EXEMPT from the 6-Z305t-24
+    // /dev/null -> svclog redirect: their /dev/null opens must stay REAL
+    // /dev/null (whitelisted by the forkSystemServer fd check), and no
+    // svc-log fd may ever enter a table the whitelist reads.
+    let mut z306_zygote_lineage: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
     // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
     // 0) — the EXIT arm turns the returned REAL fd into a tracked
@@ -15741,12 +15732,21 @@ pub fn run_ptrace_loop(
                             // the repaired table no matter how the leak
                             // arose (inherited transient, window churn,
                             // or a pre-check child open).
-                            if !boot_recovery
-                                && z305y_stdio_pin_pid == Some(pid)
-                                && (ev == libc::PTRACE_EVENT_FORK as u32
-                                    || ev == libc::PTRACE_EVENT_VFORK as u32)
-                            {
-                                z306_childgate.insert(new_child_id as libc::pid_t, 0u32);
+                            if !boot_recovery && z305y_stdio_pin_pid == Some(pid) {
+                                // 6-Z306g: the zygote + every process-fork
+                                // child = exempt from the 6-Z305t-24
+                                // /dev/null -> svclog redirect (their
+                                // /dev/null must stay REAL /dev/null — the
+                                // A11 forkSystemServer whitelist rejects
+                                // /dev/twoyi-svclogs/*, and #162 proved a
+                                // svclog fd on fd 28 is boot-fatal there).
+                                z306_zygote_lineage.insert(pid);
+                                if ev == libc::PTRACE_EVENT_FORK as u32
+                                    || ev == libc::PTRACE_EVENT_VFORK as u32
+                                {
+                                    z306_zygote_lineage.insert(new_child_id as libc::pid_t);
+                                    z306_childgate.insert(new_child_id as libc::pid_t, 0u32);
+                                }
                             }
                         } else {
                             log(&format!(
@@ -17025,25 +17025,22 @@ pub fn run_ptrace_loop(
                     // appears before the check's opendir("/proc/self/
                     // fd") is closed at the NEXT ENTRY, before the
                     // readdir.
-                    if z306_childgate.contains_key(&pid) && !z306_forkgate.contains_key(&pid) {
+                    if z306_childgate.contains_key(&pid) {
                         let scans = z306_childgate.get(&pid).copied().unwrap_or(0);
                         if scans >= z306_childgate_scan_cap {
                             z306_childgate.remove(&pid);
                             log(&format!(
-                                "6-Z306c: child gate window closed for pid={} after {} scanned ENTRYs",
+                                "6-Z306f: child gate window closed for pid={} after {} scanned ENTRYs",
                                 pid, scans
                             ));
                         } else {
                             z306_childgate.insert(pid, scans + 1);
-                            // 6-Z306c-v2: name every open/openat path in
-                            // the window — the #161 wall was a RAW (hook-
-                            // bypassing) open; this names it verbatim.
-                            // 6-Z306e: an open of /proc/self/fd IS the
-                            // whitelist check's opendir — run the
-                            // AGGRESSIVE sweep right here (before the
-                            // readdir) so the listing is clean; the
-                            // trigger re-fires on each restored open()
-                            // until the table is clean (idempotent).
+                            // Name every open/openat path in the window
+                            // (bounded) — names raw openers verbatim.
+                            // 6-Z306f: an open of /proc/self/fd IS the
+                            // whitelist check's opendir — audit the table
+                            // right there (log-only) so the artifact shows
+                            // exactly what the check will see.
                             let mut opendir_trigger = false;
                             if (abi.openat != -1 && syscall_num == abi.openat)
                                 || (abi.open != -1 && syscall_num == abi.open)
@@ -17077,77 +17074,81 @@ pub fn run_ptrace_loop(
                                         p,
                                         scans + 1,
                                         if opendir_trigger {
-                                            " — CHECK OPENDIR: aggressive sweep"
+                                            " — CHECK OPENDIR: audit"
                                         } else {
                                             ""
                                         }
                                     ));
                                 }
-                            }
-                            let leaked = if opendir_trigger {
-                                z306_scan_sweep_fds(pid, rootfs, &rootfs_canonical, true)
-                            } else {
-                                // Per-ENTRY: the narrow preload-transient
-                                // families only (never mid-flight after
-                                // preload) — svclog fds are handled by the
-                                // fork gate + the opendir trigger, so a
-                                // transient /dev/null-redirect fd can't be
-                                // closed mid-write.
-                                z306_scan_sweep_fds(pid, rootfs, &rootfs_canonical, false)
-                            };
-                            if leaked.is_empty() {
-                                static Z306C_CLEAN_LOGGED: std::sync::atomic::AtomicU64 =
-                                    std::sync::atomic::AtomicU64::new(0);
-                                if Z306C_CLEAN_LOGGED
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    < 6
-                                {
-                                    log(&format!(
-                                        "6-Z306c: child gate scan #{} — pid={} clean (sweep continues)",
-                                        scans + 1, pid
-                                    ));
-                                }
-                            } else {
-                                let done = z306_budget.entry(pid).or_insert(0);
-                                if *done >= z306_budget_cap {
-                                    static Z306C_CAP_LOGGED: std::sync::atomic::AtomicU64 =
-                                        std::sync::atomic::AtomicU64::new(0);
-                                    if Z306C_CAP_LOGGED
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                        < 4
+                                // ── 6-Z306f: the HYPHEN/FONTS open DENY ──
+                                //
+                                // The #161 wall: the child RAW-OPENED
+                                // hyph-as.hyb (a hook-bypassing open) and
+                                // the fd survived to the whitelist check.
+                                // Instead of closing (the injection is
+                                // broken — #163), the open itself is
+                                // DENIED with the PROVEN 6-Z185 pattern:
+                                // rewrite the syscall to getpid (the
+                                // kernel runs a harmless getpid) and fake
+                                // -ENOENT at EXIT. HONEST semantics: the
+                                // guest sees exactly what a missing file
+                                // looks like — Hyphenator.init catches the
+                                // IOException and skips the locale, the
+                                // same path AOSP already takes for
+                                // hyph-af.hyb which ships absent. The fd
+                                // NEVER EXISTS, so nothing can leak to the
+                                // whitelist.
+                                if let Some(pp) = &p {
+                                    if pp.starts_with("/system/fonts/")
+                                        || pp.starts_with("/system/usr/hyphen-data/")
                                     {
-                                        log(&format!(
-                                            "6-Z306c: budget cap {} reached for child pid={} — proceeding with leaks {:?}",
-                                            z306_budget_cap, pid, leaked
-                                        ));
-                                    }
-                                } else {
-                                    let fd0 = leaked[0];
-                                    *done += 1;
-                                    let closes_done = *done;
-                                    log(&format!(
-                                        "6-Z306c: child gate — pid={} (scan #{}) leaks={:?} — injecting close({})",
-                                        pid, scans + 1, leaked, fd0
-                                    ));
-                                    let gate = Z306ForkGate {
-                                        saved: regs,
-                                        fd: fd0,
-                                        closes_done,
-                                    };
-                                    let mut r = regs;
-                                    set_syscall_num(&mut r, &abi, abi.close_nr);
-                                    set_syscall_arg(&mut r, abi.reg_arg1, fd0 as u64);
-                                    match ptrace_setregs(pid, &r, iov_len) {
-                                        Ok(()) => {
-                                            z306_forkgate.insert(pid, gate);
-                                        }
-                                        Err(e) => {
+                                        static Z306F_DENY_LOGGED: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        let dn = Z306F_DENY_LOGGED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if dn < 16 {
                                             log(&format!(
-                                                "6-Z306c: setregs FAILED pid={} ({}) — syscall proceeds with the leak",
-                                                pid, e
+                                                "6-Z306f: child open DENIED (whitelist-leak class) pid={} path={:?} → getpid rewrite, -ENOENT at exit",
+                                                pid, pp
                                             ));
                                         }
+                                        let mut r = regs;
+                                        set_syscall_num(&mut r, &abi, abi.getpid);
+                                        match ptrace_setregs(pid, &r, iov_len) {
+                                            Ok(()) => {
+                                                pending_sandbox_deny.insert(pid, -2);
+                                            }
+                                            Err(e) => {
+                                                log(&format!(
+                                                    "6-Z306f: deny setregs FAILED pid={} ({}) — open proceeds",
+                                                    pid, e
+                                                ));
+                                            }
+                                        }
                                     }
+                                }
+                            }
+                            // Audit-only scans (bounded): the aggressive
+                            // classifier at the opendir trigger, the narrow
+                            // families per-ENTRY — naming whatever remains.
+                            let leaks = if opendir_trigger {
+                                z306_audit_fds(pid, rootfs, &rootfs_canonical)
+                            } else {
+                                z306_audit_fds_narrow(pid)
+                            };
+                            if !leaks.is_empty() {
+                                static Z306C_LEAK_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z306C_LEAK_LOGGED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    < 16
+                                {
+                                    log(&format!(
+                                        "6-Z306f: child gate AUDIT — pid={} (scan #{}) non-whitelisted fds: {}",
+                                        pid,
+                                        scans + 1,
+                                        leaks.join(" | ")
+                                    ));
                                 }
                             }
                         }
@@ -17163,81 +17164,34 @@ pub fn run_ptrace_loop(
                     // which would otherwise rewrite an injected close(0)
                     // back to getpid and defeat the sweep.
                     //
-                    // Placement contract: z306_forkgate MUST be empty here
-                    // (the EXIT arm removes the entry before the restored
-                    // clone re-enters as a fresh ENTRY stop). The restore
-                    // at EXIT re-aims the same svc instruction, the clone
-                    // re-executes, the gate re-scans, and either injects
-                    // the next leaked fd or lets the fork pass clean.
-                    if !z306_forkgate.contains_key(&pid)
-                        && z305y_stdio_pin_pid == Some(pid)
-                        && abi.close_nr != -1
-                        && syscall_num == abi.clone_nr
-                    {
+                    if z305y_stdio_pin_pid == Some(pid) && syscall_num == abi.clone_nr {
                         let clone_flags = get_syscall_arg(&regs, abi.reg_arg1);
                         if z306_flags_are_process_fork(clone_flags) {
-                            // 6-Z306e: AGGRESSIVE sweep at the fork —
-                            // every fd the stock A11 whitelist would
-                            // reject is closed (fork = a quiescent point;
-                            // no transient can be mid-flight).
-                            let leaked = z306_scan_sweep_fds(pid, rootfs, &rootfs_canonical, true);
-                            if leaked.is_empty() {
-                                // Clean pass-through — reset this pid's
-                                // close budget.
-                                z306_budget.remove(&pid);
-                                static Z306_CLEAN_LOGGED: std::sync::atomic::AtomicU64 =
+                            // 6-Z306f: PASSIVE audit at the fork gate. The
+                            // #163 run proved the regs-hijack injection at
+                            // a clone ENTRY does not take on aarch64 (the
+                            // kernel executed the clone with its original
+                            // regs — "close(6) done ret=Some(3160)" = the
+                            // fork's own return), so the gate no longer
+                            // injects. The leak classes are instead fixed
+                            // at their SOURCES: svclog fds via the
+                            // zygote-lineage redirect exemption (6-Z306g),
+                            // hyphen/fonts opens via the 6-Z185-style deny
+                            // in the child gate. This audit names any
+                            // residual non-whitelisted fd (with its
+                            // target!) for the next wall.
+                            let leaks = z306_audit_fds(pid, rootfs, &rootfs_canonical);
+                            if !leaks.is_empty() {
+                                static Z306_LEAK_LOGGED: std::sync::atomic::AtomicU64 =
                                     std::sync::atomic::AtomicU64::new(0);
-                                if Z306_CLEAN_LOGGED
+                                if Z306_LEAK_LOGGED
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    < 12
+                                    < 8
                                 {
                                     log(&format!(
-                                        "6-Z306: fork gate clean — pid={} clone(flags={:#x}) leaks=0 (fork proceeds)",
-                                        pid, clone_flags
+                                        "6-Z306f: fork gate AUDIT — pid={} clone(flags={:#x}) non-whitelisted fds: {}",
+                                        pid, clone_flags, leaks.join(" | ")
                                     ));
-                                }
-                            } else {
-                                let done = z306_budget.entry(pid).or_insert(0);
-                                if *done >= z306_budget_cap {
-                                    static Z306_CAP_LOGGED: std::sync::atomic::AtomicU64 =
-                                        std::sync::atomic::AtomicU64::new(0);
-                                    if Z306_CAP_LOGGED
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                        < 4
-                                    {
-                                        log(&format!(
-                                            "6-Z306: budget cap {} reached for pid={} — fork proceeds with leaks {:?}",
-                                            z306_budget_cap, pid, leaked
-                                        ));
-                                    }
-                                } else {
-                                    let fd0 = leaked[0];
-                                    *done += 1;
-                                    let closes_done = *done;
-                                    log(&format!(
-                                        "6-Z306: fork gate — pid={} clone(flags={:#x}) leaks={:?} — injecting close({}) (round {})",
-                                        pid, clone_flags, leaked, fd0, closes_done
-                                    ));
-                                    let gate = Z306ForkGate {
-                                        saved: regs,
-                                        fd: fd0,
-                                        closes_done,
-                                    };
-                                    let mut r = regs;
-                                    set_syscall_num(&mut r, &abi, abi.close_nr);
-                                    set_syscall_arg(&mut r, abi.reg_arg1, fd0 as u64);
-                                    match ptrace_setregs(pid, &r, iov_len) {
-                                        Ok(()) => {
-                                            z306_forkgate.insert(pid, gate);
-                                        }
-                                        Err(e) => {
-                                            log(&format!(
-                                                "6-Z306: setregs FAILED pid={} ({}) — clone proceeds with the leak",
-                                                pid, e
-                                            ));
-                                            z306_budget.remove(&pid);
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -21598,6 +21552,9 @@ pub fn run_ptrace_loop(
                                 if path == "/dev/null"
                                     && !boot_recovery
                                     && pid != init_pid
+                                    // 6-Z306g: zygote-lineage exemption —
+                                    // see the arming site comment.
+                                    && !z306_zygote_lineage.contains(&pid)
                                     && svclog_redirects < SVCLOG_REDIRECT_CAP
                                 {
                                     let open_flags = if syscall_num == abi.open {
@@ -24430,43 +24387,6 @@ pub fn run_ptrace_loop(
                 } else {
                     // ── Syscall EXIT ──
                     in_syscall = false;
-
-                    // ── 6-Z306: the injected preload-leak close() returned —
-                    // restore the stashed clone ENTRY regs ──
-                    //
-                    // Runs FIRST in the EXIT branch (before every other
-                    // interposer): the stop being processed here is the
-                    // close(fd) we injected at the fork gate (the kernel's
-                    // definitive phase — 6-Z68 — classified it as EXIT; the
-                    // parity flag independently agrees since the ENTRY arm
-                    // set in_syscall=true for it). Restoring the SAVED regs
-                    // wholesale re-aims the ORIGINAL svc instruction (pc was
-                    // stashed pointing at it), so the loop-top PTRACE_SYSCALL
-                    // re-executes the clone; its fresh ENTRY stop re-enters
-                    // the gate above, which re-scans and either injects the
-                    // next leaked fd or lets the fork pass clean.
-                    if let Some(gate) = z306_forkgate.remove(&pid) {
-                        let mut regs_done: Regs = unsafe { std::mem::zeroed() };
-                        let close_ret = match ptrace_getregs_wide(pid, &mut regs_done) {
-                            Ok(_) => Some(get_syscall_arg(&regs_done, abi.reg_ret) as i64),
-                            Err(_) => None,
-                        };
-                        let regs_r = gate.saved;
-                        match ptrace_setregs(pid, &regs_r, iov_len) {
-                            Ok(()) => {
-                                log(&format!(
-                                    "6-Z306: close({}) done ret={:?} — clone regs restored (closes_done={}) — fork re-enters the gate",
-                                    gate.fd, close_ret, gate.closes_done
-                                ));
-                            }
-                            Err(e) => {
-                                log(&format!(
-                                    "6-Z306: RESTORE setregs FAILED pid={} ({}) — the fork will NOT re-execute correctly; state lost",
-                                    pid, e
-                                ));
-                            }
-                        }
-                    }
 
                     // ── Security fix 6-Z185: consume a pending sandbox DENY ──
                     //
@@ -33742,34 +33662,40 @@ fn z306_flags_are_process_fork(flags: u64) -> bool {
     (flags & Z306_SIGCHLD) != 0 && (flags & Z306_SHARE_MASK) == 0
 }
 
-/// 6-Z306: scan the REAL kernel fd table of `pid` (host-side /proc —
-/// the same hook-proof source the 6-Z305t-14b STALL-FD probe reads).
-/// `aggressive` = the fork/opendir sweep: close every fd the stock A11
-/// whitelist would reject (fd 0/1/2 are whitelist-skipped stdio and are
-/// never touched). Non-aggressive = the narrow preload-transient
-/// families only (safe against mid-flight transients). Sorted ascending
-/// so the gate closes the LOWEST leaked fd first (stable, observable
-/// order in the artifact).
-fn z306_scan_sweep_fds(
-    pid: libc::pid_t,
-    rootfs: &str,
-    rootfs_canonical: &str,
-    aggressive: bool,
-) -> Vec<i64> {
+/// 6-Z306f: AUDIT the REAL kernel fd table of `pid` (host-side /proc —
+/// the same hook-proof source the 6-Z305t-14b STALL-FD probe reads) and
+/// return formatted "fd N -> guest-path" strings for every fd the stock
+/// A11 whitelist would reject. LOG-ONLY: the injection was removed after
+/// #163 proved the clone-entry regs-hijack does not take on aarch64; the
+/// leak classes are fixed at their sources instead. Bounded to fds
+/// 3..=64 (0/1/2 are whitelist-skipped stdio).
+pub fn z306_audit_fds(pid: libc::pid_t, rootfs: &str, rootfs_canonical: &str) -> Vec<String> {
     let mut out = Vec::new();
     for fd in 3..=64i64 {
         if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
             let t = target.to_string_lossy().to_string();
-            let needs_close = if aggressive {
-                matches!(
-                    z306_fd_target_class(&t, rootfs, rootfs_canonical),
-                    Some(true)
-                )
-            } else {
-                z306_fd_target_is_preload_leak(&t)
-            };
-            if needs_close {
-                out.push(fd);
+            if matches!(
+                z306_fd_target_class(&t, rootfs, rootfs_canonical),
+                Some(true)
+            ) {
+                let guest =
+                    strip_guest_prefix(&t, rootfs, rootfs_canonical).unwrap_or_else(|| t.clone());
+                out.push(format!("fd {} -> {}", fd, guest));
+            }
+        }
+    }
+    out
+}
+
+/// 6-Z306f: the per-ENTRY narrow audit — the preload-transient families
+/// only (fonts + hyphen-data), formatted like z306_audit_fds.
+pub fn z306_audit_fds_narrow(pid: libc::pid_t) -> Vec<String> {
+    let mut out = Vec::new();
+    for fd in 3..=64i64 {
+        if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
+            let t = target.to_string_lossy().to_string();
+            if z306_fd_target_is_preload_leak(&t) {
+                out.push(format!("fd {} -> {}", fd, t));
             }
         }
     }
