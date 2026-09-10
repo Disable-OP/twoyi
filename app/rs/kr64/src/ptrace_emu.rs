@@ -20915,12 +20915,24 @@ pub fn run_ptrace_loop(
                             // 6-Z306y-b: SKIP mprotect — the #192 trail came
                             // back 32× mprotect (the C++ exit teardown's
                             // __cxa_finalize region sweep buries the real
-                            // tail). Recording everything EXCEPT mprotect
-                            // keeps the last 32 ENTRIES the meaningful
-                            // syscalls (binder ioctls, dexopt reply, writes,
-                            // closes) that immediately preceded the sweep.
+                            // tail). 6-Z306y-d: SKIP munmap(215)/madvise(233)
+                            // too — #194's trail after the "Shutdown thread"
+                            // rename was 24× munmap + madvise + closes (the
+                            // teardown sweeps differ per boot), so the last
+                            // 32 ENTRIES are the meaningful syscalls only.
+                            // aarch64: munmap=215, madvise=233 (asm-generic;
+                            // x86_64/i386 numbers differ but those ABIs are
+                            // not the ladder guests — filtering by the
+                            // aarch64 numbers is correct for the fork-child
+                            // trail's only real consumer).
+                            const Z306Y_TEARDOWN_MPROTECT: i64 = 226;
+                            const Z306Y_TEARDOWN_MUNMAP: i64 = 215;
+                            const Z306Y_TEARDOWN_MADVISE: i64 = 233;
                             if z306_zygote_fork_children.contains(&pid)
                                 && syscall_num != abi.mprotect_nr
+                                && syscall_num != Z306Y_TEARDOWN_MPROTECT
+                                && syscall_num != Z306Y_TEARDOWN_MUNMAP
+                                && syscall_num != Z306Y_TEARDOWN_MADVISE
                             {
                                 let trail = z306y_trail.entry(pid).or_insert_with(|| {
                                     std::collections::VecDeque::with_capacity(32)
