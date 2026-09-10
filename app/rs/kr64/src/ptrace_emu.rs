@@ -20203,19 +20203,36 @@ pub fn run_ptrace_loop(
                                                 );
                                                 let addr306o = get_syscall_arg(&regs, abi.reg_arg3);
                                                 let len306o = get_syscall_arg(&regs, abi.reg_arg4);
-                                                let want = (len306o as usize).clamp(1, 128).max(1);
+                                                // #174 lesson: the VMA covers bionic's
+                                                // abort_msg_t block — a small HEADER
+                                                // (magic/size fields) followed by the
+                                                // message string, so the read at addr+0
+                                                // looked EMPTY (NUL in the first byte
+                                                // the string-scan hit). Dump the first
+                                                // 96 bytes HEX-ESCAPED (printables kept)
+                                                // so the offline decode sees the exact
+                                                // layout AND the string.
+                                                let want = (len306o as usize).clamp(8, 96).max(8);
                                                 let content = read_child_bytes(pid, addr306o, want)
                                                     .map(|b| {
-                                                        let e = b
-                                                            .iter()
-                                                            .position(|&c| c == 0)
-                                                            .unwrap_or(b.len());
-                                                        String::from_utf8_lossy(&b[..e])
-                                                            .replace('\n', " ")
+                                                        let mut s = String::new();
+                                                        for &c in b.iter().take(96) {
+                                                            if c == 0 {
+                                                                s.push_str("\\0");
+                                                            } else if (0x20..0x7f).contains(&c) {
+                                                                s.push(c as char);
+                                                            } else {
+                                                                s.push_str(&format!(
+                                                                    "\\x{:02x}",
+                                                                    c
+                                                                ));
+                                                            }
+                                                        }
+                                                        s
                                                     })
                                                     .unwrap_or_else(|| "<unreadable>".to_string());
                                                 log(&format!(
-                                                    "6-Z306o abort-message pid={} len={:#x} content='{}'",
+                                                    "6-Z306o abort-message pid={} len={:#x} block='{}'",
                                                     pid, len306o, content
                                                 ));
                                             }
