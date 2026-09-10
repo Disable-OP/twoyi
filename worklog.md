@@ -27531,3 +27531,18 @@ Work Log:
 
 Stage Summary:
 - The whitelist wall now has three layers: parent fork gate + continuous child sweep + raw-opener naming. #162 in flight; if it still aborts, the 6-Z306c open-path log names the opener verbatim.
+
+---
+Task ID: 10
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladder #162, replace the narrow leak filter with the A11-whitelist classifier (6-Z306e), dispatch #163.
+
+Work Log:
+- #162 (f450a30): the continuous child sweep WORKED — 256 scans clean, the hyphen leak never appeared, "Not whitelisted" = 0 in the merged kr64 logs. But the wall MOVED: the ZYGOTE's own svc log held "Not whitelisted (28): /dev/twoyi-svclogs/svc-2937.log" — fd 28 = a FOREIGN svc-log file (2937 = an unrelated app_process exec), invisible to the fonts/hyphen family filter.
+- Structural insight: the 6-Z305t-24 /dev/null write-side redirect lands in guest-visible /dev/twoyi-svclogs paths; ANY svclog fd in the zygote's table at fork is whitelist-fatal. Chasing each family individually is unbounded (the leak evolves each run).
+- 6-Z306e (ef35876): classify each translated fd target like the AOSP A11 FileDescriptorWhitelist (allow-exact: /dev/null /dev/urandom /dev/random /dev/ion /dev/tty; allow-prefix: /dev/socket/ /dev/__properties__ /system/framework/ /system/app/ /system/priv-app/ /vendor/* /apex/ /data/dalvik-cache/ /oem/ /odm/ /product/; skip kernel objects: socket:[/pipe:[/anon_inode:[ and /proc handles). The PARENT fork gate now sweeps aggressively (fork = quiescent); the CHILD gate gains an opendir("/proc/self/fd") trigger (that open IS the whitelist check — aggressive sweep before the readdir, idempotent rounds); per-ENTRY child sweeps stay narrow (fonts/hyphen only) so transient /dev/null-redirect fds are never closed mid-write.
+- Restored z306_flags_are_process_fork (dropped in the block rewrite); +2 classifier tests; 825/825 green.
+- Pushed ef35876; dispatched #163 (id 34435871820).
+
+Stage Summary:
+- The whitelist wall is now covered by the stock-semantics classifier at three points (fork gate, child window, check-moment opendir trigger). #163 in flight; the next expected wall = whatever system_server hits AFTER a clean fork (binder cap already raised to 512).
