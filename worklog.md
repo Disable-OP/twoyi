@@ -27599,3 +27599,19 @@ Work Log:
 
 Stage Summary:
 - The svclog leak chain is fully closed at the source (group-wide exemption incl. threads). The hyphen/fonts deny is now thread-aware. EXPECTED NEXT WALL for #168: the INHERITED /system/etc/preloaded-classes fd (fd 28 at fork — an exec-time zygote leak, named verbatim by the audit). Fixing it needs either (a) understanding why the reader's kernel-level close never runs (suspect: the tracer's served-open close semantics swallow the tracee-side close), or (b) solving the entry-stop syscall-rewrite mystery (the 6-Z305y pin rewrites appear never to take on this aarch64 kernel).
+
+---
+Task ID: 15
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladder #168; close out the session with the handoff state.
+
+Work Log:
+- #168 (2dac1f8): STILL "Not whitelisted (29): hyph-as.hyb" with 0 lineage-deny hits — the thread-aware deny did not catch the child's raw hyph open. Candidate causes for the next session: (a) the deny block sits behind an earlier interposer's `continue` in the ENTRY branch; (b) the open executes on a stop context the ENTRY branch gates differently (arm32 path, past_first_execve gating, or a child-switch shadow); (c) the path read raced the ENTRY registers. The fastest next probe: log EVERY open/openat path for lineage tids UNGATED by the childgate window (the current open-naming is window-capped and the hyph open happens past it).
+- The fork-gate audit remains the ground truth: at fork the zygote table holds ONLY the preloaded-classes leak (fd 28/29 varies) — the svclog class is fully closed (thread-aware redirect exemption verified across #166-#168), the binder cap holds.
+- Runs dispatched this session: #160-#168 (9 ladder runs), commits e79c5d0..2dac1f8 (+worklog commits), every wall decoded verbatim from raw artifacts.
+
+Stage Summary / HANDOFF:
+1. FIXED THIS SESSION: svclog-fd leak class (source: 6-Z305t-24 redirect hitting zygote/child/thread tables — now group-wide exempt via tgid-aware lineage), binder conn cap 64→512, fork-time fd audits (fd->path naming), /dev/pmsg0+/dev/alarm whitelist correctness, removal of the broken clone-entry injection (proven inert on aarch64).
+2. OPEN — hyphen/fonts raw-open deny: the 6-Z306f deny exists but did not fire in #167/#168 (see candidate causes above). The deny primitive itself (6-Z185 getpid-rewrite + fake -ENOENT) is the right shape; its REACH needs one debug iteration (ungated per-tid open-path logging is the next move).
+3. OPEN — inherited /system/etc/preloaded-classes fd (fd 28/29 at fork, named verbatim by the audit): an exec-time zygote leak the deny cannot fix (inherited, not opened by the child). Two candidate fixes: (a) the tracer's served-open close semantics (does a served fd's tracee-side close actually close?), (b) why entry-stop syscall-number rewrites never take on this kernel (the 6-Z305y pin's rewrites appear equally inert — that single primitive unblocks close-at-fork for ALL classes).
+4. After the whitelist passes: system_server runs with the raised binder cap; the next expected walls are SystemServer's service starts (rung 6 evidence = system_server in the guest ps subtree).
