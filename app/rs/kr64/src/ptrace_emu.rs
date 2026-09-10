@@ -20738,11 +20738,19 @@ pub fn run_ptrace_loop(
                             // Dump the svclog tail here (once per pid,
                             // 1.5 KiB, UTF-8-safe truncation).
                             if nr == abi.exit_group_nr {
-                                let comm306s =
-                                    std::fs::read_to_string(format!("/proc/{}/comm", pid))
-                                        .map(|c| c.trim_end().to_string())
-                                        .unwrap_or_default();
-                                if comm306s == "system_server" {
+                                // #187 lesson: the main thread RENAMES itself
+                                // to "Shutdown thread" while running the Java
+                                // shutdown sequence, so comm != "system_server"
+                                // at the exit stop. The identity that survives
+                                // is the cmdline (--start-system-server is a
+                                // zygote-spawn flag only system_server has).
+                                let is_ss306s = {
+                                    let cl =
+                                        std::fs::read_to_string(format!("/proc/{}/cmdline", pid))
+                                            .unwrap_or_default();
+                                    cl.contains("start-system-server")
+                                };
+                                if is_ss306s {
                                     static SS_EXIT_DUMPED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
                                     if SS_EXIT_DUMPED
