@@ -27615,3 +27615,19 @@ Stage Summary / HANDOFF:
 2. OPEN — hyphen/fonts raw-open deny: the 6-Z306f deny exists but did not fire in #167/#168 (see candidate causes above). The deny primitive itself (6-Z185 getpid-rewrite + fake -ENOENT) is the right shape; its REACH needs one debug iteration (ungated per-tid open-path logging is the next move).
 3. OPEN — inherited /system/etc/preloaded-classes fd (fd 28/29 at fork, named verbatim by the audit): an exec-time zygote leak the deny cannot fix (inherited, not opened by the child). Two candidate fixes: (a) the tracer's served-open close semantics (does a served fd's tracee-side close actually close?), (b) why entry-stop syscall-number rewrites never take on this kernel (the 6-Z305y pin's rewrites appear equally inert — that single primitive unblocks close-at-fork for ALL classes).
 4. After the whitelist passes: system_server runs with the raised binder cap; the next expected walls are SystemServer's service starts (rung 6 evidence = system_server in the guest ps subtree).
+
+---
+Task ID: 16
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladder #168, fix the zygote hyphen-open fd-0 theft + deadlock trigger, dispatch #169.
+
+Work Log:
+- #168 decode (rung 7 SURFACEFLINGER, SF+gralloc+composer ALIVE — the opengles pipe and libdrm walls are GONE; 0 'Unknown format' hits; stderr down to 74MB): the wall moved to the ZYGOTE. main (pid 2883) futex-hung at +151s (wchan=futex_do_wait, bionic mutex word=2) and NEVER forked system_server. 6-Z285 BT at the stall: libc++.so → libartbase → libbase → liblog → libtwoyi_loader_shlib+0x1b98/+0x4634 — the deadlock path goes through the INTERPOSER's own log chain, entered during the preload's hyphen stage.
+- fd 0 = hyph-as.hyb in the zygote's STALL-FD: the zygote's OWN hyphen open stole the freed stdio slot fd 0; the 6-Z305y close(0)→getpid stdio-floor pin then kept that fd alive forever (inherited-by-every-fork leak). The 6-Z306f persistent deny had 0 hits because it EXEMPTED the pin pid.
+- #167 comparison: the SAME stall signature (futex_do_wait at +150.5s, fd 0 = hyph-as.hyb, daemon cascade at +13.2-13.6s) — NOT a regression from the thread-aware-deny commit.
+- ALSO decoded: the 4 ART daemon threads (HeapTask/ReferenceQueue/Finalizer/FinalizerWatchdog per PR_SET_VMA anames) ALL exited exit-code-0 at +13.7s with ZERO visible syscalls in BOTH #167 and #168 — a deterministic Java-level death, cause still unknown; if one died holding the log mutex, that IS the deadlock (2948's exit at +150.96s preceded main's hang by 0.24s).
+- Fixes: 6-Z306f-c2 (df72552) — the persistent hyphen-data deny now covers the PIN PID too (fonts still allowed for the zygote's preload; children deny both). 6-Z306i (same commit) — the stall dump reads the bionic mutex bytes and validates owner_tid candidates (+8 LP64/+4 32-bit) against /proc/<pid>/task/<tid>: ALIVE owner → comm+wchan (userspace-spinner suspect), DEAD owner → abandoned-mutex proof. 6-Z305t-75d (df4123b) — the shlib stdin watchdog repairs fd 0/1/2 BEFORE its first sleep, closing the slot-0 race the hyph open won. 825/825 tests, clippy/fmt clean.
+- Dispatched #169 on df4123b.
+
+Stage Summary:
+- The deny now reaches the zygote's own preload (the fd-0 theft path is closed at BOTH layers); the next stall will NAME its mutex owner. Open walls: (1) the ART daemon cascade death (deterministic, unexplained — the likely mutex-holder origin); (2) if the owner probe shows DEAD, the fix is owner-died recovery or removing the exit-holding path; (3) the deny's getpid rewrite relies on entry-stop rewrites that a worklog note claims 'never take' on this kernel — if hyph opens STILL land in the fd table, that primitive is the next decode target.
