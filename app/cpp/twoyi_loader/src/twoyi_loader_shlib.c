@@ -4213,6 +4213,27 @@ int selinux_android_setcontext_raw(uid_t uid, int isSystemServer,
     return 0;
 }
 
+// 6-Z306r-b (#184 decode): selinux_android_setcon — the NEXT line after
+// setcontext in SpecializeCommon (Zygote.cpp:1799). The forked
+// system_server cleared setcontext (6-Z306r) and died here:
+//   'JNI FatalError called: (system_server) frameworks/base/core/jni/
+//    com_android_internal_os_Zygote.cpp:1799:
+//    selinux_android_setcon(u:r:system_server:s0)'
+// setcon writes the domain to /sys/fs/selinux/context — the same
+// emulated-selinuxfs gap as 6-Z306r. Fake it identically (bounded log).
+int selinux_android_setcon(const char *context) {
+    static int logged;
+    if (logged < 4) {
+        logged++;
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] 6-Z306r-b selinux_android_setcon(%s) → faked 0 (no enforcing SELinux in the emulated env)\n",
+            context ? context : "(null)");
+        write_str(2, msg);
+    }
+    return 0;
+}
+
 // NOTE: selinux_android_setfilecon already exists below (the older
 // (path, seinfo, uid) libselinux variant) — do NOT redefine it here.
 
