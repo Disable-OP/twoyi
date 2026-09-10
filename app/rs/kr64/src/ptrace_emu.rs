@@ -6569,6 +6569,51 @@ fn maps_bracket_in(content: &str, addr: u64) -> String {
     "(address beyond the last mapping)".to_string()
 }
 
+/// 6-Z306o-c: read a dying process's bionic abort message from the
+/// `[anon:abort message]`-named VMA and return it as a printable,
+/// hex-escaped string.
+///
+/// WHY THIS HOOK POINT: bionic's android_set_abort_message mmaps the
+/// block, prctl(PR_SET_VMA,…,"abort message") NAMES it, and only then
+/// copies the message in (ladder #175 proved the ENTRY-time read of the
+/// named block is all zeros). By the time the fatal signal stops the
+/// process, the block is fully written — and the host kernel (6.x)
+/// exposes VMA names in /proc/<pid>/maps as `[anon:<name>]`, so the
+/// address needs no prctl interception at all. Capped at 192 bytes;
+/// NUL → `\0`, printable kept, other bytes `\xNN`.
+fn read_abort_message_vma(pid: libc::pid_t) -> Option<String> {
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
+    let mut range: Option<(u64, u64)> = None;
+    for line in maps.lines() {
+        if !line.contains("[anon:abort message]") {
+            continue;
+        }
+        // "start-end perms offset dev inode path" — take the first hit.
+        let dash = line.find('-')?;
+        let space = line.find(' ')?;
+        let start = u64::from_str_radix(&line[..dash], 16).ok()?;
+        let end = u64::from_str_radix(&line[dash + 1..space], 16).ok()?;
+        if end > start {
+            range = Some((start, end));
+        }
+        break;
+    }
+    let (start, end) = range?;
+    let want = ((end - start) as usize).clamp(8, 192);
+    let bytes = read_child_bytes(pid, start, want)?;
+    let mut s = String::new();
+    for &c in bytes.iter() {
+        if c == 0 {
+            s.push_str("\\0");
+        } else if (0x20..0x7f).contains(&c) {
+            s.push(c as char);
+        } else {
+            s.push_str(&format!("\\x{:02x}", c));
+        }
+    }
+    Some(s)
+}
+
 /// Read exactly `len` bytes from the traced child's memory starting at
 /// `addr`, using `PTRACE_PEEKDATA` in word-sized chunks. Returns `None`
 /// if the very first PEEK fails (EIO / unmapped address); returns a
@@ -33520,6 +33565,30 @@ pub fn run_ptrace_loop(
                     nr: 0,
                 });
                 log(&format!("forwarding signal {} to child", sig));
+
+                // ── 6-Z306o-c: abort-message VMA dump on SIGABRT ──
+                // The #173/#174/#175 chain: ~44 service aborts whose
+                // strings never reached the log (DIAG LOGFATAL headers
+                // only; crash_dump can't exec → no tombstones). By the
+                // signal-stop the bionic abort-message VMA is fully
+                // written; read it from /proc/<pid>/maps and PEEK.
+                // Caps: 64 per run (a crash-loop can re-abort fast).
+                if sig == 6 {
+                    static ABORT_VMA_DUMPS: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    if ABORT_VMA_DUMPS.load(std::sync::atomic::Ordering::Relaxed) < 64 {
+                        ABORT_VMA_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match read_abort_message_vma(pid) {
+                            Some(msg) => {
+                                log(&format!("6-Z306o-c abort-vma pid={} msg='{}'", pid, msg))
+                            }
+                            None => log(&format!(
+                                "6-Z306o-c abort-vma pid={} msg=<no abort-message VMA>",
+                                pid
+                            )),
+                        }
+                    }
+                }
 
                 // For SIGSEGV (signal 11), log the crash address and
                 // instruction pointer via PTRACE_GETSIGINFO. This helps
