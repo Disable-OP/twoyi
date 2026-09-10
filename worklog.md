@@ -27631,3 +27631,17 @@ Work Log:
 
 Stage Summary:
 - The deny now reaches the zygote's own preload (the fd-0 theft path is closed at BOTH layers); the next stall will NAME its mutex owner. Open walls: (1) the ART daemon cascade death (deterministic, unexplained — the likely mutex-holder origin); (2) if the owner probe shows DEAD, the fix is owner-died recovery or removing the exit-holding path; (3) the deny's getpid rewrite relies on entry-stop rewrites that a worklog note claims 'never take' on this kernel — if hyph opens STILL land in the fd table, that primitive is the next decode target.
+
+---
+Task ID: 17
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladder #169 (deny fires; owner probe read), root-cause the futex deadlock, dispatch #170.
+
+Work Log:
+- #169: 6-Z306f-c2 WORKS (hyph-*.hyb denied for the pin pid at +15.9s) but the zygote STILL futex-hung at +150.6s on the IDENTICAL BT (shlib+0x1b98/+0x4634 → liblog → libbase → libartbase → libc++). 6-Z306i read the mutex bytes: 02 00..00 00..00 — a NORMAL bionic mutex records NO owner tid, so the probe can't name the holder for word=1/2 mutexes (kept for PI/robust words).
+- KEY decode: the interposer's write_str had a THIRD leg — dlsym(RTLD_DEFAULT,"__android_log_write") on EVERY line — AND opened/closed /data/local/tmp/twoyi-loader.log per line through its own GOT-patched open hooks. Any open inside liblog's internals re-enters write_str → the ART/libbase log mutex is a NON-recursive std::mutex → SELF-deadlock with the holder = our own thread, owner never recorded (matches the all-zero probe). The same word=2 signature hit sensors multihal (3666, libutils BT) independently; it SIGSEGV'd at +49.8s (non-critical HAL).
+- 6-Z306j (a6896fc): write_str now does fd-2 svclog + tmp-log ONLY (the __android_log_write leg removed — every line already reaches the artifacts via svclog) + a __thread re-entry guard degrading re-entrant calls to the raw fd write. Guest-native log traffic (hook-forwarded) untouched. Verified the only remaining shlib→liblog edges are the designed forwarding hooks.
+- Dispatched #170 on a6896fc.
+
+Stage Summary:
+- If #170 clears the +150s wall, the zygote should reach runSelectLoop and fork system_server (rung 8 territory). If a word=2 hang RETURNS at a new site, it is guest-native (not interposer) and needs the 6-Z306j /proc thread census (state/wchan/syscall per sibling) as the next probe. Open walls: ART daemon cascade death (deterministic, still unexplained — possibly benign for boot if the zygote proceeds), sensors multihal self-deadlock.
