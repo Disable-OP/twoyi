@@ -27517,3 +27517,17 @@ Stage Summary:
 - The whitelist wall now has BOTH layers covered: parent gate (fork-time leak) + child gate (fork-instantaneous transient) + the binder cap raised (the next wall for a surviving system_server).
 - #161 in flight. Success signals: "6-Z306c: child gate clean" + system_server ALIVE in the guest ps subtree + rung 6 SYSTEM_SERVER in result.json; watch for the media family no longer crash-looping on binder.
 - Risks: if the child's leak re-opens after the child-gate disarms (a raw open post-fork pre-check not seen by hooks), the artifact's 6-Z306c lines will show clean-then-reject timing and the gate window must widen; the abort-path futex wedge remains the fallback signature for ANY future fatal.
+
+---
+Task ID: 9
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladder #161 (first child-gate run), convert the child gate to a continuous sweep, dispatch #162.
+
+Work Log:
+- #161 (930bf70): the child gate FIRED and scanned clean at the system_server child's ENTRY #1, disarmed — and the child STILL aborted "Not whitelisted (28): hyph-as.hyb". Decisive detail: hyph-AS = the FIRST hyb alphabetically while the tracker's fd-28 slot recycled through ~130 hyphen files ending at hyph-und-ethi — combined with the clean kernel tables (gate scan + +158s STALL-FD) and zero tracked hyphen opens post-fork, the child itself RAW-OPENED the leak file between its first syscall and the whitelist check (a hook-bypassing open, the same bypass family as the close-bypass).
+- Verified the tracer's readlink(/proc/self/fd) serving is honest (executes the real kernel readlink, rewrites only the result prefix — 6-Z305c/d machinery), so the whitelist read real kernel state at check time.
+- 6-Z306c-v2 (f450a30): the child-gate scan is now CONTINUOUS across the window (no early disarm; cap 256 scanned ENTRYs) — a leak appearing at any point before the check's opendir("/proc/self/fd") is closed at the next ENTRY, before the readdir. Every open/openat path in the window is logged (bounded 48) so the raw opener is named verbatim. (Field-name fix: ChildAbi.open/openat, not *_nr.) fmt+clippy clean, 823/823.
+- Pushed f450a30; dispatched #162.
+
+Stage Summary:
+- The whitelist wall now has three layers: parent fork gate + continuous child sweep + raw-opener naming. #162 in flight; if it still aborts, the 6-Z306c open-path log names the opener verbatim.
