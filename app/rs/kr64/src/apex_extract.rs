@@ -216,6 +216,228 @@ pub fn is_real_libdl(bytes: &[u8]) -> bool {
     bytes.len() > LIBDL_STUB_SIZE && bytes.starts_with(&ELF_MAGIC)
 }
 
+// ── 6-Z306n: CFI-slowpath neutering for every libdl.so we serve ──────
+//
+// Ladder #171/#172 decode (probe 6-Z306m): EVERY vendor HAL
+// (_vendor_bin_hw_ comm) SIGSEGVs at libdl.so+0x1128 — inside
+// `__cfi_slowpath`. Register ground truth: x9 (the shadow-base global
+// the function loads from its .bss) == 0, so `ldrh w8, [x9, x8]` faults
+// at si_addr = the raw shadow index (0x7dffe3e6 & co. = callee>>17).
+//
+// WHY the shadow base is NULL: Android's CFI (Control Flow Integrity)
+// runtime lives in libdl.so. The shadow is initialized by the LINKER
+// calling __cfi_init on ITS OWN libdl instance — in our guest that is
+// /dev/libdl.so (5-L, LD_LIBRARY_PATH-first). VENDOR binaries resolve
+// their namespace's libdl.so to the FLATTENED apex copy
+// (/apex/com.android.runtime/lib64/bionic/libdl.so — 6-Z305t) — a
+// SEPARATE LOAD whose __cfi_shadow_base (.bss, filesz=0) stays NULL.
+// Every CFI-instrumented vendor indirect call whose fast-path shadow
+// probe fails (always — shadow uninitialized) routes to THAT
+// instance's __cfi_slowpath → NULL deref → SIGSEGV storm → init's
+// broken-cgroup group-kill takes out surfaceflinger + the live zygote
+// (the rung-7 wall).
+//
+// FIX: patch __cfi_slowpath + __cfi_slowpath_diag to a bare `RET` in
+// every libdl.so the twoyi environment serves (the /dev extracted
+// bytes AND every apex-staged copy). A no-op slowpath means a failed
+// CFI fast-path check falls through to the actual indirect call —
+// i.e., CFI is treated as not-enforced, which is the honest semantics
+// for an emulated environment that cannot maintain the shadow
+// contract across multiple libdl instances. This is a virtualization
+// shim (same class as the getpid hook), NOT a boot-evidence fake: the
+// guest still has to reach system_server, SurfaceFlinger and the
+// launcher on its own.
+//
+// The patch is symbol-driven (ELF .dynsym lookup), NOT offset-driven,
+// so it survives ROM updates; it is aarch64+ELF64-gated and idempotent
+// (already-RET entries are left alone and reported as such).
+
+/// A single symbol patch performed by [`neuter_cfi_slowpath`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CfiPatch {
+    /// Symbol whose entry point was neutered.
+    pub symbol: &'static str,
+    /// File offset written (== st_value mapped through PT_LOAD).
+    pub file_offset: u64,
+    /// `true` when the entry point ALREADY held the RET (idempotent
+    /// re-run), `false` when the original prologue was overwritten.
+    pub already_neutered: bool,
+}
+
+/// aarch64 `RET` instruction encoding (`ret x30`).
+const A64_RET: u32 = 0xd65f03c0;
+
+/// Patch `__cfi_slowpath` and `__cfi_slowpath_diag` to immediate `RET`
+/// in an ELF64 aarch64 shared object held in `bytes`. Returns the list
+/// of performed/confirmed patches; an empty result means nothing was
+/// patched (not an ELF64 aarch64 SO, or neither symbol exported).
+///
+/// Only the FIRST instruction of each symbol is touched — the CFI
+/// slowpath is a never-return abort path on a healthy system, so its
+/// prologue is never a valid branch target.
+pub fn neuter_cfi_slowpath(bytes: &mut [u8]) -> Vec<CfiPatch> {
+    const TARGETS: [&str; 2] = ["__cfi_slowpath", "__cfi_slowpath_diag"];
+    let mut out = Vec::new();
+    // ELF64 + little-endian + aarch64 (e_machine 183) gate.
+    if bytes.len() < 64 || !bytes.starts_with(&ELF_MAGIC) || bytes[4] != 2 || bytes[5] != 1 {
+        return out;
+    }
+    let e_machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+    if e_machine != 183 {
+        return out;
+    }
+    let rd32 = |b: &[u8], o: usize| -> u64 {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as u64
+    };
+    let rd64 = |b: &[u8], o: usize| -> u64 {
+        u64::from_le_bytes([
+            b[o],
+            b[o + 1],
+            b[o + 2],
+            b[o + 3],
+            b[o + 4],
+            b[o + 5],
+            b[o + 6],
+            b[o + 7],
+        ])
+    };
+    let e_shoff = rd64(bytes, 40) as usize;
+    let (e_shentsize, e_shnum) = (
+        u16::from_le_bytes([bytes[58], bytes[59]]) as usize,
+        u16::from_le_bytes([bytes[60], bytes[61]]) as usize,
+    );
+    if e_shoff == 0 || e_shnum == 0 || e_shoff + e_shnum * e_shentsize > bytes.len() {
+        return out;
+    }
+    // Section header fields: name,type,flags,addr,offset,size(,link,info).
+    // The symbol table is .dynsym (SHT_DYNSYM=11) when present, else
+    // .symtab (SHT_SYMTAB=2). Its string table is resolved through the
+    // SYMTAB's sh_link — NOT by grabbing any SHT_STRTAB section (the
+    // last one would be .shstrtab, whose entries are section names, and
+    // the symbol lookup would silently match nothing — the exact bug
+    // this guard replaces).
+    let mut sections: Vec<(u32, usize, usize, u32)> = Vec::new(); // (type, offset, size, link)
+    for i in 0..e_shnum {
+        let h = e_shoff + i * e_shentsize;
+        if h + 64 > bytes.len() {
+            return out;
+        }
+        let sh_type = rd32(bytes, h + 4);
+        let sh_offset = rd64(bytes, h + 24) as usize;
+        let sh_size = rd64(bytes, h + 32) as usize;
+        let sh_link = rd32(bytes, h + 40) as u32;
+        sections.push((sh_type as u32, sh_offset, sh_size, sh_link));
+    }
+    // Last-wins per type so a late .symtab can't shadow .dynsym silently.
+    let mut dynsym: Option<usize> = None;
+    let mut regular_symtab: Option<usize> = None;
+    for (i, s) in sections.iter().enumerate() {
+        match s.0 {
+            11 => dynsym = Some(i),
+            2 => regular_symtab = Some(i),
+            _ => {}
+        }
+    }
+    let sym_i = match dynsym.or(regular_symtab) {
+        Some(i) => i,
+        None => return out,
+    };
+    let (sym_off, sym_size, sym_link) = {
+        let s = sections[sym_i];
+        (s.1, s.2, s.3 as usize)
+    };
+    let (str_off, str_size) = match sections.get(sym_link) {
+        Some(&(3, off, size, _)) => (off, size),
+        _ => return out, // symtab's linked string table missing/not a STRTAB
+    };
+    // Program headers for the vaddr→file-offset mapping (PT_LOAD, p_type 1).
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new(); // (vaddr, offset, filesz)
+    let e_phoff = rd64(bytes, 32) as usize;
+    let (e_phentsize, e_phnum) = (
+        u16::from_le_bytes([bytes[54], bytes[55]]) as usize,
+        u16::from_le_bytes([bytes[56], bytes[57]]) as usize,
+    );
+    if e_phoff != 0 && e_phnum > 0 {
+        for i in 0..e_phnum {
+            let h = e_phoff + i * e_phentsize;
+            if h + 56 > bytes.len() {
+                break;
+            }
+            let p_type = rd32(bytes, h);
+            if p_type == 1 {
+                let p_offset = rd64(bytes, h + 8);
+                let p_vaddr = rd64(bytes, h + 16);
+                let p_filesz = rd64(bytes, h + 32);
+                loads.push((p_vaddr, p_offset, p_filesz));
+            }
+        }
+    }
+    if str_off >= bytes.len() || str_off + str_size > bytes.len() {
+        return out;
+    }
+    let n_syms = sym_size / 24;
+    for i in 0..n_syms {
+        let o = sym_off + i * 24;
+        if o + 24 > bytes.len() {
+            break;
+        }
+        let st_name = rd32(bytes, o) as usize;
+        let st_info = bytes[o + 4];
+        let st_value = rd64(bytes, o + 8);
+        if st_name >= str_size || (st_info & 0xf) != 2 {
+            continue; // not STT_FUNC
+        }
+        let s = str_off + st_name;
+        let e = match bytes[s..str_off + str_size].iter().position(|&c| c == 0) {
+            Some(p) => s + p,
+            None => continue,
+        };
+        let name = std::str::from_utf8(&bytes[s..e]).unwrap_or("");
+        if !TARGETS.contains(&name) || st_value == 0 {
+            continue;
+        }
+        // Resolve the static symbol name BEFORE mutating `bytes` (the
+        // `name` borrow must not span the write below).
+        let sym = name_static(name);
+        // Map st_value → file offset through the PT_LOAD table; for
+        // libdl.so the exec segment is vaddr==offset so this is 1:1,
+        // but honor the general mapping anyway.
+        let file_off = loads
+            .iter()
+            .find(|(vaddr, _, filesz)| st_value >= *vaddr && st_value < vaddr + filesz)
+            .map(|(vaddr, offset, _)| (st_value - vaddr + offset) as usize);
+        let fo = match file_off {
+            Some(v) if v + 4 <= bytes.len() => v,
+            _ => continue,
+        };
+        let cur = u32::from_le_bytes([bytes[fo], bytes[fo + 1], bytes[fo + 2], bytes[fo + 3]]);
+        if cur == A64_RET {
+            out.push(CfiPatch {
+                symbol: sym,
+                file_offset: fo as u64,
+                already_neutered: true,
+            });
+            continue;
+        }
+        bytes[fo..fo + 4].copy_from_slice(&A64_RET.to_le_bytes());
+        out.push(CfiPatch {
+            symbol: sym,
+            file_offset: fo as u64,
+            already_neutered: false,
+        });
+    }
+    out
+}
+
+/// The two target names are fixed; map a matched dynstr name back to
+/// the static target so [`CfiPatch::symbol`] stays `&'static str`.
+fn name_static(name: &str) -> &'static str {
+    match name {
+        "__cfi_slowpath_diag" => "__cfi_slowpath_diag",
+        _ => "__cfi_slowpath",
+    }
+}
+
 /// Returns `true` if the file at `path` starts with the ZIP local file
 /// header signature (`PK\x03\x04`).
 ///
@@ -2332,5 +2554,190 @@ mod tests {
             parse_apex_manifest_name(&[0x0A, 0x03, b'a', 0x01, b'b']),
             None
         );
+    }
+
+    // ========================================================================
+    // Tests for neuter_cfi_slowpath (6-Z306n).
+    // ========================================================================
+
+    /// Build a minimal ELF64 aarch64 shared object with the given
+    /// exported function symbols. Layout:
+    ///   0x000 ELF header + phdrs
+    ///   0x100 .dynstr
+    ///   0x200 .dynsym (24-byte entries)
+    ///   0x300 PT_LOAD #1 (R):  file 0x000 vaddr 0x000 size 0x400
+    ///   0x400 .text            file 0x400 vaddr 0x400 size 4*n_syms
+    ///   0x500 PT_LOAD #2 (RX): file 0x400 vaddr 0x400 size 0x100
+    fn build_test_so(entries: &[(u64, &str)], text_bytes: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 0x500 + text_bytes.len().max(0x100)];
+        b[0..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2; // ELFCLASS64
+        b[5] = 1; // ELFDATA2LSB
+                  // e_type=3 (DYN), e_machine=183 (aarch64)
+        b[16..18].copy_from_slice(&3u16.to_le_bytes());
+        b[18..20].copy_from_slice(&183u16.to_le_bytes());
+        // e_phoff = 64, e_phentsize = 56, e_phnum = 2
+        b[32..40].copy_from_slice(&64u64.to_le_bytes());
+        b[54..56].copy_from_slice(&56u16.to_le_bytes());
+        b[56..58].copy_from_slice(&2u16.to_le_bytes());
+        // e_shoff = 0x600 area? Keep sections BEFORE the phdr data we
+        // need: put shdr table at 0x700 (fixed reserve), grow if needed.
+        // Simpler: place shdr table right after everything, patch offset.
+        // dynstr at 0x100, dynsym at 0x200.
+        let mut strtab: Vec<u8> = Vec::new();
+        strtab.push(0); // index 0 = null
+        let mut syms: Vec<(u64, usize)> = Vec::new(); // (value, name_off)
+        for (v, name) in entries {
+            let off = strtab.len();
+            strtab.extend_from_slice(name.as_bytes());
+            strtab.push(0);
+            syms.push((*v, off));
+        }
+        b[0x100..0x100 + strtab.len()].copy_from_slice(&strtab);
+        // dynsym entries: null + one per symbol (STT_FUNC=2, GLOBAL=1)
+        let mut so = 0x200;
+        // null entry
+        so += 24;
+        for (v, noff) in &syms {
+            b[so..so + 4].copy_from_slice(&(*noff as u32).to_le_bytes());
+            b[so + 4] = (1 << 4) | 2; // STB_GLOBAL | STT_FUNC
+            b[so + 8..so + 16].copy_from_slice(&v.to_le_bytes());
+            so += 24;
+        }
+        let symtab_size = (so - 0x200) as u64;
+        // text at 0x400
+        b[0x400..0x400 + text_bytes.len()].copy_from_slice(text_bytes);
+        // Now append the section header table (3 entries: null, dynsym, dynstr)
+        let shoff = b.len();
+        let mut sh = Vec::new();
+        sh.extend_from_slice(&[0u8; 64]); // null section
+        let mk = |ty: u32, off: u64, size: u64, link: u32| {
+            let mut e = vec![0u8; 64];
+            e[4..8].copy_from_slice(&ty.to_le_bytes());
+            e[24..32].copy_from_slice(&off.to_le_bytes());
+            e[32..40].copy_from_slice(&size.to_le_bytes());
+            e[40..44].copy_from_slice(&link.to_le_bytes());
+            e
+        };
+        sh.extend_from_slice(&mk(11, 0x200, symtab_size, 2)); // .dynsym, sh_link → .dynstr
+        sh.extend_from_slice(&mk(3, 0x100, strtab.len() as u64, 0)); // .dynstr
+        b.extend_from_slice(&sh);
+        // patch e_shoff, e_shentsize=64, e_shnum=3, e_shstrndx=0
+        b[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        b[58..60].copy_from_slice(&64u16.to_le_bytes());
+        b[60..62].copy_from_slice(&3u16.to_le_bytes());
+        b[62..64].copy_from_slice(&0u16.to_le_bytes());
+        // program headers at 64: two PT_LOADs
+        let ph = |vaddr: u64, off: u64, filesz: u64, flags: u32| {
+            let mut e = vec![0u8; 56];
+            e[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            e[4..8].copy_from_slice(&flags.to_le_bytes());
+            e[8..16].copy_from_slice(&off.to_le_bytes());
+            e[16..24].copy_from_slice(&vaddr.to_le_bytes());
+            e[32..40].copy_from_slice(&filesz.to_le_bytes());
+            e
+        };
+        b[64..120].copy_from_slice(&ph(0, 0, 0x400, 4)); // R
+        let blen = b.len();
+        b[120..176].copy_from_slice(&ph(0x400, 0x400, (blen - 0x400) as u64, 5)); // RX
+        b
+    }
+
+    #[test]
+    fn neuter_cfi_slowpath_patches_both_symbols() {
+        // __cfi_slowpath @ vaddr 0x400, __cfi_slowpath_diag @ 0x408.
+        // Prologues = stp x29,x30 (a9bf7bfd), NOT ret.
+        let mut so = build_test_so(
+            &[(0x400, "__cfi_slowpath"), (0x408, "__cfi_slowpath_diag")],
+            &{
+                let mut t = vec![0u8; 0x100];
+                t[0..4].copy_from_slice(&0xa9bf7bfdu32.to_le_bytes());
+                t[8..12].copy_from_slice(&0xa9bf7bfdu32.to_le_bytes());
+                t
+            },
+        );
+        let patches = neuter_cfi_slowpath(&mut so);
+        assert_eq!(
+            patches.len(),
+            2,
+            "both symbols must be patched: {:?}",
+            patches
+        );
+        assert!(!patches[0].already_neutered && !patches[1].already_neutered);
+        // file offset == vaddr - 0x400 + 0x400 = 0x400 / 0x408
+        assert_eq!(patches[0].file_offset, 0x400);
+        assert_eq!(patches[1].file_offset, 0x408);
+        let rd = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        assert_eq!(rd(&so, 0x400), 0xd65f03c0, "__cfi_slowpath must be RET");
+        assert_eq!(
+            rd(&so, 0x408),
+            0xd65f03c0,
+            "__cfi_slowpath_diag must be RET"
+        );
+    }
+
+    #[test]
+    fn neuter_cfi_slowpath_is_idempotent() {
+        let text = {
+            let mut t = vec![0u8; 0x100];
+            t[0..4].copy_from_slice(&0xd65f03c0u32.to_le_bytes()); // already RET
+            t[8..12].copy_from_slice(&0xd65f03c0u32.to_le_bytes());
+            t
+        };
+        let mut so = build_test_so(
+            &[(0x400, "__cfi_slowpath"), (0x408, "__cfi_slowpath_diag")],
+            &text,
+        );
+        let patches = neuter_cfi_slowpath(&mut so);
+        assert_eq!(patches.len(), 2);
+        assert!(patches.iter().all(|p| p.already_neutered), "{:?}", patches);
+    }
+
+    #[test]
+    fn neuter_cfi_slowpath_ignores_non_aarch64_and_missing_symbols() {
+        // x86_64 e_machine (62): no patch.
+        let text = vec![0u8; 0x100];
+        let mut so = build_test_so(&[(0x400, "__cfi_slowpath")], &text);
+        so[18..20].copy_from_slice(&62u16.to_le_bytes());
+        assert!(neuter_cfi_slowpath(&mut so).is_empty());
+        // aarch64 but no cfi symbols: no patch.
+        let mut so2 = build_test_so(&[(0x400, "dlopen")], &text);
+        assert!(neuter_cfi_slowpath(&mut so2).is_empty());
+        // non-ELF bytes: no patch.
+        let mut junk = vec![0x41u8; 0x600];
+        assert!(neuter_cfi_slowpath(&mut junk).is_empty());
+    }
+
+    #[test]
+    fn neuter_cfi_slowpath_real_guest_libdl_layout_matches_probe() {
+        // Optional end-to-end check against the REAL guest libdl.so
+        // (extracted from com.android.runtime.apex of
+        // arm64-v8a-30_r02). Runs only when the file is present at
+        // /tmp/libdl_real_guest.so (dev sandbox); skipped in CI.
+        let p = "/tmp/libdl_real_guest.so";
+        let orig = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(_) => return, // not available — skip silently
+        };
+        assert!(orig.len() > 5848);
+        let mut so = orig.clone();
+        let patches = neuter_cfi_slowpath(&mut so);
+        assert_eq!(patches.len(), 2, "{:?}", patches);
+        // The probe-established offsets: __cfi_slowpath @0x1104,
+        // __cfi_slowpath_diag @0x1168 (vaddr==file offset for the
+        // exec PT_LOAD of the AOSP-11 libdl).
+        assert_eq!(
+            patches.iter().map(|x| x.file_offset).collect::<Vec<_>>(),
+            vec![0x1104u64, 0x1168u64]
+        );
+        // Length and everything-but-the-two-words must be unchanged.
+        assert_eq!(so.len(), orig.len());
+        let mut diffs = 0usize;
+        for i in 0..orig.len() {
+            if so[i] != orig[i] {
+                diffs += 1;
+            }
+        }
+        assert_eq!(diffs, 8, "exactly two 4-byte instructions may change");
     }
 }
