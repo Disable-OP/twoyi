@@ -20727,6 +20727,58 @@ pub fn run_ptrace_loop(
                                 get_syscall_arg(&regs, abi.reg_arg3),
                                 get_syscall_arg(&regs, abi.reg_arg4),
                             ));
+                            // ── 6-Z306s: system_server exit(0) svclog tail ──
+                            // The forked system_server clears every
+                            // SpecializeCommon wall, then a JAVA "Shutdown
+                            // thread" runs exit_group(0) — no abort VMA, so
+                            // its own words live ONLY in its svclog
+                            // (svc-<pid>.log). This Task-6-S arm is the one
+                            // that SEES the main thread's exit_group ENTRY
+                            // (the main interposition arm never reaches it).
+                            // Dump the svclog tail here (once per pid,
+                            // 1.5 KiB, UTF-8-safe truncation).
+                            if nr == abi.exit_group_nr {
+                                let comm306s =
+                                    std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                        .map(|c| c.trim_end().to_string())
+                                        .unwrap_or_default();
+                                if comm306s == "system_server" {
+                                    static SS_EXIT_DUMPED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if SS_EXIT_DUMPED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        < 2
+                                    {
+                                        let svc_path =
+                                            format!("{}/dev/twoyi-svclogs/svc-{}.log", rootfs, pid);
+                                        match std::fs::metadata(&svc_path) {
+                                            Ok(m) => {
+                                                let len = m.len() as usize;
+                                                let skip = len.saturating_sub(1536);
+                                                let tail = std::fs::read(&svc_path)
+                                                    .map(|b| b[skip.min(b.len())..].to_vec())
+                                                    .unwrap_or_default();
+                                                let text = String::from_utf8_lossy(&tail)
+                                                    .replace('\n', " | ");
+                                                let shown = text.get(..1400).unwrap_or(&text);
+                                                log(&format!(
+                                                    "6-Z306s: system_server pid={} exit_group svclog tail ({} of {} bytes): {}",
+                                                    pid,
+                                                    tail.len(),
+                                                    len,
+                                                    shown
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                log(&format!(
+                                                    "6-Z306s: system_server pid={} exit_group — svclog {} unreadable: {}",
+                                                    pid, svc_path, e
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
