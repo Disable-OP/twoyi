@@ -13280,6 +13280,9 @@ pub fn run_ptrace_loop(
     // svc-log fd may ever enter a table the whitelist reads.
     let mut z306_zygote_lineage: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // 6-Z306g: tid -> tgid cache for the thread-aware lineage check.
+    let mut z306_lineage_tgid_cache: std::collections::HashMap<libc::pid_t, libc::pid_t> =
+        std::collections::HashMap::new();
     // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
     // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
     // 0) — the EXIT arm turns the returned REAL fd into a tracked
@@ -21607,8 +21610,14 @@ pub fn run_ptrace_loop(
                                     && !boot_recovery
                                     && pid != init_pid
                                     // 6-Z306g: zygote-lineage exemption —
-                                    // see the arming site comment.
-                                    && !z306_zygote_lineage.contains(&pid)
+                                    // THREAD-AWARE (a zygote thread's tid is
+                                    // not in the set; its TGID is — #165's
+                                    // fd 28 = svc-<thread-tid>.log wall).
+                                    && !z306_in_zygote_lineage(
+                                        pid,
+                                        &z306_zygote_lineage,
+                                        &mut z306_lineage_tgid_cache,
+                                    )
                                     && svclog_redirects < SVCLOG_REDIRECT_CAP
                                 {
                                     let open_flags = if syscall_num == abi.open {
@@ -33716,6 +33725,45 @@ fn z306_flags_are_process_fork(flags: u64) -> bool {
         | 0x0000_0800 // CLONE_SIGHAND
         | 0x0001_0000; // CLONE_THREAD
     (flags & Z306_SIGCHLD) != 0 && (flags & Z306_SHARE_MASK) == 0
+}
+
+/// 6-Z306g: is `pid` (which may be a THREAD tid of the zygote) inside the
+/// zygote lineage? The svclog-redirect exemption must cover THREADS too:
+/// ladder #165's wall was fd 28 = svc-2947.log where 2947 = a THREAD TID
+/// of the zygote — a zygote thread's /dev/null open was redirected (the
+/// lineage set held only the TGID) and the svclog fd landed in the SHARED
+/// thread-group table, inherited by forkSystemServer's child. The tgid
+/// comes from /proc/<pid>/stat field 4 (the tgid after the comm paren),
+/// cached in a small map — opens are rare, the read is negligible.
+pub fn z306_in_zygote_lineage(
+    pid: libc::pid_t,
+    lineage: &std::collections::HashSet<libc::pid_t>,
+    cache: &mut std::collections::HashMap<libc::pid_t, libc::pid_t>,
+) -> bool {
+    if lineage.contains(&pid) {
+        return true;
+    }
+    let tgid = match cache.get(&pid) {
+        Some(&t) => t,
+        None => {
+            let t = std::fs::read_to_string(format!("/proc/{}/stat", pid))
+                .ok()
+                .and_then(|s| {
+                    // Field 4 (state is 3): after the comm's closing paren.
+                    let rest = match s.rfind(')') {
+                        Some(i) => &s[i + 1..],
+                        None => return None,
+                    };
+                    rest.split_whitespace().nth(1)?.parse::<libc::pid_t>().ok()
+                })
+                .unwrap_or(0);
+            if cache.len() < 512 {
+                cache.insert(pid, t);
+            }
+            t
+        }
+    };
+    tgid != 0 && lineage.contains(&tgid)
 }
 
 /// 6-Z306f: AUDIT the REAL kernel fd table of `pid` (host-side /proc —
