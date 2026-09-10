@@ -27460,3 +27460,13 @@ Honest unverified: no local ARM64 runtime; one ladder from proof.
 2. If system_server survives, expect the rung 8 gates: SystemUI/launcher spawn needs the SF display chain + bootanim — watch the opengles renderer sessions and the composer's HWC2 surface.
 3. webDevReview cron exists (job 370515, fixed_rate 3600s, payload "Continue"). Keep active; do not duplicate.
 4. Dispatch discipline: confirm_dispatch=yes ALWAYS; rungs via result.json only; HOST vs GUEST log separation always.
+
+---
+## 6-Z305x v2 — ladder #156 decoded: the whitelist wall persists (fd 29, hyph-as.hyb, PARENT-side check); the instrument upgraded to full coverage + the fb-hook close-identity logger; #157 dispatched
+
+- #156 verdict: rung 7 SURFACEFLINGER again, but "Not whitelisted" STILL fired (fd 28→29) — the abort lives in the ZYGOTE's OWN svc log because the whitelist check (FileDescriptorTable::Create) runs in the PARENT (ForkCommon) BEFORE fork; the fail_fn tag is the is_system_server flag, not the child. fd_utils.cpp ParseFd SKIPS fds <= 2 ("handled specially post-fork anyway") — so the 6-Z305y stdio pin (which held: 20 raw closes pinned, zero stdio rebounds) is orthogonal; the leak is a REAL fd above stdio.
+- The 6-Z305x tracker's first cut decoded: ALL preload opens (Roboto-Thin..NotoSansMalayalam fonts, hyph-* hybs, fd 29/30 recycling across ~130 files) flow through the shlib's open hooks; but the close-matching undercounts (watermark [tracked 96] with stale-path matches) — most guest close() calls bind to the FB HOOK's close (first close exporter) and take its raw-syscall path, bypassing the shlib's close hook entirely.
+- The 89k-line /proc/self/task open loop between preload-end and the fork = the libprocessgroup cgroup-failure retry storm (the EACCES createProcessGroup family), NOT the leak.
+- health-hal-2-1 crash-loop: registerAsService returns -2147483648 (UNKNOWN_ERROR) ×24 — the hwservicemanager ADD transaction fails; separate wall, non-zygote-killer.
+- INSTRUMENT v2 (commit 7b35675): shlib tracker budgets 32/80 → 160/320, table 96 → 256; close lines log the fd's REAL identity via readlink(/proc/self/fd/N); NEW fb-hook close-identity logger (runs in the hook every guest close reaches; logs the real target of every closed fonts/hyphen-data fd, 200-line cap). #157 dispatched (34421736657).
+- NEXT: read #157's PRELOAD-FD pairs — the open-without-close (or close-with-wrong-identity) names the leak; fix it at the source; then the whitelist wall falls and system_server runs → rung 6 evidence → rung 8 gates (SystemUI/launcher).
