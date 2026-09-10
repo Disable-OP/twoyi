@@ -20905,7 +20905,16 @@ pub fn run_ptrace_loop(
                             // 6-Z306y: record the per-pid trail for direct
                             // fork children (before any other probe so the
                             // exit-time dump includes the exit_group itself).
-                            if z306_zygote_fork_children.contains(&pid) {
+                            // 6-Z306y-b: SKIP mprotect — the #192 trail came
+                            // back 32× mprotect (the C++ exit teardown's
+                            // __cxa_finalize region sweep buries the real
+                            // tail). Recording everything EXCEPT mprotect
+                            // keeps the last 32 ENTRIES the meaningful
+                            // syscalls (binder ioctls, dexopt reply, writes,
+                            // closes) that immediately preceded the sweep.
+                            if z306_zygote_fork_children.contains(&pid)
+                                && syscall_num != abi.mprotect_nr
+                            {
                                 let trail = z306y_trail.entry(pid).or_insert_with(|| {
                                     std::collections::VecDeque::with_capacity(32)
                                 });
