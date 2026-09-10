@@ -380,28 +380,44 @@ static inline int twoyi_sys_fstatat(int dirfd, const char *path,
 #endif
 }
 
-// Helper: write to both stderr and a log file (for debugging when stderr is /dev/null)
-// Also tries to write to logd via __android_log_print (if available via dlsym)
+// Helper: write to stderr (and a debug log file). For debugging when stderr is /dev/null.
+//
+// 6-Z306j (#168/#169 decode): the OLD third leg — dlsym'd
+// __android_log_write on every line — is REMOVED. Ladder #168/#169: the
+// zygote's main thread futex-DEADLOCKED inside exactly this leg's call
+// chain (BT: shlib → liblog → libbase → libartbase art::Mutex → libc++
+// futex wait, mutex word=2 with NO owner tid recorded), and the same
+// word=2 signature hit sensors multihal independently. The recursion
+// shape: write_str → __android_log_write → (liblog internals open a
+// property/pmsg/logd path) → OUR OWN GOT-patched open hook → write_str
+// again → the ART/libbase log mutex is a NON-recursive std::mutex →
+// self-deadlock with the invisible holder being OUR OWN THREAD. Every
+// write_str line ALREADY reaches the artifact via the fd-2 svclog leg
+// (and the tmp-log leg below), so the logd leg was redundant even
+// before it became the deadlock trigger.
+// 6-Z306j-b: belt-and-braces — a thread-local re-entry guard. If any
+// future code path re-enters write_str through the open hooks (the
+// tmp-log open itself goes through twoyi_sys_open), the re-entrant
+// call degrades to the raw fd write only. No recursion can self-
+// deadlock the logger again.
+static __thread int in_write_str;
+
 static void write_str(int fd, const char *s) {
     if (!s) return;
+    if (in_write_str) {
+        // Re-entry through our own hooks: raw write only, no opens, no logd.
+        size_t l0 = 0; while (s[l0]) l0++;
+        syscall(NR_write, fd, s, l0);
+        return;
+    }
+    in_write_str = 1;
     size_t l = 0; while (s[l]) l++;
     // Write to stderr (goes to logd's stderr collector)
     syscall(NR_write, fd, s, l);
     // Also write to /data/local/tmp/twoyi-loader.log for debugging
     int logfd = twoyi_sys_open("/data/local/tmp/twoyi-loader.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (logfd >= 0) { syscall(NR_write, logfd, s, l); syscall(NR_close, logfd); }
-    // Also try __android_log_write via dlsym (goes directly to logd socket)
-    // This is critical for processes where stderr is closed/redirected (e.g., after execv)
-    static int (*android_log_write_p)(int, const char *, const char *) = NULL;
-    static int android_log_checked = 0;
-    if (!android_log_checked) {
-        android_log_write_p = (int (*)(int, const char *, const char *))dlsym(RTLD_DEFAULT, "__android_log_write");
-        android_log_checked = 1;
-    }
-    if (android_log_write_p) {
-        // ANDROID_LOG_INFO = 4, tag = "twoyi_loader"
-        android_log_write_p(4, "twoyi_loader", s);
-    }
+    in_write_str = 0;
 }
 
 // =========================================================================
