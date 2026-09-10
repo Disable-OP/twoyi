@@ -17204,21 +17204,90 @@ pub fn run_ptrace_loop(
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if dn < 16 {
                                         log(&format!(
-                                            "6-Z306f: lineage open DENIED (whitelist-leak class, pin={}) pid={} path={:?} → getpid rewrite, -ENOENT at exit",
+                                            "6-Z306f-d: lineage open PATH-REWRITTEN (whitelist-leak class, pin={}) pid={} path={:?} → /dev/null",
                                             z306_is_pin_pid, pid, pp
                                         ));
                                     }
-                                    let mut r = regs;
-                                    set_syscall_num(&mut r, &abi, abi.getpid);
-                                    match ptrace_setregs(pid, &r, iov_len) {
-                                        Ok(()) => {
-                                            pending_sandbox_deny.insert(pid, -2);
+                                    // ── 6-Z306f-d: PATH-REWRITE deny ──
+                                    //
+                                    // The OLD deny (set_syscall_num(getpid)
+                                    // at ENTRY + fake -ENOENT at EXIT) never
+                                    // worked on this aarch64 kernel: the
+                                    // entry-stop syscall-NUMBER rewrite does
+                                    // not take (the same primitive the pin
+                                    // rewrites and #163's injection hit), so
+                                    // the kernel executed the REAL open of
+                                    // hyph-as.hyb. The EXIT handler then
+                                    // faked the return to -ENOENT, the caller
+                                    // skipped every close, and the real fd
+                                    // leaked into every fork — fd 28 =
+                                    // hyph-as.hyb at forkSystemServer → the
+                                    // CHILD's stock FileDescriptorWhitelist
+                                    // aborted "Not whitelisted (28)" and the
+                                    // just-forked system_server died. That
+                                    // one broken primitive explains the
+                                    // ENTIRE #159-#178 hyphen-leak saga.
+                                    //
+                                    // The fix needs NO injection: overwrite
+                                    // the PATH argument in the child's memory
+                                    // with "/dev/null" (POKEDATA — a proven
+                                    // primitive) and let the open RUN. The
+                                    // kernel opens /dev/null: a real, normal
+                                    // fd the caller can mmap/close exactly
+                                    // like the file it asked for (Hyphenator
+                                    // treats an empty/short mapping the same
+                                    // way it treats the absent hyph-af.hyb
+                                    // that stock AOSP ships without), and
+                                    // /dev/null is stock-whitelisted AND in
+                                    // Z306_ALLOW_EXACT — even if the fd
+                                    // leaks into a fork, the whitelist check
+                                    // PASSES. The replacement is shorter than
+                                    // every denied path, so it fits in place;
+                                    // the kernel re-reads the (now
+                                    // NUL-terminated) string from the same
+                                    // buffer.
+                                    const DEV_NULL_C: [u8; 10] = *b"/dev/null\0";
+                                    let mut rewrite_ok = true;
+                                    for (wi, chunk) in DEV_NULL_C.chunks(8).enumerate() {
+                                        let mut w = [0u8; 8];
+                                        w[..chunk.len()].copy_from_slice(chunk);
+                                        let v = u64::from_le_bytes(w);
+                                        let a = paddr + (wi * 8) as u64;
+                                        let rc = unsafe {
+                                            libc::ptrace(
+                                                libc::PTRACE_POKEDATA,
+                                                pid,
+                                                a as i64,
+                                                v as i64,
+                                            )
+                                        };
+                                        if rc == -1 {
+                                            rewrite_ok = false;
+                                            break;
                                         }
-                                        Err(e) => {
-                                            log(&format!(
-                                                "6-Z306f: deny setregs FAILED pid={} ({}) — open proceeds",
-                                                pid, e
-                                            ));
+                                    }
+                                    if !rewrite_ok {
+                                        // POKEDATA failed (process died
+                                        // mid-write?) — fall back to the old
+                                        // deny so the path is at least
+                                        // attempted-neutralized; its known
+                                        // leak behavior is logged upstream.
+                                        log(&format!(
+                                            "6-Z306f-d: POKEDATA rewrite FAILED pid={} — falling back to getpid-deny (leak-prone!)",
+                                            pid
+                                        ));
+                                        let mut r = regs;
+                                        set_syscall_num(&mut r, &abi, abi.getpid);
+                                        match ptrace_setregs(pid, &r, iov_len) {
+                                            Ok(()) => {
+                                                pending_sandbox_deny.insert(pid, -2);
+                                            }
+                                            Err(e) => {
+                                                log(&format!(
+                                                    "6-Z306f: deny setregs FAILED pid={} ({}) — open proceeds",
+                                                    pid, e
+                                                ));
+                                            }
                                         }
                                     }
                                 }
