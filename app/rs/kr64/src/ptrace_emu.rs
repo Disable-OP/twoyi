@@ -567,6 +567,34 @@ struct ChildAbi {
     // a dirfd (arg1) + a PATH (arg2) → arg2 is the path (same as openat).
     unlink: i64,
     unlinkat: i64,
+    // 6-Z306v: renameat / renameat2 — the FIRST files-vs-paths syscall
+    // family where the CREATE side (mkstemp = openat(O_CREAT|O_EXCL),
+    // translated by the open arm) and the COMMIT side (rename) disagree.
+    // Ladder #189 decode: installd's fs_write_atomic_int() (cutils
+    // fs.cpp) mktemp'd /data/misc/installd/layout_version.XXXXXX (the
+    // open arm translated it into {rootfs}/data/misc/installd/), then
+    // renameat'd it — renameat had NO translation arm (the backstop's
+    // own comment: "NOT translated by any handler today; the backstop
+    // is their only guard") → the kernel saw the RAW guest path, which
+    // resolves to the HOST's real /data/misc/installd → the 6-Z185
+    // sandbox backstop DENIED it ("resolved outside the rootfs sandbox
+    // and no host allowlist matches — faking -13") → rename = EPERM →
+    // fs_write_atomic_int failed → initialise_directories() goto fail →
+    // installd_main: "Could not create directories; exiting." →
+    // exit(1) crash-loop every ~10s → installd never registered with
+    // servicemanager → the forked system_server's
+    // ZygoteInit.performSystemServerDexOpt dereferenced
+    // ServiceManager.getService("installd") = null → NullPointerException
+    // → "System zygote died with exception" → the clean exit(0) that
+    // #185-#188 chased.
+    //   i386:   renameat=38,  renameat2=353
+    //   x86_64: renameat=264, renameat2=316
+    //   aarch64 (asm-generic): renameat=38, renameat2=276
+    //   arm32:  renameat=329, renameat2=382
+    // Both take (dirfd, PATH, dirfd, PATH) — arg2 + arg4 are the paths
+    // (same shape as openat's arg2).
+    renameat: i64,
+    renameat2: i64,
     // Syscalls that TWRP init calls early in startup which return EPERM
     // as untrusted_app (capget — no capabilities; fchown/fchmod — can't
     // change ownership/permissions of fds; ioprio_get / ioprio_set —
@@ -1547,6 +1575,9 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // init's unlink("/dev/socket/property_service") hits the rootfs.
     unlink: 87,
     unlinkat: 263,
+    // 6-Z306v: x86_64 renameat=264, renameat2=316 (unistd_64.h).
+    renameat: 264,
+    renameat2: 316,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. Real fchown on x86_64 is 93 (NOT 91, which
     // is fchmod — the diagnostic log that motivated this fix reported
@@ -1875,6 +1906,11 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // the HOST /dev/socket (which gave EACCES → init startup failure).
     unlink: 10,
     unlinkat: 301,
+    // 6-Z306v: i386 renameat=302, renameat2=353 (unistd_32.h — renameat
+    // is 302, NOT 38: 38 is i386's old plain rename; the backstop tuple
+    // below had i386/x86_64 renameat swapped until this fix).
+    renameat: 302,
+    renameat2: 353,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. i386 fchown=95, fchmod=94, capget=184,
     // ioprio_get=290, ioprio_set=289 (per /usr/lib/linux/uapi/x86/
@@ -2254,6 +2290,9 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // Task 6-Y; verified against /usr/include/asm-generic/unistd.h.
     unlink: -1,
     unlinkat: 35,
+    // 6-Z306v: aarch64 (asm-generic) renameat=38, renameat2=276.
+    renameat: 38,
+    renameat2: 276,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
     // fchown=55, fchmod=52, capget=90, ioprio_get=31, ioprio_set=30
@@ -2621,6 +2660,9 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     getcwd: 183,
     unlink: 10,
     unlinkat: 328,
+    // 6-Z306v: arm32 renameat=329, renameat2=382 (syscall.tbl).
+    renameat: 329,
+    renameat2: 382,
     fchown: 207, // fchown32 — bionic lp32 mapping
     fchmod: 94,
     capget: 184,
@@ -5051,9 +5093,11 @@ fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> ([(PathArgSlot, bool); 4],
     //               — utimensat(dirfd, path, times, flags))
     //   *at:        renameat(arg2 oldpath, arg4 newpath) linkat(arg2,arg4)
     //               symlinkat(arg2), faccessat2(arg2)
-    // Numbers per kernel UAPI (i386/x86_64/aarch64):
+    // Numbers per kernel UAPI (i386/x86_64/aarch64), re-verified against
+    // the installed asm/unistd_{32,64}.h + asm-generic/unistd.h for
+    // 6-Z306v (the pre-fix comment had i386/x86_64 renameat garbled):
     //   rename:     38 / 82 / -1
-    //   renameat:  264 / 292 / 38
+    //   renameat:  302 / 264 / 38
     //   renameat2: 353 / 316 / 276
     //   link:       9 / 86 / -1
     //   linkat:    303 / 265 / 37
@@ -5086,9 +5130,9 @@ fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> ([(PathArgSlot, bool); 4],
         // 6-Z228: arm32 (reg_syscall=7 = r7 is arm-only)
         (38i64, 329, 382, 9, 330, 83, 331, 92, 320, 439)
     } else if abi.execve == 11 {
-        (38i64, 264, 353, 9, 303, 83, 304, 92, 320, 439)
+        (38i64, 302, 353, 9, 303, 83, 304, 92, 320, 439)
     } else if abi.execve == 59 {
-        (82, 292, 316, 86, 265, 88, 266, 76, 280, 439)
+        (82, 264, 316, 86, 265, 88, 266, 76, 280, 439)
     } else {
         (-1, 38, 276, -1, 37, -1, 36, -1, 88, 439)
     };
@@ -23974,6 +24018,77 @@ pub fn run_ptrace_loop(
                                         unlink_read_fail_rw_count
                                     ));
                                 }
+                            }
+                        }
+                        // ── 6-Z306v: renameat / renameat2 ENTRY path
+                        // translation (BOTH path args) ──
+                        //
+                        // The create side of installd's atomic-file write
+                        // (mkstemp → openat(O_CREAT|O_EXCL)) was translated
+                        // by the open arm into {rootfs}/data/misc/installd/,
+                        // but the COMMIT side (renameat) had no arm — the
+                        // kernel saw the raw guest path, which on the host
+                        // resolves to the REAL /data/misc/installd, and the
+                        // 6-Z185 backstop correctly denied it (-13 EPERM).
+                        // fs_write_atomic_int → initialise_directories()
+                        // goto fail → installd "Could not create
+                        // directories; exiting." exit(1) crash-loop → no
+                        // "installd" in servicemanager → system_server's
+                        // performSystemServerDexOpt NPE (the #185-#188
+                        // exit(0) mystery). Translate BOTH paths the same
+                        // way unlinkat does: read arg2/arg4, translate via
+                        // the sandbox resolver, write each through the
+                        // scratch area and repoint its register.
+                        n if n == abi.renameat || (abi.renameat2 != -1 && n == abi.renameat2) => {
+                            // oldpath = arg2, newpath = arg4 (dirfd = arg1 /
+                            // arg3 per renameat(2)).
+                            let old_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let new_addr = get_syscall_arg(&regs, abi.reg_arg4);
+                            if let Some(old_path) = read_child_string(pid, old_addr) {
+                                let old_trans =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &old_path);
+                                if old_trans != old_path {
+                                    write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        abi.reg_arg2,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &old_trans,
+                                    );
+                                }
+                            }
+                            if let Some(new_path) = read_child_string(pid, new_addr) {
+                                let new_trans =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &new_path);
+                                if new_trans != new_path {
+                                    write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        abi.reg_arg4,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &new_trans,
+                                    );
+                                }
+                            }
+                            static Z306V_DIAG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if Z306V_DIAG.load(std::sync::atomic::Ordering::Relaxed) < 12 {
+                                let o = read_child_string(pid, old_addr)
+                                    .unwrap_or_else(|| "<unreadable>".into());
+                                let nw = read_child_string(pid, new_addr)
+                                    .unwrap_or_else(|| "<unreadable>".into());
+                                Z306V_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                log(&format!(
+                                    "6-Z306v: {} pid={} old={:?} new={:?} — path args translated into the rootfs",
+                                    if syscall_num == abi.renameat { "renameat" } else { "renameat2" },
+                                    pid,
+                                    o,
+                                    nw
+                                ));
                             }
                         }
                         // ── bootfix FIX 1: statfs (i386 nr=99) /
