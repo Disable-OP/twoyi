@@ -33611,6 +33611,93 @@ pub fn run_ptrace_loop(
                                         log(&format!("6-Z243 sp maps: {}", resolve_maps(rsp)));
                                     }
                                 }
+                                // ── 6-Z306m: crash-SITE probe — instruction
+                                // words at pc + CALLER module attribution ──
+                                //
+                                // Ladder #171 wall: EVERY vendor HAL
+                                // (_vendor_bin_hw_ comm) SIGSEGVs at the same
+                                // page offset (pc & 0xfff == 0x128) inside
+                                // libdl.so, dereferencing a garbage x8 whose
+                                // value looks like the LOW 32 BITS of a stack
+                                // pointer (0x766311ac, 0x7e16a9b2, …) — a
+                                // 32/64-bit truncation signature. 6-Z243
+                                // already names pc's module but NOT the
+                                // caller, and without the faulting
+                                // instruction WORDS the exact libdl function
+                                // stays unknown. This probe:
+                                //   1. PEEKs 4 instruction words at pc (the
+                                //      tracee is signal-stopped, PEEKDATA is
+                                //      safe; aarch64 instrs are 4 bytes).
+                                //   2. Attributes x30 (lr = caller), x16 (PLT
+                                //      GOT scratch) and x17 (PLT target
+                                //      scratch) via the same maps ground
+                                //      truth — the caller module is THE
+                                //      decisive datum for "which dlopen-ish
+                                //      call site died".
+                                // Bounded: a global cap of 96 dumps per run
+                                // (the #171 storm produced 706 crashes; the
+                                // first 96 cover every early service
+                                // generation with full library diversity).
+                                #[cfg(target_arch = "aarch64")]
+                                {
+                                    use std::sync::atomic::{AtomicU32, Ordering};
+                                    static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
+                                    if DUMP_COUNT.fetch_add(1, Ordering::Relaxed) < 96 {
+                                        // aarch64 user_pt_regs: x0..x30 at idx
+                                        // 0..=30 (same layout the 6-Z180 dump
+                                        // above already relies on).
+                                        let rp = &crash_regs as *const Regs as *const u64;
+                                        let g = |i: usize| unsafe { *rp.add(i) };
+                                        let (lr, x16, x17) = (g(30), g(16), g(17));
+                                        let mut words: Vec<String> = Vec::new();
+                                        for off in [0i64, 8] {
+                                            let _ = std::io::Error::last_os_error();
+                                            let w = unsafe {
+                                                libc::ptrace(
+                                                    libc::PTRACE_PEEKDATA,
+                                                    pid,
+                                                    (pc as i64) + off,
+                                                    0,
+                                                )
+                                            };
+                                            let e = std::io::Error::last_os_error()
+                                                .raw_os_error()
+                                                .unwrap_or(0);
+                                            if w == -1 && e != 0 {
+                                                words.push("<gap>".to_string());
+                                            } else {
+                                                // two 4-byte aarch64 instrs per peek
+                                                let b = w as u64;
+                                                words.push(format!("{:08x}", (b & 0xffff_ffff) as u32));
+                                                words.push(format!("{:08x}", (b >> 32) as u32));
+                                            }
+                                        }
+                                        log(&format!(
+                                            "6-Z306m crash instrs @pc={:#x} (tid={}): {}",
+                                            pc,
+                                            pid,
+                                            words.join(" ")
+                                        ));
+                                        // same maps ground truth as 6-Z243 above
+                                        let resolve306m = |want: u64| -> String {
+                                            match std::fs::read_to_string(format!(
+                                                "/proc/{}/maps",
+                                                pid
+                                            )) {
+                                                Ok(maps) => resolve_addr_in_maps(&maps, want),
+                                                Err(_) => {
+                                                    format!("{:#x} in UNREADABLE-MAPS", want)
+                                                }
+                                            }
+                                        };
+                                        log(&format!("6-Z306m lr maps: {}", resolve306m(lr)));
+                                        log(&format!(
+                                            "6-Z306m x16 maps: {} | x17 maps: {}",
+                                            resolve306m(x16),
+                                            resolve306m(x17)
+                                        ));
+                                    }
+                                }
                                 // 6-Z180: crashing THREAD identity — waitpid
                                 // reports TIDs for threads, so /proc/<tid>/comm
                                 // names the exact thread ("RenderThread" vs
