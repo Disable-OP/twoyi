@@ -26346,6 +26346,39 @@ pub fn run_ptrace_loop(
                             if buf != 0 {
                                 if let Some(bytes) = read_child_bytes(pid, buf, ret as usize) {
                                     let target = String::from_utf8_lossy(&bytes).into_owned();
+                                    // ── 6-Z306f-e: svclog fd → /dev/null for
+                                    // fd-readlinks ──
+                                    // Ladder #179: the path-rewrite deny let
+                                    // the zygote reach forkSystemServer (the
+                                    // hyph wall is GONE) — and the forked
+                                    // system_server child then died in the
+                                    // STOCK FileDescriptorWhitelist check on
+                                    // ITS OWN stderr-redirect fd:
+                                    //   'Not whitelisted (31):
+                                    //    /dev/twoyi-svclogs/svc-2897.log'
+                                    // On a real device init redirects service
+                                    // stdio to /dev/null; our guest redirects
+                                    // it to the svclog file (6-Z305t-24), a
+                                    // path stock never whitelists. The check
+                                    // reads each fd's target via
+                                    // readlink("/proc/self/fd/N") — a
+                                    // TRACER-side result rewrite (the proven
+                                    // 6-Z200b primitive) presents the svclog
+                                    // fd as /dev/null. The fd itself stays a
+                                    // real file, so logging keeps working;
+                                    // only the STRING the whitelist check
+                                    // sees changes. Gated on the request
+                                    // being an fd readlink (the extra
+                                    // request-buffer read is paid only when
+                                    // the result is an svclog path).
+                                    let svclog_fd_readlink = target.contains("/dev/twoyi-svclogs/");
+                                    let svclog_rewrite = if svclog_fd_readlink {
+                                        let req306e =
+                                            read_child_string(pid, path_addr).unwrap_or_default();
+                                        req306e.starts_with("/proc/self/fd")
+                                    } else {
+                                        false
+                                    };
                                     // ── 6-Z305c: the DECISION POINT trace v3 ──
                                     // The 62-byte results never matched the
                                     // rootfs prefix — log REQUEST + RESULT for
@@ -26381,7 +26414,39 @@ pub fn run_ptrace_loop(
                                             z305c_req, ret, target, z305c_guest, n,
                                         ));
                                     }
-                                    if let Some(guest) = z305c_guest {
+                                    if svclog_rewrite {
+                                        // Present the svclog fd as /dev/null to
+                                        // the in-guest whitelist machinery.
+                                        if let Some(total) = stop_log_allow(
+                                            &mut stop_log_budget,
+                                            SITE_READLINK_REWRITE,
+                                            pid,
+                                            512,
+                                        ) {
+                                            log(&format!(
+                                                "6-Z306f-e: fd-readlink {} → /dev/null (svclog whitelist illusion) [occurrence #{}]",
+                                                target, total
+                                            ));
+                                        }
+                                        let out = b"/dev/null".to_vec();
+                                        if out.len() <= ret as usize {
+                                            if write_child_bytes_pokedata(pid, buf, &out) > 0 {
+                                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                                if ptrace_getregs_wide(pid, &mut regs2).is_ok() {
+                                                    set_syscall_ret(
+                                                        &mut regs2,
+                                                        &abi,
+                                                        out.len() as i64,
+                                                    );
+                                                    let _ = ptrace_setregs(
+                                                        pid,
+                                                        &regs2,
+                                                        std::mem::size_of::<Regs>(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(guest) = z305c_guest {
                                         // 6-Z305t-71: bounded — every
                                         // fd-readlink rewrite logged; ~50K
                                         // lines in ladder #133's boot.
