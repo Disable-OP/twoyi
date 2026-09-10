@@ -33578,6 +33578,43 @@ pub fn run_ptrace_loop(
                         std::sync::atomic::AtomicU32::new(0);
                     if ABORT_VMA_DUMPS.load(std::sync::atomic::Ordering::Relaxed) < 64 {
                         ABORT_VMA_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // 6-Z306o-d: SIGINFO ground truth for SIGABRT —
+                        // si_code (SI_USER=0 → kill() from another
+                        // process; SI_TKILL=-6 → self-abort) and si_pid
+                        // name the SENDER of the zygote-killing SIGABRT
+                        // (the #173-#176 cascade wall).
+                        let mut si6: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                        let si6_rc = unsafe {
+                            libc::ptrace(
+                                libc::PTRACE_GETSIGINFO,
+                                pid,
+                                0,
+                                &mut si6 as *mut libc::siginfo_t as *mut libc::c_void,
+                            )
+                        };
+                        if si6_rc == 0 {
+                            let sp6 = &si6 as *const libc::siginfo_t as *const u8;
+                            let si_code = unsafe {
+                                i32::from_le_bytes([
+                                    *sp6.add(8),
+                                    *sp6.add(9),
+                                    *sp6.add(10),
+                                    *sp6.add(11),
+                                ])
+                            };
+                            let si_pid = unsafe {
+                                i32::from_le_bytes([
+                                    *sp6.add(16),
+                                    *sp6.add(17),
+                                    *sp6.add(18),
+                                    *sp6.add(19),
+                                ])
+                            };
+                            log(&format!(
+                                "6-Z306o-d siginfo pid={} si_code={} si_pid={} (0=SI_USER → sender is si_pid)",
+                                pid, si_code, si_pid
+                            ));
+                        }
                         match read_abort_message_vma(pid) {
                             Some(msg) => {
                                 log(&format!("6-Z306o-c abort-vma pid={} msg='{}'", pid, msg))
