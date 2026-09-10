@@ -33576,7 +33576,11 @@ pub fn run_ptrace_loop(
                 if sig == 6 {
                     static ABORT_VMA_DUMPS: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
-                    if ABORT_VMA_DUMPS.load(std::sync::atomic::Ordering::Relaxed) < 64 {
+                    // #177: the cap (64) was eaten by the crash-looping
+                    // HALs BEFORE the zygote's own abort at +156s — raise
+                    // to 384 (each record is one bounded line; 384 ×
+                    // ~200B ≈ 77KB worst case).
+                    if ABORT_VMA_DUMPS.load(std::sync::atomic::Ordering::Relaxed) < 384 {
                         ABORT_VMA_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // 6-Z306o-d: SIGINFO ground truth for SIGABRT —
                         // si_code (SI_USER=0 → kill() from another
@@ -33610,9 +33614,12 @@ pub fn run_ptrace_loop(
                                     *sp6.add(19),
                                 ])
                             };
+                            let comm6 = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                .map(|c| c.trim_end().to_string())
+                                .unwrap_or_else(|_| "?".to_string());
                             log(&format!(
-                                "6-Z306o-d siginfo pid={} si_code={} si_pid={} (0=SI_USER → sender is si_pid)",
-                                pid, si_code, si_pid
+                                "6-Z306o-d siginfo pid={} comm={:?} si_code={} si_pid={} (0=SI_USER → sender is si_pid)",
+                                pid, comm6, si_code, si_pid
                             ));
                         }
                         match read_abort_message_vma(pid) {
