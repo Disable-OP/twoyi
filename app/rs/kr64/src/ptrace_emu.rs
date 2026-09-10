@@ -17038,36 +17038,63 @@ pub fn run_ptrace_loop(
                             // 6-Z306c-v2: name every open/openat path in
                             // the window — the #161 wall was a RAW (hook-
                             // bypassing) open; this names it verbatim.
+                            // 6-Z306e: an open of /proc/self/fd IS the
+                            // whitelist check's opendir — run the
+                            // AGGRESSIVE sweep right here (before the
+                            // readdir) so the listing is clean; the
+                            // trigger re-fires on each restored open()
+                            // until the table is clean (idempotent).
+                            let mut opendir_trigger = false;
                             if (abi.openat != -1 && syscall_num == abi.openat)
                                 || (abi.open != -1 && syscall_num == abi.open)
                             {
                                 static Z306C_OPEN_LOGGED: std::sync::atomic::AtomicU64 =
                                     std::sync::atomic::AtomicU64::new(0);
+                                let path_arg = if syscall_num == abi.openat {
+                                    abi.reg_arg2
+                                } else {
+                                    abi.reg_arg1
+                                };
+                                let paddr = get_syscall_arg(&regs, path_arg);
+                                let p = if paddr != 0 {
+                                    read_child_string(pid, paddr)
+                                } else {
+                                    None
+                                };
+                                if let Some(pp) = &p {
+                                    if pp.starts_with("/proc/self/fd") {
+                                        opendir_trigger = true;
+                                    }
+                                }
                                 if Z306C_OPEN_LOGGED
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                     < 48
                                 {
-                                    let path_arg = if syscall_num == abi.openat {
-                                        abi.reg_arg2
-                                    } else {
-                                        abi.reg_arg1
-                                    };
-                                    let paddr = get_syscall_arg(&regs, path_arg);
-                                    let p = if paddr != 0 {
-                                        read_child_string(pid, paddr)
-                                    } else {
-                                        None
-                                    };
                                     log(&format!(
-                                        "6-Z306c: child open pid={} nr={} path={:?} (stop #{})",
+                                        "6-Z306c: child open pid={} nr={} path={:?} (stop #{}){}",
                                         pid,
                                         syscall_num,
                                         p,
-                                        scans + 1
+                                        scans + 1,
+                                        if opendir_trigger {
+                                            " — CHECK OPENDIR: aggressive sweep"
+                                        } else {
+                                            ""
+                                        }
                                     ));
                                 }
                             }
-                            let leaked = z306_scan_leaked_preload_fds(pid);
+                            let leaked = if opendir_trigger {
+                                z306_scan_sweep_fds(pid, rootfs, &rootfs_canonical, true)
+                            } else {
+                                // Per-ENTRY: the narrow preload-transient
+                                // families only (never mid-flight after
+                                // preload) — svclog fds are handled by the
+                                // fork gate + the opendir trigger, so a
+                                // transient /dev/null-redirect fd can't be
+                                // closed mid-write.
+                                z306_scan_sweep_fds(pid, rootfs, &rootfs_canonical, false)
+                            };
                             if leaked.is_empty() {
                                 static Z306C_CLEAN_LOGGED: std::sync::atomic::AtomicU64 =
                                     std::sync::atomic::AtomicU64::new(0);
@@ -17149,7 +17176,11 @@ pub fn run_ptrace_loop(
                     {
                         let clone_flags = get_syscall_arg(&regs, abi.reg_arg1);
                         if z306_flags_are_process_fork(clone_flags) {
-                            let leaked = z306_scan_leaked_preload_fds(pid);
+                            // 6-Z306e: AGGRESSIVE sweep at the fork —
+                            // every fd the stock A11 whitelist would
+                            // reject is closed (fork = a quiescent point;
+                            // no transient can be mid-flight).
+                            let leaked = z306_scan_sweep_fds(pid, rootfs, &rootfs_canonical, true);
                             if leaked.is_empty() {
                                 // Clean pass-through — reset this pid's
                                 // close budget.
@@ -33630,20 +33661,67 @@ pub fn run_ptrace_loop(
 /// artifact the fork-gate sweep must close before the zygote forks
 /// system_server?
 ///
-/// Pure predicate (unit-tested). The readlink targets are the TRACED,
-/// TRANSLATED host paths (e.g.
-/// /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/usr/
-/// hyphen-data/hyph-as.hyb) — the same strings the 6-Z305t-14b STALL-FD
-/// probe and the #159 ladder evidence show. Match the two #156/#157
-/// leak families by SUBSTRING with a trailing slash so sibling
-/// directories (fonts2/, hyphen-data-old/) can never match, and so the
-/// file NAME is free (any .hyb / any font file qualifies).
-///
-/// Deliberately NOT matched: apex jars, framework jars, sockets, pipes,
-/// /dev/null, svc logs — those are either whitelisted by the AOSP
-/// FileDescriptorWhitelist or legitimate stdio/sync machinery.
+/// Pure predicate (unit-tested). `target` is the raw HOST readlink result
+/// (translated, rootfs-prefixed). This is the NARROW family matcher kept
+/// for the per-ENTRY child sweeps: fonts + hyphen-data are preload-only
+/// artifacts that can never be mid-flight transients after preload
+/// completes, so closing them on sight inside the child window is safe.
 fn z306_fd_target_is_preload_leak(target: &str) -> bool {
     target.contains("/rootfs/system/fonts/") || target.contains("/rootfs/system/usr/hyphen-data/")
+}
+
+/// 6-Z306e: classify a translated fd readlink target the way the AOSP
+/// android-11 FileDescriptorWhitelist (fd_utils.cpp) would, on the GUEST
+/// path. Returns the guest path when the target is a real filesystem
+/// path under the rootfs (None for kernel objects: sockets, pipes, /proc
+/// handles — those are skipped by the sweep).
+///
+/// Pure predicate (unit-tested). The aggressive sweep closes every fd
+/// whose guest path is NOT whitelist-class: ladder #162's wall was
+/// "Not whitelisted (28): /dev/twoyi-svclogs/svc-2937.log" — the zygote
+/// held a FOREIGN svc-log fd (the 6-Z305t-24 /dev/null write-side
+/// redirect lands in guest-visible paths!) that no fonts/hyphen filter
+/// could ever name. The honest fix mirrors the stock whitelist: at fork
+/// (and at the child's opendir("/proc/self/fd")) any fd the stock
+/// whitelist would reject is closed with a REAL close() — a physical
+/// device's zygote carries only whitelisted fds at forkSystemServer.
+pub fn z306_fd_target_class(target: &str, rootfs: &str, rootfs_canonical: &str) -> Option<bool> {
+    // Mirror the tracer's readlink rewrite: host path -> guest path.
+    let guest = strip_guest_prefix(target, rootfs, rootfs_canonical)?;
+    // Kernel object links and transient /proc handles: never touch.
+    if guest.starts_with("socket:[")
+        || guest.starts_with("pipe:[")
+        || guest.starts_with("anon_inode:[")
+        || guest.starts_with("/proc/")
+    {
+        return None;
+    }
+    const Z306_ALLOW_EXACT: [&str; 5] = [
+        "/dev/null",
+        "/dev/urandom",
+        "/dev/random",
+        "/dev/ion",
+        "/dev/tty",
+    ];
+    const Z306_ALLOW_PREFIXES: [&str; 14] = [
+        "/dev/socket/",
+        "/dev/__properties__",
+        "/system/framework/",
+        "/system/app/",
+        "/system/priv-app/",
+        "/vendor/framework/",
+        "/vendor/app/",
+        "/vendor/priv-app/",
+        "/apex/",
+        "/data/dalvik-cache/",
+        "/oem/",
+        "/odm/",
+        "/vendor/",
+        "/product/",
+    ];
+    let allowed = Z306_ALLOW_EXACT.iter().any(|p| guest.starts_with(p))
+        || Z306_ALLOW_PREFIXES.iter().any(|p| guest.starts_with(p));
+    Some(!allowed)
 }
 
 /// 6-Z306: is this clone() flags word a PROCESS fork (the forkSystemServer
@@ -33665,16 +33743,32 @@ fn z306_flags_are_process_fork(flags: u64) -> bool {
 }
 
 /// 6-Z306: scan the REAL kernel fd table of `pid` (host-side /proc —
-/// the same hook-proof source the 6-Z305t-14b STALL-FD probe reads) for
-/// leaked preload fds. Bounded to fds 0..=64 (the zygote's live table at
-/// fork time per #159's STALL-FD snapshot: 23 entries). Sorted ascending
+/// the same hook-proof source the 6-Z305t-14b STALL-FD probe reads).
+/// `aggressive` = the fork/opendir sweep: close every fd the stock A11
+/// whitelist would reject (fd 0/1/2 are whitelist-skipped stdio and are
+/// never touched). Non-aggressive = the narrow preload-transient
+/// families only (safe against mid-flight transients). Sorted ascending
 /// so the gate closes the LOWEST leaked fd first (stable, observable
 /// order in the artifact).
-fn z306_scan_leaked_preload_fds(pid: libc::pid_t) -> Vec<i64> {
+fn z306_scan_sweep_fds(
+    pid: libc::pid_t,
+    rootfs: &str,
+    rootfs_canonical: &str,
+    aggressive: bool,
+) -> Vec<i64> {
     let mut out = Vec::new();
-    for fd in 0..=64i64 {
+    for fd in 3..=64i64 {
         if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
-            if z306_fd_target_is_preload_leak(&target.to_string_lossy()) {
+            let t = target.to_string_lossy().to_string();
+            let needs_close = if aggressive {
+                matches!(
+                    z306_fd_target_class(&t, rootfs, rootfs_canonical),
+                    Some(true)
+                )
+            } else {
+                z306_fd_target_is_preload_leak(&t)
+            };
+            if needs_close {
                 out.push(fd);
             }
         }
@@ -33745,6 +33839,83 @@ mod tests {
         assert!(z306_fd_target_is_preload_leak(
             "/x/rootfs/system/fonts/fonts2/NotoSans.ttf"
         ));
+    }
+
+    #[test]
+    fn z306_class_closes_foreign_svclog_and_keeps_whitelisted() {
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        // The #162 wall verbatim: a FOREIGN svc-log fd on the zygote —
+        // the aggressive sweep must close it.
+        assert_eq!(
+            z306_fd_target_class(
+                "/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs/svc-2937.log",
+                rootfs,
+                rootfs
+            ),
+            Some(true)
+        );
+        // The #159-161 walls: preload transients.
+        assert_eq!(
+            z306_fd_target_class(
+                "/data/user/0/io.twoyi.debug/profiles/default/rootfs/system/usr/hyphen-data/hyph-as.hyb",
+                "/data/user/0/io.twoyi.debug/profiles/default/rootfs",
+                rootfs
+            ),
+            Some(true)
+        );
+        // Stock-whitelisted classes stay open.
+        assert_eq!(
+            z306_fd_target_class(
+                "/data/user/0/io.twoyi.debug/rootfs/apex/com.android.art/javalib/core-oj.jar",
+                rootfs,
+                rootfs
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            z306_fd_target_class(
+                "/data/user/0/io.twoyi.debug/rootfs/system/framework/framework.jar",
+                rootfs,
+                rootfs
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            z306_fd_target_class(
+                "/data/user/0/io.twoyi.debug/rootfs/dev/null",
+                rootfs,
+                rootfs
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            z306_fd_target_class(
+                "/data/user/0/io.twoyi.debug/rootfs/dev/__properties__/property_info",
+                rootfs,
+                rootfs
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn z306_class_skips_kernel_objects_and_proc_handles() {
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        // Sockets/pipes/anon inodes and /proc handles: None = never touch
+        // (A11's ParseFd skips non-regular files; the check's own dirfd
+        // must survive its own readdir).
+        assert_eq!(z306_fd_target_class("socket:[50294]", rootfs, rootfs), None);
+        assert_eq!(
+            z306_fd_target_class(
+                "/data/user/0/io.twoyi.debug/rootfs/proc/self/fd",
+                rootfs,
+                rootfs
+            ),
+            None
+        );
+        // Targets outside the rootfs (should not happen for translated
+        // opens) are skipped rather than force-closed.
+        assert_eq!(z306_fd_target_class("/etc/hostname", rootfs, rootfs), None);
     }
 
     #[test]
