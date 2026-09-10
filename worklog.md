@@ -27574,3 +27574,15 @@ Work Log:
 Stage Summary:
 - OPEN WALL (named, needs the next session): the INHERITED /system/etc/preloaded-classes fd (fd 28 at fork) — an exec-time zygote leak. The deny can't fix inherited fds; the clone-entry injection is proven not to take. Candidate fixes for next session: (a) make the zygote's OWN preload reads close honestly (find why no kernel close ever runs for the served/stdio reads), or (b) revisit why entry-stop syscall-number rewrites (set_syscall_num + SETREGS + PTRACE_SYSCALL) do not take on this aarch64 kernel (the 6-Z305y pin evidence suggests they never did) — that single primitive unblocks the entire close-at-fork class.
 - #165 in flight (id will be in the actions list; run on cb3c9ee).
+
+---
+Task ID: 13
+Agent: Z.ai Code (main session, continued)
+Task: Analyze ladder #165, fix the thread-tid lineage gap (6-Z306g-b), dispatch #166.
+
+Work Log:
+- #165 (cb3c9ee): the wall = fd 28 = /dev/twoyi-svclogs/svc-2947.log; 2947 = a THREAD TID of the zygote (2889). The lineage exemption held only the TGID, so a zygote THREAD's /dev/null open was still redirected into the SHARED thread-group table, inherited by the forked system_server. The persistent hyphen/fonts deny had nothing to fire on (0 DENIED — the raw hyph open is a racy class and did not occur this run).
+- 6-Z306g-b (672b2db): z306_in_zygote_lineage() — thread-aware exemption via the thread's TGID (parsed once from /proc/<pid>/stat field 4, cached ≤512). 825/825. Pushed; dispatched #166.
+
+Stage Summary:
+- The svclog-fd leak chain is now fully mapped: /dev/null write-side opens by ZYGOTE THREADS were the last unexempted source. #166 in flight; remaining named walls after this: the inherited /system/etc/preloaded-classes fd (exec-time zygote leak; needs either a working entry-stop rewrite primitive or served-open close semantics) and the general entry-stop rewrite mystery (pin rewrites appear never to take on this aarch64 kernel).
