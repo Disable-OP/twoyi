@@ -33746,15 +33746,16 @@ pub fn z306_in_zygote_lineage(
     let tgid = match cache.get(&pid) {
         Some(&t) => t,
         None => {
-            let t = std::fs::read_to_string(format!("/proc/{}/stat", pid))
+            // NOTE: /proc/<tid>/stat has NO tgid field (its "pid" IS the
+            // tid; field 4 = ppid — the #166 run's parser bug read ppid).
+            // The TGID lives in /proc/<tid>/status's "Tgid:" line.
+            let t = std::fs::read_to_string(format!("/proc/{}/status", pid))
                 .ok()
                 .and_then(|s| {
-                    // Field 4 (state is 3): after the comm's closing paren.
-                    let rest = match s.rfind(')') {
-                        Some(i) => &s[i + 1..],
-                        None => return None,
-                    };
-                    rest.split_whitespace().nth(1)?.parse::<libc::pid_t>().ok()
+                    s.lines().find_map(|l| {
+                        l.strip_prefix("Tgid:")
+                            .and_then(|v| v.trim().parse::<libc::pid_t>().ok())
+                    })
                 })
                 .unwrap_or(0);
             if cache.len() < 512 {
