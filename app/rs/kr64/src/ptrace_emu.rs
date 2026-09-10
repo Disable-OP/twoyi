@@ -14178,6 +14178,11 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     let mut prctl_spin_consecutive: std::collections::HashMap<libc::pid_t, u64> =
         std::collections::HashMap::new();
+    // 6-Z306o: per-pid count of abort-message dumps already served (cap 8
+    // per pid so a crash-looping service can't flood; global cap via the
+    // static inside the probe).
+    let mut prctl_abort_dumped: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
     let mut connect_path_log_count: u64 = 0;
     // 6-Z305h: quiet-death sampler state. Run 34002339515's window
     // decoded init main's quiet exit(0) but left four facts anonymous:
@@ -20160,6 +20165,64 @@ pub fn run_ptrace_loop(
                         // logs ONE SPIN-DETECTED line with the last rip.
                         // 6-Z305t-72: ABI-exact (see ChildAbi.prctl).
                         if syscall_num == abi.prctl {
+                            // ── 6-Z306o: abort-message content dump ──
+                            // Ladder #173: 44 aborts (+130-156s) whose
+                            // messages were NOT captured by the DIAG
+                            // LOGFATAL wire tap (headers only) and whose
+                            // debuggerd tombstones never landed
+                            // ("crash_dump helper failed to exec") — the
+                            // 6-Z149 probe proved the dying processes all
+                            // prctl(PR_SET_VMA, …, "abort message", addr,
+                            // len) with len=0x5f, so the CONTENT is sitting
+                            // at addr at this exact moment. Read it here:
+                            // 1 PEEK for the VMA name on every PR_SET_VMA,
+                            // up to 16 PEEKs only when the name matches.
+                            // Caps: 8 per pid, 256 per run.
+                            {
+                                let option306o = get_syscall_arg(&regs, abi.reg_arg1);
+                                if option306o == 0x53564d41 {
+                                    static ABORT_DUMPS: std::sync::atomic::AtomicU32 =
+                                        std::sync::atomic::AtomicU32::new(0);
+                                    let arg5_306o = get_syscall_arg(&regs, abi.reg_arg5);
+                                    let dumped = prctl_abort_dumped.entry(pid).or_insert(0);
+                                    if arg5_306o > 0x1000
+                                        && *dumped < 8
+                                        && ABORT_DUMPS.load(std::sync::atomic::Ordering::Relaxed)
+                                            < 256
+                                    {
+                                        if let Some(nb) = read_child_bytes(pid, arg5_306o, 16) {
+                                            let nend =
+                                                nb.iter().position(|b| *b == 0).unwrap_or(16);
+                                            let vname =
+                                                String::from_utf8_lossy(&nb[..nend]).to_string();
+                                            if vname == "abort message" {
+                                                *dumped += 1;
+                                                ABORT_DUMPS.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                let addr306o = get_syscall_arg(&regs, abi.reg_arg3);
+                                                let len306o = get_syscall_arg(&regs, abi.reg_arg4);
+                                                let want = (len306o as usize).clamp(1, 128).max(1);
+                                                let content = read_child_bytes(pid, addr306o, want)
+                                                    .map(|b| {
+                                                        let e = b
+                                                            .iter()
+                                                            .position(|&c| c == 0)
+                                                            .unwrap_or(b.len());
+                                                        String::from_utf8_lossy(&b[..e])
+                                                            .replace('\n', " ")
+                                                    })
+                                                    .unwrap_or_else(|| "<unreadable>".to_string());
+                                                log(&format!(
+                                                    "6-Z306o abort-message pid={} len={:#x} content='{}'",
+                                                    pid, len306o, content
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // 6-Z149: deep prctl sampling. The Z148 run
                             // proved the spin's rip is libc's prctl
                             // syscall INSTRUCTION (every caller shares
