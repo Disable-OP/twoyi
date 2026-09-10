@@ -1880,12 +1880,20 @@ static void fb_fd_clear(int fd) {
 // lands under /system/fonts/ or /system/usr/hyphen-data/ is recorded
 // with its fd; every close() of a recorded fd logs the pair. An OPEN
 // with NO matching CLOSE in the artifact = the leak, with the fd and
-// path. Bounded: 32 open lines and an 80-line total budget per
-// process; the table itself holds 96 entries (far above the ~80
-// transient preload opens the zygote issues).
+// path. Bounded: 160 open lines and a 320-line total budget per
+// process (the full preload open family is ~130); the table holds 256
+// entries (above the real preload open count so nothing drops).
 // ---------------------------------------------------------------------------
 
-#define PRELOAD_FD_MAX 96
+// #156 decode: the tracker's first cut proved the hyb/font lifecycle
+// flows through BOTH hook layers (the shlib sees some opens+closes, the
+// fb hook's raw fallbacks others) and that fd 29/30 recycle across ~130
+// preload files — so the leak evidence must carry (a) EVERY pair and
+// (b) the fd's REAL current identity at close (the tracked path is
+// STALE under fd recycling: close(fd=30) logged Roboto-Thin while the
+// table said NotoSansMalayalam). Budgets raised to full-coverage;
+// table sized above the real ~130 preload open count.
+#define PRELOAD_FD_MAX 256
 struct preload_fd_ent { int fd; char path[80]; };
 static struct preload_fd_ent g_preload_fds[PRELOAD_FD_MAX];
 static int g_preload_fd_n;
@@ -1906,7 +1914,7 @@ static void preload_fd_track(const char *path, int fd) {
         e->fd = fd;
         snprintf(e->path, sizeof(e->path), "%s", path);
     }
-    if (g_preload_fd_log < 32) {
+    if (g_preload_fd_log < 160) {
         g_preload_fd_log++;
         char msg[224];
         snprintf(msg, sizeof(msg),
@@ -1918,15 +1926,26 @@ static void preload_fd_track(const char *path, int fd) {
 }
 
 static void preload_fd_note_close(int fd) {
+    // 6-Z305x v2: log the fd's REAL current identity (readlink) — under
+    // fd recycling the tracked path is stale by definition (the fd may
+    // have been re-opened for a different file since).
     pthread_mutex_lock(&g_preload_fd_lock);
     for (int i = 0; i < g_preload_fd_n; i++) {
         if (g_preload_fds[i].fd == fd) {
-            if (g_preload_fd_log < 80) {
+            if (g_preload_fd_log < 320) {
                 g_preload_fd_log++;
-                char msg[256];
+                char real[160];
+                real[0] = '\0';
+                char linkpath[64];
+                snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
+                long n = syscall(SYS_readlinkat, AT_FDCWD, linkpath, real,
+                                 (long)(sizeof(real) - 1));
+                if (n < 0) n = 0;
+                real[n] = '\0';
+                char msg[384];
                 snprintf(msg, sizeof(msg),
-                    "[twoyi_loader] 6-Z305x PRELOAD-FD: close(fd=%d) -> %s [tracked %d]\n",
-                    fd, g_preload_fds[i].path, g_preload_fd_n);
+                    "[twoyi_loader] 6-Z305x PRELOAD-FD: close(fd=%d) tracked=%s real=%s [tracked %d]\n",
+                    fd, g_preload_fds[i].path, n > 0 ? real : "?", g_preload_fd_n);
                 write_str(2, msg);
             }
             g_preload_fds[i] = g_preload_fds[--g_preload_fd_n];
