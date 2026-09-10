@@ -3747,6 +3747,8 @@ fn patch_file_contexts_delete(rootfs_prefix: &str) {
 ///   * `{rootfs}/sys/fs/selinux/`            (empty directory, mode 0755)
 ///   * `{rootfs}/sys/fs/selinux/enforce`     (empty file, mode 0666 — content "0")
 ///   * `{rootfs}/sys/fs/selinux/load`        (empty file, mode 0666)
+///   * `{rootfs}/sys/fs/selinux/status`      (one zero page, mode 0666 — the
+///     libselinux mmap'd kernel-status node; 6-Z306u)
 ///
 /// Companion change in `ptrace_emu::translate_path`: `/sys/*` opens are
 /// now redirected to `{rootfs}/sys/*` (previously they passed through to
@@ -3893,6 +3895,38 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     touch("sys/fs/selinux/create", 0o666, "");
     touch("sys/fs/selinux/member", 0o666, "");
 
+    // 6-Z306u: /sys/fs/selinux/status — the libselinux STATUS PAGE node.
+    // Ladder #188 decode: every installd generation (pids 4258/4464/.../5558)
+    // exec'd cleanly and then exited STATUS 1 with zero kmsg output ~7.3s
+    // in — installd_main() (frameworks/native/cmds/installd/installd.cpp,
+    // android-11.0.0_r1 lines 219-220) does
+    //   if (selinux_enabled && selinux_status_open(true) < 0) {
+    //       SLOGE("Could not open selinux status; exiting.\n"); exit(1);
+    //   }
+    // and libselinux selinux_status_open() (external/selinux
+    // libselinux/src/sestatus.c) first open()s "%s/status" (the mmap-able
+    // kernel status page), falling back to an avc_netlink_open() netlink
+    // socket. In this sandbox BOTH fail: (a) the fake selinuxfs never had
+    // a `status` node → open() = -ENOENT; (b) the netlink fallback's
+    // socket(PF_NETLINK, SOCK_RAW, NETLINK_SELINUX) hits the HOST kernel's
+    // SELinux enforcing (the guest runs as the host's untrusted app —
+    // netlink_selinux_socket create is denied). -1 → exit(1) → installd
+    // crash-loops every ~10s → never registers "installd" with
+    // servicemanager → the forked system_server's
+    // ZygoteInit.performSystemServerDexOpt dereferences
+    // ServiceManager.getService("installd") = null → NullPointerException
+    // "Attempt to invoke interface method 'void android.os.IInstalld.dexopt
+    // (...)'" → the clean exit(0) that #185-#188 chased ("Shutdown thread").
+    // Fix: pre-create the node as ONE FULL PAGE of zeros. The struct
+    // selinux_status_t layout is {version, sequence, enforcing, policyload}
+    // — all-zero encodes version 0 / seqno 0 / PERMISSIVE / policyload 0,
+    // exactly consistent with this sandbox's setenforce-0 world. The page
+    // size matters: selinux_status_open() mmaps MAP_SHARED|PROT_READ and
+    // later fields are read within the first page — a sub-page file risks
+    // SIGBUS past EOF on the mapped region, so seed exactly 4096 bytes.
+    let status_seed = "\0".repeat(4096);
+    touch("sys/fs/selinux/status", 0o666, &status_seed);
+
     // 6-Z305m: /sys/fs/selinux/access — the security_compute_av node
     // (libselinux compute_av.c line 30-33: snprintf("%s/access",
     // selinux_mnt); open(O_RDWR|O_CLOEXEC) — ENOENT = every
@@ -3930,7 +3964,7 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     );
 
     info!(
-        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null,create,member,access}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1); 6-Z305j added selinux/member — the security_compute_create node, was the bootstrap-apexd-failed reboot; 6-Z305m added selinux/access — the security_compute_av node, was the post-class-discovery property wall)",
+        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null,create,member,access,status}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1); 6-Z305j added selinux/member — the security_compute_create node, was the bootstrap-apexd-failed reboot; 6-Z305m added selinux/access — the security_compute_av node, was the post-class-discovery property wall; 6-Z306u added selinux/status — the libselinux mmap'd status page, was the installd exit(1) crash-loop that starved system_server's performSystemServerDexOpt)",
         rootfs_prefix
     );
 }

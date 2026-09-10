@@ -449,12 +449,19 @@ jobs:
           # The zygote / hwservicemanager / HAL exit(1) crash-loops have
           # their only failure evidence on that previously-swallowed
           # stderr — these files name the failing lines verbatim.
-          timeout 30 sudo docker exec redroid sh -c \
+          # #188 lesson: timeout 30 KILLED the per-file loop ~half-way
+          # (243 files later the run had spawned svc-5558+; every file
+          # after svc-3709 was silently missing — installd's dying
+          # "Could not open selinux status" line was in that gap). The
+          # head -80 listing cap hid the same files. timeout 30→120,
+          # listing head 80→400 (still bounded: per-file output stays
+          # grep-30 + tail-24).
+          timeout 120 sudo docker exec redroid sh -c \
             "d=/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs; \
-             ls -la \$d 2>/dev/null | head -80; \
+             ls -la \$d 2>/dev/null | head -400; \
              for f in \$d/svc-*.log; do \
                [ -f \$f ] && echo \"== \$(basename \$f) (\$(stat -c%s \$f) bytes) ==\" && \
-               grep -aE 'linker|CANNOT LINK|cannot locate|not found|WARNING|virtualization|binder_open_fallback|proxy|TWOYI_ROOTFS|logdw|abort message|abort\(\) INTERCEPTED|FATAL|exited|cannot|Failed|failed' \$f | grep -av 'anon:' | head -30; \
+               grep -aE 'linker|CANNOT LINK|cannot locate|not found|WARNING|virtualization|binder_open_fallback|proxy|TWOYI_ROOTFS|logdw|abort message|abort\(\) INTERCEPTED|FATAL|exited|exiting|Could not|cannot|Failed|failed' \$f | grep -av 'anon:' | head -30; \
                echo \"-- tail 3072 --\"; tail -c 3072 \$f | grep -av 'anon:' | tail -24; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs.txt 2>&1 || true
