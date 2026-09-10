@@ -97,10 +97,14 @@
 //   - old bionic (libdl not loaded) — uses raw_syscall* fallbacks
 //
 // RTLD_NEXT is normally defined in <dlfcn.h> as ((void *)-1L); we redefine
-// it here since we're not including the header.
+// it here since we're not including the header. RTLD_DEFAULT (the whole
+// global scope, searched from the beginning) is ((void *)0) — the 6-Z305z
+// close-chain fallback needs it to reach the shlib's uniquely-named
+// __twoyi_shlib_close when the RTLD_NEXT quirk strikes.
 // ---------------------------------------------------------------------------
 extern void *dlsym(void *handle, const char *symbol) __attribute__((weak));
-#define RTLD_NEXT ((void *)-1L)
+#define RTLD_NEXT    ((void *)-1L)
+#define RTLD_DEFAULT ((void *)0)
 
 // ── 6-Z246: RTLD_NEXT self-resolution guard ──────────────────────────
 //
