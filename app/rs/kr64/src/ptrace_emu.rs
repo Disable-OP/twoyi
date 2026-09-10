@@ -20818,6 +20818,59 @@ pub fn run_ptrace_loop(
                     //      x86_64. Read the per-arch pc slot: 32 on
                     //      aarch64 hosts (both native user_pt_regs and
                     //      the widened arm32 view), 16 on x86_64 hosts.
+                    // ── 6-Z306s: system_server exit(0) svclog tail dump ──
+                    //
+                    // Ladder #185: the forked system_server got through the
+                    // whitelist check, the capbset drops AND the SELinux
+                    // setcon ("seccomp disabled by setenforce 0" glog),
+                    // opened the whole boot classpath, registered on the
+                    // binder (conn=339 IDENT uid=1000) — then a JAVA
+                    // "Shutdown thread" ran and it called exit_group(0).
+                    // exit_group(0) of a comm=="system_server" process is
+                    // un-diagnosable without ITS OWN words: its stderr is
+                    // the svclog file (6-Z305t-24) — dump its TAIL here,
+                    // before the reaper, straight into the tracer log.
+                    // Bounded: 1.5 KiB tail, once per pid.
+                    if syscall_num == abi.exit_group_nr {
+                        let comm306s = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                            .map(|c| c.trim_end().to_string())
+                            .unwrap_or_default();
+                        if comm306s == "system_server" {
+                            static SS_EXIT_DUMPED: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if SS_EXIT_DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2
+                            {
+                                let svc_path =
+                                    format!("{}/dev/twoyi-svclogs/svc-{}.log", rootfs, pid);
+                                match std::fs::metadata(&svc_path) {
+                                    Ok(m) => {
+                                        let len = m.len() as usize;
+                                        let skip = len.saturating_sub(1536);
+                                        let tail = std::fs::read(&svc_path)
+                                            .map(|b| b[skip.min(b.len())..].to_vec())
+                                            .unwrap_or_default();
+                                        let text =
+                                            String::from_utf8_lossy(&tail).replace('\n', " | ");
+                                        let shown = text.get(..1400).unwrap_or(&text);
+                                        log(&format!(
+                                            "6-Z306s: system_server pid={} exit_group svclog tail ({} of {} bytes): {}",
+                                            pid,
+                                            tail.len(),
+                                            len,
+                                            shown
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        log(&format!(
+                                            "6-Z306s: system_server pid={} exit_group — svclog {} unreadable: {}",
+                                            pid, svc_path, e
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if pid == init_pid && syscall_num == abi.exit_group_nr {
                         let exit_code = get_syscall_arg(&regs, abi.reg_arg1);
                         if exit_code != 0 {
