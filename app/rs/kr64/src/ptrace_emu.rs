@@ -20844,6 +20844,63 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // ── 6-Z306x: zygote-lineage rename + self-kill
+                    // observability ──
+                    //
+                    // #190's forked system_server went comm "system_server"
+                    // → "Shutdown thread" (the ART Runtime::~Runtime
+                    // destructor's attached shutdown thread name) and
+                    // tgkill'ed its own Signal-Catcher-class thread before
+                    // a SILENT exit_group(0) — no Java exception anywhere,
+                    // stderr invisible (lineage /dev/null exemption, now
+                    // narrowed by 6-Z306w). To name the exact teardown
+                    // sequence, log (bounded 40/run each):
+                    //   * PR_SET_NAME (15) renames inside the lineage —
+                    //     the name string tells which ART/framework stage
+                    //     renamed and WHEN relative to the traced opens;
+                    //   * kill/tgkill issued BY a lineage pid — the target
+                    //     + signal distinguish a SIGQUIT stack-dump request
+                    //     from a SIGKILL teardown.
+                    {
+                        let lineage_306x = z306_zygote_lineage.contains(&pid);
+                        if lineage_306x {
+                            if syscall_num == abi.prctl
+                                && get_syscall_arg(&regs, abi.reg_arg1) == 15
+                            {
+                                static Z306X_NAME: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z306X_NAME.load(std::sync::atomic::Ordering::Relaxed) < 40 {
+                                    Z306X_NAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let name_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                    let name = read_child_string(pid, name_addr)
+                                        .unwrap_or_else(|| "<unreadable>".into());
+                                    log(&format!("6-Z306x: pid={} PR_SET_NAME -> {:?}", pid, name));
+                                }
+                            }
+                            let is_tgkill_306x =
+                                abi.tgkill_nr != -1 && syscall_num == abi.tgkill_nr;
+                            let is_kill_306x = abi.kill_nr != -1 && syscall_num == abi.kill_nr;
+                            if is_tgkill_306x || is_kill_306x {
+                                static Z306X_KILL: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z306X_KILL.load(std::sync::atomic::Ordering::Relaxed) < 40 {
+                                    Z306X_KILL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let a0 = get_syscall_arg(&regs, abi.reg_arg1);
+                                    let a1 = get_syscall_arg(&regs, abi.reg_arg2);
+                                    let a2 = get_syscall_arg(&regs, abi.reg_arg3);
+                                    log(&format!(
+                                        "6-Z306x: pid={} {} args=({a0:#x}, {a1:#x}, {a2:#x}) comm={:?}",
+                                        pid,
+                                        if is_tgkill_306x { "tgkill" } else { "kill" },
+                                        std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                            .unwrap_or_default()
+                                            .trim_end()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     // ── 6-Z306t: GENERIC nonzero-exit svclog tail dump ──
                     //
                     // #188's lesson generalised: a service that exits with a
@@ -22163,8 +22220,27 @@ pub fn run_ptrace_loop(
                                     // THREAD-AWARE (a zygote thread's tid is
                                     // not in the set; its TGID is — #165's
                                     // fd 28 = svc-<thread-tid>.log wall).
-                                    && !z306_in_zygote_lineage(
+                                    // 6-Z306w: NARROWED to the pinned zygote
+                                    // process itself. #190's decode: the
+                                    // FORKED system_server child's ONLY
+                                    // dying words (ART Runtime::~Runtime
+                                    // "Shutdown thread" clean exit(0) — no
+                                    // Java exception anywhere) go to the
+                                    // inherited REAL /dev/null and are
+                                    // un-capturable; the child's OWN
+                                    // /dev/null opens (seen at 6-Z306c stops
+                                    // #4/#9/#34/#101) were left real by the
+                                    // blanket lineage exemption. Fork
+                                    // children now GET the svclog redirect —
+                                    // the whitelist concern is already
+                                    // covered by 6-Z306f-e's readlink
+                                    // rewrite (svclog fd → presented as
+                                    // /dev/null), and the zygote PARENT's
+                                    // table is unchanged so its fork-inherited
+                                    // fds stay exactly as before.
+                                    && !z306_is_zygote_self(
                                         pid,
+                                        z305y_stdio_pin_pid,
                                         &z306_zygote_lineage,
                                         &mut z306_lineage_tgid_cache,
                                     )
@@ -34640,6 +34716,49 @@ pub fn z306_in_zygote_lineage(
         }
     };
     tgid != 0 && lineage.contains(&tgid)
+}
+
+/// 6-Z306w: whether `pid` is the PINNED ZYGOTE process itself (or one of
+/// its threads) — the only lineage member that keeps the blanket /dev/null
+/// redirect exemption. Fork children (system_server et al.) no longer do:
+/// their /dev/null opens become svclog captures so a silent clean exit has
+/// visible dying words (#190's ART "Shutdown thread" exit(0) class).
+pub fn z306_is_zygote_self(
+    pid: libc::pid_t,
+    pin_pid: Option<libc::pid_t>,
+    lineage: &std::collections::HashSet<libc::pid_t>,
+    cache: &mut std::collections::HashMap<libc::pid_t, libc::pid_t>,
+) -> bool {
+    let Some(pin) = pin_pid else {
+        return false;
+    };
+    if pid == pin {
+        return true;
+    }
+    // A thread of the zygote (tid != pin, tgid == pin) is also "self": its
+    // fds land in the same inherited table the whitelist audits.
+    if !lineage.contains(&pid) {
+        let tgid = match cache.get(&pid) {
+            Some(&t) => t,
+            None => {
+                let t = std::fs::read_to_string(format!("/proc/{}/status", pid))
+                    .ok()
+                    .and_then(|s| {
+                        s.lines().find_map(|l| {
+                            l.strip_prefix("Tgid:")
+                                .and_then(|v| v.trim().parse::<libc::pid_t>().ok())
+                        })
+                    })
+                    .unwrap_or(0);
+                if cache.len() < 512 {
+                    cache.insert(pid, t);
+                }
+                t
+            }
+        };
+        return tgid == pin;
+    }
+    false
 }
 
 /// 6-Z306f: AUDIT the REAL kernel fd table of `pid` (host-side /proc —
