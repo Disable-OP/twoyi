@@ -3034,8 +3034,20 @@ int close(int fd) {
         write_str(2, ") (was tracked ashmem fd)\n");
     }
     static int (*real_close)(int) = NULL;
-    if (!real_close && dlsym) real_close = (int (*)(int))hook_de_self(
-                (void *)dlsym(RTLD_NEXT, "close"), "close"); /* 6-Z246 */
+    if (!real_close && dlsym) {
+        real_close = (int (*)(int))hook_de_self(
+                    (void *)dlsym(RTLD_NEXT, "close"), "close"); /* 6-Z246 */
+        if (!real_close && dlsym) {
+            /* 6-Z305z: the old-bionic RTLD_NEXT quirk — fall back to the
+             * shlib's UNIQUELY-NAMED close body (__twoyi_shlib_close):
+             * the STDIO FLOOR + binder/qemu/fb fd bookkeeping + the
+             * 6-Z305x tracker live there. A raw close here (the old
+             * fallback) is what let preload-transient fds drift past
+             * every hook layer and leak past the forkSystemServer
+             * whitelist (ladders #155/#156/#157). */
+            real_close = (int (*)(int))dlsym(RTLD_DEFAULT, "__twoyi_shlib_close");
+        }
+    }
     if (real_close) return real_close(fd);
     return (int)raw_syscall1(SYS_close, fd);
 }
