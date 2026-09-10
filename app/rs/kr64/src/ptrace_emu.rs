@@ -20828,7 +20828,14 @@ pub fn run_ptrace_loop(
                                         if let Some(trail) = z306y_trail.get(&pid) {
                                             let names: Vec<String> = trail
                                                 .iter()
-                                                .map(|&n| syscall_name(n, &abi).trim().to_string())
+                                                .map(|&n| {
+                                                    let nm = syscall_name(n, &abi).trim();
+                                                    if nm == "unknown" || nm == "[unknown]" {
+                                                        format!("nr={n}")
+                                                    } else {
+                                                        format!("{nm}/{n}")
+                                                    }
+                                                })
                                                 .collect();
                                             log(&format!(
                                                 "6-Z306y: fork-child pid={} last {} syscalls (oldest->newest): {}",
