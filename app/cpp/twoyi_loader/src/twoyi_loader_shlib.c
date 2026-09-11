@@ -501,6 +501,50 @@ static pthread_mutex_t g_sm_pending_lock = PTHREAD_MUTEX_INITIALIZER;
 static uintptr_t g_sm_pending_stash = 0;
 static uint32_t g_sm_pending_stash_len = 0;
 
+// 6-Z306aa: fork-aware client-side binder diagnostics. Every bounded
+// decoder below used to be a function-local `static` — which fork COPIES
+// into the child at whatever budget the parent had left. The forked
+// system_server (zygote lineage) therefore ran its entire life with
+// EXHAUSTED budgets: its SM getService hit reply (the wire bytes were
+// proven correct — trailer=60B = [EX_NONE][flat(24)][stability i32],
+// offsets=[4]) decoded to NULL at the client and the
+// ZygoteInit.performSystemServerDexOpt installd NPE died-looped with
+// ZERO client-side observability (ladder #195). Hoisted to file scope so
+// the pthread_atfork child handler (bp_fork_child_diag_rearm, installed
+// in the constructor) can re-arm them in every forked child: the next
+// ladder sees the child's SM-REPLY/SM-TR dumps + the client's
+// CONSUMED/NOFREE verdict — the last inch of the decode chain.
+static int g_diag_br_tx = 12;          // bp_patch_reply_data BR-side tx diag
+static int g_diag_reply_dump_done = 0; // first-REPLY-per-process blob dump
+static int g_diag_tr_dump = 4;         // SM-TR final-tr dump
+static int g_diag_vs_dump = 6;         // virtual-service reply dump
+static int g_diag_bc = 12;             // outgoing BC tx/reply diag
+static int g_diag_sm_consumed = 4;     // SM-REPLY-CONSUMED verdict budget
+static unsigned g_diag_bp_wr = 2;      // binder_proxy_write_read log budget
+static unsigned g_diag_bp_ioctl = 4;   // binder_proxy_ioctl log budget
+
+static void bp_fork_child_diag_rearm(void) {
+    g_diag_br_tx = 12;
+    g_diag_reply_dump_done = 0;
+    g_diag_tr_dump = 4;
+    g_diag_vs_dump = 6;
+    g_diag_bc = 12;
+    g_diag_sm_consumed = 4;
+    g_diag_bp_wr = 2;
+    g_diag_bp_ioctl = 4;
+    // The inherited pending stash points at the PARENT's transaction —
+    // a stale match in the child would poison the verdict observer.
+    pthread_mutex_lock(&g_sm_pending_lock);
+    g_sm_pending_stash = 0;
+    g_sm_pending_stash_len = 0;
+    pthread_mutex_unlock(&g_sm_pending_lock);
+    char m[96];
+    snprintf(m, sizeof(m),
+             "[twoyi_loader] 6-Z306aa: fork-child binder diag re-armed "
+             "(rawpid=%d)\n", (int)syscall(SYS_getpid));
+    write_str(2, m);
+}
+
 static void bp_alloc_register(void *base, uint64_t size) {
     pthread_mutex_lock(&g_bp_alloc_lock);
     // Prefer a free slot; otherwise overwrite the oldest (round-robin).
@@ -542,9 +586,8 @@ static void bp_alloc_free(uintptr_t ptr) {
     // failed before Parcel teardown (transport-level).
     pthread_mutex_lock(&g_sm_pending_lock);
     if (g_sm_pending_stash != 0 && ptr == (uintptr_t)g_sm_pending_stash) {
-        static int sm_consumed_budget = 4;
-        if (sm_consumed_budget > 0) {
-            sm_consumed_budget--;
+        if (g_diag_sm_consumed > 0) {
+            g_diag_sm_consumed--;
             char msg[128];
             snprintf(msg, sizeof(msg),
                 "[twoyi_loader] *** SM-REPLY-CONSUMED (client freed the reply "
@@ -591,9 +634,8 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
             // and what code/target did it carry. First 12 deliveries per
             // process.
             {
-                static int br_tx_diag = 12;
-                if (br_tx_diag > 0) {
-                    br_tx_diag--;
+                if (g_diag_br_tx > 0) {
+                    g_diag_br_tx--;
                     uint32_t t_code, t_target;
                     memcpy(&t_code, stream + pos + 4 + 16, 4);
                     memcpy(&t_target, stream + pos + 4, 4);
@@ -650,9 +692,8 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
             // receives. Prefixed with the fb_hook fatal marker so the
             // tracer's write-DIAG bypass captures it regardless of
             // budget (g_fatal_entered-style: once per process).
-            static int reply_dump_done = 0;
-            if (!reply_dump_done && dlen >= 28 && dlen <= 128 && olen >= 8) {
-                reply_dump_done = 1;
+            if (!g_diag_reply_dump_done && dlen >= 28 && dlen <= 128 && olen >= 8) {
+                g_diag_reply_dump_done = 1;
                 char dump[512];
                 int off = snprintf(dump, sizeof(dump),
                     "[twoyi_loader] *** SM-REPLY dlen=%u olen=%u data=", dlen, olen);
@@ -723,8 +764,8 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 // to handle 0 means the transact itself failed before
                 // Parcel teardown.
                 {
-                    static int tr_dump_budget = 4;
-                    static int vs_dump_budget = 6;
+                    int tr_dump_budget = g_diag_tr_dump;
+                    int vs_dump_budget = g_diag_vs_dump;
                     /* 6-Z272g: the virtual-service METHOD replies
                      * (getHardwareInfo etc.) have olen==0 — the SM gate
                      * skipped them while the getHardwareInfo reply is the
@@ -733,8 +774,8 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                     int is_sm = (dlen >= 28 && dlen <= 128 && olen >= 8);
                     int is_vs = (dlen >= 8 && dlen <= 256 && olen == 0);
                     if ((is_sm && tr_dump_budget > 0) || (is_vs && vs_dump_budget > 0)) {
-                        if (is_sm) tr_dump_budget--;
-                        if (is_vs) vs_dump_budget--;
+                        if (is_sm) { tr_dump_budget--; g_diag_tr_dump = tr_dump_budget; }
+                        if (is_vs) { vs_dump_budget--; g_diag_vs_dump = vs_dump_budget; }
                         uint32_t t_flags, t_dsize, t_osize;
                         uint64_t t_dptr, t_optr;
                         memcpy(&t_flags, stream + pos + 4 + 20, 4);
@@ -1397,9 +1438,8 @@ static uint32_t bp_scan_tx_blobs(const uint8_t *stream, uint64_t len,
             // reaches asInterface). First 12 transaction/reply commands
             // per process.
             {
-                static int bc_diag = 12;
-                if (bc_diag > 0) {
-                    bc_diag--;
+                if (g_diag_bc > 0) {
+                    g_diag_bc--;
                     const uint8_t *btd = stream + pos;
                     uint32_t t_code, t_target;
                     uint64_t t_ds;
@@ -1575,7 +1615,7 @@ static unsigned char *bp_build_v2_request_trailer(
 // read buffer; sets BOTH consumed fields (the livelock fix). Returns 0 / -1
 // with errno like a real ioctl.
 static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
-    static unsigned log_budget = 2;
+    unsigned log_budget = g_diag_bp_wr;
 
     // The proxy parses the BC_* stream from offset 0 and never reports
     // partial consumption, so a nonzero incoming write_consumed (which
@@ -1714,6 +1754,7 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
             ncopy >= 4 ? *(const uint32_t *)(const void *)(resp + 4) : 0u);
         write_str(2, msg);
     }
+    g_diag_bp_wr = log_budget; // 6-Z306aa: persist the budget for forked children
     free(resp);
     return 0;
 }
@@ -1723,7 +1764,7 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
 // exchange the frame, write response bytes back into the guest's arg.
 // Returns 0 / -1 with errno like a real ioctl.
 static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
-    static unsigned log_budget = 4;
+    unsigned log_budget = g_diag_bp_ioctl;
     uint32_t wire = req;
     uint32_t req_len = 0;
     const void *req_payload = NULL;
@@ -1823,6 +1864,7 @@ static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
         }
         free(resp);
     }
+    g_diag_bp_ioctl = log_budget; // 6-Z306aa: persist the budget for forked children
     return 0;
 
 fail:
@@ -7565,6 +7607,19 @@ static void twoyi_init(void) {
     if (g_real_pid < 0) {
         g_real_pid = (int)syscall(SYS_getpid);
     }
+
+    // 6-Z306aa: fork-aware client-side binder diagnostics. Re-arm the
+    // bounded SM-reply/BC-trx decoder budgets (hoisted file-scope
+    // statics) in every FORKED child — the zygote forks system_server
+    // and apps with the parent's exhausted budgets copied in, which left
+    // the forked system_server's SM getService hit → NULL decode (the
+    // performSystemServerDexOpt installd NPE die-loop) completely
+    // unobservable (ladder #195). pthread_atfork's child handler runs
+    // right after fork returns in the child, before execve — exactly the
+    // window where the inherited state must be corrected. Install once;
+    // idempotent across re-exec (the constructor re-runs in a fresh
+    // image, and atfork registrations die with the fork image anyway).
+    pthread_atfork(NULL, NULL, bp_fork_child_diag_rearm);
 
     // Save LD_PRELOAD path so we can restore it before execv/execve.
     // 6-Z305t-45: set_preload_path() now ALSO captures the file-based
