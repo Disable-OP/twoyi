@@ -16780,6 +16780,112 @@ pub fn run_ptrace_loop(
                                                     ));
                                                 }
                                             }
+                                            // 6-Z306al: writev-peek — #226's
+                                            // gen-2 died at the RESTARTED svc
+                                            // of bionic's writev (x8=0x42)
+                                            // flushing a 5-iovec logdw write
+                                            // during the health@2.1 abort
+                                            // flood: the dying thread was the
+                                            // flood's log-writer. The iovec
+                                            // array (x1) is still mapped at
+                                            // the EXIT event (the same
+                                            // address-space rule the FP walk
+                                            // already relies on): walk
+                                            // min(x2,8) iovecs and dump the
+                                            // head bytes of the non-empty
+                                            // ones — the content NAMES the
+                                            // line the process was flushing
+                                            // at death. Bounded to 16 peeks
+                                            // per boot.
+                                            #[cfg(target_arch = "aarch64")]
+                                            {
+                                                static Z306AL_BUDGET: std::sync::atomic::AtomicU32 =
+                                                    std::sync::atomic::AtomicU32::new(16);
+                                                let al_x8 = unsafe {
+                                                    *(&dregs as *const Regs as *const u64).add(8)
+                                                };
+                                                if al_x8 == 66
+                                                    && Z306AL_BUDGET
+                                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                                        > 0
+                                                {
+                                                    Z306AL_BUDGET.fetch_sub(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    let al_rp = &dregs as *const Regs as *const u64;
+                                                    let (al_x0, al_x1, al_x2) = unsafe {
+                                                        (
+                                                            *al_rp.add(0),
+                                                            *al_rp.add(1),
+                                                            *al_rp.add(2),
+                                                        )
+                                                    };
+                                                    let mut dumped = 0usize;
+                                                    let mut al_out = String::new();
+                                                    for i in 0..al_x2.min(8) {
+                                                        if dumped >= 128 {
+                                                            break;
+                                                        }
+                                                        let iov = al_x1.wrapping_add(i * 16);
+                                                        let (Some(base), Some(len)) = (
+                                                            read_child_u64(pid, iov),
+                                                            read_child_u64(
+                                                                pid,
+                                                                iov.wrapping_add(8),
+                                                            ),
+                                                        ) else {
+                                                            al_out.push_str(&format!(" [{}=?]", i));
+                                                            continue;
+                                                        };
+                                                        if base < 0x1000 || len == 0 {
+                                                            al_out.push_str(&format!(
+                                                                " [{}={:#x}/{}]",
+                                                                i, base, len
+                                                            ));
+                                                            continue;
+                                                        }
+                                                        let n = (len as usize)
+                                                            .min(64)
+                                                            .min(128 - dumped);
+                                                        match read_child_bytes(pid, base, n) {
+                                                            Some(bytes) => {
+                                                                for &b in &bytes {
+                                                                    let c = if (0x20..0x7f)
+                                                                        .contains(&b)
+                                                                    {
+                                                                        b as char
+                                                                    } else if b == b'\n' {
+                                                                        '⏎'
+                                                                    } else {
+                                                                        '.'
+                                                                    };
+                                                                    al_out.push(c);
+                                                                }
+                                                                dumped += n;
+                                                            }
+                                                            None => al_out.push_str(&format!(
+                                                                " [{}={:#x} UNREADABLE]",
+                                                                i, base
+                                                            )),
+                                                        }
+                                                    }
+                                                    if dumped > 0 {
+                                                        log(&format!(
+                                                            "6-Z306al: writev-peek pid={} fd={:#x} iovs={} → {} bytes: {}",
+                                                            pid, al_x0, al_x2, dumped, al_out
+                                                        ));
+                                                    } else {
+                                                        log(&format!(
+                                                            "6-Z306al: writev-peek pid={} fd={:#x} iovs={} — no readable iovec content ({})",
+                                                            pid,
+                                                            al_x0,
+                                                            al_x2,
+                                                            al_out.trim()
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                             match maps_read {
                                                 Ok(content) => {
                                                     log(&format!(
