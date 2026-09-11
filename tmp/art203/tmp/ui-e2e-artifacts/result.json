@@ -1,0 +1,201 @@
+{
+  "suite": "android-boot-ladder",
+  "rom": "pure-stock-android11-aosp-arm64 (RSR1.210722.013.A4)",
+  "rung": 7,
+  "stage": "SURFACEFLINGER",
+  "stage_meaning": "surfaceflinger spawned",
+  "ladder": [
+    {
+      "rung": 1,
+      "stage": "ROOTFS_READY",
+      "meaning": "rootfs/init materialized"
+    },
+    {
+      "rung": 2,
+      "stage": "INIT_STARTED",
+      "meaning": "kr64 exec'd guest init"
+    },
+    {
+      "rung": 3,
+      "stage": "PROPERTY_SERVICE",
+      "meaning": "property service up"
+    },
+    {
+      "rung": 4,
+      "stage": "CORE_DAEMONS",
+      "meaning": "core daemons spawned"
+    },
+    {
+      "rung": 5,
+      "stage": "ZYGOTE",
+      "meaning": "zygote spawned"
+    },
+    {
+      "rung": 6,
+      "stage": "SYSTEM_SERVER",
+      "meaning": "system_server spawned"
+    },
+    {
+      "rung": 7,
+      "stage": "SURFACEFLINGER",
+      "meaning": "surfaceflinger spawned"
+    },
+    {
+      "rung": 8,
+      "stage": "SYSTEMUI_LAUNCHER",
+      "meaning": "SystemUI/launcher up"
+    },
+    {
+      "rung": 9,
+      "stage": "BOOT_COMPLETED",
+      "meaning": "real sys.boot_completed=1"
+    }
+  ],
+  "evidence": {
+    "ROOTFS_READY": [
+      {
+        "source": "property-area",
+        "line": "== /data/user/0/io.twoyi.debug/rootfs/dev/__properties__"
+      }
+    ],
+    "PROPERTY_SERVICE": [
+      {
+        "source": "kr64",
+        "line": "[KR64][ptrace][+417344ms] intercepted open(/dev/__properties__"
+      }
+    ],
+    "CORE_DAEMONS": [
+      {
+        "source": "guest-ps",
+        "line": "logd"
+      }
+    ],
+    "SURFACEFLINGER": [
+      {
+        "source": "guest-ps",
+        "line": "surfaceflinger"
+      }
+    ]
+  },
+  "app_pid": 2048,
+  "guest_processes": [
+    "io.twoyi.debug",
+    "logcat",
+    "sh",
+    "libkr64.so",
+    "init",
+    "init",
+    "ueventd",
+    "logd",
+    "lmkd",
+    "servicemanager",
+    "hwservicemanager",
+    "android.system.suspend@1.0-service",
+    "android.hardware.atrace@1.0-service",
+    "android.hardware.keymaster@4.1-service",
+    "createns",
+    "statsd",
+    "android.hidl.allocator@1.0-service",
+    "android.hardware.authsecret@1.0-service",
+    "android.hardware.bluetooth@1.1-service.sim",
+    "android.hardware.contexthub@1.1-service.mock",
+    "android.hardware.drm@1.0-service",
+    "android.hardware.graphics.allocator@3.0-service",
+    "android.hardware.graphics.composer@2.3-service",
+    "android.hardware.power.stats@1.0-service.mock",
+    "android.hardware.thermal@2.0-service.mock",
+    "android.hardware.usb@1.0-service",
+    "android.hardware.wifi@1.0-service",
+    "android.hardware.identity-service.example",
+    "android.hardware.lights-service.example",
+    "android.hardware.power-service.example",
+    "android.hardware.rebootescrow-service.default",
+    "android.hardware.vibrator-service.example",
+    "tombstoned",
+    "credstore",
+    "gpuservice",
+    "surfaceflinger",
+    "adbd",
+    "mdnsd",
+    "traced_probes",
+    "traced",
+    "cameraserver",
+    "drmserver",
+    "idmap2d",
+    "incidentd",
+    "keystore",
+    "media.metrics",
+    "mediaserver",
+    "storaged",
+    "wificond",
+    "gatekeeperd",
+    "update_engine",
+    "android.hardware.biometrics.face@1.0-service.example",
+    "android.hardware.biometrics.fingerprint@2.1-service",
+    "android.hardware.gatekeeper@1.0-service.software",
+    "android.hardware.sensors@2.1-service.multihal",
+    "audioserver",
+    "android.hardware.audio.service.ranchu",
+    "[_system_bin_cra]",
+    "iorapd",
+    "llkd",
+    "app_process64",
+    "installd",
+    "mediaextractor",
+    "netd",
+    "vold",
+    "android.hardware.drm@1.3-service.clearkey"
+  ],
+  "post_mortem": "",
+  "blockers_sample": [
+    {
+      "kind": "signal",
+      "line": "  SIGSEGV regs: x0="
+    },
+    {
+      "kind": "signal",
+      "line": "  SIGSEGV"
+    },
+    {
+      "kind": "signal",
+      "line": "  SIGSEGV regs: x16=0xf6ffdd99e3b0 x"
+    },
+    {
+      "kind": "signal",
+      "line": "  S"
+    },
+    {
+      "kind": "signal",
+      "line": "[KR64][ptrace][+434346ms]"
+    },
+    {
+      "kind": "signal",
+      "line": "[KR64][ptrace][+434346ms] SIGSEGV stack"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64][ptrace][+417436ms] Task-6-S ENTRY: pid=8969 clone nr=220 args=0x3d0f00,0xfbef67d06cb0"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64][ptrace][+417445ms] intercepted open(/dev/__properties__/u:object_r:exported_default_p"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64][ptrace][+417503ms] DIAG KLO"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64][ptrace][+417813ms] VFS materialize FAILED for /proc/self/status: Permission denied (o"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64 INFO][+417814ms] [KR64][bi"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64 INFO][+422"
+    }
+  ],
+  "honest_note": "BOOT_COMPLETED rung fires ONLY on the kr64 bridge for a REAL sys.boot_completed=1 property write observed on the emulated property wire \u2014 never synthesized. Guest process rungs require the io.twoyi.debug process subtree (host redroid processes are excluded)."
+}
