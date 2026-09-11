@@ -28004,3 +28004,17 @@ Work Log:
 Stage Summary:
 - #229 decode tree: (i) "6-Z306an: FORGOTTEN-RESUME" lines present + zygote forks system_server ("System server process" / addService(activity)) ⇒ the forget-resume class CONFIRMED — next find WHICH arm drops the resume (bounded audit of rewrite paths) and consider it fixed-by-watchdog permanently; (ii) watchdog silent + zygote still wedged at write(2) ⇒ the tracee is really blocked in-kernel ⇒ hunt the fd-2 reader (6-Z305t-24 svclog redirect vs the 6-Z306g exemption for RESTARTED zygotes — 6 restarts this run); (iii) no FORGOTTEN-RESUME lines but boot advances past rung 7 ⇒ the wedge was timing-dependent and the A/B (arm B) can now be judged on a real wedge-era run.
 - The mirror A/B stays at arm B (const true) pending a wedge-era run.
+---
+Task ID: 24d (continuation — #229 postmortem, #230 dispatched)
+Agent: Z.ai Code (main session, continued)
+Task: Decode #229 (zero artifacts → build break); fix; re-dispatch.
+
+Work Log:
+- #229 (682dad1) FAILED at the APK build step, ZERO artifacts, zero guest signal: E0308 in z306an_query_entry_stop — the aarch64-linux-android libc declares ptrace(request: c_int) while the HOST gnu libc declares ptrace(request: c_uint); libc only names PTRACE_GET_SYSCALL_INFO under the gnu module. My local host-target gates (839/839) could not see an android-target type error — a gate GAP now documented (the android compile only happens in the E2E APK build step).
+- LANDED the cross-target fix (19d432f): raw 0x420e kept as a local libc::c_int const + `as _` cast at the call site (the as-cast is legal both ways; the cast target is inferred from the function signature, so the mismatch class is gone structurally). Local android-target cargo check is still impossible (cc-rs needs aarch64-linux-android-clang, NDK not present in this sandbox) — noted honestly.
+- Gates: fmt clean; clippy -D warnings clean; 839/839 (host). Pushed a27e2ed..19d432f.
+- Verified zero runs in flight → DISPATCHED #230 (19d432f, boot_wait 420, HTTP 204).
+
+Stage Summary:
+- #229 cost one run slot and bought a real lesson: any future libc-signature-sensitive code must be checked against BOTH targets or written target-agnostically (as _ / std::mem helpers). The 6-Z306an watchdog itself is unchanged (logic identical on both targets).
+- #230 decode tree = the Task-24c tree (FORGOTTEN-RESUME lines → confirm the forget-resume class; silent watchdog + persistent wedge → hunt the fd-2 reader; boot advances → judge the A/B on a real wedge-era run).
