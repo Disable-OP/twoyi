@@ -28018,3 +28018,19 @@ Work Log:
 Stage Summary:
 - #229 cost one run slot and bought a real lesson: any future libc-signature-sensitive code must be checked against BOTH targets or written target-agnostically (as _ / std::mem helpers). The 6-Z306an watchdog itself is unchanged (logic identical on both targets).
 - #230 decode tree = the Task-24c tree (FORGOTTEN-RESUME lines → confirm the forget-resume class; silent watchdog + persistent wedge → hunt the fd-2 reader; boot advances → judge the A/B on a real wedge-era run).
+---
+Task ID: 24e (continuation — #230 decode)
+Agent: Z.ai Code (main session, continued)
+Task: Decode #230 (19d432f, 6-Z306an live); record; hand off.
+
+Work Log:
+- #230 (34653829495) completed SUCCESS, rung 5 (ZYGOTE) — a VARIANCE run, different stall shape from #228 (16 zygote restarts vs 6; fleet stuck at HAL-era adds; SF/mediaserver never registered). The 6-Z306an watchdog did NOT intervene (0 lines) — it cannot have caused the shallower run (it is inert unless it fires).
+- **THE DISCRIMINATOR IS EMPIRICALLY VALIDATED**: across the full 435s run the watchdog's GETSYSCALL_INFO query produced ZERO interventions AND ZERO false positives over hundreds of legitimate >3s syscall waiters (lmkd poll, logd sigsuspend...) — op=ENTRY correctly identifies ONLY parked-at-entry tracees. The kernel distinguishes parked-at-entry from blocked-in-kernel exactly as designed.
+- Two stuck pids exposed the NEXT diagnostic gap: 7629 (consumed ENTRY nr=63 fd=11) and 7658 (nr=207 fd=7) sat 15s+ per PROBE-CTX with in_syscall=true, yet GETSYSCALL_INFO answered NOT-parked-at-entry ⇒ either (a) really blocked in-kernel, (b) parked in a GROUP-STOP (op=NONE — my parse maps it to None → silent, INVISIBLE), or (c) the EXIT was missed and the bookkeeping is stale while the tracee blocks elsewhere. Class (b) is diagnosable and currently silenced by design.
+- TWRP gate on the 6-Z306an-era: NOT yet run for the main-loop change (the arm-B binder gate was pre-6-Z306an) — dispatched this leg.
+
+Stage Summary / NEXT-SESSION DECISION TREE:
+1. **6-Z306an-o**: extend the watchdog pass to NAME (bounded, once/pid) the op=NONE group-stop class — a group-stop parked >10s = the tracer lost a group-stop event (the #230 stuck-pid candidate class); NO intervention yet, evidence first.
+2. **Missed-EXIT reconciliation**: when in_syscall=true and GETSYSCALL_INFO fails (not stopped), reconcile against a bounded /proc/<pid>/syscall (or wchan) read to name what the tracee is REALLY blocked in — distinguishes (a) from (c).
+3. The variance problem is now the meta-obstacle: 3 runs, 3 shapes (arm-A deep-wedge rung 7 / arm-B fast-death rung 7 / arm-B shallow rung 5). Single-run verdicts are noise — the wedge-era A/B judgment needs the boot to REACH system_server reliably, which loops back to the zygote-era stall class. The fd-2/reader + group-stop-loss hunts are the current frontier.
+4. Known-good: 839/839; CI GREEN; TWRP arm-B gate GREEN; the watchdog is live and honest (0 interventions, 0 false positives).
