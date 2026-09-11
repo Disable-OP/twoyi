@@ -5161,16 +5161,14 @@ fn servicemanager_hidl(
                 // re-locks internally in the AIDL path — here we hold the
                 // lock, so call the same method on the guard's target).
                 b.fire_registration_callbacks(&name, h, false);
-                h
-            };
-            // 6-Z306ae-e: mirror the registry's strong node ref IN THIS
-            // IOCTL (liveness-gated).
-            if ptr != 0 {
+                // 6-Z306ae-e: mirror the registry's strong node ref IN
+                // THIS IOCTL (liveness-gated) — decided inside the lock.
                 let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
-                if mirror_ref_ok(gpid, ptr, cookie) {
+                if ptr != 0 && mirror_ref_ok(gpid, ptr, cookie) {
                     mirror = Some((BR_ACQUIRE, ptr, cookie));
                 }
-            }
+                h
+            };
             // Reply: bool success = true.
             writer.write_i32(1);
             let _ = handle;
@@ -5336,17 +5334,14 @@ fn servicemanager_hidl(
                 // callbacks for the newly registered key (the same helper
                 // the 1.0 add arm uses).
                 b.fire_registration_callbacks(&key, h, false);
-                h
-            };
-            // 6-Z306ae-e: mirror the registry's strong node ref IN THIS
-            // IOCTL (liveness-gated) — the HAL's incStrong runs while the
-            // registering thread is still inside transact.
-            if ptr != 0 {
+                // 6-Z306ae-e: mirror the registry's strong node ref IN
+                // THIS IOCTL (liveness-gated) — decided inside the lock.
                 let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
-                if mirror_ref_ok(gpid, ptr, cookie) {
+                if ptr != 0 && mirror_ref_ok(gpid, ptr, cookie) {
                     mirror = Some((BR_ACQUIRE, ptr, cookie));
                 }
-            }
+                h
+            };
             writer.write_u8(1); // bool success = true
             info!(
                 "[KR64][binder][svc] HIDL addWithChain({}) → handle 0x{:08x} (conn={}, chain={:?})",
@@ -5445,7 +5440,17 @@ fn servicemanager_hidl(
     }
 
     let (data, offsets, sg) = writer.into_parts_with_sg();
-    TransactionResult::Reply { data, offsets, sg }
+    match mirror {
+        Some((br, mptr, mcookie)) => TransactionResult::ReplyMirrored {
+            br,
+            ptr: mptr,
+            cookie: mcookie,
+            data,
+            offsets,
+            sg,
+        },
+        None => TransactionResult::Reply { data, offsets, sg },
+    }
 }
 
 /// Legacy v1 path (no parcel blob): the loader could not inline the
@@ -5484,20 +5489,10 @@ fn servicemanager_legacy(code: u32) -> TransactionResult {
         _ => return TransactionResult::Failed,
     }
     let (data, offsets) = writer.into_parts();
-    match mirror {
-        Some((br, mptr, mcookie)) => TransactionResult::ReplyMirrored {
-            br,
-            ptr: mptr,
-            cookie: mcookie,
-            data,
-            offsets,
-            sg: Vec::new(),
-        },
-        None => TransactionResult::Reply {
-            data,
-            offsets,
-            sg: Vec::new(),
-        },
+    TransactionResult::Reply {
+        data,
+        offsets,
+        sg: Vec::new(),
     }
 }
 
@@ -9945,6 +9940,7 @@ mod tests {
                     TransactionResult::Failed => "Failed",
                     TransactionResult::CompleteOnly => "CompleteOnly",
                     TransactionResult::Reply { .. } => unreachable!(),
+                    TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
                 }
             ),
         }
