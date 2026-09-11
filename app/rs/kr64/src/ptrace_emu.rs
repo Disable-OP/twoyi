@@ -12125,6 +12125,27 @@ fn process_vm_readv_chunk(pid: libc::pid_t, addr: u64, buf: &mut [u8]) -> isize 
     }
 }
 
+/// 6-Z306ad: bounded read of the guest's memory at `addr` via
+/// process_vm_readv (the same PTRACE_MODE_ATTACH right every other
+/// tracer-side probe uses). Returns None when the read fails
+/// (unmapped / foreign / zero address) — NEVER dereferences inside the
+/// guest, so a bad pointer is a clean None, not a crash. Used by the
+/// binder LOCAL-flat probes to snapshot the registered object bytes
+/// from OUTSIDE the tracee.
+pub fn peek_guest_bytes(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u8>> {
+    if len == 0 || addr == 0 || pid <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    let n = process_vm_readv_chunk(pid, addr, &mut buf);
+    if n <= 0 {
+        None
+    } else {
+        buf.truncate(n as usize);
+        Some(buf)
+    }
+}
+
 /// Task 6-Z62: write `bytes` into the child at `addr` with
 /// process_vm_writev, in 1 MiB calls (the syscall accepts up to
 /// MAX_RW_COUNT ≈ 2 GiB per call; 1 MiB keeps each call's kernel-side
