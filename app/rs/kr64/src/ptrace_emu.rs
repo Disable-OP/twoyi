@@ -16424,7 +16424,25 @@ pub fn run_ptrace_loop(
                             let af_ws = af_status as libc::c_int;
                             if libc::WIFSIGNALED(af_ws) {
                                 let term_sig = libc::WTERMSIG(af_ws);
-                                if z306af_deaths < 16
+                                // 6-Z306af-c: LINEAGE GATE — #212 burned all
+                                // 16 captures on the early-boot SIGABRT
+                                // fleet (init's crash-looping daemons, all
+                                // dead by +10s) while the system_server
+                                // generations — the deaths this instrument
+                                // exists for — got nothing. Capture ONLY
+                                // init itself and the zygote lineage (the
+                                // zygote + its forked children: system_server
+                                // today, apps tomorrow). The fleet keeps its
+                                // delivery-stop dumps (it HAS delivery
+                                // stops).
+                                let af_is_lineage = pid == init_pid
+                                    || z306_in_zygote_lineage(
+                                        pid,
+                                        &z306_zygote_lineage,
+                                        &mut z306_lineage_tgid_cache,
+                                    );
+                                if z306af_deaths < 32
+                                    && af_is_lineage
                                     && !z306af_delivery_dumped.contains(&pid)
                                     && (term_sig == libc::SIGSEGV
                                         || term_sig == libc::SIGBUS
@@ -16434,14 +16452,31 @@ pub fn run_ptrace_loop(
                                 {
                                     z306af_deaths += 1;
                                     z306af_delivery_dumped.insert(pid);
-                                    let comm =
+                                    // #212 lesson: at the EXIT event after a
+                                    // fatal signal the per-tid procfs reads
+                                    // returned ENOENT even though GETREGS
+                                    // worked — for a THREAD (tid) the group
+                                    // view is equivalent, so fall back to
+                                    // /proc/<tgid>/ before giving up.
+                                    let af_tgid =
+                                        z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(0);
+                                    let mut af_comm =
                                         std::fs::read_to_string(format!("/proc/{}/comm", pid))
-                                            .map(|c| c.trim_end().to_string())
-                                            .unwrap_or_else(|_| "?".to_string());
+                                            .ok()
+                                            .map(|c| c.trim_end().to_string());
+                                    if af_comm.is_none() && af_tgid != 0 && af_tgid != pid {
+                                        af_comm = std::fs::read_to_string(format!(
+                                            "/proc/{}/comm",
+                                            af_tgid
+                                        ))
+                                        .ok()
+                                        .map(|c| c.trim_end().to_string());
+                                    }
+                                    let comm = af_comm.unwrap_or_else(|| "?".to_string());
                                     log(&format!(
-                                    "6-Z306af: death-site capture pid={} sig={} comm={:?} (fatal signal with no delivery-stop dump — reading registers at the EXIT event)",
-                                    pid, term_sig, comm
-                                ));
+                                        "6-Z306af: death-site capture pid={} sig={} comm={:?} lineage=yes (fatal signal with no delivery-stop dump — reading registers at the EXIT event)",
+                                        pid, term_sig, comm
+                                    ));
                                     let mut dregs: Regs = unsafe { std::mem::zeroed() };
                                     match ptrace_getregs(pid, &mut dregs) {
                                         Ok(_) => {
@@ -16453,10 +16488,18 @@ pub fn run_ptrace_loop(
                                                 *(&dregs as *const Regs as *const u64).add(19)
                                             };
                                             log(&format!("6-Z306af pc={:#x} sp={:#x}", pc, sp));
-                                            match std::fs::read_to_string(format!(
+                                            let mut maps_read = std::fs::read_to_string(format!(
                                                 "/proc/{}/maps",
                                                 pid
-                                            )) {
+                                            ));
+                                            if maps_read.is_err() && af_tgid != 0 && af_tgid != pid
+                                            {
+                                                maps_read = std::fs::read_to_string(format!(
+                                                    "/proc/{}/maps",
+                                                    af_tgid
+                                                ));
+                                            }
+                                            match maps_read {
                                                 Ok(content) => {
                                                     log(&format!(
                                                         "6-Z306af pc-bracket:\n{}",
@@ -16464,7 +16507,7 @@ pub fn run_ptrace_loop(
                                                     ));
                                                 }
                                                 Err(e) => log(&format!(
-                                                    "6-Z306af maps read failed: {}",
+                                                    "6-Z306af maps read failed: {} (pc raw; resolve via a maps snapshot or the next capture)",
                                                     e
                                                 )),
                                             }
@@ -16480,11 +16523,11 @@ pub fn run_ptrace_loop(
                                             .cloned()
                                             .collect();
                                     log(&format!(
-                                    "6-Z306af last {} ALL syscalls of pid {} (oldest->newest): {}",
-                                    death_tail.len(),
-                                    pid,
-                                    format_syscall_buffer(&death_tail, abi)
-                                ));
+                                        "6-Z306af last {} ALL syscalls of pid {} (oldest->newest): {}",
+                                        death_tail.len(),
+                                        pid,
+                                        format_syscall_buffer(&death_tail, abi)
+                                    ));
                                 }
                             }
                         }
