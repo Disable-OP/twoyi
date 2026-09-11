@@ -3543,7 +3543,10 @@ fn handle_write_read(
                         // receiving server will cast to its BBinder (the
                         // vendor-HAL vtable-garbage crash class rides this
                         // path; see the pc=-0x78 fleet in #198/#199).
-                        let dpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                        let dpid = {
+                            let b = bus.lock().expect("binder bus poisoned");
+                            b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                        };
                         probe_flat_mem(
                             "delivery",
                             &PROBE_DELIVERY_BUDGET,
