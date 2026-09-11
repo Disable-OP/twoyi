@@ -1,0 +1,18 @@
+# profiles/default/rootfs/system
+total 108
+drwx------ 12 u0_a87 u0_a87  4096 2026-09-11 10:21 .
+drwx------ 29 u0_a87 u0_a87  4096 2026-09-11 10:21 ..
+drwx------  2 u0_a87 u0_a87  4096 2026-09-11 10:21 apex
+drwx------ 28 u0_a87 u0_a87  4096 2026-09-11 10:21 app
+drwx------  4 u0_a87 u0_a87 20480 2026-09-11 10:21 bin
+-rw-r--r--  1 u0_a87 u0_a87  3330 2026-09-11 10:21 build.prop
+drwx------ 16 u0_a87 u0_a87  4096 2026-09-11 10:21 etc
+drwx------  2 u0_a87 u0_a87 20480 2026-09-11 10:21 fonts
+drwx------  4 u0_a87 u0_a87  4096 2026-09-11 10:21 framework
+drwx------  5 u0_a87 u0_a87 28672 2026-09-11 10:21 lib64
+drwx------ 39 u0_a87 u0_a87  4096 2026-09-11 10:21 priv-app
+lrwxrwxrwx  1 u0_a87 u0_a87    10 2026-09-11 10:21 product -> ../product
+lrwxrwxrwx  1 u0_a87 u0_a87    13 2026-09-11 10:21 system_ext -> ../system_ext
+drwx------  7 u0_a87 u0_a87  4096 2026-09-11 10:21 usr
+lrwxrwxrwx  1 u0_a87 u0_a87     9 2026-09-11 10:21 vendor -> ../vendor
+drwx------  2 u0_a87 u0_a87  4096 2026-09-11 10:21 xbin

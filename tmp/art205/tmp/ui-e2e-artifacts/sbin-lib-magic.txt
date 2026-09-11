@@ -1,0 +1,16 @@
+== libaosprecovery.so ==
+ls: rootfs/sbin/libaosprecovery.so: No such file or directory
+== libc.so ==
+ls: rootfs/sbin/libc.so: No such file or directory
+== libcrecovery.so ==
+ls: rootfs/sbin/libcrecovery.so: No such file or directory
+== liblog.so ==
+ls: rootfs/sbin/liblog.so: No such file or directory
+== libminuitwrp.so ==
+ls: rootfs/sbin/libminuitwrp.so: No such file or directory
+== linker64 ==
+ls: rootfs/sbin/linker64: No such file or directory
+== recovery ==
+ls: rootfs/sbin/recovery: No such file or directory
+== adbd ==
+ls: rootfs/sbin/adbd: No such file or directory

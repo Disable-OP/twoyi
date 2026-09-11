@@ -4082,6 +4082,19 @@ fn handle_transaction(
 /// (0x720600000048). Falls back to the caller's sequential read when
 /// the offsets array is absent/short (legacy v1 wire).
 fn flat_at_first_binder_offset(blob: &RequestBlob) -> Option<FlatBinderObject> {
+    let off = flat_at_first_binder_offset_pos(blob)?;
+    let d = &blob.data;
+    Some(FlatBinderObject {
+        r#type: u32::from_ne_bytes(d[off..off + 4].try_into().ok()?),
+        flags: u32::from_ne_bytes(d[off + 4..off + 8].try_into().ok()?),
+        binder: u64::from_ne_bytes(d[off + 8..off + 16].try_into().ok()?),
+        cookie: u64::from_ne_bytes(d[off + 16..off + 24].try_into().ok()?),
+    })
+}
+
+/// 6-Z306ae-c: the POSITION of the first binder-typed flat among the
+/// offsets-array objects (None when absent/malformed/out of range).
+fn flat_at_first_binder_offset_pos(blob: &RequestBlob) -> Option<usize> {
     let count = blob.offsets.len() / 8;
     for i in 0..count {
         let off = u64::from_ne_bytes(blob.offsets[i * 8..i * 8 + 8].try_into().ok()?) as usize;
@@ -4095,12 +4108,7 @@ fn flat_at_first_binder_offset(blob: &RequestBlob) -> Option<FlatBinderObject> {
             || typ == BINDER_TYPE_WEAK_BINDER
             || typ == BINDER_TYPE_WEAK_HANDLE
         {
-            return Some(FlatBinderObject {
-                r#type: typ,
-                flags: u32::from_ne_bytes(d[off + 4..off + 8].try_into().ok()?),
-                binder: u64::from_ne_bytes(d[off + 8..off + 16].try_into().ok()?),
-                cookie: u64::from_ne_bytes(d[off + 16..off + 24].try_into().ok()?),
-            });
+            return Some(off);
         }
     }
     None
@@ -4347,6 +4355,44 @@ fn servicemanager_proxy(
             // owner registered them (baseline for the serve-time probe).
             let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
             probe_flat_mem("capture", &PROBE_CAPTURE_BUDGET, gpid, &name, ptr, cookie);
+            // 6-Z306ae-c: the capture-shift decode — hex the PARCEL bytes
+            // around the captured flat (the offsets-anchored position),
+            // bounded to the first 12 registrations per boot. The #205 Δ
+            // census (mBase = cookie + 0x88 dominant on HIDL, +0x20/+0x38/
+            // +0x68 on AIDL) says the captured cookie slot holds a pointer
+            // Δ below the true object; this dump decides whether the
+            // parcel CONTENT is shifted or the flat position is.
+            static CAPTURE_FLAT_DUMP: AtomicU32 = AtomicU32::new(12);
+            if CAPTURE_FLAT_DUMP.load(Ordering::Relaxed) > 0 {
+                CAPTURE_FLAT_DUMP.fetch_sub(1, Ordering::Relaxed);
+                if let Some(rb) = req_blob {
+                    let count = rb.offsets.len() / 8;
+                    let mut offs_hex = String::new();
+                    for i in 0..count.min(8) {
+                        let v = u64::from_ne_bytes(
+                            rb.offsets[i * 8..i * 8 + 8].try_into().unwrap(),
+                        );
+                        offs_hex.push_str(&format!("{:x} ", v));
+                    }
+                    if let Some(flat_off) = flat_at_first_binder_offset_pos(rb) {
+                        let s = flat_off.saturating_sub(8);
+                        let e = (flat_off + 40).min(rb.data.len());
+                        let mut hex = String::new();
+                        for byte in &rb.data[s..e] {
+                            hex.push_str(&format!("{:02x}", byte));
+                        }
+                        info!(
+                            "[KR64][binder][svc] 6-Z306ae-c: capture-flat {} name='{}' offs=[{}] flat@{} bytes[{}..{}]={}",
+                            code, name, offs_hex.trim(), flat_off, s, e, hex
+                        );
+                    } else {
+                        info!(
+                            "[KR64][binder][svc] 6-Z306ae-c: capture-flat {} name='{}' offs=[{}] NO-BINDER-TYPED-FLAT",
+                            code, name, offs_hex.trim()
+                        );
+                    }
+                }
+            }
             info!(
                 "[KR64][binder][svc] addService({}) → handle 0x{:08x} (conn={}, ptr=0x{:x})",
                 name, handle, conn_id, ptr
