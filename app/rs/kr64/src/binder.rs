@@ -1670,6 +1670,47 @@ pub const PROXY_CONN_ID: ConnId = 0;
 /// transactions can carry kernel-true sender identities.
 pub const WIRE_CMD_IDENT: u32 = 0x4004_62FF;
 
+/// 6-Z306ai: IDENT v2 extension marker (ASCII "idex", little-endian).
+/// A 24-byte IDENT payload `[12B legacy][u32 magic][u32 tid][u32 dev]`
+/// carries the CONNECTING THREAD's tid and WHICH binder device the
+/// connection serves (see [`ident_dev_name`]) — the per-thread proxy
+/// conns created lazily by `bp_conn_for_ioctl` had no other way to
+/// surface either. The boot decode correlates an aborting pool thread
+/// (comm `HwBinder:pid_N`, named by the death-site capture) with the
+/// transactions ITS conn served (the proxy's per-conn logs).
+pub const IDENT_EXT_MAGIC: u32 = 0x6964_6578;
+
+/// 6-Z306ai: parse the `WIRE_CMD_IDENT` payload —
+/// returns `(pid, uid, tid, dev_code)`. Legacy 12-byte shlib payloads
+/// decode as `(pid, uid, 0, 0)`; only a 24-byte payload whose
+/// extension marker matches yields tid/dev (partial extensions are
+/// treated as legacy — conservative against wire drift).
+fn parse_ident_payload(p: &[u8]) -> (i32, u32, u32, u32) {
+    if p.len() < 8 {
+        return (0, 0, 0, 0);
+    }
+    let pid = i32::from_ne_bytes(p[0..4].try_into().unwrap());
+    let uid = u32::from_ne_bytes(p[4..8].try_into().unwrap());
+    if p.len() >= 24 && u32::from_ne_bytes(p[12..16].try_into().unwrap()) == IDENT_EXT_MAGIC {
+        let tid = u32::from_ne_bytes(p[16..20].try_into().unwrap());
+        let dev = u32::from_ne_bytes(p[20..24].try_into().unwrap());
+        (pid, uid, tid, dev)
+    } else {
+        (pid, uid, 0, 0)
+    }
+}
+
+/// 6-Z306ai: human name for the IDENT v2 dev code (0 = unknown —
+/// legacy shlib or a non-canonical path).
+fn ident_dev_name(code: u32) -> &'static str {
+    match code {
+        1 => "binder",
+        2 => "hwbinder",
+        3 => "vndbinder",
+        _ => "?",
+    }
+}
+
 /// Which in-proxy virtual service backs a handle. These are minimal but
 /// SEMANTICALLY CORRECT AIDL implementations (real parcel shapes, honest
 /// errors) — never fake-success: operations the container cannot satisfy
@@ -1861,6 +1902,14 @@ struct ConnBox {
     /// semantics. Zero until the (optional) IDENT frame arrives.
     sender_pid: i32,
     sender_euid: u32,
+    /// 6-Z306ai: the owning guest THREAD and the binder device this
+    /// connection serves (1=binder, 2=hwbinder, 3=vndbinder), from the
+    /// IDENT v2 extension. Zero = unknown (legacy shlib or pre-extension
+    /// connect). Logged only — no wire-semantics change: the boot decode
+    /// correlates an aborting pool thread (`HwBinder:pid_N`) with the
+    /// transactions THIS conn served via the proxy's per-conn lines.
+    sender_tid: u32,
+    dev_code: u32,
     /// 6-Z306ab: the stability-annotation wire format for THIS
     /// connection. false (default) = the android-11 plain-Level form
     /// (`Stability::Level` values 3/12/63 — the ONLY values A11's
@@ -2954,14 +3003,10 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
         // values only fill the gap when SO_PEERCRED was unavailable,
         // and the two are logged side by side to catch disagreements.
         WIRE_CMD_IDENT => {
-            let (pid, uid) = if req.payload.len() >= 8 {
-                (
-                    i32::from_ne_bytes(req.payload[0..4].try_into().unwrap()),
-                    u32::from_ne_bytes(req.payload[4..8].try_into().unwrap()),
-                )
-            } else {
-                (0, 0)
-            };
+            // 6-Z306ai: parse via the shared helper — legacy 12-byte and
+            // v2 24-byte (magic "idex" + tid + dev) payloads both decode;
+            // the extension is additive and the response is unchanged.
+            let (pid, uid, tid, dev) = parse_ident_payload(&req.payload);
             let mut stamped = false;
             if let Ok(mut b) = bus.lock() {
                 if let Some(box_) = b.conns.get_mut(&conn_id) {
@@ -2970,14 +3015,22 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
                         box_.sender_euid = uid;
                         stamped = true;
                     }
+                    if box_.sender_tid == 0 && tid != 0 {
+                        box_.sender_tid = tid;
+                    }
+                    if box_.dev_code == 0 && dev != 0 {
+                        box_.dev_code = dev;
+                    }
                 }
             }
             info!(
-                "[KR64][binder][vm{}] conn={} IDENT announced pid={} uid={} (getpid-faked) — {}",
+                "[KR64][binder][vm{}] conn={} IDENT announced pid={} uid={} tid={} dev={} (getpid-faked) — {}",
                 vm_id,
                 conn_id,
                 pid,
                 uid,
+                tid,
+                ident_dev_name(dev),
                 if stamped {
                     "stamped (no SO_PEERCRED available)"
                 } else {
@@ -10208,5 +10261,59 @@ mod tests {
             TransactionResult::Failed => {}
             _ => panic!("a corrupted SG region must fail honestly"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 6-Z306ai — IDENT v2 (tid + dev in the per-conn announcement)
+    // ------------------------------------------------------------------
+
+    /// Legacy 12-byte payloads decode (pid, uid, tid=0, dev=0).
+    #[test]
+    fn z306ai_parse_ident_legacy_payload() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&4711i32.to_ne_bytes());
+        p.extend_from_slice(&1000u32.to_ne_bytes());
+        p.extend_from_slice(&1010u32.to_ne_bytes());
+        assert_eq!(parse_ident_payload(&p), (4711, 1000, 0, 0));
+    }
+
+    /// A v2 payload yields tid + dev; the legacy prefix is untouched.
+    #[test]
+    fn z306ai_parse_ident_v2_payload() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&4711i32.to_ne_bytes());
+        p.extend_from_slice(&1000u32.to_ne_bytes());
+        p.extend_from_slice(&1010u32.to_ne_bytes());
+        p.extend_from_slice(&IDENT_EXT_MAGIC.to_ne_bytes());
+        p.extend_from_slice(&5177u32.to_ne_bytes());
+        p.extend_from_slice(&2u32.to_ne_bytes());
+        assert_eq!(parse_ident_payload(&p), (4711, 1000, 5177, 2));
+        assert_eq!(ident_dev_name(2), "hwbinder");
+        assert_eq!(ident_dev_name(1), "binder");
+        assert_eq!(ident_dev_name(3), "vndbinder");
+        assert_eq!(ident_dev_name(0), "?");
+    }
+
+    /// Wire-drift hardening: a WRONG magic or a partial extension decodes
+    /// as legacy (tid=0, dev=0) instead of reading garbage.
+    #[test]
+    fn z306ai_parse_ident_partial_or_bad_magic_is_legacy() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&4711i32.to_ne_bytes());
+        p.extend_from_slice(&1000u32.to_ne_bytes());
+        p.extend_from_slice(&1010u32.to_ne_bytes());
+        // 24 bytes but a WRONG magic:
+        p.extend_from_slice(&0xdead_beefu32.to_ne_bytes());
+        p.extend_from_slice(&5177u32.to_ne_bytes());
+        p.extend_from_slice(&2u32.to_ne_bytes());
+        assert_eq!(parse_ident_payload(&p), (4711, 1000, 0, 0));
+        // Right magic but truncated to 20 bytes → legacy.
+        let mut p2 = p.clone();
+        p2[12..16].copy_from_slice(&IDENT_EXT_MAGIC.to_ne_bytes());
+        p2.truncate(20);
+        assert_eq!(parse_ident_payload(&p2), (4711, 1000, 0, 0));
+        // Short payloads never panic.
+        assert_eq!(parse_ident_payload(&[]), (0, 0, 0, 0));
+        assert_eq!(parse_ident_payload(&[1, 2, 3]), (0, 0, 0, 0));
     }
 }
