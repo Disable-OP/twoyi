@@ -6990,7 +6990,7 @@ mod tests {
         bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
         bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
         let payload = make_v2_write_read_payload(&bc, &req_data, &req_off, 4096);
-        let (ret, resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
+        let (ret, _resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
         assert_eq!(ret, 0, "ADD_SERVICE should succeed");
 
         // Two same-name GETs back-to-back on the same connection.
