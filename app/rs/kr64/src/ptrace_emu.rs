@@ -3391,6 +3391,48 @@ fn qpipe_proxy_inject(pid: libc::pid_t, rootfs: &str) -> std::io::Result<i32> {
     r
 }
 
+/// 6-Z306af-d: parse the executable file-backed rows of a maps file
+/// (`r-xp` rows with an absolute path) into (start, end, path) triples —
+/// the minimum needed to resolve a crash pc to `library+offset` offline
+/// (the live /proc/<pid>/maps is already ENOENT at a fatal-signal EXIT
+/// event — the #212/#213 lesson — so the resolution needs a snapshot
+/// taken while the process was healthy).
+fn z306af_parse_exec_maps(maps: &str) -> Vec<(u64, u64, String)> {
+    let mut rows = Vec::new();
+    for line in maps.lines() {
+        if !line.contains(" r-xp ") {
+            continue;
+        }
+        let path = match line.rsplit_once(' ') {
+            Some((_, p)) => p.trim(),
+            None => continue,
+        };
+        if path.is_empty() || !path.starts_with('/') {
+            continue;
+        }
+        let range = line.split(' ').next().unwrap_or("");
+        let mut se = range.splitn(2, '-');
+        let parsed = match (se.next(), se.next()) {
+            (Some(s), Some(e)) => (u64::from_str_radix(s, 16), u64::from_str_radix(e, 16)),
+            _ => continue,
+        };
+        if let (Ok(s), Ok(e)) = parsed {
+            rows.push((s, e, path.to_string()));
+            if rows.len() >= 240 {
+                break;
+            }
+        }
+    }
+    rows
+}
+
+/// 6-Z306af-d: resolve a pc against a parsed snapshot.
+fn z306af_resolve_pc(rows: &[(u64, u64, String)], pc: u64) -> Option<String> {
+    rows.iter()
+        .find(|(s, e, _)| pc >= *s && pc < *e)
+        .map(|(s, _, p)| format!("{}+{:#x}", p, pc - s))
+}
+
 /// 6-Z305t-71i: decode bionic's abort message at a fatal-signal stop.
 ///
 /// The debuggerd crash_dump CANNOT attach to any guest process — every
@@ -14347,6 +14389,13 @@ pub fn run_ptrace_loop(
         std::collections::HashSet::new();
     // 6-Z306af: per-run cap on EXIT-event death-site captures.
     let mut z306af_deaths: u64 = 0;
+    // 6-Z306af-d: fork-time executable-maps snapshots for lineage
+    // processes (taken at the PR_SET_NAME rename — see the 6-Z306x
+    // hook). At the fatal-signal EXIT event the live
+    // /proc/<pid>/maps is already ENOENT, so the crash pc resolves
+    // against this snapshot instead. Executable file-backed rows only.
+    let mut z306af_maps_cache: std::collections::HashMap<libc::pid_t, Vec<(u64, u64, String)>> =
+        std::collections::HashMap::new();
     // 6-Z305i: capped DIAG for the first non-init getpid pass-throughs
     // (the InitAborter contract fix — see the pending_getpid EXIT arm).
     let mut z305i_getpid_diag: u64 = 0;
@@ -16506,10 +16555,31 @@ pub fn run_ptrace_loop(
                                                         maps_bracket_in(&content, pc)
                                                     ));
                                                 }
-                                                Err(e) => log(&format!(
-                                                    "6-Z306af maps read failed: {} (pc raw; resolve via a maps snapshot or the next capture)",
-                                                    e
-                                                )),
+                                                Err(e) => {
+                                                    // 6-Z306af-d: fall back to
+                                                    // the rename-time snapshot.
+                                                    let snap = z306af_maps_cache
+                                                        .get(&pid)
+                                                        .or_else(|| {
+                                                            if af_tgid != 0 {
+                                                                z306af_maps_cache.get(&af_tgid)
+                                                            } else {
+                                                                None
+                                                            }
+                                                        })
+                                                        .cloned()
+                                                        .unwrap_or_default();
+                                                    match z306af_resolve_pc(&snap, pc) {
+                                                        Some(res) => log(&format!(
+                                                            "6-Z306af pc-resolved (rename-time snapshot): {} (live maps failed: {})",
+                                                            res, e
+                                                        )),
+                                                        None => log(&format!(
+                                                            "6-Z306af maps read failed: {} (pc raw; no snapshot for this pid)",
+                                                            e
+                                                        )),
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(e) => log(&format!("6-Z306af getregs failed: {}", e)),
@@ -21121,18 +21191,45 @@ pub fn run_ptrace_loop(
                                         .unwrap_or_else(|| "<unreadable>".into());
                                     log(&format!("6-Z306x: pid={} PR_SET_NAME -> {:?}", pid, name));
                                 }
+                                // 6-Z306af-d: snapshot the executable maps at
+                                // the rename — every lineage process names
+                                // itself exactly once at startup (zygote64 /
+                                // system_server / <app process>), and the
+                                // forked address space is final at that point
+                                // (system_server specializes without exec).
+                                // At a fatal-signal EXIT event the live maps
+                                // are ENOENT (#212/#213), so this snapshot is
+                                // the only pc→library resolver left. Cap 12/run.
+                                {
+                                    static Z306AF_SNAP: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z306AF_SNAP.load(std::sync::atomic::Ordering::Relaxed) < 12
+                                        && !z306af_maps_cache.contains_key(&pid)
+                                    {
+                                        if let Ok(maps) =
+                                            std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                        {
+                                            let rows = z306af_parse_exec_maps(&maps);
+                                            if !rows.is_empty() {
+                                                z306af_maps_cache.insert(pid, rows);
+                                            }
+                                            Z306AF_SNAP
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+                                }
                             }
                             let is_tgkill_306x =
                                 abi.tgkill_nr != -1 && syscall_num == abi.tgkill_nr;
                             let is_kill_306x = abi.kill_nr != -1 && syscall_num == abi.kill_nr;
                             if is_tgkill_306x || is_kill_306x {
+                                let a0 = get_syscall_arg(&regs, abi.reg_arg1);
+                                let a1 = get_syscall_arg(&regs, abi.reg_arg2);
+                                let a2 = get_syscall_arg(&regs, abi.reg_arg3);
                                 static Z306X_KILL: std::sync::atomic::AtomicU64 =
                                     std::sync::atomic::AtomicU64::new(0);
                                 if Z306X_KILL.load(std::sync::atomic::Ordering::Relaxed) < 40 {
                                     Z306X_KILL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let a0 = get_syscall_arg(&regs, abi.reg_arg1);
-                                    let a1 = get_syscall_arg(&regs, abi.reg_arg2);
-                                    let a2 = get_syscall_arg(&regs, abi.reg_arg3);
                                     log(&format!(
                                         "6-Z306x: pid={} {} args=({a0:#x}, {a1:#x}, {a2:#x}) comm={:?}",
                                         pid,
@@ -21141,6 +21238,40 @@ pub fn run_ptrace_loop(
                                             .unwrap_or_default()
                                             .trim_end()
                                     ));
+                                }
+                                // 6-Z306af-d: the bionic abort message is
+                                // FINAL at the tgkill entry-stop —
+                                // android_set_abort_message() writes it into
+                                // the '[anon:abort message]' VMA and only
+                                // THEN raises SIGABRT, and the dying process's
+                                // procfs is fully alive at its own syscall
+                                // ENTRY stop, so read_abort_message_vma works
+                                // here even when the EXIT-event reads fail
+                                // (the #212/#213 lesson: gen-1 system_server
+                                // died by SIGABRT at +323.6s with the
+                                // PR_SET_VMA 'abort message' naming visible
+                                // at 6-Z149 but no delivery stop and no VMA
+                                // read). Lineage-only, 8 per run.
+                                let af_sig = if is_tgkill_306x { a2 } else { a1 };
+                                if af_sig == libc::SIGABRT as u64 {
+                                    static Z306AF_ABORT_MSG: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z306AF_ABORT_MSG.load(std::sync::atomic::Ordering::Relaxed)
+                                        < 8
+                                    {
+                                        Z306AF_ABORT_MSG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        match read_abort_message_vma(pid) {
+                                            Some(msg) => log(&format!(
+                                                "6-Z306af: tgkill-ABORT pid={} abort message: {:?}",
+                                                pid, msg
+                                            )),
+                                            None => log(&format!(
+                                                "6-Z306af: tgkill-ABORT pid={} (no abort-message VMA readable at the tgkill entry)",
+                                                pid
+                                            )),
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -36136,6 +36267,33 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // First mapping hit → no previous neighbour, just the line.
         let out = maps_bracket_in(content, 0xaaaa0008);
         assert!(out.contains("/only.so"));
+    }
+
+    #[test]
+    fn z306af_parse_exec_maps_keeps_only_executable_file_backed_rows() {
+        let maps = "\
+aaaa0000-aaaa1000 r--p 00000000 00:01 1  /system/lib64/liba.so\n\
+aaaa1000-aaaa2000 r-xp 00001000 00:01 1  /system/lib64/liba.so\n\
+aaaa2000-aaaa3000 rw-p 00002000 00:01 1  /system/lib64/liba.so\n\
+bbbb0000-bbbb1000 r-xp 00000000 00:01 2  [anon:libc code]\n\
+cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
+        let rows = z306af_parse_exec_maps(maps);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 0xaaaa1000);
+        assert_eq!(rows[0].1, 0xaaaa2000);
+        assert_eq!(rows[0].2, "/system/lib64/liba.so");
+        assert_eq!(rows[1].2, "/system/lib64/libb.so");
+    }
+
+    #[test]
+    fn z306af_resolve_pc_names_library_and_offset() {
+        let rows = vec![(0xaaaa1000, 0xaaaa2000, "/system/lib64/liba.so".to_string())];
+        assert_eq!(
+            z306af_resolve_pc(&rows, 0xaaaa1234).unwrap(),
+            "/system/lib64/liba.so+0x234"
+        );
+        assert!(z306af_resolve_pc(&rows, 0xaaaa2000).is_none());
+        assert!(z306af_resolve_pc(&rows, 0xaaaa0fff).is_none());
     }
 
     #[test]
