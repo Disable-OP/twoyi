@@ -7266,6 +7266,69 @@ fn z306an_query_entry_stop(pid: libc::pid_t) -> Option<(u64, u64, u64)> {
     z306an_parse_syscall_info(&buf)
 }
 
+/// 6-Z306an-o: pure op-byte parser — byte 0 of a successful
+/// PTRACE_GET_SYSCALL_INFO reply is always the op (the kernel writes
+/// at least one byte when it returns > 0; `ptrace_syscall_info_op`:
+/// 0 = NONE, 1 = ENTRY, 2 = EXIT, 3 = SECCOMP). Locked by unit test.
+fn z306an_parse_syscall_info_op(buf: &[u8]) -> Option<u8> {
+    buf.first().copied()
+}
+
+/// 6-Z306an-o: which KIND of ptrace stop is `pid` parked in RIGHT NOW?
+/// The same raw PTRACE_GET_SYSCALL_INFO query the ENTRY probe uses
+/// (0x420e, stable UAPI; the request is `c_int` on android targets and
+/// `c_uint` on gnu — the local-const + `as _` cast is legal on both,
+/// per the 19d432f cross-target fix). Returns the op byte when the
+/// kernel answers; `None` when the tracee is not in any ptrace stop
+/// (running or blocked inside a real syscall) or is dying.
+fn z306an_query_stop_op(pid: libc::pid_t) -> Option<u8> {
+    const PTRACE_GET_SYSCALL_INFO: libc::c_int = 0x420e;
+    let mut buf = [0u8; 128];
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_GET_SYSCALL_INFO as _,
+            pid,
+            buf.len() as u64,
+            buf.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    if rc < 1 {
+        return None;
+    }
+    z306an_parse_syscall_info_op(&buf[..rc as usize])
+}
+
+/// 6-Z306an-r: classify the text of `/proc/<pid>/syscall`. The kernel
+/// prints "running" for a task executing in userspace, a row
+/// "nr 0xarg0 … 0xarg5 0xsp 0xpc" (nr DECIMAL, possibly negative) for
+/// a task blocked inside a real syscall, and nothing on read failure.
+/// The three honest labels are the (a) blocked-in-kernel vs (c)
+/// stale-bookkeeping discriminator the #230 decode mandated. Pure;
+/// locked by unit test.
+fn z306anr_classify_proc_syscall(text: &str) -> &'static str {
+    let t = text.trim();
+    if t.is_empty() {
+        return "unreadable-or-empty";
+    }
+    if t == "running" {
+        return "running-in-userspace";
+    }
+    match t.split_whitespace().next().unwrap_or("").parse::<i64>() {
+        Ok(_) => "blocked-in-kernel",
+        Err(_) => "unparsable",
+    }
+}
+
+/// 6-Z306an-r: bounded read of `/proc/<pid>/syscall`. The tracer is the
+/// tracee's ptracer, which grants the read across uid flips. `None` on
+/// any read failure (dying pid / ESRCH) — the log line then says so
+/// honestly instead of guessing.
+fn z306anr_read_proc_syscall(pid: libc::pid_t) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{}/syscall", pid))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 /// 6-Z160: read a full 64-bit word from the traced child (aarch64 +
 /// x86_64 iovec fields, pointers). Same errno-dance contract as
 /// `read_child_u32`.
@@ -13128,6 +13191,26 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     let mut z306an_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
         std::collections::HashMap::new();
+    // 6-Z306an-o/-r: bounded evidence state for the two INVISIBLE classes
+    // the #230 decode exposed behind the old "not-ENTRY → silence" arm.
+    // -o: a pid PARKED in a non-ENTRY ptrace stop (op=NONE group-stop /
+    // undelivered signal-stop, op=2 EXIT, op=3 SECCOMP) is named ONCE per
+    // pid — but only after the park PERSISTS across two watchdog passes
+    // (≥25 s apart via the 30 s cooldown): a fresh, still-unconsumed stop
+    // (e.g. the 6-Z305t-18 probe's own armed SIGSTOP waiting for the main
+    // loop's arm) must never read as a consumed-never-answered park.
+    // -r: a pid whose consumed-ENTRY bookkeeping is stale (not in ANY
+    // ptrace stop) is reconciled against /proc/<pid>/syscall ONCE per
+    // pid, 64 lines/boot cap. Both maps join the death hygiene (inline
+    // form, per the binder_fds precedent at the WIFEXITED/WIFSIGNALED
+    // arms) so a pid-RECYCLED successor starts fresh.
+    let mut z306ano_seen: std::collections::HashMap<libc::pid_t, std::time::Instant> =
+        std::collections::HashMap::new();
+    let mut z306ano_named: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    let mut z306anr_named: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    let mut z306anr_budget: u32 = 0;
     // 6-Z271d: throttle for the stall scan (every 256th stop).
     let mut stall_tick: u64 = 0;
     // 6-Z184 AUDIT FIX (agent 12): this used to be a single global bool —
@@ -15610,9 +15693,13 @@ pub fn run_ptrace_loop(
         // resume: force PTRACE_SYSCALL, the pending syscall executes,
         // the EXIT stop returns, and the normal flow continues — the
         // honest supervisor action (never a fake success, never a kill).
-        // op=NONE (a group-stop) or a failed query (running/blocked-in-
-        // kernel) are left alone silently — a log line there would fire
-        // on every sleeping futex waiter. Budget: 4 interventions/pid.
+        // op=NONE (a group-stop) and failed queries (running/blocked-in-
+        // kernel) are never resumed — but since #230 they are no longer
+        // SILENT: the -o arm names a non-ENTRY park that PERSISTS across
+        // two passes (once/pid), and the -r arm reconciles a failed
+        // query against /proc/<pid>/syscall (once/pid, 64/boot). The
+        // intervention remains exclusive to the ENTRY class.
+        // Budget: 4 interventions/pid.
         if stall_tick % 256 == 0 {
             let now_an = std::time::Instant::now();
             let an_candidates: Vec<libc::pid_t> = last_stop_at
@@ -15633,28 +15720,103 @@ pub fn run_ptrace_loop(
                     continue;
                 }
                 z306an_last.insert(ap, now_an);
-                if let Some((anr, aa0, aa1)) = z306an_query_entry_stop(ap) {
-                    z306an_budget.insert(ap, ab + 1);
-                    let age = last_stop_at
-                        .get(&ap)
-                        .map(|t| now_an.duration_since(*t).as_secs())
-                        .unwrap_or(0);
-                    log(&format!(
-                        "6-Z306an: FORGOTTEN-RESUME — pid={} parked in ENTRY stop nr={} a0={:#x} a1={:#x} for {}s; forcing PTRACE_SYSCALL resume (intervention {}/4)",
-                        ap,
-                        anr,
-                        aa0,
-                        aa1,
-                        age,
-                        ab + 1
-                    ));
-                    let rc = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, ap, 0, 0) };
-                    if rc != 0 {
-                        log(&format!(
-                            "6-Z306an: resume pid={} FAILED (errno={}) — the ESRCH/reap flow handles it",
-                            ap,
-                            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-                        ));
+                let age = last_stop_at
+                    .get(&ap)
+                    .map(|t| now_an.duration_since(*t).as_secs())
+                    .unwrap_or(0);
+                // 6-Z306an-o/-r: the #230 decode exposed two INVISIBLE
+                // classes behind the old "not-ENTRY → silence" arm:
+                // (o) tracees PARKED in a non-ENTRY ptrace stop — op=0
+                //     (NONE: group-stop or undelivered signal-delivery
+                //     stop), 2 (EXIT), 3 (SECCOMP) — a stop the main
+                //     loop consumed but never answered; the ENTRY-only
+                //     parse mapped them to None and the pid vanished
+                //     from the record.
+                // (r) tracees whose consumed-ENTRY bookkeeping is
+                //     stale — not in ANY ptrace stop: either genuinely
+                //     blocked in-kernel (the legitimate futex/poll
+                //     majority) or RUNNING in userspace (a missed EXIT
+                //     — the #230 stuck-pid candidate class).
+                // Both name themselves ONCE per pid, evidence first;
+                // the INTERVENTION stays exclusive to the proven
+                // FORGOTTEN-RESUME (ENTRY) class.
+                match z306an_query_stop_op(ap) {
+                    Some(1) => {
+                        // ENTRY stop — the proven forgotten-resume
+                        // class. Re-query for the parsed triple (the
+                        // tracee cannot move between the two queries:
+                        // it is stopped and we are not resuming it).
+                        // Any earlier -o park timer is stale — reset.
+                        z306ano_seen.remove(&ap);
+                        if let Some((anr, aa0, aa1)) = z306an_query_entry_stop(ap) {
+                            z306an_budget.insert(ap, ab + 1);
+                            log(&format!(
+                                "6-Z306an: FORGOTTEN-RESUME — pid={} parked in ENTRY stop nr={} a0={:#x} a1={:#x} for {}s; forcing PTRACE_SYSCALL resume (intervention {}/4)",
+                                ap,
+                                anr,
+                                aa0,
+                                aa1,
+                                age,
+                                ab + 1
+                            ));
+                            let rc = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, ap, 0, 0) };
+                            if rc != 0 {
+                                log(&format!(
+                                    "6-Z306an: resume pid={} FAILED (errno={}) — the ESRCH/reap flow handles it",
+                                    ap,
+                                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                                ));
+                            }
+                        }
+                    }
+                    Some(op) => {
+                        // 6-Z306an-o: a park must PERSIST across two
+                        // passes (≥25 s apart — the 30 s cooldown makes
+                        // consecutive visits that far apart) before it
+                        // is named: a fresh, still-unconsumed stop (the
+                        // 6-Z305t-18 probe's own armed SIGSTOP waiting
+                        // for the main loop's arm, or any stop queued
+                        // mid-dispatch) clears within one loop
+                        // iteration and must never read as a
+                        // consumed-never-answered park. Evidence ONLY —
+                        // no resume, no kill; the class must first be
+                        // proven to exist in the wild before any
+                        // intervention is designed for it.
+                        let first = *z306ano_seen.entry(ap).or_insert(now_an);
+                        let held = now_an.duration_since(first).as_secs();
+                        if held >= 25 && z306ano_named.insert(ap) {
+                            log(&format!(
+                                "6-Z306an-o: pid={} PARKED ≥25s in an op={} ptrace stop (park held {}s, last consumed stop {}s ago) — a stop the tracer consumed but never answered (op=0 group-stop/undelivered-signal class; evidence-only, no intervention)",
+                                ap, op, held, age
+                            ));
+                        }
+                    }
+                    None => {
+                        // Not parked any more → the -o park timer resets
+                        // (a fresh-stop blip must not accumulate).
+                        z306ano_seen.remove(&ap);
+                        // 6-Z306an-r: reconcile the stale consumed-ENTRY
+                        // bookkeeping against /proc/<pid>/syscall — the
+                        // (a) vs (c) discriminator the #230 decode
+                        // mandated. Once per pid, 64 lines/boot.
+                        if age >= 10 && z306anr_budget < 64 && z306anr_named.insert(ap) {
+                            z306anr_budget += 1;
+                            match z306anr_read_proc_syscall(ap) {
+                                Some(text) => {
+                                    let class = z306anr_classify_proc_syscall(&text);
+                                    log(&format!(
+                                        "6-Z306an-r: pid={} consumed-ENTRY bookkeeping pending but NOT in any ptrace stop ({}s); /proc/syscall=\"{}\" → {} (a=blocked-in-kernel, c=stale-bookkeeping)",
+                                        ap, age, text, class
+                                    ));
+                                }
+                                None => {
+                                    log(&format!(
+                                        "6-Z306an-r: pid={} consumed-ENTRY bookkeeping pending but NOT in any ptrace stop ({}s); /proc/syscall UNREADABLE → dying/ESRCH (the reap flow owns it)",
+                                        ap, age
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -15731,6 +15893,17 @@ pub fn run_ptrace_loop(
             // these maps are loop locals like ashmem_fd_sizes).
             binder_fds.retain(|(p, _), _| *p != pid);
             pending_binder_ioctl.remove(&pid);
+            // 6-Z306an/-o/-r: the forgotten-resume watchdog's per-pid
+            // budget/cooldown and the once-per-pid evidence state die
+            // with the process — a pid-RECYCLED successor must start
+            // with a fresh intervention budget and be eligible for its
+            // own evidence lines (inline form, per the binder_fds
+            // precedent above).
+            z306an_budget.remove(&pid);
+            z306an_last.remove(&pid);
+            z306ano_named.remove(&pid);
+            z306ano_seen.remove(&pid);
+            z306anr_named.remove(&pid);
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
             // dead pid + the prop_area_maps entries — see
@@ -15969,6 +16142,17 @@ pub fn run_ptrace_loop(
             // these maps are loop locals like ashmem_fd_sizes).
             binder_fds.retain(|(p, _), _| *p != pid);
             pending_binder_ioctl.remove(&pid);
+            // 6-Z306an/-o/-r: the forgotten-resume watchdog's per-pid
+            // budget/cooldown and the once-per-pid evidence state die
+            // with the process — a pid-RECYCLED successor must start
+            // with a fresh intervention budget and be eligible for its
+            // own evidence lines (inline form, per the binder_fds
+            // precedent above).
+            z306an_budget.remove(&pid);
+            z306an_last.remove(&pid);
+            z306ano_named.remove(&pid);
+            z306ano_seen.remove(&pid);
+            z306anr_named.remove(&pid);
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
             // above).
@@ -44131,5 +44315,49 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         // Short buffers never panic and never parse.
         assert_eq!(super::z306an_parse_syscall_info(&[]), None);
         assert_eq!(super::z306an_parse_syscall_info(&buf[..24]), None);
+    }
+
+    #[test]
+    fn z306an_op_byte_parser_names_group_stops() {
+        // op=0 (NONE — group-stop / undelivered signal-stop): the #230
+        // class the ENTRY-only parse mapped to None and lost.
+        assert_eq!(super::z306an_parse_syscall_info_op(&[0, 0, 0]), Some(0));
+        assert_eq!(super::z306an_parse_syscall_info_op(&[1, 9, 9]), Some(1));
+        assert_eq!(super::z306an_parse_syscall_info_op(&[3]), Some(3));
+        // No bytes written → no op (the query failed).
+        assert_eq!(super::z306an_parse_syscall_info_op(&[]), None);
+    }
+
+    #[test]
+    fn z306anr_classifier_separates_blocked_running_and_garbage() {
+        // (a) blocked in-kernel: "nr 0x… ×6 sp pc" — nr DECIMAL.
+        assert_eq!(
+            super::z306anr_classify_proc_syscall(
+                "232 0x7ffc 0x1 0x2 0x3 0x4 0x5 0x7ffc 0x400000\n"
+            ),
+            "blocked-in-kernel"
+        );
+        assert_eq!(
+            super::z306anr_classify_proc_syscall("-1 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0"),
+            "blocked-in-kernel"
+        );
+        // (c) running in userspace — the stale-bookkeeping witness.
+        assert_eq!(
+            super::z306anr_classify_proc_syscall("running\n"),
+            "running-in-userspace"
+        );
+        // Honest edges: empty (failed read) and unparsable rows.
+        assert_eq!(
+            super::z306anr_classify_proc_syscall(""),
+            "unreadable-or-empty"
+        );
+        assert_eq!(
+            super::z306anr_classify_proc_syscall("   \n"),
+            "unreadable-or-empty"
+        );
+        assert_eq!(
+            super::z306anr_classify_proc_syscall("garbage"),
+            "unparsable"
+        );
     }
 }
