@@ -1,0 +1,314 @@
+── top-level rootfs klog node ──
+dev=2049 ino=6296142 size=16778146 mtime=2026-09-11 11:52:42.722001802 +0000
+fdtest-markers=10728
+<6>[twoyi_loader] logdw kmsg fd test
+<6>[twoyi_loader] logdw kmsg fd test
+<6>[twoyi_loader] logdw kmsg fd test
+<6>[twoyi_loader] logdw kmsg fd test
+<6>[twoyi_loader] logdw kmsg fd test
+── tail (cat -v, last 1536 bytes) ──
+support vendor buffer allocation Function not implemented(-38)^@^@M-^F2M-
+M-kM-#j1hM-b'^DHidlServiceManagement^@Registered android.hardware.camera.provider@2.6::ICameraProvider/internal/0 (start delay of 1092ms)^@^@M-^F2M-
+M-kM-#j2M-
+M-x'^DHidlServiceManagement^@Removing namespace from process name android.hardware.camera.provider@2.6-service-google to provider@2.6-service-google.^@^@M-^F2M-
+M-kM-#jM-HM-^W5(^DLegacySupport^@Registration complete for android.hardware.camera.provider@2.6::ICameraProvider/internal/0.^@^@M-c^LM-
+M-kM-#jM-iM-=c(^Eadbd^@failed to accept client on JDWP control socket: Invalid argument^@^@M-c^LM-
+M-kM-#jmM-zr(^Eadbd^@failed to accept client on JDWP control socket: Invalid argument^@^@M-^G#M-
+M-kM-#j7^]M-#(^DServiceManager^@Waiting for service 'package_native' on '/dev/binder'...^@^@M-c^LM-
+M-kM-#jM-^GM-JL)^Eadbd^@failed to accept client on JDWP control socket: Invalid argument^@^@M-c^LM-
+M-kM-#jM-LM-HY)^Eadbd^@failed to accept client on JDWP control socket: Invalid argument^@^@^_^LM-
+M-kM-#jM-*M-qM-;*^Dtombstoned^@received crash request for pid 12935^@^@M-c^LM-
+M-kM-#j^HlM-8*^Eadbd^@failed to accept client on JDWP control socket: Invalid argument^@^@M-c^LM-
+M-kM-#jM-Q0M-D*^Eadbd^@failed to accept client on JDWP control socket: Invalid argument^@^@M-^G#M-
+M-kM-#j^EM-:\6^DServiceManager^@Waiting for service 'package_native' on '/dev/binder'...^@^@M-c^LM-
+M-kM-#jM-bM-lM-d6^Eadbd^@failed to accept client on JDWP control socket: Invalid argument^@^@^_^LM-
+M-kM-#j]M-zM-_6^Dtombstoned^@received crash request for pid 12950^@^@^_^LM-
+M-kM-#jT^_M-^L7^Dtombstoned^@enqueueing crash request for pid 12950^@^@M-c^LM-
+M-kM-#j>M-^VI8^Eadbd^@failed to accept client on JDWP control socket: Invalid argument^@^@^_^LM-
+M-kM-#jFM-^^K8^Dtombstoned^@received crash request for pid 12941^@
+── profiles-default rootfs klog node (6-Z305t-39: the CORRECT path — #96 maps dumps prove the guest runtime loads from {data}/profiles/default/rootfs) ──
+dev=2049 ino=6296142 size=16779130 mtime=2026-09-11 11:52:42.992985437 +0000
+fdtest-markers=10728
+<6>[twoyi_loader] logdw kmsg fd test
+<6>[twoyi_loader] logdw kmsg fd test
+<6>[twoyi_loader] logdw kmsg fd test
+<6>[twoyi_loader] logdw kmsg fd test
+<6>[twoyi_loader] logdw kmsg fd test
+
+── profiles-default rootfs tree check ──
+total 1928
+drwx------ 29 u0_a87 u0_a87    4096 2026-09-11 11:44 .
+drwx------  3 u0_a87 u0_a87    4096 2026-09-11 11:44 ..
+dr-xr-xr-x  4 u0_a87 u0_a87    4096 2026-09-11 11:44 acct
+-rw-r--r--  1 u0_a87 u0_a87     723 2026-09-11 11:44 adb_keys
+drwx------ 23 u0_a87 u0_a87    4096 2026-09-11 11:44 apex
+lrwxrwxrwx  1 u0_a87 u0_a87      10 2026-09-11 11:44 bin -> system/bin
+lrwxrwxrwx  1 u0_a87 u0_a87      49 2026-09-11 11:44 bugreports -> data/user_de/0/com.android.shell/files/bugreports
+drwxrwx---  6 u0_a87 u0_a87    4096 2026-09-11 11:44 cache
+drwxrwxrwx  4 u0_a87 u0_a87    4096 2026-09-11 11:45 config
+lrwxrwxrwx  1 u0_a87 u0_a87      16 2026-09-11 11:44 d -> sys/kernel/debug
+drwxrwx--x 45 u0_a87 u0_a87    4096 2026-09-11 11:44 data
+drwxrwxrwx  5 u0_a87 u0_a87    4096 2026-09-11 11:44 data_mirror
+drwx------  2 u0_a87 u0_a87    4096 2026-09-11 11:44 debug_ramdisk
+-rw-rw-rw- 1 u0_a87 u0_a87 16779725 2026-09-11 11:52 /data/user/0/io.twoyi.debug/profiles/default/rootfs/dev/__kmsg__
+
+/data/user/0/io.twoyi.debug/profiles/default/rootfs/dev/twoyi-svclogs:
+total 29280
+drwxr-xr-x  2 u0_a87 u0_a87    12288 2026-09-11 11:45 .
+drwxr-xr-x 25 u0_a87 u0_a87     4096 2026-09-11 11:44 ..
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2699.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2706.log
+-rw-r--r--  1 u0_a87 u0_a87     6045 2026-09-11 11:44 svc-2708.log
+-rw-r--r--  1 u0_a87 u0_a87     4656 2026-09-11 11:44 svc-2709.log
+-rw-r--r--  1 u0_a87 u0_a87     2445 2026-09-11 11:44 svc-2716.log
+-rw-r--r--  1 u0_a87 u0_a87     2535 2026-09-11 11:44 svc-2719.log
+-rw-r--r--  1 u0_a87 u0_a87  1635297 2026-09-11 11:52 svc-2722.log
+-rw-r--r--  1 u0_a87 u0_a87     5068 2026-09-11 11:44 svc-2723.log
+-rw-r--r--  1 u0_a87 u0_a87     5758 2026-09-11 11:44 svc-2724.log
+-rw-r--r--  1 u0_a87 u0_a87     6028 2026-09-11 11:44 svc-2725.log
+-rw-r--r--  1 u0_a87 u0_a87     4072 2026-09-11 11:44 svc-2726.log
+-rw-r--r--  1 u0_a87 u0_a87    34402 2026-09-11 11:44 svc-2735.log
+-rw-r--r--  1 u0_a87 u0_a87    45600 2026-09-11 11:44 svc-2739.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2752.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2753.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2754.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2756.log
+-rw-r--r--  1 u0_a87 u0_a87    45863 2026-09-11 11:44 svc-2758.log
+-rw-r--r--  1 u0_a87 u0_a87     2002 2026-09-11 11:44 svc-2759.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2762.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2763.log
+-rw-r--r--  1 u0_a87 u0_a87     1987 2026-09-11 11:44 svc-2765.log
+-rw-r--r--  1 u0_a87 u0_a87     2624 2026-09-11 11:44 svc-2766.log
+-rw-r--r--  1 u0_a87 u0_a87     8663 2026-09-11 11:44 svc-2767.log
+-rw-r--r--  1 u0_a87 u0_a87     7627 2026-09-11 11:44 svc-2768.log
+-rw-r--r--  1 u0_a87 u0_a87     7728 2026-09-11 11:44 svc-2769.log
+-rw-r--r--  1 u0_a87 u0_a87     1987 2026-09-11 11:44 svc-2770.log
+-rw-r--r--  1 u0_a87 u0_a87     4656 2026-09-11 11:44 svc-2785.log
+-rw-r--r--  1 u0_a87 u0_a87     3626 2026-09-11 11:44 svc-2786.log
+-rw-r--r--  1 u0_a87 u0_a87     3202 2026-09-11 11:44 svc-2791.log
+-rw-r--r--  1 u0_a87 u0_a87     1987 2026-09-11 11:44 svc-2794.log
+-rw-r--r--  1 u0_a87 u0_a87     4656 2026-09-11 11:44 svc-2799.log
+-rw-r--r--  1 u0_a87 u0_a87     3496 2026-09-11 11:44 svc-2818.log
+-rw-r--r--  1 u0_a87 u0_a87     3075 2026-09-11 11:44 svc-2821.log
+-rw-r--r--  1 u0_a87 u0_a87     4494 2026-09-11 11:44 svc-2822.log
+-rw-r--r--  1 u0_a87 u0_a87     2874 2026-09-11 11:44 svc-2823.log
+-rw-r--r--  1 u0_a87 u0_a87     2682 2026-09-11 11:44 svc-2830.log
+-rw-r--r--  1 u0_a87 u0_a87    19589 2026-09-11 11:44 svc-2831.log
+-rw-r--r--  1 u0_a87 u0_a87     3181 2026-09-11 11:44 svc-2832.log
+-rw-r--r--  1 u0_a87 u0_a87     4041 2026-09-11 11:44 svc-2833.log
+-rw-r--r--  1 u0_a87 u0_a87     1993 2026-09-11 11:44 svc-2842.log
+-rw-r--r--  1 u0_a87 u0_a87     1999 2026-09-11 11:44 svc-2843.log
+-rw-r--r--  1 u0_a87 u0_a87    14842 2026-09-11 11:44 svc-2877.log
+-rw-r--r--  1 u0_a87 u0_a87     6241 2026-09-11 11:44 svc-2878.log
+-rw-r--r--  1 u0_a87 u0_a87  3227094 2026-09-11 11:47 svc-2879.log
+-rw-r--r--  1 u0_a87 u0_a87     7542 2026-09-11 11:44 svc-2880.log
+-rw-r--r--  1 u0_a87 u0_a87    12122 2026-09-11 11:44 svc-2881.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2886.log
+-rw-r--r--  1 u0_a87 u0_a87     7644 2026-09-11 11:44 svc-2887.log
+-rw-r--r--  1 u0_a87 u0_a87    10917 2026-09-11 11:44 svc-2890.log
+-rw-r--r--  1 u0_a87 u0_a87    10284 2026-09-11 11:44 svc-2897.log
+-rw-r--r--  1 u0_a87 u0_a87     7664 2026-09-11 11:44 svc-2906.log
+-rw-r--r--  1 u0_a87 u0_a87    11488 2026-09-11 11:44 svc-2914.log
+-rw-r--r--  1 u0_a87 u0_a87    38127 2026-09-11 11:44 svc-2921.log
+-rw-r--r--  1 u0_a87 u0_a87    38436 2026-09-11 11:44 svc-2922.log
+-rw-r--r--  1 u0_a87 u0_a87    35397 2026-09-11 11:45 svc-2923.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2926.log
+-rw-r--r--  1 u0_a87 u0_a87     9255 2026-09-11 11:44 svc-2937.log
+-rw-r--r--  1 u0_a87 u0_a87     7469 2026-09-11 11:44 svc-2941.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2943.log
+-rw-r--r--  1 u0_a87 u0_a87    34955 2026-09-11 11:44 svc-2947.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2948.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-2949.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2962.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2967.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2977.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2983.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-2984.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-2986.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-2991.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2993.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-2995.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-2996.log
+-rw-r--r--  1 u0_a87 u0_a87     8494 2026-09-11 11:44 svc-3002.log
+-rw-r--r--  1 u0_a87 u0_a87    34417 2026-09-11 11:44 svc-3003.log
+-rw-r--r--  1 u0_a87 u0_a87     7652 2026-09-11 11:44 svc-3011.log
+-rw-r--r--  1 u0_a87 u0_a87     7730 2026-09-11 11:44 svc-3024.log
+-rw-r--r--  1 u0_a87 u0_a87     7830 2026-09-11 11:44 svc-3027.log
+-rw-r--r--  1 u0_a87 u0_a87     6611 2026-09-11 11:44 svc-3028.log
+-rw-r--r--  1 u0_a87 u0_a87     5326 2026-09-11 11:44 svc-3029.log
+-rw-r--r--  1 u0_a87 u0_a87     5326 2026-09-11 11:44 svc-3035.log
+-rw-r--r--  1 u0_a87 u0_a87     5654 2026-09-11 11:44 svc-3044.log
+-rw-r--r--  1 u0_a87 u0_a87     5326 2026-09-11 11:44 svc-3047.log
+-rw-r--r--  1 u0_a87 u0_a87     1929 2026-09-11 11:44 svc-3048.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3058.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3059.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3085.log
+-rw-r--r--  1 u0_a87 u0_a87     2874 2026-09-11 11:44 svc-3096.log
+-rw-r--r--  1 u0_a87 u0_a87    12566 2026-09-11 11:44 svc-3097.log
+-rw-r--r--  1 u0_a87 u0_a87     6678 2026-09-11 11:44 svc-3098.log
+-rw-r--r--  1 u0_a87 u0_a87     5705 2026-09-11 11:44 svc-3099.log
+-rw-r--r--  1 u0_a87 u0_a87    10213 2026-09-11 11:44 svc-3100.log
+-rw-r--r--  1 u0_a87 u0_a87     1929 2026-09-11 11:44 svc-3102.log
+-rw-r--r--  1 u0_a87 u0_a87     3514 2026-09-11 11:44 svc-3103.log
+-rw-r--r--  1 u0_a87 u0_a87     9966 2026-09-11 11:44 svc-3104.log
+-rw-r--r--  1 u0_a87 u0_a87    37699 2026-09-11 11:44 svc-3105.log
+-rw-r--r--  1 u0_a87 u0_a87    38771 2026-09-11 11:44 svc-3106.log
+-rw-r--r--  1 u0_a87 u0_a87    34955 2026-09-11 11:44 svc-3108.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-3119.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3121.log
+-rw-r--r--  1 u0_a87 u0_a87     3734 2026-09-11 11:44 svc-3124.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3125.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3130.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3133.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3145.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3148.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3158.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3159.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3160.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3163.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-3188.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-3189.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-3190.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:44 svc-3191.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3192.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3193.log
+-rw-r--r--  1 u0_a87 u0_a87    34128 2026-09-11 11:44 svc-3194.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3250.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:44 svc-3255.log
+-rw-r--r--  1 u0_a87 u0_a87    12124 2026-09-11 11:45 svc-3264.log
+-rw-r--r--  1 u0_a87 u0_a87     3362 2026-09-11 11:45 svc-3265.log
+-rw-r--r--  1 u0_a87 u0_a87     4198 2026-09-11 11:45 svc-3266.log
+-rw-r--r--  1 u0_a87 u0_a87     2575 2026-09-11 11:45 svc-3267.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3275.log
+-rw-r--r--  1 u0_a87 u0_a87    12566 2026-09-11 11:45 svc-3282.log
+-rw-r--r--  1 u0_a87 u0_a87 22038527 2026-09-11 11:52 svc-3283.log
+-rw-r--r--  1 u0_a87 u0_a87     2874 2026-09-11 11:45 svc-3284.log
+-rw-r--r--  1 u0_a87 u0_a87     4117 2026-09-11 11:45 svc-3285.log
+-rw-r--r--  1 u0_a87 u0_a87     1929 2026-09-11 11:45 svc-3286.log
+-rw-r--r--  1 u0_a87 u0_a87    10135 2026-09-11 11:45 svc-3295.log
+-rw-r--r--  1 u0_a87 u0_a87    37589 2026-09-11 11:45 svc-3300.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3302.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3310.log
+-rw-r--r--  1 u0_a87 u0_a87    38815 2026-09-11 11:45 svc-3311.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3312.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3316.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3317.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3318.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3322.log
+-rw-r--r--  1 u0_a87 u0_a87    34328 2026-09-11 11:45 svc-3323.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:45 svc-3325.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3329.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3330.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3334.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3336.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3344.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3345.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3348.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3349.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3357.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:45 svc-3358.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:45 svc-3359.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:45 svc-3360.log
+-rw-r--r--  1 u0_a87 u0_a87     6184 2026-09-11 11:45 svc-3361.log
+-rw-r--r--  1 u0_a87 u0_a87    34327 2026-09-11 11:45 svc-3362.log
+-rw-r--r--  1 u0_a87 u0_a87     4157 2026-09-11 11:45 svc-3380.log
+-rw-r--r--  1 u0_a87 u0_a87    12566 2026-09-11 11:45 svc-3381.log
+-rw-r--r--  1 u0_a87 u0_a87    12124 2026-09-11 11:45 svc-3382.log
+-rw-r--r--  1 u0_a87 u0_a87     1929 2026-09-11 11:45 svc-3383.log
+-rw-r--r--  1 u0_a87 u0_a87     3650 2026-09-11 11:45 svc-3386.log
+-rw-r--r--  1 u0_a87 u0_a87    12157 2026-09-11 11:45 svc-3388.log
+-rw-r--r--  1 u0_a87 u0_a87     5774 2026-09-11 11:45 svc-3389.log
+-rw-r--r--  1 u0_a87 u0_a87     5630 2026-09-11 11:45 svc-3390.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3406.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3413.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3416.log
+-rw-r--r--  1 u0_a87 u0_a87     7078 2026-09-11 11:45 svc-3418.log
+-rw-r--r--  1 u0_a87 u0_a87     7467 2026-09-11 11:47 svc-3419.log
+-rw-r--r--  1 u0_a87 u0_a87   590883 2026-09-11 11:51 svc-3420.log
+-rw-r--r--  1 u0_a87 u0_a87   105455 2026-09-11 11:52 svc-3421.log
+-rw-r--r--  1 u0_a87 u0_a87   100315 2026-09-11 11:45 svc-3422.log
+-rw-r--r--  1 u0_a87 u0_a87     7353 2026-09-11 11:45 svc-3449.log
+-rw-r--r--  1 u0_a87 u0_a87     9556 2026-09-11 11:45 svc-3455.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3456.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3459.log
+-rw-r--r--  1 u0_a87 u0_a87     6466 2026-09-11 11:45 svc-3465.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3466.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3467.log
+-rw-r--r--  1 u0_a87 u0_a87     8138 2026-09-11 11:45 svc-3468.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3477.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3479.log
+-rw-r--r--  1 u0_a87 u0_a87    68562 2026-09-11 11:45 svc-3481.log
+-rw-r--r--  1 u0_a87 u0_a87    37735 2026-09-11 11:45 svc-3489.log
+-rw-r--r--  1 u0_a87 u0_a87    84504 2026-09-11 11:45 svc-3493.log
+-rw-r--r--  1 u0_a87 u0_a87    10136 2026-09-11 11:45 svc-3501.log
+-rw-r--r--  1 u0_a87 u0_a87    37697 2026-09-11 11:45 svc-3512.log
+-rw-r--r--  1 u0_a87 u0_a87    38989 2026-09-11 11:45 svc-3516.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3520.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3521.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3523.log
+-rw-r--r--  1 u0_a87 u0_a87    34849 2026-09-11 11:45 svc-3524.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3529.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3530.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3539.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3541.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3542.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3543.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3548.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3549.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3551.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3554.log
+-rw-r--r--  1 u0_a87 u0_a87     6185 2026-09-11 11:45 svc-3556.log
+-rw-r--r--  1 u0_a87 u0_a87     6185 2026-09-11 11:45 svc-3558.log
+-rw-r--r--  1 u0_a87 u0_a87     6185 2026-09-11 11:45 svc-3559.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3560.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3561.log
+-rw-r--r--  1 u0_a87 u0_a87     6185 2026-09-11 11:45 svc-3571.log
+-rw-r--r--  1 u0_a87 u0_a87     6185 2026-09-11 11:45 svc-3573.log
+-rw-r--r--  1 u0_a87 u0_a87    34467 2026-09-11 11:45 svc-3574.log
+-rw-r--r--  1 u0_a87 u0_a87     8911 2026-09-11 11:45 svc-3585.log
+-rw-r--r--  1 u0_a87 u0_a87    11108 2026-09-11 11:45 svc-3586.log
+-rw-r--r--  1 u0_a87 u0_a87     5911 2026-09-11 11:45 svc-3587.log
+-rw-r--r--  1 u0_a87 u0_a87     8055 2026-09-11 11:45 svc-3588.log
+-rw-r--r--  1 u0_a87 u0_a87     9306 2026-09-11 11:45 svc-3591.log
+-rw-r--r--  1 u0_a87 u0_a87    12568 2026-09-11 11:45 svc-3601.log
+-rw-r--r--  1 u0_a87 u0_a87   100515 2026-09-11 11:45 svc-3602.log
+-rw-r--r--  1 u0_a87 u0_a87     1929 2026-09-11 11:45 svc-3611.log
+-rw-r--r--  1 u0_a87 u0_a87    12125 2026-09-11 11:45 svc-3612.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3616.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3618.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3624.log
+-rw-r--r--  1 u0_a87 u0_a87    10126 2026-09-11 11:45 svc-3627.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3629.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3630.log
+-rw-r--r--  1 u0_a87 u0_a87    37604 2026-09-11 11:45 svc-3642.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3644.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3645.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3646.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3647.log
+-rw-r--r--  1 u0_a87 u0_a87    39096 2026-09-11 11:45 svc-3648.log
+-rw-r--r--  1 u0_a87 u0_a87    34576 2026-09-11 11:45 svc-3649.log
+-rw-r--r--  1 u0_a87 u0_a87    68441 2026-09-11 11:45 svc-3655.log
+-rw-r--r--  1 u0_a87 u0_a87     6185 2026-09-11 11:45 svc-3657.log
+-rw-r--r--  1 u0_a87 u0_a87     6185 2026-09-11 11:45 svc-3658.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3659.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3661.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3666.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3669.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3676.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3696.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3698.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3699.log
+-rw-r--r--  1 u0_a87 u0_a87     6185 2026-09-11 11:45 svc-3702.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3707.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3708.log
+-rw-r--r--  1 u0_a87 u0_a87        0 2026-09-11 11:45 svc-3712.log
+
+── profiles tree (existence check) ──
+total 12
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 11:43 .
+drwx------ 10 u0_a87 u0_a87 4096 2026-09-11 11:44 ..
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 11:44 default
+
+── twrp-kmsg.log (the symlink/staging target) ──
+dev=2049 ino=6296141 size=0 mtime=2026-09-11 11:44:43.304686118 +0000
+fdtest-markers=0

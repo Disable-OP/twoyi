@@ -6297,26 +6297,27 @@ fn probe_flat_mem(
 /// 6-Z306ae-b therefore rejected every correct capture and the mirror
 /// never fired (#205: 241 skips, 0 deliveries).
 /// The gate that actually protects the guest: the object at cookie
-/// must LOOK ALIVE — [cookie..+16] readable with vptr≠0 and mRefs≠0
-/// (a freed scudo chunk reads zeros — the #199/#201 platform_compat
-/// serve-time state and the #204 atrace incWeak(NULL) crash shape).
-/// HIDL HALs that drop their sp<> after registerAsService survive on
-/// real kernels BECAUSE of this mirror; without it they die — the
-/// vendor-HAL fleet crash class.
+/// must LOOK ALIVE — [cookie..+8] readable with vptr≠0. A freed scudo
+/// chunk reads zeros (the #199/#201 platform_compat serve-time state
+/// and the #204 atrace incWeak(NULL) crash shape). NOTE: NO mRefs
+/// check at [cookie+8] — for the virtually-inheriting wrapper classes
+/// (IBinder : public virtual RefBase) the BBinder subobject is just
+/// {vptr} and [B+8] is padding that can legitimately be zero; mRefs
+/// lives in the shared RefBase subobject at B+Δ (#209: 238/246
+/// registrations wrongly rejected by the mRefs≠0 check).
 fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
     if guest_pid <= 0 || ptr == 0 || cookie == 0 {
         return false;
     }
-    match crate::ptrace_emu::peek_guest_bytes(guest_pid, cookie, 16) {
-        Some(b) if b.len() == 16 => {
+    match crate::ptrace_emu::peek_guest_bytes(guest_pid, cookie, 8) {
+        Some(b) if b.len() == 8 => {
             let vptr = u64::from_ne_bytes(b[0..8].try_into().unwrap());
-            let mrefs = u64::from_ne_bytes(b[8..16].try_into().unwrap());
-            if vptr != 0 && mrefs != 0 {
+            if vptr != 0 {
                 true
             } else {
                 info!(
-                    "[KR64][binder][svc] 6-Z306ae-d: mirror skipped — object at cookie=0x{:x} not alive (vptr={:#x} mRefs={:#x}) pid={}",
-                    cookie, vptr, mrefs, guest_pid
+                    "[KR64][binder][svc] 6-Z306ae-d: mirror skipped — object at cookie=0x{:x} not alive (vptr=0) pid={}",
+                    cookie, guest_pid
                 );
                 false
             }
