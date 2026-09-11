@@ -14401,6 +14401,17 @@ pub fn run_ptrace_loop(
     // AFTER the prctl returns, so it is read at the next traced ENTRY.
     let mut z306af_pending_abort: std::collections::HashMap<libc::pid_t, (u64, u64)> =
         std::collections::HashMap::new();
+    // 6-Z306af-h: per-TID syscall rings for lineage pids — the global
+    // all-syscalls ring interleaves every process, so the dying
+    // THREAD's own final syscalls were unattributable (#215/#217: the
+    // "last 24 ALL" tails mixed storm traffic). Recorded at the same
+    // point as the 6-Z306y fork-child trail, but keyed by TID and
+    // gated on the whole zygote lineage (system_server's binder/
+    // HwBinder threads included). Cap 64 pids × 24 entries.
+    let mut z306af_tid_trail: std::collections::HashMap<
+        libc::pid_t,
+        std::collections::VecDeque<i64>,
+    > = std::collections::HashMap::new();
     // 6-Z305i: capped DIAG for the first non-init getpid pass-throughs
     // (the InitAborter contract fix — see the pending_getpid EXIT arm).
     let mut z305i_getpid_diag: u64 = 0;
@@ -16599,6 +16610,66 @@ pub fn run_ptrace_loop(
                                                     af_tgid
                                                 ));
                                             }
+                                            // 6-Z306af-h: frame-pointer chain walk
+                                            // (best effort) — AOSP system libs ship
+                                            // with frame pointers: fp → [fp]=next
+                                            // fp, [fp+8]=lr (the 6-Z296 walker's
+                                            // upward-reading rule). The mm may
+                                            // already be gone at the EXIT event
+                                            // (procfs ENOENT) — the reads then
+                                            // fail and the walk is skipped.
+                                            #[cfg(target_arch = "aarch64")]
+                                            {
+                                                // Snapshot rows for the FP-chain
+                                                // walk (own, else the group
+                                                // leader's — same address space).
+                                                let af_snap_rows: Vec<(u64, u64, String)> =
+                                                    z306af_maps_cache
+                                                        .get(&pid)
+                                                        .or_else(|| {
+                                                            if af_tgid != 0 {
+                                                                z306af_maps_cache.get(&af_tgid)
+                                                            } else {
+                                                                None
+                                                            }
+                                                        })
+                                                        .cloned()
+                                                        .unwrap_or_default();
+                                                let mut af_fp = unsafe {
+                                                    *(&dregs as *const Regs as *const u64).add(29)
+                                                };
+                                                let mut af_frames: Vec<String> = Vec::new();
+                                                for k in 0..12 {
+                                                    if af_fp < 0x1000 || af_fp >= (1u64 << 48) {
+                                                        break;
+                                                    }
+                                                    let (Some(af_nf), Some(af_lr)) = (
+                                                        read_child_u64(pid, af_fp),
+                                                        read_child_u64(pid, af_fp.wrapping_add(8)),
+                                                    ) else {
+                                                        break;
+                                                    };
+                                                    if af_lr > 0x1000 {
+                                                        let res =
+                                                            z306af_resolve_pc(&af_snap_rows, af_lr)
+                                                                .unwrap_or_else(|| {
+                                                                    format!("{:#x}", af_lr)
+                                                                });
+                                                        af_frames.push(format!("#{k} lr={res}"));
+                                                    }
+                                                    // chain sanity: must rise (or end)
+                                                    if af_nf <= af_fp {
+                                                        break;
+                                                    }
+                                                    af_fp = af_nf;
+                                                }
+                                                if !af_frames.is_empty() {
+                                                    log(&format!(
+                                                        "6-Z306af fp-chain (lr per frame, newest first): {}",
+                                                        af_frames.join(" | ")
+                                                    ));
+                                                }
+                                            }
                                             match maps_read {
                                                 Ok(content) => {
                                                     log(&format!(
@@ -16630,6 +16701,26 @@ pub fn run_ptrace_loop(
                                                             e
                                                         )),
                                                     }
+                                                }
+                                            }
+                                            // 6-Z306af-h: the dying TID's OWN
+                                            // syscall ring + the group leader's
+                                            // (when different) — the global ring
+                                            // is cross-pid interleaved.
+                                            if let Some(ring) = z306af_tid_trail.get(&pid) {
+                                                log(&format!(
+                                                    "6-Z306af tid-ring of {} (oldest->newest): {}",
+                                                    pid,
+                                                    format_syscall_buffer(ring, abi)
+                                                ));
+                                            }
+                                            if af_tgid != 0 && af_tgid != pid {
+                                                if let Some(ring) = z306af_tid_trail.get(&af_tgid) {
+                                                    log(&format!(
+                                                        "6-Z306af tgid-ring of {} (oldest->newest): {}",
+                                                        af_tgid,
+                                                        format_syscall_buffer(ring, abi)
+                                                    ));
                                                 }
                                             }
                                         }
@@ -21270,6 +21361,24 @@ pub fn run_ptrace_loop(
                             const Z306Y_TEARDOWN_MPROTECT: i64 = 226;
                             const Z306Y_TEARDOWN_MUNMAP: i64 = 215;
                             const Z306Y_TEARDOWN_MADVISE: i64 = 233;
+                            // 6-Z306af-h: per-TID ring — same filters as the
+                            // fork-child trail, but lineage-WIDE and keyed by
+                            // the tid waitpid reports (threads included).
+                            if z306af_tid_trail.len() < 64 || z306af_tid_trail.contains_key(&pid) {
+                                if syscall_num != abi.mprotect_nr
+                                    && syscall_num != Z306Y_TEARDOWN_MPROTECT
+                                    && syscall_num != Z306Y_TEARDOWN_MUNMAP
+                                    && syscall_num != Z306Y_TEARDOWN_MADVISE
+                                {
+                                    let ring = z306af_tid_trail.entry(pid).or_insert_with(|| {
+                                        std::collections::VecDeque::with_capacity(24)
+                                    });
+                                    if ring.len() >= 24 {
+                                        ring.pop_front();
+                                    }
+                                    ring.push_back(syscall_num);
+                                }
+                            }
                             if z306_zygote_fork_children.contains(&pid)
                                 && syscall_num != abi.mprotect_nr
                                 && syscall_num != Z306Y_TEARDOWN_MPROTECT
