@@ -27744,3 +27744,18 @@ Stage Summary:
 - The mission-level reading is corrected: #210 did NOT have "0 zygote deaths" in the strict sense — the zygote DID die (self-KILL after the gen-1 SIGSEGV) and its restart explains gen2; "0 zygote deaths" was true only of the pre-cap window markers. system_server survival across AMS construction is REAL but the constructor-era self-transaction (batterystats code=8) is followed by a deterministic ~3s-later SIGSEGV class that kills each generation.
 - #212 (on ac73e3d) is the decode run: expect "6-Z306af: death-site capture pid=<gen N> sig=11 comm=<thread>" + pc-bracket → the exact library/offset of the post-AMS-constructor crash → root-cause → targeted fix.
 - Next walls after that: AMS completion → setSystemProcess ("activity") → PMS (the queued installd dexopt SIGSEGV x19=0 becomes relevant) → rung 8. The TWRP gate result re-verifies recovery on the mirror-era SM arms.
+
+---
+Task ID: 19e
+Agent: Z.ai Code (main session, continued)
+Task: Fix 6-Z306af CI (scope + rustfmt); decode #211 + TWRP gate #8069; dispatch #212.
+
+Work Log:
+- CI #1671 (ac73e3d) failed at the rustfmt step; installing the stable toolchain locally exposed the REAL bug — the death-site arm referenced `ws` from OUTSIDE the `if getevent_r == 0` scope. 6-Z306af-b (f503861): GETEVENTMSG re-read inside the arm (same value, one bounded ptrace call) + rustfmt. Local gates: cargo fmt clean, clippy -D warnings clean, **830/830 tests** (first local Rust gate run of the mission — sandbox now has rustup stable 1.98.1).
+- TWRP recovery gate #8069 (3db8ef0) **GREEN** — the SM arms with the in-transaction mirror are recovery-safe (19c queue item 3 CLOSED).
+- Ladder #211 (3db8ef0) = rung 7 (as expected — no code change since #210). Decode: **the post-AMS-constructor death class is MULTI-MODE** — gen1 (4983) exited code 1 at +182.3s (not SIGSEGV this run); a later gen died by SIGABRT at +361.8s (6812); zygote-2 (7109) itself died by SIGSEGV at +390.6s; conn 302/500 disconnects at +223.6/+401.9s; addService(appops) reached at +188.9s (conn 244) and +341.4s (conn 416). The HAL storm is also variable (217 signal-11 child deaths vs 122 in #210). Variable post-registration deaths (exit(1)/SIGABRT/SIGSEGV) across generations are consistent with a common root cause manifesting stochastically — #212's 6-Z306af will name the sites.
+- Dispatched ladder #212 (f503861, boot_wait 420) after kr64-tests GREEN on that HEAD.
+
+Stage Summary:
+- Instrument ready: #212 will emit "6-Z306af: death-site capture pid=… sig=… comm=…" + pc-bracket for every no-delivery fatal death (up to 16).
+- Recovery corpus re-verified GREEN on the mirror-era SM. Next: decode #212 death sites → targeted fix for the post-batterystats/system_server-death class → expect AMS completion → "activity" registration → PMS.
