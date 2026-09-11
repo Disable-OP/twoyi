@@ -97,7 +97,7 @@ def adb(*args, timeout=30):
         # the whole harness AFTER the E2E itself had run (lineage run
         # 33851414641: "UnicodeDecodeError: 'utf-8' codec can't decode
         # byte 0x9d" at 11:25 — the boot verdict was never written).
-        r = subprocess.run(ADB + list(args), capture_output=True, text=True,
+        r = subprocess.run(ADB + list(args), capture_output=True,
                            encoding="utf-8", errors="replace",
                            timeout=timeout)
         return r.stdout.strip()
@@ -135,7 +135,7 @@ def input_cmd(cmd):
     if not _ADB_DEAD:
         try:
             st = subprocess.run(ADB + ["get-state"], capture_output=True,
-                                text=True, timeout=5)
+                                text=True, errors="replace", timeout=5)
             alive = "device" in (st.stdout + st.stderr)
         except Exception:
             alive = False
@@ -149,10 +149,10 @@ def input_cmd(cmd):
         if ":" in serial:
             try:
                 r = subprocess.run(["adb", "connect", serial],
-                                   capture_output=True, text=True, timeout=10)
+                                   capture_output=True, text=True, errors="replace", timeout=10)
                 if "connected" in (r.stdout + r.stderr):
                     st2 = subprocess.run(ADB + ["get-state"],
-                                         capture_output=True, text=True,
+                                         capture_output=True, text=True, errors="replace",
                                          timeout=5)
                     if "device" in (st2.stdout + st2.stderr):
                         _ADB_DEAD = False
@@ -164,7 +164,7 @@ def input_cmd(cmd):
     # Channel 2: docker exec `input`.
     try:
         r = subprocess.run(["sudo", "docker", "exec", "redroid", "sh", "-c", cmd],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, errors="replace", timeout=20)
         out = (r.stdout or "") + (r.stderr or "")
         if r.returncode == 0 and "rror" not in out and "sage" not in out:
             return out
@@ -203,7 +203,7 @@ def _broadcast_cmd(cmd):
                      f"--es action tap --ei x {x1} --ei y {y1}")
         r = subprocess.run(
             ["sudo", "docker", "exec", "redroid", "sh", "-c", amcmd],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, errors="replace", timeout=20)
         # Delivery is fire-and-forget; the probe verifies the effect
         # via its marker/frame checks after each gesture.
         return (r.stdout or "") + (r.stderr or "")
@@ -224,7 +224,7 @@ def _sendevent_discover():
     try:
         r = subprocess.run(
             ["sudo", "docker", "exec", "redroid", "sh", "-c", "getevent -pl 2>/dev/null"],
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, errors="replace", timeout=15)
         text = r.stdout or ""
     except Exception:
         return
@@ -253,7 +253,7 @@ def _sendevent_discover():
                 ["sudo", "docker", "exec", "redroid", "sh", "-c",
                  f"getevent -pl 2>/dev/null | grep -A30 '{_TOUCH_EVDEV}' | "
                  f"grep ABS_MT_POSITION_Y"],
-                capture_output=True, text=True, timeout=15)
+                capture_output=True, text=True, errors="replace", timeout=15)
             my = re.search(r"max\s+(\d+)", r.stdout or "")
             _, xm, _, _ = _TOUCH_RANGE
             _TOUCH_RANGE = (0, xm, 0, int(my.group(1)) if my else 0)
@@ -271,7 +271,7 @@ def _first_evdev_for(getevent_pl_text, dev_name):
         r = subprocess.run(
             ["sudo", "docker", "exec", "redroid", "sh", "-c",
              "getevent -lp 2>/dev/null"],
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, errors="replace", timeout=15)
         for block in (r.stdout or "").split("add device"):
             if dev_name in block:
                 m = re.search(r"/dev/input/event\d+", block)
@@ -310,7 +310,7 @@ def _sendevent_cmd(cmd):
     # Unknown shape or no nodes — last resort: docker `input` anyway.
     try:
         r = subprocess.run(["sudo", "docker", "exec", "redroid", "sh", "-c", cmd],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, errors="replace", timeout=20)
         return (r.stdout or "") + (r.stderr or "")
     except Exception:
         return ""
@@ -544,7 +544,7 @@ def dump_ui(name):
     if not _ADB_DEAD:
         try:
             st = subprocess.run(ADB + ["get-state"], capture_output=True,
-                                text=True, timeout=5)
+                                text=True, errors="replace", timeout=5)
             alive = "device" in (st.stdout + st.stderr)
         except Exception:
             alive = False
@@ -736,7 +736,7 @@ def touchscreen_tap(x, y):
     drops short 'input tap' events. Falls back to 'input tap' if the
     'touchscreen' source isn't supported on this device."""
     r = subprocess.run(ADB + ["shell", f"input touchscreen tap {x} {y}"],
-                       capture_output=True, text=True, timeout=30)
+                       capture_output=True, text=True, errors="replace", timeout=30)
     combined = (r.stdout + r.stderr).lower()
     if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
         adb_shell(f"input tap {x} {y}")
@@ -803,14 +803,14 @@ def tap_picker_row_with_fallbacks(x, y):
             # cmd is a list of shell commands to run in sequence
             for sub in cmd:
                 r = subprocess.run(ADB + ["shell", sub],
-                                   capture_output=True, text=True, timeout=30)
+                                   capture_output=True, text=True, errors="replace", timeout=30)
                 combined = (r.stdout + r.stderr).lower()
                 if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
                     print(f"    tap_picker_row: {name} not supported on device — skipping")
                     return False
         else:
             r = subprocess.run(ADB + ["shell", cmd],
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, text=True, errors="replace", timeout=30)
             combined = (r.stdout + r.stderr).lower()
             if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
                 print(f"    tap_picker_row: {name} not supported on device — skipping")
@@ -855,7 +855,7 @@ def tap_picker_row_with_fallbacks(x, y):
     # closed, repeat.
     print("    tap_picker_row: trying trackball scan")
     probe = subprocess.run(ADB + ["shell", "input trackball roll 0 0"],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, errors="replace", timeout=30)
     probe_out = (probe.stdout + probe.stderr).lower()
     if any(s in probe_out for s in ("usage", "unknown", "error", "not found", "invalid")):
         print("    tap_picker_row: trackball not supported on device — skipping")
@@ -863,9 +863,9 @@ def tap_picker_row_with_fallbacks(x, y):
         closed = False
         for i in range(1, 21):
             subprocess.run(ADB + ["shell", "input trackball roll 0 1"],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, errors="replace", timeout=30)
             subprocess.run(ADB + ["shell", "input trackball press"],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, errors="replace", timeout=30)
             wait(1.0)  # give picker time to close (or not)
             if picker_closed():
                 print(f"    tap_picker_row: ✓ picker closed after trackball roll #{i}")
@@ -1783,7 +1783,7 @@ def main():
                 r = subprocess.run(
                     ["sudo", "docker", "exec", "redroid", "sh", "-c",
                      f"tail -n 4000 '{p}' 2>/dev/null"],
-                    capture_output=True, text=True, timeout=15)
+                    capture_output=True, text=True, errors="replace", timeout=15)
                 out = r.stdout or ""
                 if len(out) > 200:
                     break
@@ -1812,7 +1812,7 @@ def main():
                 r = subprocess.run(
                     ["sudo", "docker", "exec", "redroid", "sh", "-c",
                      f"stat -c%s '{p}' 2>/dev/null || echo -1"],
-                    capture_output=True, text=True, timeout=15)
+                    capture_output=True, text=True, errors="replace", timeout=15)
                 lines = (r.stdout or "").strip().splitlines()
                 if lines and lines[-1].strip().lstrip("-").isdigit():
                     size = max(size, int(lines[-1].strip()))
@@ -1832,7 +1832,7 @@ def main():
             r = subprocess.run(
                 ["sudo", "docker", "exec", "redroid", "sh", "-c",
                  "ps -A -o PID,PPID,NAME 2>/dev/null"],
-                capture_output=True, text=True, timeout=15)
+                capture_output=True, text=True, errors="replace", timeout=15)
             rows = []
             for line in (r.stdout or "").splitlines():
                 parts = line.split()
@@ -2348,7 +2348,7 @@ def main():
                                  f"--es action tap --ei x {x} --ei y {y}")
                         r = subprocess.run(
                             ["sudo", "docker", "exec", "redroid", "sh", "-c", amcmd],
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, text=True, errors="replace", timeout=20)
                         out = (r.stdout or "") + (r.stderr or "")
                         print(f"  [fox-nav] {tag} attempt 0: DEBUG BROADCAST "
                               f"({x},{y}) rc={r.returncode} "

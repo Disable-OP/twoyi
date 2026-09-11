@@ -62,7 +62,7 @@ def guest_recovery_log():
             r = subprocess.run(
                 ["sudo", "docker", "exec", "redroid", "sh", "-c",
                  f"tail -n 4000 {root}/rootfs/tmp/recovery.log"],
-                capture_output=True, text=True, timeout=20)
+                capture_output=True, text=True, errors="replace", timeout=20)
             out = (r.stdout or "")
             if len(out) > 200:
                 return out
@@ -76,7 +76,7 @@ def logcat_dump():
     out = ""
     try:
         r = subprocess.run(nav.ADB + ["shell", "logcat", "-d", "-v", "time"],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, errors="replace", timeout=20)
         out = (r.stdout or "") + (r.stderr or "")
         if "Beginning of" in out or len(out) > 200:
             return out
@@ -86,7 +86,7 @@ def logcat_dump():
         r = subprocess.run(
             ["sudo", "docker", "exec", "redroid", "sh", "-c",
              "/system/bin/logcat -d -v time"],
-            capture_output=True, text=True, timeout=25)
+            capture_output=True, text=True, errors="replace", timeout=25)
         return (r.stdout or "") + (r.stderr or "")
     except Exception:
         return out
@@ -120,7 +120,7 @@ def screen_size():
     try:
         r = subprocess.run(
             ["sudo", "docker", "exec", "redroid", "sh", "-c", "wm size"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, errors="replace", timeout=10)
         m = re.search(r"(\d+)x(\d+)", (r.stdout or ""))
         if m:
             return int(m.group(1)), int(m.group(2))
@@ -145,7 +145,7 @@ def adb_docker_out(cmd, timeout=25):
     try:
         r = subprocess.run(
             ["sudo", "docker", "exec", "redroid", "sh", "-c", cmd],
-            capture_output=True, text=True, timeout=timeout)
+            capture_output=True, text=True, errors="replace", timeout=timeout)
         return ((r.stdout or "") + (r.stderr or "")).strip()
     except Exception as e:
         return f"<threw {e!r}>"
@@ -157,7 +157,7 @@ def adb_out(cmd, timeout=20):
     that the effect check alone would silently bury)."""
     try:
         r = subprocess.run(nav.ADB + ["shell", cmd],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
         return ((r.stdout or "") + (r.stderr or "")).strip()
     except Exception as e:
         return f"<threw {e!r}>"
@@ -398,7 +398,7 @@ def main():
             nav.ADB + ["shell",
                        f"am broadcast -a io.twoyi.debug.TOUCH "
                        f"--es action key --ei key {android_key}"],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, errors="replace", timeout=20)
         key_results.append((android_key, r.returncode, (r.stdout or "")[:60]))
         time.sleep(2)
     probe["key_broadcasts"] = key_results
