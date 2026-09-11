@@ -995,6 +995,49 @@ static void binder_fd_clear_proxy(int fd) {
     pthread_mutex_unlock(&g_binder_fd_lock);
 }
 
+// 6-Z306ai: which binder DEVICE each tracked fd serves — 1=/dev/binder,
+// 2=/dev/hwbinder, 3=/dev/vndbinder, 0=unknown. Per-thread proxy conns
+// are created lazily from bp_conn_for_ioctl(fd), where the open-path is
+// long gone; this table remembers the device so each conn's IDENT can
+// announce it. The proxy's conn→(pid,tid,dev) map lets the boot decode
+// tie an aborting pool thread (comm "HwBinder:pid_N") to the exact
+// transactions its connection served.
+#define BP_DEV_NONE 0u
+#define BP_DEV_BINDER 1u
+#define BP_DEV_HWBINDER 2u
+#define BP_DEV_VNDBINDER 3u
+static unsigned char g_binder_dev_of_fd[TWOYI_MAX_FD];
+
+static uint32_t binder_dev_code_from_path(const char *path) {
+    if (!path) return BP_DEV_NONE;
+    if (strcmp(path, "/dev/binder") == 0) return BP_DEV_BINDER;
+    if (strcmp(path, "/dev/hwbinder") == 0) return BP_DEV_HWBINDER;
+    if (strcmp(path, "/dev/vndbinder") == 0) return BP_DEV_VNDBINDER;
+    return BP_DEV_NONE;
+}
+
+static void binder_fd_dev_set(int fd, uint32_t code) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD || code == BP_DEV_NONE) return;
+    pthread_mutex_lock(&g_binder_fd_lock);
+    g_binder_dev_of_fd[fd] = (unsigned char)code;
+    pthread_mutex_unlock(&g_binder_fd_lock);
+}
+
+static uint32_t binder_fd_dev_get(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return BP_DEV_NONE;
+    pthread_mutex_lock(&g_binder_fd_lock);
+    uint32_t r = g_binder_dev_of_fd[fd];
+    pthread_mutex_unlock(&g_binder_fd_lock);
+    return r;
+}
+
+static void binder_fd_dev_clear(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return;
+    pthread_mutex_lock(&g_binder_fd_lock);
+    g_binder_dev_of_fd[fd] = 0;
+    pthread_mutex_unlock(&g_binder_fd_lock);
+}
+
 // ---------------------------------------------------------------------------
 // qemu_pipe proxy fd tracking — 6-Z116 (z115 DESIGN.md §3 + §7-Rank-1).
 //
@@ -1131,6 +1174,13 @@ static uint32_t bp_stat_pid(void) {
     return v;
 }
 
+// 6-Z306ai: hoisted above binder_proxy_connect (which now announces the
+// connecting thread's tid in the IDENT v2 payload). Pure SYS_gettid
+// wrapper — raw syscall, no PLT hooks in the way.
+static uint32_t bp_gettid(void) {
+    return (uint32_t)syscall(SYS_gettid);
+}
+
 // Connect a Unix stream socket to the kr64 binder proxy. Candidates, in
 // order (fb-hook input-bridge recipe — fresh socket per candidate because a
 // failed connect(2) leaves socket state unspecified):
@@ -1139,7 +1189,7 @@ static uint32_t bp_stat_pid(void) {
 //   2: vm0/dev/binder                 — relative (guest cwd is the rootfs)
 // Returns the connected fd or -1 (caller falls back to /dev/null — no
 // regression when the proxy is absent, e.g. TWRP mode).
-static int binder_proxy_connect(const char *guest_path) {
+static int binder_proxy_connect(const char *guest_path, uint32_t dev_code_hint) {
     char cands[3][160];
     int ncands = 0;
     static int logged_fail = 0;
@@ -1201,11 +1251,28 @@ static int binder_proxy_connect(const char *guest_path) {
             ident.gid = (uint32_t)getgid();
             unsigned char ihdr[8];
             uint32_t icmd = 0x400462FFu;  // WIRE_CMD_IDENT (not a real binder ioctl)
-            uint32_t ilen = 12;
+            // 6-Z306ai: IDENT v2 — append [u32 magic "idex"][u32 tid]
+            // [u32 dev] to the 12-byte legacy payload. tid = the
+            // CONNECTING thread (the per-thread conn owner), dev = which
+            // binder device this conn serves (hint first, then the open
+            // path). The proxy accepts both lengths; the response is
+            // unchanged. The boot decode needs conn→(pid,tid,dev) to tie
+            // an aborting "HwBinder:pid_N" thread to the transactions its
+            // conn served.
+            uint32_t itid = bp_gettid();
+            uint32_t idev = dev_code_hint ? dev_code_hint
+                                          : binder_dev_code_from_path(guest_path);
+            uint32_t iext = 0x69646578u;  // "idex" — IDENT v2 extension marker
+            unsigned char ipay[24];
+            uint32_t ilen = (uint32_t)sizeof(ipay);
             memcpy(ihdr + 0, &icmd, 4);
             memcpy(ihdr + 4, &ilen, 4);
+            memcpy(ipay + 0, &ident, 12);
+            memcpy(ipay + 12, &iext, 4);
+            memcpy(ipay + 16, &itid, 4);
+            memcpy(ipay + 20, &idev, 4);
             if (bp_send_all(sfd, ihdr, 8) == 0 &&
-                bp_send_all(sfd, &ident, sizeof(ident)) == 0) {
+                bp_send_all(sfd, ipay, sizeof(ipay)) == 0) {
                 int32_t iret = 0;
                 uint32_t irlen = 0;
                 // Drain the ack ([i32 ret][u32 len]) — ignore content.
@@ -1288,10 +1355,6 @@ struct bp_thread_conn {
 static struct bp_thread_conn g_bp_thread_conns[BP_THREAD_CONN_MAX];
 static pthread_mutex_t g_bp_thread_conn_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static uint32_t bp_gettid(void) {
-    return (uint32_t)syscall(SYS_gettid);
-}
-
 // Lookup (no insert). Returns the dedicated conn fd or -1.
 static int bp_thread_conn_lookup(int binder_fd, uint32_t tid) {
     int conn = -1;
@@ -1370,7 +1433,9 @@ static int bp_conn_for_ioctl(int binder_fd) {
     uint32_t tid = bp_gettid();
     int conn = bp_thread_conn_lookup(binder_fd, tid);
     if (conn >= 0) return conn;
-    conn = binder_proxy_connect(NULL);
+    // 6-Z306ai: surface the device this binder fd serves in the new
+    // conn's IDENT (the path itself is gone — only the fd is at hand).
+    conn = binder_proxy_connect(NULL, binder_fd_dev_get(binder_fd));
     if (conn < 0) return binder_fd;
     if (bp_thread_conn_insert(binder_fd, tid, conn) < 0) {
         // Table full — drop the spare and share the primary (rare: the
@@ -3608,6 +3673,7 @@ int __twoyi_shlib_close(int fd) {
     if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
     binder_fd_clear(fd);
     binder_fd_clear_proxy(fd);
+    binder_fd_dev_clear(fd);
     // 6-Z271g: dropping the binder fd also tears down every per-thread
     // proxy conn bound to it (fd-number recycling hygiene + no ghost
     // registrations in the proxy).
@@ -6217,9 +6283,10 @@ static int binder_open_fallback(const char *path, int real_fd, int saved_errno) 
                  st.st_rdev != 0);
             if (!is_real_binder) {
                 syscall(NR_close, real_fd);
-                int pfd = binder_proxy_connect(path);
+                int pfd = binder_proxy_connect(path, 0);
                 if (pfd >= 0) {
                     binder_fd_mark_proxy(pfd);
+                    binder_fd_dev_set(pfd, binder_dev_code_from_path(path));
                     // 6-Z271g: the opening thread keeps pfd as its
                     // dedicated conn (same as the failed-open path).
                     bp_thread_conn_insert(pfd, bp_gettid(), pfd);
@@ -6242,9 +6309,10 @@ static int binder_open_fallback(const char *path, int real_fd, int saved_errno) 
     // protocol on it (see the wire client block above). If the connect
     // fails too (proxy absent — e.g. TWRP mode, or kr64 fell back to the
     // host binder), the /dev/null path below is unchanged: no regression.
-    int pfd = binder_proxy_connect(path);
+    int pfd = binder_proxy_connect(path, 0);
     if (pfd >= 0) {
         binder_fd_mark_proxy(pfd);
+        binder_fd_dev_set(pfd, binder_dev_code_from_path(path));
         // 6-Z271g: the OPENING thread keeps pfd as its dedicated conn;
         // every other binder thread lazily establishes its own (see the
         // g_bp_thread_conns table). One conn per thread = real-binder
