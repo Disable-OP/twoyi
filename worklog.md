@@ -27830,3 +27830,18 @@ Work Log:
 Stage Summary:
 - The dying-thread identity is now concrete: a system_server LOG-WRITER thread in a post-appops log flood, dying at a signal-restarted timed futex inside libc's syscall() wrapper. Next decode inputs queued: (1) the abort-message catch (6-Z306af-g) for the with-message SIGABRT class; (2) an fp-chain sample when a death happens with the mm still mapped; (3) correlating the log flood's content with the death (the guest logd protocol buffers on the writev fds are binary — a tracer-side liblog-decode probe is the candidate next instrument if the message class stays silent).
 - #219 dispatched (ee3b003) for more instrument samples.
+
+---
+Task ID: 21
+Agent: Z.ai Code (webDevReview cron session, continued)
+Task: Land the scudo discriminator; decode #220/#222; hand off with the wedge hypothesis.
+
+Work Log:
+- LANDED 6-Z306af-j (a72e2d4): kill/tgkill from ANY guest issuer targeting a lineage pid → names the killer (16/run). LANDED 6-Z306af-k (2bf3a0b): at a Scudo abort, read the 16-byte chunk header + 16 user bytes via process_vm_readv (double-free vs overflow discriminator). Both gated (fmt/clippy/832 tests), CI GREEN.
+- #220 DECODE: gen-1 WEDGED silently for 265s right after the platform_compat LOCAL-flat hit (conn 335 silent, appops never registered) and was **SIGKILLed at +196.2s with NO zygote restart** — an external killer. Also observed: the tracer's STALL-PROBE loops on the resulting zombie (6-Z305t-18 stop TIMEOUTs — benign but noisy; candidate trim).
+- **#222 DECODE — the killer NAMED**: `kill pid=5445 comm="watchdog" → target=5345 sig=9` — **system_server's own Watchdog thread killed the process** (the 60s hang detector), followed by the zygote self-kills at +203.4s/+349.3s. No scudo abort this run.
+- THE UNIFIED PICTURE (runs #210-#222): the primary phenomenon is a **WEDGE in the AMS-constructor era** (a thread stuck in a timed futex / a lost-reply wait); the death MODE is whichever detector fires first: the Watchdog SIGKILL (#220/#222), a Scudo invalid-free abort (#213/#221), or a group-kill SIGSEGV collateral (#214/#215 — the log-writer tid-ring is a bystander caught mid-restartable-syscall). The binder conn/wire state at the wedge: silent conns, no disconnects — a lost-reply/wire-lock stall class, not a crash class.
+- SHARPENED HYPOTHESIS for the next session: the wedge follows the constructor-era SELF-TRANSACTIONS (same-process batterystats/platform_compat traffic riding the 6-Z306ac LOCAL-flat + the 6-Z306ae in-transaction mirror). Experiment: gate the in-transaction mirror OFF for self-transactions (issuer conn == owner conn — the mirror's BR_ACQUIRE prefix on a same-conn reply batch may mis-sequence libbinder's waitForResponse) OR audit the reply ordering; plus correlate the wedge thread's tid-ring (now per-TID) at the 60s Watchdog kill.
+
+Stage Summary:
+- Root-cause chain complete: heap corruption (#221) AND wedge→Watchdog-kill (#220/#222) are both constructor-era binder-phase failures; the wedge is the primary phenomenon, the scudo abort the secondary. The next lever is the mirror-on-self-transaction experiment (one-line gate → dispatch → decode).
