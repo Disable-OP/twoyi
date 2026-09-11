@@ -7220,6 +7220,47 @@ fn read_child_u32(pid: libc::pid_t, addr: u64) -> Option<u32> {
     Some(word as u32)
 }
 
+/// 6-Z306an: parse a `struct ptrace_syscall_info` buffer (LP64 layout,
+/// arch-neutral): byte 0 = op; the `entry` union member starts at
+/// offset 24 = [nr u64][args[6] × u64]. Returns `(nr, args[0], args[1])`
+/// ONLY when op == PTRACE_SYSCALL_INFO_ENTRY (1) — the tracee is sitting
+/// AT its syscall-entry stop with the syscall not yet executed. Any
+/// other op (NONE for group-stops, EXIT for exit-stops) or a short
+/// buffer → None. Unit-tested; the raw query lives in
+/// `z306an_query_entry_stop`.
+fn z306an_parse_syscall_info(buf: &[u8]) -> Option<(u64, u64, u64)> {
+    const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
+    if buf.len() < 48 || buf[0] != PTRACE_SYSCALL_INFO_ENTRY {
+        return None;
+    }
+    let rd = |off: usize| u64::from_ne_bytes(buf[off..off + 8].try_into().unwrap());
+    Some((rd(24), rd(32), rd(40)))
+}
+
+/// 6-Z306an: ask the kernel whether `pid` is CURRENTLY parked in a
+/// syscall-entry stop (PTRACE_GET_SYSCALL_INFO = 0x420e, stable UAPI —
+/// `addr` = buffer size, `data` = buffer). A parked tracee returns
+/// `Some((nr, a0, a1))`; a tracee that is running or blocked INSIDE a
+/// real syscall (the legitimate 6-Z305t-18 futex/poll class) is not in
+/// any ptrace stop → the query fails → None. ESRCH (dying pid) → None;
+/// the reap flow owns those.
+fn z306an_query_entry_stop(pid: libc::pid_t) -> Option<(u64, u64, u64)> {
+    const PTRACE_GET_SYSCALL_INFO: libc::c_uint = 0x420e;
+    let mut buf = [0u8; 128];
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_GET_SYSCALL_INFO,
+            pid,
+            buf.len() as u64,
+            buf.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    if rc <= 0 {
+        return None;
+    }
+    z306an_parse_syscall_info(&buf)
+}
+
 /// 6-Z160: read a full 64-bit word from the traced child (aarch64 +
 /// x86_64 iovec fields, pointers). Same errno-dance contract as
 /// `read_child_u32`.
@@ -13075,6 +13116,13 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     let mut stall_probe_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
         std::collections::HashMap::new();
+    // 6-Z306an: FORGOTTEN-RESUME watchdog — per-pid intervention budget
+    // (max 4 forced PTRACE_SYSCALL resumes/boot) + last-attempt instant
+    // (30 s cooldown). See the watchdog pass near the 6-Z305t-18 probe.
+    let mut z306an_budget: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    let mut z306an_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
+        std::collections::HashMap::new();
     // 6-Z271d: throttle for the stall scan (every 256th stop).
     let mut stall_tick: u64 = 0;
     // 6-Z184 AUDIT FIX (agent 12): this used to be a single global bool —
@@ -15531,6 +15579,77 @@ pub fn run_ptrace_loop(
                         // relationship grants register access regardless
                         // of the tracee's (post-setuid) uid.
                         stall_interrupt_probe(sp, &abi);
+                    }
+                }
+            }
+        }
+
+        // ── 6-Z306an: FORGOTTEN-RESUME watchdog — the #228 zygote wall ──
+        //
+        // Ladder #228 (34649192843): the zygote64 main thread sat between
+        // a CONSUMED syscall-ENTRY stop and its EXIT for 315 s ("last
+        // consumed ENTRY nr=64 fd=2" — a write to the REAL /dev/null,
+        // which can never block); the 6-Z305t-18 SIGSTOP probe TIMED OUT
+        // every 15 s because a tracee parked in a ptrace-stop never
+        // reports new stops — the signature of a stop the main loop
+        // consumed and never resumed (PTRACE_SYSCALL lost on some
+        // rewrite/error arm). A tracee merely BLOCKED inside a real
+        // syscall (futex/poll — the legitimate 271d/305t-18 class) is
+        // also not in a ptrace-stop and also re-stops never; the maps
+        // alone cannot tell the two states apart.
+        //
+        // THE DISCRIMINATOR is PTRACE_GET_SYSCALL_INFO (the 6-Z68 probe
+        // family): op=PTRACE_SYSCALL_INFO_ENTRY means the tracee is
+        // STILL SITTING in its entry stop — the syscall never executed,
+        // a resume the design requires was forgotten. The fix IS the
+        // resume: force PTRACE_SYSCALL, the pending syscall executes,
+        // the EXIT stop returns, and the normal flow continues — the
+        // honest supervisor action (never a fake success, never a kill).
+        // op=NONE (a group-stop) or a failed query (running/blocked-in-
+        // kernel) are left alone silently — a log line there would fire
+        // on every sleeping futex waiter. Budget: 4 interventions/pid.
+        if stall_tick % 256 == 0 {
+            let now_an = std::time::Instant::now();
+            let an_candidates: Vec<libc::pid_t> = last_stop_at
+                .iter()
+                .filter(|(p, t)| {
+                    now_an.duration_since(**t) >= std::time::Duration::from_secs(3)
+                        && in_syscall_map.get(*p).copied().unwrap_or(false)
+                })
+                .map(|(p, _t)| *p)
+                .collect();
+            for ap in an_candidates {
+                let cooldown_ok = match z306an_last.get(&ap) {
+                    None => true,
+                    Some(t) => now_an.duration_since(*t) >= std::time::Duration::from_secs(30),
+                };
+                let ab = z306an_budget.get(&ap).copied().unwrap_or(0);
+                if !cooldown_ok || ab >= 4 {
+                    continue;
+                }
+                z306an_last.insert(ap, now_an);
+                if let Some((anr, aa0, aa1)) = z306an_query_entry_stop(ap) {
+                    z306an_budget.insert(ap, ab + 1);
+                    let age = last_stop_at
+                        .get(&ap)
+                        .map(|t| now_an.duration_since(*t).as_secs())
+                        .unwrap_or(0);
+                    log(&format!(
+                        "6-Z306an: FORGOTTEN-RESUME — pid={} parked in ENTRY stop nr={} a0={:#x} a1={:#x} for {}s; forcing PTRACE_SYSCALL resume (intervention {}/4)",
+                        ap,
+                        anr,
+                        aa0,
+                        aa1,
+                        age,
+                        ab + 1
+                    ));
+                    let rc = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, ap, 0, 0) };
+                    if rc != 0 {
+                        log(&format!(
+                            "6-Z306an: resume pid={} FAILED (errno={}) — the ESRCH/reap flow handles it",
+                            ap,
+                            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                        ));
                     }
                 }
             }
@@ -43976,5 +44095,36 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         assert_eq!(n2, 4);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn z306an_parse_syscall_info_entry_only() {
+        // Build a minimal `struct ptrace_syscall_info` for an ENTRY stop:
+        // [op u8 @0][pad/arch @1..8][ip @8][sp @16][nr @24][args[0] @32]…
+        let mut buf = [0u8; 128];
+        buf[0] = 1; // PTRACE_SYSCALL_INFO_ENTRY
+        let nr: u64 = 64; // write — the #228 zygote wedge syscall
+        let a0: u64 = 0x2; // fd 2 — the wedge's fd
+        let a1: u64 = 0x2; // buf=0x2 — the garbage pointer
+        buf[24..32].copy_from_slice(&nr.to_ne_bytes());
+        buf[32..40].copy_from_slice(&a0.to_ne_bytes());
+        buf[40..48].copy_from_slice(&a1.to_ne_bytes());
+        assert_eq!(
+            super::z306an_parse_syscall_info(&buf),
+            Some((nr, a0, a1)),
+            "an ENTRY-stop buffer parses to (nr, a0, a1)"
+        );
+
+        // op = NONE (a group-stop) is NOT the forget-resume class.
+        let mut g = buf;
+        g[0] = 0;
+        assert_eq!(super::z306an_parse_syscall_info(&g), None);
+        // op = EXIT (4) likewise.
+        let mut e = buf;
+        e[0] = 4;
+        assert_eq!(super::z306an_parse_syscall_info(&e), None);
+        // Short buffers never panic and never parse.
+        assert_eq!(super::z306an_parse_syscall_info(&[]), None);
+        assert_eq!(super::z306an_parse_syscall_info(&buf[..24]), None);
     }
 }
