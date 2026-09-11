@@ -222,7 +222,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -3538,6 +3538,21 @@ fn handle_write_read(
                         Some(b) => (b.data.len() as u64, b.offsets.len() as u64),
                         None => (0, 0),
                     };
+                    if tx.cookie != 0 {
+                        // 6-Z306ad: delivery-time snapshot — the cookie the
+                        // receiving server will cast to its BBinder (the
+                        // vendor-HAL vtable-garbage crash class rides this
+                        // path; see the pc=-0x78 fleet in #198/#199).
+                        let dpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                        probe_flat_mem(
+                            "delivery",
+                            &PROBE_DELIVERY_BUDGET,
+                            dpid,
+                            &format!("code={:#x}", tx.code),
+                            tx.ptr,
+                            tx.cookie,
+                        );
+                    }
                     push_br_transaction(
                         &mut read_buf,
                         tx.code,
@@ -4099,6 +4114,18 @@ fn servicemanager_proxy(
                     if let Some(bx) = b.conns.get_mut(&conn_id) {
                         bx.sm_last_was_hit = true; // 6-Z306ab: flip signal
                     }
+                    if is_owner {
+                        // 6-Z306ad: ladders #199/#201 — the forked
+                        // system_server died in Parcel::unflattenBinder's
+                        // sp<IBinder>(cookie) ctor (vbase-offset read
+                        // through a NULL vtable, si_addr=0xffff..ffe8)
+                        // milliseconds after this LOCAL flat was served.
+                        // Snapshot the object bytes NOW, from outside the
+                        // guest, to pin whether the vtable word was already
+                        // zero AT SERVE TIME.
+                        let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                        probe_flat_mem("serve", &PROBE_SERVE_BUDGET, gpid, &name, ptr, cookie);
+                    }
                     let obj = if is_owner {
                         FlatBinderObject {
                             r#type: BINDER_TYPE_BINDER,
@@ -4174,6 +4201,10 @@ fn servicemanager_proxy(
             };
             let mut b = bus.lock().expect("binder bus poisoned");
             let handle = b.add_guest_service(&name, conn_id, ptr, cookie);
+            // 6-Z306ad: capture-time snapshot — the object bytes as the
+            // owner registered them (baseline for the serve-time probe).
+            let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+            probe_flat_mem("capture", &PROBE_CAPTURE_BUDGET, gpid, &name, ptr, cookie);
             info!(
                 "[KR64][binder][svc] addService({}) → handle 0x{:08x} (conn={}, ptr=0x{:x})",
                 name, handle, conn_id, ptr
@@ -5949,6 +5980,54 @@ fn push_br_failed_reply(buf: &mut Vec<u8>) {
 /// `[BR_TRANSACTION_COMPLETE][BR_REPLY]`).
 fn push_br_transaction_complete(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_ne_bytes());
+}
+
+/// 6-Z306ad: bounded LOCAL-flat memory probes. The forked system_server
+/// (ladders #199/#201) died inside Parcel::unflattenBinder's
+/// sp<IBinder>(cookie) constructor — the Itanium vbase-offset read
+/// (`ldr x8,[x21]; ldur x8,[x8,#-0x18]`) faulted with a NULL vtable
+/// word at the registered cookie. These probes snapshot the registered
+/// (ptr, cookie) bytes at the three wire moments — CAPTURE (addService),
+/// SERVE (owner getService hit), DELIVERY (BR_TRANSACTION to a local
+/// node) — read from OUTSIDE the guest via process_vm_readv, so a bad
+/// pointer yields a clean "<unreadable>" instead of a guest crash.
+/// Each probe class is bounded per boot; the log lines are the evidence
+/// that pins WHEN the object's first word became zero.
+static PROBE_CAPTURE_BUDGET: AtomicU32 = AtomicU32::new(32);
+static PROBE_SERVE_BUDGET: AtomicU32 = AtomicU32::new(32);
+static PROBE_DELIVERY_BUDGET: AtomicU32 = AtomicU32::new(96);
+
+fn probe_flat_mem(
+    tag: &str,
+    budget: &AtomicU32,
+    guest_pid: i32,
+    label: &str,
+    ptr: u64,
+    cookie: u64,
+) {
+    if guest_pid <= 0 {
+        return;
+    }
+    if budget.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    budget.fetch_sub(1, Ordering::Relaxed);
+    let snap = |a: u64| -> String {
+        match crate::ptrace_emu::peek_guest_bytes(guest_pid, a, 16) {
+            Some(b) => b.iter().map(|x| format!("{:02x}", x)).collect(),
+            None => "<unreadable>".to_string(),
+        }
+    };
+    info!(
+        "[KR64][binder][svc] 6-Z306ad: {} {} pid={} ptr=0x{:x} mem=[{}] cookie=0x{:x} mem=[{}]",
+        tag,
+        label,
+        guest_pid,
+        ptr,
+        snap(ptr),
+        cookie,
+        snap(cookie)
+    );
 }
 
 /// Push `[BR_REPLY][binder_transaction_data]` with `tr.data_size` and
