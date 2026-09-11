@@ -6700,6 +6700,37 @@ fn z306af_scudo_chunk_header(pid: libc::pid_t, msg: &str) -> Option<String> {
     )
 }
 
+/// 6-Z306aj: read the `(si_signo, si_code, si_addr|si_pid)` head out of a
+/// `siginfo_t` byte-safely. Layout on every supported LP64 target:
+/// `si_signo`@0 (i32), `si_errno`@4, `si_code`@8, `_sifields` union@16 —
+/// whose first member doubles as `si_pid` (SI_USER/SI_TKILL kills) and as
+/// `_sigfault._addr` (SEGV/BUS faults). Reading through a raw byte
+/// pointer keeps this target-neutral and lets the unit test poke bytes
+/// without constructing a real kernel frame.
+fn z306aj_parse_siginfo_head(si: &libc::siginfo_t) -> (i32, i32, u64) {
+    let p = si as *const libc::siginfo_t as *const u8;
+    let i32_at = |off: usize| -> i32 {
+        i32::from_le_bytes(unsafe {
+            [
+                *p.add(off),
+                *p.add(off + 1),
+                *p.add(off + 2),
+                *p.add(off + 3),
+            ]
+        })
+    };
+    let signo = i32_at(0);
+    let code = i32_at(8);
+    let val = unsafe {
+        let mut b = [0u8; 8];
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = *p.add(16 + i);
+        }
+        u64::from_le_bytes(b)
+    };
+    (signo, code, val)
+}
+
 fn read_abort_message_vma(pid: libc::pid_t) -> Option<String> {
     let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
     let mut range: Option<(u64, u64)> = None;
@@ -16587,6 +16618,52 @@ pub fn run_ptrace_loop(
                                         "6-Z306af: death-site capture pid={} sig={} comm={:?} lineage=yes in_syscall(tracer)={} (fatal signal with no delivery-stop dump — reading registers at the EXIT event)",
                                         pid, term_sig, comm, af_in_sys
                                     ));
+                                    // 6-Z306aj: siginfo at the EXIT event —
+                                    // the delivery stop never fires for the
+                                    // generation deaths (#223/#224), so
+                                    // si_code/si_addr were never seen. The
+                                    // kernel only guarantees last_siginfo
+                                    // DURING a signal-delivery stop, so this
+                                    // is a BEST-EFFORT probe: a successful
+                                    // read whose si_signo does not match the
+                                    // exit status is labelled STALE and never
+                                    // trusted; si_code for a fault class
+                                    // (SEGV_MAPERR=1/ACCERR=2) vs a directed
+                                    // kill (SI_USER=0/SI_TKILL=-6) decides
+                                    // between a real memory fault and group-
+                                    // kill collateral — the #224 SIGSEGV-mode
+                                    // discriminator.
+                                    let mut asi: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                                    let asi_rc = unsafe {
+                                        libc::ptrace(
+                                            libc::PTRACE_GETSIGINFO,
+                                            pid,
+                                            0,
+                                            &mut asi as *mut libc::siginfo_t as *mut libc::c_void,
+                                        )
+                                    };
+                                    if asi_rc == 0 {
+                                        let (si_signo, si_code, si_val) =
+                                            z306aj_parse_siginfo_head(&asi);
+                                        let trust = if si_signo == term_sig {
+                                            "live"
+                                        } else {
+                                            "STALE/UNKNOWN — do not trust"
+                                        };
+                                        log(&format!(
+                                            "6-Z306aj: siginfo@EXIT pid={} term_sig={} si_signo={} si_code={} si_addr/pid={:#x} ({})",
+                                            pid, term_sig, si_signo, si_code, si_val, trust
+                                        ));
+                                    } else {
+                                        log(&format!(
+                                            "6-Z306aj: siginfo unavailable at EXIT pid={} term_sig={} (errno={}) — no signal-delivery stop existed (GETREGS still proven)",
+                                            pid,
+                                            term_sig,
+                                            std::io::Error::last_os_error()
+                                                .raw_os_error()
+                                                .unwrap_or(0)
+                                        ));
+                                    }
                                     let mut dregs: Regs = unsafe { std::mem::zeroed() };
                                     match ptrace_getregs(pid, &mut dregs) {
                                         Ok(_) => {
@@ -36719,6 +36796,42 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         );
         assert!(z306af_resolve_pc(&rows, 0xaaaa2000).is_none());
         assert!(z306af_resolve_pc(&rows, 0xaaaa0fff).is_none());
+    }
+
+    /// 6-Z306aj: the siginfo head reader must decode si_signo@0, si_code@8
+    /// and the union head @16 (si_addr for faults, si_pid for kills).
+    #[test]
+    fn z306aj_parse_siginfo_head_reads_signo_code_and_union_head() {
+        let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let p = &mut si as *mut libc::siginfo_t as *mut u8;
+        unsafe {
+            *p.add(0) = 11; // si_signo = SIGSEGV (little-endian byte 0)
+            *p.add(8) = 1; // si_code = SEGV_MAPERR
+            *p.add(16) = 0xef;
+            *p.add(17) = 0xbe;
+            *p.add(23) = 0xad; // si_addr = 0xad00_0000_0000_beef
+        }
+        let (signo, code, val) = z306aj_parse_siginfo_head(&si);
+        assert_eq!(signo, 11);
+        assert_eq!(code, 1);
+        assert_eq!(val, 0xad00_0000_0000_beef);
+
+        // Directed-kill shape: SI_TKILL (-6) with si_pid in the union.
+        let mut si2: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let p2 = &mut si2 as *mut libc::siginfo_t as *mut u8;
+        unsafe {
+            *p2.add(0) = 6; // SIGABRT
+            *p2.add(8) = 0xfa; // -6 as two's-complement low byte...
+            *p2.add(9) = 0xff;
+            *p2.add(10) = 0xff;
+            *p2.add(11) = 0xff; // si_code = -6 (SI_TKILL)
+            *p2.add(16) = 0x2c; // si_pid = 4742? no — 0x2c = 44
+            *p2.add(17) = 0x12; // pid = 0x122c = 4652
+        }
+        let (signo2, code2, pid2) = z306aj_parse_siginfo_head(&si2);
+        assert_eq!(signo2, 6);
+        assert_eq!(code2, -6);
+        assert_eq!(pid2, 0x122c);
     }
 
     #[test]
