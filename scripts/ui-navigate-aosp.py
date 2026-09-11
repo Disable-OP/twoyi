@@ -71,7 +71,7 @@ class AdbTimeout:
 def adb(*args, timeout=30):
     try:
         return subprocess.run(ADB + list(args), capture_output=True,
-                              text=True, timeout=timeout)
+                              text=True, errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         print(f"    [adb-timeout] {' '.join(args)[:120]} "
               f"({timeout}s) — emulator starved; continuing")
