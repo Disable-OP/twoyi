@@ -27759,3 +27759,21 @@ Work Log:
 Stage Summary:
 - Instrument ready: #212 will emit "6-Z306af: death-site capture pid=… sig=… comm=…" + pc-bracket for every no-delivery fatal death (up to 16).
 - Recovery corpus re-verified GREEN on the mirror-era SM. Next: decode #212 death sites → targeted fix for the post-batterystats/system_server-death class → expect AMS completion → "activity" registration → PMS.
+
+---
+Task ID: 19f
+Agent: Z.ai Code (main session, continued)
+Task: Iterate the death-site instrument through #212/#213 evidence (6-Z306af-b/c/d); dispatch #214.
+
+Work Log:
+- #212 (f503861) decode: the EXIT-event capture FIRES but all 16 budget slots were consumed by the early-boot SIGABRT fleet (dead by +10s); zero captures after +100s. Also observed: at fatal-signal EXIT events the procfs reads (comm/maps) return ENOENT even though GETREGS works.
+- 6-Z306af-c (c2ef627): lineage gate (init + zygote-lineage only), cap 16→32, tgid-fallback procfs reads. kr64-tests GREEN; dispatched #213.
+- #213 (c2ef627) decode: the gate works — exactly ONE capture after +100s: **gen-2 system_server (pid 7019, child of zygote64 5377) died by SIGABRT at +323.56s, ~8s after addService(appops/batterystats/activity_task (conn 481, +314-315.7s))**. Death trail: mmap/munmap churn + fstatfs + pread64. At the same ms the mass binder-conn collapse ran (conns 493/497/498/499 + "Connection reset by peer"). pc=0xe25adba0aed0 captured but maps were ENOENT (procfs gone at the EXIT event).
+- THE DECODE PATH FOUND: the 6-Z149 prctl-deep probe showed the dying process prctl'ing PR_SET_VMA with name 'abort message' (addr=0xe6f7d289b000 len=0x5f) at +323.006s — 0.5s BEFORE the SIGABRT. bionic writes the message into the VMA and THEN raises; at the tgkill ENTRY-stop the message is final and procfs is alive.
+- LANDED 6-Z306af-d (575bb8d): (a) tgkill/kill SIGABRT from a lineage pid → read_abort_message_vma at the entry-stop (8/run) — the abort message will name the ART abort reason; (b) PR_SET_NAME in the lineage → rename-time executable-maps snapshot (12/run) + z306af_parse_exec_maps/z306af_resolve_pc (unit-tested) → offline pc→library+offset resolution for SIGSEGV-class deaths. Local gates: fmt clean, clippy -D warnings clean, 832/832 tests.
+- Dispatched ladder #214 (575bb8d, boot_wait 420).
+
+Stage Summary:
+- The post-AMS-constructor generation death (SIGABRT/SIGSEGV/exit(1) variants) is THE boot blocker; its decode instruments are now complete: abort message text (SIGABRT class) + pc→library resolution (SIGSEGV class) + death-site registers + syscall tails.
+- #214 expectation: "6-Z306af: tgkill-ABORT pid=7019-era abort message: <ART abort reason>" — the root-cause input for the targeted fix.
+- Timeline note: the guest boots through the AMS constructor in ~150s (gen fork at +304 → appops +315), so each 420s watch shows ~2 generations — instrument coverage is sufficient.
