@@ -16537,6 +16537,40 @@ pub fn run_ptrace_loop(
                                                 *(&dregs as *const Regs as *const u64).add(19)
                                             };
                                             log(&format!("6-Z306af pc={:#x} sp={:#x}", pc, sp));
+                                            // 6-Z306af-e: full register file — the
+                                            // #214 decode put the death pc at the
+                                            // `svc` of libc's syscall() wrapper
+                                            // (syscall+0x1c), so x8 = the syscall
+                                            // number and x0-x5 = its args are the
+                                            // ground truth for WHO the dying thread
+                                            // was calling. Same compact 8-per-row
+                                            // format as the delivery-stop arm.
+                                            #[cfg(target_arch = "aarch64")]
+                                            {
+                                                let rp = &dregs as *const Regs as *const u64;
+                                                let mut s = String::new();
+                                                for row in 0..4 {
+                                                    let mut line = String::new();
+                                                    for col in 0..8 {
+                                                        let idx = row * 8 + col;
+                                                        if idx > 30 {
+                                                            break;
+                                                        }
+                                                        let v = unsafe { *rp.add(idx) };
+                                                        line.push_str(&format!(
+                                                            " x{}={:#x}",
+                                                            idx, v
+                                                        ));
+                                                    }
+                                                    s.push_str(&format!(
+                                                        "\n  6-Z306af regs:{}",
+                                                        line
+                                                    ));
+                                                }
+                                                log(&s);
+                                            }
+                                            #[cfg(not(target_arch = "aarch64"))]
+                                            log("  6-Z306af regs: (x86_64 register dump not wired for the EXIT capture)");
                                             let mut maps_read = std::fs::read_to_string(format!(
                                                 "/proc/{}/maps",
                                                 pid
