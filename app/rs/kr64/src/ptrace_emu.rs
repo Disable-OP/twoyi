@@ -14396,6 +14396,11 @@ pub fn run_ptrace_loop(
     // against this snapshot instead. Executable file-backed rows only.
     let mut z306af_maps_cache: std::collections::HashMap<libc::pid_t, Vec<(u64, u64, String)>> =
         std::collections::HashMap::new();
+    // 6-Z306af-g: pids that just NAMED an '[anon:abort message]' VMA via
+    // PR_SET_VMA (addr, len) — the message content is written by bionic
+    // AFTER the prctl returns, so it is read at the next traced ENTRY.
+    let mut z306af_pending_abort: std::collections::HashMap<libc::pid_t, (u64, u64)> =
+        std::collections::HashMap::new();
     // 6-Z305i: capped DIAG for the first non-init getpid pass-throughs
     // (the InitAborter contract fix — see the pending_getpid EXIT arm).
     let mut z305i_getpid_diag: u64 = 0;
@@ -20791,6 +20796,13 @@ pub fn run_ptrace_loop(
                                     } else {
                                         String::new()
                                     };
+                                    // 6-Z306af-g: record the abort-message VMA
+                                    // (addr, len) for the next-ENTRY read — the
+                                    // content is written by bionic AFTER this
+                                    // prctl returns.
+                                    if option == 0x53564d41 && name == "abort message" && addr > 0 {
+                                        z306af_pending_abort.insert(pid, (addr, len.min(512)));
+                                    }
                                     // Stack scan: 32 u64 slots from rsp.
                                     // Slot 0 is the caller's return
                                     // address; deeper slots carry saved
@@ -21192,6 +21204,53 @@ pub fn run_ptrace_loop(
                     {
                         let lineage_306x = z306_zygote_lineage.contains(&pid);
                         if lineage_306x {
+                            // 6-Z306af-g: a pending abort-message read — the
+                            // 6-Z149 prctl-deep probe records the
+                            // PR_SET_VMA('abort message') VMA (addr, len) at
+                            // its ENTRY stop; bionic writes the message AFTER
+                            // the prctl returns (mmap → prctl → memcpy), so
+                            // the content is final at the NEXT traced syscall
+                            // ENTRY of the same pid. #216's gen death died by
+                            // SIGABRT with the VMA named 0.5s earlier but NO
+                            // traced tgkill and NO delivery stop, so both the
+                            // tgkill-entry hook and the delivery-stop VMA
+                            // reader missed it; this catch fires on the first
+                            // stop after the naming regardless of how the
+                            // signal is raised. 8 per run.
+                            if let Some((msg_addr, msg_len)) = z306af_pending_abort.get(&pid) {
+                                let (msg_addr, msg_len) = (*msg_addr, *msg_len);
+                                static Z306AF_G: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                z306af_pending_abort.remove(&pid);
+                                if Z306AF_G.load(std::sync::atomic::Ordering::Relaxed) < 8 {
+                                    let cap = msg_len.min(512) as usize;
+                                    match peek_guest_bytes(pid, msg_addr, cap) {
+                                        Some(bytes) => {
+                                            let end = bytes
+                                                .iter()
+                                                .position(|b| *b == 0)
+                                                .unwrap_or(bytes.len());
+                                            Z306AF_G
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            log(&format!(
+                                                "6-Z306af: abort-message(pid={}, vma={:#x} len={:#x}): {:?}",
+                                                pid,
+                                                msg_addr,
+                                                msg_len,
+                                                String::from_utf8_lossy(&bytes[..end])
+                                            ));
+                                        }
+                                        None => {
+                                            Z306AF_G
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            log(&format!(
+                                                "6-Z306af: abort-message(pid={}, vma={:#x} len={:#x}) UNREADABLE at the next ENTRY",
+                                                pid, msg_addr, msg_len
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                             // 6-Z306y: record the per-pid trail for direct
                             // fork children (before any other probe so the
                             // exit-time dump includes the exit_group itself).
