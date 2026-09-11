@@ -181,7 +181,12 @@ jobs:
     name: Android 11 boot ladder E2E (arm64 runner)
     needs: build-apk
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
+    # 30 min headroom: the stall-adaptive watch is the PRIMARY control (it ends
+    # a frozen guest in ~90s), so a raised job cap only ever buys runway for a
+    # GENUINELY-PROGRESSING boot (klog growth resets the stall budget). At the
+    # 15-min cap, #199 was cut mid-SystemServer.startBootstrapServices (AMS in
+    # flight) while the guest was still actively progressing.
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
