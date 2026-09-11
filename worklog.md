@@ -27924,3 +27924,27 @@ Work Log:
 Stage Summary:
 - The two "failures" cost zero guest information but bought a permanent harness hardening: any future kmsg content now survives the snapshot path.
 - NEXT: dispatch ladder #227 (d266a78 — full instrument stack 6-Z306ah+ai+aj+ak) + decode per the Task-23 tree. TWRP gate not re-dispatched for a harness-only delta (guest code identical to the GREEN 504f92f gate).
+
+---
+Task ID: 23c (continuation — real-ladder dispatch + decode)
+Agent: Z.ai Code (main session, continued)
+Task: Dispatch the REAL Android Boot Ladder on the instrument stack; decode the run; hand off.
+
+Work Log:
+- **DISPATCH ERROR FOUND AND CORRECTED**: #225/#226/#227 were dispatched to `ui-e2e-aosp-arm64.yml` (a STALE AOSP E2E flow: redroid-preloaded rootfs, no ladder classification) — NOT the mission ladder `ui-e2e-android-arm64.yml` ("Android Boot Ladder", vendored pure-stock rootfs + result.json rung verdict). #224 (the Task-22b success) was run by the LADDER workflow. The stale-flow runs still yielded the 6-Z306ak harness fix (their "ZERO KR64 lines" final assertion + the t=15s kmsg UnicodeDecodeError were flow-level). All future dispatches MUST target ui-e2e-android-arm64.yml.
+- DISPATCHED the real ladder on 6bdcbb3 (run 34645448458, boot_wait 420) — completed SUCCESS. Rung 7 (SURFACEFLINGER) per result.json — matches the #224 baseline; the instruments did not regress the boot.
+- **6-Z306ai VERIFIED LIVE**: every conn announces tid+dev (e.g. conn=8 pid=2787 tid=2803 dev=binder — a pool-thread conn distinguishable from the opener for the first time; hwbinder/vndbinder conns correctly named).
+- **6-Z306aj HONEST NEGATIVE (branch b CLOSED with data)**: first fire at the +361.5s SIGSEGV death returned si_signo=5/si_code=1541 → labelled STALE/UNKNOWN per the guard — the kernel does NOT retain the death signal's siginfo at a pure EXIT-event stop. The probe stays in place (its negative is decisive evidence); si_addr for this class must come from the killer-side or a delivery stop.
+- **RUN DECODE (deepest service census yet + BOTH death classes in one run)**:
+  1. gen-1 (pid 5297, conn 300 @+168s): registered platform_compat(+184.0s) → device_identifiers(+184.3s), then SILENCE; at +195.2s the stall probe caught pool thread 5484 (conns 319/320) **TRUE blocked in futex(uaddr=0xfffffffffffffe00, FUTEX_WAIT|PRIVATE, 2) — A GARBAGE FUTEX ADDRESS** (and thread 5477 blocked in libc, ReferenceQueueD futexed normally); at +202.5s the 60s Watchdog fired: `6-Z306af-j: kill pid=5344 comm="watchdog" → lineage target=5297 sig=9`. THE WEDGE CLASS AGAIN, now with a corrupted-futex-address witness.
+  2. gen-2 (pid 7340, conns 511-527 @+333.7-348.4s): died +361.5s, sig=11, in_syscall=false. Death-site registers: x8=0x42, x0=0x29, x1=sp, x2=5; rename-time snapshot pc → libc.so+0x5fb38; offline symbolization (apex libc BuildID ac8f7173, r-xp row bias 0x3b000 per the #214 decode) resolves EXACTLY to **writev+0x8 — the `svc` of bionic's writev, pc rewound by the syscall-restart machinery** (same restart-collateral shape as #214/#215's restarted futex svc, now proven for writev: the dying thread was flushing a 5-iovec logdw write when the group died). No scudo abort this run; no killer line (6-Z306af-j silent for it).
+  3. Context flood: 381 intercepted aborts (die=1 die-loop) from +3s onward — the health@2.1 registerAsService VINTF-manifest failure crash-loop is the loudest source; system_server's main thread died as the log-writer of exactly this flood era.
+  4. 6-Z306ag depth witness: never fired (no nested txn stacks) — the single-slot→stack fix was necessary-but-not-sufficient; the wedge's second leg is CONFIRMED live.
+- TWRP gate on 504f92f (34641583045): GREEN — recovery corpus safe across 6-Z306ah/ai/aj.
+
+Stage Summary / NEXT-SESSION DECISION TREE:
+- The wedge second leg is now armed with a concrete witness: a binder pool thread futex-waiting on 0xfffffffffffffe00. Two candidate fix paths, in priority order:
+  a. **Task-21 A/B (mandated by the tree)**: gate the 6-Z306ae in-transaction mirror OFF for self-transactions (issuer conn == owner conn) — one gated arm in the AIDL addService tail + both HIDL tails → dispatch → if the Watchdog wedge disappears, the mirror's BR_ACQUIRE prefix mis-sequences a same-conn waitForResponse; if it persists, the mirror is exonerated and the corruption hunt moves to the futex-address writer.
+  b. **6-Z306al instrument**: at the death-site capture, if the ring tail shows writev, PEEK x1's iovec array and dump iov[0] bytes (bounded 16/run) — the dying log line NAMES the flood content the process was flushing at death.
+- Fix targets if the mirror is exonerated: audit who can write a futex uaddr of -512 into a pool thread's wait (the 6-Z306ae-e DeferredReply staging? the shlib's futex emulation? a POKEDATA scratch overlap?).
+- Known-good: kr64-tests 837/837 GREEN (CI on 6bdcbb3); TWRP gate GREEN; ladder rung 7 stable on the instrument stack.
