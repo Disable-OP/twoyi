@@ -1836,9 +1836,22 @@ struct ConnBox {
     /// for: (txn id, queued-at). Used for the bounded reply timeout and
     /// for waiter cleanup when the connection dies.
     out_sync: std::collections::VecDeque<(u64, std::time::Instant)>,
-    /// This connection currently holds a delivered transaction and owes
-    /// its `BC_REPLY` (the requester's pending sync transaction id).
-    inflight_txn: Option<u64>,
+    /// 6-Z306ag: the connection's TRANSACTION STACK — the ids of every
+    /// delivered, still-unanswered sync transaction, INNERMOST LAST.
+    /// Kernel semantics (`binder_thread.transaction_stack`): a binder
+    /// thread processing an incoming transaction may issue nested
+    /// outgoing calls, and while waiting for a nested reply it may
+    /// receive ANOTHER incoming transaction (kernel delivers node work
+    /// to any ready pool thread, including one parked on its own reply).
+    /// `BC_REPLY` completes the TOP (innermost) frame; the outer frames
+    /// must survive. The previous single `Option<u64>` slot OVERWROTE on
+    /// every delivery — the outer `BC_REPLY` then correlated to the
+    /// WRONG waiter (reply bytes crossing transactions) or found no
+    /// waiter at all ("BC_REPLY with no delivered transaction"), wedging
+    /// the requester until REPLY_TIMEOUT. Reachable exactly when a
+    /// process starts serving overlapping/nested binder traffic — the
+    /// system_server AMS-constructor era (self-traffic conn→conn).
+    txn_stack: Vec<u64>,
     /// Death notifications this connection requested:
     /// handle → cookie. Delivered as `BR_DEAD_BINDER` when the owning
     /// connection unregisters.
@@ -2180,9 +2193,10 @@ impl BusState {
         let (mut dead_txns, out_sync) = match self.conns.remove(&conn) {
             Some(bx) => {
                 let mut v = bx.pending_in;
-                if let Some(t) = bx.inflight_txn {
-                    v.push(t);
-                }
+                // 6-Z306ag: every frame of the transaction stack owes a
+                // reply — resolve them ALL as DEAD (kernel: a dying
+                // thread's whole transaction stack fails).
+                v.extend(bx.txn_stack.iter().copied());
                 (v, bx.out_sync)
             }
             None => (Vec::new(), Default::default()),
@@ -3324,8 +3338,11 @@ fn handle_write_read(
             }
             BC_REPLY | BC_REPLY_SG => {
                 // 6-Z271: the guest is answering a transaction the bus
-                // delivered to it. Correlate via the connection's inflight
-                // txn and route the reply to the original requester.
+                // delivered to it. Correlate via the connection's
+                // TRANSACTION STACK (6-Z306ag): BC_REPLY completes the
+                // TOP (innermost) frame — kernel `binder_transaction()`
+                // pops `thread->transaction_stack` — and routes the reply
+                // to the original requester. Outer frames survive.
                 let reply_blob = if is_v2 && blob_idx < req_blobs.len() {
                     let b = &req_blobs[blob_idx];
                     blob_idx += 1;
@@ -3335,9 +3352,7 @@ fn handle_write_read(
                 };
                 let inflight = {
                     let mut b = bus.lock().expect("binder bus poisoned");
-                    b.conns
-                        .get_mut(&conn_id)
-                        .and_then(|bx| bx.inflight_txn.take())
+                    b.conns.get_mut(&conn_id).and_then(|bx| bx.txn_stack.pop())
                 };
                 match inflight {
                     Some(txn_id) => {
@@ -3546,12 +3561,15 @@ fn handle_write_read(
                 match b.conns.get_mut(&conn_id) {
                     Some(bx) => match bx.inbox.pop_front() {
                         Some(InboxItem::Tx(tx)) => {
-                            // Mark the delivered transaction as inflight so the
-                            // guest's BC_REPLY correlates (sync only — one-way
-                            // has txn_id 0 and expects no reply). Remove it
-                            // from pending_in: it's no longer "queued".
+                            // Mark the delivered transaction as owing a reply
+                            // (sync only — one-way has txn_id 0 and expects
+                            // no reply). Remove it from pending_in: it's no
+                            // longer "queued". 6-Z306ag: PUSH onto the
+                            // transaction stack — never overwrite; outer
+                            // frames must survive nested processing.
                             if tx.txn_id != 0 {
-                                bx.inflight_txn = Some(tx.txn_id);
+                                bx.txn_stack.push(tx.txn_id);
+                                z306ag_note_stack_depth(bx.txn_stack.len());
                                 bx.pending_in.retain(|id| *id != tx.txn_id);
                             }
                             Delivery::Tx(tx)
@@ -3611,8 +3629,12 @@ fn handle_write_read(
                         if let Some(tx) = &item {
                             if tx.txn_id != 0 {
                                 if let Some(bx) = b.conns.get_mut(&conn_id) {
-                                    bx.inflight_txn = Some(tx.txn_id);
-                                    bx.pending_in.push(tx.txn_id);
+                                    // 6-Z306ag: PUSH onto the stealing conn's
+                                    // transaction stack (LIFO reply
+                                    // correlation; death-resolvable via the
+                                    // stack itself — no pending_in entry).
+                                    bx.txn_stack.push(tx.txn_id);
+                                    z306ag_note_stack_depth(bx.txn_stack.len());
                                 }
                             }
                         }
@@ -6253,6 +6275,31 @@ static PROBE_CAPTURE_BUDGET: AtomicU32 = AtomicU32::new(32);
 static PROBE_SERVE_BUDGET: AtomicU32 = AtomicU32::new(32);
 static PROBE_DELIVERY_BUDGET: AtomicU32 = AtomicU32::new(96);
 
+/// 6-Z306ag: bounded evidence that a connection is servicing
+/// NESTED/OVERLAPPING transactions — the exact shape the previous
+/// single-slot inflight correlation corrupted (outer BC_REPLY lost or
+/// routed to the wrong waiter). Depth 1 is the plain sequential case
+/// (silent); depth ≥ 2 emits one line, capped per boot. This is the
+/// ladder-side witness: if the AMS-constructor-era wedge was this
+/// shape, the runs should now show depth≥2 events AND no
+/// "BC_REPLY with no delivered transaction" lines.
+static Z306AG_NESTED_LOG_BUDGET: AtomicU32 = AtomicU32::new(16);
+
+fn z306ag_note_stack_depth(depth: usize) {
+    if depth < 2 {
+        return;
+    }
+    if Z306AG_NESTED_LOG_BUDGET.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    if Z306AG_NESTED_LOG_BUDGET.fetch_sub(1, Ordering::Relaxed) > 0 {
+        info!(
+            "[KR64][binder] 6-Z306ag: nested/overlapping txn stack depth={} on one conn",
+            depth
+        );
+    }
+}
+
 fn probe_flat_mem(
     tag: &str,
     budget: &AtomicU32,
@@ -7923,8 +7970,9 @@ mod tests {
     fn z271i_nested_transaction_does_not_clobber_outer_reply() {
         // A services B's call; WHILE still owing B its BC_REPLY, A makes
         // a nested sync call to C's service. The nested reply must not
-        // swallow A's outstanding outer transaction (its inflight_txn),
-        // and A's later BC_REPLY still resolves B's original call.
+        // swallow A's outstanding outer transaction (its transaction
+        // stack — 6-Z306ag), and A's later BC_REPLY still resolves B's
+        // original call.
         let rootfs = tmpdir();
         let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
         let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
@@ -8068,6 +8116,171 @@ mod tests {
         drop(conn_a);
         drop(conn_b);
         drop(conn_c);
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z306ag_overlapping_incoming_tx_reply_lifo_correlation() {
+        // THE 6-Z306ag SHAPE — the one the single-slot inflight_txn
+        // corrupted: TWO sync transactions queue for one server conn; the
+        // server pops BOTH (the second delivery lands while it still owes
+        // the first reply — kernel-faithful: a pool thread parked on its
+        // own reply can receive the next node work). Its two BC_REPLYs
+        // must resolve LIFO (innermost first) to the RIGHT requesters.
+        // Old code: the second delivery OVERWROTE the slot → the first
+        // BC_REPLY correlated to the WRONG waiter and the second found
+        // nothing ("BC_REPLY with no delivered transaction") → B wedged
+        // to the REPLY_TIMEOUT. This is the constructor-era wedge class.
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let add_service = |name: &str, cookie: u64| -> UnixStream {
+            let mut s = UnixStream::connect(&path).expect("connect");
+            let mut w = ParcelWriter::new();
+            w.write_string16(name);
+            w.write_flat_binder(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0x1111,
+                cookie,
+            });
+            w.write_i32(0);
+            w.write_i32(0);
+            let (d, o) = make_servicemanager_request_parcel(&mut w);
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+            let p = make_v2_write_read_payload(&bc, &d, &o, 4096);
+            let (r, _) = exchange(&mut s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0, "addService({name})");
+            s
+        };
+        let get_service = |s: &mut UnixStream, name: &str| -> u32 {
+            let mut w = ParcelWriter::new();
+            w.write_string16(name);
+            let (d, o) = make_servicemanager_request_parcel(&mut w);
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+            let p = make_v2_write_read_payload(&bc, &d, &o, 4096);
+            let (r, resp) = exchange(s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0);
+            let rs = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+            let off = 4 + rs + 8;
+            let dl = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+            let blob = &resp[off + 12..off + 12 + dl];
+            u64::from_ne_bytes(blob[12..20].try_into().unwrap()) as u32
+        };
+        let read_only = |s: &mut UnixStream| -> Vec<u8> {
+            let mut wr = Vec::new();
+            wr.extend_from_slice(&0u32.to_ne_bytes());
+            wr.extend_from_slice(&4096u32.to_ne_bytes());
+            let (r, resp) = exchange(s, BINDER_WRITE_READ, &wr);
+            assert_eq!(r, 0);
+            resp
+        };
+        let transact = |s: &mut UnixStream, handle: u32, code: u32| -> Vec<u8> {
+            let mut tx = [0u8; 64];
+            tx[0..4].copy_from_slice(&handle.to_ne_bytes());
+            tx[16..20].copy_from_slice(&code.to_ne_bytes());
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+            bc.extend_from_slice(&tx);
+            let p = make_v2_write_read_multi_payload(&bc, &[(&[], &[])], 4096);
+            let (r, resp) = exchange(s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0);
+            resp
+        };
+        let send_reply = |s: &mut UnixStream, payload: &[u8]| {
+            let reply = [0u8; 64];
+            let mut bc = Vec::with_capacity(4 + 64);
+            bc.extend_from_slice(&BC_REPLY.to_ne_bytes());
+            bc.extend_from_slice(&reply);
+            let p = make_v2_write_read_multi_payload(&bc, &[(payload, &[])], 0);
+            let (r, _) = exchange(s, BINDER_WRITE_READ, &p);
+            assert_eq!(r, 0);
+        };
+
+        let mut conn_a = add_service("svc_a", 0xaaaa);
+        let mut conn_b = UnixStream::connect(&path).expect("connect B");
+        let mut conn_d = UnixStream::connect(&path).expect("connect D");
+
+        // ---- B and D both resolve svc_a; B transacts code 9 (tx #1), D
+        //      transacts code 13 (tx #2) — BOTH queue on conn_a's inbox.
+        let h_a_b = get_service(&mut conn_b, "svc_a");
+        let h_a_d = get_service(&mut conn_d, "svc_a");
+        assert_eq!(h_a_b, h_a_d, "global handle table");
+        let resp_b1 = transact(&mut conn_b, h_a_b, 9);
+        assert_eq!(
+            u32::from_ne_bytes(resp_b1[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE
+        );
+        let resp_d1 = transact(&mut conn_d, h_a_d, 13);
+        assert_eq!(
+            u32::from_ne_bytes(resp_d1[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE
+        );
+
+        // ---- A pops tx #1 (stack=[1]), then — while still owing it —
+        //      pops tx #2 (stack=[1,2]). THE old overwrite site.
+        let resp_a1 = read_only(&mut conn_a);
+        assert_eq!(
+            u32::from_ne_bytes(resp_a1[4..8].try_into().unwrap()),
+            BR_TRANSACTION,
+            "A receives B's tx #1"
+        );
+        let tr_a1 = &resp_a1[8..8 + 64];
+        assert_eq!(u32::from_ne_bytes(tr_a1[16..20].try_into().unwrap()), 9);
+        let resp_a2 = read_only(&mut conn_a);
+        assert_eq!(
+            u32::from_ne_bytes(resp_a2[4..8].try_into().unwrap()),
+            BR_TRANSACTION,
+            "A receives D's tx #2 while tx #1 is still outstanding"
+        );
+        let tr_a2 = &resp_a2[8..8 + 64];
+        assert_eq!(u32::from_ne_bytes(tr_a2[16..20].try_into().unwrap()), 13);
+
+        // ---- A replies: innermost (tx #2) first → D. Then outer (tx #1)
+        //      → B. BOTH requesters must resolve, bytes exact.
+        send_reply(&mut conn_a, b"inner-rep");
+        let resp_d2 = read_only(&mut conn_d);
+        assert_eq!(
+            u32::from_ne_bytes(resp_d2[4..8].try_into().unwrap()),
+            BR_REPLY,
+            "D (innermost tx #2) resolves first — LIFO"
+        );
+        let rs_d = u32::from_ne_bytes(resp_d2[0..4].try_into().unwrap()) as usize;
+        let o_d = 4 + rs_d + 8;
+        let dl_d = u32::from_ne_bytes(resp_d2[o_d..o_d + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            &resp_d2[o_d + 12..o_d + 12 + dl_d],
+            b"inner-rep",
+            "D gets ITS OWN reply bytes (no cross-transaction corruption)"
+        );
+
+        send_reply(&mut conn_a, b"outer-rep");
+        let resp_b2 = read_only(&mut conn_b);
+        assert_eq!(
+            u32::from_ne_bytes(resp_b2[4..8].try_into().unwrap()),
+            BR_REPLY,
+            "B (outer tx #1) still resolves — the stack survived the overlap"
+        );
+        let rs_b = u32::from_ne_bytes(resp_b2[0..4].try_into().unwrap()) as usize;
+        let o_b = 4 + rs_b + 8;
+        let dl_b = u32::from_ne_bytes(resp_b2[o_b..o_b + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            &resp_b2[o_b + 12..o_b + 12 + dl_b],
+            b"outer-rep",
+            "B gets ITS OWN reply bytes"
+        );
+
+        drop(conn_a);
+        drop(conn_b);
+        drop(conn_d);
         drop(_handle);
         let _ = fs::remove_dir_all(&rootfs);
     }
