@@ -34944,7 +34944,42 @@ pub fn run_ptrace_loop(
                         }
                         match read_abort_message_vma(pid) {
                             Some(msg) => {
-                                log(&format!("6-Z306o-c abort-vma pid={} msg='{}'", pid, msg))
+                                log(&format!("6-Z306o-c abort-vma pid={} msg='{}'", pid, msg));
+                                // 6-Z306ah: the scudo corruption-class
+                                // discriminator AT THE TGKILL ENTRY —
+                                // #223 proved the fatal-signal delivery
+                                // stop never fires for the system_server
+                                // generation aborts (the 6-Z306af-k read
+                                // there had 0 hits) while THIS hook reads
+                                // the abort message successfully (the
+                                // process is stopped at the tgkill entry:
+                                // memory fully mapped, message final). The
+                                // message carries the freed address
+                                // verbatim — read its 16-byte chunk
+                                // header + 16 user bytes NOW: freed-state
+                                // header → double-free; checksum/magic
+                                // garbage → overflow/stray-write; intact
+                                // allocated header → the abort raced a
+                                // concurrent free. Bounded to 4 reads per
+                                // boot.
+                                if msg.contains("Scudo ERROR") {
+                                    static Z306AH_BUDGET: std::sync::atomic::AtomicU32 =
+                                        std::sync::atomic::AtomicU32::new(4);
+                                    if Z306AH_BUDGET.load(std::sync::atomic::Ordering::Relaxed) > 0
+                                    {
+                                        Z306AH_BUDGET
+                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                        match z306af_scudo_chunk_header(pid, &msg) {
+                                            Some(hdr) => log(&format!(
+                                                "6-Z306ah: scudo chunk header at the tgkill entry (16B header + 16B user, low->high): {}",
+                                                hdr
+                                            )),
+                                            None => log(
+                                                "6-Z306ah: scudo chunk header UNREADABLE at the tgkill entry",
+                                            ),
+                                        }
+                                    }
+                                }
                             }
                             None => log(&format!(
                                 "6-Z306o-c abort-vma pid={} msg=<no abort-message VMA>",
