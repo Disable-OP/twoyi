@@ -16723,6 +16723,40 @@ pub fn run_ptrace_loop(
                                                     ));
                                                 }
                                             }
+                                            // 6-Z306af-i: group-death sweep —
+                                            // #218/#219 caught the COLLATERAL
+                                            // class (a log-writer thread in a
+                                            // writev/timed-wait loop, identical
+                                            // across runs); the FIRST-faulting
+                                            // thread of the group should look
+                                            // different. Dump up to 8 sibling
+                                            // tids' rings (tracer-side memory —
+                                            // no procfs needed).
+                                            if af_tgid != 0 {
+                                                let af_siblings: Vec<libc::pid_t> = tracked_pids
+                                                    .iter()
+                                                    .copied()
+                                                    .filter(|t| {
+                                                        *t != pid
+                                                            && z306_lineage_tgid_cache
+                                                                .get(t)
+                                                                .copied()
+                                                                .unwrap_or(0)
+                                                                == af_tgid
+                                                    })
+                                                    .take(8)
+                                                    .collect();
+                                                for sib in af_siblings {
+                                                    if let Some(ring) = z306af_tid_trail.get(&sib) {
+                                                        log(&format!(
+                                                            "6-Z306af sibling-ring of {} (tgid {}): {}",
+                                                            sib,
+                                                            af_tgid,
+                                                            format_syscall_buffer(ring, abi)
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                         }
                                         Err(e) => log(&format!("6-Z306af getregs failed: {}", e)),
                                     }
