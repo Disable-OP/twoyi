@@ -1783,6 +1783,21 @@ enum DeferredReply {
     },
     /// `[BR_FAILED_REPLY]` (reply timeout / server died).
     Failed,
+    /// 6-Z306ae: a kernel node-ref mirror command — `[BR_ACQUIRE]` or
+    /// `[BR_RELEASE]` followed by `binder_ptr_cookie {ptr, cookie}`.
+    /// The real driver holds a strong node ref for every registry
+    /// handle and mirrors refcount changes to the OWNER process as
+    /// BR_ACQUIRE/BR_RELEASE; the owner's IPCThreadState turns them
+    /// into `obj->incStrong/decStrong` on the local BBinder. Without
+    /// the mirror, a service object whose only userspace refs are JNI
+    /// temporaries hits mStrong=0 and is DELETED right after
+    /// addService returns (the holder keeps only a wp<>) — the freed
+    /// cookie then faults in Parcel::unflattenBinder's vbase-offset
+    /// read (ladders #199/#201/#203: platform_compat cookie mem =
+    /// 16 zero bytes at serve time). Queued on the owner's
+    /// reply_queue so it lands BEFORE the addService reply that would
+    /// otherwise let the temporary sp<> die.
+    RefCmd { br: u32, ptr: u64, cookie: u64 },
 }
 
 /// An incoming transaction queued for delivery to a server connection.
@@ -1975,11 +1990,39 @@ impl BusState {
                 entry.virtual_kind = None;
                 entry.virtual_fallback = Some(kind);
             }
+            // 6-Z306ae: the OLD owner loses its registry strong ref
+            // (kernel: the old handle's node ref drops → BR_RELEASE to
+            // the old owner's process).
+            let old_owner = entry.owner;
+            let old_ptr = entry.ptr;
+            let old_cookie = entry.cookie;
+            if old_owner != owner && old_ptr != 0 {
+                if let Some(ob) = self.conns.get_mut(&old_owner) {
+                    ob.reply_queue.push_back(DeferredReply::RefCmd {
+                        br: BR_RELEASE,
+                        ptr: old_ptr,
+                        cookie: old_cookie,
+                    });
+                }
+            }
             // Native servicemanager "overwrite" semantics: same name →
             // same handle, new owner.
             entry.owner = owner;
             entry.ptr = ptr;
             entry.cookie = cookie;
+            // 6-Z306ae: the registry handle now holds a strong node ref
+            // on the NEW object — mirror it to the new owner BEFORE the
+            // addService reply unblocks the registering thread (whose
+            // JNI temporary sp<> is the last userspace ref).
+            if ptr != 0 {
+                if let Some(nb) = self.conns.get_mut(&owner) {
+                    nb.reply_queue.push_back(DeferredReply::RefCmd {
+                        br: BR_ACQUIRE,
+                        ptr,
+                        cookie,
+                    });
+                }
+            }
             return entry.handle;
         }
         let h = self.next_handle;
@@ -1996,6 +2039,17 @@ impl BusState {
             },
         );
         self.by_handle.insert(h, name.to_string());
+        // 6-Z306ae: mirror the registry's strong node ref to the owner
+        // (queued BEFORE this arm's addService reply — see RefCmd).
+        if ptr != 0 {
+            if let Some(nb) = self.conns.get_mut(&owner) {
+                nb.reply_queue.push_back(DeferredReply::RefCmd {
+                    br: BR_ACQUIRE,
+                    ptr,
+                    cookie,
+                });
+            }
+        }
         h
     }
 
@@ -3437,6 +3491,19 @@ fn handle_write_read(
                 DeferredReply::Failed => {
                     push_br_failed_reply(&mut read_buf);
                 }
+                DeferredReply::RefCmd { br, ptr, cookie } => {
+                    // 6-Z306ae: kernel node-ref mirror — the owner's
+                    // IPCThreadState handles BR_ACQUIRE (incStrong on the
+                    // local BBinder + BC_ACQUIRE_DONE back to us) and
+                    // BR_RELEASE (deferred decStrong) natively.
+                    read_buf.extend_from_slice(&br.to_ne_bytes());
+                    read_buf.extend_from_slice(&ptr.to_ne_bytes());
+                    read_buf.extend_from_slice(&cookie.to_ne_bytes());
+                    info!(
+                        "[KR64][binder][vm{}] 6-Z306ae: node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
+                        vm_id, conn_id, br, ptr, cookie
+                    );
+                }
             }
             reply_delivered = true;
         }
@@ -3970,6 +4037,44 @@ fn handle_transaction(
 /// proxy answers the legacy synthetic shapes (GET → null binder, ADD →
 /// status 0): the registry cannot work name-less, which is exactly the
 /// 6-Z271 keystore2 20 s root cause.
+/// 6-Z306ae: the flat object AT THE OFFSETS ARRAY — the kernel's own
+/// object map — instead of a cursor guess. The registration parcels'
+/// offsets[] entries point at the EXACT flat the sender's libbinder
+/// wrote; among them the binder-typed object is unambiguous (HIDL
+/// addWithChain carries 7 SG objects — name struct, name chars, THE
+/// FLAT, vec struct, array, chars0, chars1 — and only one decodes as
+/// BINDER_TYPE_*). Ladder #203's capture probes exposed the cursor
+/// guess reading parcel fragments as (ptr, cookie) for some parcels
+/// (suspend_control, android.security.identity, HIDL hash-chain
+/// servers): cookie mem = [parcel-fragment][zeros] shapes — one
+/// literally contained the BR_TRANSACTION_COMPLETE wire magic
+/// (0x720600000048). Falls back to the caller's sequential read when
+/// the offsets array is absent/short (legacy v1 wire).
+fn flat_at_first_binder_offset(blob: &RequestBlob) -> Option<FlatBinderObject> {
+    let count = blob.offsets.len() / 8;
+    for i in 0..count {
+        let off = u64::from_ne_bytes(blob.offsets[i * 8..i * 8 + 8].try_into().ok()?) as usize;
+        let d = &blob.data;
+        if off + 24 > d.len() {
+            continue;
+        }
+        let typ = u32::from_ne_bytes(d[off..off + 4].try_into().ok()?);
+        if typ == BINDER_TYPE_BINDER
+            || typ == BINDER_TYPE_HANDLE
+            || typ == BINDER_TYPE_WEAK_BINDER
+            || typ == BINDER_TYPE_WEAK_HANDLE
+        {
+            return Some(FlatBinderObject {
+                r#type: typ,
+                flags: u32::from_ne_bytes(d[off + 4..off + 8].try_into().ok()?),
+                binder: u64::from_ne_bytes(d[off + 8..off + 16].try_into().ok()?),
+                cookie: u64::from_ne_bytes(d[off + 16..off + 24].try_into().ok()?),
+            });
+        }
+    }
+    None
+}
+
 fn servicemanager_proxy(
     code: u32,
     bus: &Arc<Mutex<BusState>>,
@@ -4195,9 +4300,12 @@ fn servicemanager_proxy(
                 Some(Some(s)) => s,
                 _ => String::new(),
             };
-            let flat = reader.read_flat_binder();
+            let flat_seq = reader.read_flat_binder();
             let _allow_isolated = reader.read_i32();
             let _dump_priority = reader.read_i32();
+            // 6-Z306ae: the offsets-array flat is the kernel's own
+            // object map — prefer it over the sequential cursor guess.
+            let flat = flat_at_first_binder_offset(blob).or(flat_seq);
             let (ptr, cookie) = match &flat {
                 Some(f) => (f.binder, f.cookie),
                 None => (0, 0),
@@ -4917,6 +5025,8 @@ fn servicemanager_hidl(
                 }
             };
             let flat = p.read_binder_arg();
+            // 6-Z306ae: prefer the offsets-array flat (kernel's own map).
+            let flat = flat_at_first_binder_offset(blob).or(flat);
             let (ptr, cookie) = match &flat {
                 Some(f) => (f.binder, f.cookie),
                 None => (0, 0),
@@ -5069,6 +5179,9 @@ fn servicemanager_hidl(
                     flat = p.read_binder_arg();
                 }
             }
+            // 6-Z306ae: prefer the offsets-array flat (kernel's own map)
+            // over the positional backtrack dance.
+            let flat = flat_at_first_binder_offset(blob).or(flat);
             let (ptr, cookie) = match &flat {
                 Some(f) => (f.binder, f.cookie),
                 None => (0, 0),
