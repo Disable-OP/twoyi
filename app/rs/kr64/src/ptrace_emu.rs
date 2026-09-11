@@ -16408,78 +16408,84 @@ pub fn run_ptrace_loop(
                         // delivery stop are skipped — the vendor-HAL crash
                         // fleet (whose crashes DO produce delivery stops)
                         // must not consume this budget.
-                        if libc::WIFSIGNALED(ws) {
-                            let term_sig = libc::WTERMSIG(ws);
-                            if z306af_deaths < 16
-                                && !z306af_delivery_dumped.contains(&pid)
-                                && (term_sig == libc::SIGSEGV
-                                    || term_sig == libc::SIGBUS
-                                    || term_sig == libc::SIGILL
-                                    || term_sig == libc::SIGFPE
-                                    || term_sig == libc::SIGABRT)
-                            {
-                                z306af_deaths += 1;
-                                z306af_delivery_dumped.insert(pid);
-                                let comm = std::fs::read_to_string(format!(
-                                    "/proc/{}/comm",
-                                    pid
-                                ))
-                                .map(|c| c.trim_end().to_string())
-                                .unwrap_or_else(|_| "?".to_string());
-                                log(&format!(
+                        // (This tail section sits after the
+                        // `if getevent_r == 0` scope, so re-read the pending
+                        // wait-status via GETEVENTMSG — same value.)
+                        let mut af_status: libc::c_long = 0;
+                        let af_event_r = unsafe {
+                            libc::ptrace(
+                                libc::PTRACE_GETEVENTMSG,
+                                pid,
+                                0,
+                                &mut af_status as *mut _ as libc::c_long,
+                            )
+                        };
+                        if af_event_r == 0 {
+                            let af_ws = af_status as libc::c_int;
+                            if libc::WIFSIGNALED(af_ws) {
+                                let term_sig = libc::WTERMSIG(af_ws);
+                                if z306af_deaths < 16
+                                    && !z306af_delivery_dumped.contains(&pid)
+                                    && (term_sig == libc::SIGSEGV
+                                        || term_sig == libc::SIGBUS
+                                        || term_sig == libc::SIGILL
+                                        || term_sig == libc::SIGFPE
+                                        || term_sig == libc::SIGABRT)
+                                {
+                                    z306af_deaths += 1;
+                                    z306af_delivery_dumped.insert(pid);
+                                    let comm =
+                                        std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                            .map(|c| c.trim_end().to_string())
+                                            .unwrap_or_else(|_| "?".to_string());
+                                    log(&format!(
                                     "6-Z306af: death-site capture pid={} sig={} comm={:?} (fatal signal with no delivery-stop dump — reading registers at the EXIT event)",
                                     pid, term_sig, comm
                                 ));
-                                let mut dregs: Regs = unsafe { std::mem::zeroed() };
-                                match ptrace_getregs(pid, &mut dregs) {
-                                    Ok(_) => {
-                                        let pc = guest_pc_of(&dregs);
-                                        #[cfg(target_arch = "aarch64")]
-                                        let sp = dregs.sp;
-                                        #[cfg(not(target_arch = "aarch64"))]
-                                        let sp = unsafe {
-                                            *(&dregs as *const Regs as *const u64).add(19)
-                                        };
-                                        log(&format!(
-                                            "6-Z306af pc={:#x} sp={:#x}",
-                                            pc, sp
-                                        ));
-                                        match std::fs::read_to_string(format!(
-                                            "/proc/{}/maps",
-                                            pid
-                                        )) {
-                                            Ok(content) => {
-                                                log(&format!(
-                                                    "6-Z306af pc-bracket:\n{}",
-                                                    maps_bracket_in(&content, pc)
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                log(&format!(
+                                    let mut dregs: Regs = unsafe { std::mem::zeroed() };
+                                    match ptrace_getregs(pid, &mut dregs) {
+                                        Ok(_) => {
+                                            let pc = guest_pc_of(&dregs);
+                                            #[cfg(target_arch = "aarch64")]
+                                            let sp = dregs.sp;
+                                            #[cfg(not(target_arch = "aarch64"))]
+                                            let sp = unsafe {
+                                                *(&dregs as *const Regs as *const u64).add(19)
+                                            };
+                                            log(&format!("6-Z306af pc={:#x} sp={:#x}", pc, sp));
+                                            match std::fs::read_to_string(format!(
+                                                "/proc/{}/maps",
+                                                pid
+                                            )) {
+                                                Ok(content) => {
+                                                    log(&format!(
+                                                        "6-Z306af pc-bracket:\n{}",
+                                                        maps_bracket_in(&content, pc)
+                                                    ));
+                                                }
+                                                Err(e) => log(&format!(
                                                     "6-Z306af maps read failed: {}",
                                                     e
-                                                ))
+                                                )),
                                             }
                                         }
+                                        Err(e) => log(&format!("6-Z306af getregs failed: {}", e)),
                                     }
-                                    Err(e) => {
-                                        log(&format!("6-Z306af getregs failed: {}", e))
-                                    }
-                                }
-                                let death_tail: std::collections::VecDeque<i64> =
-                                    recent_all_syscalls
-                                        .iter()
-                                        .rev()
-                                        .take(24)
-                                        .rev()
-                                        .cloned()
-                                        .collect();
-                                log(&format!(
+                                    let death_tail: std::collections::VecDeque<i64> =
+                                        recent_all_syscalls
+                                            .iter()
+                                            .rev()
+                                            .take(24)
+                                            .rev()
+                                            .cloned()
+                                            .collect();
+                                    log(&format!(
                                     "6-Z306af last {} ALL syscalls of pid {} (oldest->newest): {}",
                                     death_tail.len(),
                                     pid,
                                     format_syscall_buffer(&death_tail, abi)
                                 ));
+                                }
                             }
                         }
                         continue;
