@@ -21525,6 +21525,67 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // ── 6-Z306af-j: who kills the lineage? ──
+                    //
+                    // #220: gen-1 system_server (5445) was killed by SIGKILL
+                    // at +196.2s with NO zygote restart and NO init
+                    // group-kill signature — an external killer (lmkd is the
+                    // prime suspect) that the 6-Z306x hook cannot see because
+                    // it only covers LINEAGE ISSUERS, and the killer is an
+                    // init child (lmkd/netd/init). For EVERY kill/tgkill from
+                    // ANY guest process: resolve the target and, when the
+                    // TARGET is a zygote-lineage pid, name the issuer (pid +
+                    // comm) + target + signal. Bounded 16 per run.
+                    {
+                        let is_kill_j = abi.kill_nr != -1 && syscall_num == abi.kill_nr;
+                        let is_tgkill_j = abi.tgkill_nr != -1 && syscall_num == abi.tgkill_nr;
+                        if is_kill_j || is_tgkill_j {
+                            let (j_target, j_sig) = if is_tgkill_j {
+                                (
+                                    get_syscall_arg(&regs, abi.reg_arg1) as i64,
+                                    get_syscall_arg(&regs, abi.reg_arg3) as i64,
+                                )
+                            } else {
+                                (
+                                    get_syscall_arg(&regs, abi.reg_arg1) as i64,
+                                    get_syscall_arg(&regs, abi.reg_arg2) as i64,
+                                )
+                            };
+                            let j_target = j_target as libc::pid_t;
+                            let j_sig = j_sig as libc::c_int;
+                            // tgkill's first arg is the TGID; kill's first arg
+                            // is the pid/tgid. The lineage check handles both
+                            // (it resolves the TID→TGID via /proc when needed;
+                            // for a plain TGID target it hits the set/cache).
+                            let j_is_lineage_target = z306_zygote_lineage.contains(&j_target)
+                                || z306_in_zygote_lineage(
+                                    j_target,
+                                    &z306_zygote_lineage,
+                                    &mut z306_lineage_tgid_cache,
+                                );
+                            if j_is_lineage_target {
+                                static Z306AF_J: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z306AF_J.load(std::sync::atomic::Ordering::Relaxed) < 16 {
+                                    Z306AF_J.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let j_comm =
+                                        std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                            .unwrap_or_default()
+                                            .trim_end()
+                                            .to_string();
+                                    log(&format!(
+                                        "6-Z306af-j: {} pid={} comm={:?} → lineage target={} sig={} (issuer uid context: the tracer sees the raw guest pid)",
+                                        if is_tgkill_j { "tgkill" } else { "kill" },
+                                        pid,
+                                        j_comm,
+                                        j_target,
+                                        j_sig
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     // ── 6-Z306t: GENERIC nonzero-exit svclog tail dump ──
                     //
                     // #188's lesson generalised: a service that exits with a
