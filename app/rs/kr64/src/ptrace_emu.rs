@@ -14339,6 +14339,14 @@ pub fn run_ptrace_loop(
     let mut z305h_recv_log: u64 = 0;
     let mut z305h_exit_dumped: bool = false;
     let mut z305h_exit127_count: u64 = 0;
+    // 6-Z306af: pids whose fatal crash ALREADY produced a delivery-stop
+    // register dump (a "SIGSEGV details" line from the `sig == 11` arm)
+    // — the EXIT-event death-site capture below skips those, because
+    // their crash site is already on record.
+    let mut z306af_delivery_dumped: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    // 6-Z306af: per-run cap on EXIT-event death-site captures.
+    let mut z306af_deaths: u64 = 0;
     // 6-Z305i: capped DIAG for the first non-init getpid pass-throughs
     // (the InitAborter contract fix — see the pending_getpid EXIT arm).
     let mut z305i_getpid_diag: u64 = 0;
@@ -16382,6 +16390,95 @@ pub fn run_ptrace_loop(
                                     tail.len(),
                                     pid,
                                     format_syscall_buffer(&tail, abi)
+                                ));
+                            }
+                        }
+                        // ── 6-Z306af: death-site capture for fatal-signal
+                        // deaths that arrived WITHOUT a signal-delivery stop.
+                        // The #210 gen-1 system_server (pid 4983) died by
+                        // SIGSEGV at +180.5s with NO delivery stop — the loop
+                        // saw only this EXIT event, so the `sig == 11` arm
+                        // (which reads the faulting thread's registers + maps
+                        // at the delivery stop) never ran, and the crash site
+                        // stayed unnamed. At the EXIT event the task is still
+                        // ptrace-stopped and its registers are readable: for
+                        // a fault death the PC IS the faulting instruction.
+                        // 6-Z305h already proved GETREGS works at this stop.
+                        // Caps: 16 per run, and pids already dumped at the
+                        // delivery stop are skipped — the vendor-HAL crash
+                        // fleet (whose crashes DO produce delivery stops)
+                        // must not consume this budget.
+                        if libc::WIFSIGNALED(ws) {
+                            let term_sig = libc::WTERMSIG(ws);
+                            if z306af_deaths < 16
+                                && !z306af_delivery_dumped.contains(&pid)
+                                && (term_sig == libc::SIGSEGV
+                                    || term_sig == libc::SIGBUS
+                                    || term_sig == libc::SIGILL
+                                    || term_sig == libc::SIGFPE
+                                    || term_sig == libc::SIGABRT)
+                            {
+                                z306af_deaths += 1;
+                                z306af_delivery_dumped.insert(pid);
+                                let comm = std::fs::read_to_string(format!(
+                                    "/proc/{}/comm",
+                                    pid
+                                ))
+                                .map(|c| c.trim_end().to_string())
+                                .unwrap_or_else(|_| "?".to_string());
+                                log(&format!(
+                                    "6-Z306af: death-site capture pid={} sig={} comm={:?} (fatal signal with no delivery-stop dump — reading registers at the EXIT event)",
+                                    pid, term_sig, comm
+                                ));
+                                let mut dregs: Regs = unsafe { std::mem::zeroed() };
+                                match ptrace_getregs(pid, &mut dregs) {
+                                    Ok(_) => {
+                                        let pc = guest_pc_of(&dregs);
+                                        #[cfg(target_arch = "aarch64")]
+                                        let sp = dregs.sp;
+                                        #[cfg(not(target_arch = "aarch64"))]
+                                        let sp = unsafe {
+                                            *(&dregs as *const Regs as *const u64).add(19)
+                                        };
+                                        log(&format!(
+                                            "6-Z306af pc={:#x} sp={:#x}",
+                                            pc, sp
+                                        ));
+                                        match std::fs::read_to_string(format!(
+                                            "/proc/{}/maps",
+                                            pid
+                                        )) {
+                                            Ok(content) => {
+                                                log(&format!(
+                                                    "6-Z306af pc-bracket:\n{}",
+                                                    maps_bracket_in(&content, pc)
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                log(&format!(
+                                                    "6-Z306af maps read failed: {}",
+                                                    e
+                                                ))
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log(&format!("6-Z306af getregs failed: {}", e))
+                                    }
+                                }
+                                let death_tail: std::collections::VecDeque<i64> =
+                                    recent_all_syscalls
+                                        .iter()
+                                        .rev()
+                                        .take(24)
+                                        .rev()
+                                        .cloned()
+                                        .collect();
+                                log(&format!(
+                                    "6-Z306af last {} ALL syscalls of pid {} (oldest->newest): {}",
+                                    death_tail.len(),
+                                    pid,
+                                    format_syscall_buffer(&death_tail, abi)
                                 ));
                             }
                         }
@@ -34448,6 +34545,12 @@ pub fn run_ptrace_loop(
                                     "SIGSEGV details: tid={} si_code={} (1=MAPERR unmapped, 2=ACCERR permission), si_addr={:#x}, pc={:#x}, sp={:#x}{}",
                                     pid, si_code, si_addr, pc, rsp, extra_regs
                                 ));
+                                // 6-Z306af: the delivery-stop dump already
+                                // names this crash site — remember the pid so
+                                // the EXIT-event death-site capture (6-Z78 arm)
+                                // skips it and the vendor-HAL crash fleet
+                                // cannot consume the death-site budget.
+                                z306af_delivery_dumped.insert(pid);
                                 // ── 6-Z243: maps ground truth ──
                                 //
                                 // Name the file-backed mapping (library /
