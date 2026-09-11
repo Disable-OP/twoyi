@@ -2019,23 +2019,11 @@ impl BusState {
             entry.ptr = ptr;
             entry.cookie = cookie;
             // 6-Z306ae: the registry handle now holds a strong node ref
-            // on the NEW object — mirror it to the new owner BEFORE the
-            // addService reply unblocks the registering thread (whose
-            // JNI temporary sp<> is the last userspace ref). Gated on
-            // refs->refBase()==cookie (mirror_ref_ok) — a bad capture
-            // must not be dereferenced inside the guest.
-            if ptr != 0 {
-                let new_pid = self.conns.get(&owner).map(|c| c.sender_pid).unwrap_or(0);
-                if mirror_ref_ok(new_pid, ptr, cookie) {
-                    if let Some(nb) = self.conns.get_mut(&owner) {
-                        nb.reply_queue.push_back(DeferredReply::RefCmd {
-                            br: BR_ACQUIRE,
-                            ptr,
-                            cookie,
-                        });
-                    }
-                }
-            }
+            // on the NEW object. The ACQUIRE mirror rides the arm's
+            // ReplyMirrored (in-transaction, gated — see the arms); only
+            // the OLD owner's RELEASE stays queue-delivered here (the
+            // old owner is a different process — no free-then-acquire
+            // race with the registering thread).
             return entry.handle;
         }
         let h = self.next_handle;
@@ -2052,21 +2040,6 @@ impl BusState {
             },
         );
         self.by_handle.insert(h, name.to_string());
-        // 6-Z306ae: mirror the registry's strong node ref to the owner
-        // (queued BEFORE this arm's addService reply — see RefCmd).
-        // Gated on refs->refBase()==cookie (mirror_ref_ok).
-        if ptr != 0 {
-            let new_pid = self.conns.get(&owner).map(|c| c.sender_pid).unwrap_or(0);
-            if mirror_ref_ok(new_pid, ptr, cookie) {
-                if let Some(nb) = self.conns.get_mut(&owner) {
-                    nb.reply_queue.push_back(DeferredReply::RefCmd {
-                        br: BR_ACQUIRE,
-                        ptr,
-                        cookie,
-                    });
-                }
-            }
-        }
         h
     }
 
@@ -3323,6 +3296,30 @@ fn handle_write_read(
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
                         resp_blobs.push(RequestBlob { data, offsets, sg });
                     }
+                    TransactionResult::ReplyMirrored {
+                        br,
+                        ptr,
+                        cookie,
+                        data,
+                        offsets,
+                        sg,
+                    } => {
+                        // 6-Z306ae-e: the mirror rides the SAME ioctl,
+                        // BEFORE the completion+reply batch — the guest's
+                        // waitForResponse runs BR_ACQUIRE's incStrong
+                        // while the registering thread is still inside
+                        // transact (no free-then-acquire race).
+                        read_buf.extend_from_slice(&br.to_ne_bytes());
+                        read_buf.extend_from_slice(&ptr.to_ne_bytes());
+                        read_buf.extend_from_slice(&cookie.to_ne_bytes());
+                        push_br_transaction_complete(&mut read_buf);
+                        push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
+                        resp_blobs.push(RequestBlob { data, offsets, sg });
+                        info!(
+                            "[KR64][binder][vm{}] 6-Z306ae-e: in-transaction mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
+                            vm_id, conn_id, br, ptr, cookie
+                        );
+                    }
                 }
             }
             BC_REPLY | BC_REPLY_SG => {
@@ -3748,6 +3745,24 @@ enum TransactionResult {
         offsets: Vec<u8>,
         sg: Vec<SgBuf>,
     },
+    /// 6-Z306ae-e: a Reply that PREPENDS the node-ref mirror command
+    /// `[BR_ACQUIRE][ptr][cookie]` to the `[BR_TRANSACTION_COMPLETE]
+    /// [BR_REPLY]` batch. The guest's `waitForResponse` processes
+    /// commands in order and only EXITS on the reply — so the owner's
+    /// `obj->incStrong` lands INSIDE the transact call, while the
+    /// registering thread's JNI temporary `sp<>` is still alive. The
+    /// reply_queue delivery (6-Z306ae) raced: HALs that drop their
+    /// `sp<>` right after `registerAsService` freed the object before
+    /// the owner's next read — ladder #207's si_addr=0x4 class (722
+    /// SIGSEGVs, incWeak(NULL)). Used only by the registration arms.
+    ReplyMirrored {
+        br: u32,
+        ptr: u64,
+        cookie: u64,
+        data: Vec<u8>,
+        offsets: Vec<u8>,
+        sg: Vec<SgBuf>,
+    },
     /// Transaction accepted with no in-ioctl reply: one-way, or a routed
     /// sync call whose `BC_REPLY` resolves on the requester's LATER read
     /// (kernel semantics — 6-Z271i deferred resolution).
@@ -4138,6 +4153,11 @@ fn servicemanager_proxy(
     }
 
     let mut reader = ParcelReader::new(parcel);
+    // 6-Z306ae-e: set by the registration arms — the reply is returned as
+    // ReplyMirrored so the node-ref mirror rides the SAME ioctl, before
+    // the reply unblocks the registering thread (no free-then-acquire
+    // race; see TransactionResult::ReplyMirrored).
+    let mut mirror: Option<(u32, u64, u64)> = None;
     // Consume the AIDL interface-token header.
     let (_strict, _work, tag, iface) = match reader.read_aidl_header() {
         Some(v) => v,
@@ -4400,6 +4420,15 @@ fn servicemanager_proxy(
             // `onRegistration` callback (the real servicemanager fires
             // IServiceCallback.onRegistration on every later addService).
             b.fire_registration_callbacks(&name, handle, false);
+            // 6-Z306ae-e: mirror the registry's strong node ref IN THIS
+            // IOCTL (liveness-gated) — the owner's incStrong runs while
+            // the registering thread's JNI temporary sp<> is alive.
+            if ptr != 0 {
+                let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                if mirror_ref_ok(gpid, ptr, cookie) {
+                    mirror = Some((BR_ACQUIRE, ptr, cookie));
+                }
+            }
             // Reply body: void (header only) per 6-Z114 §3.3.
         }
         SVC_MGR_LIST_SERVICES => {
@@ -4498,10 +4527,20 @@ fn servicemanager_proxy(
     }
 
     let (data, offsets) = writer.into_parts();
-    TransactionResult::Reply {
-        data,
-        offsets,
-        sg: Vec::new(),
+    match mirror {
+        Some((br, mptr, mcookie)) => TransactionResult::ReplyMirrored {
+            br,
+            ptr: mptr,
+            cookie: mcookie,
+            data,
+            offsets,
+            sg: Vec::new(),
+        },
+        None => TransactionResult::Reply {
+            data,
+            offsets,
+            sg: Vec::new(),
+        },
     }
 }
 
@@ -4967,6 +5006,9 @@ fn servicemanager_hidl(
     };
 
     let mut writer = ParcelWriter::new();
+    // 6-Z306ae-e: set by the registration arms — see the AIDL twin +
+    // TransactionResult::ReplyMirrored (in-transaction node-ref mirror).
+    let mut mirror: Option<(u32, u64, u64)> = None;
     // HIDL replies carry no AIDL exception prefix; the object (if any)
     // lands at offsets[0] and HIDL reads it there. The status prefix is
     // harmless for HIDL and correct for any libbinder-side reader.
@@ -5121,6 +5163,14 @@ fn servicemanager_hidl(
                 b.fire_registration_callbacks(&name, h, false);
                 h
             };
+            // 6-Z306ae-e: mirror the registry's strong node ref IN THIS
+            // IOCTL (liveness-gated).
+            if ptr != 0 {
+                let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                if mirror_ref_ok(gpid, ptr, cookie) {
+                    mirror = Some((BR_ACQUIRE, ptr, cookie));
+                }
+            }
             // Reply: bool success = true.
             writer.write_i32(1);
             let _ = handle;
@@ -5288,6 +5338,15 @@ fn servicemanager_hidl(
                 b.fire_registration_callbacks(&key, h, false);
                 h
             };
+            // 6-Z306ae-e: mirror the registry's strong node ref IN THIS
+            // IOCTL (liveness-gated) — the HAL's incStrong runs while the
+            // registering thread is still inside transact.
+            if ptr != 0 {
+                let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                if mirror_ref_ok(gpid, ptr, cookie) {
+                    mirror = Some((BR_ACQUIRE, ptr, cookie));
+                }
+            }
             writer.write_u8(1); // bool success = true
             info!(
                 "[KR64][binder][svc] HIDL addWithChain({}) → handle 0x{:08x} (conn={}, chain={:?})",
@@ -5425,10 +5484,20 @@ fn servicemanager_legacy(code: u32) -> TransactionResult {
         _ => return TransactionResult::Failed,
     }
     let (data, offsets) = writer.into_parts();
-    TransactionResult::Reply {
-        data,
-        offsets,
-        sg: Vec::new(),
+    match mirror {
+        Some((br, mptr, mcookie)) => TransactionResult::ReplyMirrored {
+            br,
+            ptr: mptr,
+            cookie: mcookie,
+            data,
+            offsets,
+            sg: Vec::new(),
+        },
+        None => TransactionResult::Reply {
+            data,
+            offsets,
+            sg: Vec::new(),
+        },
     }
 }
 

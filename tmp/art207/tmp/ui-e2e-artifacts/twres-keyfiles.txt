@@ -1,0 +1,5 @@
+wc: rootfs/twres/splash.xml: No such file or directory
+wc: rootfs/twres/ui.xml: No such file or directory
+wc: rootfs/twres/portrait.xml: No such file or directory
+wc: rootfs/twres/languages/en.xml: No such file or directory
+      0 total

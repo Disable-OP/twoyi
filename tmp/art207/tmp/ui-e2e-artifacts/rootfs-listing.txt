@@ -1,0 +1,77 @@
+total 1928
+drwx------ 29 u0_a87 u0_a87    4096 2026-09-11 11:11 .
+drwx------  3 u0_a87 u0_a87    4096 2026-09-11 11:11 ..
+dr-xr-xr-x  4 u0_a87 u0_a87    4096 2026-09-11 11:11 acct
+-rw-r--r--  1 u0_a87 u0_a87     723 2026-09-11 11:11 adb_keys
+drwx------ 23 u0_a87 u0_a87    4096 2026-09-11 11:11 apex
+lrwxrwxrwx  1 u0_a87 u0_a87      10 2026-09-11 11:11 bin -> system/bin
+lrwxrwxrwx  1 u0_a87 u0_a87      49 2026-09-11 11:11 bugreports -> data/user_de/0/com.android.shell/files/bugreports
+drwxrwx---  6 u0_a87 u0_a87    4096 2026-09-11 11:11 cache
+drwxrwxrwx  4 u0_a87 u0_a87    4096 2026-09-11 11:13 config
+lrwxrwxrwx  1 u0_a87 u0_a87      16 2026-09-11 11:11 d -> sys/kernel/debug
+drwxrwx--x 45 u0_a87 u0_a87    4096 2026-09-11 11:11 data
+drwxrwxrwx  5 u0_a87 u0_a87    4096 2026-09-11 11:11 data_mirror
+drwx------  2 u0_a87 u0_a87    4096 2026-09-11 11:11 debug_ramdisk
+lrwxrwxrwx  1 u0_a87 u0_a87      23 2026-09-11 11:11 default.prop -> system/etc/prop.default
+drwxr-xr-x 25 u0_a87 u0_a87    4096 2026-09-11 11:11 dev
+lrwxrwxrwx  1 u0_a87 u0_a87      10 2026-09-11 11:11 etc -> system/etc
+drwxr-xr-x  2 u0_a87 u0_a87    4096 2026-09-11 11:11 external_sd
+-rwxr-xr-x  1 u0_a87 u0_a87 1831856 2026-09-11 11:11 init
+-rwxr-xr-x  1 u0_a87 u0_a87    2279 2026-09-11 11:11 init.environ.rc
+-rw-r--r--  1 u0_a87 u0_a87     318 2026-09-11 11:11 init.twoyi.rc
+drwxrwxrwx 11 u0_a87 u0_a87    4096 2026-09-11 11:11 linkerconfig
+drwx------  2 u0_a87 u0_a87    4096 2026-09-11 11:11 lost+found
+drwxrwxrwx  9 u0_a87 u0_a87    4096 2026-09-11 11:11 metadata
+drwx------ 15 u0_a87 u0_a87    4096 2026-09-11 11:11 mnt
+drwx------  2 u0_a87 u0_a87    4096 2026-09-11 11:11 odm
+drwx------  2 u0_a87 u0_a87    4096 2026-09-11 11:11 oem
+srwx------  1 u0_a87 u0_a87       0 2026-09-11 11:11 opengles
+drwxr-xr-x  2 u0_a87 u0_a87    4096 2026-09-11 11:11 postinstall
+dr-xr-xr-x  4 u0_a87 u0_a87    4096 2026-09-11 11:11 proc
+drwx------  9 u0_a87 u0_a87    4096 2026-09-11 11:11 product
+drwx------  3 u0_a87 u0_a87    4096 2026-09-11 11:11 res
+-rw-------  1 u0_a87 u0_a87     154 2026-09-11 11:11 rom.ini
+drwxr-xr-x  3 u0_a87 u0_a87    4096 2026-09-11 11:11 sbin
+lrwxrwxrwx  1 u0_a87 u0_a87      20 2026-09-11 11:11 sdcard -> storage/self/primary
+drwx------  4 u0_a87 u0_a87    4096 2026-09-11 11:11 storage
+drwxr-xr-x  6 u0_a87 u0_a87    4096 2026-09-11 11:11 sys
+drwx------ 12 u0_a87 u0_a87    4096 2026-09-11 11:11 system
+drwx------  8 u0_a87 u0_a87    4096 2026-09-11 11:11 system_ext
+-r--r-----  1 u0_a87 u0_a87     333 2026-09-11 11:11 twrp-cmdline
+total 100464
+drwx------  4 u0_a87 u0_a87     4096 2026-09-11 11:11 .
+drwx------ 12 u0_a87 u0_a87     4096 2026-09-11 11:11 ..
+-rw-r--r--  1 u0_a87 u0_a87   543774 2026-09-11 11:11 am.jar
+-rw-r--r--  1 u0_a87 u0_a87    12718 2026-09-11 11:11 android.hidl.base-V1.0-java.jar
+-rw-r--r--  1 u0_a87 u0_a87    29738 2026-09-11 11:11 android.hidl.manager-V1.0-java.jar
+-rw-r--r--  1 u0_a87 u0_a87    33134 2026-09-11 11:11 android.test.base.jar
+-rw-r--r--  1 u0_a87 u0_a87   201786 2026-09-11 11:11 android.test.mock.jar
+-rw-r--r--  1 u0_a87 u0_a87   106974 2026-09-11 11:11 android.test.runner.jar
+-rw-r--r--  1 u0_a87 u0_a87     5682 2026-09-11 11:11 appwidget.jar
+total 12
+drwxr-xr-x  3 u0_a87 u0_a87 4096 2026-09-11 11:18 .
+drwxr-xr-x 25 u0_a87 u0_a87 4096 2026-09-11 11:11 ..
+drwxr-xr-x  2 u0_a87 u0_a87 4096 2026-09-11 11:11 audioserver
+srw-rw----  1 u0_a87 u0_a87    0 2026-09-11 11:18 dnsproxyd
+srw-rw----  1 u0_a87 u0_a87    0 2026-09-11 11:18 fwmarkd
+srw-rw-rw-  1 u0_a87 u0_a87    0 2026-09-11 11:11 logd
+srw-rw-rw-  1 u0_a87 u0_a87    0 2026-09-11 11:11 logdr
+s-w--w--w-  1 u0_a87 u0_a87    0 2026-09-11 11:11 logdw
+srw-rw----  1 u0_a87 u0_a87    0 2026-09-11 11:18 mdns
+srw-rw-rw-  1 u0_a87 u0_a87    0 2026-09-11 11:11 property_service
+s-w--w--w-  1 u0_a87 u0_a87    0 2026-09-11 11:11 statsdw
+srw-rw-rw-  1 u0_a87 u0_a87    0 2026-09-11 11:11 tombstoned_crash
+srw-rw-rw-  1 u0_a87 u0_a87    0 2026-09-11 11:11 tombstoned_intercept
+srw-rw-rw-  1 u0_a87 u0_a87    0 2026-09-11 11:11 tombstoned_java_trace
+srwx------  1 u0_a87 u0_a87    0 2026-09-11 11:18 usap_pool_primary
+srwx------  1 u0_a87 u0_a87    0 2026-09-11 11:18 zygote
+── restorecon/realpath forensics (6-Z305b): the guest init died on    realpath(/system/bin/init) ENOENT → InitFatalReboot; stat every    component through the container view to separate a missing file    from a path-translation bug ──
+OK   init size=1831856
+OK   system size=4096
+OK   system/bin size=20480
+OK   system/bin/init size=1028848
+OK   system/bin/sh size=310256
+LINK system/bin/linker64 -> ../../apex/com.android.runtime/bin/linker64
+OK   system/framework/framework.jar size=29841085
+OK   system/etc/prop.default size=1337
+OK   vendor/etc/selinux/precompiled_sepolicy size=520276
