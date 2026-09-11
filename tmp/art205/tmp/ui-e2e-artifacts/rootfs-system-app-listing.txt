@@ -1,0 +1,30 @@
+# profiles/default/rootfs/system/app
+total 112
+drwx------ 28 u0_a87 u0_a87 4096 2026-09-11 10:21 .
+drwx------ 12 u0_a87 u0_a87 4096 2026-09-11 10:21 ..
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 BasicDreams
+drwx------  4 u0_a87 u0_a87 4096 2026-09-11 10:21 Bluetooth
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 BluetoothMidiService
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 BookmarkProvider
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 CaptivePortalLogin
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 CarrierDefaultApp
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 CertInstaller
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 CompanionDeviceManager
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 EasterEgg
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 ExtShared
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 HTMLViewer
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 KeyChain
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 LiveWallpapersPicker
+drwx------  4 u0_a87 u0_a87 4096 2026-09-11 10:21 NfcNci
+drwx------  4 u0_a87 u0_a87 4096 2026-09-11 10:21 PacProcessor
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 PartnerBookmarksProvider
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 PresencePolling
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 PrintRecommendationService
+drwx------  4 u0_a87 u0_a87 4096 2026-09-11 10:21 PrintSpooler
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 RcsService
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 SafetyRegulatoryInfo
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 SecureElement
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 SimAppDialog
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 Stk
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 Traceur
+drwx------  3 u0_a87 u0_a87 4096 2026-09-11 10:21 WallpaperBackup
