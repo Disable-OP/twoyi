@@ -16522,9 +16522,21 @@ pub fn run_ptrace_loop(
                                         .map(|c| c.trim_end().to_string());
                                     }
                                     let comm = af_comm.unwrap_or_else(|| "?".to_string());
+                                    // 6-Z306af-f: the tracer's own in_syscall
+                                    // state for the dying tid — the #215 decode
+                                    // put the death at the RE-EXECUTED svc of a
+                                    // signal-restarted futex wait
+                                    // (x8=128 restart_syscall), so the
+                                    // ENTRY/EXIT state machine's view of this
+                                    // tid (was the original futex ENTRY still
+                                    // open? did the nr=128 restart ENTRY arrive
+                                    // while in_syscall=true?) is the next
+                                    // decode input.
+                                    let af_in_sys =
+                                        in_syscall_map.get(&pid).copied().unwrap_or(false);
                                     log(&format!(
-                                        "6-Z306af: death-site capture pid={} sig={} comm={:?} lineage=yes (fatal signal with no delivery-stop dump — reading registers at the EXIT event)",
-                                        pid, term_sig, comm
+                                        "6-Z306af: death-site capture pid={} sig={} comm={:?} lineage=yes in_syscall(tracer)={} (fatal signal with no delivery-stop dump — reading registers at the EXIT event)",
+                                        pid, term_sig, comm, af_in_sys
                                     ));
                                     let mut dregs: Regs = unsafe { std::mem::zeroed() };
                                     match ptrace_getregs(pid, &mut dregs) {
