@@ -7298,6 +7298,33 @@ mod tests {
         p
     }
 
+    // 6-Z306ae: consume the registry's strong-ref mirror from the owner's
+    // read stream — [BR_ACQUIRE][ptr][cookie] now legitimately precedes
+    // pending work (kernel-faithful node-ref notification, delivered
+    // before the addService reply unblocks the registering thread).
+    fn drain_ref_mirror(s: &mut UnixStream, expect_ptr: u64, expect_cookie: u64) {
+        let mut wr = Vec::new();
+        wr.extend_from_slice(&0u32.to_ne_bytes());
+        wr.extend_from_slice(&4096u32.to_ne_bytes());
+        let (r, resp) = exchange(s, BINDER_WRITE_READ, &wr);
+        assert_eq!(r, 0, "ref-mirror drain ok");
+        assert_eq!(
+            u32::from_ne_bytes(resp[4..8].try_into().unwrap()),
+            BR_ACQUIRE,
+            "6-Z306ae: BR_ACQUIRE mirror precedes pending work"
+        );
+        assert_eq!(
+            u64::from_ne_bytes(resp[8..16].try_into().unwrap()),
+            expect_ptr,
+            "mirror ptr = the registered weakrefs"
+        );
+        assert_eq!(
+            u64::from_ne_bytes(resp[16..24].try_into().unwrap()),
+            expect_cookie,
+            "mirror cookie = the registered BBinder"
+        );
+    }
+
     #[test]
     fn z271_bus_full_guest_to_guest_transaction_round_trip() {
         let rootfs = tmpdir();
@@ -7332,6 +7359,7 @@ mod tests {
             "ADD replies with BR_REPLY"
         );
         let _ = read_size;
+        drain_ref_mirror(&mut stream_a, 0x1234, 0x5678);
 
         // ---- Connection B: getService("svc_a") → routed handle ----
         let mut stream_b = UnixStream::connect(&path).expect("connect B");
@@ -7632,6 +7660,7 @@ mod tests {
         let payload = make_v2_write_read_payload(&bc, &ad, &ao, 4096);
         let (ret, _resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
         assert_eq!(ret, 0, "ADD_SERVICE ok");
+        drain_ref_mirror(&mut stream, 0xaaaa, 0xbeef);
 
         let mut args2 = ParcelWriter::new();
         args2.write_string16("self_svc");
@@ -7765,6 +7794,7 @@ mod tests {
             let p = make_v2_write_read_payload(&bc, &d, &o, 4096);
             let (r, _) = exchange(&mut s, BINDER_WRITE_READ, &p);
             assert_eq!(r, 0, "addService({name})");
+            drain_ref_mirror(&mut s, 0x1111, cookie);
             s
         };
         // Helper: getService from a connection, return the handle.
