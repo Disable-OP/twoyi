@@ -27815,3 +27815,18 @@ Stage Summary / HANDOFF:
    c. If the deaths trace to the binder wire-lock waits (the shlib's 8s REPLY_TIMEOUT waits sit on exactly this futex class), the fix is in the shlib's timeout/wedge-recovery path — audit twoyi_loader_shlib.c's reply-timeout machinery against the storm-era service deaths (a wedged service + an 8s wait + a timed-out re-transact could hit the 6-Z306ac-era LOCAL flat state machine).
    d. Keep re-dispatching per fix; rung 8 (SystemUI/launcher) is expected to fall once a generation survives the AMS constructor era ("activity" registration is the next wire milestone).
 3. Known-good state: TWRP/OrangeFox recovery corpus GREEN on the current SM arms; kr64-tests 832/832; the storm (init's HAL crash-loop, ~120-220 SIGSEGVs/run) remains pre-existing and non-blocking-but-noisy; the boot watch stays 420s.
+
+---
+Task ID: 20
+Agent: Z.ai Code (webDevReview cron session, new cycle)
+Task: Decision-tree item (a) — per-TID dying trail + FP-chain walk (6-Z306af-h); decode #218; dispatch #219.
+
+Work Log:
+- LANDED 6-Z306af-h (ee3b003): per-TID syscall rings (cap 64 pids × 24 entries, lineage-wide, threads included — recorded at the 6-Z306y trail point) + a frame-pointer chain walk at the death site (6-Z296's upward-reading rule, LRs resolved against the rename-time snapshot). Gates: fmt clean, clippy -D warnings clean, 832/832 tests; kr64-tests GREEN; dispatched #218.
+- **#218 DECODE — the dying thread is NAMED**: ONE capture (gen-2 era, +340.2s, SIGSEGV, in_syscall=true): the tid-ring is a **LOG-WRITE LOOP — `writev → getpid → gettid → writev → futex → … → nr=128`** — a thread flooding the guest logd (liblog's per-line getpid/gettid + writev protocol) and contending a lock via TIMED futex waits between bursts; death at the restarted svc (x8=128, x1=0x89 again). LR (libc file 0x3eab8) = an unnamed local bionic helper after android_mallopt (the pthread-wait family). The FP-chain was skipped — the mm is gone at the EXIT event (the reads failed exactly as anticipated; the walk is fail-safe).
+- Checked the shlib REPLY_TIMEOUT path (decision-tree item c): the 6-Z271g per-thread proxy rework already removed cross-thread lock holds during I/O; shlib waits are socket blocks (recvfrom), NOT futexes — the timed-futex deaths are guest-native (ART/libc log/mutex machinery). The shlib is exonerated for this class.
+- No SIGSEGV delivery dumps near the death window — the group-death-without-stops phenomenon persists; the ambient DIAG lines show crash_dump failing to attach (already-traced) and the shlib gotfix-44 re-repair running (modules=133) — noted as context, no causal link established.
+
+Stage Summary:
+- The dying-thread identity is now concrete: a system_server LOG-WRITER thread in a post-appops log flood, dying at a signal-restarted timed futex inside libc's syscall() wrapper. Next decode inputs queued: (1) the abort-message catch (6-Z306af-g) for the with-message SIGABRT class; (2) an fp-chain sample when a death happens with the mm still mapped; (3) correlating the log flood's content with the death (the guest logd protocol buffers on the writev fds are binary — a tracer-side liblog-decode probe is the candidate next instrument if the message class stays silent).
+- #219 dispatched (ee3b003) for more instrument samples.
