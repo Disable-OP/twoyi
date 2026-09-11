@@ -7245,11 +7245,16 @@ fn z306an_parse_syscall_info(buf: &[u8]) -> Option<(u64, u64, u64)> {
 /// any ptrace stop → the query fails → None. ESRCH (dying pid) → None;
 /// the reap flow owns those.
 fn z306an_query_entry_stop(pid: libc::pid_t) -> Option<(u64, u64, u64)> {
-    const PTRACE_GET_SYSCALL_INFO: libc::c_uint = 0x420e;
+    // 0x420e — stable UAPI (linux/ptrace.h). libc only names it for the
+    // gnu targets AND declares ptrace(request: c_uint) there while the
+    // android target declares ptrace(request: c_int) — so the raw value
+    // is kept local as c_int and cast with `as _` at the call site (the
+    // i32→u32 as-cast is legal on gnu; identity on android).
+    const PTRACE_GET_SYSCALL_INFO: libc::c_int = 0x420e;
     let mut buf = [0u8; 128];
     let rc = unsafe {
         libc::ptrace(
-            PTRACE_GET_SYSCALL_INFO,
+            PTRACE_GET_SYSCALL_INFO as _,
             pid,
             buf.len() as u64,
             buf.as_mut_ptr() as *mut libc::c_void,
