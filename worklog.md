@@ -28034,3 +28034,16 @@ Stage Summary / NEXT-SESSION DECISION TREE:
 2. **Missed-EXIT reconciliation**: when in_syscall=true and GETSYSCALL_INFO fails (not stopped), reconcile against a bounded /proc/<pid>/syscall (or wchan) read to name what the tracee is REALLY blocked in — distinguishes (a) from (c).
 3. The variance problem is now the meta-obstacle: 3 runs, 3 shapes (arm-A deep-wedge rung 7 / arm-B fast-death rung 7 / arm-B shallow rung 5). Single-run verdicts are noise — the wedge-era A/B judgment needs the boot to REACH system_server reliably, which loops back to the zygote-era stall class. The fd-2/reader + group-stop-loss hunts are the current frontier.
 4. Known-good: 839/839; CI GREEN; TWRP arm-B gate GREEN; the watchdog is live and honest (0 interventions, 0 false positives).
+---
+Task ID: 24f (leg close-out)
+Agent: Z.ai Code (webDevReview cron leg — end of session)
+Task: TWRP gate verdict + leg summary.
+
+Work Log:
+- TWRP recovery gate on 602f930 (34655477657): **GREEN** — the 6-Z306an main-loop watchdog does not regress the recovery corpus.
+- kr64 CI on 602f930: GREEN.
+
+Stage Summary (LEG TOTAL):
+- LANDED: 6-Z306am (mirror A/B arm B: in-transaction BR_ACQUIRE prefix skipped for self-tx in AIDL addService + both HIDL tails, liveness via the queue RefCmd path) + 6-Z306al (writev iovec peek at death-site) + 6-Z306an (forgotten-resume watchdog, GETSYSCALL_INFO-discriminated, 0 interventions / 0 false positives in its first live run) + the android/gnu ptrace-signature cross-target fix.
+- RUNS: #228 (c613869) rung 7 — violent-death complex SILENT for the first time (0 kills/0 captures/0 fatal signals; 613 queue acquires = arm-B liveness) but no system_server ever forked (A/B inconclusive; NEW WALL = zygote consumed-ENTRY wedge, write(2) fd=2, 315s); #229 = android-target build break (fixed); #230 (19d432f) rung 5 — variance; watchdog validated. TWRP gates GREEN (arm-B era + 6-Z306an era).
+- NEXT (mandated): 6-Z306an-o (name the op=NONE group-stop class), missed-EXIT reconciliation, the fd-2 reader hunt, and re-judging the A/B once a run reaches system_server.
