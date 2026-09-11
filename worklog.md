@@ -27701,3 +27701,26 @@ Stage Summary:
 - TWO production binder fixes landed this session (6-Z306ab annotation form, 6-Z306ac owner-local flat) — both generic kernel/libbinder semantics, zero ROM specifics, both verified live by ladders #198/#199.
 - The forked system_server is now ALIVE AND STARTING SERVICES: bootstrap services chain runs; AMS startup was in flight at window close. The next ladder (dispatch #200+) should show AMS completing → more bootstrap services → PMS → SystemUI/launcher territory (rung 8). Watch the binder conn cap and the SM registry growth.
 - Known non-blocking walls queued: installd dexopt-thread SIGSEGV (libutils, x19=0); log volume ~60MB (within budget).
+
+---
+Task ID: 19c (fresh-sandbox continuation session, 3rd leg)
+Agent: Z.ai Code (main session, continued)
+Task: Decode ladders #201/#203/#204/#205/#206/#207/#209/#210; root-cause and fix the LOCAL-flat object lifetime (6-Z306ae family); verify system_server survival.
+
+Work Log:
+- SANDBOX RESUME: HEAD edbe66f; cron verified; ladder job headroom 15→30min (edbe66f); #200 cancelled by concurrency (superseded by #201 = the 420s-watch evidence run).
+- DOWNLOADED the rsr2 rootfs (497MB) → guest libbinder.so → capstone+pyelftools → **disassembly-confirmed the #199 late crash**: pc=libbinder file offset 0x5BC74 INSIDE Parcel::unflattenBinder's BINDER_TYPE_BINDER branch — sp<IBinder>(cookie) ctor → IBinder : public virtual RefBase → vbase-offset read (ldur x8,[x8,#-0x18]) faulted with vptr=0 at the registered cookie. #201 reproduced byte-identically at +169.13s.
+- 6-Z306ad (b3c13a9 + cbb77e5): tracer-side LOCAL-flat memory probes (capture/serve/delivery; process_vm_readv; bounded 32/32/96). #203 (rung 7): serve-time platform_compat cookie mem = 16 ZERO bytes while the weakrefs stayed consistent (mStrong=0, mWeak=1) — the JavaBBinder was DELETED between registration and the owner lookup; capture probes exposed "parcel-fragment" cookies for some services.
+- 6-Z306ae (6851e26): (a) DeferredReply::RefCmd node-ref lifetime mirror (BR_ACQUIRE→incStrong on registration — the kernel semantic that keeps registered service objects alive; JavaBBinderHolder holds only a wp<>); (b) flat_at_first_binder_offset — offsets-anchored flat capture. #204: rung 7→4, 1340 SIGSEGVs — the mirror amplified capture errors (atrace HAL: incWeak(NULL) at [cookie+8]=0; the mirror's obj->incStrong dereferenced garbage).
+- 6-Z306ae-b (752d94e + fmt): mirror gated on the (wrong) mBase==cookie invariant → #205: rung 7 restored, 0 mirrors, 241 skips, Δ census (0x88 dominant HIDL / 0x20-0x68 AIDL).
+- 6-Z306ae-c (7922e92 + fmt ea815eb): capture-flat parcel hex dump → #206 settled it: **the parcel cookie slot is CORRECT; mBase(W)=B+Δ is the RefBase virtual-base subobject offset inside multiply-inheriting HIDL wrappers (BnHw<X>:BHwBinder,X) — NOT a capture error.** The "fake cookie" shapes were real objects all along; 6-Z306ac was always wire-correct.
+- 6-Z306ae-d (df31f4a): mirror gate = live-object shape (vptr≠0). #207: 264 mirrors delivered, 0 zygote deaths — but 722 SIGSEGVs (si_addr=0x4): **the reply_queue mirror RACED** — HALs that drop their sp<> after registerAsService freed the object before the owner's next read.
+- 6-Z306ae-e (b69c918) + -f (f478c98): **in-transaction mirror** — TransactionResult::ReplyMirrored prepends [BR_ACQUIRE][ptr][cookie] to the SAME ioctl's [COMPLETE][REPLY] batch; the guest's waitForResponse runs incStrong INSIDE the transact call while the registering thread's JNI temporary sp<> is still alive. Wired into the AIDL addService tail + both HIDL add/addWithChain tails. #208 failed build (pre-fix commit); kr64-tests #1668 GREEN on f478c98.
+- 6-Z306ae-g (ebabc8a): dropped the mRefs liveness check ([B+8] is layout padding for virtually-inheriting wrappers; mRefs lives at B+Δ) — #209 had 238/246 wrong rejections. Gate = readable [cookie..+8] with vptr≠0. kr64-tests #1669 GREEN.
+- **#210 (ebabc8a) — THE MILESTONE: 108 in-transaction mirrors delivered, 0 skips, 122 SIGSEGVs (BELOW the ~180 pre-mirror baseline — the HAL fleet is healing), 0 zygote deaths, and the serve-time probe shows platform_compat mStrong=1 (THE MIRROR'S REF) with a LIVE vptr at the cookie — the object survives the registration→lookup window for the first time in mission history. addService(appops) at +177.5s (gen 1) and +326.2s (gen 2) — the AMS constructor is PROGRESSING past the wall.**
+
+Stage Summary:
+- The LOCAL-flat object lifetime bug is FIXED end-to-end (in-transaction node-ref mirror, liveness-gated). The vendor-HAL fleet crash volume dropped below baseline. system_server survives AMS construction past PlatformCompat→AppOps.
+- The mirror gates/probes stay bounded (capture-flat dump 12/boot; probe budgets 32/32/96) — candidate trim next session once stable.
+- Next walls (in expected order): AMS completing ("activity"/"package_native"/"window" registrations) → PMS (dexopt path — the queued installd libutils SIGSEGV x19=0 becomes relevant) → SystemUI/launcher (rung 8) → BOOT_COMPLETED (rung 9). The A11 getService(activity) poller storm self-resolves at AMS registration.
+- CI state: kr64-tests #1669 GREEN; ladder #210 = deepest verified run (survival + fleet healing); TWRP regression gate untouched by this session (the SM arms only gained the in-transaction mirror prefix; recovery uses the same SM path — next dispatch re-verifies).
