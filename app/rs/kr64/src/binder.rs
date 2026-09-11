@@ -6222,41 +6222,45 @@ fn probe_flat_mem(
     );
 }
 
-/// 6-Z306ae-b: the kernel's own node-ref invariant — a BR_ACQUIRE is
-/// only deliverable when the captured pair satisfies
-/// `refs->refBase() == obj` (A11 IPCThreadState asserts it and would
-/// abort the guest otherwise). Ladder #204 showed what happens without
-/// the check: a (ptr, cookie) capture whose weakrefs' mBase != cookie
-/// (a systematic capture shift, Δ = 0x20/0x38/0x68 in the probes) made
-/// the mirror's `obj->incStrong` dereference garbage inside the guest —
-/// incWeak(NULL) at [cookie+8]=0, 1340 SIGSEGVs, rung 7 → 4. Peek the
-/// weakrefs object OUTSIDE the guest and require [ptr+8..+16] ==
-/// cookie; skip the mirror (keeping the pre-mirror behavior) when the
-/// capture fails the invariant.
+/// 6-Z306ae-d: the mirror's liveness gate. The #206 capture-flat dump
+/// settled the "capture shift": the parcel cookie slot is CORRECT
+/// ([flat]{type,flags,binder=W,cookie=B}[stability][allow][prio], all
+/// sane); mBase(W) = B + Δ is the **RefBase virtual-base subobject
+/// offset** inside multiply-inheriting HIDL wrappers (BnHw<X> :
+/// BHwBinder, X — the shared RefBase lives at a different offset than
+/// the BHwBinder subobject; Δ = 0x88 BnHw<HIDL>, 0x20/0x38/0x68
+/// elsewhere) — NOT a capture error. The mBase==cookie "invariant" of
+/// 6-Z306ae-b therefore rejected every correct capture and the mirror
+/// never fired (#205: 241 skips, 0 deliveries).
+/// The gate that actually protects the guest: the object at cookie
+/// must LOOK ALIVE — [cookie..+16] readable with vptr≠0 and mRefs≠0
+/// (a freed scudo chunk reads zeros — the #199/#201 platform_compat
+/// serve-time state and the #204 atrace incWeak(NULL) crash shape).
+/// HIDL HALs that drop their sp<> after registerAsService survive on
+/// real kernels BECAUSE of this mirror; without it they die — the
+/// vendor-HAL fleet crash class.
 fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
     if guest_pid <= 0 || ptr == 0 || cookie == 0 {
         return false;
     }
-    match crate::ptrace_emu::peek_guest_bytes(guest_pid, ptr, 16) {
+    match crate::ptrace_emu::peek_guest_bytes(guest_pid, cookie, 16) {
         Some(b) if b.len() == 16 => {
-            let mbase = u64::from_ne_bytes(b[8..16].try_into().unwrap());
-            if mbase == cookie {
+            let vptr = u64::from_ne_bytes(b[0..8].try_into().unwrap());
+            let mrefs = u64::from_ne_bytes(b[8..16].try_into().unwrap());
+            if vptr != 0 && mrefs != 0 {
                 true
             } else {
                 info!(
-                    "[KR64][binder][svc] 6-Z306ae-b: mirror skipped — weakrefs mBase=0x{:x} != cookie=0x{:x} (capture Δ=+0x{:x}) pid={}",
-                    mbase,
-                    cookie,
-                    mbase.wrapping_sub(cookie),
-                    guest_pid
+                    "[KR64][binder][svc] 6-Z306ae-d: mirror skipped — object at cookie=0x{:x} not alive (vptr={:#x} mRefs={:#x}) pid={}",
+                    cookie, vptr, mrefs, guest_pid
                 );
                 false
             }
         }
         _ => {
             info!(
-                "[KR64][binder][svc] 6-Z306ae-b: mirror skipped — weakrefs at ptr=0x{:x} unreadable pid={}",
-                ptr, guest_pid
+                "[KR64][binder][svc] 6-Z306ae-d: mirror skipped — cookie=0x{:x} unreadable pid={}",
+                cookie, guest_pid
             );
             false
         }
