@@ -27794,3 +27794,24 @@ Stage Summary:
 - THE BOOT BLOCKER IS NOW FULLY CHARACTERIZED: every system_server generation dies ~3–25s after addService(appops), in/around a signal-restarted timed futex wait, pc at the restarted svc. The remaining unknown is the exact fault mechanism at the re-executed svc — the in_syscall desync test (#216) is the decisive input.
 - Candidate fixes after #216: (1) if the tracer's state machine desyncs on nr=128 restarts → handle restart_syscall ENTRY/EXIT explicitly (sync in_syscall, passthrough); (2) if the SEGV is guest-native → the futex uaddr (0xf1a0a0c060b8-class) names the lock owner via the 6-Z271f/6-Z306i machinery.
 - Decoded artifacts kept: /home/z/twoyi/tmp/libc-decode/ (apex libc.so + Build ID), art212/art213/art214/art215 artifact bundles.
+
+---
+Task ID: 19h
+Agent: Z.ai Code (main session, continued)
+Task: Decode #216/#217 (in_syscall verdict + abort-message catch); close the session leg with the consolidated decision tree.
+
+Work Log:
+- **#216 (28a82d4) decode**: ONE lineage capture — gen death by SIGABRT at +327.0s with **in_syscall(tracer)=false** — the tracer's ENTRY/EXIT state machine is EXONERATED for that death. pc = libc+0xfed0 (row-relative) = file 0x4aed0 = the RETURN ADDRESS after the svc (NOT rewound this time); x8=128/x1=0x89 again (restarted futex context); LR = libc file 0x3fab8 (an unnamed local bionic helper in the pthread-wait family). The tracer did NOT desync; the deaths are GUEST-NATIVE.
+- LANDED 6-Z306af-g (17c17df): the abort-message catch at the first traced ENTRY after the PR_SET_VMA('abort message') naming (covers aborts that never pass a traced tgkill — the #216 case). Gates: fmt/clippy/832 tests; CI GREEN.
+- **#217 (17c17df) decode**: TWO lineage captures — SIGABRT +170.0s and SIGSEGV +320.1s, BOTH with **in_syscall(tracer)=true** and NO abort-message VMA naming. So: (a) the in_syscall verdict VARIES per death (false in #216, true in #217) — the deaths are not one single syscall-context; (b) the SIGABRT class without an abort message did NOT go through android_set_abort_message (a bare abort()/forced signal).
+- CONSOLIDATED DEATH CHARACTERIZATION (runs #210-#217): every system_server generation dies in the post-appops window (+3s to +25s after addService(appops)); modes: SIGSEGV at the restarted svc of a futex(FUTEX_WAIT_BITSET|PRIVATE) timed wait (#214/#215), SIGABRT with an 'abort message' VMA (#213, len 0x5f), SIGABRT without a message (#216/#217 gen1), exit(1) (#211). The STABLE invariants: the timed-futex context where registers were captured (x1=0x89, x8=128), the post-appops timing, and the binder-conn collapse at the death moment.
+- Session totals: 7 production commits (ac73e3d, f503861, c2ef627, 575bb8d, e1610d3, 28a82d4, 17c17df) — the complete 6-Z306af death-site instrument family — plus the #211-#217 decode chain. TWRP gate #8069 GREEN (recovery safe on the mirror-era SM). kr64-tests GREEN on every head. webDevReview cron active throughout.
+
+Stage Summary / HANDOFF:
+1. The mission moved from "unnamed silent generation deaths" to a fully characterized death class with per-mode instruments. Rung remains 7 (honest); system_server still dies before completing the AMS constructor era.
+2. NEXT-SESSION DECISION TREE (in order):
+   a. The dying thread's OWN syscall trail (the current "last 24 ALL" ring interleaves other pids) — make the EXIT-event capture dump the 6-Z306y per-pid trail for the dying TID (it exists for direct fork children; system_server gens ARE direct fork children — z306y_trail should have them!) — resolve which syscall the in_syscall=true deaths were inside (binder ioctl? openat?).
+   b. The #213-style abort message (len 0x5f) — if a run reproduces the with-message SIGABRT, the 6-Z306af-g catch names it verbatim; that message is the root-cause string.
+   c. If the deaths trace to the binder wire-lock waits (the shlib's 8s REPLY_TIMEOUT waits sit on exactly this futex class), the fix is in the shlib's timeout/wedge-recovery path — audit twoyi_loader_shlib.c's reply-timeout machinery against the storm-era service deaths (a wedged service + an 8s wait + a timed-out re-transact could hit the 6-Z306ac-era LOCAL flat state machine).
+   d. Keep re-dispatching per fix; rung 8 (SystemUI/launcher) is expected to fall once a generation survives the AMS constructor era ("activity" registration is the next wire milestone).
+3. Known-good state: TWRP/OrangeFox recovery corpus GREEN on the current SM arms; kr64-tests 832/832; the storm (init's HAL crash-loop, ~120-220 SIGSEGVs/run) remains pre-existing and non-blocking-but-noisy; the boot watch stays 420s.
