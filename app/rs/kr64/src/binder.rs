@@ -4204,6 +4204,45 @@ fn flat_at_first_binder_offset_pos(blob: &RequestBlob) -> Option<usize> {
     None
 }
 
+// ─── 6-Z306am: Task-21 mirror A/B (mandated by the #224/#226 decode tree) ───
+//
+// ARM B (ACTIVE): the registration tails' IN-TRANSACTION mirror — the
+// [BR_ACQUIRE] prefix that 6-Z306ae-e prepends to the same-ioctl
+// [BR_TRANSACTION_COMPLETE][BR_REPLY] batch — is SKIPPED for
+// self-transactions (issuer conn == owner conn; tautologically true at
+// addService: a service registers itself). The hypothesis under test
+// (Task-21 sharpened, #220/#222/#224-#227 gen-1 witnesses): the prefix
+// mis-sequences a same-conn waitForResponse and wedges the registering
+// process (the Watchdog SIGKILL class with the garbage-futex-address
+// witness, uaddr=-512).
+//
+// Liveness is PRESERVED: the skipped acquire rides the PRE-6-Z306ae-e
+// path — a `DeferredReply::RefCmd` on the issuer's reply_queue,
+// delivered on its NEXT read (the same delivery the old-owner RELEASE
+// already uses; the delivery re-checks the liveness gate and pads
+// BR_NOOP when the object died). Ladder #207's free-then-acquire race
+// therefore reopens BY CONSTRUCTION — accepted, bounded, and itself
+// diagnostic: if the wedge disappears anyway, the PREFIX was the wedge;
+// if the #207 HAL-carnage class explodes instead, the in-transaction
+// placement is load-bearing (both verdicts drive the permanent redesign).
+//
+// ARM A (baseline): `false` → the current prefix behavior. The verdict
+// flips this const (or deletes the gate) and the winning shape becomes
+// permanent.
+const Z306AM_SELF_MIRROR_PREFIX_OFF: bool = true;
+
+/// 6-Z306am: bounded arm-B skip log — the first 24 skips per boot, then
+/// silent (the registration storm makes this line hot).
+static Z306AM_SKIP_LOG: AtomicU32 = AtomicU32::new(24);
+
+/// 6-Z306am: should the registration tail's in-transaction mirror be
+/// skipped in favor of a queue-delivered acquire? `issuer`/`owner` stay
+/// parameters so a later refinement (same-PID cross-conn self-traffic)
+/// reuses the gate unchanged.
+fn z306am_skip_prefix(issuer: ConnId, owner: ConnId) -> bool {
+    Z306AM_SELF_MIRROR_PREFIX_OFF && issuer == owner
+}
+
 fn servicemanager_proxy(
     code: u32,
     bus: &Arc<Mutex<BusState>>,
@@ -4498,10 +4537,30 @@ fn servicemanager_proxy(
             // 6-Z306ae-e: mirror the registry's strong node ref IN THIS
             // IOCTL (liveness-gated) — the owner's incStrong runs while
             // the registering thread's JNI temporary sp<> is alive.
+            // 6-Z306am: arm B gates the PREFIX off for self-transactions
+            // and re-routes the acquire through the liveness-gated
+            // RefCmd queue (see the gate's header comment).
             if ptr != 0 {
                 let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
                 if mirror_ref_ok(gpid, ptr, cookie) {
-                    mirror = Some((BR_ACQUIRE, ptr, cookie));
+                    if z306am_skip_prefix(conn_id, conn_id) {
+                        if let Some(bx) = b.conns.get_mut(&conn_id) {
+                            bx.reply_queue.push_back(DeferredReply::RefCmd {
+                                br: BR_ACQUIRE,
+                                ptr,
+                                cookie,
+                            });
+                        }
+                        if Z306AM_SKIP_LOG.load(Ordering::Relaxed) > 0 {
+                            Z306AM_SKIP_LOG.fetch_sub(1, Ordering::Relaxed);
+                            info!(
+                                "[KR64][binder][svc] 6-Z306am: arm B — prefix SKIPPED (self-tx) name='{}' conn={} ptr=0x{:x} cookie=0x{:x} → liveness RefCmd queued",
+                                name, conn_id, ptr, cookie
+                            );
+                        }
+                    } else {
+                        mirror = Some((BR_ACQUIRE, ptr, cookie));
+                    }
                 }
             }
             // Reply body: void (header only) per 6-Z114 §3.3.
@@ -5238,9 +5297,29 @@ fn servicemanager_hidl(
                 b.fire_registration_callbacks(&name, h, false);
                 // 6-Z306ae-e: mirror the registry's strong node ref IN
                 // THIS IOCTL (liveness-gated) — decided inside the lock.
+                // 6-Z306am: arm B gates the PREFIX off for self-
+                // transactions and re-routes the acquire through the
+                // liveness-gated RefCmd queue (see the gate's header).
                 let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
                 if ptr != 0 && mirror_ref_ok(gpid, ptr, cookie) {
-                    mirror = Some((BR_ACQUIRE, ptr, cookie));
+                    if z306am_skip_prefix(conn_id, conn_id) {
+                        if let Some(bx) = b.conns.get_mut(&conn_id) {
+                            bx.reply_queue.push_back(DeferredReply::RefCmd {
+                                br: BR_ACQUIRE,
+                                ptr,
+                                cookie,
+                            });
+                        }
+                        if Z306AM_SKIP_LOG.load(Ordering::Relaxed) > 0 {
+                            Z306AM_SKIP_LOG.fetch_sub(1, Ordering::Relaxed);
+                            info!(
+                                "[KR64][binder][svc] 6-Z306am: arm B — prefix SKIPPED (self-tx) HIDL add '{}' conn={} ptr=0x{:x} cookie=0x{:x} → liveness RefCmd queued",
+                                name, conn_id, ptr, cookie
+                            );
+                        }
+                    } else {
+                        mirror = Some((BR_ACQUIRE, ptr, cookie));
+                    }
                 }
                 h
             };
@@ -5411,9 +5490,29 @@ fn servicemanager_hidl(
                 b.fire_registration_callbacks(&key, h, false);
                 // 6-Z306ae-e: mirror the registry's strong node ref IN
                 // THIS IOCTL (liveness-gated) — decided inside the lock.
+                // 6-Z306am: arm B gates the PREFIX off for self-
+                // transactions and re-routes the acquire through the
+                // liveness-gated RefCmd queue (see the gate's header).
                 let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
                 if ptr != 0 && mirror_ref_ok(gpid, ptr, cookie) {
-                    mirror = Some((BR_ACQUIRE, ptr, cookie));
+                    if z306am_skip_prefix(conn_id, conn_id) {
+                        if let Some(bx) = b.conns.get_mut(&conn_id) {
+                            bx.reply_queue.push_back(DeferredReply::RefCmd {
+                                br: BR_ACQUIRE,
+                                ptr,
+                                cookie,
+                            });
+                        }
+                        if Z306AM_SKIP_LOG.load(Ordering::Relaxed) > 0 {
+                            Z306AM_SKIP_LOG.fetch_sub(1, Ordering::Relaxed);
+                            info!(
+                                "[KR64][binder][svc] 6-Z306am: arm B — prefix SKIPPED (self-tx) HIDL addWithChain '{}' conn={} ptr=0x{:x} cookie=0x{:x} → liveness RefCmd queued",
+                                key, conn_id, ptr, cookie
+                            );
+                        }
+                    } else {
+                        mirror = Some((BR_ACQUIRE, ptr, cookie));
+                    }
                 }
                 h
             };
@@ -10315,5 +10414,26 @@ mod tests {
         // Short payloads never panic.
         assert_eq!(parse_ident_payload(&[]), (0, 0, 0, 0));
         assert_eq!(parse_ident_payload(&[1, 2, 3]), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn z306am_gate_shape_matches_the_ab_arm() {
+        // 6-Z306am: the gate is arm-shaped — the ACTIVE arm (B) skips the
+        // prefix for self-transactions (issuer == owner, tautological at
+        // the registration tails); a cross-conn issuer never skips (the
+        // registration tails cannot produce one today, but the gate keeps
+        // the predicate so a same-PID cross-conn refinement reuses it).
+        if Z306AM_SELF_MIRROR_PREFIX_OFF {
+            assert!(z306am_skip_prefix(7, 7), "arm B: self-tx skips the prefix");
+            assert!(
+                !z306am_skip_prefix(7, 9),
+                "arm B: cross-conn keeps the in-transaction mirror"
+            );
+        } else {
+            assert!(
+                !z306am_skip_prefix(7, 7) && !z306am_skip_prefix(7, 9),
+                "arm A: the gate is inert — prefix behavior identical to 6-Z306ae-e"
+            );
+        }
     }
 }
