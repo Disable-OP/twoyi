@@ -1992,17 +1992,21 @@ impl BusState {
             }
             // 6-Z306ae: the OLD owner loses its registry strong ref
             // (kernel: the old handle's node ref drops → BR_RELEASE to
-            // the old owner's process).
+            // the old owner's process). Gated on the ref invariant —
+            // see mirror_ref_ok.
             let old_owner = entry.owner;
             let old_ptr = entry.ptr;
             let old_cookie = entry.cookie;
             if old_owner != owner && old_ptr != 0 {
-                if let Some(ob) = self.conns.get_mut(&old_owner) {
-                    ob.reply_queue.push_back(DeferredReply::RefCmd {
-                        br: BR_RELEASE,
-                        ptr: old_ptr,
-                        cookie: old_cookie,
-                    });
+                let old_pid = self.conns.get(&old_owner).map(|c| c.sender_pid).unwrap_or(0);
+                if mirror_ref_ok(old_pid, old_ptr, old_cookie) {
+                    if let Some(ob) = self.conns.get_mut(&old_owner) {
+                        ob.reply_queue.push_back(DeferredReply::RefCmd {
+                            br: BR_RELEASE,
+                            ptr: old_ptr,
+                            cookie: old_cookie,
+                        });
+                    }
                 }
             }
             // Native servicemanager "overwrite" semantics: same name →
@@ -2013,14 +2017,19 @@ impl BusState {
             // 6-Z306ae: the registry handle now holds a strong node ref
             // on the NEW object — mirror it to the new owner BEFORE the
             // addService reply unblocks the registering thread (whose
-            // JNI temporary sp<> is the last userspace ref).
+            // JNI temporary sp<> is the last userspace ref). Gated on
+            // refs->refBase()==cookie (mirror_ref_ok) — a bad capture
+            // must not be dereferenced inside the guest.
             if ptr != 0 {
-                if let Some(nb) = self.conns.get_mut(&owner) {
-                    nb.reply_queue.push_back(DeferredReply::RefCmd {
-                        br: BR_ACQUIRE,
-                        ptr,
-                        cookie,
-                    });
+                let new_pid = self.conns.get(&owner).map(|c| c.sender_pid).unwrap_or(0);
+                if mirror_ref_ok(new_pid, ptr, cookie) {
+                    if let Some(nb) = self.conns.get_mut(&owner) {
+                        nb.reply_queue.push_back(DeferredReply::RefCmd {
+                            br: BR_ACQUIRE,
+                            ptr,
+                            cookie,
+                        });
+                    }
                 }
             }
             return entry.handle;
@@ -2041,13 +2050,17 @@ impl BusState {
         self.by_handle.insert(h, name.to_string());
         // 6-Z306ae: mirror the registry's strong node ref to the owner
         // (queued BEFORE this arm's addService reply — see RefCmd).
+        // Gated on refs->refBase()==cookie (mirror_ref_ok).
         if ptr != 0 {
-            if let Some(nb) = self.conns.get_mut(&owner) {
-                nb.reply_queue.push_back(DeferredReply::RefCmd {
-                    br: BR_ACQUIRE,
-                    ptr,
-                    cookie,
-                });
+            let new_pid = self.conns.get(&owner).map(|c| c.sender_pid).unwrap_or(0);
+            if mirror_ref_ok(new_pid, ptr, cookie) {
+                if let Some(nb) = self.conns.get_mut(&owner) {
+                    nb.reply_queue.push_back(DeferredReply::RefCmd {
+                        br: BR_ACQUIRE,
+                        ptr,
+                        cookie,
+                    });
+                }
             }
         }
         h
@@ -3495,14 +3508,28 @@ fn handle_write_read(
                     // 6-Z306ae: kernel node-ref mirror — the owner's
                     // IPCThreadState handles BR_ACQUIRE (incStrong on the
                     // local BBinder + BC_ACQUIRE_DONE back to us) and
-                    // BR_RELEASE (deferred decStrong) natively.
-                    read_buf.extend_from_slice(&br.to_ne_bytes());
-                    read_buf.extend_from_slice(&ptr.to_ne_bytes());
-                    read_buf.extend_from_slice(&cookie.to_ne_bytes());
-                    info!(
-                        "[KR64][binder][vm{}] 6-Z306ae: node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
-                        vm_id, conn_id, br, ptr, cookie
-                    );
+                    // BR_RELEASE (deferred decStrong) natively. Re-check
+                    // the ref invariant at delivery: the object may have
+                    // died between enqueue and this read — an incStrong
+                    // on a freed cookie is the #204 crash storm.
+                    let dpid2 = {
+                        let b = bus.lock().expect("binder bus poisoned");
+                        b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                    };
+                    if mirror_ref_ok(dpid2, ptr, cookie) {
+                        read_buf.extend_from_slice(&br.to_ne_bytes());
+                        read_buf.extend_from_slice(&ptr.to_ne_bytes());
+                        read_buf.extend_from_slice(&cookie.to_ne_bytes());
+                        info!(
+                            "[KR64][binder][vm{}] 6-Z306ae: node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
+                            vm_id, conn_id, br, ptr, cookie
+                        );
+                    } else {
+                        // Skipped by the invariant gate — never hand the
+                        // guest an empty read buffer (kernel semantics:
+                        // every BINDER_WRITE_READ returns at least BR_NOOP).
+                        push_br_noop(&mut read_buf);
+                    }
                 }
             }
             reply_delivered = true;
@@ -6146,6 +6173,47 @@ fn probe_flat_mem(
     );
 }
 
+/// 6-Z306ae-b: the kernel's own node-ref invariant — a BR_ACQUIRE is
+/// only deliverable when the captured pair satisfies
+/// `refs->refBase() == obj` (A11 IPCThreadState asserts it and would
+/// abort the guest otherwise). Ladder #204 showed what happens without
+/// the check: a (ptr, cookie) capture whose weakrefs' mBase != cookie
+/// (a systematic capture shift, Δ = 0x20/0x38/0x68 in the probes) made
+/// the mirror's `obj->incStrong` dereference garbage inside the guest —
+/// incWeak(NULL) at [cookie+8]=0, 1340 SIGSEGVs, rung 7 → 4. Peek the
+/// weakrefs object OUTSIDE the guest and require [ptr+8..+16] ==
+/// cookie; skip the mirror (keeping the pre-mirror behavior) when the
+/// capture fails the invariant.
+fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
+    if guest_pid <= 0 || ptr == 0 || cookie == 0 {
+        return false;
+    }
+    match crate::ptrace_emu::peek_guest_bytes(guest_pid, ptr, 16) {
+        Some(b) if b.len() == 16 => {
+            let mbase = u64::from_ne_bytes(b[8..16].try_into().unwrap());
+            if mbase == cookie {
+                true
+            } else {
+                info!(
+                    "[KR64][binder][svc] 6-Z306ae-b: mirror skipped — weakrefs mBase=0x{:x} != cookie=0x{:x} (capture Δ=+0x{:x}) pid={}",
+                    mbase,
+                    cookie,
+                    mbase.wrapping_sub(cookie),
+                    guest_pid
+                );
+                false
+            }
+        }
+        _ => {
+            info!(
+                "[KR64][binder][svc] 6-Z306ae-b: mirror skipped — weakrefs at ptr=0x{:x} unreadable pid={}",
+                ptr, guest_pid
+            );
+            false
+        }
+    }
+}
+
 /// Push `[BR_REPLY][binder_transaction_data]` with `tr.data_size` and
 /// `tr.offsets_size` stamped from the reply parcel; `tr.data_ptr` and
 /// `tr.offsets_ptr` stay 0 on the wire — the v2 client patches them from
@@ -7298,33 +7366,6 @@ mod tests {
         p
     }
 
-    // 6-Z306ae: consume the registry's strong-ref mirror from the owner's
-    // read stream — [BR_ACQUIRE][ptr][cookie] now legitimately precedes
-    // pending work (kernel-faithful node-ref notification, delivered
-    // before the addService reply unblocks the registering thread).
-    fn drain_ref_mirror(s: &mut UnixStream, expect_ptr: u64, expect_cookie: u64) {
-        let mut wr = Vec::new();
-        wr.extend_from_slice(&0u32.to_ne_bytes());
-        wr.extend_from_slice(&4096u32.to_ne_bytes());
-        let (r, resp) = exchange(s, BINDER_WRITE_READ, &wr);
-        assert_eq!(r, 0, "ref-mirror drain ok");
-        assert_eq!(
-            u32::from_ne_bytes(resp[4..8].try_into().unwrap()),
-            BR_ACQUIRE,
-            "6-Z306ae: BR_ACQUIRE mirror precedes pending work"
-        );
-        assert_eq!(
-            u64::from_ne_bytes(resp[8..16].try_into().unwrap()),
-            expect_ptr,
-            "mirror ptr = the registered weakrefs"
-        );
-        assert_eq!(
-            u64::from_ne_bytes(resp[16..24].try_into().unwrap()),
-            expect_cookie,
-            "mirror cookie = the registered BBinder"
-        );
-    }
-
     #[test]
     fn z271_bus_full_guest_to_guest_transaction_round_trip() {
         let rootfs = tmpdir();
@@ -7359,7 +7400,6 @@ mod tests {
             "ADD replies with BR_REPLY"
         );
         let _ = read_size;
-        drain_ref_mirror(&mut stream_a, 0x1234, 0x5678);
 
         // ---- Connection B: getService("svc_a") → routed handle ----
         let mut stream_b = UnixStream::connect(&path).expect("connect B");
@@ -7660,7 +7700,6 @@ mod tests {
         let payload = make_v2_write_read_payload(&bc, &ad, &ao, 4096);
         let (ret, _resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
         assert_eq!(ret, 0, "ADD_SERVICE ok");
-        drain_ref_mirror(&mut stream, 0xaaaa, 0xbeef);
 
         let mut args2 = ParcelWriter::new();
         args2.write_string16("self_svc");
@@ -7794,7 +7833,6 @@ mod tests {
             let p = make_v2_write_read_payload(&bc, &d, &o, 4096);
             let (r, _) = exchange(&mut s, BINDER_WRITE_READ, &p);
             assert_eq!(r, 0, "addService({name})");
-            drain_ref_mirror(&mut s, 0x1111, cookie);
             s
         };
         // Helper: getService from a connection, return the handle.
