@@ -4076,26 +4076,60 @@ fn servicemanager_proxy(
                     None => (STABILITY_ANNOTATION_VINTF, STABILITY_ANNOTATION_NULL),
                 }
             };
-            match b.services.get(&name).map(|e| e.handle) {
-                Some(handle) => {
+            let entry_info = b
+                .services
+                .get(&name)
+                .map(|e| (e.handle, e.owner, e.ptr, e.cookie));
+            match entry_info {
+                Some((handle, owner, ptr, cookie)) => {
+                    // 6-Z306ac: SAME-PROCESS LOOKUP = LOCAL BINDER. The
+                    // kernel returns BINDER_TYPE_BINDER (cookie = the
+                    // owner's BBinder*) when the lookup comes from the
+                    // OWNER connection — the node lives in the requester's
+                    // process and `unflattenBinder` decodes the LOCAL
+                    // object (no proxy). Serving a HANDLE to the owner made
+                    // the client build a BinderProxy for its OWN local
+                    // service; SystemServer's
+                    //   (PlatformCompat) ServiceManager.getService("platform_compat")
+                    // (ActivityManagerService:2597) then threw
+                    //   ClassCastException: BinderProxy cannot be cast to PlatformCompat
+                    // and startBootstrapServices died — ladder #198's rung-6
+                    // wall.
+                    let is_owner = owner == conn_id;
                     if let Some(bx) = b.conns.get_mut(&conn_id) {
                         bx.sm_last_was_hit = true; // 6-Z306ab: flip signal
                     }
-                    let obj = FlatBinderObject {
-                        r#type: BINDER_TYPE_HANDLE,
-                        flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
-                        binder: handle as u64,
-                        cookie: 0,
+                    let obj = if is_owner {
+                        FlatBinderObject {
+                            r#type: BINDER_TYPE_BINDER,
+                            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                            binder: ptr,
+                            cookie,
+                        }
+                    } else {
+                        FlatBinderObject {
+                            r#type: BINDER_TYPE_HANDLE,
+                            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                            binder: handle as u64,
+                            cookie: 0,
+                        }
                     };
                     writer.write_flat_binder(&obj);
                     // 6-Z271x: a stability annotation follows the flat;
                     // 6-Z306ab: the form (plain Level vs A12 Category)
                     // self-tunes per connection — see the flip block above.
                     writer.write_i32(ann_hit);
-                    info!(
-                        "[KR64][binder][svc] getService({}) hit → handle 0x{:08x}",
-                        name, handle
-                    );
+                    if is_owner {
+                        info!(
+                            "[KR64][binder][svc] getService({}) hit → LOCAL binder (owner conn={}, ptr=0x{:x}, cookie=0x{:x})",
+                            name, conn_id, ptr, cookie
+                        );
+                    } else {
+                        info!(
+                            "[KR64][binder][svc] getService({}) hit → handle 0x{:08x}",
+                            name, handle
+                        );
+                    }
                 }
                 None => {
                     if let Some(bx) = b.conns.get_mut(&conn_id) {
@@ -6737,8 +6771,9 @@ mod tests {
     }
 
     /// ADD_SERVICE then GET_SERVICE over the v2 wire: the GET reply must
-    /// carry a `BINDER_TYPE_HANDLE` flat object whose `binder` field
-    /// equals the proxy-allocated handle, listed in the offsets array.
+    /// carry the LOCAL flat object (6-Z306ac: the owner-conn lookup —
+    /// BINDER_TYPE_BINDER with the registered ptr/cookie), listed in the
+    /// offsets array.
     #[test]
     fn servicemanager_proxy_v2_add_then_get_returns_handle() {
         let rootfs = tmpdir();
@@ -6839,9 +6874,15 @@ mod tests {
         assert_eq!(status2, 0, "GET reply status = EX_NONE");
         // Flat-object layout (24 bytes): u32 type, u32 flags, u64 binder, u64 cookie.
         let flat_type = u32::from_ne_bytes(blob2[4..8].try_into().unwrap());
+        // 6-Z306ac: the lookup comes from the OWNER connection (this same
+        // stream registered "my_svc" above) — the kernel-binder semantic
+        // is a LOCAL flat: BINDER_TYPE_BINDER with the registering
+        // process's own ptr/cookie, NOT a handle. SystemServer's
+        // `(PlatformCompat) ServiceManager.getService("platform_compat")`
+        // (AMS:2597) depends on this: a proxy would ClassCastException.
         assert_eq!(
-            flat_type, BINDER_TYPE_HANDLE,
-            "GET hit → BINDER_TYPE_HANDLE"
+            flat_type, BINDER_TYPE_BINDER,
+            "owner-conn GET hit → LOCAL BINDER_TYPE_BINDER (6-Z306ac)"
         );
         // 6-Z271x: the stability annotation follows the flat; 6-Z306ab:
         // the FIRST get on a fresh conn serves the android-11 PLAIN
@@ -6853,17 +6894,18 @@ mod tests {
             stability, STABILITY_ANNOTATION_VINTF,
             "GET hit → plain android-11 VINTF level (63) on a fresh connection"
         );
-        // The proxy handle lives in the `binder` u64 field (low 32 bits on
-        // remote refs — 6-Z114 §3.2).
-        let flat_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
-        // 6-Z271/6-Z298: the four in-proxy virtual services are
-        // registered at proxy construction (handles 0xF0000001-4 — the
-        // 6-Z298 health service is the fourth), so the first GUEST
-        // service allocates 0xF0000005.
+        // The LOCAL flat carries the registering parcel's ptr/cookie
+        // (the client's unflattenBinder decodes the object straight from
+        // flat.cookie — the kernel's same-process semantic).
+        let local_ptr = u64::from_ne_bytes(blob2[12..20].try_into().unwrap());
+        let local_cookie = u64::from_ne_bytes(blob2[20..28].try_into().unwrap());
         assert_eq!(
-            flat_handle,
-            PROXY_HANDLE_BASE + 5,
-            "proxy handle = 0xF0000000 + 5 (after the 4 virtual services)"
+            local_ptr, 0xdead,
+            "local flat.binder = the registered ptr"
+        );
+        assert_eq!(
+            local_cookie, 0xbeef,
+            "local flat.cookie = the registered cookie"
         );
         // The reply offsets array must list the flat object's offset (= 4,
         // after the i32 status prefix).
@@ -7412,12 +7454,17 @@ mod tests {
         let o2 = 4 + rs2 + 8;
         let dl2 = u32::from_ne_bytes(resp2[o2..o2 + 4].try_into().unwrap()) as usize;
         let blob2 = &resp2[o2 + 12..o2 + 12 + dl2];
-        let self_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+        let self_ptr = u64::from_ne_bytes(blob2[12..20].try_into().unwrap());
+        // 6-Z306ac: the OWNER-conn GET now returns the LOCAL flat (the
+        // kernel's same-process semantic) — ptr/cookie, not a handle.
         assert_eq!(
-            self_handle,
-            PROXY_HANDLE_BASE + 5,
-            "own service handle (after the 4 virtual services)"
+            self_ptr, 0xaaaa,
+            "owner-conn GET → LOCAL flat.binder = the registered ptr"
         );
+        // The proxy still allocated the ROUTING handle (first guest
+        // service after the 4 in-proxy virtuals) — used below to drive
+        // the self-transaction round trip.
+        let self_handle = PROXY_HANDLE_BASE + 5;
 
         // ---- transact(code=7) on the OWN handle ----
         let mut tx = [0u8; 64];
