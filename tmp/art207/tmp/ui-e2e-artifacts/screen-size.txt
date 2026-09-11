@@ -1,0 +1,3 @@
+wm: Physical size: 720x1600
+uiautomator: 720x1600
+final: 720x1600
