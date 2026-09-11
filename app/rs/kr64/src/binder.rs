@@ -1998,7 +1998,11 @@ impl BusState {
             let old_ptr = entry.ptr;
             let old_cookie = entry.cookie;
             if old_owner != owner && old_ptr != 0 {
-                let old_pid = self.conns.get(&old_owner).map(|c| c.sender_pid).unwrap_or(0);
+                let old_pid = self
+                    .conns
+                    .get(&old_owner)
+                    .map(|c| c.sender_pid)
+                    .unwrap_or(0);
                 if mirror_ref_ok(old_pid, old_ptr, old_cookie) {
                     if let Some(ob) = self.conns.get_mut(&old_owner) {
                         ob.reply_queue.push_back(DeferredReply::RefCmd {
@@ -2021,7 +2025,11 @@ impl BusState {
             // refs->refBase()==cookie (mirror_ref_ok) — a bad capture
             // must not be dereferenced inside the guest.
             if ptr != 0 {
-                let new_pid = self.conns.get(&owner).map(|c| c.sender_pid).unwrap_or(0);
+                let new_pid = self
+                    .conns
+                    .get(&owner)
+                    .map(|c| c.sender_pid)
+                    .unwrap_or(0);
                 if mirror_ref_ok(new_pid, ptr, cookie) {
                     if let Some(nb) = self.conns.get_mut(&owner) {
                         nb.reply_queue.push_back(DeferredReply::RefCmd {
