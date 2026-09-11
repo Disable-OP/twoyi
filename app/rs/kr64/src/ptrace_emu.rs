@@ -15694,12 +15694,14 @@ pub fn run_ptrace_loop(
         // the EXIT stop returns, and the normal flow continues — the
         // honest supervisor action (never a fake success, never a kill).
         // op=NONE (a group-stop) and failed queries (running/blocked-in-
-        // kernel) are never resumed — but since #230 they are no longer
-        // SILENT: the -o arm names a non-ENTRY park that PERSISTS across
-        // two passes (once/pid), and the -r arm reconciles a failed
+        // kernel) are never resumed on a BLIP — but a park that PERSISTS
+        // across two passes is the #231-proven forgotten-resume class
+        // (pid 5144's exit-event stop, consumed by the 6-Z89 ESRCH flow
+        // and never answered): the -o arm records the evidence once/pid
+        // and completes the owed resume. The -r arm reconciles a failed
         // query against /proc/<pid>/syscall (once/pid, 64/boot). The
-        // intervention remains exclusive to the ENTRY class.
-        // Budget: 4 interventions/pid.
+        // intervention stays exclusive to the two forgotten-resume
+        // classes. Budget: 4 interventions/pid.
         if stall_tick % 256 == 0 {
             let now_an = std::time::Instant::now();
             let an_candidates: Vec<libc::pid_t> = last_stop_at
@@ -15773,22 +15775,53 @@ pub fn run_ptrace_loop(
                         // 6-Z306an-o: a park must PERSIST across two
                         // passes (≥25 s apart — the 30 s cooldown makes
                         // consecutive visits that far apart) before it
-                        // is named: a fresh, still-unconsumed stop (the
-                        // 6-Z305t-18 probe's own armed SIGSTOP waiting
-                        // for the main loop's arm, or any stop queued
-                        // mid-dispatch) clears within one loop
+                        // is acted on: a fresh, still-unconsumed stop
+                        // (the 6-Z305t-18 probe's own armed SIGSTOP
+                        // waiting for the main loop's arm, or any stop
+                        // queued mid-dispatch) clears within one loop
                         // iteration and must never read as a
-                        // consumed-never-answered park. Evidence ONLY —
-                        // no resume, no kill; the class must first be
-                        // proven to exist in the wild before any
-                        // intervention is designed for it.
+                        // consumed-never-answered park.
+                        //
+                        // #231 EVIDENCE (the class is now PROVEN): the
+                        // once-persistent park was pid 5144 — its stop
+                        // status 0x6057f (SIGTRAP + PTRACE_EVENT_EXIT)
+                        // was consumed by the 6-Z89 ESRCH flow, which
+                        // declared "resuming it via the scan below" and
+                        // NEVER resumed — the tracee sat pinned in its
+                        // own exit-event stop for 90+ s, unreapable,
+                        // invisible to every SIGSTOP probe (a tracee
+                        // parked in a ptrace-stop never reports new
+                        // stops). GETSYSCALL_INFO answers op=NONE for
+                        // event-stops AND group-stops AND undelivered
+                        // signal-delivery stops alike — in ALL three
+                        // subclasses a ≥25 s park means the loop
+                        // consumed an event and never answered it, and
+                        // the honest completion is the resume the
+                        // design already owed: force PTRACE_SYSCALL —
+                        // the exit-event tracee dies and is reaped (the
+                        // 6-Z89 flow's own promise), a group-stop tracee
+                        // proceeds (exactly what the 6-Z305t-18 probe
+                        // does on purpose), a signal-delivery stop was
+                        // already lost by the consume-without-reinject.
+                        // Never a fake success, never a kill. Budget:
+                        // the shared 4/pid + 30 s cooldown.
                         let first = *z306ano_seen.entry(ap).or_insert(now_an);
                         let held = now_an.duration_since(first).as_secs();
                         if held >= 25 && z306ano_named.insert(ap) {
                             log(&format!(
-                                "6-Z306an-o: pid={} PARKED ≥25s in an op={} ptrace stop (park held {}s, last consumed stop {}s ago) — a stop the tracer consumed but never answered (op=0 group-stop/undelivered-signal class; evidence-only, no intervention)",
-                                ap, op, held, age
+                                "6-Z306an-o: pid={} PARKED ≥25s in an op={} ptrace stop (park held {}s, last consumed stop {}s ago) — a stop the tracer consumed but never answered (#231 class: exit-event/group-stop forgotten resume); forcing PTRACE_SYSCALL resume (intervention {}/4)",
+                                ap, op, held, age,
+                                ab + 1
                             ));
+                            z306an_budget.insert(ap, ab + 1);
+                            let rc = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, ap, 0, 0) };
+                            if rc != 0 {
+                                log(&format!(
+                                    "6-Z306an-o: resume pid={} FAILED (errno={}) — the ESRCH/reap flow handles it",
+                                    ap,
+                                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                                ));
+                            }
                         }
                     }
                     None => {
