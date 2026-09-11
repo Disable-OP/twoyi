@@ -27990,3 +27990,17 @@ Stage Summary / NEXT-SESSION DECISION TREE:
 2. **The A/B stays OPEN at arm B** (const remains true) until a run REACHES the wedge era; the zero-violent-death run is recorded as the arm-B baseline. Do NOT flip to arm A on this run's evidence.
 3. The wrong-fd binder ioctls (fd 0/28 ENOTTY ×491) are a shlib per-fd device-table suspect — audit whether closed/reused fds leak stale device entries (6-Z306ai machinery), but do NOT couple it to the wedge fix.
 4. Known-good: TWRP gate GREEN on the arm-B era; kr64-tests 838/838; the queue-delivered acquire path (613 deliveries) is validated as the mirror fallback.
+---
+Task ID: 24c (continuation — 6-Z306an landed, #229 dispatched)
+Agent: Z.ai Code (main session, continued)
+Task: Execute decision-tree item 1a — land the forgotten-resume watchdog (6-Z306an); dispatch the next ladder.
+
+Work Log:
+- LANDED 6-Z306an (682dad1): the tracer now discriminates "consumed ENTRY but never resumed" (#228's zygote wall — a write to the REAL /dev/null sat in a ptrace-stop for 315s while the 6-Z305t-18 SIGSTOP probe timed out, because a tracee parked in a ptrace-stop never reports new stops) from the legitimate blocked-in-kernel class (futex/poll waiters), via PTRACE_GET_SYSCALL_INFO (0x420e): op=PTRACE_SYSCALL_INFO_ENTRY ⇒ parked at its entry stop ⇒ the design-required resume was forgotten ⇒ force PTRACE_SYSCALL (the honest supervisor action — never a fake success, never a kill); other ops / failed queries are left alone silently. Budget 4 interventions/pid/boot, 30s cooldown, 3s detection floor. z306an_parse_syscall_info (LP64: op@0, nr@24, args@32) is unit-tested; z306an_query_entry_stop wraps the raw query (ESRCH → None).
+- The fix IS the resume: the pending syscall executes for real, the EXIT stop returns, and the main loop's normal flow continues. If the #228 wedge was the forget-resume class, #229 breaks through it within ~3s of parking and the zygote reaches forkSystemServer; if the tracee is genuinely kernel-blocked instead, the watchdog stays silent and the hunt moves to the fd-2 reader (the 6-Z305t-24 svclog/pipe narrative).
+- Gates: fmt clean; clippy -D warnings clean; 839/839 tests (838 + z306an).
+- Pushed bb82581..682dad1. Verified zero runs in flight (anti-duplication) → DISPATCHED ladder ui-e2e-android-arm64.yml boot_wait 420 on 682dad1 → run pending (HTTP 204).
+
+Stage Summary:
+- #229 decode tree: (i) "6-Z306an: FORGOTTEN-RESUME" lines present + zygote forks system_server ("System server process" / addService(activity)) ⇒ the forget-resume class CONFIRMED — next find WHICH arm drops the resume (bounded audit of rewrite paths) and consider it fixed-by-watchdog permanently; (ii) watchdog silent + zygote still wedged at write(2) ⇒ the tracee is really blocked in-kernel ⇒ hunt the fd-2 reader (6-Z305t-24 svclog redirect vs the 6-Z306g exemption for RESTARTED zygotes — 6 restarts this run); (iii) no FORGOTTEN-RESUME lines but boot advances past rung 7 ⇒ the wedge was timing-dependent and the A/B (arm B) can now be judged on a real wedge-era run.
+- The mirror A/B stays at arm B (const true) pending a wedge-era run.
