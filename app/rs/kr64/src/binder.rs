@@ -6899,10 +6899,7 @@ mod tests {
         // flat.cookie — the kernel's same-process semantic).
         let local_ptr = u64::from_ne_bytes(blob2[12..20].try_into().unwrap());
         let local_cookie = u64::from_ne_bytes(blob2[20..28].try_into().unwrap());
-        assert_eq!(
-            local_ptr, 0xdead,
-            "local flat.binder = the registered ptr"
-        );
+        assert_eq!(local_ptr, 0xdead, "local flat.binder = the registered ptr");
         assert_eq!(
             local_cookie, 0xbeef,
             "local flat.cookie = the registered cookie"
