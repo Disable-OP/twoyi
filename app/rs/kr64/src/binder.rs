@@ -2025,11 +2025,7 @@ impl BusState {
             // refs->refBase()==cookie (mirror_ref_ok) — a bad capture
             // must not be dereferenced inside the guest.
             if ptr != 0 {
-                let new_pid = self
-                    .conns
-                    .get(&owner)
-                    .map(|c| c.sender_pid)
-                    .unwrap_or(0);
+                let new_pid = self.conns.get(&owner).map(|c| c.sender_pid).unwrap_or(0);
                 if mirror_ref_ok(new_pid, ptr, cookie) {
                     if let Some(nb) = self.conns.get_mut(&owner) {
                         nb.reply_queue.push_back(DeferredReply::RefCmd {
