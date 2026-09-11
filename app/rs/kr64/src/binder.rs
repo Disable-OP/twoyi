@@ -4369,9 +4369,8 @@ fn servicemanager_proxy(
                     let count = rb.offsets.len() / 8;
                     let mut offs_hex = String::new();
                     for i in 0..count.min(8) {
-                        let v = u64::from_ne_bytes(
-                            rb.offsets[i * 8..i * 8 + 8].try_into().unwrap(),
-                        );
+                        let v =
+                            u64::from_ne_bytes(rb.offsets[i * 8..i * 8 + 8].try_into().unwrap());
                         offs_hex.push_str(&format!("{:x} ", v));
                     }
                     if let Some(flat_off) = flat_at_first_binder_offset_pos(rb) {
