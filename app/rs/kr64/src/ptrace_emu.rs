@@ -6667,6 +6667,39 @@ fn maps_bracket_in(content: &str, addr: u64) -> String {
 /// exposes VMA names in /proc/<pid>/maps as `[anon:<name>]`, so the
 /// address needs no prctl interception at all. Capped at 192 bytes;
 /// NUL → `\0`, printable kept, other bytes `\xNN`.
+/// 6-Z306af-k: when a bionic abort message reports a Scudo ERROR with a
+/// chunk address, read the chunk's 16-byte header (the 16 bytes before
+/// the user pointer) plus the first 16 user bytes while the process's
+/// memory is still mapped — the abort path stops BEFORE the death (the
+/// tgkill ENTRY / the fatal delivery stop), so the read succeeds where
+/// the EXIT-event reads fail. The header distinguishes the corruption
+/// classes: chunk state = freed (2) → the chunk was ALREADY freed (the
+/// aborting free is a DOUBLE-FREE); checksum/magic garbage → a buffer
+/// overflow or a stray write clobbered the header.
+fn z306af_scudo_chunk_header(pid: libc::pid_t, msg: &str) -> Option<String> {
+    const NEEDLE: &str = "deallocating address ";
+    let pos = msg.find(NEEDLE)?;
+    let hex: String = msg[pos + NEEDLE.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hex.is_empty() {
+        return None;
+    }
+    let addr = u64::from_str_radix(&hex, 16).ok()?;
+    if addr < 32 {
+        return None;
+    }
+    let bytes = peek_guest_bytes(pid, addr - 16, 32)?;
+    Some(
+        bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 fn read_abort_message_vma(pid: libc::pid_t) -> Option<String> {
     let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
     let mut range: Option<(u64, u64)> = None;
@@ -21510,10 +21543,38 @@ pub fn run_ptrace_loop(
                                         Z306AF_ABORT_MSG
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         match read_abort_message_vma(pid) {
-                                            Some(msg) => log(&format!(
-                                                "6-Z306af: tgkill-ABORT pid={} abort message: {:?}",
-                                                pid, msg
-                                            )),
+                                            Some(msg) => {
+                                                log(&format!(
+                                                    "6-Z306af: tgkill-ABORT pid={} abort message: {:?}",
+                                                    pid, msg
+                                                ));
+                                                // 6-Z306af-k: the scudo
+                                                // corruption-class discriminator
+                                                // (header read at the live stop).
+                                                if msg.contains("Scudo ERROR") {
+                                                    static Z306AF_K: std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    if Z306AF_K
+                                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                                        < 8
+                                                    {
+                                                        Z306AF_K.fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                        match z306af_scudo_chunk_header(pid, &msg)
+                                                        {
+                                                            Some(hdr) => log(&format!(
+                                                                "6-Z306af-k: scudo chunk header (16B header + 16B user, low->high): {}",
+                                                                hdr
+                                                            )),
+                                                            None => log(
+                                                                "6-Z306af-k: scudo chunk header UNREADABLE at the tgkill entry",
+                                                            ),
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             None => log(&format!(
                                                 "6-Z306af: tgkill-ABORT pid={} (no abort-message VMA readable at the tgkill entry)",
                                                 pid
@@ -35267,6 +35328,26 @@ pub fn run_ptrace_loop(
                                 "6-Z305t-71i: pid={} fatal signal {} — bionic abort message: {:?} [occurrence #{} of this pid]",
                                 pid, sig, abort_msg, total
                             ));
+                            // 6-Z306af-k: the scudo corruption-class
+                            // discriminator — the memory is still mapped at
+                            // this fatal-signal delivery stop, so the header
+                            // read works here too.
+                            if abort_msg.contains("Scudo ERROR") {
+                                static Z306AF_K2: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z306AF_K2.load(std::sync::atomic::Ordering::Relaxed) < 8 {
+                                    Z306AF_K2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    match z306af_scudo_chunk_header(pid, &abort_msg) {
+                                        Some(hdr) => log(&format!(
+                                            "6-Z306af-k: scudo chunk header (16B header + 16B user, low->high): {}",
+                                            hdr
+                                        )),
+                                        None => log(
+                                            "6-Z306af-k: scudo chunk header UNREADABLE at the fatal stop",
+                                        ),
+                                    }
+                                }
+                            }
                         }
                     }
                 }
