@@ -27909,3 +27909,18 @@ Stage Summary:
 - Both proactive Task-22b instruments are in; the scudo discriminator (6-Z306ah, item a) is passive and fires on the first scudo abort.
 - #226 (next dispatch, bca96ea) carries ALL THREE: the decode decision tree is (i) scudo abort → 6-Z306ah chunk-header verdict (double-free vs overflow vs race); (ii) SIGSEGV mode → 6-Z306aj siginfo verdict (fault vs directed kill) + 6-Z306ai conn map to name the served transactions; (iii) recovery gates must stay GREEN.
 - After any verdict: the fix targets are pre-named (double-free ⇒ BC_FREE_BUFFER duplication / g_bp_reply_allocs 32-slot round-robin; overflow ⇒ v3 SG fixup order vs offsets order + HIDL onRegistration callback parcel — #223's 28ms temporal lead; directed-kill ⇒ hunt the kill() issuer via 6-Z306af-j which already names killers).
+
+---
+Task ID: 23b (continuation of the same session)
+Agent: Z.ai Code (main session, continued)
+Task: Decode the #226 failure; fix the harness; re-dispatch the boot watch.
+
+Work Log:
+- TWRP gate on 504f92f (34641583045): **GREEN** — the 6-Z306ai/aj instruments do not regress the recovery corpus.
+- **#226 (504f92f) FAILED with the IDENTICAL signature as #225** (artifacts end at 07_boot_15s + 08_progress_10s.xml) → systematic, not flake. Run-log decode: `UnicodeDecodeError: 'utf-8' codec can't decode byte 0xbf in position 55748` raised from `subprocess.run(text=True)` inside the **t=15s kmsg-live snapshot** (`run-as … cat rootfs/dev/__kmsg__`) — the guest kernel ring contains non-UTF-8 bytes; the 6-Z127 timeout guard never saw this failure class. #224 survived only because its ring decoded clean. HARNESS BUG, zero guest/proxy/tracer involvement (and #225 proved it: docs-only commit).
+- LANDED 6-Z306ak (d266a78): `errors="replace"` on every text-mode subprocess.run across ui-navigate-aosp.py / ui-navigate.py / ui-navigate-recovery-menu.py; collapsed the one pre-existing duplicated encoding/errors site; audited all 44 call sites (remaining unprotected ones are binary-mode — immune by construction). Kmsg decode failures now surface as U+FFFD in the captured evidence instead of killing the run. py-compile clean ×3.
+- Pushed 504f92f..d266a78.
+
+Stage Summary:
+- The two "failures" cost zero guest information but bought a permanent harness hardening: any future kmsg content now survives the snapshot path.
+- NEXT: dispatch ladder #227 (d266a78 — full instrument stack 6-Z306ah+ai+aj+ak) + decode per the Task-23 tree. TWRP gate not re-dispatched for a harness-only delta (guest code identical to the GREEN 504f92f gate).
