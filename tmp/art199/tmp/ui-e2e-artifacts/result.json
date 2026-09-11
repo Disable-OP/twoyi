@@ -1,0 +1,240 @@
+{
+  "suite": "android-boot-ladder",
+  "rom": "pure-stock-android11-aosp-arm64 (RSR1.210722.013.A4)",
+  "rung": 7,
+  "stage": "SURFACEFLINGER",
+  "stage_meaning": "surfaceflinger spawned",
+  "ladder": [
+    {
+      "rung": 1,
+      "stage": "ROOTFS_READY",
+      "meaning": "rootfs/init materialized"
+    },
+    {
+      "rung": 2,
+      "stage": "INIT_STARTED",
+      "meaning": "kr64 exec'd guest init"
+    },
+    {
+      "rung": 3,
+      "stage": "PROPERTY_SERVICE",
+      "meaning": "property service up"
+    },
+    {
+      "rung": 4,
+      "stage": "CORE_DAEMONS",
+      "meaning": "core daemons spawned"
+    },
+    {
+      "rung": 5,
+      "stage": "ZYGOTE",
+      "meaning": "zygote spawned"
+    },
+    {
+      "rung": 6,
+      "stage": "SYSTEM_SERVER",
+      "meaning": "system_server spawned"
+    },
+    {
+      "rung": 7,
+      "stage": "SURFACEFLINGER",
+      "meaning": "surfaceflinger spawned"
+    },
+    {
+      "rung": 8,
+      "stage": "SYSTEMUI_LAUNCHER",
+      "meaning": "SystemUI/launcher up"
+    },
+    {
+      "rung": 9,
+      "stage": "BOOT_COMPLETED",
+      "meaning": "real sys.boot_completed=1"
+    }
+  ],
+  "evidence": {
+    "ROOTFS_READY": [
+      {
+        "source": "property-area",
+        "line": "== /data/user/0/io.twoyi.debug/rootfs/dev/__properties__"
+      }
+    ],
+    "PROPERTY_SERVICE": [
+      {
+        "source": "kr64",
+        "line": "[KR64][ptrace][+175868ms] intercepted open(/dev/__properties__"
+      }
+    ],
+    "CORE_DAEMONS": [
+      {
+        "source": "guest-ps",
+        "line": "logd"
+      }
+    ],
+    "ZYGOTE": [
+      {
+        "source": "guest-ps",
+        "line": "zygote"
+      }
+    ],
+    "SURFACEFLINGER": [
+      {
+        "source": "guest-ps",
+        "line": "surfaceflinger"
+      }
+    ]
+  },
+  "app_pid": 2036,
+  "guest_processes": [
+    "io.twoyi.debug",
+    "logcat",
+    "sh",
+    "libkr64.so",
+    "init",
+    "init",
+    "ueventd",
+    "logd",
+    "lmkd",
+    "servicemanager",
+    "hwservicemanager",
+    "android.system.suspend@1.0-service",
+    "android.hardware.atrace@1.0-service",
+    "android.hardware.keymaster@4.1-service",
+    "createns",
+    "statsd",
+    "android.hidl.allocator@1.0-service",
+    "android.hardware.authsecret@1.0-service",
+    "android.hardware.bluetooth@1.1-service.sim",
+    "android.hardware.contexthub@1.1-service.mock",
+    "android.hardware.drm@1.0-service",
+    "android.hardware.graphics.allocator@3.0-service",
+    "android.hardware.graphics.composer@2.3-service",
+    "android.hardware.power.stats@1.0-service.mock",
+    "android.hardware.thermal@2.0-service.mock",
+    "android.hardware.usb@1.0-service",
+    "android.hardware.wifi@1.0-service",
+    "android.hardware.identity-service.example",
+    "android.hardware.lights-service.example",
+    "android.hardware.power-service.example",
+    "android.hardware.rebootescrow-service.default",
+    "android.hardware.vibrator-service.example",
+    "credstore",
+    "gpuservice",
+    "surfaceflinger",
+    "tombstoned",
+    "adbd",
+    "traced_probes",
+    "traced",
+    "cameraserver",
+    "drmserver",
+    "idmap2d",
+    "incidentd",
+    "iorapd",
+    "keystore",
+    "media.metrics",
+    "mediaserver",
+    "storaged",
+    "wificond",
+    "mdnsd",
+    "gatekeeperd",
+    "update_engine",
+    "android.hardware.biometrics.face@1.0-service.example",
+    "android.hardware.biometrics.fingerprint@2.1-service",
+    "android.hardware.gatekeeper@1.0-service.software",
+    "android.hardware.sensors@2.1-service.multihal",
+    "zygote64",
+    "audioserver",
+    "installd",
+    "[_system_bin_med]",
+    "netd",
+    "[_system_bin_vol]",
+    "[_vendor_bin_hw_]",
+    "[_vendor_bin_hw_]",
+    "[_vendor_bin_hw_]",
+    "[_vendor_bin_hw_]",
+    "[_vendor_bin_hw_]",
+    "[_vendor_bin_hw_]",
+    "[_vendor_bin_hw_]",
+    "[_vendor_bin_hw_]",
+    "[_vendor_bin_hw_]",
+    "[_vendor_bin_hw_]",
+    "android.hardware.neuralnetworks@1.3-service-sample-quant",
+    "[_vendor_bin_hw_]",
+    "mediaswcodec"
+  ],
+  "post_mortem": "",
+  "blockers_sample": [
+    {
+      "kind": "signal",
+      "line": "  SI"
+    },
+    {
+      "kind": "signal",
+      "line": "  SIGSEGV regs: x8=0x"
+    },
+    {
+      "kind": "signal",
+      "line": "  SIGSEGV regs: x16=0xead263cbacb8 x17=0xead2"
+    },
+    {
+      "kind": "signal",
+      "line": "  SIGSEGV regs: x16=0xead263cbacb8 x17=0xead263c77d20 x18=0xead2682f4000 x19=0xffffdc703db0 x20=0xead04263ba00 x21=0xead022614330 x22=0xead267e0c000"
+    },
+    {
+      "kind": "signal",
+      "line": "[KR64][ptrace][+187581ms] 6"
+    },
+    {
+      "kind": "signal",
+      "line": "[KR64][ptrace][+187589ms] SIGSEGV process threads: 22 alive (5133,5134,5135,5136,5137,5138,5139,5140,5141,5186"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64][p"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64][ptrace][+177179ms] 6-Z305l KLOG-TIMELINE: <3>init: createProcessGroup(1000, 5259) failed for service 'neuralnetworks_hal_service_sa"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64][ptrace][+177"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64 IN"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64][ptrace][+177905ms] 6-Z305l KLOG-TIMELINE: <3>init: createProcessGroup(1000, 5263) failed for service 'neuralnetworks_hal_service_sa"
+    },
+    {
+      "kind": "perm",
+      "line": "[KR64][ptrace][+177905ms] 6-Z305t-14: tid 5263 stop #2 status=0x0000857f WSTOPSIG=133 event=0 (121 tracked, in_syscall=false for this tid)"
+    },
+    {
+      "kind": "missing-path",
+      "line": "[KR64][ptrace][+190887ms] 6-Z305t-57: bind forensics pid=2697 fd=18 raw_ret=-98 (-errno 98): fd_link=Some(\"socket:[199575]\")"
+    },
+    {
+      "kind": "missing-path",
+      "line": "[KR64][ptrace][+190889ms] PTRACE_E"
+    },
+    {
+      "kind": "missing-path",
+      "line": "[KR64][ptrace][+191038ms] 6-Z305l KLOG-TIMELINE: <4>libprocessgroup: Failed to apply HighPerforman"
+    },
+    {
+      "kind": "missing-path",
+      "line": "[KR64][ptrace][+191038ms] 6-Z305l KLOG-TIMELINE: <4>libprocessgroup: Failed to apply HighPerformance task profile: No such fi"
+    },
+    {
+      "kind": "missing-path",
+      "line": "[KR64][ptrace][+191038ms] 6-Z155: setgid() nr=144 returned -1 (-errno 1) \u2014 faked to 0 (untrusted_app cannot change ids; init"
+    },
+    {
+      "kind": "missing-path",
+      "line": "[KR64][ptrace][+191719ms] 6-Z305l KLOG-TIMELINE: <4>libprocessgroup: Failed to apply HighPerforman"
+    }
+  ],
+  "honest_note": "BOOT_COMPLETED rung fires ONLY on the kr64 bridge for a REAL sys.boot_completed=1 property write observed on the emulated property wire \u2014 never synthesized. Guest process rungs require the io.twoyi.debug process subtree (host redroid processes are excluded)."
+}

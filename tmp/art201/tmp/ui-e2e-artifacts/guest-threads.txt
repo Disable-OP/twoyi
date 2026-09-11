@@ -1,0 +1,35 @@
+== threads of 2653 (/data/app/~~fJvrALzFqmpjzR7e12iXlw==/io.twoyi.debug-VLhIEa9IcHt74atYN74Ydw==/lib/arm64/libkr64.so --rootfs /data/user/0/io.twoyi.debug/rootfs --data-dir /data/user/0/io.twoyi.debug --vmid 0 --no-namespaces --no-seccomp --width 720 --height 1600 --init /init )
+USER           PID   TID  PPID        VSZ    RSS WCHAN            ADDR S CMD            
+u0_a87        2653  2653  2024   12901084  17856 hrtimer_nanosleep   0 S libkr64.so
+u0_a87        2653  2655  2024   12901084  17856 __skb_wait_for_more_packets 0 S kr64-accept-dm-
+u0_a87        2653  2656  2024   12901084  17856 hrtimer_nanosleep   0 S kr64-binder-acc
+u0_a87        2653  2657  2024   12901084  17856 hrtimer_nanosleep   0 S kr64-audio-acce
+u0_a87        2653  2658  2024   12901084  17856 hrtimer_nanosleep   0 S kr64-sensor-acc
+u0_a87        2653  2659  2024   12901084  17856 hrtimer_nanosleep   0 S kr64-battery-re
+u0_a87        2653  2660  2024   12901084  17856 hrtimer_nanosleep   0 S kr64-haptics
+u0_a87        2653  2661  2024   12901084  17856 futex_do_wait       0 S kr64-audio-work
+u0_a87        2653  2662  2024   12901084  17856 futex_do_wait       0 S kr64-sensor-wor
+u0_a87        2653  2663  2024   12901084  17856 futex_do_wait       0 S kr64-audio-work
+u0_a87        2653  2664  2024   12901084  17856 futex_do_wait       0 S kr64-audio-work
+u0_a87        2653  2665  2024   12901084  17856 futex_do_wait       0 S kr64-audio-work
+u0_a87        2653  2666  2024   12901084  17856 futex_do_wait       0 S kr64-audio-work
+u0_a87        2653  2667  2024   12901084  17856 futex_do_wait       0 S kr64-audio-work
+u0_a87        2653  2668  2024   12901084  17856 futex_do_wait       0 S kr64-sensor-wor
+u0_a87        2653  2669  2024   12901084  17856 futex_do_wait       0 S kr64-audio-work
+u0_a87        2653  2670  2024   12901084  17856 futex_do_wait       0 S kr64-audio-work
+u0_a87        2653  2673  2024   12901084  17856 futex_do_wait       0 S kr64-sensor-wor
+u0_a87        2653  2674  2024   12901084  17856 futex_do_wait       0 S kr64-sensor-wor
+u0_a87        2653  2684  2024   12901084  17856 __skb_wait_for_more_packets 0 S kr64-accept-tou
+u0_a87        2653  2685  2024   12901084  17856 __skb_wait_for_more_packets 0 S kr64-accept-qem
+u0_a87        2653  2686  2024   12901084  17856 __skb_wait_for_more_packets 0 S kr64-accept-key
+u0_a87        2653  2687  2024   12901084  17856 __skb_wait_for_more_packets 0 S kr64-accept-eve
+== threads of 2683 (/system/bin/init second_stage )
+USER           PID   TID  PPID        VSZ    RSS WCHAN            ADDR S CMD            
+u0_a87        2683  2683  2653   10819920   8888 unix_stream_data_wait 0 S _system_bin_ini
+u0_a87        2683  2693  2653   10819920   8888 ptrace_stop.part.0  0 t _system_bin_ini
+== threads of 2701 (/system/bin/init subcontext u:r:vendor_init:s0 15 )
+USER           PID   TID  PPID        VSZ    RSS WCHAN            ADDR S CMD            
+u0_a87        2701  2701  2683   10775768   8904 poll_schedule_timeout.constprop.0 0 S _system_bin_ini
+== threads of 2712 (/system/bin/ueventd )
+USER           PID   TID  PPID        VSZ    RSS WCHAN            ADDR S CMD            
+u0_a87        2712  2712  2683   10777232   9340 poll_schedule_timeout.constprop.0 0 S _system_bin_uev
