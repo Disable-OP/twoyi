@@ -3224,6 +3224,13 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, _iov_len: usize) -> std::io::Re
 /// saved per pass-through path syscall.
 static SETREGS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// 6-Z307p: property-socket wire census caps (used from three sites: the
+// 6-Z305q connect rewrite, the write-ENTRY stash and the write-EXIT DONE
+// log — see the z307p_prop_fds / z307p_pending loop maps).
+static Z307P_CONNECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static Z307P_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static Z307P_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // 6-Z268: per-stop record of strings this tracer WROTE into the child
 // (`write_translated_path` + scratch rewrites). The sandbox backstop
 // previously re-read every rewritten path from the child with a full
@@ -13930,6 +13937,24 @@ pub fn run_ptrace_loop(
     // FATAL even though the rewritten socket() had SUCCEEDED.
     let mut pending_entry_fd: std::collections::HashMap<libc::pid_t, (i64, i64)> =
         std::collections::HashMap::new();
+    // 6-Z307p: property-socket wire census. Wall B (ladder #247):
+    // init's RecvFully timed out reading a SETPROP2 message ("recv data
+    // is not properly obtained") and the client — system_server 7217's
+    // main thread — died of "failed to set system property" 244ms later
+    // (SystemServer.run:438 → RuntimeException → KillApplicationHandler
+    // → kill(self)). The client-side write trail was never observed.
+    // This instrument tracks every (pid, fd) whose guest connect()
+    // targeted /dev/socket/property_service (hooked at the 6-Z305q
+    // rewrite) and logs each tracked write/writev/sendto as a
+    // START(pid,fd,bytes) / DONE(pid,fd,bytes,ret) pair — a START with
+    // no DONE in the log IS the stall, caught red-handed. Caps: 8
+    // connects, 32 STARTs, 32 DONEs per run (property sets are rare
+    // per-process); tracked fds are dropped at close() and at process
+    // death.
+    let mut z307p_prop_fds: std::collections::HashSet<(libc::pid_t, i64)> =
+        std::collections::HashSet::new();
+    let mut z307p_pending: std::collections::HashMap<libc::pid_t, (i64, u64, u64)> =
+        std::collections::HashMap::new();
     // 6-Z305c: ENTRY-side readlink/readlinkat arg stash — (pid → (path_ptr,
     // buf_ptr)). bionic realpath (android-11) = open(O_PATH) + fstat(fd) +
     // readlink(/proc/self/fd/N) + stat(dst) with a dev/ino compare. At the
@@ -16394,6 +16419,10 @@ pub fn run_ptrace_loop(
             // 6-Z306k: the pin-silence discriminator's per-pid state dies
             // with the process (inline form, per the binder_fds precedent).
             z306k_budget.remove(&pid);
+            // 6-Z307p: the property-socket census state dies with the
+            // process (a recycled pid must not inherit the tracking).
+            z307p_prop_fds.retain(|(p, _)| *p != pid);
+            z307p_pending.remove(&pid);
             z306k_last.remove(&pid);
             z306k_last_natural.remove(&pid);
             z306k_probe_pending.remove(&pid);
@@ -16709,6 +16738,10 @@ pub fn run_ptrace_loop(
             // with the process (WIFSIGNALED mirror of the WIFEXITED
             // cleanup above).
             z306k_budget.remove(&pid);
+            // 6-Z307p: the property-socket census state dies with the
+            // process (a recycled pid must not inherit the tracking).
+            z307p_prop_fds.retain(|(p, _)| *p != pid);
+            z307p_pending.remove(&pid);
             z306k_last.remove(&pid);
             z306k_last_natural.remove(&pid);
             z306k_probe_pending.remove(&pid);
@@ -19276,6 +19309,29 @@ pub fn run_ptrace_loop(
                                 (syscall_num, get_syscall_arg(&regs, abi.reg_arg1) as i64),
                             );
                         }
+                        // 6-Z307p: ENTRY stash for tracked property-socket
+                        // writes (write/writev/sendto — arg3 is the byte
+                        // count for write/sendto, the iovcnt for writev).
+                        // The DONE log fires at the EXIT site with the
+                        // syscall's real return value.
+                        if (abi.write != -1 && syscall_num == abi.write)
+                            || (abi.writev_nr != -1 && syscall_num == abi.writev_nr)
+                            || (abi.sendto_nr != -1 && syscall_num == abi.sendto_nr)
+                        {
+                            let z307p_fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            if z307p_prop_fds.contains(&(pid, z307p_fd)) {
+                                let z307p_len = get_syscall_arg(&regs, abi.reg_arg3);
+                                let seq =
+                                    Z307P_START.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if seq < 32 {
+                                    log(&format!(
+                                        "6-Z307p: prop-write START pid={} fd={} bytes={} seq={}",
+                                        pid, z307p_fd, z307p_len, seq
+                                    ));
+                                }
+                                z307p_pending.insert(pid, (z307p_fd, z307p_len, seq));
+                            }
+                        }
                         // 6-Z305m: stash write(fd, buf, count) arguments at
                         // ENTRY when the fd targets a virtual selinuxfs
                         // transition/access node (see selinux_node_write_args
@@ -21827,6 +21883,32 @@ pub fn run_ptrace_loop(
                                                         abi.reg_arg3,
                                                         new_sa.len() as u64,
                                                     );
+                                                    // 6-Z307p: track the (pid, fd)
+                                                    // pair — every write on this
+                                                    // socket joins the property-wire
+                                                    // census (Wall B evidence).
+                                                    if format!("{:?}", guest_path)
+                                                        .ends_with("property_service\"")
+                                                    {
+                                                        let z307p_fd =
+                                                            get_syscall_arg(&regs, abi.reg_arg1)
+                                                                as i64;
+                                                        z307p_prop_fds
+                                                            .insert((pid, z307p_fd));
+                                                        if z307p_prop_fds.len() <= 64 {
+                                                            let n = Z307P_CONNECT
+                                                                .fetch_add(
+                                                                    1,
+                                                                    std::sync::atomic::Ordering::Relaxed,
+                                                                );
+                                                            if n < 8 {
+                                                                log(&format!(
+                                                                    "6-Z307p: prop-connect pid={} fd={} — property_service wire tracked",
+                                                                    pid, z307p_fd
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
                                                     let n = Z305Q_CONNECT_LOG
                                                         .fetch_add(
                                                             1,
@@ -28351,6 +28433,10 @@ pub fn run_ptrace_loop(
                             // 6-Z203: stop faking ASHMEM_* ioctls on the
                             // recycled fd number.
                             ashmem_fd_sizes.remove(&(pid, closed_fd));
+                            // 6-Z307p: a closed property-socket fd loses its
+                            // tracking (the number may be recycled).
+                            z307p_prop_fds.remove(&(pid, closed_fd as i64));
+                            z307p_pending.remove(&pid);
                         }
                     }
                     // Task 6-V Part A2 — open()/openat()/openat2() EXIT:
@@ -30089,6 +30175,20 @@ pub fn run_ptrace_loop(
                     // writes are uninteresting setup noise).
                     if past_first_execve && syscall_num == abi.write {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // 6-Z307p: DONE half of the property-wire census —
+                        // pair for the START logged at ENTRY. A START with
+                        // no DONE (and no close in between) names the
+                        // client-side stall that killed system_server 7217
+                        // (ladder #247 Wall B).
+                        if let Some((z307p_fd, z307p_len, z307p_seq)) = z307p_pending.remove(&pid) {
+                            let n = Z307P_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 32 {
+                                log(&format!(
+                                    "6-Z307p: prop-write DONE pid={} fd={} bytes={} ret={} seq={}",
+                                    pid, z307p_fd, z307p_len, ret, z307p_seq
+                                ));
+                            }
+                        }
                         // ── 6-Z305j: virtual /sys/fs/selinux/member
                         // request capture ── libselinux
                         // security_compute_create() opens member O_RDWR,
