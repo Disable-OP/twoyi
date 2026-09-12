@@ -30067,6 +30067,78 @@ pub fn run_ptrace_loop(
                                                     log("6-Z305l: death window re-armed on klog milestone (1200 stops)");
                                                 }
                                             }
+                                            // 6-Z306af-p: the ART/logd FATAL marker class.
+                                            // The #242 ground truth (anr-dropbox.txt) ruled
+                                            // out EVERY A11 watchdog kill path: /data/anr
+                                            // EMPTY (no anr_fd_* → OpenFdMonitor never
+                                            // tripped; no traces_* → dumpStackTraces never
+                                            // completed) and /data/system/dropbox EMPTY (the
+                                            // dropbox thread never ran) — yet the watchdog
+                                            // thread killed the process 60ms after its
+                                            // WAITED_HALF log. The remaining shape is the
+                                            // UNCAUGHT-EXCEPTION kill: the watchdog thread
+                                            // died mid-dumpStackTraces and ART's
+                                            // KillUncaughtHandler kill()ed myPid from the
+                                            // crashing thread (comm "watchdog" — exactly
+                                            // what af-j saw). The "FATAL EXCEPTION: <thread>"
+                                            // text rides the LOGD writev (liblog logd-writer
+                                            // shape, iovcnt 2-8) — a class the klog matcher
+                                            // (single-iov '<N>' lines) never sees and the
+                                            // WRITEV-SAMPLE cap (200, expired at +591ms)
+                                            // starves. Scan logd-shaped writevs for the
+                                            // markers and capture the message verbatim.
+                                            // 32/run — crash text is rare by nature.
+                                            if !is_klog && tl_iovcnt >= 2 && tl_iovcnt <= 8 {
+                                                let mut marker_hit: Option<String> = None;
+                                                for iov_i in 0..tl_iovcnt.min(4) {
+                                                    let ib = read_child_u64(
+                                                        pid,
+                                                        tl_iov_ptr
+                                                            .wrapping_add((16 * iov_i) as u64),
+                                                    );
+                                                    let il = read_child_u64(
+                                                        pid,
+                                                        tl_iov_ptr
+                                                            .wrapping_add((16 * iov_i + 8) as u64),
+                                                    );
+                                                    if let (Some(ib), Some(il)) = (ib, il) {
+                                                        if il == 0 || il > 2048 || ib == 0 {
+                                                            continue;
+                                                        }
+                                                        let n = (il as usize).min(256);
+                                                        if let Some(b) =
+                                                            read_child_bytes(pid, ib, n)
+                                                        {
+                                                            let t = String::from_utf8_lossy(&b);
+                                                            if t.contains("FATAL EXCEPTION")
+                                                                || t.contains("Watchdog")
+                                                                || t.contains("WATCHDOG")
+                                                            {
+                                                                marker_hit = Some(t.to_string());
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(t) = marker_hit {
+                                                    static Z306AF_P: std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    if Z306AF_P
+                                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                                        < 32
+                                                    {
+                                                        Z306AF_P.fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                        log(&format!(
+                                                "6-Z306af-p: logd FATAL/Watchdog writev (pid={}): {}",
+                                                pid,
+                                                crate::cap_log_line(&t, 240)
+                                            ));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
