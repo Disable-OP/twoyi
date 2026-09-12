@@ -28118,3 +28118,22 @@ Stage Summary / #233 DECODE TREE:
 2. Cross-check: the shlib lines in twoyi-loader-log.txt ("[twoyi_loader] execvp called: path=... argv: ...") MUST agree with the tracer's 6-Z306p dump — a mismatch names a second exec layer (the staged binary re-execs).
 3. TWRP gate must stay GREEN (the shlib + tracer changes both touch the recovery path: the exec hooks log argv now, the retag changes only labels).
 4. If the argv is framework-side: the fix target is the fork-slot itself — the zygote's main thread must never consume its fork on a Runtime.exec child BEFORE forkSystemServer (generic fix: ensure the caller's fork/exec happens on a NON-main thread or AFTER system_server specialization, WITHOUT ROM-specific hacks).
+
+---
+Task ID: 27 (webDevReview cron leg)
+Agent: Z.ai Code (main session)
+Task: #233 decode; land 6-Z306q + de-flood fixes; dispatch #234.
+
+Work Log:
+- #233 (8b08ff7) decoded: rung 7; TWRP gate GREEN (34661615937); 6-Z306p LIVE 8/8 budget.
+- **THE IDMAP2 CALLER IS NAMED** — and it is BENIGN: argv=[/system/bin/idmap2][create-multiple][--target-apk-path][/system/framework/framework-res.apk] = the AOSP 11 **OverlayConfig.createImmutableFrameworkIdmapsInZygote** JNI. Verified against android-11.0.0_r1 sources (core/jni/com_android_internal_content_om_OverlayConfig.cpp): the JNI `access("/system/bin/idmap2", X_OK)` then ExecuteBinary() (fork+execvp+wait — the exact zygote-main-thread fork shape); **BOTH failure paths (access ENOENT, nonzero exit) `return nullptr` → Java logs the "failed" warning → `return new String[0]` — NO exception, boot continues**. The "create-multiple failed" string confirmed present in the guest's framework.jar. The idmap2 child is a NORMAL per-era zygote witness (AOSP 11 runs it in every zygote), NOT the forkSystemServer blocker.
+- COROLLARY: the fork census (exactly ONE fork per zygote era = the idmap2 child) now means ZygoteInit.main NEVER REACHED forkSystemServer. Two live hypotheses: (a) the zygote's argv LACKS --start-system-server (main then goes straight to runSelectLoop — exact observed shape; the 6-Z305y pin only checks --zygote); (b) each era is SIGKILLed ~14s after exec (11 eras this run, mid-preload) before forkSystemServer's slot. This run's zygote svclog (811 KB) was UNREADABLE — flooded by twrp_fb_hook per-open lines.
+- LANDED 412dd2e: (1) **6-Z306q** — the ZYGOTE'S OWN execve argv dump (target contains app_process, argv[0..7], cap 3/boot, verdict field start-system-server=true/false in the line) settles (a) in one run; (2) **6-Z306p depth 3→8** — the --overlay-apk-path/--policy slots now show whether the ROM has any immutable framework overlays; (3) **6-Z306t-deflood** — klog/svclog de-flooding to recover the kill evidence: shlib logdw fd test gated to first 2 connects/process (was 12711 marker writes/boot evicting init's klog lines from the __kmsg__ ring), twrp_fb_hook __open_2/__openat_2 gated to 8/process (FB0/ASHMEM tracked opens still log; marking unconditional); shared z306_read_guest_argv helper.
+- Gates: C syntax clean in edited ranges; fmt/clippy -D warnings clean; 841/841; CI GREEN (34663620083).
+- DISPATCHED on 412dd2e: ladder #234 (34663723880, boot_wait 420) + TWRP gate (34663727938).
+
+Stage Summary / #234 DECODE TREE:
+1. 6-Z306q line: **start-system-server=false** ⇒ ROOT CAUSE = argv loss (our staged-exec/argv path or the rc→init handoff drops the flag) — fix the argv transport generically; boot should reach forkSystemServer immediately after.
+2. 6-Z306q line: **start-system-server=true** ⇒ hypothesis (b) — the era-kill cadence is the wall; the DE-FLOODED klog + zygote svclog (this run's real win) now show init's kill messages ("Service 'zygote'...", class_reset triggers) and the zygote's own preload progress ("begin/end preload", "preloaded N classes") — decode WHO kills and WHY, then fix that mechanism.
+3. 6-Z306p depth-8 lines: if --overlay-apk-path args appear, OverlayConfig found configured overlays; their idmap output paths (stdout→idmap_paths) feed /data/resource-cache — verify none of our path translation breaks the OUTPUT dir (the failure would still be benign, but knowing is better).
+4. TWRP gate must stay GREEN (the deflood changes touch the recovery logging path).
