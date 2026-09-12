@@ -28369,3 +28369,29 @@ Stage Summary / #243 DECODE TREE:
 3. If #243 shows NO af-p line but the watchdog still kills: fall back to capturing the issuer thread's full register file + stack-window at the kill ENTRY (the ART exception path's kill is preceded by the exception handler's allocations — the ring will show the shape).
 4. The stuck "system_server" clock_nanosleep thread (5058/7230) remains the #224 family — secondary until the watchdog exception is fixed.
 5. Recovery gate MUST stay GREEN.
+
+---
+Task ID: 37 (webDevReview cron leg)
+Agent: Z.ai Code (main session, same leg as Tasks 33-36)
+Task: Decode ladder #243 (rung 7 / SURFACEFLINGER era); land the fd-target + pipe-peer census and the write() marker scan; dispatch #244.
+
+Work Log:
+- Fresh-sandbox restore: PAT re-seeded (base64, outside repo at /home/z/.twoyi-github-pat; git-credential store re-created), repo re-cloned at 5783ef32; webDevReview cron alive (this leg IS a cron trigger). Ladder workflow identified: ui-e2e-android-arm64.yml = "Android Boot Ladder (ARM64 via redroid on ubuntu-24.04-arm)" (the user-provided artifact).
+- #243 (0e3eef5c, rn241) decoded: **RUNG 7 — SURFACEFLINGER reached; system_server survived past the +190s wall for the first time**. #239's BR_DEAD_REPLY fix held (BAD COMMAND 29189 = 0 everywhere); #242's uncaught-exception kill class did NOT recur (af-p: zero FATAL-EXCEPTION catches; Signal Catcher idle at kill — the WAITED_HALF dump path was never re-entered).
+- Gen-1 4965: watchdog SIGKILL at +208.9s. THE CENSUS IS DECISIVE: EVERY monitored handler thread IDLE at kill (android.fg/ui/io/display/anim/anim.lf/bg, ActivityManager x4, OomAdjuster — all ep_poll). No blocked checker wchan exists → the kill is NOT the classic blocked-monitor shape.
+- **THE REAL WALL — main never reached its Looper**: 6-Z271f /proc truth shows main parked in read(fd=0x50=80, buf, 0x1000) on a native pipe since ≥+198s (first STALL), with an ioctl(FIONREAD) read-fd pattern before it (+173s read fd43, +180s/+189s FIONREAD fds 54/61 — main is walking an fd set during service init). fd 80 was NEVER named by the fd-table instrument (6-Z305t-14b caps at 24 fds). system_server is stuck INSIDE startBootstrap/OtherServices → SystemUI can NEVER start regardless of the watchdog. The watchdog is the executioner; the fd-80 pipe is the wall.
+- Unnamed thread 5077 (comm=system_server, born between Binder:4965_1 and android.fg) parked in clock_nanosleep/restart_syscall — the #224 family, still unnamed (secondary).
+- Gen-2 6639: spawned +338s (zygote respawn window ~129s), died ~+408s by SIGSEGV (NULL deref, si_addr=0x0, tid 7131; five EVENT_EXIT sig-11 in 1ms; crash_dump64 in flight) → zygote 5315 exited → respawned 7000; gen-3 never named before boot_wait expiry. DISTINCT death class — decode after gen-1's wall falls.
+- /data/anr still EMPTY (dir exists from init mkdir; zero files) — the WAITED_HALF dump never created its temp file in #243 either; af-p caught nothing → the banner never reached the traced writev path (logd backpressure or non-writev shape).
+- LANDED b05795f6 — two instruments, both generic, both honest:
+  1. **6-Z306af-q**: the stall forensic dump now resolves the blocked syscall's OWN fd (fd-shaped arm64 nrs) via /proc/<pid>/fd/<fd> + fdinfo; for pipe:[N] targets it enumerates EVERY /proc holder of the inode (pid/comm/fd/flags) or proves NO other holder (dangling pipe — a real kernel EOFs that read; twoyi must too). Dedup (pid,fd) + inode; caps 24/6/6000; coverage logged.
+  2. **6-Z306af-s**: FATAL-EXCEPTION/Watchdog/WATCHDOG markers now also scanned on the single-buffer write() shape (reuses the 64B glog probe — zero extra reads until a hit; full payload captured, 16/run).
+- Gates: fmt+clippy clean; 844/844 tests; kr64 CI GREEN (rn1735 on b05795f6). Pushed b05795f6.
+- DISPATCHED on b05795f6: ladder #244 (rn242, boot_wait 420, expect_rung 7) + recovery pr-tier gate 4 children (twrp-2.8.7.0-angler, twrp-3.7.0_9-0-angler, twrp-3.7.0_9-0-whyred, lineage-22.2-sailfish).
+
+Stage Summary / #244 DECODE TREE:
+1. PRIMARY: the 6-Z306af-q STALL-TARGET line for the system_server main stall — it names fd 80's target; the PIPE-PEER lines name the writer peer pid/comm (or prove the pipe DANGLING). If dangling → fix the pipe-lifecycle semantic (writer-exit must drop the pipe → EOF, not eternal block) — a pure kr64 fs/pipe fidelity fix. If a peer exists → name it and diagnose why it never writes.
+2. The 6-Z306af-s lines (if any) give the Watchdog banner verbatim — cross-check the overdue checker against the census (all-idle shape predicts a wake/epoll semantic hole, not a blocked handler).
+3. Expect: STALL-TARGET fires at the FIRST main stall (~+198s equivalent) — no need to wait for the kill. If main's wall is the pipe, system_server STILL dies at the watchdog (~+209s) this run; the FIX lands next leg.
+4. Watch gen-2's SIGSEGV class once gen-1's wall falls (crash_dump64 + tombstones; NULL deref at 0x0).
+5. Recovery gate MUST stay GREEN (instruments only, delivery paths untouched).
