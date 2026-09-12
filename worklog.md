@@ -28303,3 +28303,26 @@ Stage Summary / #240 DECODE TREE:
 3. IF a new abort appears: the 6-Z306af-d empty-message race remains an instrument gap (read the message at the DEATH stop, and never dedup on empty text — pid 5861's identical-text skip was an empty-vs-empty dedup). Candidate instrument fix if #240 needs a decode that only the abort text can give.
 4. IF rung 6 moves but system_server wedges: the transaction-stack/AMS machinery (6-Z306ag) is already in place; decode via the 6-Z271d stall census.
 5. Recovery gate MUST stay GREEN (the gate touches the delivery path the recovery corpus shares; dpid/cookie/anchor-unverifiable cases deliver unchanged, so risk is low).
+
+---
+Task ID: 34 (webDevReview cron leg, continued)
+Agent: Z.ai Code (main session, same leg as Task 33)
+Task: Decode ladder #240; land the watchdog/group-death instruments (6-Z306ao); dispatch #241.
+
+Work Log:
+- #240 (22f22d4, run_number 238) decoded: rung 7, TWRP-gate 4/4 GREEN on 22f22d4 (children #8196-#8199), kr64 CI GREEN on both heads. BOTH #239 expectations HELD: "BAD COMMAND 29189" = 0 and "returned unexpected error -2147483648" = 0 — the 6-Z306z filler desync fleet is GONE; 6-Z306an rejected 55 dead-target deliveries honestly (conn=17/21/16 ← conn=71, code=256067662 — the stale-registration population now surfaces as BR_DEAD_REPLY/DEAD_OBJECT instead of killing servers).
+- system_server timeline (the headline): TWO generations. **Gen-1 5364** born +168.1s → SIGSEGV at +175.2s with NO delivery stop and NO EVENT_EXIT — the #224 GROUP-DEATH class again; the af EXIT-event capture never ran (it requires the EVENT_EXIT) and the crash site stayed unnamed. **Gen-2 7256** born +307.5s → lived a RECORD ~34s (the old record was ~11s): startBootstrapServices deep, ActivityManager + PowerManagerService threads up. At +340.588s **the guest's OWN watchdog thread killed it** (af-j: kill pid=7311 comm="watchdog" → target=7256 sig=9) — the A11 Watchdog fired on a missed monitor check-in; a silent sequential SIGKILL walk (7333→...→7256, ~65ms cadence) swept the threads, a uid-1000 killProcessGroup storm surrounded it ("Failed to kill process cgroup uid 1000 pid 7575/7576 ... 1 processes remain"), and the host phantom killer is RULED OUT (0 PhantomProcessRecord lines in the HOST logcat). The watchdog's reason (which monitor blocked) rides the guest logd — invisible to stderr/kmsg artifacts.
+- Decisive detail: 6-Z306af-j (bounded 16) logged ONLY 3 kill lines all run — the +340.588s watchdog kill was its ONLY lineage-target SIGKILL — so the killer is IN the guest (not an untraced external host actor; the af-j gate would have missed a host kill entirely, but the walk's ~65ms cadence + the watchdog issuer line settle it).
+- LANDED f2b1dc9 — **6-Z306ao instruments** (three, all bounded):
+  1. **6-Z306ao**: at any kill/tgkill ENTRY with sig=SIGKILL targeting a zygote-lineage pid, dump the victim's THREAD CENSUS from /proc/<pid>/task (tid(comm)state@wchan, cap 48 threads, 8/run) — the threads are alive at the kill ENTRY, so the census IS the watchdog's blocked-monitor evidence.
+  2. **6-Z306ao-b**: cgroup.procs materializations for uid_1000 groups get a dedicated 32-line budget (the shared 24-cap is exhausted by early-boot churn — the uid-1000 kill-sweep member sets were invisible in #240).
+  3. **6-Z306ao-c**: at the waitpid WIFSIGNALED reap of a lineage pid with NO prior delivery dump, dump the dying TGID's per-TID syscall rings (8/run) — gen-1-class group deaths get last-syscall evidence; a "NO tid rings recorded (coverage gap)" line is itself diagnostic.
+- Gates: fmt+clippy clean; 844/844. Pushed f2b1dc9.
+- DISPATCHED on f2b1dc9: ladder #241 (run_number 239, boot_wait 420) + recovery-corpus pr-tier gate. In flight at worklog-write.
+
+Stage Summary / #241 DECODE TREE:
+1. EXPECT (6-Z306ao): the next watchdog kill line carries the FULL thread census — name the blocked monitor (comm/state/wchan) and fix ITS blocker (the stall census 6-Z271d + the futex families are the decode map). The #240 suspects: DeviceEffectMan stuck in futex_do_wait at +332.9s (4×5.1s) is the only visible long-stall — verify at census time.
+2. EXPECT (6-Z306ao-c): the gen-1 group-death SIGSEGV finally leaves last-syscall evidence — check whether the #224 "restarted timed futex" signature (main thread at a futex restart, pc=libc syscall()+0xfed0) recurs and WHAT the surrounding threads were serving.
+3. EXPECT (6-Z306ao-b): every uid-1000 cgroup.procs member set served during the kill storm — verify whether system_server pids ever appear in a uid-1000 service group (a membership bug would be a REAL production fix in the 6-Z305t-56 BFS).
+4. system_server survival past the watchdog's first check (~+337s = 30s after birth) is the rung-6 gate: if the census names a fixable block, rung 6 (SYSTEM_SERVER surviving) finally lands.
+5. Recovery gate MUST stay GREEN (instruments only; no wire changes).
