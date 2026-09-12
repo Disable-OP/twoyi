@@ -500,6 +500,7 @@ static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 #define BP_BR_DECREFS    0x8010720au  /* _IOR('r',10, binder_ptr_cookie=16) */
 #define BP_BR_NOOP       0x0000720cu  /* _IO('r', 12) — cmd-only, payload size 0 */
 #define BP_BR_DEAD_REPLY 0x00007205u  /* _IO('r', 5) — cmd-only, payload size 0 */
+#define BP_OBJ_SCAN      640u         /* 6-Z306d-b: cookie-chunk scan window */
 
 #define BP_REPLY_ALLOC_MAX 32
 struct bp_reply_alloc {
@@ -697,22 +698,45 @@ static int bp_self_peek(uintptr_t addr, uint8_t *out, size_t len) {
 //   W = the flat's binder field (the weakref the node ref anchors on);
 //   R = [W+8]   = weakref_impl.mBase — the TRUE RefBase subobject
 //               (RefBase ctor: mRefs(new weakref_impl(this)));
-//   alive iff  [R+8] == W — the live object's mRefs field points back
-//              at its own weakref. Freed-and-reused chunks sever the
-//              equality; an accidental 2^-64 match is the only
-//              false-alive case. Works for AIDL (Δ small) and HIDL
-//              (Δ = 0x80/0x88/...) alike without knowing Δ.
-static int bp_binder_object_alive(uint64_t w) {
+//   alive iff  [R+8] == W (leg 1 — the round-trip) AND the cookie's
+//              object chunk CONTAINS the value W (leg 2, 6-Z306d-b —
+//              the W↔B association: a reused weakref chunk passes leg 1
+//              for a NEW object while the stale cookie points at a dead
+//              allocation — the #237 chimera). Freed-and-reused chunks
+//              sever both; the only false-alive case is a 2^-64
+//              coincidence. Works for AIDL and HIDL without knowing Δ.
+static int bp_binder_object_alive(uint64_t w, uint64_t b) {
     uint8_t buf[8];
     uint64_t r;
     uint64_t refs_back;
-    if (w == 0) return 0;
+    if (w == 0 || b == 0) return 0;
+    // Leg 1 — the round-trip: W must be a consistent weakref.
     if (!bp_self_peek((uintptr_t)w + 8, buf, 8)) return 0;
     memcpy(&r, buf, 8);
     if (r == 0) return 0;
     if (!bp_self_peek((uintptr_t)r + 8, buf, 8)) return 0;
     memcpy(&refs_back, buf, 8);
-    return refs_back == w;
+    if (refs_back != w) return 0;
+    // 6-Z306d-b (#237 decode): leg 2 — the W↔B ASSOCIATION. A freed-and-
+    // REUSED weakref chunk can pass leg 1 for a NEW object (W.mBase=R,
+    // [R+8]==W) while the registered cookie B belongs to a completely
+    // different, dead allocation — the #237 chimera pair (pid 3411: the
+    // mirror passed leg 1, the guest incStrong'd B, its reused-chunk
+    // vptr sent the vbase adjust to B+0xE0, mRefs=NULL → si_addr=0x4).
+    // A live object's allocation contains its own mRefs pointer:
+    // [R+8]==W with R = B+Δ (Δ>0, observed 0x20..0x88) sits inside B's
+    // chunk — scan [B..B+640) for the VALUE W.
+    {
+        uint8_t scan[BP_OBJ_SCAN];
+        size_t i;
+        if (!bp_self_peek((uintptr_t)b, scan, BP_OBJ_SCAN)) return 0;
+        for (i = 0; i + 8 <= BP_OBJ_SCAN; i += 8) {
+            uint64_t v;
+            memcpy(&v, scan + i, 8);
+            if (v == w) return 1;
+        }
+        return 0;
+    }
 }
 
 // Gate 1 — mirror commands on the response BR stream. Runs on the
@@ -735,7 +759,7 @@ static void bp_gate_mirror_commands(uint8_t *stream, uint64_t len) {
             uint64_t cookie;
             memcpy(&ptr, stream + pos + 4, 8);
             memcpy(&cookie, stream + pos + 12, 8);
-            if (ptr == 0 || cookie == 0 || !bp_binder_object_alive(ptr)) {
+            if (ptr == 0 || cookie == 0 || !bp_binder_object_alive(ptr, cookie)) {
                 int i;
                 for (i = 0; i < 5; i++)
                     memcpy(stream + pos + 4 * (size_t)i, &noop, 4);
@@ -827,7 +851,7 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 memcpy(&t_ptr, stream + pos + 4 + BP_TR_TARGET_OFF, 8);
                 memcpy(&t_cookie, stream + pos + 4 + BP_TR_COOKIE_OFF, 8);
                 if (t_ptr != 0 && t_cookie != 0 &&
-                    !bp_binder_object_alive(t_ptr)) {
+                    !bp_binder_object_alive(t_ptr, t_cookie)) {
                     static const uint32_t z306z_noop = BP_BR_NOOP;
                     static const uint32_t z306z_dead = BP_BR_DEAD_REPLY;
                     int zi;
@@ -970,7 +994,7 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         memcpy(&f_binder, back + obj_off + BP_FLAT_BINDER_OFF, 8);
                         memcpy(&f_cookie, back + obj_off + BP_FLAT_COOKIE_OFF, 8);
                         if (f_cookie == 0 && f_binder == 0) continue;
-                        if (bp_binder_object_alive(f_binder)) continue;
+                        if (bp_binder_object_alive(f_binder, f_cookie)) continue;
                         memset(back + obj_off + BP_FLAT_BINDER_OFF, 0, 16);
                         if (g_diag_z306z_gate > 0) {
                             char m[192];

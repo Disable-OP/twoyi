@@ -6545,14 +6545,46 @@ fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
             match crate::ptrace_emu::peek_guest_bytes(guest_pid, mbase + 8, 8) {
                 Some(rb) if rb.len() == 8 => {
                     let refs_back = u64::from_ne_bytes(rb[0..8].try_into().unwrap());
-                    if refs_back == ptr {
-                        true
-                    } else {
+                    if refs_back != ptr {
                         info!(
                             "[KR64][binder][svc] 6-Z306ae-f: mirror skipped — round-trip broken: [R+8]=0x{:x} != W=0x{:x} (R=0x{:x}, cookie=0x{:x}) — object dead/chunk-reused pid={}",
                             refs_back, ptr, mbase, cookie, guest_pid
                         );
-                        false
+                        return false;
+                    }
+                    // 6-Z306d-b (#237 decode): leg 2 — the W↔B ASSOCIATION.
+                    // A freed-and-REUSED weakref chunk can pass leg 1 for a
+                    // NEW object (W.mBase=R, [R+8]==W) while the registered
+                    // cookie B belongs to a completely different, dead
+                    // allocation — the #237 chimera pair (pid 3411: the
+                    // mirror BR_ACQUIRE passed leg 1, the guest incStrong'd
+                    // B, its reused-chunk vptr sent the vbase adjust to
+                    // B+0xE0, mRefs=NULL → si_addr=0x4). A live object's
+                    // allocation contains its own mRefs pointer: [R+8]==W
+                    // with R = B+Δ (Δ>0, observed 0x20..0x88) sits inside
+                    // B's chunk — scan [B..B+640) for the VALUE W.
+                    match crate::ptrace_emu::peek_guest_bytes(guest_pid, cookie, 640) {
+                        Some(buf) if buf.len() == 640 => {
+                            let associated = buf
+                                .chunks_exact(8)
+                                .any(|w| u64::from_ne_bytes(w.try_into().unwrap()) == ptr);
+                            if associated {
+                                true
+                            } else {
+                                info!(
+                                    "[KR64][binder][svc] 6-Z306d-b: mirror skipped — association broken: W=0x{:x} not found in cookie 0x{:x} chunk (R=0x{:x}) — stale registration pid={}",
+                                    ptr, cookie, mbase, guest_pid
+                                );
+                                false
+                            }
+                        }
+                        _ => {
+                            info!(
+                                "[KR64][binder][svc] 6-Z306d-b: mirror skipped — cookie 0x{:x} chunk unreadable pid={}",
+                                cookie, guest_pid
+                            );
+                            false
+                        }
                     }
                 }
                 _ => {
