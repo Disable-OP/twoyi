@@ -837,13 +837,28 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
             // target.ptr IS W (the node's weakref) for the ptr-form local
             // delivery; the round-trip [ [W+8]+8 ] == W decides. Remote
             // (handle-form) deliveries carry cookie==0 and are skipped.
-            // Kernel-true semantics on failure: BR_DEAD_REPLY + 16×BR_NOOPs
-            // in the guest's copy (the 68-byte slot stays byte-aligned and
-            // every filler is a cmd-only no-op); the blob below is still
-            // consumed so trailer pairing holds, and the backing/patch step
-            // is SKIPPED for this slot (writing data_ptr/offsets_ptr over
-            // the NOOP fillers would feed heap pointers to the guest's
-            // command parser — a desync).
+            //
+            // 6-Z306an CORRECTION (#239 decode): the original filler —
+            // BR_DEAD_REPLY + 16×BR_NOOPs — was a STREAM DESYNC IN WAITING:
+            // libhwbinder's SERVER-side path (getAndExecuteCommand →
+            // executeCommand) has NO `case BR_DEAD_REPLY` (the code is a
+            // CALLER-side waitForResponse code; kernel never delivers a
+            // transaction to a dead target so a server stream can't
+            // contain it) — the guest parsed our filler as an unknown
+            // command ("*** BAD COMMAND 29189" = _IO('r',5)) →
+            // UNKNOWN_ERROR → LOG_ALWAYS_FATAL abort — the audioserver/
+            // system_server death fleet of #239 ("getAndExecuteCommand
+            // (fd=5) returned unexpected error -2147483648, aborting",
+            // empty abort message — glog aborts never set one).
+            // executeCommand DOES handle BR_NOOP, so the replacement here
+            // is 17×BR_NOOPs (byte-exact: cmd + 64-byte btd slot). The
+            // kernel-true sender semantics (BR_DEAD_REPLY to the
+            // REQUESTER) now live in the DRIVER's 6-Z306an delivery gate,
+            // which rejects dead-target transactions BEFORE they are ever
+            // queued/delivered; this in-process net only fires for the
+            // sub-delivery race window, and a two-way requester whose
+            // transaction is dropped here resolves at the driver's bounded
+            // REPLY_TIMEOUT (BR_FAILED_REPLY) — never a hang.
             int z306z_tx_neutralized = 0;
             if (cmd == BP_BR_TRANSACTION) {
                 uint64_t t_ptr;
@@ -853,11 +868,12 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 if (t_ptr != 0 && t_cookie != 0 &&
                     !bp_binder_object_alive(t_ptr, t_cookie)) {
                     static const uint32_t z306z_noop = BP_BR_NOOP;
-                    static const uint32_t z306z_dead = BP_BR_DEAD_REPLY;
                     int zi;
-                    memcpy(stream + pos, &z306z_dead, 4);
-                    for (zi = 0; zi < 16; zi++)
-                        memcpy(stream + pos + 4 + 4 * (size_t)zi,
+                    /* 6-Z306an: 17×BR_NOOP fillers — BR_DEAD_REPLY is a
+                     * CALLER-side code (waitForResponse); the server-side
+                     * executeCommand aborts on it (BAD COMMAND 29189). */
+                    for (zi = 0; zi < 17; zi++)
+                        memcpy(stream + pos + 4 * (size_t)zi,
                                &z306z_noop, 4);
                     z306z_tx_neutralized = 1;
                     if (g_diag_z306z_gate > 0) {
@@ -865,7 +881,7 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         g_diag_z306z_gate--;
                         snprintf(m, sizeof(m),
                                  "[twoyi_loader] 6-Z306z: BR-TX dead target "
-                                 "W=0x%llx cookie=0x%llx -> BR_DEAD_REPLY "
+                                 "W=0x%llx cookie=0x%llx -> 17xBR_NOOP "
                                  "(pid=%d)\n",
                                  (unsigned long long)t_ptr,
                                  (unsigned long long)t_cookie, g_real_pid);

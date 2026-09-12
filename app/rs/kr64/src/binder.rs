@@ -1824,6 +1824,16 @@ enum DeferredReply {
     },
     /// `[BR_FAILED_REPLY]` (reply timeout / server died).
     Failed,
+    /// 6-Z306an: `[BR_DEAD_REPLY]` — the transaction's TARGET object died
+    /// while the work was queued (the server process itself is alive).
+    /// Kernel-true: the requester gets BR_DEAD_REPLY (waitForResponse →
+    /// DEAD_OBJECT); the server NEVER sees the transaction — libhwbinder's
+    /// server-side executeCommand has NO BR_DEAD_REPLY case (a dead-target
+    /// transaction is never delivered kernel-side), so putting the code in
+    /// the SERVER's stream hits `default: BAD COMMAND` → LOG_ALWAYS_FATAL
+    /// abort (the #239 audioserver/system_server fleet: "getAndExecute-
+    /// Command returned unexpected error -2147483648, aborting").
+    Dead,
     /// 6-Z306ae: a kernel node-ref mirror command — `[BR_ACQUIRE]` or
     /// `[BR_RELEASE]` followed by `binder_ptr_cookie {ptr, cookie}`.
     /// The real driver holds a strong node ref for every registry
@@ -3573,6 +3583,9 @@ fn handle_write_read(
                 DeferredReply::Failed => {
                     push_br_failed_reply(&mut read_buf);
                 }
+                DeferredReply::Dead => {
+                    push_br_dead_reply(&mut read_buf);
+                }
                 DeferredReply::RefCmd { br, ptr, cookie } => {
                     // 6-Z306ae: kernel node-ref mirror — the owner's
                     // IPCThreadState handles BR_ACQUIRE (incStrong on the
@@ -3704,46 +3717,120 @@ fn handle_write_read(
             }
             match delivery {
                 Delivery::Tx(tx) => {
-                    let (ds, os) = match &tx.blob {
-                        Some(b) => (b.data.len() as u64, b.offsets.len() as u64),
-                        None => (0, 0),
-                    };
+                    // 6-Z306an: delivery-time TARGET LIVENESS GATE. Kernel
+                    // semantics: a transaction whose target object died
+                    // while queued is NEVER delivered to the server — the
+                    // kernel releases the node's pending work and the
+                    // REQUESTER's read surfaces BR_DEAD_REPLY. Delivering
+                    // it here anyway forces the server's libhwbinder/
+                    // libbinder to either incStrong a dead cookie (the
+                    // #235/#237/#238 SIGSEGV fleet) or — after the 6-Z306z
+                    // shlib neutralization — parse a BR_DEAD_REPLY in the
+                    // SERVER's stream, which libhwbinder's server-side
+                    // executeCommand does not handle ("*** BAD COMMAND
+                    // 29189" → LOG_ALWAYS_FATAL abort — the #239
+                    // audioserver/system_server fleet: 30 aborts in one
+                    // run, system_server dead at +181.9s). The anchor is
+                    // the full 6-Z306ae-f round-trip + 6-Z306d-b
+                    // association chain (tri-state: only a POSITIVE Dead
+                    // verdict rejects — an unreadable anchor never drops a
+                    // possibly-live transaction).
+                    let mut tx_rejected = false;
+                    // The gate needs a readable guest target process to
+                    // verify against: no conn identity (dpid<=0 — the
+                    // unit-test bus conns never announce IDENT) or no
+                    // local object (handle-form, cookie==0) → no verdict
+                    // possible → deliver exactly as before. Only a
+                    // POSITIVE Dead verdict from the anchor rejects.
                     if tx.cookie != 0 {
-                        // 6-Z306ad: delivery-time snapshot — the cookie the
-                        // receiving server will cast to its BBinder (the
-                        // vendor-HAL vtable-garbage crash class rides this
-                        // path; see the pc=-0x78 fleet in #198/#199).
                         let dpid = {
                             let b = bus.lock().expect("binder bus poisoned");
                             b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
                         };
-                        probe_flat_mem(
-                            "delivery",
-                            &PROBE_DELIVERY_BUDGET,
-                            dpid,
-                            &format!("code={:#x}", tx.code),
+                        if dpid > 0
+                            && matches!(mirror_ref_check(dpid, tx.ptr, tx.cookie), Liveness::Dead)
+                        {
+                            // Undo the delivery bookkeeping done at pop
+                            // time (both the direct pop and the 6-Z271g
+                            // steal push the txn_stack frame; pending_in
+                            // was already retained away there) and resolve
+                            // the requester with BR_DEAD_REPLY.
+                            if tx.txn_id != 0 {
+                                let mut b = bus.lock().expect("binder bus poisoned");
+                                if let Some(bx) = b.conns.get_mut(&conn_id) {
+                                    if bx.txn_stack.last() == Some(&tx.txn_id) {
+                                        bx.txn_stack.pop();
+                                    } else {
+                                        bx.txn_stack.retain(|id| *id != tx.txn_id);
+                                    }
+                                }
+                                if let Some(requester) = b.waiters.remove(&tx.txn_id) {
+                                    if let Some(rb) = b.conns.get_mut(&requester) {
+                                        rb.reply_queue.push_back(DeferredReply::Dead);
+                                    }
+                                }
+                            }
+                            if Z306AN_REJECT_LOG.load(Ordering::Relaxed) > 0 {
+                                Z306AN_REJECT_LOG.fetch_sub(1, Ordering::Relaxed);
+                                info!(
+                                    "[KR64][binder][vm{}] 6-Z306an: dead-target transaction rejected conn={} <- conn={} code={} oneway={} ptr=0x{:x} cookie=0x{:x} → BR_DEAD_REPLY to requester (tx #{}, {} left)",
+                                    vm_id, conn_id, tx.requester, tx.code, tx.one_way,
+                                    tx.ptr, tx.cookie, tx.txn_id,
+                                    Z306AN_REJECT_LOG.load(Ordering::Relaxed)
+                                );
+                            }
+                            // Kernel semantics: every BINDER_WRITE_READ
+                            // returns at least BR_NOOP — never an empty
+                            // read buffer.
+                            push_br_noop(&mut read_buf);
+                            tx_rejected = true;
+                        }
+                    }
+                    if tx_rejected {
+                        // Skip the delivery entirely — the transaction and
+                        // its blob are dropped (kernel: released node work).
+                    } else {
+                        let (ds, os) = match &tx.blob {
+                            Some(b) => (b.data.len() as u64, b.offsets.len() as u64),
+                            None => (0, 0),
+                        };
+                        if tx.cookie != 0 {
+                            // 6-Z306ad: delivery-time snapshot — the cookie the
+                            // receiving server will cast to its BBinder (the
+                            // vendor-HAL vtable-garbage crash class rides this
+                            // path; see the pc=-0x78 fleet in #198/#199).
+                            let dpid = {
+                                let b = bus.lock().expect("binder bus poisoned");
+                                b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                            };
+                            probe_flat_mem(
+                                "delivery",
+                                &PROBE_DELIVERY_BUDGET,
+                                dpid,
+                                &format!("code={:#x}", tx.code),
+                                tx.ptr,
+                                tx.cookie,
+                            );
+                        }
+                        push_br_transaction(
+                            &mut read_buf,
+                            tx.code,
+                            tx.flags,
+                            tx.sender_pid,
+                            tx.sender_euid,
                             tx.ptr,
                             tx.cookie,
+                            ds,
+                            os,
                         );
-                    }
-                    push_br_transaction(
-                        &mut read_buf,
-                        tx.code,
-                        tx.flags,
-                        tx.sender_pid,
-                        tx.sender_euid,
-                        tx.ptr,
-                        tx.cookie,
-                        ds,
-                        os,
-                    );
-                    if let Some(blob) = tx.blob {
-                        resp_blobs.push(blob);
-                    }
-                    info!(
+                        if let Some(blob) = tx.blob {
+                            resp_blobs.push(blob);
+                        }
+                        info!(
                     "[KR64][binder][vm{}] delivered transaction conn={} <- conn={} code={} oneway={} (tx #{})",
                     vm_id, conn_id, tx.requester, tx.code, tx.one_way, tx.txn_id
                 );
+                    }
                 }
                 Delivery::Death(cookie) => {
                     push_br_dead_binder(&mut read_buf, cookie);
@@ -6404,6 +6491,14 @@ fn push_br_failed_reply(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&BR_FAILED_REPLY.to_ne_bytes());
 }
 
+/// 6-Z306an: Push `[BR_DEAD_REPLY]` (4 bytes, no payload) — the
+/// caller-side code for a transaction whose target object is dead.
+/// Consumed by `IPCThreadState::waitForResponse` (`case BR_DEAD_REPLY:
+/// err = DEAD_OBJECT`), NEVER by the server-side `executeCommand`.
+fn push_br_dead_reply(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&BR_DEAD_REPLY.to_ne_bytes());
+}
+
 /// Push `[BR_TRANSACTION_COMPLETE]` (4 bytes, no payload). The client's
 /// `IPCThreadState::waitForResponse` consumes this and keeps looping for
 /// the actual `BR_REPLY` (6-Z114 §4.5 — sync reply may batch
@@ -6436,6 +6531,12 @@ static PROBE_DELIVERY_BUDGET: AtomicU32 = AtomicU32::new(96);
 /// shape, the runs should now show depth≥2 events AND no
 /// "BC_REPLY with no delivered transaction" lines.
 static Z306AG_NESTED_LOG_BUDGET: AtomicU32 = AtomicU32::new(16);
+
+/// 6-Z306an: bounded log budget for dead-target transaction rejections
+/// at the delivery gate (the fleet crash-loops on stale registrations —
+/// one line per rejection would flood; 24 lines name the population and
+/// stay quiet after).
+static Z306AN_REJECT_LOG: AtomicU32 = AtomicU32::new(24);
 
 fn z306ag_note_stack_depth(depth: usize) {
     if depth < 2 {
@@ -6511,9 +6612,28 @@ fn probe_flat_mem(
 /// subobject; the object is ALIVE iff [R+8] == W (RefBase ctor:
 /// mRefs(new weakref_impl(this)); the live object's mRefs field points
 /// back at its weakref). Freed-and-reused chunks sever the equality.
-fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
+/// 6-Z306an: tri-state liveness verdict for the delivery-side gates.
+/// The boolean [`mirror_ref_ok`] cannot distinguish "the anchor is
+/// POSITIVELY broken" (freed chunk / severed round-trip / association
+/// missing — the object is really dead) from "the guest memory could
+/// not be read at all" (the verdict is unknown). For mirror commands
+/// the distinction is irrelevant (skip = BR_NOOP is always safe), but
+/// the 6-Z306an TRANSACTION delivery gate must never drop a LIVE
+/// transaction just because a peek failed — that would surface a
+/// spurious BR_DEAD_REPLY to an innocent requester. Only a positive
+/// `Dead` verdict rejects a delivery; `Unknown` delivers as before.
+enum Liveness {
+    /// The anchor verified the object alive (round-trip + association).
+    Alive,
+    /// The anchor POSITIVELY identified the object as dead/reused.
+    Dead,
+    /// The anchor could not run (unreadable guest memory) — no verdict.
+    Unknown,
+}
+
+fn mirror_ref_check(guest_pid: i32, ptr: u64, cookie: u64) -> Liveness {
     if guest_pid <= 0 || ptr == 0 || cookie == 0 {
-        return false;
+        return Liveness::Dead;
     }
     // 6-Z306ae-f (#236 decode): the ROUND-TRIP liveness anchor. The
     // 6-Z306ae-d vptr-only contract is proven insufficient: ladder #236
@@ -6540,7 +6660,7 @@ fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
                     "[KR64][binder][svc] 6-Z306ae-f: mirror skipped — weakref W=0x{:x} mBase=0 (freed chunk) cookie=0x{:x} pid={}",
                     ptr, cookie, guest_pid
                 );
-                return false;
+                return Liveness::Dead;
             }
             match crate::ptrace_emu::peek_guest_bytes(guest_pid, mbase + 8, 8) {
                 Some(rb) if rb.len() == 8 => {
@@ -6550,7 +6670,7 @@ fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
                             "[KR64][binder][svc] 6-Z306ae-f: mirror skipped — round-trip broken: [R+8]=0x{:x} != W=0x{:x} (R=0x{:x}, cookie=0x{:x}) — object dead/chunk-reused pid={}",
                             refs_back, ptr, mbase, cookie, guest_pid
                         );
-                        return false;
+                        return Liveness::Dead;
                     }
                     // 6-Z306d-b (#237 decode): leg 2 — the W↔B ASSOCIATION.
                     // A freed-and-REUSED weakref chunk can pass leg 1 for a
@@ -6569,13 +6689,13 @@ fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
                                 .chunks_exact(8)
                                 .any(|w| u64::from_ne_bytes(w.try_into().unwrap()) == ptr);
                             if associated {
-                                true
+                                Liveness::Alive
                             } else {
                                 info!(
                                     "[KR64][binder][svc] 6-Z306d-b: mirror skipped — association broken: W=0x{:x} not found in cookie 0x{:x} chunk (R=0x{:x}) — stale registration pid={}",
                                     ptr, cookie, mbase, guest_pid
                                 );
-                                false
+                                Liveness::Dead
                             }
                         }
                         _ => {
@@ -6583,7 +6703,7 @@ fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
                                 "[KR64][binder][svc] 6-Z306d-b: mirror skipped — cookie 0x{:x} chunk unreadable pid={}",
                                 cookie, guest_pid
                             );
-                            false
+                            Liveness::Unknown
                         }
                     }
                 }
@@ -6592,7 +6712,7 @@ fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
                         "[KR64][binder][svc] 6-Z306ae-f: mirror skipped — mBase R=0x{:x} unreadable cookie=0x{:x} pid={}",
                         mbase, cookie, guest_pid
                     );
-                    false
+                    Liveness::Unknown
                 }
             }
         }
@@ -6601,9 +6721,16 @@ fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
                 "[KR64][binder][svc] 6-Z306ae-f: mirror skipped — weakref W=0x{:x} unreadable cookie=0x{:x} pid={}",
                 ptr, cookie, guest_pid
             );
-            false
+            Liveness::Unknown
         }
     }
+}
+
+/// Boolean wrapper for the mirror-command gates (all pre-6-Z306an call
+/// sites): skip-on-unknown is the safe policy there, so Unknown maps to
+/// false exactly as every unreadable case did before the tri-state.
+fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
+    matches!(mirror_ref_check(guest_pid, ptr, cookie), Liveness::Alive)
 }
 
 /// Push `[BR_REPLY][binder_transaction_data]` with `tr.data_size` and
@@ -6864,6 +6991,53 @@ mod tests {
             "BR_CLEAR_DEATH_NOTIFICATION_DONE = _IOR('r',16,8)"
         );
         assert_eq!(BR_FAILED_REPLY, 0x00007211, "BR_FAILED_REPLY = _IO('r',17)");
+    }
+
+    #[test]
+    fn z306an_dead_reply_emits_caller_side_code() {
+        // 6-Z306an: the dead-target rejection must surface BR_DEAD_REPLY
+        // on the REQUESTER's stream (waitForResponse handles it →
+        // DEAD_OBJECT) — NEVER in a server stream (executeCommand has no
+        // case for it → "BAD COMMAND 29189" → LOG_ALWAYS_FATAL, the #239
+        // fleet). The emitted dword is _IO('r',5) = 0x00007205.
+        let mut buf = Vec::new();
+        push_br_dead_reply(&mut buf);
+        assert_eq!(buf, 0x00007205u32.to_le_bytes(), "BR_DEAD_REPLY dword");
+        assert_eq!(buf.len(), 4, "cmd-only, no payload");
+    }
+
+    #[test]
+    fn z306an_dead_target_slot_filler_is_noop_only() {
+        // The 68-byte server-stream slot for a neutralized BR_TRANSACTION
+        // (cmd + 64-byte binder_transaction_data) must be filled with
+        // BR_NOOP ONLY: executeCommand handles BR_NOOP (skip) and ABORTS
+        // on BR_DEAD_REPLY. 68 bytes / 4 = 17 dwords.
+        let slot_bytes = 4 + std::mem::size_of::<BinderTransactionData>();
+        assert_eq!(slot_bytes, 68, "cmd + btd on 64-bit");
+        assert_eq!(slot_bytes / 4, 17, "17×BR_NOOP fills the slot");
+        // And the shlib's BP_BR_NOOP must equal the kernel BR_NOOP the
+        // guest's executeCommand switches on.
+        assert_eq!(BR_NOOP, 0x0000720C);
+    }
+
+    #[test]
+    fn z306an_mirror_ref_check_tri_state_arg_validation() {
+        // Invalid args (pid<=0 / ptr==0 / cookie==0) are a POSITIVE Dead
+        // verdict for the mirror gates (unchanged boolean behavior), and
+        // the wrapper maps Dead → false exactly like the pre-tri-state
+        // mirror_ref_ok did.
+        assert!(matches!(
+            mirror_ref_check(0, 0x1000, 0x2000),
+            Liveness::Dead
+        ));
+        assert!(matches!(
+            mirror_ref_check(-5, 0x1000, 0x2000),
+            Liveness::Dead
+        ));
+        assert!(matches!(mirror_ref_check(1234, 0, 0x2000), Liveness::Dead));
+        assert!(matches!(mirror_ref_check(1234, 0x1000, 0), Liveness::Dead));
+        assert!(!mirror_ref_ok(0, 0x1000, 0x2000));
+        assert!(!mirror_ref_ok(1234, 0x1000, 0));
     }
 
     #[test]
