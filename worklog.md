@@ -28326,3 +28326,26 @@ Stage Summary / #241 DECODE TREE:
 3. EXPECT (6-Z306ao-b): every uid-1000 cgroup.procs member set served during the kill storm — verify whether system_server pids ever appear in a uid-1000 service group (a membership bug would be a REAL production fix in the 6-Z305t-56 BFS).
 4. system_server survival past the watchdog's first check (~+337s = 30s after birth) is the rung-6 gate: if the census names a fixable block, rung 6 (SYSTEM_SERVER surviving) finally lands.
 5. Recovery gate MUST stay GREEN (instruments only; no wire changes).
+
+---
+Task ID: 35 (webDevReview cron leg, continued)
+Agent: Z.ai Code (main session, same leg as Tasks 33/34)
+Task: Decode ladder #241 (the 6-Z306ao census run); land 6-Z306ao-d/e; dispatch #242.
+
+Work Log:
+- #241 (fcfae74f, rn239) decoded: rung 7; recovery gate 4/4 GREEN on fcfae74f (children #8200-#8203); kr64 CI GREEN. The 6-Z306ao THREAD CENSUS LANDED and named the wall precisely:
+  - BOTH system_server generations were killed by their OWN "watchdog" thread at 32-35s of process life (gen-1 5036 at +184.8s; gen-2 7132 at +349.6s). The census at the kill moment: EVERY handler thread (ActivityManager ×4, android.fg/ui/io/display/anim/bg, PowerManagerSer, OomAdjuster) IDLE in ep_poll — the watchdog MONITORS were NOT stuck.
+  - "[glog I/Watchdog] WAITED_HALF" logged 60ms before the kill (fd=30 write via pid 5424). The A11 Watchdog OVERDUE kill path needs ≥67s (60s timeout + ≥5s deathbed: dumpStackTraces + SystemClock.sleep(5000) + dropbox join(2s)) — the 32s kill + 60ms gap is IMPOSSIBLE for that path. Kill-path candidates: (a) OpenFdMonitor — debuggable builds check /proc/self/fd/{rlim_cur-12} at EVERY 30s interval boundary and kill IMMEDIATELY (first boundary ≈ 30s after birth — fits!); (b) an UNCAUGHT EXCEPTION in the watchdog's dumpStackTraces work — the ART uncaught handler kill()s from the crashing thread (comm "watchdog" exactly, 60ms gap fits).
+  - A stuck-forever thread named "system_server" (never renamed; 5058/7230) exists in BOTH generations: 6-Z271f STALL-DUMP nr=101 clock_nanosleep, wchan hrtimer_nanosleep → restart_syscall at kill, holding an inotify fd — the #224 "restarted timed" family resurfaces; not yet proven to be the watchdog's trigger (all MONITORS idle).
+  - The DIAG write(fd=30) sampler starved exactly at the decisive moment (2 lines/run) — "WATCHDOG KILLING SYSTEM PROCESS: <subject>" is invisible.
+- LANDED 6666982 — 6-Z306ao-d + 6-Z306ao-e:
+  1. **6-Z306ao-d** (tracer): the 6-Z306ao census line now carries the ISSUER's tid-ring tail — a bare kill right after logd writes = uncaught-exception class; a clock_nanosleep before the kill = the OVERDUE tail's sleep(5000).
+  2. **6-Z306ao-e** (harness): the ladder artifact now dumps the guest's /data/anr + /data/system/dropbox (traces_*, anr_fd_*, system_server_watchdog entries — the watchdog writes its own ground truth there; bounded 32 KiB/file).
+- Gates: fmt+clippy clean; 844/844. Pushed 6666982. DISPATCHED on 6666982: ladder #242 (rn240) + recovery pr-tier gate. In flight at worklog-write.
+
+Stage Summary / #242 DECODE TREE:
+1. PRIMARY: anr-dropbox.txt — if an anr_fd_* file exists → the OpenFdMonitor tripped → the guest fd table hit rlim_cur-12 → find the FD LEAK (the churn-era fixes may have regressed under system_server; the census lists the fd-heavy suspects). If a traces_ file exists → uncaught-exception/OVERDUE class — the traces name the exact stack. If a system_server_watchdog dropbox entry exists → the SUBJECT names the blocked checker verbatim.
+2. The issuer ring-tail distinguishes the kill path (logd-write→kill = exception; nanosleep→kill = OVERDUE tail).
+3. The stuck "system_server" nanosleep thread (5058/7230) needs identity: it is the only non-idle anomaly in an otherwise-idle process — if #242's evidence ties it to a checker, fix its stuck timed-wait.
+4. system_server reaching the watchdog's SECOND interval boundary (~+345s = 60s+) without a kill = rung 6 finally landing.
+5. Recovery gate MUST stay GREEN (instruments + harness only).
