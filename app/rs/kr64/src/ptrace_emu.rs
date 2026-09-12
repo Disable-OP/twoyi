@@ -6764,6 +6764,20 @@ fn read_abort_message_vma(pid: libc::pid_t) -> Option<String> {
     Some(s)
 }
 
+/// 6-Z306af-d re-gate (Task-31c): FNV-1a 64-bit content hash for the
+/// abort-message dedup — identical abort texts (the crash-loop class:
+/// init restarts the same service, the same CHECK string re-fires) no
+/// longer consume the per-boot read budget. No external deps; inputs
+/// are short ASCII messages.
+fn z306af_abort_msg_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_96ce_4842_2235;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// Read exactly `len` bytes from the traced child's memory starting at
 /// `addr`, using `PTRACE_PEEKDATA` in word-sized chunks. Returns `None`
 /// if the very first PEEK fails (EIO / unmapped address); returns a
@@ -13791,6 +13805,16 @@ pub fn run_ptrace_loop(
         std::collections::HashSet::new();
     let mut z306_zygote_lineage: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // 6-Z306af-d THREAD set (Task-31c queue item 1, artifact-corrected):
+    // clone-created THREADS of lineage members. #238's system_server abort
+    // was named by HwBinder THREAD 7502, but z306_zygote_lineage only ever
+    // held TGIDs (fork children) — the lineage-gated abort instruments
+    // never ran for it and the abort text (len=0x64) was lost. Threads are
+    // inserted at their CREATION event (PTRACE_EVENT_CLONE, classified via
+    // /proc Tgid == tid) so the per-stop lineage gate stays a pure set
+    // lookup — no per-stop /proc reads (the 6-Z306u perf lesson).
+    let mut z306_lineage_threads: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     // 6-Z306p: zygote fork-child execve argv dump budget (8/boot) — the
     // idmap2-caller instrument (Task 25b decision tree item 1). Early-
     // boot service execs are NOT zygote fork children, so they cannot
@@ -14708,6 +14732,26 @@ pub fn run_ptrace_loop(
         libc::pid_t,
         std::collections::VecDeque<i64>,
     > = std::collections::HashMap::new();
+    // 6-Z306af-d re-gate (Task-31c queue item 1, artifact-corrected): the
+    // lineage-gated abort-message reads (the af-g pending catch + the af-d
+    // tgkill-entry read) share ONE per-pid-1 + boot-cap-32 + content-dedup
+    // budget. #238 correction: the af-d read did NOT fail by budget
+    // exhaustion — it fired ZERO times because the aborting pid was a
+    // THREAD the old bare-contains gate never admitted (the Task-31c
+    // close-out hypothesis was wrong on that point). The thread-set fix
+    // restores reachability; THIS re-gate keeps the reads bounded once a
+    // lineage-internal crash loop (zygote-child apps repeating the same
+    // abort) arrives: one read per pid, 32 distinct texts per boot,
+    // identical texts deduped by FNV-1a hash (the af-g catch and the af-d
+    // read both fire for one abort — dedup keeps the second from
+    // double-logging).
+    let mut z306af_abort_read_pids: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    let mut z306af_abort_msg_seen: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
+    let mut z306af_abort_reads: u64 = 0;
+    let mut z306af_abort_dedup: u64 = 0;
+    let mut z306af_abort_unread: u64 = 0;
     // 6-Z305i: capped DIAG for the first non-init getpid pass-throughs
     // (the InitAborter contract fix — see the pending_getpid EXIT arm).
     let mut z305i_getpid_diag: u64 = 0;
@@ -16620,7 +16664,11 @@ pub fn run_ptrace_loop(
                             // the repaired table no matter how the leak
                             // arose (inherited transient, window churn,
                             // or a pre-check child open).
-                            if !boot_recovery && z305y_stdio_pin_pid == Some(pid) {
+                            if !boot_recovery
+                                && (z305y_stdio_pin_pid == Some(pid)
+                                    || z306_zygote_lineage.contains(&pid)
+                                    || z306_lineage_threads.contains(&pid))
+                            {
                                 // 6-Z306g: the zygote + every process-fork
                                 // child = exempt from the 6-Z305t-24
                                 // /dev/null -> svclog redirect (their
@@ -16628,13 +16676,66 @@ pub fn run_ptrace_loop(
                                 // A11 forkSystemServer whitelist rejects
                                 // /dev/twoyi-svclogs/*, and #162 proved a
                                 // svclog fd on fd 28 is boot-fatal there).
-                                z306_zygote_lineage.insert(pid);
+                                // 6-Z306af-d thread tracking (Task-31c,
+                                // artifact-corrected): the lineage now
+                                // tracks the FULL tree — any lineage
+                                // member's fork/vfork/clone child is
+                                // classified ONCE at the event: a child
+                                // whose /proc Tgid differs from its own
+                                // tid is a THREAD (→ z306_lineage_threads);
+                                // otherwise a process (→
+                                // z306_zygote_lineage). One bounded /proc
+                                // read per creation event — zero per-stop
+                                // cost. The childgate and fork-children
+                                // sets stay PROCESS-only (their consumers
+                                // are exec/service instruments).
                                 if ev == libc::PTRACE_EVENT_FORK as u32
                                     || ev == libc::PTRACE_EVENT_VFORK as u32
+                                    || ev == libc::PTRACE_EVENT_CLONE as u32
                                 {
-                                    z306_zygote_lineage.insert(new_child_id as libc::pid_t);
-                                    z306_childgate.insert(new_child_id as libc::pid_t, 0u32);
-                                    z306_zygote_fork_children.insert(new_child_id as libc::pid_t);
+                                    let z306_child = new_child_id as libc::pid_t;
+                                    let z306_is_thread = if ev == libc::PTRACE_EVENT_CLONE as u32 {
+                                        // CLONE fires for thread creation
+                                        // AND for clone()-created
+                                        // processes; Tgid == tid separates
+                                        // them. On a read failure default
+                                        // to THREAD — a misfiled process
+                                        // only skips the TGID-only arms
+                                        // below, while a misfiled THREAD
+                                        // would burn the af-d maps-snapshot
+                                        // budget.
+                                        match std::fs::read_to_string(format!(
+                                            "/proc/{}/status",
+                                            z306_child
+                                        )) {
+                                            Ok(s) => s.lines().any(|l| {
+                                                l.strip_prefix("Tgid:")
+                                                    .and_then(|v| {
+                                                        v.trim().parse::<libc::pid_t>().ok()
+                                                    })
+                                                    .is_some_and(|t| t != z306_child)
+                                            }),
+                                            Err(_) => true,
+                                        }
+                                    } else {
+                                        // fork/vfork always create processes.
+                                        false
+                                    };
+                                    if z306_is_thread {
+                                        z306_lineage_threads.insert(z306_child);
+                                    } else {
+                                        z306_zygote_lineage.insert(z306_child);
+                                    }
+                                }
+                                if z305y_stdio_pin_pid == Some(pid) {
+                                    z306_zygote_lineage.insert(pid);
+                                    if ev == libc::PTRACE_EVENT_FORK as u32
+                                        || ev == libc::PTRACE_EVENT_VFORK as u32
+                                    {
+                                        z306_childgate.insert(new_child_id as libc::pid_t, 0u32);
+                                        z306_zygote_fork_children
+                                            .insert(new_child_id as libc::pid_t);
+                                    }
                                 }
                             }
                         } else {
@@ -22190,7 +22291,21 @@ pub fn run_ptrace_loop(
                     //     + signal distinguish a SIGQUIT stack-dump request
                     //     from a SIGKILL teardown.
                     {
-                        let lineage_306x = z306_zygote_lineage.contains(&pid);
+                        // 6-Z306af-d thread gate (Task-31c queue item 1,
+                        // artifact-corrected): the block admits lineage
+                        // THREADS via z306_lineage_threads (populated at the
+                        // creation events — see the fork-event arm). #238:
+                        // the abort was named by HwBinder THREAD 7502; the
+                        // old bare-contains gate skipped the af-g catch +
+                        // af-d read for it and the abort text (len=0x64) was
+                        // lost. The TGID-only check stays for the arms that
+                        // must NOT expand: thread PR_SET_NAME self-renames
+                        // would eat the af-d maps-snapshot budget (12/run —
+                        // the death-site pc resolver) and the 6-Z306x
+                        // NAME/KILL caps.
+                        let lineage_306x = z306_zygote_lineage.contains(&pid)
+                            || z306_lineage_threads.contains(&pid);
+                        let lineage_306x_tgid_only = z306_zygote_lineage.contains(&pid);
                         if lineage_306x {
                             // 6-Z306af-g: a pending abort-message read — the
                             // 6-Z149 prctl-deep probe records the
@@ -22204,13 +22319,18 @@ pub fn run_ptrace_loop(
                             // tgkill-entry hook and the delivery-stop VMA
                             // reader missed it; this catch fires on the first
                             // stop after the naming regardless of how the
-                            // signal is raised. 8 per run.
+                            // signal is raised. 6-Z306af-d re-gate (Task-31c):
+                            // THIS catch is the site that should have read
+                            // system_server 7434's abort text (named by
+                            // HwBinder THREAD 7502 at +312.6s) — the old
+                            // bare-contains lineage gate skipped it for
+                            // threads. Read FIRST (dedup needs the content),
+                            // then gate: per-pid 1, boot cap 32, text dedup
+                            // shared with the tgkill-entry read below.
                             if let Some((msg_addr, msg_len)) = z306af_pending_abort.get(&pid) {
                                 let (msg_addr, msg_len) = (*msg_addr, *msg_len);
-                                static Z306AF_G: std::sync::atomic::AtomicU64 =
-                                    std::sync::atomic::AtomicU64::new(0);
                                 z306af_pending_abort.remove(&pid);
-                                if Z306AF_G.load(std::sync::atomic::Ordering::Relaxed) < 8 {
+                                if z306af_abort_read_pids.insert(pid) {
                                     let cap = msg_len.min(512) as usize;
                                     match peek_guest_bytes(pid, msg_addr, cap) {
                                         Some(bytes) => {
@@ -22218,23 +22338,43 @@ pub fn run_ptrace_loop(
                                                 .iter()
                                                 .position(|b| *b == 0)
                                                 .unwrap_or(bytes.len());
-                                            Z306AF_G
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            log(&format!(
-                                                "6-Z306af: abort-message(pid={}, vma={:#x} len={:#x}): {:?}",
-                                                pid,
-                                                msg_addr,
-                                                msg_len,
-                                                String::from_utf8_lossy(&bytes[..end])
-                                            ));
+                                            let h = z306af_abort_msg_hash(&bytes[..end]);
+                                            if z306af_abort_msg_seen.insert(h) {
+                                                if z306af_abort_reads < 32 {
+                                                    z306af_abort_reads += 1;
+                                                    log(&format!(
+                                                        "6-Z306af: abort-message(pid={}, vma={:#x} len={:#x}): {:?}",
+                                                        pid,
+                                                        msg_addr,
+                                                        msg_len,
+                                                        String::from_utf8_lossy(&bytes[..end])
+                                                    ));
+                                                } else if z306af_abort_dedup < 4 {
+                                                    z306af_abort_dedup += 1;
+                                                    log(&format!(
+                                                        "6-Z306af-d: abort-message(pid={}) cap-drop #{} (32 distinct texts read this boot)",
+                                                        pid, z306af_abort_dedup
+                                                    ));
+                                                }
+                                            } else if z306af_abort_dedup < 4 {
+                                                z306af_abort_dedup += 1;
+                                                log(&format!(
+                                                    "6-Z306af-d: abort-message(pid={}) dedup skip #{} (identical text already read)",
+                                                    pid, z306af_abort_dedup
+                                                ));
+                                            }
                                         }
                                         None => {
-                                            Z306AF_G
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            log(&format!(
-                                                "6-Z306af: abort-message(pid={}, vma={:#x} len={:#x}) UNREADABLE at the next ENTRY",
-                                                pid, msg_addr, msg_len
-                                            ));
+                                            // Own budget: SIGSEGV-class deaths
+                                            // have no abort VMA content — 8
+                                            // unread lines then silence.
+                                            if z306af_abort_unread < 8 {
+                                                z306af_abort_unread += 1;
+                                                log(&format!(
+                                                    "6-Z306af: abort-message(pid={}, vma={:#x} len={:#x}) UNREADABLE at the next ENTRY (unread #{}/8)",
+                                                    pid, msg_addr, msg_len, z306af_abort_unread
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -22292,6 +22432,12 @@ pub fn run_ptrace_loop(
                             }
                             if syscall_num == abi.prctl
                                 && get_syscall_arg(&regs, abi.reg_arg1) == 15
+                                // 6-Z306af-d thread gate: TGID-only — thread
+                                // self-renames (pthread_setname_np →
+                                // prctl(PR_SET_NAME)) must NOT eat this cap
+                                // or the af-d maps-snapshot budget below
+                                // (the death-site pc resolver).
+                                && lineage_306x_tgid_only
                             {
                                 static Z306X_NAME: std::sync::atomic::AtomicU64 =
                                     std::sync::atomic::AtomicU64::new(0);
@@ -22333,7 +22479,12 @@ pub fn run_ptrace_loop(
                             let is_tgkill_306x =
                                 abi.tgkill_nr != -1 && syscall_num == abi.tgkill_nr;
                             let is_kill_306x = abi.kill_nr != -1 && syscall_num == abi.kill_nr;
-                            if is_tgkill_306x || is_kill_306x {
+                            // 6-Z306af-d thread gate: TGID-only — with
+                            // threads admitted to the block, every binder
+                            // thread's kill/tgkill would flood this 40-cap
+                            // log; the af-j/af-m hooks cover thread issuers
+                            // with their own budgets.
+                            if (is_tgkill_306x || is_kill_306x) && lineage_306x_tgid_only {
                                 let a0 = get_syscall_arg(&regs, abi.reg_arg1);
                                 let a1 = get_syscall_arg(&regs, abi.reg_arg2);
                                 let a2 = get_syscall_arg(&regs, abi.reg_arg3);
@@ -22362,53 +22513,80 @@ pub fn run_ptrace_loop(
                                 // died by SIGABRT at +323.6s with the
                                 // PR_SET_VMA 'abort message' naming visible
                                 // at 6-Z149 but no delivery stop and no VMA
-                                // read). Lineage-only, 8 per run.
+                                // read). Lineage pids AND threads (the
+                                // 6-Z306af-d thread gate). Re-gate (Task-31c):
+                                // per-pid 1 + boot cap 32 + text dedup shared
+                                // with the af-g catch — one abort, one read.
                                 let af_sig = if is_tgkill_306x { a2 } else { a1 };
                                 if af_sig == libc::SIGABRT as u64 {
-                                    static Z306AF_ABORT_MSG: std::sync::atomic::AtomicU64 =
-                                        std::sync::atomic::AtomicU64::new(0);
-                                    if Z306AF_ABORT_MSG.load(std::sync::atomic::Ordering::Relaxed)
-                                        < 8
-                                    {
-                                        Z306AF_ABORT_MSG
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    // Read FIRST (dedup needs the content),
+                                    // then gate: per-pid 1, boot cap 32.
+                                    if z306af_abort_read_pids.insert(pid) {
                                         match read_abort_message_vma(pid) {
                                             Some(msg) => {
-                                                log(&format!(
-                                                    "6-Z306af: tgkill-ABORT pid={} abort message: {:?}",
-                                                    pid, msg
-                                                ));
-                                                // 6-Z306af-k: the scudo
-                                                // corruption-class discriminator
-                                                // (header read at the live stop).
-                                                if msg.contains("Scudo ERROR") {
-                                                    static Z306AF_K: std::sync::atomic::AtomicU64 =
-                                                        std::sync::atomic::AtomicU64::new(0);
-                                                    if Z306AF_K
-                                                        .load(std::sync::atomic::Ordering::Relaxed)
-                                                        < 8
-                                                    {
-                                                        Z306AF_K.fetch_add(
-                                                            1,
-                                                            std::sync::atomic::Ordering::Relaxed,
-                                                        );
-                                                        match z306af_scudo_chunk_header(pid, &msg)
-                                                        {
-                                                            Some(hdr) => log(&format!(
-                                                                "6-Z306af-k: scudo chunk header (16B header + 16B user, low->high): {}",
-                                                                hdr
-                                                            )),
-                                                            None => log(
-                                                                "6-Z306af-k: scudo chunk header UNREADABLE at the tgkill entry",
-                                                            ),
+                                                let h = z306af_abort_msg_hash(msg.as_bytes());
+                                                if z306af_abort_msg_seen.insert(h) {
+                                                    if z306af_abort_reads < 32 {
+                                                        z306af_abort_reads += 1;
+                                                        log(&format!(
+                                                            "6-Z306af: tgkill-ABORT pid={} abort message: {:?}",
+                                                            pid, msg
+                                                        ));
+                                                        // 6-Z306af-k: the scudo
+                                                        // corruption-class
+                                                        // discriminator (header
+                                                        // read at the live stop).
+                                                        if msg.contains("Scudo ERROR") {
+                                                            static Z306AF_K:
+                                                                std::sync::atomic::AtomicU64 =
+                                                                std::sync::atomic::AtomicU64::new(
+                                                                    0,
+                                                                );
+                                                            if Z306AF_K
+                                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                                                < 8
+                                                            {
+                                                                Z306AF_K.fetch_add(
+                                                                    1,
+                                                                    std::sync::atomic::Ordering::Relaxed,
+                                                                );
+                                                                match z306af_scudo_chunk_header(
+                                                                    pid, &msg,
+                                                                ) {
+                                                                    Some(hdr) => log(&format!(
+                                                                        "6-Z306af-k: scudo chunk header (16B header + 16B user, low->high): {}",
+                                                                        hdr
+                                                                    )),
+                                                                    None => log(
+                                                                        "6-Z306af-k: scudo chunk header UNREADABLE at the tgkill entry",
+                                                                    ),
+                                                                }
+                                                            }
                                                         }
+                                                    } else if z306af_abort_dedup < 4 {
+                                                        z306af_abort_dedup += 1;
+                                                        log(&format!(
+                                                            "6-Z306af-d: tgkill-ABORT(pid={}) cap-drop #{} (32 distinct texts read this boot)",
+                                                            pid, z306af_abort_dedup
+                                                        ));
                                                     }
+                                                } else if z306af_abort_dedup < 4 {
+                                                    z306af_abort_dedup += 1;
+                                                    log(&format!(
+                                                        "6-Z306af-d: tgkill-ABORT(pid={}) dedup skip #{} (identical text already read)",
+                                                        pid, z306af_abort_dedup
+                                                    ));
                                                 }
                                             }
-                                            None => log(&format!(
-                                                "6-Z306af: tgkill-ABORT pid={} (no abort-message VMA readable at the tgkill entry)",
-                                                pid
-                                            )),
+                                            None => {
+                                                if z306af_abort_unread < 8 {
+                                                    z306af_abort_unread += 1;
+                                                    log(&format!(
+                                                        "6-Z306af: tgkill-ABORT pid={} (no abort-message VMA readable at the tgkill entry; unread #{}/8)",
+                                                        pid, z306af_abort_unread
+                                                    ));
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -22472,6 +22650,47 @@ pub fn run_ptrace_loop(
                                         j_target,
                                         j_sig
                                     ));
+                                }
+                                // 6-Z306af-m: the sig=33 raiser context
+                                // (Task-31c queue item 2). #238: the ONLY
+                                // sig=33 traffic in the whole run was the
+                                // 15-send spiral from HwBinder THREAD 7502 to
+                                // tgid 7434 at +313.97..+314.34s — 1.4s after
+                                // 7502 named its abort message (len=0x64) and
+                                // ~1.2s before 7434 died by SIGABRT. af-j
+                                // names the issuer but logs only the TGID;
+                                // af-m adds the TARGET TID (tgkill arg2) and
+                                // the issuer's own 6-Z306af-h tid-ring tail
+                                // (thread coverage arrived with the 6-Z306af-d
+                                // thread set) so the decode sees WHAT the
+                                // raiser served between the abort-message
+                                // naming and the SIGABRT. Thread-directed
+                                // only; 8 per run.
+                                if j_sig == 33 && is_tgkill_j {
+                                    static Z306AF_M: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z306AF_M.load(std::sync::atomic::Ordering::Relaxed) < 8 {
+                                        Z306AF_M.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        let m_tid =
+                                            get_syscall_arg(&regs, abi.reg_arg2) as libc::pid_t;
+                                        let m_comm =
+                                            std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                                .map(|c| c.trim_end().to_string())
+                                                .unwrap_or_default();
+                                        let m_ring = z306af_tid_trail
+                                            .get(&pid)
+                                            .map(|r| {
+                                                r.iter()
+                                                    .map(|n| n.to_string())
+                                                    .collect::<Vec<_>>()
+                                                    .join(",")
+                                            })
+                                            .unwrap_or_default();
+                                        log(&format!(
+                                            "6-Z306af-m: sig=33 raiser pid={} comm={:?} → target tid={} ring-tail(nr, oldest->newest): [{}]",
+                                            pid, m_comm, m_tid, m_ring
+                                        ));
+                                    }
                                 }
                             }
                         }
