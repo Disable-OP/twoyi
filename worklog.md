@@ -28235,3 +28235,21 @@ Stage Summary / #238 DECODE TREE:
 2. system_server deaths: 5579's clean exit(0) +2.3s is the next wall candidate — decode via the zygote svclog (SystemServer's own stderr — what exception/exit path) and the era's last transactions. If SystemServer's runtime exits BECAUSE a core service got DEAD_OBJECT (our honest-failure conversion), the fix is the LIFETIME one (Task-31 tree item 3: in-transaction mirror for HIDL tails) — the services must stop dying in the first place.
 3. Watch 6-Z306d-b skip volume: a high skip count on LIVE registrations would mean the 640B window misses some layouts (Δ>0x270?) — widen to 1024. Zero skips + zero crashes + system_server surviving = the anchor is complete.
 4. Recovery gate must stay GREEN on 7115bbf.
+
+---
+Task ID: 31c (webDevReview cron leg, continued — leg close-out)
+Agent: Z.ai Code (main session, same leg)
+Task: Decode ladder #238; leg close-out.
+
+Work Log:
+- #238 (7115bbf, run_number 236) decoded: rung 7, empty post-mortem, kr64 CI #1722 GREEN, **recovery gate dispatched on 7115bbf** (in flight at close — the association leg touched the wire, the gate is mandatory).
+- **THE BINDER LIFETIME WAR IS WON AT THE DELIVERY LAYER**: si_addr=0x4 SIGSEGVs = ZERO (1337 → 431 → 341 → 0 across #235→#238); libutils.so crashes = ZERO (216 → 0); total SIGSEGVs 136 (56 libgooglecamerahal + 14 libaudioflinger + 1 libandroid_servers — non-binder fleets). 171 honest anchor rejections (6-Z306ae-f + 6-Z306d-b lines). The four-layer anchor (vptr → round-trip → association, driver + shlib) is complete and production-green.
+- **system_server 7434 (era 3, born +304.4s) = the NEW WALL, cleanly isolated**: lived ~11s, died by SIGABRT (+315.5s) preceded by a 5+× tgkill sig=33 loop from its OWN HwBinder pool thread (7502, comm "HwBinder:7434_1"); the abort-message VMA was prctl'd by 7502 at +312.6s (len=0x64). The 6-Z306af-d abort-message read did NOT fire — its 8/run budget was consumed by the HAL-fleet aborts (1246 abort mentions) hours... minutes earlier. Eras 1/2 died before forkSystemServer (their decode is secondary to the 7434 class).
+- Leg totals: 5 production commits (77d6a9d 6-Z306z, 622560c instruments, f844224 6-Z306ae-f, 7115bbf 6-Z306d-b, + worklogs ad13e73), ladders #236-#238 dispatched+decoded, recovery gate GREEN on 622560c-era and f844224-era (7115bbf gate in flight), CI GREEN on every head.
+
+Stage Summary / NEXT-LEG QUEUE (priority order):
+1. **6-Z306af-d re-gate** (per-pid 1 + boot cap 32 — the 6-Z306u lesson): the abort-message instrument must survive to system_server's SIGABRT. Then #239 names the 7434 abort text (the sig-33 loop's cause — likely an HIDL service call failing in a way that trips a CHECK/LOG(FATAL) inside libhwbinder/libhidlbase).
+2. **Decode the sig=33 loop**: sig 33 = bionic SIGRTMIN+1... identify the raiser (6-Z306af-j already names issuer tid/comm — extend with the tgkill si_ptr payload or the sender's ring tail) and correlate with the HwBinder thread's served transactions (6-Z306ai conn map).
+3. **googlecamerahal fleet (56)**: pc = libgooglecamerahal.so r-xp, si_addr=0xfef8b70b5020-class (a REAL-pointer MAPERR — deref of a freed-but-mapped object), x0 memories show [vptr][mRefs] BOTH valid (the #236 pid-2908 class) — a non-binder internal crash class; the camera HAL is optional for boot (init criticality) — consider it POST-booting work unless it blocks rung 6.
+4. **eras 1/2 pre-forkSystemServer deaths**: the de-flooded klog now shows init's service restarts; decode why eras 1/2 never forked system_server (era 3 did — variance or progression?).
+5. Recovery gate on 7115bbf: verify GREEN; investigate any 6-Z306d-b skip lines in recovery artifacts (a too-strict association on live recovery objects would show as service failures).
