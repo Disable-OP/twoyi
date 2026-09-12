@@ -3905,6 +3905,22 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             if (kmsg_fd >= 0) {
                 syscall(SYS_dup3, kmsg_fd, sockfd, 0);
                 syscall(SYS_close, kmsg_fd);
+                /* 6-Z306t-deflood (#233 decode): the fd test below ran on
+                 * EVERY logd-socket connect — 12711 "logdw kmsg fd test"
+                 * marker writes per boot, which EVICTED init's own klog
+                 * lines (the only record of WHY init SIGKILLs each zygote
+                 * era ~14s after exec) from the mirrored __kmsg__ ring
+                 * before the artifacts ever read it. Gate the test to the
+                 * first 2 connects per process; the dup3 REDIRECT itself
+                 * is production behavior and always applies (the caller's
+                 * logd writes still land in the kmsg mirror). Plain static
+                 * (no TLS — banned in this shlib), same acceptance as
+                 * kmsg_fail_diag above. */
+                static unsigned char kmsg_fdtest_budget = 2;
+                if (kmsg_fdtest_budget == 0) {
+                    return 0;
+                }
+                kmsg_fdtest_budget--;
                 /* 6-Z305t-31/32: fd TEST — BOTH write() (landed in #89) and
                  * writev() (returned 37 in #90 yet the bytes were never
                  * found) through the dup'd fd, with both returns on the

@@ -7353,6 +7353,43 @@ fn read_child_u64(pid: libc::pid_t, addr: u64) -> Option<u64> {
     Some(word as u64)
 }
 
+/// 6-Z306p/-q (#233 decode): walk the guest's execve argv array and return
+/// up to `max_entries` strings, each truncated to 96 chars. ABI-aware
+/// stride (4 bytes on execve==11 — i386/arm32 — 8 bytes otherwise). A NULL
+/// terminator or an unreadable slot ends the walk; an unreadable slot is
+/// reported as "<unreadable>" so a truncated census is never mistaken for
+/// an empty argv.
+fn z306_read_guest_argv(
+    pid: libc::pid_t,
+    argv_addr: u64,
+    stride: u64,
+    max_entries: u64,
+) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if argv_addr == 0 {
+        return parts;
+    }
+    for idx in 0..max_entries {
+        let entry = match read_child_u64(pid, argv_addr.wrapping_add(idx * stride)) {
+            Some(w) if stride == 4 => w & 0xFFFF_FFFF,
+            Some(w) => w,
+            None => {
+                parts.push("<unreadable>".to_string());
+                break;
+            }
+        };
+        if entry == 0 {
+            break;
+        }
+        parts.push(
+            read_child_string(pid, entry)
+                .map(|s| s.chars().take(96).collect::<String>())
+                .unwrap_or_else(|| "<unreadable>".to_string()),
+        );
+    }
+    parts
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Task 6-Z110: property-service CLIENT emulation — pure helpers
 //
@@ -13728,6 +13765,14 @@ pub fn run_ptrace_loop(
     // boot service execs are NOT zygote fork children, so they cannot
     // exhaust the budget (the 6-Z272f-b lesson).
     let mut z306p_budget: u32 = 0;
+    // 6-Z306q: the ZYGOTE'S OWN execve argv dump budget (3/boot) — #233's
+    // 6-Z306p census named the idmap2 child (OverlayConfig
+    // createImmutableFrameworkIdmapsInZygote — a NORMAL AOSP 11 zygote-era
+    // invocation that is benign on failure), so the live question moved to
+    // the zygote's own argv: does the exec'd app_process64 actually carry
+    // --start-system-server? A missing flag reproduces the exact observed
+    // shape (no forkSystemServer ever; straight to runSelectLoop).
+    let mut z306q_budget: u32 = 0;
     // 6-Z306s mislabel fix: direct zygote fork children that execve'd a
     // NEW image (pid -> pre-rewrite guest exec target). The 6-Z306s
     // exit-tail dump must label these "zygote-child-exec:<target>",
@@ -19077,30 +19122,15 @@ pub fn run_ptrace_loop(
                                 z306p_budget += 1;
                                 let argv_addr = get_syscall_arg(&regs, abi.reg_arg2);
                                 let stride: u64 = if abi.execve == 11 { 4 } else { 8 };
-                                let mut argv_parts: Vec<String> = Vec::new();
-                                if argv_addr != 0 {
-                                    for idx in 0..4u64 {
-                                        let entry = match read_child_u64(
-                                            pid,
-                                            argv_addr.wrapping_add(idx * stride),
-                                        ) {
-                                            Some(w) if stride == 4 => w & 0xFFFF_FFFF,
-                                            Some(w) => w,
-                                            None => {
-                                                argv_parts.push("<unreadable>".to_string());
-                                                break;
-                                            }
-                                        };
-                                        if entry == 0 {
-                                            break;
-                                        }
-                                        argv_parts.push(
-                                            read_child_string(pid, entry)
-                                                .map(|s| s.chars().take(96).collect::<String>())
-                                                .unwrap_or_else(|| "<unreadable>".to_string()),
-                                        );
-                                    }
-                                }
+                                // 6-Z306p depth 3→8 (#233 decode): the first
+                                // 4 slots proved the caller is the AOSP 11
+                                // OverlayConfig JNI (idmap2 create-multiple
+                                // --target-apk-path framework-res.apk); the
+                                // remaining slots (--overlay-apk-path/
+                                // --policy/--ignore-overlayable) state
+                                // whether the ROM actually HAS immutable
+                                // framework overlays configured.
+                                let argv_parts = z306_read_guest_argv(pid, argv_addr, stride, 8);
                                 // z306s_execed bookkeeping is UNCONDITIONAL
                                 // (correctness for the exit-label, not a
                                 // diagnostic — bounded by the per-boot zygote
@@ -19112,6 +19142,45 @@ pub fn run_ptrace_loop(
                                     exec_path,
                                     argv_parts.join("]["),
                                     z306p_budget
+                                ));
+                            }
+
+                            // ── 6-Z306q: the ZYGOTE'S OWN execve argv dump ──
+                            //
+                            // #233's 6-Z306p census CLOSED the "who execs
+                            // idmap2" question: it is the AOSP 11
+                            // OverlayConfig.createImmutableFrameworkIdmapsInZygote
+                            // JNI (ExecuteBinary fork+execvp; BOTH failure
+                            // paths return an empty array WITHOUT exception
+                            // — verified against android-11.0.0_r1 sources —
+                            // so the idmap2 child is a NORMAL zygote-era
+                            // witness, not the wall). The remaining
+                            // hypotheses for "no forkSystemServer ever":
+                            // (a) the zygote's argv LACKS --start-system-server
+                            //     (ZygoteInit.main then skips
+                            //     forkSystemServer and goes straight to
+                            //     runSelectLoop — reproduces the observed
+                            //     shape exactly);
+                            // (b) each zygote era is SIGKILLed mid-preload
+                            //     (~14s cadence per #231's init-kill
+                            //     attribution) before reaching
+                            //     forkSystemServer's slot.
+                            // This arm dumps the ZYGOTE'S OWN argv
+                            // (target contains "app_process"), argv[0..7],
+                            // cap 3/boot — settling (a) in one run.
+                            if exec_path.contains("app_process") && z306q_budget < 3 {
+                                z306q_budget += 1;
+                                let argv_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                let stride: u64 = if abi.execve == 11 { 4 } else { 8 };
+                                let argv_parts = z306_read_guest_argv(pid, argv_addr, stride, 8);
+                                let has_sss =
+                                    argv_parts.iter().any(|a| a.contains("start-system-server"));
+                                log(&format!(
+                                    "6-Z306q: zygote execve target={} argv=[{}] start-system-server={} (budget {}/3)",
+                                    exec_path,
+                                    argv_parts.join("]["),
+                                    has_sss,
+                                    z306q_budget
                                 ));
                             }
                         }
