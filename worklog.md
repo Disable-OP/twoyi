@@ -28418,3 +28418,29 @@ Stage Summary / #245 DECODE TREE:
 2. PRIMARY: **6-Z306af-t anr-open ENTRY/EXIT** — if the dump's createTempFile open appears and FAILS with errno E → fix that fs semantic (generic; the watchdog's silence ends). If it appears and SUCCEEDS → the traces file EXISTS mid-run → extend the anr-dropbox harness capture to read its content (the Java stacks name main's park exactly).
 3. If NO anr opens at all + fds low → the monitor checker never even POSTED/scheduled — instrument postAtFrontOfQueue's wake path next.
 4. Recovery gate MUST stay GREEN.
+
+---
+Task ID: 37 (webDevReview cron leg, continued — #245 decode)
+Agent: Z.ai Code (main session, same leg)
+Task: Decode ladder #245 (the fork); land the Java-stack follow window; dispatch #246.
+
+Work Log:
+- #245 (e23b2bee, rn243) decoded: rung 7; recovery gate 4/4 GREEN (children #8216-#8219); kr64 CI GREEN rn1737/1738.
+- **THE SMOKING GUN — 6-Z306af-s caught the kill chain verbatim**:
+    +190.853s [glog I/Watchdog] WAITED_HALF                      (pid 5355)
+    +190.871s [glog V/AndroidRuntime] FATAL EXCEPTION: watchdog  (pid 5355)
+    +190.915s kill(myPid=5331, SIGKILL) by comm=watchdog
+  62ms WAITED_HALF→FATAL, 44ms FATAL→SIGKILL. **The #242 class is CONFIRMED with names: the watchdog thread dies of an UNCAUGHT JAVA EXCEPTION inside the WAITED_HALF branch — i.e. INSIDE ActivityManagerService.dumpStackTraces(...) — and ART's KillUncaughtHandler kills system_server.**
+- Every observation now explained: /data/anr EMPTY (the dump died before its temp-file open — af-t saw ZERO anr opens from the watchdog era; the only two anr opens all run were early directory opens by other pids); no overdue banner (the Slog.w lives AFTER dumpStackTraces — never reached); no traces/dropbox.
+- **6-Z306ao-fd eliminated the second fork**: victim open_fds=89/32768 soft (gen-3: 87) — the OpenFdMonitor ~96% trip mark NEVER tripped. Overdue-vs-fd question closed: this is the exception path.
+- gen-3 deterministic: WAITED_HALF +360.060s → kill +360.1s (50ms).
+- The remaining unknown = the EXCEPTION'S JAVA STACK (the exact call inside dumpStackTraces that throws on our guest but not on real hardware — a /proc or fs semantic defect). The stack lines carry no marker; af-s ignored them.
+- LANDED 2b4933b9 — **6-Z306af-s2**: on any FATAL/Watchdog marker hit, arm a per-pid follow window; the next 10 writes from the same pid are captured verbatim (240B cap each, one window/run). The crash output rides the same glog-redirect stream → the full Java stack lands in the kr64 log.
+- Gates: fmt+clippy clean; 844/844; kr64 CI GREEN (on 2b4933b9). Pushed 2b4933b9.
+- DISPATCHED on 2b4933b9: ladder #246 (rn244, boot_wait 420, expect_rung 7) + recovery pr-tier gate 4 children.
+
+Stage Summary / #246 DECODE TREE:
+1. PRIMARY: the 6-Z306af-s2 stack(N) lines behind "FATAL EXCEPTION: watchdog" — the top frames name the exact twoyi-side defect (expect a /proc/<pid>/ reader or a file-op inside dumpStackTraces: Process.readProcLines? /proc/<pid>/stat? /data/anr dir creation? android.os.Debug.readMemoryFiles? — read the frames, don't guess).
+2. THE FIX (next leg): a real /proc or fs semantic, generic (recovery must stay GREEN).
+3. Expected outcome after the fix: dumpStackTraces COMPLETES → traces file written → the WAITED_HALF dump no longer kills → the watchdog either finds no overdue checker (system_server healthy) or finally prints its overdue banner with REAL evidence → system_server survives past +190s/+360s → RUNG 6 SURVIVAL → rung 8 (SystemUI/launcher) era begins.
+4. Side leads parked: pid 2909/2865-class self-SIGKILL zygote children (ring [ppoll×3, socket/connect/sendto, clone]); the unnamed clock_nanosleep thread (5348-class).
