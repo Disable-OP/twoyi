@@ -65,6 +65,7 @@ typedef struct prop_info prop_info;
 #include <ucontext.h>
 #include <pthread.h>
 #include <sys/epoll.h>
+#include <sys/uio.h> // 6-Z306z: struct iovec (process_vm_readv self-peek)
 
 // _GNU_SOURCE needed for RTLD_NEXT
 #ifndef _GNU_SOURCE
@@ -483,6 +484,22 @@ static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 #define BP_BR_TRANSACTION 0x80407202u  /* _IOR('r', 2, 64) — 6-Z271 server delivery */
 #define BP_TR_DATA_PTR_OFF     48u     /* binder_transaction_data.data.ptr.buffer */
 #define BP_TR_OFFSETS_PTR_OFF  56u     /* binder_transaction_data.data.ptr.offsets */
+// 6-Z306z: the local-flat wire shapes and node-ref mirror commands the
+// delivery gate watches (binder64 uapi spellings — the driver's
+// binder.rs constants; _IOC_READ=2 sets the 0x80000000 dir bit).
+#define BP_BINDER_TYPE_BINDER       0x73622a85u /* B_PACK_CHARS('s','b','*',0x85) */
+#define BP_BINDER_TYPE_WEAK_BINDER  0x77622a85u /* B_PACK_CHARS('w','b','*',0x85) */
+#define BP_FLAT_SIZE                24u         /* flat_binder_object (64-bit ABI) */
+#define BP_FLAT_COOKIE_OFF          16u         /* flat_binder_object.cookie */
+#define BP_FLAT_BINDER_OFF          8u          /* flat_binder_object.binder (weakrefs) */
+#define BP_TR_TARGET_OFF            0u          /* binder_transaction_data.target.ptr */
+#define BP_TR_COOKIE_OFF            8u          /* binder_transaction_data.cookie */
+#define BP_BR_INCREFS    0x80107207u  /* _IOR('r', 7, binder_ptr_cookie=16) */
+#define BP_BR_ACQUIRE    0x80107208u  /* _IOR('r', 8, binder_ptr_cookie=16) */
+#define BP_BR_RELEASE    0x80107209u  /* _IOR('r', 9, binder_ptr_cookie=16) */
+#define BP_BR_DECREFS    0x8010720au  /* _IOR('r',10, binder_ptr_cookie=16) */
+#define BP_BR_NOOP       0x0000720cu  /* _IO('r', 12) — cmd-only, payload size 0 */
+#define BP_BR_DEAD_REPLY 0x00007205u  /* _IO('r', 5) — cmd-only, payload size 0 */
 
 #define BP_REPLY_ALLOC_MAX 32
 struct bp_reply_alloc {
@@ -522,6 +539,7 @@ static int g_diag_bc = 12;             // outgoing BC tx/reply diag
 static int g_diag_sm_consumed = 4;     // SM-REPLY-CONSUMED verdict budget
 static unsigned g_diag_bp_wr = 2;      // binder_proxy_write_read log budget
 static unsigned g_diag_bp_ioctl = 4;   // binder_proxy_ioctl log budget
+static int g_diag_z306z_gate = 8;      // 6-Z306z delivery-gate log budget
 
 static void bp_fork_child_diag_rearm(void) {
     g_diag_br_tx = 12;
@@ -532,6 +550,7 @@ static void bp_fork_child_diag_rearm(void) {
     g_diag_sm_consumed = 4;
     g_diag_bp_wr = 2;
     g_diag_bp_ioctl = 4;
+    g_diag_z306z_gate = 8;
     // The inherited pending stash points at the PARENT's transaction —
     // a stale match in the child would poison the verdict observer.
     pthread_mutex_lock(&g_sm_pending_lock);
@@ -600,6 +619,125 @@ static void bp_alloc_free(uintptr_t ptr) {
     pthread_mutex_unlock(&g_sm_pending_lock);
 }
 
+// ==========================================================================
+// 6-Z306z: the delivery-side (ptr,cookie) LIVENESS GATE — the SHLIB twin
+// of the kr64 driver's mirror_ref_ok, hardened per the #235 decode.
+//
+// EVIDENCE (ladder #235): the ENTIRE vendor-HAL fleet (1337 SIGSEGVs)
+// died at android::RefBase::incStrong+0x8 (libutils.so, si_addr=0x4,
+// x0 = x21+0x88 — the Δ=+0x88 HIDL wrapper virtual-base shape): a
+// (ptr,cookie) object DELIVERED BY THE PROXY WIRE whose vptr was
+// readable but whose mRefs (offset +8) was ZERO — a freed/reused scudo
+// chunk or a Δ-shifted cookie. Each gralloc death → init onrestart
+// 'restart surfaceflinger' → SF's onrestart 'restart zygote' → the era
+// SIGKILLed mid-boot (11–17 zygote eras, rung 7 forever). The driver
+// gate (6-Z306ae-d) checks ONLY vptr!=0 via process_vm_readv and runs
+// at mirror-enqueue/delivery time; it cannot see the valid-vptr/
+// mRefs=0 class, and its check races the delivery. The proxy IS the
+// guest process, so the delivery-side check is a plain in-process
+// peek — same never-dereference contract, trivially satisfied:
+// process_vm_readv on SELF returns EFAULT for bad ranges instead of
+// faulting us.
+//
+// THE GATE (both Task-29 paths):
+//   1. node-ref mirror commands ([BR_ACQUIRE]/[BR_INCREFS] with a dead
+//      cookie — the guest's IPCThreadState would incStrong/incWeak the
+//      dead object: the #204 atrace incWeak(NULL) and #235
+//      incStrong-mRefs=0 crash shapes) → the 20-byte command is
+//      rewritten as 5×BR_NOOP (cmd-only, size 0 — the stream walk stays
+//      byte-aligned and no blob pairing is involved: mirror commands
+//      never carry trailer blobs). Released-side commands (BR_RELEASE /
+//      BR_DECREFS) are NOT gated: decStrong on a cookie we never
+//      acquired-mirrored cannot occur on this wire (the gate ran at
+//      acquire time).
+//   2. delivered parcels (bp_patch_reply_data): BR_TRANSACTION with
+//      target.ptr != 0 and a dead tr.cookie → rewritten in the guest's
+//      copy as BR_DEAD_REPLY + 16×BR_NOOPs (fills the 68-byte slot;
+//      kernel-true semantics: a transaction to a dead node fails with
+//      DEAD_OBJECT/FAILED_TRANSACTION instead of killing the server →
+//      the gralloc→SF→zygote cascade root dies); embedded LOCAL flats
+//      (BINDER/WEAK_BINDER, cookie != 0, dead) → ptr+cookie zeroed (the
+//      A11 null-binder shape: unflattenBinder yields a NULL sp and
+//      skips the incStrong — proven benign by the SM miss reply).
+//      Blob pairing is preserved: the blob is consumed whether or not
+//      the command is neutralized.
+// Liveness contract: [cookie..+16] readable && vptr != 0 && mRefs != 0
+// (the Task-29 hardening of mirror_ref_ok's 8-byte vptr check — the
+// valid-vptr/mRefs=0 class is exactly what the #235 fleet taught us).
+// ==========================================================================
+
+// 16-byte peek into OUR OWN address space. The kernel validates the
+// remote range and returns -1/EFAULT for unmapped or unreadable
+// addresses — no signal, no fault, honest failure.
+static int bp_self_peek16(uintptr_t addr, uint8_t out[16]) {
+    struct iovec local;
+    struct iovec remote;
+    ssize_t n;
+    if (addr == 0) return 0;
+    local.iov_base = out;
+    local.iov_len = 16;
+    remote.iov_base = (void *)addr;
+    remote.iov_len = 16;
+    n = syscall(SYS_process_vm_readv, (long)syscall(SYS_getpid),
+                &local, 1, &remote, 1, 0);
+    return n == (ssize_t)16;
+}
+
+// The mirror_ref_ok contract (vptr != 0) HARDENED with mRefs != 0 —
+// the #235 gralloc fleet died with a VALID vptr but mRefs == 0, which
+// the driver's 8-byte check alone cannot see. Unreadable == dead.
+static int bp_binder_object_alive(uint64_t cookie) {
+    uint8_t buf[16];
+    uint64_t vptr;
+    uint64_t mrefs;
+    if (cookie == 0) return 0;
+    if (!bp_self_peek16((uintptr_t)cookie, buf)) return 0;
+    memcpy(&vptr, buf, 8);
+    memcpy(&mrefs, buf + 8, 8);
+    return vptr != 0 && mrefs != 0;
+}
+
+// Gate 1 — mirror commands on the response BR stream. Runs on the
+// PROXY-SIDE copy (resp+4) BEFORE the transfer into the guest's read
+// buffer; BR_ACQUIRE/BR_INCREFS never carry trailer blobs, so the
+// 5×BR_NOOP rewrite is pairing-neutral for bp_patch_reply_data.
+static void bp_gate_mirror_commands(uint8_t *stream, uint64_t len) {
+    uint64_t pos = 0;
+    static const uint32_t noop = BP_BR_NOOP;
+    while (pos + 4 <= len) {
+        uint32_t cmd;
+        uint32_t sz;
+        memcpy(&cmd, stream + pos, 4);
+        sz = (cmd >> 16) & 0x3fff;
+        if ((cmd == BP_BR_ACQUIRE || cmd == BP_BR_INCREFS) &&
+            pos + 4 + 16 <= len) {
+            uint64_t ptr;
+            uint64_t cookie;
+            memcpy(&ptr, stream + pos + 4, 8);
+            memcpy(&cookie, stream + pos + 12, 8);
+            if (cookie != 0 && !bp_binder_object_alive(cookie)) {
+                int i;
+                for (i = 0; i < 5; i++)
+                    memcpy(stream + pos + 4 * (size_t)i, &noop, 4);
+                if (g_diag_z306z_gate > 0) {
+                    char m[176];
+                    g_diag_z306z_gate--;
+                    snprintf(m, sizeof(m),
+                             "[twoyi_loader] 6-Z306z: %s dead cookie=0x%llx "
+                             "ptr=0x%llx neutralized (5x NOOP, pid=%d)\n",
+                             (cmd == BP_BR_ACQUIRE) ? "BR_ACQUIRE" : "BR_INCREFS",
+                             (unsigned long long)cookie,
+                             (unsigned long long)ptr, g_real_pid);
+                    write_str(2, m);
+                }
+            }
+            pos += 4 + 16;
+            continue;
+        }
+        pos += 4 + (uint64_t)sz;
+    }
+}
+
 /// Walk the copied BR stream for BR_REPLY commands and give every one a
 /// real backing allocation from the proxy's reply-blob trailer.
 static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
@@ -646,6 +784,47 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                              (cmd == BP_BR_TRANSACTION) ? "BR-TX" : "BR-RPY",
                              t_target, t_code, g_real_pid);
                     write_str(2, m);
+                }
+            }
+            // 6-Z306z gate 2a: a BR_TRANSACTION whose LOCAL target object
+            // (tr.cookie with target.ptr != 0) is not alive in this
+            // process would crash the server in executeTransaction's
+            // sp<BBinder> construction — the #235 gralloc→SF→zygote
+            // cascade root. Kernel-true semantics: a transaction to a
+            // dead node fails. Rewrite the command IN THE GUEST'S COPY as
+            // BR_DEAD_REPLY + 16×BR_NOOPs (the 68-byte slot stays
+            // byte-aligned and every filler is a cmd-only no-op); the
+            // blob below is still consumed so trailer pairing holds, and
+            // the backing/patch step is SKIPPED for this slot (writing
+            // data_ptr/offsets_ptr over the NOOP fillers would feed heap
+            // pointers to the guest's command parser — a desync).
+            int z306z_tx_neutralized = 0;
+            if (cmd == BP_BR_TRANSACTION) {
+                uint64_t t_ptr;
+                uint64_t t_cookie;
+                memcpy(&t_ptr, stream + pos + 4 + BP_TR_TARGET_OFF, 8);
+                memcpy(&t_cookie, stream + pos + 4 + BP_TR_COOKIE_OFF, 8);
+                if (t_ptr != 0 && t_cookie != 0 &&
+                    !bp_binder_object_alive(t_cookie)) {
+                    static const uint32_t z306z_noop = BP_BR_NOOP;
+                    static const uint32_t z306z_dead = BP_BR_DEAD_REPLY;
+                    int zi;
+                    memcpy(stream + pos, &z306z_dead, 4);
+                    for (zi = 0; zi < 16; zi++)
+                        memcpy(stream + pos + 4 + 4 * (size_t)zi,
+                               &z306z_noop, 4);
+                    z306z_tx_neutralized = 1;
+                    if (g_diag_z306z_gate > 0) {
+                        char m[192];
+                        g_diag_z306z_gate--;
+                        snprintf(m, sizeof(m),
+                                 "[twoyi_loader] 6-Z306z: BR-TX dead target "
+                                 "cookie=0x%llx ptr=0x%llx -> BR_DEAD_REPLY "
+                                 "(pid=%d)\n",
+                                 (unsigned long long)t_cookie,
+                                 (unsigned long long)t_ptr, g_real_pid);
+                        write_str(2, m);
+                    }
                 }
             }
             if (rem < 8) return;
@@ -709,10 +888,14 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
             // base + dlen; every BINDER_TYPE_PTR object's `buffer` field is
             // fixed up to point at its SG copy (the kernel's receiver-side
             // pointer fixup — the client dereferences it as its own memory).
+            // 6-Z306z: skipped entirely when gate 2a neutralized this
+            // transaction — the guest only sees DEAD_REPLY + NOOP fillers.
             uint64_t sg_total = sg_pack;
             uint64_t sg_pad = (sg_total > 0) ? (8 - (((uint64_t)dlen + olen) % 8)) % 8 : 0;
             uint64_t back_len = (uint64_t)dlen + olen + sg_pad + sg_total;
-            uint8_t *back = (uint8_t *)malloc((size_t)(back_len ? back_len : 1));
+            uint8_t *back = z306z_tx_neutralized
+                                ? NULL
+                                : (uint8_t *)malloc((size_t)(back_len ? back_len : 1));
             if (back) {
                 if (dlen) memcpy(back, p, dlen);
                 if (olen) memcpy(back + dlen, p + dlen, olen);
@@ -737,6 +920,46 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                                             olen + sg_pad + sg_dst[fixed]);
                         memcpy(back + obj_off + 8, &target, 8);
                         fixed++;
+                    }
+                }
+                // 6-Z306z gate 2b: embedded LOCAL flats — walk the offsets
+                // array of the WRITTEN copy; any BINDER/WEAK_BINDER object
+                // whose cookie is not alive in this process gets its
+                // binder+cookie zeroed (the A11 null-binder shape:
+                // unflattenBinder yields a NULL sp and skips incStrong —
+                // proven benign by the SM miss reply). Runs on `back`
+                // before registration so the guest can never see the dead
+                // pointer pair.
+                {
+                    for (uint64_t j = 0; j + 8 <= (uint64_t)olen; j += 8) {
+                        uint64_t obj_off;
+                        uint32_t typ;
+                        uint64_t f_cookie;
+                        memcpy(&obj_off, back + dlen + j, 8);
+                        if (obj_off > (uint64_t)dlen ||
+                            obj_off + BP_FLAT_SIZE > (uint64_t)dlen)
+                            continue;
+                        memcpy(&typ, back + obj_off, 4);
+                        if (typ != BP_BINDER_TYPE_BINDER &&
+                            typ != BP_BINDER_TYPE_WEAK_BINDER)
+                            continue;
+                        memcpy(&f_cookie, back + obj_off + BP_FLAT_COOKIE_OFF, 8);
+                        if (f_cookie == 0) continue;
+                        if (bp_binder_object_alive(f_cookie)) continue;
+                        memset(back + obj_off + BP_FLAT_BINDER_OFF, 0, 16);
+                        if (g_diag_z306z_gate > 0) {
+                            char m[192];
+                            g_diag_z306z_gate--;
+                            snprintf(m, sizeof(m),
+                                     "[twoyi_loader] 6-Z306z: dead LOCAL flat "
+                                     "cookie=0x%llx zeroed in %s dlen=%u "
+                                     "(pid=%d)\n",
+                                     (unsigned long long)f_cookie,
+                                     (cmd == BP_BR_TRANSACTION) ? "BR-TX"
+                                                                : "BR-RPY",
+                                     dlen, g_real_pid);
+                            write_str(2, m);
+                        }
                     }
                 }
                 bp_alloc_register(back, back_len);
@@ -1785,6 +2008,10 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
     uint64_t ncopy = ((uint64_t)srv_read < bwr->read_size)
                      ? (uint64_t)srv_read : bwr->read_size;
     if (ncopy > 0) {
+        // 6-Z306z gate 1: neutralize node-ref mirror commands whose
+        // cookie is not alive BEFORE the stream enters the guest's read
+        // buffer (the #204/#235 incStrong/incWeak-on-dead-object class).
+        bp_gate_mirror_commands(resp + 4, srv_read);
         memcpy((void *)(uintptr_t)bwr->read_buffer, resp + 4, (size_t)ncopy);
         // 6-Z265: the proxy appends a v2-style trailer with the reply
         // parcel bytes even for v1 requests. Back every BR_REPLY's
