@@ -28519,3 +28519,22 @@ Stage Summary / #249 DECODE TREE:
 4. Wall B (property race): the 6-Z307p START/DONE census runs this pass too — any START without DONE names the client-side stall.
 5. Recovery gate: the callback path is new shared wire — the next pr-tier dispatch MUST stay 4/4 GREEN.
 6. If system_server STILL dies: the next exception's stack will be in the klog (the kmsg mirror carries every banner) — read the frames, do not guess.
+
+---
+Task ID: 40 (webDevReview cron leg, same sandbox)
+Agent: Z.ai Code (main session)
+Task: Decode ladder #249 (rn249); land the wire-true get() reply; dispatch #250.
+
+Work Log:
+- #249 (rn249, f34779eb) decoded: rung 7; both watchdog eras died of NoSuchElementException AGAIN — but the ERROR STRING MOVED: 'getService: defaultServiceManager()->get returns Status(EX_TRANSACTION_FAILED): FAILED_TRANSACTION' (rn248 said 'unable to call into hwbinder service'). 6-Z307b's onValues lines = 0, debugDump = 0.
+- **THE DECISIVE EVIDENCE — the bounded SM entry diag named the REQUEST truth**: 'HIDL SM code=1 dsize=204 offs=4 sg=[16,44,16,8]' + 8 'parse-fail (get.cb)' diags — the REAL get() request is token + FOUR PTR objects (two hidl_string pairs). NO callback object ever rides the wire. For `get(...) generates (IServiceManager_get_cb)` hidl-gen invokes the client's callback LOCALLY from the REPLY values; the wire reply is [status][chain vec<string> SG][base IBase flat]. Retrospectively: the pre-6-Z307b arm's [status][flat] reply failed the client's vec-first parse ('unable to call into hwbinder service', #248) — the chain vec was ALWAYS required.
+- **LANDED a05ab356 — 6-Z307c**: the GET arm now replies [status-ok][chain vec SG][base flat] — hit: chain=[fq], base = the service's HANDLE flat; miss: chain=[], base = null binder (honest NAME_NOT_FOUND). The strict cb parse + onValues delivery machinery REMOVED (the wire never carried a cb; write_hidl_vec_string stays for the reply's chain vec). Tests rewritten to the reply shapes (148B/4-object hit, 108B/3-object miss). fmt clean; clippy -D warnings clean; **848/848**. Pushed a05ab356.
+- DISPATCHED on a05ab356: **ladder #250** (rn250, boot_wait 420, stall 0, expect_rung 7) + **recovery pr-tier gate** (tier=pr — the GET arm is shared wire; the corpus gate is mandatory).
+
+Stage Summary / #250 DECODE TREE:
+1. PRIMARY: the watchdog's get() must now COMPLETE end-to-end on the reply: expect 'HIDL get(android.hidl.manager@1.0::IServiceManager/default) hit → handle 0x… (chain+base reply)', ZERO parse-fail(get.cb), ZERO FATAL-EXCEPTION-watchdog, and 'HIDL debugDump → N entries' (the watchdog's next call finally reached).
+2. EXPECT rung 6 SURVIVAL — system_server living past the WAITED_HALF windows (+195s/+360s era cadence); the frontier becomes the REAL overdue banner (honest blocked-checker names) or healthy-checker silence.
+3. The C++ @1.2 fleets' 'unable to call into hwbinder service' / EX_TRANSACTION_FAILED strings must vanish.
+4. Wall B: the 6-Z307p property-wire census runs every pass — a START without DONE still names the stall.
+5. Recovery gate 4/4 GREEN mandatory (the reply-shape change is shared wire).
+6. If the watchdog STILL dies: the kmsg banner names the next divergence — read the frames, do not guess.
