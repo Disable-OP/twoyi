@@ -28095,3 +28095,26 @@ Stage Summary / NEXT-SESSION DECISION TREE:
 2. **6-Z306s mislabel fix** (still open, small): a zygote-lineage fork that execve's a new image must not be tagged "system_server".
 3. #233 decode tree: (i) argv names a framework/overlay component ⇒ chase why it runs pre-forkSystemServer and whether its failure (or its exit-0 sync wait) breaks the main() flow — e.g. the zygote's main thread BLOCKING in wait4 somewhere it should not, or an exception path swallowing forkSystemServer; (ii) argv names OUR machinery ⇒ fix ours; (iii) argv = idmap2 with service/scan args ⇒ replicate the call in a standalone guest test to see if idmap2 itself deadlocks/aborts the caller.
 4. Known-good: TWRP gates GREEN across 6-Z306an-o/-r AND the armed -o intervention; 841/841; CI GREEN; the forgotten-event resume is LIVE and correct on two subclasses (exit-event #231, fork-event #232).
+
+---
+Task ID: 26 (webDevReview cron leg)
+Agent: Z.ai Code (main session)
+Task: Land 6-Z306p (the mandated execve-argv instrument) + the 6-Z306s mislabel fix + the loader-log artifact; dispatch #233.
+
+Work Log:
+- Session resume verified: HEAD 0547aa5, zero runs in flight (API check), webDevReview cron alive via gateway trace (web-cron-review) — NOT re-created (anti-duplication). Mission state read from worklog Tasks 25/25b.
+- LANDED 8b08ff7 (three coordinated pieces):
+  1. **6-Z306p** (the Task-25b item-1 instrument): at execve ENTRY, a DIRECT zygote fork child (z306_zygote_fork_children gate) dumps argv[0..3] via the child-memory helpers — ABI-aware stride (4B on execve==11, 8B otherwise), 96-char truncation per string, 8/boot budget (early-boot service execs are NOT zygote fork children, so they cannot exhaust the budget — the 6-Z272f-b lesson). Runs BEFORE the 6-Z101 rewrite, so the target string is the pre-rewrite GUEST spelling. Names the idmap2 caller's command line: framework Runtime.exec/ProcessBuilder, a shell `exec idmap2`, or our machinery.
+  2. **6-Z306s mislabel fix**: z306s_execed (pid → pre-rewrite exec target) records every zygote fork child that execve'd a NEW image; the 6-Z306s exit-tail dump now labels those "zygote-child-exec:<target>" with their OWN 2/boot dump budget — the healthy exit-0 idmap2 exits (16/boot in #232) can never again crowd out the 4/boot REAL system_server evidence. State dies with the pid at BOTH forget-dead-hygiene sites (WIFEXITED + WIFSIGNALED).
+  3. **Guest-side argv witness**: the shlib log_exec_call (all 5 exec variants) now also logs argv[0..3] (bounded 560-byte line, no TLS per the shlib TLS ban) → lands in /data/local/tmp/twoyi-loader.log. Plus the ladder artifact twoyi-loader-log.txt (both rootfs trees — profiles/default is the live one per #96 — head+tail 32 KiB each).
+- Gates: gcc -fsyntax-only on the shlib OK; cargo fmt --check clean; clippy --all-targets -D warnings clean; 841/841 tests. kr64 CI GREEN on 8b08ff7 (run 34661498589).
+- DISPATCHED on 8b08ff7: ladder #233 (run 34661606254, boot_wait 420, expect_rung 0 = diagnostic) + TWRP gate (run 34661615937, boot_wait 60). In flight at this worklog write.
+
+Stage Summary / #233 DECODE TREE:
+1. "6-Z306p: zygote fork-child N execve target=idmap2 argv=[...]" present ⇒ THE CALLER IS NAMED:
+   (i) argv = framework overlay/RRO scan args (e.g. "idmap2 scan --overlay ...") ⇒ a framework component (Runtime.exec from a zygote-loaded class or a framework thread) — chase WHY it runs pre-forkSystemServer (AOSP 11 idmap2 is normally invoked by installd/idmap via binder, NOT from the zygote main thread) and whether the bare-name execvp resolving through OUR PATH (staged-copy rewrite) succeeds-but-derails the zygote's main() flow;
+   (ii) argv = shell/script args ⇒ a guest init/rc `exec idmap2` line executed in the wrong context;
+   (iii) argv = OUR machinery (twoyi/twoyi_loader strings) ⇒ fix ours immediately.
+2. Cross-check: the shlib lines in twoyi-loader-log.txt ("[twoyi_loader] execvp called: path=... argv: ...") MUST agree with the tracer's 6-Z306p dump — a mismatch names a second exec layer (the staged binary re-execs).
+3. TWRP gate must stay GREEN (the shlib + tracer changes both touch the recovery path: the exec hooks log argv now, the retag changes only labels).
+4. If the argv is framework-side: the fix target is the fork-slot itself — the zygote's main thread must never consume its fork on a Runtime.exec child BEFORE forkSystemServer (generic fix: ensure the caller's fork/exec happens on a NON-main thread or AFTER system_server specialization, WITHOUT ROM-specific hacks).
