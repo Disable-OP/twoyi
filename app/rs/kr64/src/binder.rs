@@ -890,6 +890,18 @@ pub const HIDL_SM_ADD: u32 = 2;
 /// libhwbinder surfaced Status(EX_TRANSACTION_FAILED) at every getService
 /// site (139 logs / 956 aborts, ladder #122 — the HIDL fleet killer).
 pub const HIDL_SM_GET_TRANSPORT: u32 = 3;
+/// 1.0 `debugDump() generates (vec<InstanceDebugInfo>)` — code 7. THE
+/// A11 Watchdog call site: `getInterestingHalPids()` (Watchdog.java:517)
+/// does `IServiceManager.getService().debugDump()` and runs inside the
+/// WAITED_HALF branch — Watchdog.java:616 evaluates it as
+/// `dumpStackTraces`' 4th argument. Before this arm (and before the
+/// 6-Z307 instance seeding) the proxy answered the watchdog's
+/// `@1.0::IServiceManager/default` lookup with a null binder →
+/// `HwBinder.getService` threw `java.util.NoSuchElementException` →
+/// uncaught in the watchdog thread → ART's KillApplicationHandler
+/// SIGKILLed system_server (the ladder-#247 "FATAL EXCEPTION:
+/// watchdog" kill chain, 49ms end-to-end).
+pub const HIDL_SM_DEBUG_DUMP: u32 = 7;
 /// 6-Z276/6-Z305t-66: `registerForNotifications` — code 6. The old map
 /// guessed 4, which is `list`'s code (the arm never fired on the real
 /// wire; nothing on the A11 boot path calls list()).
@@ -913,6 +925,11 @@ pub const HIDL_SM_LIST_MANIFEST_BY_INTERFACE: u32 = 13;
 /// ONE byte (hwbinder::Parcel::writeUint8 = write(&val, 1), no padding).
 pub const HIDL_TRANSPORT_EMPTY: u8 = 0;
 pub const HIDL_TRANSPORT_HWBINDER: u8 = 1;
+/// `android.hidl.base@1.0::DebugInfo.Architecture` — `enum Architecture
+/// : uint8_t { UNKNOWN = 0, IS_64BIT = 1, IS_32BIT = 2 }`. The real
+/// hwservicemanager's debugDump reports UNKNOWN for BINDER-registered
+/// services (ServiceManager.cpp:745) — the proxy does the same.
+pub const HIDL_DEBUG_ARCH_UNKNOWN: u8 = 0;
 /// PASSTHROUGH is answered by the passthrough dlopen path, never by this
 /// registry (a HIDL passthrough HAL never appears as a wire service).
 pub const HIDL_TRANSPORT_PASSTHROUGH: u8 = 2;
@@ -1745,6 +1762,19 @@ pub enum VirtualService {
     /// Missing sysfs files translate to the interface's documented
     /// `EX_UNSUPPORTED_OPERATION`, never fabricated data.
     Health,
+    /// 6-Z307: hwservicemanager's OWN instances (`android.hidl.manager@
+    /// {1.0,1.1,1.2}::IServiceManager/default`). On real Android the
+    /// hwservicemanager process registers ITSELF into its own in-process
+    /// table (ServiceManager::registerAsService) — that registration
+    /// never crosses the wire, so an interposed registry could never
+    /// learn it: 354× `HIDL get(android.hidl.manager@1.2::IServiceManager/
+    /// default) miss` (ladder #247) and the Java watchdog's
+    /// `NoSuchElementException` kill. Transactions on these handles are
+    /// served by the SAME servicemanager dispatcher as handle 0 (the
+    /// full IServiceManager arm set against the same registry) — the
+    /// proxy IS the HIDL service manager for this VM, exactly as it
+    /// already is for handle 0.
+    HidlServiceManager,
 }
 
 impl VirtualService {
@@ -1758,6 +1788,10 @@ impl VirtualService {
             VirtualService::KeyMint => "android.hardware.security.keymint.IKeyMintDevice",
             VirtualService::SharedSecret => "android.hardware.security.sharedsecret.ISharedSecret",
             VirtualService::Health => "android.hardware.health.IHealth",
+            // INTERFACE_TRANSACTION on a seeded SM handle: answered from
+            // the handle's own seeded fq (the @1.0/@1.1/@1.2 instances
+            // each claim their own version) — see the dispatch site.
+            VirtualService::HidlServiceManager => "android.hidl.manager@1.0::IServiceManager",
         }
     }
 }
@@ -2018,6 +2052,26 @@ impl BusState {
                 // battery client (lineage recovery's GetBatteryInfo).
                 "android.hardware.health.IHealth/default",
                 VirtualService::Health,
+            ),
+            (
+                // 6-Z307: hwservicemanager's OWN instances. Real
+                // hwservicemanager self-registers under every version of
+                // its interface chain INSIDE its own table — the wire
+                // never carries it, so the interposed registry must seed
+                // it. A11 evidence (ladder #247): 354× `HIDL get(android.
+                // hidl.manager@1.2::IServiceManager/default) miss → null
+                // binder`, and the watchdog thread died of
+                // NoSuchElementException on the @1.0 lookup.
+                "android.hidl.manager@1.0::IServiceManager/default",
+                VirtualService::HidlServiceManager,
+            ),
+            (
+                "android.hidl.manager@1.1::IServiceManager/default",
+                VirtualService::HidlServiceManager,
+            ),
+            (
+                "android.hidl.manager@1.2::IServiceManager/default",
+                VirtualService::HidlServiceManager,
             ),
         ];
         for (name, kind) in VIRTUALS {
@@ -4012,12 +4066,32 @@ fn handle_transaction(
         };
         if let Some(kind) = virtual_kind {
             let mut w = ParcelWriter::new();
-            w.write_string16(kind.descriptor());
+            if kind == VirtualService::HidlServiceManager {
+                // The seeded SM handles each claim their OWN version:
+                // answer with the fq from the entry's key, not the
+                // kind-level default — a @1.2 proxy must not claim
+                // @1.0.
+                let fq = {
+                    let b = bus.lock().expect("binder bus poisoned");
+                    b.by_handle
+                        .get(&target_handle)
+                        .and_then(|n| n.split_once('/'))
+                        .map(|(f, _)| f.to_string())
+                };
+                let fq = fq.unwrap_or_else(|| kind.descriptor().to_string());
+                w.write_string16(&fq);
+                info!(
+                    "[KR64][binder][svc] INTERFACE_TRANSACTION → SM instance descriptor {}",
+                    fq
+                );
+            } else {
+                w.write_string16(kind.descriptor());
+                info!(
+                    "[KR64][binder][svc] INTERFACE_TRANSACTION → {} descriptor",
+                    kind.descriptor()
+                );
+            }
             let (data, offsets) = w.into_parts();
-            info!(
-                "[KR64][binder][svc] INTERFACE_TRANSACTION → {} descriptor",
-                kind.descriptor()
-            );
             return TransactionResult::Reply {
                 data,
                 offsets,
@@ -5651,6 +5725,64 @@ fn servicemanager_hidl(
         // parent_offset = j*32 (+0 fqName, +16 instance)]. The SG bytes
         // ride the v3 resp trailer and the loader applies the receiver
         // pointer fixup (the 6-Z305t-68 machinery).
+        // 1.0 `debugDump()` — code 7. The A11 Watchdog's
+        // getInterestingHalPids() consumes this INSIDE the WAITED_HALF
+        // branch (Watchdog.java:616 → :517); on real hwservicemanager
+        // (ServiceManager.cpp:724) it is one InstanceDebugInfo per
+        // registered service with getDebugPid() = the registering
+        // process's pid (NO_PID = -1 when unknown). The proxy's registry
+        // data is REAL (real guest owner pids); proxy-owned virtuals
+        // report NO_PID (-1) — the watchdog skips those, exactly as it
+        // skips them on real hardware.
+        HIDL_SM_DEBUG_DUMP => {
+            let entries: Vec<(String, String, i32)> = {
+                let b = bus.lock().expect("binder bus poisoned");
+                b.services
+                    .iter()
+                    .map(|(k, e)| {
+                        let (f, i) = k.split_once('/').unwrap_or((k.as_str(), ""));
+                        let pid = if e.owner == PROXY_CONN_ID {
+                            -1
+                        } else {
+                            b.conns.get(&e.owner).map(|c| c.sender_pid).unwrap_or(0)
+                        };
+                        (f.to_string(), i.to_string(), if pid > 0 { pid } else { -1 })
+                    })
+                    .take(128)
+                    .collect()
+            };
+            let count = entries.len();
+            // hidl_vec<InstanceDebugInfo> wire (element = 64B stride:
+            // interfaceName hdr @+0, instanceName hdr @+16 — both fixed
+            // up loader-side from the chars PTR objects — pid @+32,
+            // clientPids vec hdr @+40 (fixed up from the empty-array
+            // PTR object), arch u8 @+56).
+            let mut vs = vec![0u8; 16];
+            vs[8..12].copy_from_slice(&(count as u32).to_ne_bytes());
+            let vec_idx = writer.next_object_index();
+            writer.write_ptr_object(vs, None, 0);
+            let arr_idx = writer.next_object_index();
+            let mut array = vec![0u8; count * 64];
+            for (j, (_, _, pid)) in entries.iter().enumerate() {
+                let base = j * 64;
+                array[base + 32..base + 36].copy_from_slice(&pid.to_ne_bytes());
+                array[base + 56] = HIDL_DEBUG_ARCH_UNKNOWN;
+            }
+            writer.write_ptr_object(array, Some(vec_idx), 0);
+            for (j, (f, i, _)) in entries.iter().enumerate() {
+                let base = (j * 64) as u64;
+                let mut fc = f.as_bytes().to_vec();
+                fc.push(0);
+                writer.write_ptr_object(fc, Some(arr_idx), base);
+                let mut ic = i.as_bytes().to_vec();
+                ic.push(0);
+                writer.write_ptr_object(ic, Some(arr_idx), base + 16);
+                // clientPids: empty vec — the loader writes the 16B
+                // {buffer, size=0} header at base+40 from this PTR.
+                writer.write_ptr_object(Vec::new(), Some(arr_idx), base + 40);
+            }
+            info!("[KR64][binder][svc] HIDL debugDump → {} entries", count);
+        }
         HIDL_SM_LIST_MANIFEST_BY_INTERFACE => {
             let fq = match p.read_string_arg() {
                 Some(s) => s,
@@ -5846,6 +5978,12 @@ fn virtual_service_transaction(
                 // from android-15.0.0_r1 IHealth.aidl; the interface
                 // library ships as android.hardware.health-V4-ndk.so).
                 VirtualService::Health => 4,
+                // 6-Z307: HIDL interfaces carry no AIDL interface-version
+                // meta transaction — and this dispatcher is unreachable
+                // for HidlServiceManager anyway (the transaction dispatch
+                // site routes the kind to servicemanager_proxy before
+                // virtual_service_transaction). Defensive 0.
+                VirtualService::HidlServiceManager => 0,
             });
             let (data, offsets) = w.into_parts();
             return TransactionResult::Reply {
@@ -5886,6 +6024,10 @@ fn virtual_service_transaction(
         VirtualService::KeyMint => virtual_keymint(code, &mut reader),
         VirtualService::SharedSecret => virtual_sharedsecret(code, &mut reader),
         VirtualService::Health => virtual_health(code, &mut reader),
+        // 6-Z307: the SM instances are served by the servicemanager
+        // dispatcher (see the transaction dispatch site) — unreachable
+        // here; fail honestly rather than fabricate a reply shape.
+        VirtualService::HidlServiceManager => TransactionResult::Failed,
     }
 }
 
@@ -7985,8 +8127,8 @@ mod tests {
         let routed_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
         assert_eq!(
             routed_handle,
-            PROXY_HANDLE_BASE + 5,
-            "svc_a handle = 0xF0000005 (after the 4 virtual services)"
+            PROXY_HANDLE_BASE + 8,
+            "svc_a handle = 0xF0000008 (after the 7 virtual services: 4 AIDL/HIDL platform services + the 3 seeded 6-Z307 hwservicemanager instances)"
         );
 
         // ---- Connection B: transact(code=42) to the routed handle ----
@@ -8290,7 +8432,7 @@ mod tests {
         // The proxy still allocated the ROUTING handle (first guest
         // service after the 4 in-proxy virtuals) — used below to drive
         // the self-transaction round trip.
-        let self_handle = PROXY_HANDLE_BASE + 5;
+        let self_handle = PROXY_HANDLE_BASE + 8; // after the 7 virtual services (6-Z307: +3 seeded hwservicemanager instances)
 
         // ---- transact(code=7) on the OWN handle ----
         let mut tx = [0u8; 64];
@@ -10086,10 +10228,131 @@ mod tests {
         assert_eq!(HIDL_SM_ADD, 2);
         assert_eq!(HIDL_SM_GET_TRANSPORT, 3);
         assert_eq!(HIDL_SM_REGISTER_FOR_NOTIFICATIONS, 6);
+        assert_eq!(HIDL_SM_DEBUG_DUMP, 7);
         assert_eq!(HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS, 9);
         assert_eq!(HIDL_SM_ADD_WITH_CHAIN, 12);
         assert_eq!(HIDL_TRANSPORT_EMPTY, 0);
         assert_eq!(HIDL_TRANSPORT_HWBINDER, 1);
+        assert_eq!(HIDL_DEBUG_ARCH_UNKNOWN, 0);
+    }
+
+    /// 6-Z307: the HIDL service manager's OWN instances are seeded into
+    /// the registry at bus construction — the self-registration that
+    /// never crosses the wire on real Android either (it happens inside
+    /// the hwservicemanager process). The ladder-#247 watchdog kill
+    /// chain started at `HwBinder.getService("android.hidl.manager@
+    /// 1.0::IServiceManager", "default")` → NoSuchElementException
+    /// because this lookup missed 354 times.
+    #[test]
+    fn z307_hwservicemanager_self_instances_are_seeded() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let b = bus.lock().expect("bus");
+        for ver in ["1.0", "1.1", "1.2"] {
+            let key = format!("android.hidl.manager@{}::IServiceManager/default", ver);
+            let e = b
+                .services
+                .get(&key)
+                .unwrap_or_else(|| panic!("{} missing", key));
+            assert_eq!(e.virtual_kind, Some(VirtualService::HidlServiceManager));
+            assert_eq!(e.owner, PROXY_CONN_ID);
+            assert!(b.by_handle.values().any(|n| n == &key));
+        }
+    }
+
+    /// 6-Z307: `HIDL_SM_GET` on the seeded instances must HIT — the
+    /// watchdog's exact failing lookup (`@1.0`, then a `debugDump()` on
+    /// the returned handle) now resolves end-to-end.
+    #[test]
+    fn z307_hidl_get_of_iservice_manager_instances_hits() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        for ver in ["1.0", "1.2"] {
+            let req = hidl_sm_request(
+                "android.hidl.manager@1.0::IServiceManager",
+                &|b: &mut HidlReqBuilder| {
+                    let fq = format!("android.hidl.manager@{}::IServiceManager", ver);
+                    b.string_arg(&fq);
+                    b.string_arg("default");
+                },
+            );
+            let result = servicemanager_hidl(HIDL_SM_GET, &req, &bus, PROXY_CONN_ID);
+            let TransactionResult::Reply { data, offsets, .. } = result else {
+                panic!("get(@{}) must Reply", ver);
+            };
+            // The first offsets entry must point at a BINDER_TYPE_HANDLE
+            // flat with a NONZERO handle (a hit, not the null binder).
+            let off = u64::from_ne_bytes(offsets[0..8].try_into().unwrap()) as usize;
+            let ty = u32::from_ne_bytes(data[off..off + 4].try_into().unwrap());
+            let handle = u64::from_ne_bytes(data[off + 8..off + 16].try_into().unwrap());
+            assert_eq!(ty, BINDER_TYPE_HANDLE, "@{} must hit a handle", ver);
+            assert_ne!(handle, 0, "@{} must carry a nonzero handle", ver);
+        }
+    }
+
+    /// 6-Z307: `debugDump` (code 7) answers the REAL vec<InstanceDebugInfo>
+    /// shape from the registry: one 64B-stride element per service with
+    /// REAL owner pids for guest-owned entries and NO_PID (-1) for
+    /// proxy-owned virtuals (the watchdog skips NO_PID).
+    #[test]
+    fn z307_debug_dump_builds_instance_debug_info_reply() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        // A guest-owned service with a REAL pid (conn 7 registered by
+        // guest pid 4242) + the seeded SM instances (proxy-owned).
+        {
+            let mut b = bus.lock().expect("bus");
+            let conn = b.register_conn();
+            b.conns.get_mut(&conn).unwrap().sender_pid = 4242;
+            b.add_guest_service(
+                "android.hardware.audio@6.0::IDevicesFactory/default",
+                conn,
+                0x11,
+                0x22,
+            );
+        }
+        let req = hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|_b| {});
+        let result = servicemanager_hidl(HIDL_SM_DEBUG_DUMP, &req, &bus, PROXY_CONN_ID);
+        let TransactionResult::Reply { data, offsets, sg } = result else {
+            panic!("debugDump must Reply");
+        };
+        // status(4) + vec-struct PTR(40) + array PTR(40) + 3 PTRs per
+        // entry (interfaceName chars, instanceName chars, empty
+        // clientPids array).
+        let n_entries = {
+            // The vec-struct SG (object 0) carries the count at +8.
+            let sv = &sg[0].data;
+            u32::from_ne_bytes(sv[8..12].try_into().unwrap()) as usize
+        };
+        assert!(n_entries >= 4, "at least audio + 3 seeded SM instances");
+        assert_eq!(offsets.len(), (2 + n_entries * 3) * 8);
+        let arr_off = u64::from_ne_bytes(offsets[8..16].try_into().unwrap()) as usize;
+        let arr_len =
+            u64::from_ne_bytes(data[arr_off + 16..arr_off + 24].try_into().unwrap()) as usize;
+        assert_eq!(arr_len, n_entries * 64);
+        // Walk the SG array objects: the elements' pids live at
+        // element_base+32 (inline, NOT fixed up).
+        let mut seen_audio_pid = false;
+        let mut seen_sm_no_pid = false;
+        let mut audio_idx = None;
+        for (i, b_) in sg.iter().enumerate() {
+            if b_.data.len() == n_entries * 64 {
+                audio_idx = Some(i);
+            }
+        }
+        let arr = &sg[audio_idx.expect("array sg")].data;
+        for j in 0..n_entries {
+            let base = j * 64;
+            let pid = i32::from_ne_bytes(arr[base + 32..base + 36].try_into().unwrap());
+            let arch = arr[base + 56];
+            assert_eq!(arch, HIDL_DEBUG_ARCH_UNKNOWN);
+            if pid > 0 {
+                assert_eq!(pid, 4242, "the audio entry carries the REAL owner pid");
+                seen_audio_pid = true;
+            } else {
+                assert_eq!(pid, -1, "proxy-owned entries report NO_PID");
+                seen_sm_no_pid = true;
+            }
+        }
+        assert!(seen_audio_pid && seen_sm_no_pid);
+        let _ = data.len();
     }
 
     /// Build a HIDL servicemanager request the way libhwbinder + hidl-gen
