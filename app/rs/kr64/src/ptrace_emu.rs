@@ -22338,31 +22338,61 @@ pub fn run_ptrace_loop(
                                                 .iter()
                                                 .position(|b| *b == 0)
                                                 .unwrap_or(bytes.len());
-                                            let h = z306af_abort_msg_hash(&bytes[..end]);
-                                            if z306af_abort_msg_seen.insert(h) {
-                                                if z306af_abort_reads < 32 {
-                                                    z306af_abort_reads += 1;
+                                            // 6-Z306af-n (#239 decode): an EMPTY
+                                            // catch read is the prctl→strcpy
+                                            // race (bionic names the VMA BEFORE
+                                            // the strcpy lands — the catch can
+                                            // fire on the naming prctl's own
+                                            // EXIT window). #239 paid for this:
+                                            // the empty text (a) blocked the
+                                            // AUTHORITATIVE tgkill-entry read
+                                            // for that pid (read_pids was
+                                            // already inserted) and (b) seeded
+                                            // the dedup set with the empty
+                                            // hash, swallowing later pids
+                                            // ("dedup skip #1 (identical text)"
+                                            // for pid 5861). An empty read now
+                                            // DEFERS: release the per-pid gate
+                                            // so the tgkill-ABORT read (the
+                                            // message is FINAL there — written
+                                            // before the raise) can fire, and
+                                            // never hash an empty text.
+                                            if end == 0 {
+                                                z306af_abort_read_pids.remove(&pid);
+                                                if z306af_abort_dedup < 4 {
+                                                    z306af_abort_dedup += 1;
                                                     log(&format!(
+                                                        "6-Z306af-n: abort-message(pid={}, vma={:#x} len={:#x}) EMPTY at the catch (prctl→strcpy race) — per-pid gate released for the tgkill-ABORT read",
+                                                        pid, msg_addr, msg_len
+                                                    ));
+                                                }
+                                            } else {
+                                                let h = z306af_abort_msg_hash(&bytes[..end]);
+                                                if z306af_abort_msg_seen.insert(h) {
+                                                    if z306af_abort_reads < 32 {
+                                                        z306af_abort_reads += 1;
+                                                        log(&format!(
                                                         "6-Z306af: abort-message(pid={}, vma={:#x} len={:#x}): {:?}",
                                                         pid,
                                                         msg_addr,
                                                         msg_len,
                                                         String::from_utf8_lossy(&bytes[..end])
                                                     ));
-                                                } else if z306af_abort_dedup < 4 {
-                                                    z306af_abort_dedup += 1;
-                                                    log(&format!(
+                                                    } else if z306af_abort_dedup < 4 {
+                                                        z306af_abort_dedup += 1;
+                                                        log(&format!(
                                                         "6-Z306af-d: abort-message(pid={}) cap-drop #{} (32 distinct texts read this boot)",
                                                         pid, z306af_abort_dedup
                                                     ));
-                                                }
-                                            } else if z306af_abort_dedup < 4 {
-                                                z306af_abort_dedup += 1;
-                                                log(&format!(
+                                                    }
+                                                } else if z306af_abort_dedup < 4 {
+                                                    z306af_abort_dedup += 1;
+                                                    log(&format!(
                                                     "6-Z306af-d: abort-message(pid={}) dedup skip #{} (identical text already read)",
                                                     pid, z306af_abort_dedup
                                                 ));
-                                            }
+                                                }
+                                            } // 6-Z306af-n: end of the non-empty-text arm
                                         }
                                         None => {
                                             // Own budget: SIGSEGV-class deaths
@@ -22524,25 +22554,46 @@ pub fn run_ptrace_loop(
                                     if z306af_abort_read_pids.insert(pid) {
                                         match read_abort_message_vma(pid) {
                                             Some(msg) => {
-                                                let h = z306af_abort_msg_hash(msg.as_bytes());
-                                                if z306af_abort_msg_seen.insert(h) {
-                                                    if z306af_abort_reads < 32 {
-                                                        z306af_abort_reads += 1;
+                                                // 6-Z306af-n (#239 decode): an
+                                                // EMPTY message = the glog/
+                                                // plain-abort class (glog's
+                                                // LOG_ALWAYS_FATAL aborts
+                                                // WITHOUT android_set_abort_
+                                                // message — #239's "-2147483648"
+                                                // fleet). Never seed the dedup
+                                                // set with the empty hash — it
+                                                // would swallow later pids'
+                                                // reads as "identical text";
+                                                // log the emptiness itself
+                                                // (bounded) instead.
+                                                if msg.is_empty() {
+                                                    if z306af_abort_dedup < 4 {
+                                                        z306af_abort_dedup += 1;
                                                         log(&format!(
+                                                            "6-Z306af-n: tgkill-ABORT pid={} abort message EMPTY (plain abort/glog class — no android_set_abort_message)",
+                                                            pid
+                                                        ));
+                                                    }
+                                                } else {
+                                                    let h = z306af_abort_msg_hash(msg.as_bytes());
+                                                    if z306af_abort_msg_seen.insert(h) {
+                                                        if z306af_abort_reads < 32 {
+                                                            z306af_abort_reads += 1;
+                                                            log(&format!(
                                                             "6-Z306af: tgkill-ABORT pid={} abort message: {:?}",
                                                             pid, msg
                                                         ));
-                                                        // 6-Z306af-k: the scudo
-                                                        // corruption-class
-                                                        // discriminator (header
-                                                        // read at the live stop).
-                                                        if msg.contains("Scudo ERROR") {
-                                                            static Z306AF_K:
+                                                            // 6-Z306af-k: the scudo
+                                                            // corruption-class
+                                                            // discriminator (header
+                                                            // read at the live stop).
+                                                            if msg.contains("Scudo ERROR") {
+                                                                static Z306AF_K:
                                                                 std::sync::atomic::AtomicU64 =
                                                                 std::sync::atomic::AtomicU64::new(
                                                                     0,
                                                                 );
-                                                            if Z306AF_K
+                                                                if Z306AF_K
                                                                 .load(std::sync::atomic::Ordering::Relaxed)
                                                                 < 8
                                                             {
@@ -22562,21 +22613,22 @@ pub fn run_ptrace_loop(
                                                                     ),
                                                                 }
                                                             }
+                                                            }
+                                                        } else if z306af_abort_dedup < 4 {
+                                                            z306af_abort_dedup += 1;
+                                                            log(&format!(
+                                                            "6-Z306af-d: tgkill-ABORT(pid={}) cap-drop #{} (32 distinct texts read this boot)",
+                                                            pid, z306af_abort_dedup
+                                                        ));
                                                         }
                                                     } else if z306af_abort_dedup < 4 {
                                                         z306af_abort_dedup += 1;
                                                         log(&format!(
-                                                            "6-Z306af-d: tgkill-ABORT(pid={}) cap-drop #{} (32 distinct texts read this boot)",
-                                                            pid, z306af_abort_dedup
-                                                        ));
-                                                    }
-                                                } else if z306af_abort_dedup < 4 {
-                                                    z306af_abort_dedup += 1;
-                                                    log(&format!(
                                                         "6-Z306af-d: tgkill-ABORT(pid={}) dedup skip #{} (identical text already read)",
                                                         pid, z306af_abort_dedup
                                                     ));
-                                                }
+                                                    }
+                                                } // 6-Z306af-n: end of the non-empty-message arm
                                             }
                                             None => {
                                                 if z306af_abort_unread < 8 {
