@@ -28137,3 +28137,28 @@ Stage Summary / #234 DECODE TREE:
 2. 6-Z306q line: **start-system-server=true** ⇒ hypothesis (b) — the era-kill cadence is the wall; the DE-FLOODED klog + zygote svclog (this run's real win) now show init's kill messages ("Service 'zygote'...", class_reset triggers) and the zygote's own preload progress ("begin/end preload", "preloaded N classes") — decode WHO kills and WHY, then fix that mechanism.
 3. 6-Z306p depth-8 lines: if --overlay-apk-path args appear, OverlayConfig found configured overlays; their idmap output paths (stdout→idmap_paths) feed /data/resource-cache — verify none of our path translation breaks the OUTPUT dir (the failure would still be benign, but knowing is better).
 4. TWRP gate must stay GREEN (the deflood changes touch the recovery logging path).
+
+---
+Task ID: 28 (webDevReview cron leg)
+Agent: Z.ai Code (main session)
+Task: #234 decode (the kill cascade named); land 6-Z306u + 6-Z306v; dispatch #235.
+
+Work Log:
+- #234 (412dd2e) decoded: rung 7; TWRP gate GREEN (34663727938); kr64 CI GREEN.
+- **6-Z306q SETTLED HYPOTHESIS (a): start-system-server=TRUE in all 3 dumped eras** — argv=[/system/bin/app_process64][-Xzygote][/system/bin][--zygote][--start-system-server]. The zygote's argv is PERFECT. 6-Z306p depth-8 confirmed the OverlayConfig flow with a REAL immutable overlay (/product/overlay/framework-res__auto_generated_rro_product.apk --policy public) — normal AOSP 11 behavior.
+- **THE DE-FLOOD PAID OFF IMMEDIATELY**: zygote svclog 811KB→83KB and READABLE — the zygote's own stderr shows `ZygotePreload took 1140ms`, `PostZygoteInitGC 27ms`, `ZygoteInit took 1183ms` (preload is FAST — not the wall), initNativeState's benign "Failed to unmount /storage/emulated/*: Invalid argument" D-lines, then... silence. Init's klog (6-Z305l KLOG-TIMELINE) recovered and NAMED THE KILL CHAIN:
+  * **vendor.gralloc-3-0 SIGSEGVs every ~7s** (pids 2993/3384/3669: started +9.9s/+23.4s/+39.1s, signal 11 at +16.0s/+30.7s/+46.7s);
+  * each gralloc death → init runs **<Service 'vendor.gralloc-3-0' onrestart>:1 → 'restart surfaceflinger'** → SIGKILL SF;
+  * each SF restart → **<Service 'surfaceflinger' onrestart>:1 → 'restart zygote'** → init SIGKILLs the zygote (6-Z78: status=0x9, +31.4s era 2903);
+  * zygote restarts → preload again → killed again — **11 eras, rung 7 forever.**
+- **GRALLOC DEATH SITE (offline-symbolized from live maps + guest ELF)**: SIGSEGV si_addr=0x4, si_code=MAPERR, pc = **android::RefBase::incStrong+0x8** (libutils.so, dynsym-exact 0x10910 size 92), **LR in libhidlbase+0x983ec** (the hwbinder client receive path), **x0 = x21+0x88** (the #206 Δ=+0x88 HIDL wrapper virtual-base shape) — incStrong on a ZEROED object: mRefs read 0 → incWeak(NULL)->mWeak@+4 → fault. THE SAME dead-cookie lifetime class the kr64 driver's mirror_ref_ok liveness gate fixed on the binder side — **the shlib's hwbinder proxy wire has no such gate.**
+- **THE ZYGOTE PRE-FORK SILENCE (second wall, needs its own decode)**: the main thread REACHED the forkSystemServer pre-fork phase (~+16.3s: 500×prctl spins at the shlib prctl-hook rip; 6-Z306f-d whitelist-leak hyphen reopens = the FileDescriptorTable machinery; garbage-fd BINDER_VERSION ioctls on /dev/null fds) then ZERO traced stops for 15s until the era SIGKILL. in_syscall=false at silence → invisible to the 6-Z306an candidates (by design).
+- LANDED 7babbae: **6-Z306u** (at SIGSEGV delivery: peek x0(this)/x21(base) 16B via process_vm_readv, 8/boot, aarch64 — freed-scudo-chunk vs wrong-offset-capture decided in one run) + **6-Z306v** (PIN-PID silence discriminator: ≥5s of traced-stop silence in the pinned zygote → /proc/<pid>/syscall + wchan + stat state, 4/pid + 30s cooldown, dies with the pid — names the pre-fork block even with in_syscall=false).
+- Gates: fmt/clippy -D warnings clean; 841/841; CI GREEN (34665690206).
+- DISPATCHED on 7babbae: ladder #235 (34665785168, boot_wait 420) + TWRP gate (34665788421).
+
+Stage Summary / #235 DECODE TREE:
+1. **6-Z306u lines for the gralloc fleet** (the PRIMARY fix target): x0/x21 mem = zeros ⇒ freed-scudo object delivered by the shlib hwbinder proxy ⇒ FIX THE PROXY WIRE: audit the shlib's BR_TRANSACTION/BR_ACQUIRE (ptr,cookie) capture+serve path; add the same liveness-gate semantics as the kr64 driver's mirror_ref_ok (in-process check is trivial for the proxy — it IS the process). x21 mem = valid vptr but mRefs=0 ⇒ a mis-offset (Δ) capture ⇒ fix the flat position interpretation for the HIDL tails in the PROXY (not the driver).
+2. **6-Z306v lines for the zygote eras**: "running-in-userspace" ⇒ ART SuspendAll spin/park (the 6-Z271f op=137 bionic-mutex wedge family) — instrument the GC threads' mutex state; "blocked-in-kernel + wchan=futex_wait*" ⇒ a real futex wait — name the lock owner via the per-TID rings; "state=T (stopped)" ⇒ a group-stop loss — the -o intervention budget may now be reachable BEFORE the cascade kills the era (the cascade root dies first per item 1, extending the era lifespan).
+3. **CASCADING EXPECTATION**: with the gralloc SIGSEGV fixed, the era lifespan extends from ~20s to unlimited ⇒ the zygote completes forkSystemServer ⇒ system_server forks (the rung-6 ladder line finally moves) ⇒ the #221-era system_server walls (AMS wedge / scudo) become the frontier again.
+4. TWRP gate must stay GREEN.
