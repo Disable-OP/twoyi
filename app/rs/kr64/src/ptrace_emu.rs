@@ -10290,6 +10290,192 @@ fn stall_forensic_dump(pid: libc::pid_t) {
         }
     }
 
+    // 6-Z306af-q: the blocked syscall's OWN fd target. Ladder #243:
+    // system_server gen-1 main parked in read(fd=0x50=80) (the 6-Z271f
+    // /proc truth) but the 6-Z305t-14b table above caps at 24 fds and
+    // never named fd 80 — the single fd the whole boot was stuck on.
+    // For fd-shaped syscalls (arg0 IS an fd), resolve arg0 via
+    // /proc/<pid>/fd/<fd> + fdinfo (pos/flags). When the target is a
+    // pipe:[N], enumerate EVERY /proc holder of the same inode: a
+    // blocking pipe read unblocks ONLY when a writer writes or the
+    // last write end closes (EOF). Naming the peer — or proving NO
+    // other holder exists (a dangling pipe a real kernel would EOF
+    // immediately) — is the root-blocker evidence for the whole
+    // system_server-startup wall. Dedup per (pid, fd); the peer scan
+    // dedups per pipe inode; readlink budget 6000 per run. Same-uid
+    // visibility caveat: unreadable foreign fds simply don't match,
+    // so the scan logs its coverage (pids scanned / links read) and a
+    // "no other holder" verdict is only conclusive when coverage is
+    // non-trivial.
+    {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        // aarch64 (asm-generic) fd-first syscalls the tracer actually
+        // sees during boot. arg0 is an fd for every one of these.
+        let fd_shaped = matches!(
+            nr,
+            22 | 23
+                | 24
+                | 25
+                | 29
+                | 32
+                | 46
+                | 61
+                | 62
+                | 63
+                | 64
+                | 65
+                | 66
+                | 67
+                | 68
+                | 82
+                | 83
+                | 200
+                | 201
+                | 202
+                | 203
+                | 206
+                | 207
+                | 211
+                | 212
+                | 242
+        );
+        if fd_shaped && a0 <= 0x7fff_ffff {
+            static STALL_TARGET_SEEN: Mutex<Option<HashSet<(i32, i32)>>> = Mutex::new(None);
+            static STALL_TARGET_BUDGET: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let fd = a0 as i32;
+            let fresh = {
+                let mut seen = STALL_TARGET_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                seen.get_or_insert_with(HashSet::new).insert((pid, fd))
+            };
+            if fresh && STALL_TARGET_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < 24 {
+                STALL_TARGET_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let target = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                let fdinfo = std::fs::read_to_string(format!("/proc/{}/fdinfo/{}", pid, fd))
+                    .unwrap_or_default();
+                let flags = fdinfo
+                    .lines()
+                    .find(|l| l.starts_with("flags:"))
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_else(|| "flags: ?".to_string());
+                let pos = fdinfo
+                    .lines()
+                    .find(|l| l.starts_with("pos:"))
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_else(|| "pos: ?".to_string());
+                crate::trace_log_line(&format!(
+                    "6-Z306af-q STALL-TARGET: pid={} nr={} fd={} -> {} [{} {}]",
+                    pid, nr, fd, target, flags, pos
+                ));
+                // Pipe-peer census — only for pipe inodes.
+                let pipe_inode = target
+                    .strip_prefix("pipe:[")
+                    .and_then(|s| s.strip_suffix(']'))
+                    .map(|s| s.to_string());
+                if let Some(inode) = pipe_inode {
+                    static PIPE_PEER_SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+                    static PIPE_PEER_BUDGET: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    static READLINK_BUDGET: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let pipe_key = format!("pipe:[{}]", inode);
+                    let fresh_pipe = {
+                        let mut seen = PIPE_PEER_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                        seen.get_or_insert_with(HashSet::new)
+                            .insert(pipe_key.clone())
+                    };
+                    if fresh_pipe
+                        && PIPE_PEER_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < 6
+                        && READLINK_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < 6000
+                    {
+                        PIPE_PEER_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let want = format!("pipe:[{}]", inode);
+                        let mut holders: Vec<String> = Vec::new();
+                        let mut pids_scanned = 0usize;
+                        let mut links_read = 0usize;
+                        let mut other_holder = false;
+                        if let Ok(rd) = std::fs::read_dir("/proc") {
+                            'outer: for dent in rd.flatten() {
+                                let fname = dent.file_name().to_string_lossy().into_owned();
+                                if !fname.bytes().all(|b| b.is_ascii_digit()) {
+                                    continue;
+                                }
+                                pids_scanned += 1;
+                                let scan_pid: i32 = fname.parse().unwrap_or(-1);
+                                let peer_comm =
+                                    std::fs::read_to_string(format!("/proc/{}/comm", scan_pid))
+                                        .map(|s| s.trim().to_string())
+                                        .unwrap_or_else(|_| "?".to_string());
+                                for fdno in 0..48i32 {
+                                    if READLINK_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+                                        >= 6000
+                                    {
+                                        break 'outer;
+                                    }
+                                    READLINK_BUDGET
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let lt = std::fs::read_link(format!(
+                                        "/proc/{}/fd/{}",
+                                        scan_pid, fdno
+                                    ));
+                                    let lt = match lt {
+                                        Ok(p) => p.to_string_lossy().into_owned(),
+                                        Err(_) => continue,
+                                    };
+                                    links_read += 1;
+                                    if lt == want {
+                                        if scan_pid != pid {
+                                            other_holder = true;
+                                        }
+                                        let flags = std::fs::read_to_string(format!(
+                                            "/proc/{}/fdinfo/{}",
+                                            scan_pid, fdno
+                                        ))
+                                        .ok()
+                                        .and_then(|s| {
+                                            s.lines()
+                                                .find(|l| l.starts_with("flags:"))
+                                                .map(|l| l.trim().to_string())
+                                        })
+                                        .unwrap_or_else(|| "flags: ?".to_string());
+                                        if holders.len() < 8 {
+                                            holders.push(format!(
+                                                "pid={} comm={:?} fd={} [{}]",
+                                                scan_pid, peer_comm, fdno, flags
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if holders.is_empty() {
+                            crate::trace_log_line(&format!(
+                                "6-Z306af-q PIPE-PEER: {} has NO holder among readlinks (scanned {} pids, {} links) — dangling",
+                                want, pids_scanned, links_read
+                            ));
+                        } else {
+                            for h in &holders {
+                                crate::trace_log_line(&format!(
+                                    "6-Z306af-q PIPE-PEER: {} held by {}",
+                                    want, h
+                                ));
+                            }
+                            if !other_holder {
+                                crate::trace_log_line(&format!(
+                                    "6-Z306af-q PIPE-PEER: {} — every holder IS pid {} (self-pipe; the writer is inside the stalled process)",
+                                    want, pid
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 6-Z282: ppoll/poll fd-array naming — the LineageOS recovery's main
     // loop parks in ppoll for its whole life with a SINGLE drawn frame and
     // ZERO named graphics opens (runs 33846196526/33848918462/33868066820:
@@ -29890,6 +30076,53 @@ pub fn run_ptrace_loop(
                                 .as_ref()
                                 .map(|b| is_glog_redirect_write(b))
                                 .unwrap_or(false);
+                            // 6-Z306af-s: the FATAL/Watchdog marker class
+                            // rides the SINGLE-BUFFER write() shape too.
+                            // #243: the watchdog SIGKILLed system_server
+                            // gen-1 at +208.9s and af-p (writev-only,
+                            // iovcnt 2..=8) captured NOTHING — either the
+                            // banner rode a plain write() (liblog fallback
+                            // shape) or never left the process at all
+                            // (logd socket backpressure). This 64B probe
+                            // is already read for glog classification on
+                            // every <=512B write — match the same marker
+                            // family here; on a hit, re-read the full
+                            // payload verbatim. 16/run.
+                            {
+                                let af_s_hit = probe
+                                    .as_ref()
+                                    .map(|b| {
+                                        let t = String::from_utf8_lossy(b);
+                                        t.contains("FATAL EXCEPTION")
+                                            || t.contains("Watchdog")
+                                            || t.contains("WATCHDOG")
+                                    })
+                                    .unwrap_or(false);
+                                if af_s_hit {
+                                    static Z306AF_S: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z306AF_S.load(std::sync::atomic::Ordering::Relaxed) < 16 {
+                                        Z306AF_S.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        let full = read_child_bytes(
+                                            pid,
+                                            get_syscall_arg(&regs, abi.reg_arg2),
+                                            (ret as usize).min(512),
+                                        );
+                                        log(&format!(
+                                            "6-Z306af-s: logd FATAL/Watchdog write (pid={}): {}",
+                                            pid,
+                                            full.map(|b| {
+                                                crate::cap_log_line(
+                                                    &String::from_utf8_lossy(&b),
+                                                    240,
+                                                )
+                                                .into_owned()
+                                            })
+                                            .unwrap_or_else(|| "<unreadable>".to_string())
+                                        ));
+                                    }
+                                }
+                            }
                             is_fatal_marker = probe
                                 .map(|b| {
                                     b.starts_with(b"[twrp_fb_hook] ***")
