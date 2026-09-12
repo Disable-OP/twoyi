@@ -30192,9 +30192,14 @@ pub fn run_ptrace_loop(
                             // 6-Z306af-s2: armed follow-window state —
                             // declared at probe scope so BOTH the arm site
                             // (marker hit) and the capture site (every
-                            // subsequent write) see it.
-                            static Z306AF_S2_ARMED: std::sync::Mutex<Option<(i32, u32)>> =
-                                std::sync::Mutex::new(None);
+                            // subsequent write) see it. Value = (pid,
+                            // remaining, armed_at_ms). #246 fix: the window
+                            // now EXPIRES after 5 s of wall time — gen-1's
+                            // window stuck armed at remaining=3 when its
+                            // process died and blocked every later arm.
+                            static Z306AF_S2_ARMED: std::sync::Mutex<
+                                Option<(i32, u32, std::time::Instant)>,
+                            > = std::sync::Mutex::new(None);
                             let probe =
                                 read_child_bytes(pid, get_syscall_arg(&regs, abi.reg_arg2), 64);
                             // 6-Z301: glog classification FIRST (borrow);
@@ -30215,14 +30220,20 @@ pub fn run_ptrace_loop(
                             // every <=512B write — match the same marker
                             // family here; on a hit, re-read the full
                             // payload verbatim. 16/run.
+                            // 6-Z306af-s (#246 tuning): arm ONLY on the
+                            // crash shapes — "FATAL EXCEPTION" or the
+                            // WATCHDOG-KILLING banner. The bare "Watchdog"
+                            // match armed the window on innocent
+                            // [SystemServerTiming] StartWatchdog lines
+                            // (#246 +165.4s) and burned it 30 s before the
+                            // real crash.
                             {
                                 let af_s_hit = probe
                                     .as_ref()
                                     .map(|b| {
                                         let t = String::from_utf8_lossy(b);
                                         t.contains("FATAL EXCEPTION")
-                                            || t.contains("Watchdog")
-                                            || t.contains("WATCHDOG")
+                                            || t.contains("WATCHDOG KILLING")
                                     })
                                     .unwrap_or(false);
                                 if af_s_hit {
@@ -30261,12 +30272,39 @@ pub fn run_ptrace_loop(
                                         // captured verbatim (one window/run).
                                         {
                                             if let Ok(mut w) = Z306AF_S2_ARMED.lock() {
-                                                if w.is_none() {
-                                                    *w = Some((pid, 10));
-                                                    log(&format!(
-                                                        "6-Z306af-s2: follow window ARMED for pid={} (next 10 writes verbatim)",
-                                                        pid
-                                                    ));
+                                                match w.as_ref() {
+                                                    None => {
+                                                        *w = Some((
+                                                            pid,
+                                                            10,
+                                                            std::time::Instant::now(),
+                                                        ));
+                                                        log(&format!(
+                                                            "6-Z306af-s2: follow window ARMED for pid={} (next 10 writes verbatim)",
+                                                            pid
+                                                        ));
+                                                    }
+                                                    Some((apid, _, _)) if *apid == pid => {
+                                                        log(&format!(
+                                                            "6-Z306af-s2: window already armed for pid={} — extends nothing (crash stream already captured)",
+                                                            pid
+                                                        ));
+                                                    }
+                                                    Some((apid, _, started)) => {
+                                                        if started.elapsed()
+                                                            > std::time::Duration::from_secs(5)
+                                                        {
+                                                            log(&format!(
+                                                                "6-Z306af-s2: stale window for pid={} expired — re-arming for pid={}",
+                                                                apid, pid
+                                                            ));
+                                                            *w = Some((
+                                                                pid,
+                                                                10,
+                                                                std::time::Instant::now(),
+                                                            ));
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -30280,7 +30318,16 @@ pub fn run_ptrace_loop(
                                     let mut take = false;
                                     let mut remain = 0u32;
                                     if let Ok(mut w) = Z306AF_S2_ARMED.lock() {
-                                        if let Some((apid, r)) = w.as_mut() {
+                                        let expired = matches!(
+                                            w.as_ref(),
+                                            Some((_, _, started)) if started.elapsed()
+                                                > std::time::Duration::from_secs(5)
+                                        );
+                                        if expired {
+                                            log("6-Z306af-s2: window expired (5s) — crash stream ended before the stack drained");
+                                            *w = None;
+                                        }
+                                        if let Some((apid, r, _)) = w.as_mut() {
                                             if *apid == pid && *r > 0 {
                                                 take = true;
                                                 *r -= 1;
@@ -30288,11 +30335,6 @@ pub fn run_ptrace_loop(
                                                 if *r == 0 {
                                                     *w = None;
                                                 }
-                                            } else if *apid != pid {
-                                                // different process speaking —
-                                                // keep the window armed (the
-                                                // crashing thread interleaves
-                                                // with the fleet).
                                             }
                                         }
                                     }
