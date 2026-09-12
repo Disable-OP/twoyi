@@ -2909,19 +2909,39 @@ int __open_2(const char *path, int flags) {
     // open variant — selected by -D_FORTIFY_SOURCE). If libminuitwrp was
     // built with _FORTIFY_SOURCE, this is the variant that gets called
     // instead of open().
-    write_str(2, "[twrp_fb_hook] __open_2(\"");
-    write_str(2, path ? path : "(null)");
-    write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
-    write_str(2, ") -> fd="); write_num(2, fd);
+    // 6-Z306t-deflood (#233 decode): UNBOUNDED, the zygote's own svclog hit
+    // 811 KB of "__open_2(\"/proc/self/task\")" lines (thousands per
+    // process) — drowning the zygote's REAL stderr (its last words before
+    // the era death) AND the shared twoyi-loader.log. Gate to the first 8
+    // opens per process; FB0/ASHMEM tracked opens (rare, decisive) keep
+    // logging forever. The fd MARKING is tracking state and stays
+    // unconditional. Plain static (no TLS — banned in this shlib); a
+    // cross-thread race costs at most one extra log line (per the
+    // g_inbr_log_open precedent).
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
-        write_str(2, " [FB0 TRACKED]");
     }
     if (fd >= 0 && is_ashmem_path(path)) {
         ash_fd_mark(fd);
-        write_str(2, " [ASHMEM TRACKED]");
     }
-    write_str(2, "\n");
+    {
+        static unsigned char open2_log_budget = 8;
+        int fd_tracked = fd >= 0 && (is_fb_path(path) || is_ashmem_path(path));
+        if (fd_tracked || open2_log_budget > 0) {
+            if (!fd_tracked) open2_log_budget--;
+            write_str(2, "[twrp_fb_hook] __open_2(\"");
+            write_str(2, path ? path : "(null)");
+            write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
+            write_str(2, ") -> fd="); write_num(2, fd);
+            if (fd_tracked && is_fb_path(path)) {
+                write_str(2, " [FB0 TRACKED]");
+            }
+            if (fd_tracked && is_ashmem_path(path)) {
+                write_str(2, " [ASHMEM TRACKED]");
+            }
+            write_str(2, "\n");
+        }
+    }
     return fd;
 }
 
@@ -2948,20 +2968,34 @@ int __openat_2(int dirfd, const char *path, int flags) {
     // paths ignore dirfd, AT_FDCWD retry is always valid).
     fd = rootfs_retry_open(path, fd, flags, 0);
     // DIAGNOSTIC (Task 31): log EVERY __openat_2() call.
-    write_str(2, "[twrp_fb_hook] __openat_2(df="); write_num(2, dirfd);
-    write_str(2, ", \"");
-    write_str(2, path ? path : "(null)");
-    write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
-    write_str(2, ") -> fd="); write_num(2, fd);
+    // 6-Z306t-deflood (#233 decode): same gating as __open_2 above —
+    // first 8 opens per process, tracked opens log forever, marking
+    // unconditional.
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
-        write_str(2, " [FB0 TRACKED]");
     }
     if (fd >= 0 && is_ashmem_path(path)) {
         ash_fd_mark(fd);
-        write_str(2, " [ASHMEM TRACKED]");
     }
-    write_str(2, "\n");
+    {
+        static unsigned char openat2_log_budget = 8;
+        int fd_tracked = fd >= 0 && (is_fb_path(path) || is_ashmem_path(path));
+        if (fd_tracked || openat2_log_budget > 0) {
+            if (!fd_tracked) openat2_log_budget--;
+            write_str(2, "[twrp_fb_hook] __openat_2(df="); write_num(2, dirfd);
+            write_str(2, ", \"");
+            write_str(2, path ? path : "(null)");
+            write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
+            write_str(2, ") -> fd="); write_num(2, fd);
+            if (fd_tracked && is_fb_path(path)) {
+                write_str(2, " [FB0 TRACKED]");
+            }
+            if (fd_tracked && is_ashmem_path(path)) {
+                write_str(2, " [ASHMEM TRACKED]");
+            }
+            write_str(2, "\n");
+        }
+    }
     return fd;
 }
 
