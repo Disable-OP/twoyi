@@ -13248,6 +13248,21 @@ pub fn run_ptrace_loop(
     let mut z306anr_named: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     let mut z306anr_budget: u32 = 0;
+    // 6-Z306v: PIN-PID silence discriminator (#234 decode) — the zygote
+    // main thread went COMPLETELY silent (no traced stops at all) for 15 s
+    // inside the forkSystemServer pre-fork phase and died to the
+    // gralloc→SF→zygote cascade before any instrument fired. The 6-Z306an
+    // candidates require in_syscall=true; a thread that went quiet with NO
+    // pending consumed-ENTRY (parked in ART's SuspendAll, spinning in
+    // userspace, group-stopped, or blocked in a syscall whose ENTRY was
+    // never traced) is invisible. For the PIN PID only: on ≥5 s of
+    // traced-stop silence, read /proc/<pid>/syscall + /proc/<pid>/wchan +
+    // the stat state byte and name the state — 4/pid budget, 30 s
+    // cooldown, dies with the pid (both hygiene sites).
+    let mut z306v_budget: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    let mut z306v_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
+        std::collections::HashMap::new();
     // 6-Z271d: throttle for the stall scan (every 256th stop).
     let mut stall_tick: u64 = 0;
     // 6-Z184 AUDIT FIX (agent 12): this used to be a single global bool —
@@ -15911,6 +15926,59 @@ pub fn run_ptrace_loop(
                     }
                 }
             }
+
+            // ── 6-Z306v: PIN-PID silence discriminator (the #234 zygote
+            // pre-fork 15s block) ──
+            // The 6-Z306an candidates above cover in_syscall=true pids
+            // only. The PIN PID (the zygote) going quiet with NO pending
+            // consumed-ENTRY is the #234 gap: the forkSystemServer
+            // pre-fork phase's 15 s of ZERO traced stops before the era
+            // SIGKILL left the block site unnamed. Probe the procfs state
+            // (bounded 4/pid, 30 s cooldown, ≥5 s of silence):
+            //   * /proc/<pid>/syscall — "running" (userspace spin/park)
+            //     vs "nr ..." (blocked-in-kernel, the futex class) vs
+            //     unreadable (dying);
+            //   * /proc/<pid>/wchan — the kernel wait channel (futex_wait
+            //     vs poll vs ptrace-related...);
+            //   * the stat state byte — R/S/D/T/Z at a glance.
+            if let Some(pin) = z305y_stdio_pin_pid {
+                let now_v = std::time::Instant::now();
+                let quiet_for = last_stop_at
+                    .get(&pin)
+                    .map(|t| now_v.duration_since(*t).as_secs())
+                    .unwrap_or(u64::MAX);
+                if quiet_for >= 5 {
+                    let vb = z306v_budget.get(&pin).copied().unwrap_or(0);
+                    let vcool = match z306v_last.get(&pin) {
+                        None => true,
+                        Some(t) => now_v.duration_since(*t) >= std::time::Duration::from_secs(30),
+                    };
+                    if vb < 4 && vcool {
+                        z306v_last.insert(pin, now_v);
+                        z306v_budget.insert(pin, vb + 1);
+                        let psc = z306anr_read_proc_syscall(pin);
+                        let pclass = psc
+                            .as_deref()
+                            .map(z306anr_classify_proc_syscall)
+                            .unwrap_or("unreadable-or-empty");
+                        let wchan = std::fs::read_to_string(format!("/proc/{}/wchan", pin))
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|_| "<unreadable>".into());
+                        let state = std::fs::read_to_string(format!("/proc/{}/stat", pin))
+                            .ok()
+                            .and_then(|s| {
+                                s.rsplit(')').next().and_then(|rest| {
+                                    rest.split_whitespace().next().map(|x| x.to_string())
+                                })
+                            })
+                            .unwrap_or_else(|| "gone".into());
+                        log(&format!(
+                            "6-Z306v: pin pid={} silent {}s state={} wchan={:?} proc_syscall={:?} → {} (occurrence {}/4)",
+                            pin, quiet_for, state, wchan, psc, pclass, vb + 1
+                        ));
+                    }
+                }
+            }
         }
 
         // Check if the child exited.
@@ -16000,6 +16068,10 @@ pub fn run_ptrace_loop(
             // zygote-child-exec (inline form, per the binder_fds
             // precedent above).
             z306s_execed.remove(&pid);
+            // 6-Z306v: the pin-silence discriminator's per-pid state dies
+            // with the process (inline form, per the binder_fds precedent).
+            z306v_budget.remove(&pid);
+            z306v_last.remove(&pid);
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
             // dead pid + the prop_area_maps entries — see
@@ -16252,6 +16324,11 @@ pub fn run_ptrace_loop(
             // 6-Z306s: the exec-target label dies with the process
             // (WIFSIGNALED mirror of the WIFEXITED cleanup above).
             z306s_execed.remove(&pid);
+            // 6-Z306v: the pin-silence discriminator's per-pid state dies
+            // with the process (WIFSIGNALED mirror of the WIFEXITED
+            // cleanup above).
+            z306v_budget.remove(&pid);
+            z306v_last.remove(&pid);
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
             // above).
@@ -35836,6 +35913,60 @@ pub fn run_ptrace_loop(
                                     "SIGSEGV details: tid={} si_code={} (1=MAPERR unmapped, 2=ACCERR permission), si_addr={:#x}, pc={:#x}, sp={:#x}{}",
                                     pid, si_code, si_addr, pc, rsp, extra_regs
                                 ));
+                                // ── 6-Z306u: faulting-object memory peek ──
+                                //
+                                // #234 decode: the vendor-gralloc crash loop
+                                // (root of the gralloc→SF→zygote restart
+                                // cascade that kills every zygote era) died
+                                // at android::RefBase::incStrong+0x8
+                                // (libutils.so, si_addr=0x4 = NULL refs ->
+                                // incWeak mWeak@+4), LR in libhidlbase — an
+                                // incStrong on a ZEROED object, with
+                                // x0 = x21+0x88 (the #206 Δ=+0x88 HIDL
+                                // wrapper virtual-base shape). To decide
+                                // "freed scudo chunk" vs "wrong-offset
+                                // capture" in ONE run, peek the memory at
+                                // x0 (this) and x21 (the BnHw base
+                                // candidate): 16 bytes each, process_vm_readv
+                                // only (never dereferences inside the guest),
+                                // 8/boot budget, aarch64-only.
+                                #[cfg(target_arch = "aarch64")]
+                                {
+                                    static Z306U_BUDGET: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z306U_BUDGET
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        < 8
+                                    {
+                                        let rp = &crash_regs as *const Regs as *const u64;
+                                        let x0 = unsafe { *rp.add(0) };
+                                        let x21 = unsafe { *rp.add(21) };
+                                        for (label, addr) in [("x0(this)", x0), ("x21(base)", x21)]
+                                        {
+                                            let mem = if addr != 0 {
+                                                peek_guest_bytes(pid, addr, 16)
+                                                    .map(|b| {
+                                                        b.iter()
+                                                            .map(|x| format!("{:02x}", x))
+                                                            .collect::<String>()
+                                                    })
+                                                    .unwrap_or_else(|| "<unreadable>".into())
+                                            } else {
+                                                "null".into()
+                                            };
+                                            log(&format!(
+                                                "6-Z306u: pid={} {} ptr={:#x} mem=[{}] (occurrence {} of 8)",
+                                                pid,
+                                                label,
+                                                addr,
+                                                mem,
+                                                Z306U_BUDGET.load(
+                                                    std::sync::atomic::Ordering::Relaxed
+                                                )
+                                            ));
+                                        }
+                                    }
+                                }
                                 // 6-Z306af: the delivery-stop dump already
                                 // names this crash site — remember the pid so
                                 // the EXIT-event death-site capture (6-Z78 arm)
