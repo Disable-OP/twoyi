@@ -108,3 +108,4 @@ scripts/dl_artifact.sh
 tmp/art*/
 tmp/ui-e2e-artifacts/
 tmp/libc-decode/
+tmp/
