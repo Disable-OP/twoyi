@@ -103,3 +103,8 @@ corpus/images/
 corpus/results/
 scripts/gh_api.sh
 scripts/dl_artifact.sh
+
+# raw E2E artifact extractions — decode findings live in worklog.md, raw logs stay untracked
+tmp/art*/
+tmp/ui-e2e-artifacts/
+tmp/libc-decode/
