@@ -10232,7 +10232,7 @@ fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
 ///     the owning TID while contended (normal mutexes store the tid
 ///     directly; robust/PI words have bit 30 set) — logging it NAMES
 ///     the lock holder outright when the holder is another guest thread.
-fn stall_forensic_dump(pid: libc::pid_t) {
+fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
     let raw = match std::fs::read_to_string(format!("/proc/{}/syscall", pid)) {
         Ok(s) => s.trim().to_string(),
         Err(_) => return, // gone, or kernel without CONFIG_HAVE_ARCH_TRACEHOOK
@@ -10340,7 +10340,13 @@ fn stall_forensic_dump(pid: libc::pid_t) {
                 | 212
                 | 242
         );
-        if fd_shaped && a0 <= 0x7fff_ffff {
+        // 6-Z306af-q tuning (#244 decode): the flat 24 budget burned out
+        // on early eventpoll/socket targets BEFORE main's stall could
+        // resolve. Pipe stalls are ALWAYS interesting (a read(2) parked
+        // >5s on a pipe is never benign noise) and always resolve; every
+        // other fd-shaped target only resolves after 15s parked.
+        let pipe_stall = wchan == "anon_pipe_read";
+        if fd_shaped && a0 <= 0x7fff_ffff && (pipe_stall || elapsed_secs >= 15.0) {
             static STALL_TARGET_SEEN: Mutex<Option<HashSet<(i32, i32)>>> = Mutex::new(None);
             static STALL_TARGET_BUDGET: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
@@ -15991,7 +15997,7 @@ pub fn run_ptrace_loop(
                 // stale recvfrom ENTRY — becomes answerable: true nr,
                 // futex uaddr/op, the futex WORD (a pthread mutex word
                 // holds the owning TID), and the library owning PC.
-                stall_forensic_dump(sp);
+                stall_forensic_dump(sp, &wchan, elapsed.as_secs_f32());
             }
         }
 
@@ -23043,6 +23049,43 @@ pub fn run_ptrace_loop(
                                             census,
                                             issuer_ring
                                         ));
+                                        // 6-Z306ao-fd: the victim's open-fd
+                                        // count vs its Max-open-files soft
+                                        // limit. #243/#244 left a fork on the
+                                        // table: the A11 Watchdog kills EITHER
+                                        // via the overdue-checker path (which
+                                        // calls dumpStackTraces FIRST — its
+                                        // temp file under /data/anr never
+                                        // appeared) OR via the OpenFdMonitor
+                                        // ("Open FD high water mark reached",
+                                        // ~96% of the soft limit) — the fd
+                                        // count at the kill ENTRY decides
+                                        // which fork we are on. Cheap: one
+                                        // read_dir + one limits read per kill
+                                        // (≤8/run via the census budget).
+                                        let fd_count =
+                                            std::fs::read_dir(format!("/proc/{}/fd", j_target))
+                                                .map(|rd| rd.flatten().count())
+                                                .unwrap_or(0);
+                                        let max_open = std::fs::read_to_string(format!(
+                                            "/proc/{}/limits",
+                                            j_target
+                                        ))
+                                        .map(|s| {
+                                            s.lines()
+                                                .find(|l| l.starts_with("Max open files"))
+                                                .and_then(|l| {
+                                                    l.split_whitespace()
+                                                        .nth(3)
+                                                        .map(|v| v.parse::<u64>().unwrap_or(0))
+                                                })
+                                                .unwrap_or(0)
+                                        })
+                                        .unwrap_or(0);
+                                        log(&format!(
+                                            "6-Z306ao-fd: victim target={} open_fds={} max_open_files_soft={} (OpenFdMonitor trips ≈96% of soft limit)",
+                                            j_target, fd_count, max_open
+                                        ));
                                     }
                                 }
                                 // 6-Z306af-m: the sig=33 raiser context
@@ -25281,6 +25324,58 @@ pub fn run_ptrace_loop(
                                 // its original path, translated path, flags
                                 // and O_EXCL state, un-gated (first 40 —
                                 // property-area opens are rare).
+                                // 6-Z306af-t: same blindspot class for
+                                // /data/anr — #243/#244: the A11 watchdog's
+                                // WAITED_HALF and overdue paths BOTH call
+                                // dumpStackTraces BEFORE the kill, and its
+                                // FIRST act is File.createTempFile under
+                                // /data/anr — yet /data/anr stayed EMPTY in
+                                // both runs while the kill still happened.
+                                // Either the dump's opens fail inside twoyi's
+                                // fs layer (the exception lands in
+                                // tracesFileException and is swallowed) or
+                                // they never happen (the kill rode the
+                                // OpenFdMonitor path). Trace EVERY /data/anr
+                                // open at ENTRY (flags shape) and at EXIT
+                                // (fd vs -errno) — the pair names it bit
+                                // -exact. Budgets 12 ENTRY / 16 EXIT per run.
+                                {
+                                    let anr_hit = path.contains("/data/anr")
+                                        || translated.contains("/data/anr");
+                                    if anr_hit {
+                                        static Z306AF_T_ENTRY: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        if Z306AF_T_ENTRY.load(std::sync::atomic::Ordering::Relaxed)
+                                            < 12
+                                        {
+                                            Z306AF_T_ENTRY
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            let t_flags = if syscall_num == abi.open
+                                                || syscall_num == abi.openat
+                                            {
+                                                let flags_reg = if syscall_num == abi.open {
+                                                    abi.reg_arg2
+                                                } else {
+                                                    abi.reg_arg3
+                                                };
+                                                get_syscall_arg(&regs, flags_reg) as i32
+                                            } else {
+                                                0
+                                            };
+                                            log(&format!(
+                                                "6-Z306af-t anr-open ENTRY: pid={} op={} path={} translated={} flags={:#x} O_CREAT={} O_EXCL={} O_RDWR={}",
+                                                pid,
+                                                if syscall_num == abi.open { "open" } else { "openat" },
+                                                path,
+                                                translated,
+                                                t_flags,
+                                                t_flags & libc::O_CREAT != 0,
+                                                t_flags & libc::O_EXCL != 0,
+                                                t_flags & libc::O_RDWR != 0
+                                            ));
+                                        }
+                                    }
+                                }
                                 if is_property_metadata_file(&path)
                                     || is_property_metadata_file(&translated)
                                     || path.ends_with("__properties__")
@@ -28414,6 +28509,32 @@ pub fn run_ptrace_loop(
                                             },
                                             prop_area_diag_count,
                                             szlog
+                                        ));
+                                    }
+                                }
+                                // 6-Z306af-t (EXIT half): the /data/anr open
+                                // RESULT — fd vs -errno, un-gated by the
+                                // property predicates, independent of
+                                // ret sign (a failing createTempFile here is
+                                // EXACTLY the swallowed-tracesFileException
+                                // class #243/#244 left on the table). 16/run.
+                                if p.contains("/data/anr") {
+                                    static Z306AF_T_EXIT: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z306AF_T_EXIT.load(std::sync::atomic::Ordering::Relaxed) < 16
+                                    {
+                                        Z306AF_T_EXIT
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        log(&format!(
+                                            "6-Z306af-t anr-open EXIT: pid={} path={} ret={} ({})",
+                                            pid,
+                                            p,
+                                            ret,
+                                            if ret < 0 {
+                                                format!("-errno {}", -ret)
+                                            } else {
+                                                "fd".to_string()
+                                            }
                                         ));
                                     }
                                 }
