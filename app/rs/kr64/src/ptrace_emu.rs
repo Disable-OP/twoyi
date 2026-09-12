@@ -30189,6 +30189,12 @@ pub fn run_ptrace_loop(
                             // "[glog I/twoyi_loader] [twoyi_loader] " prefix
                             // to separate the loader's per-binder-op DIAG
                             // spam from real log lines.
+                            // 6-Z306af-s2: armed follow-window state —
+                            // declared at probe scope so BOTH the arm site
+                            // (marker hit) and the capture site (every
+                            // subsequent write) see it.
+                            static Z306AF_S2_ARMED: std::sync::Mutex<Option<(i32, u32)>> =
+                                std::sync::Mutex::new(None);
                             let probe =
                                 read_child_bytes(pid, get_syscall_arg(&regs, abi.reg_arg2), 64);
                             // 6-Z301: glog classification FIRST (borrow);
@@ -30232,6 +30238,73 @@ pub fn run_ptrace_loop(
                                         log(&format!(
                                             "6-Z306af-s: logd FATAL/Watchdog write (pid={}): {}",
                                             pid,
+                                            full.map(|b| {
+                                                crate::cap_log_line(
+                                                    &String::from_utf8_lossy(&b),
+                                                    240,
+                                                )
+                                                .into_owned()
+                                            })
+                                            .unwrap_or_else(|| "<unreadable>".to_string())
+                                        ));
+                                        // 6-Z306af-s2: ARM the follow window —
+                                        // #245: af-s caught "[glog V/
+                                        // AndroidRuntime] FATAL EXCEPTION:
+                                        // watchdog" 18ms before the kill, but
+                                        // the JAVA STACK lines that follow
+                                        // carry no marker and were lost. The
+                                        // stack IS the decode: it names the
+                                        // exact call inside the WAITED_HALF
+                                        // dumpStackTraces that throws on our
+                                        // guest but not on real hardware.
+                                        // Next 10 writes from the SAME pid are
+                                        // captured verbatim (one window/run).
+                                        {
+                                            if let Ok(mut w) = Z306AF_S2_ARMED.lock() {
+                                                if w.is_none() {
+                                                    *w = Some((pid, 10));
+                                                    log(&format!(
+                                                        "6-Z306af-s2: follow window ARMED for pid={} (next 10 writes verbatim)",
+                                                        pid
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // 6-Z306af-s2 (capture half): drain the
+                                // armed follow window — every write from the
+                                // armed pid, content-independent, 240B cap
+                                // each, until 10 lines or the pid changes.
+                                {
+                                    let mut take = false;
+                                    let mut remain = 0u32;
+                                    if let Ok(mut w) = Z306AF_S2_ARMED.lock() {
+                                        if let Some((apid, r)) = w.as_mut() {
+                                            if *apid == pid && *r > 0 {
+                                                take = true;
+                                                *r -= 1;
+                                                remain = *r;
+                                                if *r == 0 {
+                                                    *w = None;
+                                                }
+                                            } else if *apid != pid {
+                                                // different process speaking —
+                                                // keep the window armed (the
+                                                // crashing thread interleaves
+                                                // with the fleet).
+                                            }
+                                        }
+                                    }
+                                    if take {
+                                        let full = read_child_bytes(
+                                            pid,
+                                            get_syscall_arg(&regs, abi.reg_arg2),
+                                            (ret as usize).min(512),
+                                        );
+                                        log(&format!(
+                                            "6-Z306af-s2 stack({}): {}",
+                                            remain,
                                             full.map(|b| {
                                                 crate::cap_log_line(
                                                     &String::from_utf8_lossy(&b),
