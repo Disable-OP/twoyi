@@ -28492,3 +28492,30 @@ Stage Summary / #248 DECODE TREE:
 3. Wall B (the property race): the 6-Z307p START/DONE pairs name the stall if it recurs (a START without DONE under a SIGSEGV-storm window = tracer-latency class confirmed; the fix then targets the stall site, not the timeouts). If system_server 7217-class deaths VANISH entirely this run, the race may have been pure storm-load — the census still decides.
 4. Recovery gate MUST stay GREEN: the seeds touch the registry every recovery shares; a TWRP/OrangeFox regression ⇒ suspect the seeded handles colliding with recovery's own SM usage — bisect by un-seeding 1.1/1.2 first (1.0 is the Java-binds version).
 5. Watch the new `HIDL debugDump → N entries` volume: it fires per watchdog iteration (30s cadence) per era — budget-capped, but a huge N means many registry entries; the 128-entry cap is pre-army (registry ≤ ~30 entries today).
+
+---
+Task ID: 39 (webDevReview cron leg, same sandbox)
+Agent: Z.ai Code (main session)
+Task: Decode ladder #248 (rn248); land the named fix; dispatch #249.
+
+Work Log:
+- CI INFRA INCIDENT: rn247 hung 8h mid "UI navigation — import rootfs + boot Android" (job timeout-minutes: 30 never fired — GitHub runner-side zombie; the arm64 runner 1000017060 wedged). Cancelled rn247 + the 4 recovery children (202s), re-dispatched both. rn248 (id 34720335488) completed on 92f17959; recovery pr-tier gate 4/4 GREEN on 92f17959 (children 8232-8235 — the 6-Z307 seeding does NOT regress TWRP/OrangeFox/PitchBlack/Lineage).
+- **#248 DECODED — THE 354-MISS CLASS IS GONE, the wall moved ONE LEVEL DEEPER (precisely named)**:
+  * `HIDL get(android.hidl.manager@{1.0,1.2}::IServiceManager/default)` now HITS (2× @1.0 = the two watchdog eras, 49× @1.2 = the C++ retry fleets) — the 6-Z307 instance seeding WORKS on the wire.
+  * BUT the watchdog STILL died (2 eras, same NoSuchElementException stack, PIDs 5477/7884) — and its own client log named the exact divergence: `HidlServiceManagement: getService: unable to call into hwbinder service for android.hidl.manager@1.0::IServiceManager/default.`
+  * ROOT CAUSE: real HIDL semantics for `get(string, string) generates (IServiceManager_get_cb)` — hidl-gen marshals the generated callback interface as a nested LOCAL binder object APPENDED TO THE REQUEST; the method's own reply body is EMPTY; the result rides `getServiceCallback.onValues(vec<string> chain, IBase base)` — a ONEWAY transaction the service manager delivers to that object. The pre-6-Z307b arm replied with the handle flat and never delivered the callback → the client's future never completed → service=null → HwBinder.getService surfaced NoSuchElementException (the NAME_NOT_FOUND mapping). CONSISTENCY PROOF: getTransport (a sync-reply method) worked all along; get (a callback method) failed even on a registry hit. debugDump = 0 lines (the watchdog never got past getService).
+- **LANDED f34779eb — 6-Z307b, the get()-callback delivery** (binder.rs, +224/−34):
+  1. The GET arm parses the request's trailing callback flat (read_binder_arg; strict parse-fail diag on absence).
+  2. The reply body is now EMPTY (status prefix only).
+  3. The arm queues `getServiceCallback.onValues` (code=1, ONEWAY, requester=PROXY_CONN_ID, target ptr/cookie = the callback flat's values) on the REQUESTER'S OWN connection via the 6-Z276 IncomingTx/queue_transaction machinery — the client's binder POOL threads pick it up off the conn mailbox while the requesting thread waits on the callback future (the kernel's node-work-to-any-thread semantics). Hit: chain=[fq], base=HANDLE flat. Miss: chain=[], base=null flat (the honest NAME_NOT_FOUND shape — no hang, no fabricated service).
+  4. Proxy-conn callers (tests) skip the delivery; new ParcelWriter.write_hidl_vec_string (SG vec<string> per 6-Z305t-69).
+  5. Tests: get-hit asserts empty reply + queued onValues (code/flags/ptr/cookie/parcel layout 148B) + nonzero base handle; new get-miss test (108B null onValues). fmt clean; clippy -D warnings clean; **848/848**. Pushed f34779eb.
+- DISPATCHED on f34779eb: **ladder #249** (rn249, boot_wait 420, stall 0, expect_rung 7) + recovery gate already GREEN on the pre-callback commit (the callback touches only the HIDL get path; recovery clients are PASSTHROUGH short-circuited and the corpus gate will re-run in the next pr-tier dispatch).
+
+Stage Summary / #249 DECODE TREE:
+1. PRIMARY: the watchdog's get() round trip must COMPLETE — expect `6-Z307b: onValues(android.hidl.manager@1.0::IServiceManager/default) queued for conn=…` lines, then `HIDL debugDump → N entries` (the watchdog's next call finally happening), and ZERO 'FATAL EXCEPTION: watchdog' NoSuchElementException. The two former kill eras should live through their WAITED_HALF windows.
+2. EXPECT rung 6 SURVIVAL (SYSTEM_SERVER alive past +195s/+360s) — the watchdog either finds healthy checkers or prints its REAL overdue banner with honest blocked-checker names (that banner would be the true frontier, named).
+3. The C++ @1.2 retry fleets ("Waited one second / unable to call into hwbinder service") must resolve — watch those strings go to zero; services blocked on SM lookups unblock.
+4. Wall B (property race): the 6-Z307p START/DONE census runs this pass too — any START without DONE names the client-side stall.
+5. Recovery gate: the callback path is new shared wire — the next pr-tier dispatch MUST stay 4/4 GREEN.
+6. If system_server STILL dies: the next exception's stack will be in the klog (the kmsg mirror carries every banner) — read the frames, do not guess.
