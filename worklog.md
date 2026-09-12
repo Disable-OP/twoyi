@@ -28349,3 +28349,23 @@ Stage Summary / #242 DECODE TREE:
 3. The stuck "system_server" nanosleep thread (5058/7230) needs identity: it is the only non-idle anomaly in an otherwise-idle process — if #242's evidence ties it to a checker, fix its stuck timed-wait.
 4. system_server reaching the watchdog's SECOND interval boundary (~+345s = 60s+) without a kill = rung 6 finally landing.
 5. Recovery gate MUST stay GREEN (instruments + harness only).
+
+---
+Task ID: 36 (webDevReview cron leg, continued)
+Agent: Z.ai Code (main session, same leg as Tasks 33-35)
+Task: Decode ladder #242 (the 6-Z306ao-e ground truth); land 6-Z306af-p; dispatch #243.
+
+Work Log:
+- #242 (6666982, rn240) decoded: rung 7; recovery gate 4/4 GREEN on 6666982 (children #8204-#8207 in flight at decode, parent rn23 success); kr64 CI GREEN (rn1732 on 63b9452).
+- **THE 6-Z306ao-e GROUND TRUTH NAMED THE WALL SHAPE**: the new anr-dropbox artifact shows /data/anr EMPTY and /data/system/dropbox EMPTY — no anr_fd_* (the OpenFdMonitor NEVER tripped → ruled out), no traces_* (dumpStackTraces NEVER completed), no system_server_watchdog dropbox entry (the dropbox thread NEVER ran). Yet the watchdog thread killed system_server 60ms after its WAITED_HALF log. Every A11 kill path writes its evidence BEFORE the kill — none of it exists.
+- **CONCLUSION: the UNCAUGHT-EXCEPTION kill** — the watchdog thread died MID-dumpStackTraces (its WAITED_HALF branch) and ART's KillUncaughtHandler kill()ed myPid from the crashing thread. Matches every observation: issuer comm "watchdog", target myPid, SIGKILL, 60ms gap, ZERO deathbed fs artifacts, no "WATCHDOG KILLING SYSTEM PROCESS" log line (that Slog.w belongs to the OVERDUE path which never ran).
+- The exception text ("FATAL EXCEPTION: watchdog" + stack) rides the LOGD writev — invisible to both the klog matcher (single-iov KernelLogger lines) and the WRITEV-SAMPLE class (cap 200, expired at +591ms).
+- LANDED 0e3eef5 — **6-Z306af-p**: logd-shaped writevs (iovcnt 2..=8, non-klog) are scanned at ENTRY for "FATAL EXCEPTION"/"Watchdog" markers; a hit logs the message verbatim (32/run). This names the exact exception + Java stack next run.
+- Gates: fmt+clippy clean; 844/844. Pushed 0e3eef5. DISPATCHED on 0e3eef5: ladder #243 (rn241) + recovery pr-tier gate. In flight at worklog-write.
+
+Stage Summary / #243 DECODE TREE:
+1. PRIMARY: the 6-Z306af-p line names the watchdog thread's exception — the Java stack names the twoyi-side defect (a /proc or syscall semantic inside dumpStackTraces that throws on our guest but not on real hardware).
+2. Fix the named defect generically (a real /proc-semantic gap, NOT a watchdog special-case), regression-test recovery, and expect system_server to survive the watchdog's SECOND interval (~+380s) — rung 6 (SYSTEM_SERVER survival) lands.
+3. If #243 shows NO af-p line but the watchdog still kills: fall back to capturing the issuer thread's full register file + stack-window at the kill ENTRY (the ART exception path's kill is preceded by the exception handler's allocations — the ring will show the shape).
+4. The stuck "system_server" clock_nanosleep thread (5058/7230) remains the #224 family — secondary until the watchdog exception is fixed.
+5. Recovery gate MUST stay GREEN.
