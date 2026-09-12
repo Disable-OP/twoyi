@@ -621,7 +621,9 @@ static void bp_alloc_free(uintptr_t ptr) {
 
 // ==========================================================================
 // 6-Z306z: the delivery-side (ptr,cookie) LIVENESS GATE — the SHLIB twin
-// of the kr64 driver's mirror_ref_ok, hardened per the #235 decode.
+// of the kr64 driver's mirror gate, now on the 6-Z306ae-f ROUND-TRIP
+// anchor (see bp_binder_object_alive below for the #236/#209 evidence
+// that killed the vptr&&mRefs-at-cookie contract).
 //
 // EVIDENCE (ladder #235): the ENTIRE vendor-HAL fleet (1337 SIGSEGVs)
 // died at android::RefBase::incStrong+0x8 (libutils.so, si_addr=0x4,
@@ -640,67 +642,85 @@ static void bp_alloc_free(uintptr_t ptr) {
 // faulting us.
 //
 // THE GATE (both Task-29 paths):
-//   1. node-ref mirror commands ([BR_ACQUIRE]/[BR_INCREFS] with a dead
-//      cookie — the guest's IPCThreadState would incStrong/incWeak the
-//      dead object: the #204 atrace incWeak(NULL) and #235
-//      incStrong-mRefs=0 crash shapes) → the 20-byte command is
-//      rewritten as 5×BR_NOOP (cmd-only, size 0 — the stream walk stays
-//      byte-aligned and no blob pairing is involved: mirror commands
-//      never carry trailer blobs). Released-side commands (BR_RELEASE /
-//      BR_DECREFS) are NOT gated: decStrong on a cookie we never
-//      acquired-mirrored cannot occur on this wire (the gate ran at
-//      acquire time).
+//   1. node-ref mirror commands ([BR_ACQUIRE]/[BR_INCREFS] whose weakref
+//      fails the round-trip — the guest's IPCThreadState would
+//      incStrong/incWeak the dead object: the #204 atrace incWeak(NULL)
+//      and #235/#236 incStrong-mRefs=NULL crash shapes) → the 20-byte
+//      command is rewritten as 5×BR_NOOP (cmd-only, size 0 — the stream
+//      walk stays byte-aligned and no blob pairing is involved: mirror
+//      commands never carry trailer blobs). Released-side commands
+//      (BR_RELEASE / BR_DECREFS) are NOT gated: decStrong on a cookie we
+//      never acquired-mirrored cannot occur on this wire (the gate ran
+//      at acquire time).
 //   2. delivered parcels (bp_patch_reply_data): BR_TRANSACTION with
-//      target.ptr != 0 and a dead tr.cookie → rewritten in the guest's
-//      copy as BR_DEAD_REPLY + 16×BR_NOOPs (fills the 68-byte slot;
-//      kernel-true semantics: a transaction to a dead node fails with
-//      DEAD_OBJECT/FAILED_TRANSACTION instead of killing the server →
-//      the gralloc→SF→zygote cascade root dies); embedded LOCAL flats
-//      (BINDER/WEAK_BINDER, cookie != 0, dead) → ptr+cookie zeroed (the
+//      a ptr-form LOCAL target whose weakref fails the round-trip →
+//      rewritten in the guest's copy as BR_DEAD_REPLY + 16×BR_NOOPs
+//      (fills the 68-byte slot; kernel-true semantics: a transaction to
+//      a dead node fails with DEAD_OBJECT/FAILED_TRANSACTION instead of
+//      killing the server → the gralloc→SF→zygote cascade root dies);
+//      embedded LOCAL flats with a dead weakref → ptr+cookie zeroed (the
 //      A11 null-binder shape: unflattenBinder yields a NULL sp and
 //      skips the incStrong — proven benign by the SM miss reply).
 //      Blob pairing is preserved: the blob is consumed whether or not
 //      the command is neutralized.
-// Liveness contract: [cookie..+16] readable && vptr != 0 && mRefs != 0
-// (the Task-29 hardening of mirror_ref_ok's 8-byte vptr check — the
-// valid-vptr/mRefs=0 class is exactly what the #235 fleet taught us).
+// Liveness contract (6-Z306ae-f): R = [W+8]; alive iff [R+8] == W —
+// the kernel-true weakref round-trip, Δ-agnostic, wrapper-padding-safe.
 // ==========================================================================
 
-// 16-byte peek into OUR OWN address space. The kernel validates the
+// 8/16-byte peek into OUR OWN address space. The kernel validates the
 // remote range and returns -1/EFAULT for unmapped or unreadable
 // addresses — no signal, no fault, honest failure.
-static int bp_self_peek16(uintptr_t addr, uint8_t out[16]) {
+static int bp_self_peek(uintptr_t addr, uint8_t *out, size_t len) {
     struct iovec local;
     struct iovec remote;
     ssize_t n;
     if (addr == 0) return 0;
     local.iov_base = out;
-    local.iov_len = 16;
+    local.iov_len = len;
     remote.iov_base = (void *)addr;
-    remote.iov_len = 16;
+    remote.iov_len = len;
     n = syscall(SYS_process_vm_readv, (long)syscall(SYS_getpid),
                 &local, 1, &remote, 1, 0);
-    return n == (ssize_t)16;
+    return n == (ssize_t)len;
 }
 
-// The mirror_ref_ok contract (vptr != 0) HARDENED with mRefs != 0 —
-// the #235 gralloc fleet died with a VALID vptr but mRefs == 0, which
-// the driver's 8-byte check alone cannot see. Unreadable == dead.
-static int bp_binder_object_alive(uint64_t cookie) {
-    uint8_t buf[16];
-    uint64_t vptr;
-    uint64_t mrefs;
-    if (cookie == 0) return 0;
-    if (!bp_self_peek16((uintptr_t)cookie, buf)) return 0;
-    memcpy(&vptr, buf, 8);
-    memcpy(&mrefs, buf + 8, 8);
-    return vptr != 0 && mrefs != 0;
+// 6-Z306ae-f (#236 decode): the ROUND-TRIP liveness anchor — the
+// kernel-true, Δ-agnostic replacement for the 6-Z306z vptr&&mRefs-at-
+// cookie contract. #236 killed that contract twice over: a delivered
+// HIDL flat with [cookie]=[valid vptr][0xbd] (the wrapper chunk
+// partially reused) PASSED while the true RefBase subobject was dead
+// (the guest's incStrong, vbase-adjusted to R, read mRefs=NULL at
+// [R+8] — the si_addr=0x4 fleet shape that killed the first-ever
+// forked system_server 30 s into its run); and #209 proved the
+// wrapper padding at [B+8] can legitimately be ZERO for LIVE objects
+// (a false-dead direction). The anchor never touches the cookie:
+//   W = the flat's binder field (the weakref the node ref anchors on);
+//   R = [W+8]   = weakref_impl.mBase — the TRUE RefBase subobject
+//               (RefBase ctor: mRefs(new weakref_impl(this)));
+//   alive iff  [R+8] == W — the live object's mRefs field points back
+//              at its own weakref. Freed-and-reused chunks sever the
+//              equality; an accidental 2^-64 match is the only
+//              false-alive case. Works for AIDL (Δ small) and HIDL
+//              (Δ = 0x80/0x88/...) alike without knowing Δ.
+static int bp_binder_object_alive(uint64_t w) {
+    uint8_t buf[8];
+    uint64_t r;
+    uint64_t refs_back;
+    if (w == 0) return 0;
+    if (!bp_self_peek((uintptr_t)w + 8, buf, 8)) return 0;
+    memcpy(&r, buf, 8);
+    if (r == 0) return 0;
+    if (!bp_self_peek((uintptr_t)r + 8, buf, 8)) return 0;
+    memcpy(&refs_back, buf, 8);
+    return refs_back == w;
 }
 
 // Gate 1 — mirror commands on the response BR stream. Runs on the
 // PROXY-SIDE copy (resp+4) BEFORE the transfer into the guest's read
 // buffer; BR_ACQUIRE/BR_INCREFS never carry trailer blobs, so the
 // 5×BR_NOOP rewrite is pairing-neutral for bp_patch_reply_data.
+// Liveness anchor: the payload's ptr field IS W (the weakref) — the
+// 6-Z306ae-f round-trip (bp_binder_object_alive) decides.
 static void bp_gate_mirror_commands(uint8_t *stream, uint64_t len) {
     uint64_t pos = 0;
     static const uint32_t noop = BP_BR_NOOP;
@@ -715,7 +735,7 @@ static void bp_gate_mirror_commands(uint8_t *stream, uint64_t len) {
             uint64_t cookie;
             memcpy(&ptr, stream + pos + 4, 8);
             memcpy(&cookie, stream + pos + 12, 8);
-            if (cookie != 0 && !bp_binder_object_alive(cookie)) {
+            if (ptr == 0 || cookie == 0 || !bp_binder_object_alive(ptr)) {
                 int i;
                 for (i = 0; i < 5; i++)
                     memcpy(stream + pos + 4 * (size_t)i, &noop, 4);
@@ -787,17 +807,19 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 }
             }
             // 6-Z306z gate 2a: a BR_TRANSACTION whose LOCAL target object
-            // (tr.cookie with target.ptr != 0) is not alive in this
-            // process would crash the server in executeTransaction's
-            // sp<BBinder> construction — the #235 gralloc→SF→zygote
-            // cascade root. Kernel-true semantics: a transaction to a
-            // dead node fails. Rewrite the command IN THE GUEST'S COPY as
-            // BR_DEAD_REPLY + 16×BR_NOOPs (the 68-byte slot stays
-            // byte-aligned and every filler is a cmd-only no-op); the
-            // blob below is still consumed so trailer pairing holds, and
-            // the backing/patch step is SKIPPED for this slot (writing
-            // data_ptr/offsets_ptr over the NOOP fillers would feed heap
-            // pointers to the guest's command parser — a desync).
+            // is not alive in this process would crash the server in
+            // executeTransaction's sp<BBinder> construction — the #235
+            // gralloc→SF→zygote cascade root. Liveness anchor (6-Z306ae-f):
+            // target.ptr IS W (the node's weakref) for the ptr-form local
+            // delivery; the round-trip [ [W+8]+8 ] == W decides. Remote
+            // (handle-form) deliveries carry cookie==0 and are skipped.
+            // Kernel-true semantics on failure: BR_DEAD_REPLY + 16×BR_NOOPs
+            // in the guest's copy (the 68-byte slot stays byte-aligned and
+            // every filler is a cmd-only no-op); the blob below is still
+            // consumed so trailer pairing holds, and the backing/patch step
+            // is SKIPPED for this slot (writing data_ptr/offsets_ptr over
+            // the NOOP fillers would feed heap pointers to the guest's
+            // command parser — a desync).
             int z306z_tx_neutralized = 0;
             if (cmd == BP_BR_TRANSACTION) {
                 uint64_t t_ptr;
@@ -805,7 +827,7 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 memcpy(&t_ptr, stream + pos + 4 + BP_TR_TARGET_OFF, 8);
                 memcpy(&t_cookie, stream + pos + 4 + BP_TR_COOKIE_OFF, 8);
                 if (t_ptr != 0 && t_cookie != 0 &&
-                    !bp_binder_object_alive(t_cookie)) {
+                    !bp_binder_object_alive(t_ptr)) {
                     static const uint32_t z306z_noop = BP_BR_NOOP;
                     static const uint32_t z306z_dead = BP_BR_DEAD_REPLY;
                     int zi;
@@ -819,10 +841,10 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         g_diag_z306z_gate--;
                         snprintf(m, sizeof(m),
                                  "[twoyi_loader] 6-Z306z: BR-TX dead target "
-                                 "cookie=0x%llx ptr=0x%llx -> BR_DEAD_REPLY "
+                                 "W=0x%llx cookie=0x%llx -> BR_DEAD_REPLY "
                                  "(pid=%d)\n",
-                                 (unsigned long long)t_cookie,
-                                 (unsigned long long)t_ptr, g_real_pid);
+                                 (unsigned long long)t_ptr,
+                                 (unsigned long long)t_cookie, g_real_pid);
                         write_str(2, m);
                     }
                 }
@@ -924,16 +946,18 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 }
                 // 6-Z306z gate 2b: embedded LOCAL flats — walk the offsets
                 // array of the WRITTEN copy; any BINDER/WEAK_BINDER object
-                // whose cookie is not alive in this process gets its
+                // whose weakref fails the 6-Z306ae-f round-trip gets its
                 // binder+cookie zeroed (the A11 null-binder shape:
                 // unflattenBinder yields a NULL sp and skips incStrong —
                 // proven benign by the SM miss reply). Runs on `back`
                 // before registration so the guest can never see the dead
-                // pointer pair.
+                // pointer pair. The anchor is the flat's binder field (W),
+                // never the cookie (the #209/#236 wrapper-padding traps).
                 {
                     for (uint64_t j = 0; j + 8 <= (uint64_t)olen; j += 8) {
                         uint64_t obj_off;
                         uint32_t typ;
+                        uint64_t f_binder;
                         uint64_t f_cookie;
                         memcpy(&obj_off, back + dlen + j, 8);
                         if (obj_off > (uint64_t)dlen ||
@@ -943,17 +967,19 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         if (typ != BP_BINDER_TYPE_BINDER &&
                             typ != BP_BINDER_TYPE_WEAK_BINDER)
                             continue;
+                        memcpy(&f_binder, back + obj_off + BP_FLAT_BINDER_OFF, 8);
                         memcpy(&f_cookie, back + obj_off + BP_FLAT_COOKIE_OFF, 8);
-                        if (f_cookie == 0) continue;
-                        if (bp_binder_object_alive(f_cookie)) continue;
+                        if (f_cookie == 0 && f_binder == 0) continue;
+                        if (bp_binder_object_alive(f_binder)) continue;
                         memset(back + obj_off + BP_FLAT_BINDER_OFF, 0, 16);
                         if (g_diag_z306z_gate > 0) {
                             char m[192];
                             g_diag_z306z_gate--;
                             snprintf(m, sizeof(m),
                                      "[twoyi_loader] 6-Z306z: dead LOCAL flat "
-                                     "cookie=0x%llx zeroed in %s dlen=%u "
+                                     "W=0x%llx cookie=0x%llx zeroed in %s dlen=%u "
                                      "(pid=%d)\n",
+                                     (unsigned long long)f_binder,
                                      (unsigned long long)f_cookie,
                                      (cmd == BP_BR_TRANSACTION) ? "BR-TX"
                                                                 : "BR-RPY",

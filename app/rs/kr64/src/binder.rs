@@ -6485,46 +6485,89 @@ fn probe_flat_mem(
     );
 }
 
-/// 6-Z306ae-d: the mirror's liveness gate. The #206 capture-flat dump
-/// settled the "capture shift": the parcel cookie slot is CORRECT
-/// ([flat]{type,flags,binder=W,cookie=B}[stability][allow][prio], all
-/// sane); mBase(W) = B + Δ is the **RefBase virtual-base subobject
-/// offset** inside multiply-inheriting HIDL wrappers (BnHw<X> :
-/// BHwBinder, X — the shared RefBase lives at a different offset than
-/// the BHwBinder subobject; Δ = 0x88 BnHw<HIDL>, 0x20/0x38/0x68
-/// elsewhere) — NOT a capture error. The mBase==cookie "invariant" of
-/// 6-Z306ae-b therefore rejected every correct capture and the mirror
-/// never fired (#205: 241 skips, 0 deliveries).
-/// The gate that actually protects the guest: the object at cookie
-/// must LOOK ALIVE — [cookie..+8] readable with vptr≠0. A freed scudo
-/// chunk reads zeros (the #199/#201 platform_compat serve-time state
-/// and the #204 atrace incWeak(NULL) crash shape). NOTE: NO mRefs
-/// check at [cookie+8] — for the virtually-inheriting wrapper classes
-/// (IBinder : public virtual RefBase) the BBinder subobject is just
-/// {vptr} and [B+8] is padding that can legitimately be zero; mRefs
-/// lives in the shared RefBase subobject at B+Δ (#209: 238/246
-/// registrations wrongly rejected by the mRefs≠0 check).
+/// 6-Z306ae-d → 6-Z306ae-f: the mirror's liveness gate. The #206
+/// capture-flat dump settled the "capture shift": the parcel cookie slot
+/// is CORRECT ([flat]{type,flags,binder=W,cookie=B}[stability][allow]
+/// [prio], all sane); mBase(W) = B + Δ is the **RefBase virtual-base
+/// subobject offset** inside multiply-inheriting wrappers (IBinder :
+/// public virtual RefBase — for ALL binder classes, AIDL and HIDL; Δ =
+/// 0x88 BnHw<HIDL>, 0x20/0x38/0x68/0x80 elsewhere) — NOT a capture
+/// error. The mBase==cookie "invariant" of 6-Z306ae-b therefore
+/// rejected every correct capture and the mirror never fired (#205:
+/// 241 skips, 0 deliveries).
+///
+/// The 6-Z306ae-d contract (vptr≠0 at [cookie..+8]) protected against
+/// the freed-zeroed-chunk class but #236 killed it: a delivered flat
+/// with [cookie]=[valid vptr][0xbd] (the wrapper chunk partially
+/// reused) passed while the true RefBase subobject was dead — the
+/// guest's incStrong (vbase-adjusted to R) read mRefs=NULL at [R+8]
+/// and died (the si_addr=0x4 fleet shape). The 6-Z306ae-f ROUND-TRIP
+/// anchor (in the body below) is kernel-true and Δ-agnostic: it never
+/// inspects the wrapper padding at [B+8] (which #209 proved can
+/// legitimately be zero) and never needs to know Δ.
+///
+/// Anchor: W = the flat's binder field (the weakref the node ref is
+/// anchored on); R = [W+8] = weakref_impl.mBase = the TRUE RefBase
+/// subobject; the object is ALIVE iff [R+8] == W (RefBase ctor:
+/// mRefs(new weakref_impl(this)); the live object's mRefs field points
+/// back at its weakref). Freed-and-reused chunks sever the equality.
 fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
     if guest_pid <= 0 || ptr == 0 || cookie == 0 {
         return false;
     }
-    match crate::ptrace_emu::peek_guest_bytes(guest_pid, cookie, 8) {
+    // 6-Z306ae-f (#236 decode): the ROUND-TRIP liveness anchor. The
+    // 6-Z306ae-d vptr-only contract is proven insufficient: ladder #236
+    // delivered a HIDL flat whose cookie slot read [valid vptr][0xbd] —
+    // the BHwBinder wrapper chunk LOOKED alive while the TRUE RefBase
+    // subobject (mBase = cookie + 0x80, the #206 virtual-base Δ) was
+    // dead; the guest's incStrong (vbase-adjusted to mBase) read
+    // mRefs=NULL at [mBase+8] and died (si_addr=0x4 at
+    // RefBase::incStrong+0x8 — the fleet shape), killing the FIRST-EVER
+    // forked guest system_server 30 s into its run.
+    //
+    // Kernel-true anchor: W = the captured weakref (the flat's binder
+    // field); R = [W+8] = weakref_impl.mBase = the true RefBase
+    // subobject pointer (RefBase ctor: mRefs(new weakref_impl(this)) —
+    // weakref_impl.mBase = the RefBase*); the object is alive iff
+    // [R+8] == W (its mRefs field points back at the very weakref the
+    // node's ref is anchored on). Freed-and-reused chunks sever the
+    // equality; an accidental 2^-64 match is the only false-alive case.
+    match crate::ptrace_emu::peek_guest_bytes(guest_pid, ptr + 8, 8) {
         Some(b) if b.len() == 8 => {
-            let vptr = u64::from_ne_bytes(b[0..8].try_into().unwrap());
-            if vptr != 0 {
-                true
-            } else {
+            let mbase = u64::from_ne_bytes(b[0..8].try_into().unwrap());
+            if mbase == 0 {
                 info!(
-                    "[KR64][binder][svc] 6-Z306ae-d: mirror skipped — object at cookie=0x{:x} not alive (vptr=0) pid={}",
-                    cookie, guest_pid
+                    "[KR64][binder][svc] 6-Z306ae-f: mirror skipped — weakref W=0x{:x} mBase=0 (freed chunk) cookie=0x{:x} pid={}",
+                    ptr, cookie, guest_pid
                 );
-                false
+                return false;
+            }
+            match crate::ptrace_emu::peek_guest_bytes(guest_pid, mbase + 8, 8) {
+                Some(rb) if rb.len() == 8 => {
+                    let refs_back = u64::from_ne_bytes(rb[0..8].try_into().unwrap());
+                    if refs_back == ptr {
+                        true
+                    } else {
+                        info!(
+                            "[KR64][binder][svc] 6-Z306ae-f: mirror skipped — round-trip broken: [R+8]=0x{:x} != W=0x{:x} (R=0x{:x}, cookie=0x{:x}) — object dead/chunk-reused pid={}",
+                            refs_back, ptr, mbase, cookie, guest_pid
+                        );
+                        false
+                    }
+                }
+                _ => {
+                    info!(
+                        "[KR64][binder][svc] 6-Z306ae-f: mirror skipped — mBase R=0x{:x} unreadable cookie=0x{:x} pid={}",
+                        mbase, cookie, guest_pid
+                    );
+                    false
+                }
             }
         }
         _ => {
             info!(
-                "[KR64][binder][svc] 6-Z306ae-d: mirror skipped — cookie=0x{:x} unreadable pid={}",
-                cookie, guest_pid
+                "[KR64][binder][svc] 6-Z306ae-f: mirror skipped — weakref W=0x{:x} unreadable cookie=0x{:x} pid={}",
+                ptr, cookie, guest_pid
             );
             false
         }
