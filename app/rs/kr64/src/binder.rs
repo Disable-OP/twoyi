@@ -1543,6 +1543,27 @@ impl ParcelWriter {
     /// the SG region — the HIDL buffer model for reply values
     /// (writeBuffer/writeEmbeddedBuffer emulation). Returns the object's
     /// offsets-array index for parent linkage.
+    /// `hidl_vec<hidl_string>` — the SG wire shape (6-Z305t-69):
+    /// [PTR vec struct 16B {ptr, count@+8}][PTR array child, len =
+    /// count×16] then count × [PTR chars_j, parent = THE ARRAY,
+    /// parent_offset = j*16] — the element ptr-structs live INSIDE the
+    /// array buffer (loader-fixed from the chars objects), one string
+    /// per element. Used for getServiceCallback.onValues' chain (6-Z307b).
+    fn write_hidl_vec_string(&mut self, items: &[String]) {
+        let count = items.len();
+        let mut vs = vec![0u8; 16];
+        vs[8..12].copy_from_slice(&(count as u32).to_ne_bytes());
+        let vec_idx = self.next_object_index();
+        self.write_ptr_object(vs, None, 0);
+        let arr_idx = self.next_object_index();
+        self.write_ptr_object(vec![0u8; count * 16], Some(vec_idx), 0);
+        for (j, s) in items.iter().enumerate() {
+            let mut ch = s.as_bytes().to_vec();
+            ch.push(0);
+            self.write_ptr_object(ch, Some(arr_idx), (j * 16) as u64);
+        }
+    }
+
     fn write_ptr_object(
         &mut self,
         content: Vec<u8>,
@@ -5325,31 +5346,116 @@ fn servicemanager_hidl(
                     return TransactionResult::Failed;
                 }
             };
-            let key = format!("{}/{}", fq, name);
-            let b = bus.lock().expect("binder bus poisoned");
-            match b.services.get(&key).map(|e| e.handle) {
-                Some(handle) => {
-                    let obj = FlatBinderObject {
-                        r#type: BINDER_TYPE_HANDLE,
-                        flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
-                        binder: handle as u64,
-                        cookie: 0,
-                    };
-                    writer.write_flat_binder(&obj);
-                    info!(
-                        "[KR64][binder][svc] HIDL get({}) hit → handle 0x{:08x}",
-                        key, handle
-                    );
-                }
+            // 6-Z307b: the client's SYNCHRONOUS callback object. Real HIDL
+            // semantics (IServiceManager.hal 1.0: `get(string fqName, string
+            // name) generates (IServiceManager_get_cb _hidl_cb)`):
+            // hidl-gen marshals the generated callback interface as a
+            // nested LOCAL binder object appended to the request, the
+            // method's own reply body is EMPTY, and the result rides
+            // `IServiceManager.getServiceCallback.onValues(vec<string>
+            // chain, IBase base)` — a ONEWAY transaction the service
+            // manager delivers to that object. The pre-6-Z307b arm
+            // replied with the handle flat and NEVER delivered the
+            // callback: the client's future never completed, `service`
+            // stayed null and HwBinder.getService surfaced
+            // NoSuchElementException (ladder #248: the registry HIT was
+            // logged but the watchdog STILL died — "getService: unable to
+            // call into hwbinder service for android.hidl.manager@1.0::
+            // IServiceManager/default").
+            let cb = match p.read_binder_arg() {
+                Some(f) => f,
                 None => {
-                    let obj = FlatBinderObject {
-                        r#type: BINDER_TYPE_BINDER,
-                        flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
-                        binder: 0,
-                        cookie: 0,
-                    };
-                    writer.write_flat_binder(&obj);
-                    info!("[KR64][binder][svc] HIDL get({}) miss → null binder", key);
+                    hidl_sm_parse_fail_diag("get.cb", code, blob);
+                    return TransactionResult::Failed;
+                }
+            };
+            let key = format!("{}/{}", fq, name);
+            let (hit_handle, requester_lives) = {
+                let b = bus.lock().expect("binder bus poisoned");
+                (
+                    b.services.get(&key).map(|e| e.handle),
+                    b.conns.contains_key(&conn_id) && conn_id != PROXY_CONN_ID,
+                )
+            };
+            match hit_handle {
+                Some(handle) => info!(
+                    "[KR64][binder][svc] HIDL get({}) hit → handle 0x{:08x} (onValues cb)",
+                    key, handle
+                ),
+                None => info!(
+                    "[KR64][binder][svc] HIDL get({}) miss → onValues(null)",
+                    key
+                ),
+            }
+            // Reply body: EMPTY (status prefix only — the result is
+            // callback-delivered, never in the method reply).
+            // Deliver the callback to the requester's OWN connection —
+            // the callback object is the client's local binder, so the
+            // BR_TRANSACTION's target ptr/cookie ARE the flat's values
+            // (the client's own BBinder identity, kernel-style). The
+            // client's binder POOL threads pick it up off the conn's
+            // mailbox while the requesting thread waits on the callback
+            // future — exactly the kernel's node-work-to-any-thread
+            // semantics. Proxy-conn callers (tests) skip the delivery.
+            if requester_lives {
+                let mut cw = ParcelWriter::new();
+                cw.write_status_ok();
+                match hit_handle {
+                    Some(handle) => {
+                        // chain = [fq] (the found service's interface),
+                        // base = the service's handle flat.
+                        cw.write_hidl_vec_string(std::slice::from_ref(&fq));
+                        cw.write_flat_binder(&FlatBinderObject {
+                            r#type: BINDER_TYPE_HANDLE,
+                            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                            binder: handle as u64,
+                            cookie: 0,
+                        });
+                    }
+                    None => {
+                        // chain = [], base = null binder (the real
+                        // hwservicemanager's miss shape — the client maps
+                        // it to the honest NAME_NOT_FOUND/NoSuchElement).
+                        cw.write_hidl_vec_string(&[]);
+                        cw.write_flat_binder(&FlatBinderObject {
+                            r#type: BINDER_TYPE_BINDER,
+                            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                            binder: 0,
+                            cookie: 0,
+                        });
+                    }
+                }
+                let (data, offsets) = cw.into_parts();
+                let cb_tx = IncomingTx {
+                    // The proxy itself is the sender (kernel semantics:
+                    // the service manager initiated this callback).
+                    requester: PROXY_CONN_ID,
+                    // getServiceCallback.onValues is ONEWAY.
+                    txn_id: 0,
+                    code: 1, // onValues = FIRST_CALL_TRANSACTION
+                    flags: TF_ONE_WAY,
+                    one_way: true,
+                    sender_pid: 0,
+                    sender_euid: 0,
+                    blob: Some(RequestBlob {
+                        data,
+                        offsets,
+                        sg: Vec::new(),
+                    }),
+                    ptr: cb.binder,
+                    cookie: cb.cookie,
+                };
+                let mut b = bus.lock().expect("binder bus poisoned");
+                if b.queue_transaction(cb_tx, conn_id) {
+                    info!(
+                        "[KR64][binder][svc] 6-Z307b: onValues({}) queued for conn={} (cb ptr=0x{:x} cookie=0x{:x})",
+                        key, conn_id, cb.binder, cb.cookie
+                    );
+                } else {
+                    warning!(
+                        "[KR64][binder][svc] 6-Z307b: onValues({}) callback dropped (conn={} mailbox full/gone)",
+                        key, conn_id
+                    );
                 }
             }
         }
@@ -10259,12 +10365,18 @@ mod tests {
         }
     }
 
-    /// 6-Z307: `HIDL_SM_GET` on the seeded instances must HIT — the
-    /// watchdog's exact failing lookup (`@1.0`, then a `debugDump()` on
-    /// the returned handle) now resolves end-to-end.
+    /// 6-Z307/6-Z307b: `HIDL_SM_GET` on the seeded instances must (a)
+    /// reply with an EMPTY body (the result rides the callback, never the
+    /// method reply) and (b) queue the `getServiceCallback.onValues(chain,
+    /// base)` one-way transaction on the requester's OWN connection with
+    /// the callback flat's ptr/cookie as the target identity and the
+    /// seeded instance's handle as the base. This is the watchdog's exact
+    /// failing round trip (ladder #248: the registry HIT was logged but
+    /// the callback never arrived → NoSuchElementException).
     #[test]
     fn z307_hidl_get_of_iservice_manager_instances_hits() {
         let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let conn = bus.lock().expect("bus").register_conn();
         for ver in ["1.0", "1.2"] {
             let req = hidl_sm_request(
                 "android.hidl.manager@1.0::IServiceManager",
@@ -10272,20 +10384,98 @@ mod tests {
                     let fq = format!("android.hidl.manager@{}::IServiceManager", ver);
                     b.string_arg(&fq);
                     b.string_arg("default");
+                    // The client's synchronous callback object (nested
+                    // local binder, appended to the request).
+                    b.push_flat(&FlatBinderObject {
+                        r#type: BINDER_TYPE_BINDER,
+                        flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                        binder: 0xABCD,
+                        cookie: 0xEF01,
+                    });
                 },
             );
-            let result = servicemanager_hidl(HIDL_SM_GET, &req, &bus, PROXY_CONN_ID);
+            let result = servicemanager_hidl(HIDL_SM_GET, &req, &bus, conn);
             let TransactionResult::Reply { data, offsets, .. } = result else {
                 panic!("get(@{}) must Reply", ver);
             };
-            // The first offsets entry must point at a BINDER_TYPE_HANDLE
-            // flat with a NONZERO handle (a hit, not the null binder).
-            let off = u64::from_ne_bytes(offsets[0..8].try_into().unwrap()) as usize;
-            let ty = u32::from_ne_bytes(data[off..off + 4].try_into().unwrap());
-            let handle = u64::from_ne_bytes(data[off + 8..off + 16].try_into().unwrap());
-            assert_eq!(ty, BINDER_TYPE_HANDLE, "@{} must hit a handle", ver);
-            assert_ne!(handle, 0, "@{} must carry a nonzero handle", ver);
+            // EMPTY reply body: status-ok only, no objects.
+            assert_eq!(
+                data.len(),
+                4,
+                "@{} reply must carry the status prefix only",
+                ver
+            );
+            assert!(offsets.is_empty(), "@{} reply must carry no objects", ver);
+            // The onValues callback must be queued on the requester's conn.
+            let b = bus.lock().expect("bus");
+            let box_ = b.conns.get(&conn).unwrap();
+            let item = box_
+                .inbox
+                .back()
+                .unwrap_or_else(|| panic!("@{} must queue onValues", ver));
+            let InboxItem::Tx(tx) = item else {
+                panic!("@{} inbox item must be a transaction", ver);
+            };
+            assert_eq!(tx.code, 1, "onValues = FIRST_CALL_TRANSACTION");
+            assert!(tx.one_way, "onValues is oneway");
+            assert_eq!(tx.ptr, 0xABCD, "target ptr = the callback object");
+            assert_eq!(tx.cookie, 0xEF01, "target cookie = the callback object");
+            let blob = tx.blob.as_ref().unwrap();
+            // status(4) + vec-struct PTR(40) + array PTR(40) + 1 chars
+            // PTR(40) + base flat(24) = 148.
+            assert_eq!(blob.data.len(), 148);
+            // The LAST object must be the base HANDLE flat with the
+            // seeded instance's nonzero handle.
+            let boff =
+                u64::from_ne_bytes(blob.offsets[blob.offsets.len() - 8..].try_into().unwrap())
+                    as usize;
+            let ty = u32::from_ne_bytes(blob.data[boff..boff + 4].try_into().unwrap());
+            let handle = u64::from_ne_bytes(blob.data[boff + 8..boff + 16].try_into().unwrap());
+            assert_eq!(ty, BINDER_TYPE_HANDLE, "@{} base must be a handle", ver);
+            assert_ne!(handle, 0, "@{} base handle must be nonzero", ver);
         }
+    }
+
+    /// 6-Z307b: a get() MISS delivers onValues with an EMPTY chain and a
+    /// null base — the honest NAME_NOT_FOUND shape (the client maps it to
+    /// NoSuchElementException; no hang, no fabricated service).
+    #[test]
+    fn z307b_hidl_get_miss_delivers_null_onvalues() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let conn = bus.lock().expect("bus").register_conn();
+        let req = hidl_sm_request(
+            "android.hidl.manager@1.0::IServiceManager",
+            &|b: &mut HidlReqBuilder| {
+                b.string_arg("android.hardware.does.not@1.0::IExist");
+                b.string_arg("default");
+                b.push_flat(&FlatBinderObject {
+                    r#type: BINDER_TYPE_BINDER,
+                    flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                    binder: 0x1234,
+                    cookie: 0x5678,
+                });
+            },
+        );
+        let result = servicemanager_hidl(HIDL_SM_GET, &req, &bus, conn);
+        let TransactionResult::Reply { data, offsets, .. } = result else {
+            panic!("get miss must still Reply (the result rides the callback)");
+        };
+        assert_eq!(data.len(), 4);
+        assert!(offsets.is_empty());
+        let b = bus.lock().expect("bus");
+        let box_ = b.conns.get(&conn).unwrap();
+        let InboxItem::Tx(tx) = box_.inbox.back().unwrap() else {
+            panic!("miss must queue onValues");
+        };
+        let blob = tx.blob.as_ref().unwrap();
+        // status(4) + vec PTR(40) + array PTR(40) + null flat(24) = 108.
+        assert_eq!(blob.data.len(), 108);
+        let boff =
+            u64::from_ne_bytes(blob.offsets[blob.offsets.len() - 8..].try_into().unwrap()) as usize;
+        let ty = u32::from_ne_bytes(blob.data[boff..boff + 4].try_into().unwrap());
+        let binder = u64::from_ne_bytes(blob.data[boff + 8..boff + 16].try_into().unwrap());
+        assert_eq!(ty, BINDER_TYPE_BINDER);
+        assert_eq!(binder, 0, "miss base = null binder");
     }
 
     /// 6-Z307: `debugDump` (code 7) answers the REAL vec<InstanceDebugInfo>
