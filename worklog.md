@@ -28444,3 +28444,23 @@ Stage Summary / #246 DECODE TREE:
 2. THE FIX (next leg): a real /proc or fs semantic, generic (recovery must stay GREEN).
 3. Expected outcome after the fix: dumpStackTraces COMPLETES → traces file written → the WAITED_HALF dump no longer kills → the watchdog either finds no overdue checker (system_server healthy) or finally prints its overdue banner with REAL evidence → system_server survives past +190s/+360s → RUNG 6 SURVIVAL → rung 8 (SystemUI/launcher) era begins.
 4. Side leads parked: pid 2909/2865-class self-SIGKILL zygote children (ring [ppoll×3, socket/connect/sendto, clone]); the unnamed clock_nanosleep thread (5348-class).
+
+---
+Task ID: 37 (webDevReview cron leg, continued — #246 decode + s2 hardening)
+Agent: Z.ai Code (main session, same leg)
+Task: Decode ladder #246; fix the s2 window expiry + arming; dispatch #247.
+
+Work Log:
+- #246 (2b4933b9, rn244) decoded: rung 7; recovery gate 4/4 GREEN (children #8220-#8223); kr64 CI GREEN.
+- gen-1 (4866) kill chain VIA THE s2 WINDOW: WAITED_HALF (+195.471s) → **2× NEW binder-proxy CONNECTs from the watchdog thread itself (fd=87/88 — the uncaught-exception handler's getService('activity')/handleApplicationCrash crash-report calls)** → "Sending signal. PID: 4866 SIG: 9" → SIGKILL (+195.521s). 49ms total. The binder calls in the death window confirm the KillApplicationHandler shape (crash report → finally → kill).
+- gen-2's "FATAL EXCEPTION: watchdog" line WAS captured (+356.216s, pid 6522) — but s2 could NOT arm: gen-1's window was still armed (its process died at remaining=3) and the is_none() gate blocked every later arm for the rest of the run. INSTRUMENT BUG.
+- Also: the bare-"Watchdog" marker armed the window 30s early on innocent "[SystemServerTiming] StartWatchdog" lines (+165.4s).
+- LANDED ce3b32b6: s2 window now (pid, remaining, armed_at) with a 5s expiry (capture site drains expired; arm site re-arms stale); arming restricted to "FATAL EXCEPTION" / "WATCHDOG KILLING" shapes.
+- Gates: fmt+clippy clean; 844/844; kr64 CI GREEN on ce3b32b6. Pushed ce3b32b6.
+- DISPATCHED on ce3b32b6: ladder #247 (rn245, boot_wait 420, expect_rung 7) + recovery pr-tier gate 4 children.
+
+Stage Summary / #247 DECODE TREE:
+1. PRIMARY: the s2 stack(N) lines behind "FATAL EXCEPTION: watchdog" (now cleanly armed+drained) — the Java frames name the exact call inside dumpStackTraces that throws on our guest (candidates: /proc/<pid>/ reader, traces-file path handling, File.createTempFile, FileObserver, Process.getPidsForCommands /proc reads, Debug.dumpNativeBacktraceToFile).
+2. FIX next leg = the named /proc-or-fs semantic, generic. Recovery MUST stay GREEN.
+3. After the fix: WAITED_HALF dump completes → traces written → no more exception kills → system_server survives the watchdog era → rung 8 (SystemUI) becomes the frontier.
+4. Parked leads: binder-connect identity during crash reporting (getService('activity') from system_server to ITSELF — works? returns?), 2909/2865-class self-kill zygote children, unnamed nanosleep thread.
