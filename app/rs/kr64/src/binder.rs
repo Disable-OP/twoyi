@@ -4227,7 +4227,7 @@ fn handle_transaction(
                     b.by_handle
                         .get(&target_handle)
                         .and_then(|n| n.split_once('/'))
-                        .map(|(fq, _)| {
+                        .map(|(_fq, _)| {
                             // The real hwservicemanager's ServiceManager
                             // object implements the WHOLE manager
                             // interface chain; every seeded version handle
@@ -10424,7 +10424,6 @@ mod tests {
         // The request: the interfaceChain call carries NO args — just the
         // IBase token (the wire shape from ladder #248: the probes were
         // token-only parcels).
-        let req = hidl_sm_request("android.hidl.base@1.0::IBase", &|_b| {});
         // Route through the DISPATCH-level arm: the seeded @1.0 handle's
         // transaction. servicemanager_hidl itself never sees 0xf43484e —
         // the dispatch intercepts it (vintf manager chain, then SM arms).
