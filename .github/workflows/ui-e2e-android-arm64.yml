@@ -492,6 +492,26 @@ jobs:
                tail -c 32768 \$f; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs-raw-top20.txt 2>&1 || true
+          # ── 6-Z306p complement: the loader shlib's own log ──────────
+          # The shlib execvp hook + the staged exec's init log to
+          # /data/local/tmp/twoyi-loader.log (guest view) =
+          # {rootfs}/data/local/tmp/twoyi-loader.log on the host side
+          # (vfs translate: /data/* → rootfs copy; the live tree is the
+          # profiles/default one per the #96 maps-dumps lesson). Ladder
+          # #231/#232: the zygote's fork+execvp(idmap2) caller's argv may
+          # be logged here by the shlib — this artifact makes it
+          # decodable. Bounded: head 32 KiB + tail 32 KiB per candidate.
+          timeout 30 sudo docker exec redroid sh -c \
+            "for f in /data/user/0/io.twoyi.debug/profiles/default/rootfs/data/local/tmp/twoyi-loader.log \
+                      /data/user/0/io.twoyi.debug/rootfs/data/local/tmp/twoyi-loader.log; do \
+               if [ -e \$f ]; then \
+                 echo \"== \$f (\$(stat -c%s \$f) bytes, mtime \$(stat -c%y \$f)) ==\"; \
+                 head -c 32768 \$f; \
+                 echo; echo '...[SNIP-MIDDLE]...'; echo; \
+                 tail -c 32768 \$f; \
+               else echo \"MISSING \$f\"; fi; \
+             done" \
+            > /tmp/ui-e2e-artifacts/twoyi-loader-log.txt 2>&1 || true
           # ── 6-Z305t-36: klog node FILE-IDENTITY forensics ──────────────
           # Ladder #93: the shlib's kmsg fd tests fire (write=37 writev=37
           # ×11 processes) yet the marker bytes never appear in the captured

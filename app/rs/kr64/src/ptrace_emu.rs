@@ -13723,6 +13723,19 @@ pub fn run_ptrace_loop(
         std::collections::HashSet::new();
     let mut z306_zygote_lineage: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // 6-Z306p: zygote fork-child execve argv dump budget (8/boot) — the
+    // idmap2-caller instrument (Task 25b decision tree item 1). Early-
+    // boot service execs are NOT zygote fork children, so they cannot
+    // exhaust the budget (the 6-Z272f-b lesson).
+    let mut z306p_budget: u32 = 0;
+    // 6-Z306s mislabel fix: direct zygote fork children that execve'd a
+    // NEW image (pid -> pre-rewrite guest exec target). The 6-Z306s
+    // exit-tail dump must label these "zygote-child-exec:<target>",
+    // never "system_server" — ladder #231/#232 proved the 16 idmap2
+    // children were mislabelled (the classifier assumed zygote fork
+    // child == system_server).
+    let mut z306s_execed: std::collections::HashMap<libc::pid_t, String> =
+        std::collections::HashMap::new();
     // 6-Z306t: pids whose nonzero-exit svclog tail was already dumped
     // (1 dump/pid — threads sharing a tgid or re-entry paths must not
     // re-dump the same file).
@@ -15937,6 +15950,11 @@ pub fn run_ptrace_loop(
             z306ano_named.remove(&pid);
             z306ano_seen.remove(&pid);
             z306anr_named.remove(&pid);
+            // 6-Z306s: the exec-target label dies with the process — a
+            // pid-RECYCLED successor must not be mislabelled as a
+            // zygote-child-exec (inline form, per the binder_fds
+            // precedent above).
+            z306s_execed.remove(&pid);
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
             // dead pid + the prop_area_maps entries — see
@@ -16186,6 +16204,9 @@ pub fn run_ptrace_loop(
             z306ano_named.remove(&pid);
             z306ano_seen.remove(&pid);
             z306anr_named.remove(&pid);
+            // 6-Z306s: the exec-target label dies with the process
+            // (WIFSIGNALED mirror of the WIFEXITED cleanup above).
+            z306s_execed.remove(&pid);
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
             // above).
@@ -19029,6 +19050,70 @@ pub fn run_ptrace_loop(
                                     pid, exec_path
                                 ));
                             }
+
+                            // ── 6-Z306p: zygote fork-child execve argv dump ──
+                            //
+                            // Ladder #231/#232: EVERY zygote era forks
+                            // exactly ONE child that execvp's a bare
+                            // "idmap2" ~1s after the zygote exec
+                            // (preloaded-classes still open ⇒ during
+                            // preloadClasses) and NEVER proceeds to
+                            // forkSystemServer; the zygote then poll-loops
+                            // forever. The caller's command line is the
+                            // single decisive input for the hunt: a
+                            // framework Runtime.exec/ProcessBuilder
+                            // invocation, a shell `exec idmap2`, or our own
+                            // machinery all name differently.
+                            //
+                            // Gate: pid ∈ z306_zygote_fork_children (direct
+                            // process-fork child of the pinned zygote — the
+                            // #231/#232 idmap2 shape). Budget 8/boot. Reads
+                            // argv[0..3] via the child-memory helpers
+                            // (ABI-aware stride: 4B on execve==11, 8B
+                            // otherwise), each string truncated to 96
+                            // chars. Runs BEFORE the 6-Z101 rewrite, so the
+                            // target is the pre-rewrite GUEST spelling.
+                            if z306_zygote_fork_children.contains(&pid) && z306p_budget < 8 {
+                                z306p_budget += 1;
+                                let argv_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                let stride: u64 = if abi.execve == 11 { 4 } else { 8 };
+                                let mut argv_parts: Vec<String> = Vec::new();
+                                if argv_addr != 0 {
+                                    for idx in 0..4u64 {
+                                        let entry = match read_child_u64(
+                                            pid,
+                                            argv_addr.wrapping_add(idx * stride),
+                                        ) {
+                                            Some(w) if stride == 4 => w & 0xFFFF_FFFF,
+                                            Some(w) => w,
+                                            None => {
+                                                argv_parts.push("<unreadable>".to_string());
+                                                break;
+                                            }
+                                        };
+                                        if entry == 0 {
+                                            break;
+                                        }
+                                        argv_parts.push(
+                                            read_child_string(pid, entry)
+                                                .map(|s| s.chars().take(96).collect::<String>())
+                                                .unwrap_or_else(|| "<unreadable>".to_string()),
+                                        );
+                                    }
+                                }
+                                // z306s_execed bookkeeping is UNCONDITIONAL
+                                // (correctness for the exit-label, not a
+                                // diagnostic — bounded by the per-boot zygote
+                                // fork-child count).
+                                z306s_execed.insert(pid, exec_path.clone());
+                                log(&format!(
+                                    "6-Z306p: zygote fork-child {} execve target={} argv=[{}] (budget {}/8)",
+                                    pid,
+                                    exec_path,
+                                    argv_parts.join("]["),
+                                    z306p_budget
+                                ));
+                            }
                         }
 
                         // ── 6-Z101 + 6-Z102: staged-exe execve ENTRY rewrite ──
@@ -21788,12 +21873,36 @@ pub fn run_ptrace_loop(
                                 // system_server; the dump cap is 2).
                                 let is_ss306s = z306_zygote_fork_children.contains(&pid);
                                 if is_ss306s {
+                                    // 6-Z306s mislabel fix (#231/#232): a
+                                    // direct zygote fork child that execve'd
+                                    // a NEW image (z306s_execed) is NOT
+                                    // system_server — label it
+                                    // "zygote-child-exec:<target>" and give
+                                    // it its own 2/boot dump budget so the
+                                    // healthy exit-0 idmap2 exits can never
+                                    // crowd out the 4/boot real
+                                    // system_server evidence.
+                                    let z306s_execed_target = z306s_execed.get(&pid).cloned();
                                     static SS_EXIT_DUMPED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
-                                    if SS_EXIT_DUMPED
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                        < 4
-                                    {
+                                    static ZEXEC_EXIT_DUMPED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let ss_label: String;
+                                    let ss_budgeted = match &z306s_execed_target {
+                                        Some(t) => {
+                                            ss_label = format!("zygote-child-exec:{}", t);
+                                            ZEXEC_EXIT_DUMPED
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                                < 2
+                                        }
+                                        None => {
+                                            ss_label = "system_server".to_string();
+                                            SS_EXIT_DUMPED
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                                < 4
+                                        }
+                                    };
+                                    if ss_budgeted {
                                         // 6-Z306y: the child's OWN last-32
                                         // syscall trail — the #191 decode
                                         // showed a silent graceful teardown
@@ -21846,7 +21955,8 @@ pub fn run_ptrace_loop(
                                                     .replace('\n', " | ");
                                                 let shown = text.get(..1400).unwrap_or(&text);
                                                 log(&format!(
-                                                    "6-Z306s: system_server pid={} exit_group svclog tail ({} of {} bytes): {}",
+                                                    "6-Z306s: {} pid={} exit_group svclog tail ({} of {} bytes): {}",
+                                                    ss_label,
                                                     pid,
                                                     tail.len(),
                                                     len,
@@ -21855,8 +21965,11 @@ pub fn run_ptrace_loop(
                                             }
                                             Err(e) => {
                                                 log(&format!(
-                                                    "6-Z306s: system_server pid={} exit_group — svclog {} unreadable: {}",
-                                                    pid, svc_path, e
+                                                    "6-Z306s: {} pid={} exit_group — svclog {} unreadable: {}",
+                                                    ss_label,
+                                                    pid,
+                                                    svc_path,
+                                                    e
                                                 ));
                                             }
                                         }
