@@ -28075,3 +28075,23 @@ Stage Summary / NEXT-SESSION DECISION TREE:
 3. **6-Z306s mislabel**: a zygote-lineage fork that execve's a NEW image (PTRACE_EVENT_EXEC) should not be labelled "system_server" — retag to "zygote-child-exec:<target>" or gate on the forkSystemServer signature (bionic fork + NO exec). Small, prevents misleading decodes.
 4. Secondary: the vendor-HAL SIGSEGV carnage + zombie fleet continues (the +215 s era, 't'/'Z' rows in the final ps) — parked as the post-boot cleanup class; the fleet survives it (guest core + zygote alive at end).
 5. Known-good: TWRP gates GREEN on the 6-Z306an-o/-r era AND the -o-intervention era (pending #232's gate); 841/841; CI GREEN on both pushes.
+
+---
+Task ID: 25b (continuation — #232 decode)
+Agent: Z.ai Code (webDevReview cron leg, continued)
+Task: Decode #232 (39cb50c, runs 34659452142/34659456524); record; hand off.
+
+Work Log:
+- TWRP gate on 39cb50c (34659456524): **GREEN**. kr64 CI: GREEN (both pushes).
+- #232 (34659452142): completed SUCCESS, rung 7 — same wall, but the instruments delivered:
+  1. **-o INTERVENTION FIRED LIVE**: pid 3580 parked ≥30 s in op=NONE → evidence line + forced PTRACE_SYSCALL (1/4). Autopsy: 3580 = a ZYGOTE64 instance (PR_SET_NAME zygote64 +46.5 s); its consumed-and-forgotten stop was **status 0x0004057f = SIGTRAP + PTRACE_EVENT_FORK(4)** — the forgotten-event class is BROADER than exit-events: fork-event stops land in the same consume-without-resume hole. Post-resume: 3580 proceeded (forked its idmap2 child at +47.5 s; no further park lines). The intervention's subclass coverage (event-stops AND group-stops) is validated by a second data point.
+  2. -r census: 16 lines again (same blocked-in-kernel/dying split, zero stale-bookkeeping).
+  3. **THE IDMAP2 WALL IS UNIVERSAL AND NOW COUNTED**: 14 zygote eras (31 init SIGKILLs of zygote again), and **16 fork+execvp("/system/bin/idmap2")+exit(0) children** — one per zygote era (±1), each fork ~1 s after the zygote's exec, execvp PATH-searches /system/bin + /system/xbin (bare-name execvp), staged-copy rewrite VERIFIED each time, child exits 0 after ~170 ms of pread64-heavy work. Parents rotate (3580 → 3890; 4481 → 4761; 4784 → 5094 — all zygote instances of successive eras). **forkSystemServer NEVER happens; the zygote enters its poll loop directly.**
+- FRAMEWORK RULE-OUTS (AOSP 11 sources fetched and read this leg): ZygoteInit.handleSystemServerProcess's ONLY exec is the parsedArgs.mInvokeWith wrapper (WrapperInit.execApplication) — needs a `wrap.system_server` property (property area: NO wrap keys); performSystemServerDexOpt goes through installd BINDER (no fork/exec in ZygoteInit); the vendored init.zygote64.rc DOES carry --start-system-server; the loader shlib hooks execvp but spawns nothing. The fork-gate audits show preloaded-classes still open at the fork ⇒ the fork is BEFORE/during preloadClasses' close — earlier than forkSystemServer's normal slot.
+- DISK LESSON: the sandbox filled (artifacts + toolchain ≈ 9.9 G rootfs); old artifact extractions art204..231 deleted after decoding (worklogs retain all findings); keep ≤2 artifact sets on disk going forward.
+
+Stage Summary / NEXT-SESSION DECISION TREE:
+1. **6-Z306p (the mandated instrument): at an execve ENTRY, dump argv[0..3]** — aarch64 x1 = argv; walk ≤4 pointers via read_child_u64, read ≤96 bytes each (bounded, ≤8/boot). A single #233 run will NAME the idmap2 caller's command line (Java Runtime.exec/ProcessBuilder path, a shell `exec idmap2`, or something else entirely) and with it the reason forkSystemServer never fires. Complement: add /data/local/tmp/twoyi-loader.log to the artifact bundle (the shlib's execvp hook logs the path — and the staged exec's own init logs its argv).
+2. **6-Z306s mislabel fix** (still open, small): a zygote-lineage fork that execve's a new image must not be tagged "system_server".
+3. #233 decode tree: (i) argv names a framework/overlay component ⇒ chase why it runs pre-forkSystemServer and whether its failure (or its exit-0 sync wait) breaks the main() flow — e.g. the zygote's main thread BLOCKING in wait4 somewhere it should not, or an exception path swallowing forkSystemServer; (ii) argv names OUR machinery ⇒ fix ours; (iii) argv = idmap2 with service/scan args ⇒ replicate the call in a standalone guest test to see if idmap2 itself deadlocks/aborts the caller.
+4. Known-good: TWRP gates GREEN across 6-Z306an-o/-r AND the armed -o intervention; 841/841; CI GREEN; the forgotten-event resume is LIVE and correct on two subclasses (exit-event #231, fork-event #232).
