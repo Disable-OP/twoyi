@@ -28217,3 +28217,21 @@ Stage Summary / #237 DECODE TREE:
 3. THE ZOMBIE-SERVICE QUESTION (new decode): the round-trip converts dead-object deliveries into DEAD_OBJECT — system_server will now SURVIVE them, but the service behind them is still lost (registered-then-died). If AMS progress stalls on a missing service, the next fix is the LIFETIME one: make the HIDL-tail mirror IN-TRANSACTION (kill the arm-B queue race for HIDL adds) so the incStrong lands before registerAsService's temporary sp<> dies — Task-21-era evidence said the in-transaction design is the proven-safe one.
 4. Recovery gate MUST stay GREEN (the anchor is stricter — verify no false-dead skips on live recovery objects: watch for 6-Z306ae-f skip lines in the recovery artifacts; a green gate with zero skips = perfect).
 5. Watch the 6-Z306ae-f skip census: skips on LIVE objects would show as service failures without crashes (a too-strict anchor); skips on DEAD objects = the fix working as designed.
+
+---
+Task ID: 31b (webDevReview cron leg, continued)
+Agent: Z.ai Code (main session, same leg)
+Task: Decode ladder #237; land the chimera fix (6-Z306d-b); dispatch #238.
+
+Work Log:
+- #237 (f844224, run_number 235) decoded: rung 7, empty post-mortem; **recovery pr-tier gate 4/4 GREEN** (#8084-#8087) — the round-trip anchor does not regress recovery; kr64 CI #1720 GREEN.
+- 6-Z306ae-f validated LIVE: 105 honest skips (round-trip broken, [R+8]=0x0 — freed-not-reused chunks, exactly the anchor design). SIGSEGVs 456 (vs 616), si_addr=0x4 341 (vs 431). 3 zygote eras, cascade still dead. TWO system_server births (5579 +167.5s, 7531 +301s) — 5579 exited CLEANLY (code 0) +2.3s after birth (a NEW death mode — startup-path exit, not a signal; queued for decode), the fleet still crash-looping.
+- **THE CHIMERA HOLE (#237's decisive decode, pid 3411)**: the mirror BR_ACQUIRE for (W=0xe96d434063a0, B=0xe96dd340b418) PASSED the round-trip — W's chunk had been FREED AND REUSED as a NEW weakref_impl (W.mBase=R=0xe96da340c0e8, [R+8]==W: a perfectly consistent, but FOREIGN weakref pair) — while the registered cookie B belonged to a different, dead allocation. The guest incStrong'd B; its reused-chunk vptr sent the vbase adjust to B+0xE0; mRefs=NULL there → si_addr=0x4. Leg 1 (round-trip) validates W's consistency but NOT the W↔B association. The 6-Z306u captures confirmed the now-MORE-VARIED crash shapes (some live-looking objects faulting at the weakref deref, one garbage-pointer class — the surviving chimera/stale-registration population).
+- **LANDED 7115bbf — 6-Z306d-b, the ASSOCIATION leg**: alive(W,B) ⟺ leg 1 (round-trip: R=[W+8], [R+8]==W) AND leg 2 (B's object chunk CONTAINS the value W: [R+8]==W with R=B+Δ, Δ>0 observed 0x20..0x88, sits inside [B..B+640)). The 640-byte cookie-chunk peek + qword scan is ABI-independent, Δ-agnostic, needs no vtable parsing (the vbase-offset slot is per-class — not usable). Applied: driver mirror_ref_ok (all call sites; association-broken = 6-Z306d-b diag) + the shlib 6-Z306z gates (bp_binder_object_alive(W,B) both legs in-process). Gates: C clean, fmt/clippy clean, 841/841, CI #1722 in flight.
+- DISPATCHED ladder #238 on 7115bbf (boot_wait 420).
+
+Stage Summary / #238 DECODE TREE:
+1. EXPECT: si_addr=0x4 fleet near-zero (chimera mirrors/transactions now neutralized — the stale-registration population is the LAST known source of the incStrong-on-dead shape); if a residual fleet remains, the 6-Z306u captures name its new shape (the garbage-pointer class at pid 3116 x0=0x5d1dffde388e is a candidate — that one is NOT a (W,B) delivery shape and may be a separate bug).
+2. system_server deaths: 5579's clean exit(0) +2.3s is the next wall candidate — decode via the zygote svclog (SystemServer's own stderr — what exception/exit path) and the era's last transactions. If SystemServer's runtime exits BECAUSE a core service got DEAD_OBJECT (our honest-failure conversion), the fix is the LIFETIME one (Task-31 tree item 3: in-transaction mirror for HIDL tails) — the services must stop dying in the first place.
+3. Watch 6-Z306d-b skip volume: a high skip count on LIVE registrations would mean the 640B window misses some layouts (Δ>0x270?) — widen to 1024. Zero skips + zero crashes + system_server surviving = the anchor is complete.
+4. Recovery gate must stay GREEN on 7115bbf.
