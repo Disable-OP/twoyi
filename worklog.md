@@ -28162,3 +28162,18 @@ Stage Summary / #235 DECODE TREE:
 2. **6-Z306v lines for the zygote eras**: "running-in-userspace" ⇒ ART SuspendAll spin/park (the 6-Z271f op=137 bionic-mutex wedge family) — instrument the GC threads' mutex state; "blocked-in-kernel + wchan=futex_wait*" ⇒ a real futex wait — name the lock owner via the per-TID rings; "state=T (stopped)" ⇒ a group-stop loss — the -o intervention budget may now be reachable BEFORE the cascade kills the era (the cascade root dies first per item 1, extending the era lifespan).
 3. **CASCADING EXPECTATION**: with the gralloc SIGSEGV fixed, the era lifespan extends from ~20s to unlimited ⇒ the zygote completes forkSystemServer ⇒ system_server forks (the rung-6 ladder line finally moves) ⇒ the #221-era system_server walls (AMS wedge / scudo) become the frontier again.
 4. TWRP gate must stay GREEN.
+
+---
+Task ID: 29 (webDevReview cron leg)
+Agent: Z.ai Code (main session)
+Task: #235 partial decode; close the leg with the precise fix plan.
+
+Work Log:
+- #235 (7babbae) decoded: rung 7; TWRP gate GREEN (34665788421); the gralloc→SF→zygote cascade still active (17 zygote SIGKILLs); the ENTIRE vendor-HAL fleet (1337 SIGSEGV deliveries) shares the IDENTICAL signature: si_addr=0x4, pc low bits ...5918 = RefBase::incStrong+0x8 (ASLR only moves the base) — incStrong-on-dead-object is the FLEET's uniform death, not gralloc-specific.
+- **6-Z306u needs re-gating**: the 8/boot budget was consumed at +3.7s by four early-boot crash pids (2767-2888, valid-vptr memories — a different crash class); ZERO captures reached the gralloc fleet. Fix: per-pid 1 + boot cap 32.
+- **6-Z306v tag collision**: the codebase already has a "6-Z306v" renameat-translate arm — MY discriminator lines collided (only "6-Z306v: pin pid=..." is mine). Fired ONCE all run (pin 5726, state=gone — the era was already dead at the probe). Open question: the 15s-period 6-Z305t-18 SIGSTOP probe refreshes last_stop_at[pin] every 15s, capping observable silence at ~15s, and the 30s cooldown permits only ONE firing per era — but 17 eras ⇒ 17 expected firings vs 1 seen ⇒ the stall_tick%256 pass cadence + the probe interplay needs a look. Next leg: retag mine to 6-Z306w, drop the threshold to 3s, exempt the probe-refreshed windows (or key the silence on the MAIN THREAD's own last syscall), and re-check.
+- LEG CLOSE-OUT (no run dispatched; #235 was the last decode of the leg): the fix plan is fully specified — (1) 6-Z306u per-pid re-gate; (2) 6-Z306v→6-Z306w retag + threshold/cooldown fix; (3) THE PRODUCTION FIX: the shlib hwbinder proxy wire gets the liveness-gate semantics (in-process check before serving any (ptr,cookie) binder object: vptr≠0 && mRefs≠0 — the same contract as the kr64 driver's mirror_ref_ok) for BOTH the mirror BR_ACQUIRE and the serve-LOCAL flat paths (the #234 evidence pins the death inside libhidlbase's client receive → the proxy's delivered object was zeroed).
+- Known-good: TWRP gates GREEN across 6-Z306p/q/u/v era; 841/841; CI GREEN on every push (412dd2e/7babbae/3b855ba); de-flood (6-Z306t-deflood) verified live and decisive.
+
+Stage Summary:
+- The mission's boot wall is now a TWO-PART fix: the shlib hwbinder proxy liveness gate (kills the fleet SIGSEGVs → ends the gralloc→SF→zygote cascade → eras survive) + the zygote pre-fork silence decode (6-Z306w). Next session: land (1)+(2)+(3), dispatch #236, expect the era lifespan to extend and rung 6 (SYSTEM_SERVER) to finally move.
