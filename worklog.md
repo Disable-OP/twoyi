@@ -28395,3 +28395,26 @@ Stage Summary / #244 DECODE TREE:
 3. Expect: STALL-TARGET fires at the FIRST main stall (~+198s equivalent) — no need to wait for the kill. If main's wall is the pipe, system_server STILL dies at the watchdog (~+209s) this run; the FIX lands next leg.
 4. Watch gen-2's SIGSEGV class once gen-1's wall falls (crash_dump64 + tombstones; NULL deref at 0x0).
 5. Recovery gate MUST stay GREEN (instruments only, delivery paths untouched).
+
+---
+Task ID: 37 (webDevReview cron leg, continued — #244 decode)
+Agent: Z.ai Code (main session, same leg)
+Task: Decode ladder #244; land the watchdog-fork + anr-trace instruments; dispatch #245.
+
+Work Log:
+- #244 (b05795f6, rn242) decoded: rung 7 again; recovery gate 4/4 GREEN (children #8212-#8215); kr64 CI GREEN rn1735/1736.
+- **6-Z306af-q's FIRST catch cleared a suspect**: pipe:[277334] (fd 5 O_RDONLY + fd 6 O_WRONLY, both O_CLOEXEC) is held ONLY by system_server, reader = tid 5263 comm perfetto_hprof_ — that is ART's OWN heap-dump request self-pipe, parked BY DESIGN on real hardware. NOT the wall.
+- main was NOT pipe-blocked this run: at the +200.1s watchdog kill main = futex_do_wait, perfetto = normal park, all handler threads idle. #243 read(fd=80) vs #244 futex_do_wait — two park shapes, same kill cadence (~60s after watchdog start). Gen-3 (7260) died identically at +365.6s — deterministic per generation.
+- **Clock-jump theory tested and KILLED**: kr64 never intercepts clock_gettime (native pass-through) — guest time IS host time; the watchdog measures real seconds honestly.
+- **A11 Watchdog.java ground truth** (fetched android-11.0.0_r1): mMonitorChecker is bound to `new Handler()` = system_server's MAIN looper — the Monitors (AMS.monitor() etc.) RUN ON MAIN. Main not running messages ⇒ the monitor checker never completes ⇒ kill with every other thread idle. Matches both runs exactly. ALSO: both the WAITED_HALF and the overdue paths call dumpStackTraces BEFORE the kill; its first act is File.createTempFile under /data/anr — /data/anr stayed EMPTY in both runs.
+- **THE FORK** (decides the next fix): (a) the dump's opens FAIL inside twoyi's fs (exception → tracesFileException, swallowed — the watchdog keeps its silence) or (b) the kill rode the OpenFdMonitor path ("Open FD high water mark reached"). #242's "OpenFdMonitor never tripped" inference rested on the same empty /data/anr — circular. New evidence closes it.
+- Side catch: pid 2909 comm=main (a zygote child) self-SIGKILLed at +201.6s, ring [ppoll ×3, socket/connect/sendto, clone...] — separate class, later leg.
+- LANDED e23b2bee: **6-Z306ao-fd** (victim's open-fd count + Max-open-files soft limit at every sig=9 census — decides the fork bit-exact); **6-Z306af-t** (every open/openat with /data/anr in the guest or translated path logged at ENTRY with flags shape + EXIT with fd/-errno — 12/16 per run); **6-Z306af-q tuning** (pipe stalls always resolve target+peers; other targets only after 15s parked — the flat 24 budget burned out on eventpoll noise in #244).
+- Gates: fmt+clippy clean; 844/844; kr64 CI GREEN (rn1737 on e23b2bee). Pushed e23b2bee.
+- DISPATCHED on e23b2bee: ladder #245 (rn243, boot_wait 420, expect_rung 7) + recovery pr-tier gate 4 children.
+
+Stage Summary / #245 DECODE TREE:
+1. PRIMARY: **6-Z306ao-fd** — if victim open_fds ≈ 96% of soft limit → OpenFdMonitor path → the wall is an FD LEAK in system_server under twoyi (hunt the leak generically next). If fds are low → overdue path confirmed.
+2. PRIMARY: **6-Z306af-t anr-open ENTRY/EXIT** — if the dump's createTempFile open appears and FAILS with errno E → fix that fs semantic (generic; the watchdog's silence ends). If it appears and SUCCEEDS → the traces file EXISTS mid-run → extend the anr-dropbox harness capture to read its content (the Java stacks name main's park exactly).
+3. If NO anr opens at all + fds low → the monitor checker never even POSTED/scheduled — instrument postAtFrontOfQueue's wake path next.
+4. Recovery gate MUST stay GREEN.
