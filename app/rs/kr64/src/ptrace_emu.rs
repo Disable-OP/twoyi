@@ -10027,6 +10027,56 @@ fn proc_state_char(pid: libc::pid_t) -> Option<char> {
     rest.split_whitespace().next()?.chars().next()
 }
 
+/// 6-Z306ao: compact thread census of a process — per thread (cap 48):
+/// `tid(comm)state@wchan`. At a SIGKILL ENTRY stop the victim's threads
+/// are still alive, so this names the blocked monitor a watchdog is
+/// about to kill the process for (the #240 gen-2 wall: system_server's
+/// OWN "watchdog" thread 7311 SIGKILLed system_server 7256 after ~34s
+/// and the blocked monitor was never named). Also used at the
+/// group-death reap (6-Z306ao-c) where it degrades gracefully (a dying
+/// task dir shrinks as threads exit).
+fn z306ao_thread_census(pid: libc::pid_t) -> String {
+    let task_dir = format!("/proc/{}/task", pid);
+    let mut out = String::new();
+    let mut n = 0u32;
+    if let Ok(rd) = std::fs::read_dir(&task_dir) {
+        for e in rd.flatten() {
+            if n >= 48 {
+                out.push_str(" ...(+more)");
+                break;
+            }
+            let tid: libc::pid_t = e.file_name().to_string_lossy().parse().unwrap_or(0);
+            if tid == 0 {
+                continue;
+            }
+            let comm = std::fs::read_to_string(format!("/proc/{}/task/{}/comm", pid, tid))
+                .map(|c| c.trim_end().to_string())
+                .unwrap_or_else(|_| "?".into());
+            let stat = std::fs::read_to_string(format!("/proc/{}/task/{}/stat", pid, tid))
+                .unwrap_or_default();
+            let state = stat
+                .rfind(')')
+                .and_then(|p| stat.get(p + 2..))
+                .and_then(|rest| {
+                    rest.split_whitespace()
+                        .next()
+                        .and_then(|s| s.chars().next())
+                })
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into());
+            let wchan = std::fs::read_to_string(format!("/proc/{}/task/{}/wchan", pid, tid))
+                .map(|w| w.trim_end().to_string())
+                .unwrap_or_else(|_| "?".into());
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("{}({}){}@{}", tid, comm, state, wchan));
+            n += 1;
+        }
+    }
+    out
+}
+
 // 6-Z305t-17: PTRACE_INTERRUPT was REMOVED — it is PTRACE_SEIZE-only and
 // returned ESRCH on every ATTACH-attached twoyi tracee (ladder #74, 84/84
 // probes ESRCH). The stall probe now uses SIGSTOP (see stall_interrupt_probe).
@@ -16335,6 +16385,59 @@ pub fn run_ptrace_loop(
                 "child {} killed by signal {} (after {} iterations)",
                 pid, sig, loop_count
             ));
+            // 6-Z306ao-c: the GROUP-DEATH class (#224, #240 gen-1: system_
+            // server 5364 SIGSEGV at +175.2s with NO delivery stop and NO
+            // EVENT_EXIT — the waitpid reap is the tracer's ONLY witness,
+            // so the EXIT-event death-site capture never ran and the crash
+            // site stays unnamed). Dump what survives the death here: the
+            // per-TID syscall rings (6-Z306af-h) of the dying TGID's
+            // threads (TGIDs resolved by the 6-Z306af-d cache — a thread
+            // the instruments never classified is invisible to this dump,
+            // which is itself evidence of coverage gaps). 8 per run.
+            if sig == libc::SIGSEGV
+                || sig == libc::SIGABRT
+                || sig == libc::SIGBUS
+                || sig == libc::SIGILL
+            {
+                let reap_is_lineage =
+                    z306_in_zygote_lineage(pid, &z306_zygote_lineage, &mut z306_lineage_tgid_cache);
+                if reap_is_lineage {
+                    static Z306AO_REAP: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    if Z306AO_REAP.load(std::sync::atomic::Ordering::Relaxed) < 8
+                        && !z306af_delivery_dumped.contains(&pid)
+                    {
+                        Z306AO_REAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut parts: Vec<String> = Vec::new();
+                        for (tid, ring) in z306af_tid_trail.iter() {
+                            let tgid = z306_lineage_tgid_cache.get(tid).copied().unwrap_or(0);
+                            if tgid == pid && !ring.is_empty() {
+                                parts.push(format!(
+                                    "tid={} [{}]",
+                                    tid,
+                                    ring.iter()
+                                        .map(|n| n.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                ));
+                            }
+                        }
+                        if parts.is_empty() {
+                            log(&format!(
+                                "6-Z306ao-c: group-death reap pid={} sig={} — NO delivery stop, NO EVENT_EXIT, and NO tid rings recorded for this TGID (coverage gap)",
+                                pid, sig
+                            ));
+                        } else {
+                            log(&format!(
+                                "6-Z306ao-c: group-death reap pid={} sig={} (no delivery stop / no EVENT_EXIT) — tid-ring tails: {}",
+                                pid,
+                                sig,
+                                parts.join(" | ")
+                            ));
+                        }
+                    }
+                }
+            }
             // Task 6-Z75 hygiene: same as the WIFEXITED branch above —
             // drop the killed child's cached ABI entry.
             abi_map.remove(&pid);
@@ -22703,6 +22806,37 @@ pub fn run_ptrace_loop(
                                         j_sig
                                     ));
                                 }
+                                // 6-Z306ao: SIGKILL against a lineage TGID —
+                                // dump the victim's THREAD CENSUS at the
+                                // kill ENTRY. #240 gen-2: the guest's OWN
+                                // "watchdog" thread (7311) SIGKILLed
+                                // system_server (7256) at +340.6s after
+                                // ~34s (a monitor thread missed its
+                                // check-in) — the blocked monitor was never
+                                // named because the watchdog's report rides
+                                // the guest logd, not stderr/kmsg. The
+                                // threads are still alive at the kill ENTRY:
+                                // their {comm,state,wchan} IS the watchdog's
+                                // evidence. 8 per run.
+                                if j_sig == libc::SIGKILL {
+                                    static Z306AO_CENSUS: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z306AO_CENSUS.load(std::sync::atomic::Ordering::Relaxed) < 8
+                                    {
+                                        Z306AO_CENSUS
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        let census = z306ao_thread_census(j_target);
+                                        log(&format!(
+                                            "6-Z306ao: sig=9 → lineage target={} issuer pid={} comm={:?} — threads alive at kill: {}",
+                                            j_target,
+                                            pid,
+                                            std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                                .unwrap_or_default()
+                                                .trim_end(),
+                                            census
+                                        ));
+                                    }
+                                }
                                 // 6-Z306af-m: the sig=33 raiser context
                                 // (Task-31c queue item 2). #238: the ONLY
                                 // sig=33 traffic in the whole run was the
@@ -24409,6 +24543,33 @@ pub fn run_ptrace_loop(
                                                             "6-Z305t-56: cgroup.procs materialized {} (group root {}) with {} real member pids: {:?}",
                                                             translated, group_pid, members.len(), members
                                                         ));
+                                                    }
+                                                    // 6-Z306ao-b: uid_1000 groups get a
+                                                    // DEDICATED budget — the shared
+                                                    // 24-cap is exhausted by the
+                                                    // early-boot service churn, and
+                                                    // the #240 gen-2 wall (system_
+                                                    // server swept by a uid-1000
+                                                    // killProcessGroup storm: "Failed
+                                                    // to kill process cgroup uid 1000
+                                                    // pid 7575/7576") lives exactly
+                                                    // there. 32 lines name every
+                                                    // uid-1000 member set served.
+                                                    if translated.contains("uid_1000") {
+                                                        static CGROUP_PROCS_UID1000_LOG:
+                                                            std::sync::atomic::AtomicU64 =
+                                                            std::sync::atomic::AtomicU64::new(0);
+                                                        let un = CGROUP_PROCS_UID1000_LOG
+                                                            .fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                        if un < 32 {
+                                                            log(&format!(
+                                                                "6-Z306ao-b: uid_1000 cgroup.procs {} (group root {}) members: {:?}",
+                                                                translated, group_pid, members
+                                                            ));
+                                                        }
                                                     }
                                                 }
                                                 Err(e) => {
