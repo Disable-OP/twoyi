@@ -28538,3 +28538,31 @@ Stage Summary / #250 DECODE TREE:
 4. Wall B: the 6-Z307p property-wire census runs every pass — a START without DONE still names the stall.
 5. Recovery gate 4/4 GREEN mandatory (the reply-shape change is shared wire).
 6. If the watchdog STILL dies: the kmsg banner names the next divergence — read the frames, do not guess.
+
+---
+Task ID: 41 (webDevReview cron leg, same sandbox)
+Agent: Z.ai Code (main session)
+Task: Decode #250 (rn250) + land the corrected 6-Z307d; decode #251 (rn251) — the cascade-dead milestone; dispatch the long-window run.
+
+Work Log:
+- #250 (rn250, a05ab356) decoded: the divergence moved twice and the bounded SM entry diag kept naming it:
+  * 'BAD_TYPE' (both watchdog eras): the client's Return<sp<IBase>> reads ONE object — 6-Z307c's chain-vec-before-flat reply fed it a PTR where it expected the base flat. THE GET REPLY IS ONE FLAT.
+  * THE DEEPER #248 ROOT CAUSE FOUND: the Task-38 dispatch edit (SM-handle transactions → servicemanager_proxy) was silently lost in a failed MultiEdit batch — every transaction on a seeded handle hit virtual_service_transaction's defensive Failed arm → BR_FAILED_REPLY. rn248's "unable to call into hwbinder service" was THAT, not a reply-shape defect.
+- **LANDED 2fc40bc6 + 42012de4 — 6-Z307d**:
+  1. GET reply reverted to [status-ok][base flat] (getRawServiceInternal: `Return<sp<IBase>> ret = sm->get(...); sp<IBase> base = ret;` — ONE object).
+  2. THE SM-HANDLE ROUTING NOW ACTUALLY LANDED (HidlServiceManager kind → servicemanager_proxy, the full SM arm set).
+  3. NEW IBase::interfaceChain arm (0xf43484e — the reserved IBase code, pinned LIVE from #248's conn=95/126/151 probes): the client's FIRST post-get transaction (canCastInterface → interface->interfaceChain, HidlTransportUtils.cpp:27); the arm answers [status-ok][vec<string> chain = @1.2/@1.1/@1.0 IServiceManager + IBase] so the castTo is CONTAINED.
+  4. Tests: 28B single-flat get-hit/miss + interfaceChain shape/contents; 849/849; fmt clean; clippy -D warnings clean (one unused-locals follow-up commit after clippy caught the slip — the gates sequence is re-verified).
+- **#251 (rn251, 42012de4) DECODED — THE CASCADE-DEAD MILESTONE**:
+  * ZERO FATAL EXCEPTION / ZERO NoSuchElementException in the whole kmsg; ZERO zygote era deaths; ZERO 'Sending signal. PID' kills; ZERO WAITED_HALF — **the first run in mission history where system_server survived the ENTIRE watch window**. The uncaught-exception watchdog kill chain (the #245-#250 wall) is DEAD.
+  * 39× IBase interfaceChain replies served; 39× @1.2 get hits — the C++ SM-cast fleets now resolve.
+  * The @1.0 watchdog lookup NEVER FIRED because the watchdog never went WAITED_HALF — system_server main was PROGRESSING.
+  * THE NEW FRONTIER — BOOTSTRAP THROUGHPUT: the ladder's 420s window ended with system_server alive INSIDE startBootstrapServices (SystemServerTiming markers: InitBeforeStartServices → StartInstaller → StartActivityManager → StartWatchdog; PackageManagerService/package_native NOT yet registered — 2174 'package_native' waiter lines, iorapd gave up, rung 8 unreached). The guest is SLOW-BUT-ALIVE, not wedged.
+- DISPATCHED: ladder with boot_wait_seconds=900, expect_rung=0 (diagnostic mode — never fail on the ladder; measure how far bootstrap gets with a 2.1× window) + recovery pr-tier gate on 42012de4 (the GET/interfaceChain changes touch the shared HIDL wire; the corpus gate is mandatory).
+
+Stage Summary / NEXT DECODE TREE:
+1. PRIMARY: the 900s run — how far does bootstrap get? Expect package_native registration (PMS up), then startOtherServices (SystemServerTiming markers move), then SystemUI (rung 8) — each new marker names the NEXT wall precisely if a wedge appears.
+2. If a wedge appears: the stall instruments (6-Z306ao-fd / af-q stall-target / 6-Z306k pin-silence) name the parked syscall and its fd/peer — the decode trees are in Tasks 37-40.
+3. If throughput is the binding constraint: profile the tracer's per-stop cost in the 900s run's timestamps (the mission's section-16 rule: identify the exact waits, never shorten timeouts blindly).
+4. Recovery gate 4/4 GREEN mandatory (the GET/interfaceChain/SM-routing changes touch the shared HIDL wire).
+5. The Wall-B property race: 0 occurrences this run (no 'failed to set system property' banners — the property wire held); the 6-Z307p census stays armed.
