@@ -1,3 +1,0 @@
-ls: rootfs/tmp/: No such file or directory
-ls: rootfs/lib64/: No such file or directory
-ls: rootfs/system/lib/: No such file or directory
