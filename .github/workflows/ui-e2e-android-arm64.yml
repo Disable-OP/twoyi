@@ -492,6 +492,30 @@ jobs:
                tail -c 32768 \$f; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs-raw-top20.txt 2>&1 || true
+          # ── 6-Z306ao-e: the watchdog's OWN reports ──────────────────
+          # #241 named the wall: the guest's OWN watchdog thread SIGKILLs
+          # system_server at ~+32s of process life (two generations, both
+          # killed at 32-35s — the A11 OVERDUE path needs >=67s, so the
+          # exact kill path is still open: OpenFdMonitor / uncaught
+          # exception / OVERDUE). The A11 Watchdog writes its evidence to
+          # the guest fs BEFORE the kill: /data/anr/traces_* (dumpStack-
+          # Traces at WAITED_HALF), /data/anr/anr_fd_* (the OpenFdMonitor
+          # descriptor dump), and the dropbox "system_server_watchdog"
+          # entry (subject + full report with the blocked checker named).
+          # The tracer's DIAG write sampler starved exactly there — these
+          # files are the ground truth. List the dirs, capture every
+          # file's head (bounded 32 KiB each).
+          timeout 60 sudo docker exec redroid sh -c \
+            "r=/data/user/0/io.twoyi.debug/profiles/default/rootfs; \
+             for d in \$r/data/anr \$r/data/system/dropbox; do \
+               echo \"== \$d ==\"; ls -la \$d 2>/dev/null | head -40; \
+               for f in \$d/*; do \
+                 [ -f \$f ] || continue; \
+                 echo \"-- FILE \$f (\$(stat -c%s \$f) bytes) head 32768 --\"; \
+                 head -c 32768 \$f; echo; \
+               done; \
+             done" \
+            > /tmp/ui-e2e-artifacts/anr-dropbox.txt 2>&1 || true
           # ── 6-Z306p complement: the loader shlib's own log ──────────
           # The shlib execvp hook + the staged exec's init log to
           # /data/local/tmp/twoyi-loader.log (guest view) =
