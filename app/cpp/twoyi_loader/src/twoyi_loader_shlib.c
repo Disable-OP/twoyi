@@ -4918,14 +4918,37 @@ static int should_set_preload_for_exec(const char *path) {
     return 1;
 }
 
-// Diagnostic helper: log the exec call with path + LD_PRELOAD state
-static void log_exec_call(const char *variant, const char *path) {
+// Diagnostic helper: log the exec call with path + argv + LD_PRELOAD state
+// 6-Z306p: argv[0..3] is THE evidence for the zygote's one-and-only
+// fork+execvp(idmap2) child (ladder #231/#232: the caller's command line
+// decides between a framework Runtime.exec/ProcessBuilder invocation, a
+// shell `exec idmap2`, or our own machinery). Bounded: 4 entries, the
+// snprintf cap truncates long strings — EVERY guest process exec hits
+// this hook, so unbounded argv logging would flood twoyi-loader.log.
+// No TLS (banned in this shlib — see the in_write_str note); plain
+// locals only.
+static void log_exec_call(const char *variant, const char *path, char *const argv[]) {
     char msg[768];
     int len = snprintf(msg, sizeof(msg),
         "[twoyi_loader] %s called: path=%s preload_path=%s\n",
         variant, path ? path : "(null)",
         g_preload_path[0] ? g_preload_path : "(empty)");
     write_str(2, msg);
+    if (argv) {
+        char abuf[560];
+        int alen = snprintf(abuf, sizeof(abuf), "[twoyi_loader] %s argv:", variant);
+        for (int i = 0; i < 4 && alen > 0 && alen < (int)sizeof(abuf) - 1; i++) {
+            if (!argv[i]) break;
+            int n = snprintf(abuf + alen, sizeof(abuf) - (size_t)alen,
+                             " %s", argv[i]);
+            if (n < 0) { alen = -1; break; }
+            alen += n;
+        }
+        if (alen > 0 && alen < (int)sizeof(abuf) - 1) {
+            alen += snprintf(abuf + alen, sizeof(abuf) - (size_t)alen, "\n");
+        }
+        if (alen > 0) write_str(2, abuf);
+    }
 }
 
 // Helper: translate path for exec (prepend rootfs if needed)
@@ -4991,7 +5014,7 @@ static const char *translate_exec_path(const char *path) {
 
 int execv(const char *path, char *const argv[]) {
     if (!real_execv) real_execv = dlsym(RTLD_NEXT, "execv");
-    log_exec_call("execv", path);
+    log_exec_call("execv", path, argv);
     // Translate path to rootfs (e.g., /system/bin/logd -> {rootfs}/system/bin/logd)
     const char *exec_path = translate_exec_path(path);
     if (exec_path != path) {
@@ -5019,7 +5042,7 @@ int execv(const char *path, char *const argv[]) {
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
     if (!real_execve) real_execve = dlsym(RTLD_NEXT, "execve");
-    log_exec_call("execve", path);
+    log_exec_call("execve", path, argv);
     // Translate path to rootfs (e.g., /system/bin/logd -> {rootfs}/system/bin/logd)
     const char *exec_path = translate_exec_path(path);
     if (exec_path != path) {
@@ -5169,7 +5192,7 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
 // Hook execvp — same as execv but uses PATH
 int execvp(const char *path, char *const argv[]) {
     if (!real_execvp) real_execvp = dlsym(RTLD_NEXT, "execvp");
-    log_exec_call("execvp", path);
+    log_exec_call("execvp", path, argv);
     const char *exec_path = translate_exec_path(path);
     restore_preload_env();
     write_str(2, "[twoyi_loader] execvp: restored LD_PRELOAD\n");
@@ -5180,7 +5203,7 @@ int execvp(const char *path, char *const argv[]) {
 // Hook execvpe — same as execve but uses PATH
 int execvpe(const char *path, char *const argv[], char *const envp[]) {
     if (!real_execvpe) real_execvpe = dlsym(RTLD_NEXT, "execvpe");
-    log_exec_call("execvpe", path);
+    log_exec_call("execvpe", path, argv);
     // Same envp manipulation as execve
     restore_preload_env();
 
@@ -5229,7 +5252,7 @@ int execvpe(const char *path, char *const argv[], char *const envp[]) {
 int execveat(int dirfd, const char *path, char *const argv[],
              char *const envp[], int flags) {
     if (!real_execveat) real_execveat = dlsym(RTLD_NEXT, "execveat");
-    log_exec_call("execveat", path);
+    log_exec_call("execveat", path, argv);
     restore_preload_env();
 
     int env_count = 0;
