@@ -22826,14 +22826,36 @@ pub fn run_ptrace_loop(
                                         Z306AO_CENSUS
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         let census = z306ao_thread_census(j_target);
+                                        // 6-Z306ao-d: the ISSUER's own syscall
+                                        // ring tail — the #241 gen-1/2 kills
+                                        // came from the guest's "watchdog"
+                                        // thread 60ms after its WAITED_HALF
+                                        // log, but the A11 kill paths all do
+                                        // >=5s of deathbed work (dumpStack-
+                                        // Traces + SystemClock.sleep(5000) +
+                                        // dropbox join) — the ring names the
+                                        // path actually taken (bare kill
+                                        // after logd writes = uncaught-
+                                        // exception class; nanosleep before
+                                        // the kill = the OVERDUE tail).
+                                        let issuer_ring = z306af_tid_trail
+                                            .get(&pid)
+                                            .map(|r| {
+                                                r.iter()
+                                                    .map(|n| n.to_string())
+                                                    .collect::<Vec<_>>()
+                                                    .join(",")
+                                            })
+                                            .unwrap_or_default();
                                         log(&format!(
-                                            "6-Z306ao: sig=9 → lineage target={} issuer pid={} comm={:?} — threads alive at kill: {}",
+                                            "6-Z306ao: sig=9 → lineage target={} issuer pid={} comm={:?} — threads alive at kill: {} — issuer ring-tail: [{}]",
                                             j_target,
                                             pid,
                                             std::fs::read_to_string(format!("/proc/{}/comm", pid))
                                                 .unwrap_or_default()
                                                 .trim_end(),
-                                            census
+                                            census,
+                                            issuer_ring
                                         ));
                                     }
                                 }
