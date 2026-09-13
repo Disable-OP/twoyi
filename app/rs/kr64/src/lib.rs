@@ -12901,7 +12901,15 @@ fn write_usb_state_mirror_rc(rootfs_prefix: &str) {
 /// in the image (same location census as the 6-Z270 sanitizer), drops
 /// `first_stage_mount` flags from every row (FirstStageMount must
 /// construct but mount nothing — the path translation provides the
-/// trees), and writes the result over `/vendor/etc/fstab.ranchu`.
+/// trees), drops `logical` rows entirely (6-Z310: device-mapper does
+/// not exist in the virtual block world — `dev/device-mapper` is a
+/// defensive /dev/null stub, so DM_DEV_STATUS answers ENOTTY and every
+/// consumer that resolves a logical partition FATALs; A11 vold
+/// process_config PLOG(FATAL)s "could not find logical partition
+/// system_b" for ANY logical row in the fstab — the merged-tree world
+/// provides the partition trees via path translation, so the rows can
+/// never resolve in ANY guest boot mode), and writes the result over
+/// `/vendor/etc/fstab.ranchu`.
 /// Runs after the 6-Z99 stub write and before the 6-Z270 crypto strip
 /// (which then processes the alias like any other fstab).
 fn materialize_guest_device_fstab(rootfs_prefix: &str) {
@@ -12969,6 +12977,7 @@ fn materialize_guest_device_fstab(rootfs_prefix: &str) {
     // 6-Z101 EBUSY/InitFatalReboot class). All other rows preserved.
     let mut out: Vec<String> = Vec::new();
     let mut dropped = 0usize;
+    let mut logical_dropped = 0usize;
     for line in content.split_inclusive('\n') {
         let t = line.trim_end_matches('\n');
         if t.trim().is_empty() || t.trim().starts_with('#') {
@@ -12978,6 +12987,21 @@ fn materialize_guest_device_fstab(rootfs_prefix: &str) {
         let fields: Vec<&str> = t.split_whitespace().collect();
         if fields.len() >= 5 {
             let fs_mgr_flags = fields[4];
+            // 6-Z310: a `logical` row can never resolve in the virtual
+            // block world (no device-mapper — the control node is a
+            // defensive /dev/null stub that answers ENOTTY). A10+ vold
+            // PLOG(FATAL)-aborts on ANY logical row while "updating its
+            // blk_device" (vold main.cpp process_config →
+            // fs_mgr_update_logical_partition → DM_DEV_STATUS), which is
+            // the rn258 vold crash loop (71 signal-6 deaths/era, abort
+            // message "could not find logical partition system_b" — the
+            // postinstall row, resolved through slotselect_other). The
+            // partition trees these rows describe are already provided by
+            // the path translation; drop the rows wholesale.
+            if fs_mgr_flags.split(',').any(|tok| tok == "logical") {
+                logical_dropped += 1;
+                continue;
+            }
             let kept: Vec<&str> = fs_mgr_flags
                 .split(',')
                 .filter(|tok| {
@@ -13031,10 +13055,11 @@ fn materialize_guest_device_fstab(rootfs_prefix: &str) {
     let _ = std::fs::create_dir_all(format!("{}/vendor/etc", rootfs_prefix));
     match std::fs::write(&dst, &new_content) {
         Ok(_) => info!(
-            "[KR64] PARENT: 6-Z272j: materialized /vendor/etc/fstab.ranchu from {} ({} bytes, {} first_stage_mount flag(s) dropped)",
+            "[KR64] PARENT: 6-Z272j: materialized /vendor/etc/fstab.ranchu from {} ({} bytes, {} first_stage_mount flag(s) dropped, {} logical row(s) dropped)",
             source_path,
             new_content.len(),
-            dropped
+            dropped,
+            logical_dropped
         ),
         Err(e) => warning!(
             "[KR64] PARENT: 6-Z272j: FAILED to write {}: {}",
@@ -13661,6 +13686,58 @@ mod tests {
             "fstab.emmc (sorted first in the ramdisk root) is the source: {out}"
         );
         assert!(!out.contains("first_stage_mount"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The rn258 vold FATAL shape (6-Z310): an A11 cuttlefish-style image
+    /// whose first content-bearing fstab (scan order) is
+    /// /etc/fstab.postinstall — its `system /postinstall …
+    /// slotselect_other,logical` row resolves to "system_b" (other-slot
+    /// suffix against slot _a) and A11 vold process_config PLOG(FATAL)
+    /// aborts on it ("could not find logical partition system_b: Inappropriate
+    /// ioctl for device" — DM_DEV_STATUS against the /dev/null
+    /// device-mapper stub answers ENOTTY; 71 signal-6 deaths per era).
+    /// The materialized alias must carry NO logical row, keep the
+    /// physical fallback row, and append the container /data row.
+    #[test]
+    fn fstab_ranchu_alias_drops_logical_rows_vold_fatal_6z310() {
+        let dir = std::env::temp_dir().join(format!("kr64_6z310_test_{}", std::process::id()));
+        let etc = dir.join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("fstab.postinstall"),
+            "# Tries to mount system_other as a logical partition. If that fails, then\n\
+             # mount as a physical partition.\n\
+             \n\
+             #<src>                    <mnt_point>  <type> <mnt_flags and options> <fs_mgr_flags>\n\
+             system                    /postinstall ext4   ro,nosuid,nodev,noexec  slotselect_other,logical\n\
+             /dev/block/by-name/system /postinstall ext4   ro,nosuid,nodev,noexec  slotselect_other\n",
+        )
+        .unwrap();
+        materialize_guest_device_fstab(dir.to_str().unwrap());
+
+        let out = std::fs::read_to_string(dir.join("vendor/etc/fstab.ranchu")).unwrap();
+        let logical_row_survives = out.lines().any(|l| {
+            let t = l.trim();
+            !t.is_empty()
+                && !t.starts_with('#')
+                && t.split_whitespace()
+                    .nth(4)
+                    .map(|f| f.split(',').any(|tok| tok == "logical"))
+                    .unwrap_or(false)
+        });
+        assert!(
+            !logical_row_survives,
+            "no logical row may survive (the vold PLOG(FATAL) class): {out}"
+        );
+        assert!(
+            out.contains("/postinstall ext4"),
+            "physical fallback row survives untouched: {out}"
+        );
+        assert!(
+            out.contains("/dev/block/by-name/userdata /data"),
+            "container /data row appended: {out}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
