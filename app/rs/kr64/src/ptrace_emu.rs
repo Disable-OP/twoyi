@@ -10218,6 +10218,31 @@ fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
     true
 }
 
+/// 6-Z317: the syscalls whose stalls get the 6-Z314 stack-window
+/// capture. aarch64 nrs: read=63, readv=65, pread64=67, ppoll=73,
+/// futex=98, recvfrom=207, recvmsg=212. rn265 named the wedged lock —
+/// a POISONED/abandoned heap mutex in the scudo primary region
+/// (maps[uaddr], owner=tid 1) — but uaddr/op/word/owner (6-Z271f +
+/// 6-Z306i) never name the OBJECT that owns the mutex; only the
+/// waiter's return-address chain does. main's futex_do_wait park
+/// (rn264) lost its stack for exactly this reason: 98 was not in the
+/// read-only family.
+fn stall_stack_family() -> &'static [i64] {
+    &[63, 65, 67, 73, 98, 207, 212]
+}
+
+/// 6-Z317: the stack-window line's argument label. fd-shaped syscalls
+/// keep the historical decimal-fd label; a futex waiter's arg0 is the
+/// uaddr — print it hex so it cross-references the 6-Z271f STALL-DUMP
+/// and 6-Z306i STALL-OWNER uaddr lines directly.
+fn stall_stack_arg_label(nr: i64, a0: u64) -> String {
+    if nr == 98 {
+        format!("uaddr={:#x}", a0)
+    } else {
+        format!("fd={}", a0)
+    }
+}
+
 /// 6-Z271f: forensic dump for one blocked-in-syscall tracee.
 ///
 /// /proc/<pid>/syscall exposes the REAL syscall nr, its 6 argument
@@ -10278,9 +10303,10 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
     // between "a shlib wake-pipe wait", "a debuggerd dump-output read",
     // and "a service-init fd walk" is exactly one return-address chain.
     //
-    // For read-family stalls (aarch64: read=63, readv=65, pread64=67,
-    // ppoll=73, recvfrom=207, recvmsg=212 — the fd-shaped blocking waits
-    // the stall scanner exists for), read the guest stack window above sp
+    // For stall-stack-family syscalls (aarch64: read=63, readv=65,
+    // pread64=67, ppoll=73, futex=98, recvfrom=207, recvmsg=212 — the
+    // fd-shaped blocking waits the stall scanner exists for, plus the
+    // 6-Z317 futex-waiter class), read the guest stack window above sp
     // with the existing peek machinery (process_vm_readv fast path, then
     // the ptrace word loop) and resolve every word that lands in an
     // EXECUTABLE mapping via the same maps resolver the STALL-DUMP uses
@@ -10294,8 +10320,8 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
     // rewritten, or re-armed here (peek uses process_vm_readv/ptrace
     // PEEKDATA, both side-effect-free on a blocked tracee).
     {
-        const READ_FAMILY_STALL: &[i64] = &[63, 65, 67, 73, 207, 212];
-        if READ_FAMILY_STALL.contains(&nr) && sp != 0 {
+        if stall_stack_family().contains(&nr) && sp != 0 {
+            let arg_label = stall_stack_arg_label(nr, a0);
             use std::collections::HashSet;
             use std::sync::Mutex;
             // 6-Z315: the system_server lineage (comm == "system_server")
@@ -10345,10 +10371,10 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                             }
                             frames += 1;
                             crate::trace_log_line(&format!(
-                                "6-Z314 STALL-STACK: pid={} nr={} fd={} stack[+{:#04x}]=0x{:016x} -> {}",
+                                "6-Z314 STALL-STACK: pid={} nr={} {} stack[+{:#04x}]=0x{:016x} -> {}",
                                 pid,
                                 nr,
-                                a0,
+                                arg_label,
                                 i * 8,
                                 w,
                                 r
@@ -10356,10 +10382,10 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                         }
                         if frames == 0 {
                             crate::trace_log_line(&format!(
-                                "6-Z314 STALL-STACK: pid={} nr={} fd={} — {} words read, none in r-xp mappings (stack window may be beyond the frames; raw first 8: {:02x?})",
+                                "6-Z314 STALL-STACK: pid={} nr={} {} — {} words read, none in r-xp mappings (stack window may be beyond the frames; raw first 8: {:02x?})",
                                 pid,
                                 nr,
-                                a0,
+                                arg_label,
                                 words.len(),
                                 &bytes[..bytes.len().min(64)]
                             ));
@@ -10367,8 +10393,8 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                     }
                     None => {
                         crate::trace_log_line(&format!(
-                            "6-Z314 STALL-STACK: pid={} nr={} fd={} — stack window at sp={:#x} UNREADABLE",
-                            pid, nr, a0, sp
+                            "6-Z314 STALL-STACK: pid={} nr={} {} — stack window at sp={:#x} UNREADABLE",
+                            pid, nr, arg_label, sp
                         ));
                     }
                 }
@@ -46426,6 +46452,33 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
             super::z306anr_classify_proc_syscall("garbage"),
             "unparsable"
         );
+    }
+
+    // ── 6-Z317: futex waiters join the stall stack-window capture ────
+    //
+    // rn265 named the wedged lock (a poisoned/abandoned heap mutex in
+    // the scudo primary region, owner=tid 1) but the OBJECT that owns
+    // the mutex stays unnamed until the WAITER's return-address chain
+    // is captured. The family + the line label are the whole contract.
+
+    #[test]
+    fn z317_stall_stack_family_includes_futex_and_read_family() {
+        let fam = super::stall_stack_family();
+        for nr in [63, 65, 67, 73, 98, 207, 212] {
+            assert!(fam.contains(&nr), "stall-stack family missing nr {nr}");
+        }
+        // The guest is aarch64; the x86_64 futex nr must not leak in.
+        assert!(!fam.contains(&202));
+    }
+
+    #[test]
+    fn z317_stall_stack_arg_label_futex_is_uaddr_hex_reads_are_fd() {
+        assert_eq!(
+            super::stall_stack_arg_label(98, 0xed5212a392ac),
+            "uaddr=0xed5212a392ac"
+        );
+        assert_eq!(super::stall_stack_arg_label(63, 80), "fd=80");
+        assert_eq!(super::stall_stack_arg_label(207, 3), "fd=3");
     }
 
     // ── 6-Z311: the death last-gasp — fatal-signal capture format ────
