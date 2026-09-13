@@ -10298,6 +10298,12 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
         if READ_FAMILY_STALL.contains(&nr) && sp != 0 {
             use std::collections::HashSet;
             use std::sync::Mutex;
+            // 6-Z315: the system_server lineage (comm == "system_server")
+            // bypasses the global budget — its stall forensics ARE the
+            // boot-wall decode; everyone else keeps the 24-cap.
+            let is_system_server_thread = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                .map(|c| c.trim_end() == "system_server")
+                .unwrap_or(false);
             static STACK_SEEN: Mutex<Option<HashSet<(libc::pid_t, u64)>>> = Mutex::new(None);
             static STACK_BUDGET: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
@@ -10309,8 +10315,13 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                 let mut seen = STACK_SEEN.lock().unwrap_or_else(|e| e.into_inner());
                 seen.get_or_insert_with(HashSet::new).insert((pid, sp))
             };
-            if fresh && STACK_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < STACK_WINDOW_CAP {
-                STACK_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if fresh
+                && (is_system_server_thread
+                    || STACK_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < STACK_WINDOW_CAP)
+            {
+                if !is_system_server_thread {
+                    STACK_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 match peek_guest_bytes(pid, sp, STACK_WINDOW_BYTES) {
                     Some(bytes) => {
                         let words: Vec<u64> = bytes
@@ -10448,7 +10459,21 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
         // resolve. Pipe stalls are ALWAYS interesting (a read(2) parked
         // >5s on a pipe is never benign noise) and always resolve; every
         // other fd-shaped target only resolves after 15s parked.
+        // 6-Z315: rn263's budget burned out AGAIN before main's wedge —
+        // the benign early stallers (ueventd, hwcomposer, statsd, the
+        // crash-loop fleet) consumed all 24 slots by +180s, so the
+        // system_server stall got a STACK-WINDOW (6-Z314 fires before
+        // this gate) but NO fd-target line, and the one datum that
+        // discriminates "libmeminfo read of WHICH /proc file" stayed
+        // missing. Fix: stalls of the system_server lineage (comm ==
+        // "system_server" — main + all its threads share the comm) BYPASS
+        // the global cap entirely (the per-(pid,fd) fresh dedup stays —
+        // one line per stall episode, no flooding). The global cap still
+        // bounds everyone else at 24.
         let pipe_stall = wchan == "anon_pipe_read";
+        let is_system_server_thread = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+            .map(|c| c.trim_end() == "system_server")
+            .unwrap_or(false);
         if fd_shaped && a0 <= 0x7fff_ffff && (pipe_stall || elapsed_secs >= 15.0) {
             static STALL_TARGET_SEEN: Mutex<Option<HashSet<(i32, i32)>>> = Mutex::new(None);
             static STALL_TARGET_BUDGET: std::sync::atomic::AtomicU64 =
@@ -10458,8 +10483,13 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                 let mut seen = STALL_TARGET_SEEN.lock().unwrap_or_else(|e| e.into_inner());
                 seen.get_or_insert_with(HashSet::new).insert((pid, fd))
             };
-            if fresh && STALL_TARGET_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < 24 {
-                STALL_TARGET_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if fresh
+                && (is_system_server_thread
+                    || STALL_TARGET_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < 24)
+            {
+                if !is_system_server_thread {
+                    STALL_TARGET_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let target = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| "<unreadable>".to_string());
