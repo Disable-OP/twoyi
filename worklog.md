@@ -29000,3 +29000,34 @@ Stage Summary / NEXT-LEG FIX TREE:
 4. EXPECT after the fix: era-1 main passes the read → suspend chain completes → PMS constructor completes (the rn266 abort path is now visible by name; if it fires, its fix is next) → rung 8 (SystemUI) reachable.
 5. Recovery gate 4/4 GREEN mandatory after any fd-contract change (recoveries use the same fork paths).
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 55
+Agent: Z.ai Code (webDevReview cron "Continue" session)
+Task: Land the next production step per the Task 54b fix tree (rn267 decode); dispatch rn268 + recovery gate.
+
+Work Log:
+- Authentication is provided through the private agent environment.
+- STATIC AUDIT OF THE CLOSE PATHS (fix tree item 1): the syscall-layer close arm (6-Z305t-75d) is PURE OBSERVATION — "close() executes natively — zero rewrites" — except the 6-Z305y zygote stdio pin (close(0/1/2)→getpid rewrite, fd<=2 only). CONSEQUENCE: a swallowed close cannot be the rn267 mechanism; the leak must be a close the guest never CALLED (fork/specialize contract divergence) or a dup nobody accounted for. The z306 fork-gate sweep only closes preload-leak FAMILIES (fonts/hyphen-data + foreign svclogs); pipes legitimately stay open (self-pipes are real-kernel-legitimate — closing both-ends-in-one-process pipes is FORBIDDEN: it would kill every legitimate self-pipe trick). → fix tree item 2 applies: arm the bounded lifecycle trace.
+- **6-Z319 LANDED (0a05b8f9, fix(instruments)) — the ZYGOTE-LINEAGE PIPE LIFECYCLE TRACE**, all arms PURE OBSERVATION (no reg writes, no path rewrites — recovery-class boots bit-identical):
+  1. PIPE2 (EXIT): names the creation fds of every lineage pipe (seccomp-ALLOWED native execution; fds read from *arg0 at EXIT via the one-in-flight-per-thread stash; read_child_u32).
+  2. FORK-GATE: the zygote's OWN pipe fds at each process-fork ENTRY (what is about to cross; read_dir+readlink scan, 16-fork budget).
+  3. FORK-FDS: the child's inherited pipe set at its FIRST syscall ENTRY (ground-truth fork contract; once per child, 24-log budget).
+  4. PIPE-CLOSE: every close of a KNOWN pipe fd in the lineage — fresh /proc readlink as label; dedup via map removal (re-dup'd fds re-inserted by the dup/snapshot arms); the close itself executes natively below.
+  5. PIPE-DUP: dup/dup3 whose new fd resolves to a pipe — names WHO made the fd-80-class dup.
+  - z319_pipes_seen keyed by the PROCESS (TGID — threads share the fd table; the z306 tgid cache supplies it without /proc reads); close arm = HashSet lookup first (no per-stop /proc reads, 6-Z306u lesson); per-class budgets 32/96/32/16/24.
+- **THE DUP-FAMILY NR FIX (6-Z305t-75f)**: the rebind-diag arm believed aarch64 dup3=33 — asm-generic has NO dup2: dup=23, dup3=24, 33=MKNODAT (libc android-aarch64 authoritative). The arm has been silently matching mknodat on aarch64 and NEVER fired on x86_64 (its close_nr==57 guard excludes the ABI where dup2 IS 33). Fixed guard: (close_nr==57 && nr∈{23,24}) || (close_nr==3 && nr==33) — the fd-0 rebind net is now real on both ABIs.
+- **NAME TABLE FIX**: arm64_generic_syscall_name had 58=>"pipe2" — off-by-one (58=vhangup, 59=pipe2). A wrong nr→name mapping poisons every artifact grep decode. Pinned by z319_arm64_name_table_pipe2_is_59_not_58.
+- **6-Z318 CAP WIDENED** (fix tree item 3): abort-message scan window 96→256 bytes (out 512→1024) — rn267's registerAsService instance names truncated mid-word.
+- Gates: fmt clean, clippy -D warnings clean (kr64), 863/863 tests (incl. the new z319 test — was 862), hook syntax error count identical to baseline (2 pre-existing bionic/glibc header diffs).
+- COMMITTED 0a05b8f9 + PUSHED to origin/main.
+- DISPATCHED on 0a05b8f9: rn268 ladder (run 34769266637, boot_wait 900, stall_seconds 0, expect_rung 0) + recovery-corpus pr-tier gate (run 34769267757). In flight at worklog-write.
+
+Stage Summary / RN268 DECODE TREE:
+1. PRIMARY: reconstruct pipe:[208619]'s lifecycle from the 6-Z319 lines — PIPE2 (who created 5/6), FORK-GATE+FORK-FDS (which ends crossed the daemon fork and the system_server fork), PIPE-CLOSE (which close came, which is ABSENT), PIPE-DUP (who made the fd-80 dup). The ABSENT close IS the leak datum: if the zygote never closes its end post-daemon-fork, the fork-era contract diverged (candidate: the ART perfetto-class daemon fork in the guest — Setup() parent branch not taken, or the daemon child dying before its close); if a close line is present but the fd still shows in the child's FORK-FDS, the drift is BETWEEN close and fork (fd-table copy timing).
+2. The dup arm now REALLY fires: expect either a PIPE-DUP line naming the fd-80 creator or its ABSENCE (→ fd 80 came from another mechanism: SCM_RIGHTS/fcntl-dup — then extend the instrument to fcntl(F_DUPFD*) EXIT).
+3. Cross-check the 6-Z318 widened scan: the era aborts (health@2.1/tombstoned/clearkey-class) now carry FULL instance names.
+4. EXPECT after the fd-contract fix lands: era-1 main passes read(fd=80) → suspend chain completes → PMS constructor completes (the rn266 abort path is nameable live) → rung 8 (SystemUI) reachable.
+5. Recovery gate 4/4 GREEN mandatory (the hook + tracer changes are shared with recovery-class boots; the corpus validates directly).
+6. Do NOT chase: the audio abandoned-mutex fleet (off the bootstrap path), the drm/nnapi VINTF crash-loop fleet, HOST logcat streams, iorapd misses.
+- Authentication is provided through the private agent environment.
