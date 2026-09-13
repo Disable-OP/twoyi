@@ -4659,7 +4659,8 @@ fn arm64_generic_syscall_name(nr: i64) -> &'static str {
         41 => "pivot_root",
         48 => "faccessat",
         49 => "chdir",
-        58 => "pipe2",
+        58 => "vhangup",
+        59 => "pipe2",
         61 => "getdents64",
         62 => "lseek",
         65 => "readv",
@@ -14503,6 +14504,53 @@ pub fn run_ptrace_loop(
     // 6-Z306g: tid -> tgid cache for the thread-aware lineage check.
     let mut z306_lineage_tgid_cache: std::collections::HashMap<libc::pid_t, libc::pid_t> =
         std::collections::HashMap::new();
+    // ── 6-Z319: the ZYGOTE-LINEAGE PIPE LIFECYCLE TRACE ───────────
+    //
+    // Task 54b's rn267 decode completed the era-1 wall to the byte:
+    // system_server main parked in read(fd=80) on a pipe:[208619] whose
+    // EVERY end is self-held (fd 5 read + fd 6 write + fd 80 read-dup,
+    // all in system_server's own table; the PIPE-PEER census proved no
+    // other process holds any end — a read on it can never progress).
+    // On a real A11 boot the zygote lineage holds exactly ONE end of
+    // the ART perfetto-class pipe (the daemon child holds the other);
+    // our lineage holds BOTH ends + a dup, and main reads the dup.
+    //
+    // Syscall-layer closes execute natively (the 6-Z305t-75d arm is
+    // pure observation — zero rewrites), so a swallowed close is NOT
+    // the mechanism; the leak must be a close the guest never CALLED
+    // (a fork/specialize contract divergence) or a dup nobody
+    // accounted for. This instrument names the exact syscalls: every
+    // pipe2 CREATION (create-time fds), every FORK CROSSING (the
+    // parent's pipe fds at each process-fork + the child's inherited
+    // pipe set at its first ENTRY), every PIPE-CLOSE (lineage pid,
+    // fd known-pipe), and every PIPE-DUP (dup/dup3 whose new fd is a
+    // pipe). All arms are PURE OBSERVATION — no reg writes, no path
+    // rewrites — so recovery-class boots are bit-identical.
+    //
+    // Bookkeeping: z319_pipe2_pending / z319_dup_pending hold the
+    // one-in-flight-per-thread ENTRY stash (same pattern as
+    // z305y_zclose_pending); z319_pipes_seen tracks which (pid, fd)
+    // pairs are KNOWN pipes (populated by pipe2 EXIT, dup EXIT, and
+    // the fork snapshots) so the close arm needs no per-stop /proc
+    // read — a HashSet lookup first. Key = the process (TGID):
+    // threads share the fd table, and the z306 lineage/tgid caches
+    // give the TGID without a /proc read (populated at thread
+    // creation and by every z306_in_zygote_lineage call). Budgets
+    // are per-class (the 6-Z306u perf lesson: instruments must never
+    // own the log).
+    let mut z319_pipe2_pending: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
+    let mut z319_dup_pending: std::collections::HashMap<libc::pid_t, i32> =
+        std::collections::HashMap::new();
+    let mut z319_pipes_seen: std::collections::HashMap<
+        libc::pid_t,
+        std::collections::HashSet<i32>,
+    > = std::collections::HashMap::new();
+    let mut z319_pipe2_budget: u32 = 0;
+    let mut z319_close_budget: u32 = 0;
+    let mut z319_dup_budget: u32 = 0;
+    let mut z319_fork_snapshot_budget: u32 = 0;
+    let mut z319_forkgate_budget: u32 = 0;
     // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
     // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
     // 0) — the EXIT arm turns the returned REAL fd into a tracked
@@ -19480,6 +19528,58 @@ pub fn run_ptrace_loop(
                             ));
                         } else {
                             z306_childgate.insert(pid, scans + 1);
+                            // ── 6-Z319: the FORK-FDS snapshot ──
+                            //
+                            // At the child's FIRST syscall ENTRY, name every
+                            // pipe fd the fork crossed (the inherited table
+                            // IS the fork contract). Paired with the
+                            // parent-side FORK-GATE listing, the lifecycle
+                            // of the rn267 self-held pipe:[208619] is
+                            // reconstructable end-to-end: which ends the
+                            // daemon took, which survived into
+                            // system_server, where the fd-80-class dup
+                            // appeared. Populates z319_pipes_seen for the
+                            // close arm. Bounded: once per child, 24 logs,
+                            // children with no pipes cost nothing.
+                            if scans == 0 && z319_fork_snapshot_budget < 24 {
+                                let mut pipes: Vec<String> = Vec::new();
+                                let mut nfds: u32 = 0;
+                                if let Ok(rd) = std::fs::read_dir(format!("/proc/{}/fd", pid)) {
+                                    for ent in rd.flatten() {
+                                        nfds += 1;
+                                        if let Ok(t) = std::fs::read_link(ent.path()) {
+                                            let ts = t.to_string_lossy().into_owned();
+                                            if ts.starts_with("pipe:") {
+                                                if let Ok(fd) = ent
+                                                    .file_name()
+                                                    .to_string_lossy()
+                                                    .parse::<i32>()
+                                                {
+                                                    if z319_pipes_seen.len() > 512 {
+                                                        z319_pipes_seen.clear();
+                                                    }
+                                                    z319_pipes_seen
+                                                        .entry(pid)
+                                                        .or_default()
+                                                        .insert(fd);
+                                                    if pipes.len() < 16 {
+                                                        pipes.push(format!("{}->{}", fd, ts));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !pipes.is_empty() {
+                                    z319_fork_snapshot_budget += 1;
+                                    log(&format!(
+                                        "6-Z319 FORK-FDS: pid={} nfds={} pipes=[{}]",
+                                        pid,
+                                        nfds,
+                                        pipes.join(", ")
+                                    ));
+                                }
+                            }
                             // Name every open/openat path in the window
                             // (bounded) — names raw openers verbatim.
                             // 6-Z306f: an open of /proc/self/fd IS the
@@ -19636,6 +19736,58 @@ pub fn run_ptrace_loop(
                                     log(&format!(
                                         "6-Z306f: fork gate AUDIT — pid={} clone(flags={:#x}) non-whitelisted fds: {}",
                                         pid, clone_flags, leaks.join(" | ")
+                                    ));
+                                }
+                            }
+                            // ── 6-Z319: the PARENT-side fork-gate listing ──
+                            //
+                            // The zygote's OWN pipe fds at the moment this
+                            // fork crosses them (the pipe ends the child is
+                            // about to inherit). With the child's FORK-FDS
+                            // snapshot this names, per fork: what existed,
+                            // what crossed, and (by comparison with the
+                            // later PIPE-CLOSE lines) what was never closed
+                            // by either side — the exact rn267 leak datum.
+                            // Bounded: 16 pipe-bearing forks per run; after
+                            // the budget the scan never runs again (zero
+                            // steady-state cost).
+                            if z319_forkgate_budget < 16 {
+                                let mut pipes: Vec<String> = Vec::new();
+                                let mut nfds: u32 = 0;
+                                if let Ok(rd) = std::fs::read_dir(format!("/proc/{}/fd", pid)) {
+                                    for ent in rd.flatten() {
+                                        nfds += 1;
+                                        if let Ok(t) = std::fs::read_link(ent.path()) {
+                                            let ts = t.to_string_lossy().into_owned();
+                                            if ts.starts_with("pipe:") {
+                                                if let Ok(fd) = ent
+                                                    .file_name()
+                                                    .to_string_lossy()
+                                                    .parse::<i32>()
+                                                {
+                                                    if z319_pipes_seen.len() > 512 {
+                                                        z319_pipes_seen.clear();
+                                                    }
+                                                    z319_pipes_seen
+                                                        .entry(pid)
+                                                        .or_default()
+                                                        .insert(fd);
+                                                    if pipes.len() < 16 {
+                                                        pipes.push(format!("{}->{}", fd, ts));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !pipes.is_empty() {
+                                    z319_forkgate_budget += 1;
+                                    log(&format!(
+                                        "6-Z319 FORK-GATE: zygote pid={} nfds={} clone(flags={:#x}) pipes=[{}]",
+                                        pid,
+                                        nfds,
+                                        clone_flags,
+                                        pipes.join(", ")
                                     ));
                                 }
                             }
@@ -24637,6 +24789,42 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             }
+                            // ── 6-Z319: the PIPE-CLOSE observation ────
+                            //
+                            // fd > 2 and this (process, fd) is a KNOWN pipe
+                            // → name the close with a FRESH /proc readlink
+                            // (ground truth at close time — the map entry
+                            // only gates, never labels). Dedup via map
+                            // removal: a re-dup'd fd is re-inserted by the
+                            // dup/snapshot arms, so only the FIRST close of
+                            // each episode logs. Pure observation — the
+                            // close itself executes natively below.
+                            if close_fd > 2 {
+                                let z319_key = if z306_zygote_lineage.contains(&pid) {
+                                    pid
+                                } else {
+                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid)
+                                };
+                                let z319_is_pipe = z319_pipes_seen
+                                    .get(&z319_key)
+                                    .is_some_and(|s| s.contains(&(close_fd as i32)));
+                                if z319_is_pipe && z319_close_budget < 96 {
+                                    z319_close_budget += 1;
+                                    let target = std::fs::read_link(format!(
+                                        "/proc/{}/fd/{}",
+                                        pid, close_fd
+                                    ))
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|_| "<gone>".to_string());
+                                    log(&format!(
+                                        "6-Z319 PIPE-CLOSE: pid={} fd={} -> {}",
+                                        pid, close_fd, target
+                                    ));
+                                    if let Some(s) = z319_pipes_seen.get_mut(&z319_key) {
+                                        s.remove(&(close_fd as i32));
+                                    }
+                                }
+                            }
                         }
                         436 => {
                             // close_range(first, last, flags) — if the
@@ -24671,7 +24859,7 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
-                        // 6-Z305t-75f: dup3(aarch64=33)/dup2(x86_64=33) —
+                        // 6-Z305t-75f (nr FIX, 6-Z319): the DUP family —
                         // newfd in arg2. A dup ONTO fd 0/1/2 CLOSES the
                         // previous standard descriptor without any close()
                         // syscall — the one blind spot left in the fd-0
@@ -24679,7 +24867,19 @@ pub fn run_ptrace_loop(
                         // between watchdog repairs with ZERO traced
                         // close(0) events — a rebinding dup is the only
                         // remaining mechanism).
-                        33 if abi.close_nr == 57 => {
+                        // NUMBER FIX: the old guard `33 if abi.close_nr
+                        // == 57` believed aarch64 dup3 = 33 — but aarch64
+                        // (asm-generic) has NO dup2: dup = 23, dup3 = 24,
+                        // and 33 = MKNODAT (libc android-aarch64: SYS_dup
+                        // = 23, SYS_dup3 = 24). The arm has been silently
+                        // matching mknodat on aarch64 (and never fired on
+                        // x86_64: its close_nr == 57 guard excludes the
+                        // x86_64 ABI where dup2 IS 33) — the fd-0 rebind
+                        // net is now real on BOTH ABIs.
+                        n if (abi.close_nr == 57 && (n == 23 || n == 24))
+                            || (abi.close_nr == 3 && n == 33) =>
+                        {
+                            let old_fd = get_syscall_arg(&regs, abi.reg_arg1);
                             let newfd = get_syscall_arg(&regs, abi.reg_arg2);
                             if newfd <= 2 {
                                 static DUP_DIAG: std::sync::atomic::AtomicU64 =
@@ -24703,6 +24903,38 @@ pub fn run_ptrace_loop(
                                         pid, newfd, pc_val, region
                                     ));
                                 }
+                            }
+                            // 6-Z319: stash for the EXIT-side PIPE-DUP
+                            // observation (the new fd does not exist at
+                            // ENTRY; one-in-flight-per-thread stash, same
+                            // pattern as z305y_zclose_pending).
+                            if newfd > 2
+                                && z306_in_zygote_lineage(
+                                    pid,
+                                    &z306_zygote_lineage,
+                                    &mut z306_lineage_tgid_cache,
+                                )
+                            {
+                                z319_dup_pending.insert(pid, old_fd as i32);
+                            }
+                        }
+                        // ── 6-Z319: pipe2 ENTRY — stash the fds pointer ──
+                        //
+                        // The returned fds land in *arg0 (two i32s) — only
+                        // readable at EXIT. Stash the pointer (one per
+                        // thread, the same one-in-flight pattern). pipe2 is
+                        // seccomp-ALLOWED (native execution) and this arm
+                        // writes nothing — pure observation.
+                        n if n == libc::SYS_pipe2 as i64 => {
+                            let paddr = get_syscall_arg(&regs, abi.reg_arg1);
+                            if paddr != 0
+                                && z306_in_zygote_lineage(
+                                    pid,
+                                    &z306_zygote_lineage,
+                                    &mut z306_lineage_tgid_cache,
+                                )
+                            {
+                                z319_pipe2_pending.insert(pid, paddr);
                             }
                         }
                         n if n == abi.getpid => {
@@ -32034,6 +32266,64 @@ pub fn run_ptrace_loop(
                             let _ = ptrace_setregs(pid, &regs_u, iov_len);
                         }
                     }
+                    // ── 6-Z319 EXIT arms: pipe2 creation + PIPE-DUP ────
+                    //
+                    // Pure observation. Keyed on the one-in-flight stashes
+                    // (the stdio pin rewrites only closes of fd 0/1/2, so
+                    // the stashes never collide with a rewritten syscall).
+                    if let Some(paddr) = z319_pipe2_pending.remove(&pid) {
+                        if ret == 0 {
+                            let fa = read_child_u32(pid, paddr);
+                            let fb = read_child_u32(pid, paddr + 4);
+                            if let (Some(fa), Some(fb)) = (fa, fb) {
+                                let z319_key = if z306_zygote_lineage.contains(&pid) {
+                                    pid
+                                } else {
+                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid)
+                                };
+                                if z319_pipe2_budget < 32 {
+                                    z319_pipe2_budget += 1;
+                                    log(&format!(
+                                        "6-Z319 PIPE2: pid={} fds=[{},{}]",
+                                        pid, fa, fb
+                                    ));
+                                }
+                                if z319_pipes_seen.len() > 512 {
+                                    z319_pipes_seen.clear();
+                                }
+                                let e = z319_pipes_seen.entry(z319_key).or_default();
+                                e.insert(fa as i32);
+                                e.insert(fb as i32);
+                            }
+                        }
+                    }
+                    if let Some(old_fd) = z319_dup_pending.remove(&pid) {
+                        if ret > 2 {
+                            let target =
+                                std::fs::read_link(format!("/proc/{}/fd/{}", pid, ret))
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                            if target.starts_with("pipe:") {
+                                let z319_key = if z306_zygote_lineage.contains(&pid) {
+                                    pid
+                                } else {
+                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid)
+                                };
+                                if z319_dup_budget < 32 {
+                                    z319_dup_budget += 1;
+                                    log(&format!(
+                                        "6-Z319 PIPE-DUP: pid={} old={} new={} -> {}",
+                                        pid, old_fd, ret, target
+                                    ));
+                                }
+                                if z319_pipes_seen.len() > 512 {
+                                    z319_pipes_seen.clear();
+                                }
+                                let e = z319_pipes_seen.entry(z319_key).or_default();
+                                e.insert(ret as i32);
+                            }
+                        }
+                    }
                     if past_first_execve {
                         if let Some((prctl_option, prctl_arg2)) = prctl_rewritten_args.remove(&pid)
                         {
@@ -38203,6 +38493,17 @@ mod tests {
     // injected close() syscalls. These tests pin the two pure
     // predicates the gate's correctness rides on: the leak matcher
     // (translated readlink targets) and the process-fork flags filter.
+
+    #[test]
+    fn z319_arm64_name_table_pipe2_is_59_not_58() {
+        // 6-Z319: the arm64 name table had `58 => "pipe2"` — an off-by-one
+        // (asm-generic: 58 = vhangup, 59 = pipe2; libc android-aarch64
+        // SYS_pipe2 = 59). The artifact labels name syscalls, so a wrong
+        // nr→name mapping poisons every decode that greps for "pipe2".
+        assert_eq!(arm64_generic_syscall_name(59), "pipe2");
+        assert_eq!(arm64_generic_syscall_name(58), "vhangup");
+        assert_ne!(arm64_generic_syscall_name(58), "pipe2");
+    }
 
     #[test]
     fn z306_leak_matcher_hits_translated_preload_paths() {
