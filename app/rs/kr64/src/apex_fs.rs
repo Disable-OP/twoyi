@@ -507,7 +507,55 @@ impl Ext4Image {
     /// Permission denied" fleet-wide, boringssl_self_test64
     /// (reboot_on_failure) rebooted the guest mid-boot (ladder
     /// 34104378680 post-mortem "Reboot ending, jumping to kernel").
+    /// 6-Z312: like [`Self::extract_tree_for_guest`] with NO guest-root
+    /// anchor: absolute payload symlink targets are materialized
+    /// verbatim. Legacy entry point (kept for tests and non-guest
+    /// extraction); the production flatten path is
+    /// [`Self::extract_tree_for_guest`].
     pub fn extract_tree(&mut self, src: &str, dst: &str) -> Result<usize, Ext4Error> {
+        let mut anchored = 0usize;
+        let mut kept_absolute = 0usize;
+        self.extract_tree_inner(src, dst, None, &mut anchored, &mut kept_absolute)
+    }
+
+    /// 6-Z312: like the tree materializer above, but with GUEST-ROOT
+    /// ANCHORING of absolute symlink targets.
+    ///
+    /// `rootfs` (when present) is the guest root directory this flattened
+    /// tree lives under (the same `rootfs` kr64 translates guest paths
+    /// into). Payload symlinks with ABSOLUTE targets (apexer/mke2fs emit
+    /// e.g. `/system/lib64/libunwindstack.so` for cross-partition deps)
+    /// are rewritten as LEXICAL RELATIVE paths from the materialized
+    /// link's directory, so the kernel walk stays inside the guest root.
+    pub fn extract_tree_for_guest(
+        &mut self,
+        src: &str,
+        dst: &str,
+        rootfs: Option<&str>,
+    ) -> Result<usize, Ext4Error> {
+        let mut anchored = 0usize;
+        let mut kept_absolute = 0usize;
+        let n = self.extract_tree_inner(src, dst, rootfs, &mut anchored, &mut kept_absolute)?;
+        if anchored > 0 || kept_absolute > 0 {
+            crate::info!(
+                "[KR64][apex] 6-Z312: anchored {} absolute symlink target(s) inside the guest root ({} kept absolute)",
+                anchored,
+                kept_absolute
+            );
+        }
+        Ok(n)
+    }
+
+    /// Core tree materializer used by both [`Self::extract_tree`] and
+    /// [`Self::extract_tree_for_guest`].
+    fn extract_tree_inner(
+        &mut self,
+        src: &str,
+        dst: &str,
+        rootfs: Option<&str>,
+        anchored: &mut usize,
+        kept_absolute: &mut usize,
+    ) -> Result<usize, Ext4Error> {
         let mut n = 0usize;
         let entries = self.list_dir(src)?;
         for e in entries {
@@ -519,7 +567,45 @@ impl Ext4Image {
             let src_ino = self.walk(&src_path)?.0;
             if src_ino.mode & S_IFMT == S_IFLNK {
                 let target_len = (src_ino.size as usize).min(59);
-                let target = String::from_utf8_lossy(&src_ino.i_block[..target_len]).into_owned();
+                let raw = String::from_utf8_lossy(&src_ino.i_block[..target_len]).into_owned();
+                // 6-Z312: an ABSOLUTE target can never resolve to the
+                // guest's /system under the no-chroot illusion — the
+                // HOST kernel follows the symlink mid-walk, before any
+                // kr64 syscall-arg translation can rewrite it. Rewrite
+                // it to the lexical RELATIVE path from the link's dir to
+                // <rootfs><target> — the same proven-resolvable class as
+                // the ROM's own relative links (bin -> system/bin,
+                // ../../apex/com.android.runtime/bin/linker64).
+                let target = if raw.starts_with('/') {
+                    match rootfs.and_then(|root| z312_relative_target(&dst_path, root, &raw)) {
+                        Some(rel) => {
+                            *anchored += 1;
+                            // Bounded per-boot witness: the first 8
+                            // rewrites name the exact payload links that
+                            // used to escape the rootfs.
+                            let seen = Z312_ANCHOR_WITNESS.fetch_update(
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                                |b| if b < 8 { Some(b + 1) } else { None },
+                            );
+                            if let Ok(_) = seen {
+                                crate::info!(
+                                    "[KR64][apex] 6-Z312: anchored absolute symlink {} -> {} (payload target {})",
+                                    dst_path,
+                                    rel,
+                                    raw
+                                );
+                            }
+                            rel
+                        }
+                        None => {
+                            *kept_absolute += 1;
+                            raw
+                        }
+                    }
+                } else {
+                    raw
+                };
                 let _ = std::fs::remove_file(&dst_path);
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(&target, &dst_path).map_err(Ext4Error::Io)?;
@@ -536,7 +622,13 @@ impl Ext4Image {
                         std::fs::Permissions::from_mode((src_ino.mode & 0o777) as u32),
                     );
                 }
-                n += 1 + self.extract_tree(&src_path, &dst_path)?;
+                n += 1 + self.extract_tree_inner(
+                    &src_path,
+                    &dst_path,
+                    rootfs,
+                    anchored,
+                    kept_absolute,
+                )?;
             } else {
                 let data = self.read_file_data(&src_ino)?;
                 if let Some(parent) = Path::new(&dst_path).parent() {
@@ -560,6 +652,51 @@ impl Ext4Image {
         }
         Ok(n)
     }
+}
+
+/// 6-Z312 bounded witness budget: the first 8 anchored rewrites per boot
+/// log their exact before/after targets; the rest are only counted in
+/// the summary line. (No log storms across 21 flattened payloads.)
+static Z312_ANCHOR_WITNESS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 6-Z312: lexical relative path from the directory of `dst_path` (the
+/// materialized link) to the guest-root-resolved absolute `target`.
+///
+/// `rootfs` is the guest root; `target` is an absolute GUEST path
+/// (starts with '/'). The result is a RELATIVE target that resolves to
+/// `<rootfs><target>` when followed from `dst_path`'s directory — the
+/// kernel walk never leaves the guest root. Returns None when the two
+/// paths share no prefix (link outside the guest root — caller keeps
+/// the absolute form).
+fn z312_relative_target(dst_path: &str, rootfs: &str, target: &str) -> Option<String> {
+    let root = rootfs.trim_end_matches('/');
+    if !target.starts_with('/') {
+        return None;
+    }
+    let target_guest = format!("{}{}", root, target);
+    let link_dir = std::path::Path::new(dst_path).parent()?.to_str()?;
+    fn comps(p: &str) -> Vec<&str> {
+        p.trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+    let link_comps = comps(link_dir);
+    let tgt_comps = comps(&target_guest);
+    let mut i = 0;
+    while i < link_comps.len() && i < tgt_comps.len() && link_comps[i] == tgt_comps[i] {
+        i += 1;
+    }
+    if i == 0 {
+        return None; // link lives outside the guest root — cannot anchor
+    }
+    let ups = link_comps.len() - i;
+    let mut out: Vec<&str> = std::iter::repeat("..").take(ups).collect();
+    out.extend_from_slice(&tgt_comps[i..]);
+    if out.is_empty() {
+        out.push(".");
+    }
+    Some(out.join("/"))
 }
 
 // ── tests ───────────────────────────────────────────────────────────
@@ -850,5 +987,125 @@ mod tests {
         let entries = fs.list_dir("/").unwrap();
         assert!(!entries.is_empty(), "real payload root must list");
         eprintln!("z305t smoke: {} root entries in {}", entries.len(), p);
+    }
+
+    /// 6-Z312 fixture: root dir with one regular file and TWO fast
+    /// symlinks — an ABSOLUTE cross-partition target (the dex2oat64
+    /// CANNOT LINK shape: com.android.art/lib64/libunwindstack.so ->
+    /// /system/lib64/libunwindstack.so) and a RELATIVE one.
+    /// Inodes: root=2, file=11, abs-link=12, rel-link=13.
+    fn build_z312_image() -> Vec<u8> {
+        let mut img = vec![0u8; 6 * 4096];
+        let bs = 4096usize;
+        let sb = 1024usize;
+        img[sb + 0x00..sb + 0x04].copy_from_slice(&32u32.to_le_bytes()); // inodes_count
+        img[sb + 0x04..sb + 0x08].copy_from_slice(&6u32.to_le_bytes()); // blocks_count
+        img[sb + 0x14..sb + 0x18].copy_from_slice(&0u32.to_le_bytes()); // first_data_block
+        img[sb + 0x18..sb + 0x1C].copy_from_slice(&2u32.to_le_bytes()); // log_block_size (4096)
+        img[sb + 0x20..sb + 0x24].copy_from_slice(&32768u32.to_le_bytes()); // blocks_per_group
+        img[sb + 0x28..sb + 0x2C].copy_from_slice(&32u32.to_le_bytes()); // inodes_per_group
+        img[sb + 0x38..sb + 0x3A].copy_from_slice(&0xEF53u16.to_le_bytes()); // magic
+        img[sb + 0x4C..sb + 0x50].copy_from_slice(&1u32.to_le_bytes()); // rev dynamic
+        img[sb + 0x54..sb + 0x58].copy_from_slice(&11u32.to_le_bytes()); // first_ino
+        img[sb + 0x58..sb + 0x5A].copy_from_slice(&256u16.to_le_bytes()); // inode_size
+        img[sb + 0x60..sb + 0x64].copy_from_slice(&0x242u32.to_le_bytes()); // FILETYPE|EXTENTS|FLEX_BG
+        let gdt = block_at(1);
+        img[gdt + 8..gdt + 12].copy_from_slice(&2u32.to_le_bytes()); // bg_inode_table_lo
+        let it = block_at(2);
+        let root = it + 256; // ino 2
+        img[root..root + 2].copy_from_slice(&0x41EDu16.to_le_bytes()); // S_IFDIR|0755
+        img[root + 4..root + 8].copy_from_slice(&4096u32.to_le_bytes());
+        img[root + 32..root + 36].copy_from_slice(&0x80000u32.to_le_bytes());
+        let eh = extent_header(1, 0);
+        img[root + 40..root + 52].copy_from_slice(&eh);
+        img[root + 52..root + 64].copy_from_slice(&extent_leaf(0, 3));
+        let f = it + 10 * 256; // ino 11
+        img[f..f + 2].copy_from_slice(&0x81A4u16.to_le_bytes()); // S_IFREG|0644
+        img[f + 4..f + 8].copy_from_slice(&4u32.to_le_bytes());
+        img[f + 32..f + 36].copy_from_slice(&0x80000u32.to_le_bytes());
+        let eh2 = extent_header(1, 0);
+        img[f + 40..f + 52].copy_from_slice(&eh2);
+        img[f + 52..f + 64].copy_from_slice(&extent_leaf(0, 4));
+        let abs_target = b"/system/lib64/libunwind.so";
+        let sl = it + 11 * 256; // ino 12
+        img[sl..sl + 2].copy_from_slice(&0xA1FFu16.to_le_bytes()); // S_IFLNK|0777
+        img[sl + 4..sl + 8].copy_from_slice(&(abs_target.len() as u32).to_le_bytes());
+        img[sl + 40..sl + 40 + abs_target.len()].copy_from_slice(abs_target);
+        let rel_target = b"../share/librel.so";
+        let sl2 = it + 12 * 256; // ino 13
+        img[sl2..sl2 + 2].copy_from_slice(&0xA1FFu16.to_le_bytes());
+        img[sl2 + 4..sl2 + 8].copy_from_slice(&(rel_target.len() as u32).to_le_bytes());
+        img[sl2 + 40..sl2 + 40 + rel_target.len()].copy_from_slice(rel_target);
+        let mut dirdata = Vec::new();
+        dirdata.extend_from_slice(&dirent(2, ".", 2));
+        dirdata.extend_from_slice(&dirent(2, "..", 2));
+        dirdata.extend_from_slice(&dirent(11, "a.so", 1));
+        dirdata.extend_from_slice(&dirent(12, "libunwind.so", 7));
+        dirdata.extend_from_slice(&dirent(13, "librel.so", 7));
+        dirdata.resize(bs, 0);
+        let d3 = block_at(3);
+        img[d3..d3 + bs].copy_from_slice(&dirdata);
+        let f4 = block_at(4);
+        img[f4..f4 + 4].copy_from_slice(b"ELF\x02");
+        img
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn z312_absolute_payload_symlink_is_anchored_inside_guest_root() {
+        let mut fs = open_img(build_z312_image());
+        let root = std::env::temp_dir().join(format!("twoyi-z312-root-{}-a", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dst = root.join("apex").join("com.android.art").join("lib64");
+        std::fs::create_dir_all(&dst).unwrap();
+        let n = fs
+            .extract_tree_for_guest("/", dst.to_str().unwrap(), Some(root.to_str().unwrap()))
+            .unwrap();
+        assert!(n >= 3, "expected file + 2 links, got {}", n);
+        // from <root>/apex/com.android.art/lib64 -> <root>/system/lib64/libunwind.so
+        let t = std::fs::read_link(dst.join("libunwind.so")).unwrap();
+        assert_eq!(
+            t.to_str().unwrap(),
+            "../../../system/lib64/libunwind.so",
+            "absolute payload target must be rewritten relative to the guest root"
+        );
+        // the anchored link must RESOLVE to the guest-root file — the
+        // runtime validation of the lexical relative math
+        std::fs::create_dir_all(root.join("system").join("lib64")).unwrap();
+        std::fs::write(
+            root.join("system").join("lib64").join("libunwind.so"),
+            b"ELF",
+        )
+        .unwrap();
+        let resolved = std::fs::read(dst.join("libunwind.so")).unwrap();
+        assert_eq!(resolved, b"ELF");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn z312_relative_targets_and_unanchored_extraction_stay_verbatim() {
+        // anchored extraction: RELATIVE payload targets are kept as-is
+        let mut fs = open_img(build_z312_image());
+        let root = std::env::temp_dir().join(format!("twoyi-z312-root-{}-b", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dst = root.join("apex").join("com.android.art").join("lib64");
+        std::fs::create_dir_all(&dst).unwrap();
+        fs.extract_tree_for_guest("/", dst.to_str().unwrap(), Some(root.to_str().unwrap()))
+            .unwrap();
+        let rel = std::fs::read_link(dst.join("librel.so")).unwrap();
+        assert_eq!(rel.to_str().unwrap(), "../share/librel.so");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // legacy extract_tree (no anchor): absolute target verbatim
+        let mut fs2 = open_img(build_z312_image());
+        let root2 = std::env::temp_dir().join(format!("twoyi-z312-root-{}-c", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root2);
+        let dst2 = root2.join("x");
+        std::fs::create_dir_all(&dst2).unwrap();
+        fs2.extract_tree("/", dst2.to_str().unwrap()).unwrap();
+        let abs = std::fs::read_link(dst2.join("libunwind.so")).unwrap();
+        assert_eq!(abs.to_str().unwrap(), "/system/lib64/libunwind.so");
+        let _ = std::fs::remove_dir_all(&root2);
     }
 }

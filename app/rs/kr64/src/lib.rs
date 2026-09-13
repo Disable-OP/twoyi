@@ -5399,7 +5399,14 @@ fn flatten_apex_payloads(cfg: &Config) {
         // marker forces a one-time re-extraction with mode preservation.
         // "v3:" (6-Z306n): re-extract + apply the CFI-slowpath neutering
         // to the staged libdl.so — persisted v2 trees predate the patch.
-        let want = format!("v3:{}:{}", meta.len(), mtime);
+        // "v4:" (6-Z312): re-extract with GUEST-ROOT ANCHORING of the
+        // payload's ABSOLUTE symlink targets — persisted v3 trees carry
+        // links like /apex/com.android.art/lib64/libunwindstack.so ->
+        // /system/lib64/libunwindstack.so, which the HOST kernel resolves
+        // mid-walk OUTSIDE the guest rootfs (the no-chroot illusion), so
+        // the linker silently loaded a foreign copy of the library (the
+        // rn259/rn260 dex2oat64 CANNOT LINK 'Reparse' fleet).
+        let want = format!("v4:{}:{}", meta.len(), mtime);
         let dst = format!("{}/{}", apex_stage_root, apex_name);
         let marker = format!("{}/.twoyi_extracted", dst);
         if let Ok(c) = std::fs::read_to_string(&marker) {
@@ -5408,7 +5415,7 @@ fn flatten_apex_payloads(cfg: &Config) {
                 continue;
             }
         }
-        match flatten_one_apex(&path, &dst, &marker, &want, &cfg.data_dir) {
+        match flatten_one_apex(&path, &dst, &marker, &want, &cfg.data_dir, &cfg.rootfs) {
             Ok(_) => {
                 flattened += 1;
             }
@@ -5439,6 +5446,7 @@ fn flatten_one_apex(
     marker: &str,
     marker_val: &str,
     data_dir: &str,
+    rootfs: &str,
 ) -> Result<usize, String> {
     let img_bytes = apex_extract::extract_apex_payload_img(apex_path)?;
     let tmp = format!(
@@ -5452,7 +5460,14 @@ fn flatten_one_apex(
     std::fs::write(&tmp, &img_bytes).map_err(|e| e.to_string())?;
     let mut img = apex_fs::Ext4Image::open(&tmp).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    let n = img.extract_tree("/", dst).map_err(|e| e.to_string())?;
+    // 6-Z312: anchor the payload's ABSOLUTE symlink targets inside the
+    // guest root — under the no-chroot illusion the HOST kernel follows
+    // symlinks mid-walk, so an absolute /system/... target escapes the
+    // guest rootfs entirely (foreign library loads / ENOENT) before any
+    // kr64 syscall-arg translation can see it.
+    let n = img
+        .extract_tree_for_guest("/", dst, Some(rootfs))
+        .map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&tmp);
 
     // 6-Z306n: neuter the CFI slowpath in the apex-staged libdl.so.
