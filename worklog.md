@@ -28980,3 +28980,23 @@ Stage Summary / RN267 DECODE TREE:
 4. Recovery gate 4/4 GREEN mandatory (the hook change is shared with recovery-class boots — the corpus validates it directly).
 5. Do NOT chase: the audio abandoned-mutex fleet (off the bootstrap path), the drm/nnapi VINTF crash-loop fleet, HOST logcat streams, iorapd misses.
 - PAT location (propagate in every summary): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat), never printed/committed.
+
+---
+Task ID: 54b (same leg, continued)
+Agent: Z.ai Code (main session, continued)
+Task: Decode rn267 (the 6-Z318 fatal-evidence mirror's first live run); close the leg with the next-leg fix tree.
+
+Work Log:
+- **RN267 (34765859077) DECODED — rung 7; recovery gate SUCCESS (6th consecutive GREEN); the hook change built clean via the real NDK in the ladder's own build-apk job.**
+- **6-Z318 PROVEN ON ITS FIRST RUN — ABORT CAUSES NOW NAMEABLE**: the kmsg mirror carries `<3>[twrp_fb_hook] abort message scan:@24:...`, `caller region: <maps line>`, and `abort-diag: raw tid/pid` lines. Named this run: `Check failed: registerAsService(instance_name()) == android::OK` (health@2.1-class HIDL registration aborts, tid 2743), `failed to get socket from init: Permission denied` + `: Success` (**tombstoned** aborts — the dump-chain breaker), `Check failed: drmFactory->registerAsService("clearkey"/"widevine")` (the known crash-loop fleet). The 96-byte scan cap truncates the instance name — widen to 256 on a future instrument leg.
+- **THE ERA-1 ANATOMY (the wall, completed to the byte)**: era-1 system_server main = pid 5195 (comm=system_server). It NEVER reached the suspend wait (0 suspend get-hits before +712s). It parked in `read(fd=80)` — and the 6-Z315 bypass + 6-Z317 stack delivered the FULL datum: stack window `libc(read) ← libmeminfo.so ← libandroid_runtime.so` (window may carry stale frames — not a proven unwinding), **STALL-TARGET: fd=80 → pipe:[208619] flags 00 pos 0**, and **PIPE-PEER: pipe:[208619] held ONLY by pid 5195 itself — fd 5 (read, O_RDONLY), fd 6 (write, O_WRONLY), fd 80 (read dup)**. Main reads a pipe whose every end lives in system_server's own fd table: NOBODY can ever write or EOF it. The guest's own ANR "Waiting Channels" dump confirms the same class in a later era (main futex, a sibling thread anon_pipe_read).
+- **THE PIPE = THE ZYGOTE-FORK SPECIALIZE/PERFETTO-CLASS PIPE**: fds 5/6 of the same inode appear across the zygote-lineage fork fleet (5195/5196/5197 — 5196 = the Signal Catcher thread, kr64 tracks guest threads as pids). On a real-kernel A11 boot system_server main NEVER reads this pipe; the child's inherited-fd set / close contract (A11 fdsToClose + the fork-and-specialize handshake) is mis-bookkept under kr64 — the prime suspect is the **6-Z305z close-path drift class ("a close path BOTH hook layers miss")**: the read end survived into the child, and main's first generic read on it blocks forever. The per-era symptom variety (rn262 pipe-read / rn263 same via libmeminfo window / rn264 futex / rn266 SIGABRT at PMS) is consistent with ONE upstream fd-hygiene defect hit by whichever thread touches the leaked fd first; the abort variant (rn266) is now nameable live thanks to 6-Z318.
+- Dispatched NOTHING this half-leg deliberately: rn268 without the fd-hygiene fix would reproduce rn267 (the instrument set is sufficient; the DEFECT is named).
+
+Stage Summary / NEXT-LEG FIX TREE:
+1. PRIMARY: land the zygote-fork fd-hygiene fix — enumerate the guest's close paths (libc close, close_range, dup2/dup3-to-same-fd, the A11 fdsToClose list execution, the loader shlib's fd virtualization) and find which variant escapes both layers (6-Z305z); make the child's post-handshake fd set match the real-kernel contract (read end closed in the child, write end closed in the parent, no leaked read dup at fd 80-class).
+2. Instrument support: if the close-drift is hard to find statically, arm a bounded dup/close TRACE for the zygote-lineage fds 5/6/80-class (create-time + close-time lines, one-shot per fd) so the next run names the exact syscall that leaked the dup.
+3. Widen the 6-Z318 abort-message scan cap 96→256 bytes (the instance names were truncated mid-word).
+4. EXPECT after the fix: era-1 main passes the read → suspend chain completes → PMS constructor completes (the rn266 abort path is now visible by name; if it fires, its fix is next) → rung 8 (SystemUI) reachable.
+5. Recovery gate 4/4 GREEN mandatory after any fd-contract change (recoveries use the same fork paths).
+- PAT location (propagate in every summary): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat), never printed/committed.
