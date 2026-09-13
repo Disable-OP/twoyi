@@ -14988,6 +14988,11 @@ pub fn run_ptrace_loop(
         std::collections::HashSet::new();
     // 6-Z306af: per-run cap on EXIT-event death-site captures.
     let mut z306af_deaths: u64 = 0;
+    // 6-Z309c: pids whose fatal-EXIT death already logged its verdict
+    // line (once per pid — the verdict must stay bounded in a crash
+    // loop while still naming EVERY first-time fatality).
+    let mut z309c_verdict_logged: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     // 6-Z306af-d: fork-time executable-maps snapshots for lineage
     // processes (taken at the PR_SET_NAME rename — see the 6-Z306x
     // hook). At the fatal-signal EXIT event the live
@@ -17034,6 +17039,28 @@ pub fn run_ptrace_loop(
                                     || ev == libc::PTRACE_EVENT_CLONE as u32
                                 {
                                     let z306_child = new_child_id as libc::pid_t;
+                                    // 6-Z309c: read the child's
+                                    // /proc/<pid>/status ONCE here (the
+                                    // CLONE classification already needed it)
+                                    // and KEEP the Tgid — at a fatal-EXIT
+                                    // event the same read is ENOENT (the
+                                    // rn254 era deaths: the TGID's sibling
+                                    // threads died 700ms before it and their
+                                    // thread-of-lineage verdict silently
+                                    // failed on the dead-time lookup,
+                                    // skipping the death-site register
+                                    // capture for the group-kill's REAL
+                                    // first-faulting thread).
+                                    let z306_status_read = if ev == libc::PTRACE_EVENT_CLONE as u32
+                                    {
+                                        std::fs::read_to_string(format!(
+                                            "/proc/{}/status",
+                                            z306_child
+                                        ))
+                                        .ok()
+                                    } else {
+                                        None
+                                    };
                                     let z306_is_thread = if ev == libc::PTRACE_EVENT_CLONE as u32 {
                                         // CLONE fires for thread creation
                                         // AND for clone()-created
@@ -17044,18 +17071,15 @@ pub fn run_ptrace_loop(
                                         // below, while a misfiled THREAD
                                         // would burn the af-d maps-snapshot
                                         // budget.
-                                        match std::fs::read_to_string(format!(
-                                            "/proc/{}/status",
-                                            z306_child
-                                        )) {
-                                            Ok(s) => s.lines().any(|l| {
+                                        match &z306_status_read {
+                                            Some(s) => s.lines().any(|l| {
                                                 l.strip_prefix("Tgid:")
                                                     .and_then(|v| {
                                                         v.trim().parse::<libc::pid_t>().ok()
                                                     })
                                                     .is_some_and(|t| t != z306_child)
                                             }),
-                                            Err(_) => true,
+                                            None => true,
                                         }
                                     } else {
                                         // fork/vfork always create processes.
@@ -17063,6 +17087,21 @@ pub fn run_ptrace_loop(
                                     };
                                     if z306_is_thread {
                                         z306_lineage_threads.insert(z306_child);
+                                        // 6-Z309c: pin the TGID while the
+                                        // status read is already in hand
+                                        // (death-time re-reads are ENOENT —
+                                        // see above).
+                                        if let Some(s) = &z306_status_read {
+                                            if let Some(t) = s.lines().find_map(|l| {
+                                                l.strip_prefix("Tgid:").and_then(|v| {
+                                                    v.trim().parse::<libc::pid_t>().ok()
+                                                })
+                                            }) {
+                                                if z306_lineage_tgid_cache.len() < 512 {
+                                                    z306_lineage_tgid_cache.insert(z306_child, t);
+                                                }
+                                            }
+                                        }
                                     } else {
                                         z306_zygote_lineage.insert(z306_child);
                                     }
@@ -17542,15 +17581,38 @@ pub fn run_ptrace_loop(
                                         &z306_zygote_lineage,
                                         &mut z306_lineage_tgid_cache,
                                     );
-                                if z306af_deaths < 32
+                                let af_cap_will_fire = z306af_deaths < 32
                                     && af_is_lineage
                                     && !z306af_delivery_dumped.contains(&pid)
                                     && (term_sig == libc::SIGSEGV
                                         || term_sig == libc::SIGBUS
                                         || term_sig == libc::SIGILL
                                         || term_sig == libc::SIGFPE
-                                        || term_sig == libc::SIGABRT)
-                                {
+                                        || term_sig == libc::SIGABRT);
+                                // 6-Z309c (the rn254 era-death decode): the
+                                // era TGID's death-site capture fired but its
+                                // dying SIBLING THREADS (first-to-die 700ms
+                                // earlier — the group-kill's real fault site)
+                                // produced NO capture and NO verdict, so the
+                                // first death was unattributable offline. One
+                                // bounded verdict line per fatal-EXIT death
+                                // (pid, sig, lineage verdict incl.
+                                // thread-of-lineage via the 6-Z309c
+                                // creation-time TGID pin, capture outcome).
+                                if z309c_verdict_logged.insert(pid) {
+                                    let af_tgid_v =
+                                        z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(0);
+                                    log(&format!(
+                                        "6-Z309c: fatal-EXIT pid={} sig={} lineage={} tgid={} capture={} (cap {}/32)",
+                                        pid,
+                                        term_sig,
+                                        af_is_lineage,
+                                        af_tgid_v,
+                                        af_cap_will_fire,
+                                        z306af_deaths
+                                    ));
+                                }
+                                if af_cap_will_fire {
                                     z306af_deaths += 1;
                                     z306af_delivery_dumped.insert(pid);
                                     // #212 lesson: at the EXIT event after a
@@ -37315,7 +37377,24 @@ pub fn run_ptrace_loop(
                                 {
                                     use std::sync::atomic::{AtomicU64, Ordering};
                                     static Z308B_FD_DUMPS: AtomicU64 = AtomicU64::new(0);
-                                    if Z308B_FD_DUMPS.fetch_add(1, Ordering::Relaxed) < 8 {
+                                    // 6-Z309c: lineage-priority budget — the
+                                    // flat 8-dump budget was consumed by the
+                                    // early crash-loop fleets before +25.5s in
+                                    // rn253/rn254 while the era deaths (the fd
+                                    // evidence's actual target) got zero.
+                                    static Z308B_FD_DUMPS_LINEAGE: AtomicU64 = AtomicU64::new(0);
+                                    let z308b_lineage = pid == init_pid
+                                        || z306_in_zygote_lineage(
+                                            pid,
+                                            &z306_zygote_lineage,
+                                            &mut z306_lineage_tgid_cache,
+                                        );
+                                    let z308b_budget_ok = if z308b_lineage {
+                                        Z308B_FD_DUMPS_LINEAGE.fetch_add(1, Ordering::Relaxed) < 8
+                                    } else {
+                                        Z308B_FD_DUMPS.fetch_add(1, Ordering::Relaxed) < 8
+                                    };
+                                    if z308b_budget_ok {
                                         let mut z308b_lines: Vec<String> = Vec::new();
                                         for fd in 0..24i32 {
                                             if let Ok(target) = std::fs::read_link(format!(
