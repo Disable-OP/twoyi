@@ -394,12 +394,33 @@ jobs:
           # thread idle, blocked in recv, or never started?"). The guest
           # runs under the app's uid (u0_a87) while the HOST's own init is
           # root — the uid filter keeps this artifact GUEST-only.
-          timeout 30 sudo docker exec redroid sh -c \
-            "for p in \$(ps -A | grep -E '^u0_a87 .* (init|ueventd|libkr64.so)$' | awk '{print \$2}'); do \
+          # 6-Z313: dump EVERY guest process's threads (was: init/ueventd/
+          # libkr64 only). The rn261 decode needed system_server's own
+          # thread states at wedge time (#243/#244: main parked in
+          # read(pipe) vs futex_do_wait — per-generation shapes) and the
+          # parked HAL fleet's per-thread wait class. Main is always the
+          # first row (tid == pid), so head -24 keeps it while bounding
+          # the artifact; per-process echo names the owner.
+          timeout 60 sudo docker exec redroid sh -c \
+            "for p in \$(ps -A | grep '^u0_a87 ' | awk '{print \$2}'); do \
                echo \"== threads of \$p (\$(cat /proc/\$p/cmdline 2>/dev/null | tr '\0' ' '))\"; \
                ps -T -p \$p 2>/dev/null | head -24; \
              done" \
             > /tmp/ui-e2e-artifacts/guest-threads.txt 2>&1 || true
+          # ── 6-Z313: GUEST logcat drain (the guest's own log timeline) ──
+          # kr64 stages twoyi-logdrain.rc: the ROM's own logcat tails the
+          # GUEST logd into {rootfs}/data/local/tmp/twoyi-guest-logcat.log
+          # (rotated ≤10 MiB). Only this artifact carries the Watchdog
+          # kill SUBJECT and the guest's own HidlServiceManagement /
+          # SystemServerTiming lines — the logcat captures below are the
+          # redroid HOST's Android. Bounded: sizes + tail 4000 lines.
+          timeout 45 sudo docker exec redroid sh -c \
+            "r=/data/user/0/io.twoyi.debug/profiles/default/rootfs; \
+             ls -la \$r/data/local/tmp/twoyi-guest-logcat.log* 2>/dev/null; \
+             for f in \$r/data/local/tmp/twoyi-guest-logcat.log \$r/data/local/tmp/twoyi-guest-logcat.log.1; do \
+               [ -f \$f ] && echo \"== \$f (\$(stat -c%s \$f) bytes) tail 4000 ==\" && tail -n 4000 \$f; \
+             done" \
+            > /tmp/ui-e2e-artifacts/guest-logcat.txt 2>&1 || true
           timeout 45 sudo docker exec redroid sh -c \
             "tail -n 20000 /data/user/0/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || tail -n 20000 /data/data/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null" \
             > /tmp/ui-e2e-artifacts/kr64-app-stderr-dockerexec.log 2>&1 || true
