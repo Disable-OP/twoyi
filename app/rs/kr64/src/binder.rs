@@ -2001,6 +2001,14 @@ struct ConnBox {
     /// transactions THIS conn served via the proxy's per-conn lines.
     sender_tid: u32,
     dev_code: u32,
+    /// 6-Z325: bounded steal-delivery watch — armed when the 6-Z271g
+    /// steal hands an ONEWAY transaction to a sibling pool thread. The
+    /// next `BC_FREE_BUFFER` from this conn is the SUCCESS signal (the
+    /// guest's `IPCThreadState::executeCommand` ran the delivered
+    /// transaction to its Parcel-teardown end — the exact stage the
+    /// rn273 decode found missing: no free, no transact, ws=0 loop);
+    /// no free within 1s names the delivery dropped again.
+    steal_watch: Option<(std::time::Instant, u32)>,
     /// 6-Z306ab: the stability-annotation wire format for THIS
     /// connection. false (default) = the android-11 plain-Level form
     /// (`Stability::Level` values 3/12/63 — the ONLY values A11's
@@ -2218,22 +2226,34 @@ impl BusState {
 
     /// 6-Z276: record a `registerForNotifications` watcher for `name`.
     /// Duplicate (conn, ptr) registrations are ignored (libbinder dedupes
-    /// too — one callback object per service).
-    fn add_watcher(&mut self, name: &str, w: ServiceWatcher) {
+    /// too — one callback object per service). Returns `true` only when a
+    /// NEW watcher entry was stored (6-Z325: the node-ref mirror fires
+    /// once per STORED entry, keeping the mirror count equal to the
+    /// registry's ref count — a duplicate register must not inflate it).
+    fn add_watcher(&mut self, name: &str, w: ServiceWatcher) -> bool {
         let list = self.watchers.entry(name.to_string()).or_default();
         if !list.iter().any(|x| x.conn == w.conn && x.ptr == w.ptr) {
             list.push(w);
+            true
+        } else {
+            false
         }
     }
 
     /// 6-Z276: drop a watcher (libbinder `unregisterForNotifications`).
-    fn remove_watcher(&mut self, name: &str, conn: ConnId, ptr: u64) {
+    /// Returns `true` when an entry was actually removed (6-Z325: the
+    /// BR_RELEASE mirror only fires for a real drop).
+    fn remove_watcher(&mut self, name: &str, conn: ConnId, ptr: u64) -> bool {
+        let mut removed = false;
         if let Some(list) = self.watchers.get_mut(name) {
+            let before = list.len();
             list.retain(|x| !(x.conn == conn && x.ptr == ptr));
+            removed = list.len() != before;
             if list.is_empty() {
                 self.watchers.remove(name);
             }
         }
+        removed
     }
 
     /// 6-Z276: drop every watcher registered by a dying connection.
@@ -3474,7 +3494,12 @@ fn handle_write_read(
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
                         resp_blobs.push(RequestBlob { data, offsets, sg });
                     }
-                    TransactionResult::ReplySpawnLooper { data, offsets, sg } => {
+                    TransactionResult::ReplySpawnLooper {
+                        mirror,
+                        data,
+                        offsets,
+                        sg,
+                    } => {
                         // 6-Z324: kernel pool-thread recruitment — the
                         // BR_SPAWN_LOOPER is PREPENDED (binder_thread_read
                         // order) so the client processes it before the
@@ -3482,6 +3507,23 @@ fn handle_write_read(
                         // non-terminal event and spawns a pooled reader
                         // that drains the queued oneway callback.
                         push_br_spawn_looper(&mut read_buf);
+                        // 6-Z325: the watcher-callback node-ref mirror rides
+                        // the same batch (kernel: the SM's strong ref on the
+                        // callback node is mirrored to the owner as
+                        // BR_ACQUIRE — binder_node_post_acquire). Without it
+                        // the transient BnHw callback wrapper dies right
+                        // after the register reply and the delivered
+                        // onRegistration is neutralized by the loader's
+                        // liveness gate (the rn273 wall).
+                        if let Some((br, ptr, cookie)) = mirror {
+                            read_buf.extend_from_slice(&br.to_ne_bytes());
+                            read_buf.extend_from_slice(&ptr.to_ne_bytes());
+                            read_buf.extend_from_slice(&cookie.to_ne_bytes());
+                            info!(
+                                "[KR64][binder][vm{}] 6-Z325: watcher node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
+                                vm_id, conn_id, br, ptr, cookie
+                            );
+                        }
                         push_br_transaction_complete(&mut read_buf);
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
                         resp_blobs.push(RequestBlob { data, offsets, sg });
@@ -3600,6 +3642,24 @@ fn handle_write_read(
                 // acknowledge a death notification. With v2 blobs the
                 // client frees its own stash; v1 has no buffers to free.
                 // Either way: no-op.
+                //
+                // 6-Z325: on a conn with a pending steal-delivery watch a
+                // BC_FREE_BUFFER is the SUCCESS signal — the guest's
+                // executeCommand processed the steal-delivered oneway to
+                // its Parcel-teardown end (transact ran, freeBuffer ran).
+                if cmd == BC_FREE_BUFFER {
+                    let mut b = bus.lock().expect("binder bus poisoned");
+                    if let Some(bx) = b.conns.get_mut(&conn_id) {
+                        if let Some((t0, code)) = bx.steal_watch.take() {
+                            info!(
+                                "[KR64][binder][vm{}] 6-Z325: steal-delivered oneway (code={}) freed after {}ms — the pool thread executed the callback transaction",
+                                vm_id,
+                                code,
+                                t0.elapsed().as_millis()
+                            );
+                        }
+                    }
+                }
             }
             BC_ENTER_LOOPER | BC_REGISTER_LOOPER | BC_EXIT_LOOPER => {
                 info!(
@@ -3635,6 +3695,25 @@ fn handle_write_read(
                     cmd,
                     psize
                 );
+            }
+        }
+    }
+
+    // 6-Z325: the steal-delivery watch timeout leg — a steal-delivered
+    // oneway whose conn neither freed it (BC_FREE_BUFFER) nor is
+    // running it (no ws>0 for 1s) was dropped by the guest again;
+    // name it once, then disarm (the budget already limited arming).
+    {
+        let mut b = bus.lock().expect("binder bus poisoned");
+        if let Some(bx) = b.conns.get_mut(&conn_id) {
+            if let Some((t0, code)) = bx.steal_watch {
+                if t0.elapsed() >= std::time::Duration::from_secs(1) {
+                    bx.steal_watch = None;
+                    warning!(
+                            "[KR64][binder][vm{}] 6-Z325: steal-delivered oneway (code={}) NOT freed within 1000ms — the pool thread's executeCommand dropped it again",
+                            vm_id, code
+                        );
+                }
             }
         }
     }
@@ -3848,6 +3927,19 @@ fn handle_write_read(
                     }
                 };
                 if let Some(tx) = stolen {
+                    // 6-Z325: arm the bounded steal-delivery watch (oneway
+                    // only — a sync steal is proven by its BC_REPLY).
+                    if tx.one_way && Z325_STEAL_WATCH_BUDGET.load(Ordering::Relaxed) > 0 {
+                        Z325_STEAL_WATCH_BUDGET.fetch_sub(1, Ordering::Relaxed);
+                        if let Some(bx) = bus
+                            .lock()
+                            .expect("binder bus poisoned")
+                            .conns
+                            .get_mut(&conn_id)
+                        {
+                            bx.steal_watch = Some((std::time::Instant::now(), tx.code));
+                        }
+                    }
                     info!(
                     "[KR64][binder][vm{}] process-pool steal: conn={} takes tx #{} queued for a sibling (code={})",
                     vm_id, conn_id, tx.txn_id, tx.code
@@ -4105,6 +4197,21 @@ enum TransactionResult {
     /// does the same on the registration reply the waiter is guaranteed
     /// to read.
     ReplySpawnLooper {
+        /// 6-Z325: an optional node-ref mirror command that rides the SAME
+        /// batch (kernel binder_thread_read order: BR_SPAWN_LOOPER is
+        /// prepended at the buffer top, the todo work — here the watcher
+        /// callback's `BR_ACQUIRE` — follows, then the completion+reply).
+        /// The registerForNotifications arms set it when they STORE a new
+        /// watcher: without the mirrored strong ref the transient BnHw
+        /// callback wrapper dies right after the register reply (its only
+        /// user-space ref is the marshal temporary) and the stored
+        /// (ptr, cookie) become freed chunks — the rn273 wall: the
+        /// delivered onRegistration was neutralized by the loader's
+        /// 6-Z306z liveness gate (weakref round-trip failed on reused
+        /// memory: mStrong=49/mBase=0xf) and Waiter::onRegistration never
+        /// ran. The mirror is the kernel's own
+        /// binder_node_post_acquire → BR_ACQUIRE semantics.
+        mirror: Option<(u32, u64, u64)>,
         data: Vec<u8>,
         offsets: Vec<u8>,
         sg: Vec<SgBuf>,
@@ -4954,7 +5061,17 @@ fn servicemanager_proxy(
                     // real servicemanager adds the listener before the
                     // preexisting check, so this caller is notified both by
                     // the immediate fire below and by later addService calls.
-                    b.add_watcher(&name, w);
+                    let added = b.add_watcher(&name, w);
+                    // 6-Z325: when a NEW watcher entry was stored, pin the
+                    // caller's local callback wrapper with the kernel's own
+                    // node-ref mirror (the SM holds a strong ref on the
+                    // callback node — binder_node_post_acquire → BR_ACQUIRE
+                    // to the owner). Without it the transient BnHw wrapper
+                    // dies after the register reply and the queued
+                    // onRegistration can never execute (the rn273 wall).
+                    if added {
+                        mirror = Some((BR_ACQUIRE, f.binder, f.cookie));
+                    }
                     match b.services.get(&name).map(|e| e.handle) {
                         Some(h) => {
                             // Already registered: immediate preexisting
@@ -4996,7 +5113,13 @@ fn servicemanager_proxy(
             let flat = reader.read_flat_binder();
             if let Some(f) = flat {
                 let mut b = bus.lock().expect("binder bus poisoned");
-                b.remove_watcher(&name, conn_id, f.binder);
+                // 6-Z325: mirror the ref drop for a real removal — the
+                // registry's strong ref on the callback node goes away
+                // (kernel: BR_RELEASE to the owner; the Waiter::done()
+                // path keeps its own local sp<> alive for the call).
+                if b.remove_watcher(&name, conn_id, f.binder) {
+                    mirror = Some((BR_RELEASE, f.binder, f.cookie));
+                }
                 info!(
                     "[KR64][binder][svc] 6-Z276: unregisterForNotifications({}) conn={} — dropped",
                     name, conn_id
@@ -5020,25 +5143,31 @@ fn servicemanager_proxy(
     }
 
     let (data, offsets) = writer.into_parts();
-    match mirror {
-        Some((br, mptr, mcookie)) => TransactionResult::ReplyMirrored {
+    if spawn_looper {
+        // 6-Z324/6-Z325: the registerForNotifications replies carry BOTH
+        // the pool-thread recruitment AND (when a new watcher was stored)
+        // the callback's node-ref mirror — one combined batch.
+        TransactionResult::ReplySpawnLooper {
+            mirror,
+            data,
+            offsets,
+            sg: Vec::new(),
+        }
+    } else if let Some((br, mptr, mcookie)) = mirror {
+        TransactionResult::ReplyMirrored {
             br,
             ptr: mptr,
             cookie: mcookie,
             data,
             offsets,
             sg: Vec::new(),
-        },
-        None if spawn_looper => TransactionResult::ReplySpawnLooper {
+        }
+    } else {
+        TransactionResult::Reply {
             data,
             offsets,
             sg: Vec::new(),
-        },
-        None => TransactionResult::Reply {
-            data,
-            offsets,
-            sg: Vec::new(),
-        },
+        }
     }
 }
 
@@ -5742,7 +5871,7 @@ fn servicemanager_hidl(
                 // listener FIRST (ServiceManager.cpp: the callback goes
                 // into the listener list before any preexisting check), so
                 // future (re)registrations of this key notify this caller.
-                b.add_watcher(
+                let added = b.add_watcher(
                     &key,
                     ServiceWatcher {
                         conn: conn_id,
@@ -5751,6 +5880,19 @@ fn servicemanager_hidl(
                         hidl: true,
                     },
                 );
+                // 6-Z325: when a NEW watcher entry was stored, pin the
+                // caller's local callback wrapper with the kernel's own
+                // node-ref mirror (hwservicemanager holds a strong ref on
+                // the callback node — binder_node_post_acquire →
+                // BR_ACQUIRE to the owner). Without it the transient BnHw
+                // wrapper dies after the register reply and the queued
+                // onRegistration can never execute (the rn273 wall: the
+                // A11 Waiter::onFirstRef registers a marshal-transient
+                // BnHwIServiceNotification whose weakref chunk was already
+                // reused at delivery time — mStrong=49/mBase=0xf).
+                if added {
+                    mirror = Some((BR_ACQUIRE, f.binder, f.cookie));
+                }
                 match b.services.get(&key).map(|e| e.handle) {
                     Some(h) => {
                         // Already registered: the immediate preexisting
@@ -5815,7 +5957,12 @@ fn servicemanager_hidl(
             if let Some(f) = flat {
                 let key = format!("{}/{}", fq, inst);
                 let mut b = bus.lock().expect("binder bus poisoned");
-                b.remove_watcher(&key, conn_id, f.binder);
+                // 6-Z325: mirror the ref drop for a real removal (the
+                // kernel releases the SM's node ref on unregister →
+                // BR_RELEASE to the owner).
+                if b.remove_watcher(&key, conn_id, f.binder) {
+                    mirror = Some((BR_RELEASE, f.binder, f.cookie));
+                }
                 info!(
                     "[KR64][binder][svc] 6-Z276: HIDL unregisterForNotifications({}) conn={} — dropped",
                     key, conn_id
@@ -6093,17 +6240,27 @@ fn servicemanager_hidl(
     }
 
     let (data, offsets, sg) = writer.into_parts_with_sg();
-    match mirror {
-        Some((br, mptr, mcookie)) => TransactionResult::ReplyMirrored {
+    if spawn_looper {
+        // 6-Z324/6-Z325: the HIDL registerForNotifications replies carry
+        // BOTH the pool-thread recruitment AND (when a new watcher was
+        // stored) the callback's node-ref mirror — one combined batch.
+        TransactionResult::ReplySpawnLooper {
+            mirror,
+            data,
+            offsets,
+            sg,
+        }
+    } else if let Some((br, mptr, mcookie)) = mirror {
+        TransactionResult::ReplyMirrored {
             br,
             ptr: mptr,
             cookie: mcookie,
             data,
             offsets,
             sg,
-        },
-        None if spawn_looper => TransactionResult::ReplySpawnLooper { data, offsets, sg },
-        None => TransactionResult::Reply { data, offsets, sg },
+        }
+    } else {
+        TransactionResult::Reply { data, offsets, sg }
     }
 }
 
@@ -6931,6 +7088,12 @@ fn push_br_transaction_complete(buf: &mut Vec<u8>) {
 static PROBE_CAPTURE_BUDGET: AtomicU32 = AtomicU32::new(32);
 static PROBE_SERVE_BUDGET: AtomicU32 = AtomicU32::new(32);
 static PROBE_DELIVERY_BUDGET: AtomicU32 = AtomicU32::new(96);
+
+/// 6-Z325: bounded steal-delivery watches per boot. The rn273 decode leg
+/// needs the SUCCESS/FAIL signal of a steal-delivered oneway callback
+/// (the pool thread's executeCommand ran it → BC_FREE_BUFFER). Budgeted
+/// like the probe classes so the watch can never turn into log flood.
+static Z325_STEAL_WATCH_BUDGET: AtomicU32 = AtomicU32::new(8);
 
 /// 6-Z309d: the shared recently-served registry (pid → last-delivery
 /// instant), capped at 64 entries. The tracer's EXIT-event death capture
@@ -10502,6 +10665,179 @@ mod tests {
             }
             _ => panic!("onRegistration not queued on the caller's inbox"),
         }
+    }
+
+    /// 6-Z325 HIDL: a registerForNotifications that STORES a new watcher
+    /// pins the caller's local callback wrapper — the reply batch carries
+    /// the node-ref mirror `[BR_ACQUIRE][ptr][cookie]` (kernel
+    /// binder_node_post_acquire semantics). A duplicate register does NOT
+    /// add a second mirror (the registry holds ONE ref per stored entry),
+    /// and the unregister mirrors the drop with BR_RELEASE.
+    fn tr_label(t: &TransactionResult) -> &'static str {
+        match t {
+            TransactionResult::Failed => "Failed",
+            TransactionResult::CompleteOnly => "CompleteOnly",
+            TransactionResult::Reply { .. } => "Reply",
+            TransactionResult::ReplySpawnLooper { .. } => "ReplySpawnLooper",
+            TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
+        }
+    }
+
+    #[test]
+    fn z325_hidl_register_reply_mirrors_callback_acquire() {
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        let cb_ptr: u64 = 0xABCD_0002;
+        let cb_cookie: u64 = 0xFEED_F00D;
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+
+        let build_req = |bus_ref: &std::sync::Arc<std::sync::Mutex<BusState>>| -> RequestBlob {
+            let _ = bus_ref;
+            hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|b| {
+                b.string_arg("android.system.suspend@1.0::ISystemSuspend");
+                b.string_arg("default");
+                b.binder_arg(&FlatBinderObject {
+                    r#type: BINDER_TYPE_BINDER,
+                    flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                    binder: cb_ptr,
+                    cookie: cb_cookie,
+                });
+            })
+        };
+
+        // Watching path (the service does NOT exist yet): the mirror still
+        // rides the reply — hwservicemanager holds the listener ref for the
+        // future fire too.
+        let req = build_req(&bus);
+        match servicemanager_hidl(HIDL_SM_REGISTER_FOR_NOTIFICATIONS, &req, &bus, caller) {
+            TransactionResult::ReplySpawnLooper { mirror, .. } => {
+                assert_eq!(
+                    mirror,
+                    Some((BR_ACQUIRE, cb_ptr, cb_cookie)),
+                    "the stored watcher's callback wrapper is pinned with BR_ACQUIRE"
+                );
+            }
+            other => panic!("expected ReplySpawnLooper, got {}", tr_label(&other)),
+        }
+
+        // The watcher list holds the entry (watching, not consumed).
+        assert!(
+            bus.lock()
+                .expect("bus")
+                .watchers
+                .contains_key("android.system.suspend@1.0::ISystemSuspend/default"),
+            "watching watcher stays registered"
+        );
+
+        // Duplicate register (same conn + ptr): no second mirror — the
+        // registry's ref count is one per STORED entry.
+        let req2 = build_req(&bus);
+        match servicemanager_hidl(HIDL_SM_REGISTER_FOR_NOTIFICATIONS, &req2, &bus, caller) {
+            TransactionResult::ReplySpawnLooper { mirror, .. } => {
+                assert_eq!(mirror, None, "duplicate register adds no ref");
+            }
+            other => panic!("expected ReplySpawnLooper, got {}", tr_label(&other)),
+        }
+
+        // Unregister: the drop mirrors as BR_RELEASE on the reply batch.
+        let req3 = hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|b| {
+            b.string_arg("android.system.suspend@1.0::ISystemSuspend");
+            b.string_arg("default");
+            b.binder_arg(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: cb_ptr,
+                cookie: cb_cookie,
+            });
+        });
+        match servicemanager_hidl(HIDL_SM_UNREGISTER_FOR_NOTIFICATIONS, &req3, &bus, caller) {
+            TransactionResult::ReplyMirrored {
+                br, ptr, cookie, ..
+            } => {
+                assert_eq!(br, BR_RELEASE, "unregister drops the node ref");
+                assert_eq!(ptr, cb_ptr);
+                assert_eq!(cookie, cb_cookie);
+            }
+            other => panic!("expected ReplyMirrored, got {}", tr_label(&other)),
+        }
+        assert!(
+            !bus.lock()
+                .expect("bus")
+                .watchers
+                .contains_key("android.system.suspend@1.0::ISystemSuspend/default"),
+            "watcher removed"
+        );
+    }
+
+    /// 6-Z325 AIDL twin: registerForNotifications mirrors BR_ACQUIRE for a
+    /// stored watcher; unregisterForNotifications mirrors BR_RELEASE.
+    #[test]
+    fn z325_aidl_register_reply_mirrors_callback_acquire() {
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        let cb_ptr: u64 = 0x1234_5679;
+        let cb_cookie: u64 = 0x0BAD_C0DF;
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+        let svc = "suspend_control";
+
+        let build_req = || {
+            let mut args = ParcelWriter::new();
+            args.write_string16(svc);
+            args.write_flat_binder(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: cb_ptr,
+                cookie: cb_cookie,
+            });
+            let (d, o) = make_servicemanager_request_parcel(&mut args);
+            RequestBlob {
+                data: d,
+                offsets: o,
+                sg: Vec::new(),
+            }
+        };
+
+        let blob = build_req();
+        match servicemanager_proxy(
+            SVC_MGR_REGISTER_FOR_NOTIFICATIONS,
+            &bus,
+            Some(&blob),
+            caller,
+        ) {
+            TransactionResult::ReplySpawnLooper { mirror, .. } => {
+                assert_eq!(
+                    mirror,
+                    Some((BR_ACQUIRE, cb_ptr, cb_cookie)),
+                    "AIDL watcher callback pinned with BR_ACQUIRE"
+                );
+            }
+            other => panic!("expected ReplySpawnLooper, got {}", tr_label(&other)),
+        }
+        assert!(
+            bus.lock().expect("bus").watchers.contains_key(svc),
+            "AIDL watching watcher stays registered"
+        );
+
+        let blob = build_req();
+        match servicemanager_proxy(
+            SVC_MGR_UNREGISTER_FOR_NOTIFICATIONS,
+            &bus,
+            Some(&blob),
+            caller,
+        ) {
+            TransactionResult::ReplyMirrored {
+                br, ptr, cookie, ..
+            } => {
+                assert_eq!(br, BR_RELEASE, "AIDL unregister drops the node ref");
+                assert_eq!(ptr, cb_ptr);
+                assert_eq!(cookie, cb_cookie);
+            }
+            other => panic!("expected ReplyMirrored, got {}", tr_label(&other)),
+        }
+        assert!(
+            !bus.lock().expect("bus").watchers.contains_key(svc),
+            "watcher removed"
+        );
     }
 
     // ====================================================================
