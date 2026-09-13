@@ -1924,6 +1924,15 @@ def main():
                     base_procs = procs
                     last_progress_at = elapsed
                 elif elapsed >= 60 and elapsed - last_progress_at >= stall_budget:
+                    # 6-Z321b (rn268 decode): the workflow input documents
+                    # stall_seconds=0 as "0 disables fast-fail", but the old
+                    # condition treated 0 as INSTANT-FAIL (elapsed -
+                    # last_progress_at >= 0 is always true) — the watch
+                    # ended on the first quiet sample and the evidence bundle
+                    # was cut mid-boot. Honor the contract: only fast-fail
+                    # when a real stall budget was requested.
+                    if stall_budget <= 0:
+                        continue
                     stalled_at = elapsed
                     print()
                     print("=" * 60)
