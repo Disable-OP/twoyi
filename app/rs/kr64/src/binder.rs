@@ -4442,30 +4442,43 @@ fn flat_at_first_binder_offset_pos(blob: &RequestBlob) -> Option<usize> {
 
 // ─── 6-Z306am: Task-21 mirror A/B (mandated by the #224/#226 decode tree) ───
 //
-// ARM B (ACTIVE): the registration tails' IN-TRANSACTION mirror — the
-// [BR_ACQUIRE] prefix that 6-Z306ae-e prepends to the same-ioctl
-// [BR_TRANSACTION_COMPLETE][BR_REPLY] batch — is SKIPPED for
-// self-transactions (issuer conn == owner conn; tautologically true at
-// addService: a service registers itself). The hypothesis under test
-// (Task-21 sharpened, #220/#222/#224-#227 gen-1 witnesses): the prefix
-// mis-sequences a same-conn waitForResponse and wedges the registering
-// process (the Watchdog SIGKILL class with the garbage-futex-address
-// witness, uaddr=-512).
+// VERDICT (ladder #253, the android.system.suspend wall): ARM B IS
+// STRUCTURALLY FATAL for binderized HIDL services — the A/B experiment
+// contract above is settled, and the winner is the kernel-true ordering
+// (ARM A, the prefix ON).
 //
-// Liveness is PRESERVED: the skipped acquire rides the PRE-6-Z306ae-e
-// path — a `DeferredReply::RefCmd` on the issuer's reply_queue,
-// delivered on its NEXT read (the same delivery the old-owner RELEASE
-// already uses; the delivery re-checks the liveness gate and pads
-// BR_NOOP when the object died). Ladder #207's free-then-acquire race
-// therefore reopens BY CONSTRUCTION — accepted, bounded, and itself
-// diagnostic: if the wedge disappears anyway, the PREFIX was the wedge;
-// if the #207 HAL-carnage class explodes instead, the in-transaction
-// placement is load-bearing (both verdicts drive the permanent redesign).
+// The #253 wire decode (2df64813 artifacts): the suspend daemon's
+// generated registerAsService() holds the BnHw wrapper in a LOCAL sp<>
+// for the duration of the addWithChain round trip; the SM's node ref is
+// the ONLY other strong ref, and under arm B it is queued as a RefCmd
+// for the daemon's NEXT read. registerAsService() returns → the local
+// sp<> drops → the wrapper's destructor runs (RefBase's dtor nulls
+// mRefs — the [R+8]=0x0 fingerprint) → the queued RefCmd's delivery-time
+// mirror_ref_ok then reads the POST-MORTEM memory, rules the object
+// Dead, and pads BR_NOOP — the SM's strong ref NEVER lands. The
+// registry keeps serving a dead-cookie handle: every client ping →
+// BR_DEAD_REPLY → "getService: found dead hwbinder service for
+// android.system.suspend@1.0::ISystemSuspend/default" → the
+// PowerManagerService constructor loop-waits forever → system_server
+// killed → zygote reforks → boot loop (5 eras in the 900s window).
+// The delivery-time gate is self-fulfilling: it checks the liveness of
+// an object whose death was CAUSED by the ref's non-delivery.
 //
-// ARM A (baseline): `false` → the current prefix behavior. The verdict
-// flips this const (or deletes the gate) and the winning shape becomes
-// permanent.
-const Z306AM_SELF_MIRROR_PREFIX_OFF: bool = true;
+// ARM A closes the window BY CONSTRUCTION: [BR_ACQUIRE] rides the same
+// ioctl reply BEFORE BR_TRANSACTION_COMPLETE/BR_REPLY, so the guest's
+// waitForResponse incStrongs the LIVE object while the registering
+// thread is still inside transact — identical to the real kernel's
+// in-kernel node ref + ordered ref-notification. The #220-#227 wedge
+// hypothesis was never pinned to the prefix (the era's SM reply shapes
+// were broken — pre-6-Z307d BAD_TYPE/EX_TRANSACTION_FAILED fleets); the
+// recovery-corpus gate + the next ladder re-verify arm A on the current
+// wire. If a registering-process wedge class returns with THIS decode's
+// instruments, the artifact will name it — do not re-raise arm B
+// without decoding one.
+//
+// ARM A (ACTIVE): `false` — the in-transaction prefix mirrors for ALL
+// registrations, self-transactions included (6-Z306ae-e behavior).
+const Z306AM_SELF_MIRROR_PREFIX_OFF: bool = false;
 
 /// 6-Z306am: bounded arm-B skip log — the first 24 skips per boot, then
 /// silent (the registration storm makes this line hot).
