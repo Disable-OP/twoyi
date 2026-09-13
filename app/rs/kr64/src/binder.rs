@@ -3474,6 +3474,18 @@ fn handle_write_read(
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
                         resp_blobs.push(RequestBlob { data, offsets, sg });
                     }
+                    TransactionResult::ReplySpawnLooper { data, offsets, sg } => {
+                        // 6-Z324: kernel pool-thread recruitment — the
+                        // BR_SPAWN_LOOPER is PREPENDED (binder_thread_read
+                        // order) so the client processes it before the
+                        // reply; `waitForResponse` treats it as a
+                        // non-terminal event and spawns a pooled reader
+                        // that drains the queued oneway callback.
+                        push_br_spawn_looper(&mut read_buf);
+                        push_br_transaction_complete(&mut read_buf);
+                        push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
+                        resp_blobs.push(RequestBlob { data, offsets, sg });
+                    }
                     TransactionResult::ReplyMirrored {
                         br,
                         ptr,
@@ -4070,6 +4082,33 @@ enum TransactionResult {
         offsets: Vec<u8>,
         sg: Vec<SgBuf>,
     },
+    /// 6-Z324: a Reply that PREPENDS `[BR_SPAWN_LOOPER]` to the
+    /// `[BR_TRANSACTION_COMPLETE][BR_REPLY]` batch — the kernel's own
+    /// pool-thread recruitment: `binder_thread_read` prepends
+    /// BR_SPAWN_LOOPER when the process has pending todo work (an incoming
+    /// async transaction) and no free pool thread. The client's
+    /// `IPCThreadState::executeCommand(BR_SPAWN_LOOPER)` spawns a pooled
+    /// binder thread that blocks in ioctl on the SAME device — it then
+    /// drains the queued oneway (the SM's `onRegistration` callback).
+    ///
+    /// RN272 decode: system_server's `waitForHwService` (A11
+    /// ServiceManagement.cpp Waiter, `isOnlyBinderThread()==false` mode)
+    /// registers for notifications and blocks on the Waiter condvar;
+    /// the preexisting-service `onRegistration` oneway was queued on the
+    /// REGISTERING thread's own conn — the only hwbinder thread of the
+    /// process — which is parked on the condvar and never reads again.
+    /// Without a pooled reader the callback never runs and main waits
+    /// forever (the PMS.<init> nativeSetAutoSuspend wall, eras at
+    /// +186.9s/+493.7s in rn272: registerForNotifications reply received,
+    /// then 264s of wire silence). The kernel breaks this on real devices
+    /// by recruiting a pool thread via BR_SPAWN_LOOPER; the proxy now
+    /// does the same on the registration reply the waiter is guaranteed
+    /// to read.
+    ReplySpawnLooper {
+        data: Vec<u8>,
+        offsets: Vec<u8>,
+        sg: Vec<SgBuf>,
+    },
     /// Transaction accepted with no in-ioctl reply: one-way, or a routed
     /// sync call whose `BC_REPLY` resolves on the requester's LATER read
     /// (kernel semantics — 6-Z271i deferred resolution).
@@ -4580,6 +4619,9 @@ fn servicemanager_proxy(
     // the reply unblocks the registering thread (no free-then-acquire
     // race; see TransactionResult::ReplyMirrored).
     let mut mirror: Option<(u32, u64, u64)> = None;
+    // 6-Z324: see servicemanager_hidl — the AIDL registerForNotifications
+    // arm sets this for the same pool-thread recruitment.
+    let mut spawn_looper = false;
     // Consume the AIDL interface-token header.
     let (_strict, _work, tag, iface) = match reader.read_aidl_header() {
         Some(v) => v,
@@ -4928,6 +4970,10 @@ fn servicemanager_proxy(
                         None => false,
                     }
                 };
+                // 6-Z324: the caller is ABOUT to wait for this callback —
+                // recruit a pooled reader via BR_SPAWN_LOOPER on this
+                // reply (the AIDL twin of the HIDL waitForHwService fix).
+                spawn_looper = true;
                 info!(
                     "[KR64][binder][svc] 6-Z276: registerForNotifications({}) conn={} — {}",
                     name,
@@ -4979,6 +5025,11 @@ fn servicemanager_proxy(
             br,
             ptr: mptr,
             cookie: mcookie,
+            data,
+            offsets,
+            sg: Vec::new(),
+        },
+        None if spawn_looper => TransactionResult::ReplySpawnLooper {
             data,
             offsets,
             sg: Vec::new(),
@@ -5456,6 +5507,12 @@ fn servicemanager_hidl(
     // 6-Z306ae-e: set by the registration arms — see the AIDL twin +
     // TransactionResult::ReplyMirrored (in-transaction node-ref mirror).
     let mut mirror: Option<(u32, u64, u64)> = None;
+    // 6-Z324: the registerForNotifications arm sets this — the reply
+    // prepends BR_SPAWN_LOOPER (kernel pool-thread recruitment) so the
+    // waiter's process gains a pooled hwbinder reader that can drain the
+    // queued onRegistration oneway while the registering thread waits on
+    // the Waiter condvar (the rn272 waitForHwService deadlock).
+    let mut spawn_looper = false;
     // HIDL replies carry no AIDL exception prefix; the object (if any)
     // lands at offsets[0] and HIDL reads it there. The status prefix is
     // harmless for HIDL and correct for any libbinder-side reader.
@@ -5719,6 +5776,12 @@ fn servicemanager_hidl(
             } else {
                 false
             };
+            // 6-Z324: the caller is ABOUT to wait for this callback (the
+            // A11 waitForHwService Waiter). Recruit a pooled hwbinder
+            // reader now via BR_SPAWN_LOOPER on this reply — the kernel's
+            // own mechanism — so the queued onRegistration oneway has a
+            // reader even if the registering thread parks on its condvar.
+            spawn_looper = true;
             // Reply: bool registered = true (the registration itself took;
             // HIDL bool = 1 byte, hwbinder::Parcel::writeBool = writeInt8).
             writer.write_u8(1);
@@ -6039,6 +6102,7 @@ fn servicemanager_hidl(
             offsets,
             sg,
         },
+        None if spawn_looper => TransactionResult::ReplySpawnLooper { data, offsets, sg },
         None => TransactionResult::Reply { data, offsets, sg },
     }
 }
@@ -6823,6 +6887,13 @@ fn write_frame(stream: &mut UnixStream, resp: &Resp) -> io::Result<()> {
 /// Push `[BR_NOOP]` (4 bytes, no payload).
 fn push_br_noop(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&BR_NOOP.to_ne_bytes());
+}
+
+/// Push `[BR_SPAWN_LOOPER]` (4 bytes, no payload) — 6-Z324: the kernel's
+/// pool-thread recruitment command (binder_thread_read prepends it when
+/// the process has pending todo work and no free pool thread).
+fn push_br_spawn_looper(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&BR_SPAWN_LOOPER.to_ne_bytes());
 }
 
 /// Push `[BR_FAILED_REPLY]` (4 bytes, no payload).
@@ -10296,17 +10367,20 @@ mod tests {
             });
         });
         match servicemanager_hidl(HIDL_SM_REGISTER_FOR_NOTIFICATIONS, &req, &bus, caller) {
-            TransactionResult::Reply { data, offsets, .. } => {
+            TransactionResult::ReplySpawnLooper { data, offsets, .. } => {
                 assert!(offsets.is_empty(), "no binder objects in the reply");
                 // [status ok][u8 1][3 pad]
                 assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+                // The variant ITSELF pins the 6-Z324 pool-thread recruitment
+                // (the read stream gains [BR_SPAWN_LOOPER] before the batch).
             }
             other => panic!(
-                "registerForNotifications must Reply, got non-Reply variant: {}",
+                "registerForNotifications must ReplySpawnLooper, got non-matching variant: {}",
                 match other {
                     TransactionResult::Failed => "Failed",
                     TransactionResult::CompleteOnly => "CompleteOnly",
-                    TransactionResult::Reply { .. } => unreachable!(),
+                    TransactionResult::Reply { .. } => "Reply (no spawn-looper!)",
+                    TransactionResult::ReplySpawnLooper { .. } => unreachable!(),
                     TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
                 }
             ),
@@ -10388,13 +10462,14 @@ mod tests {
             Some(&blob),
             caller,
         ) {
-            TransactionResult::Reply { .. } => {}
+            TransactionResult::ReplySpawnLooper { .. } => {}
             other => panic!(
-                "registerForNotifications must Reply, got non-Reply variant: {}",
+                "registerForNotifications must ReplySpawnLooper, got non-matching variant: {}",
                 match other {
                     TransactionResult::Failed => "Failed",
                     TransactionResult::CompleteOnly => "CompleteOnly",
-                    TransactionResult::Reply { .. } => unreachable!(),
+                    TransactionResult::Reply { .. } => "Reply (no spawn-looper!)",
+                    TransactionResult::ReplySpawnLooper { .. } => unreachable!(),
                     TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
                 }
             ),
@@ -11606,6 +11681,7 @@ mod tests {
                     TransactionResult::Failed => "Failed",
                     TransactionResult::CompleteOnly => "CompleteOnly",
                     TransactionResult::Reply { .. } => unreachable!(),
+                    TransactionResult::ReplySpawnLooper { .. } => "ReplySpawnLooper",
                     TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
                 }
             ),
