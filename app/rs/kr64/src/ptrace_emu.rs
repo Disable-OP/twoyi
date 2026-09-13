@@ -17592,13 +17592,34 @@ pub fn run_ptrace_loop(
                                 // get EXIT-capture priority too (the rn255
                                 // suspend-daemon death: sig=11, no delivery
                                 // stop, lineage=false → no capture → the
-                                // crash site stayed unnamed).
-                                let af_served =
-                                    !af_is_lineage && crate::binder::recently_served(pid);
+                                // crash site stayed unnamed). 6-Z309e: the
+                                // registry tracks the SERVED pid (the TGID);
+                                // the SERVING THREAD that actually crashed
+                                // is a sibling tid (rn256: pids 2772/2777
+                                // tgid=2761 died at the same instant while
+                                // 2761's own registers showed the recvfrom
+                                // COLLATERAL position) — resolve the tid's
+                                // tgid (creation-time-pinned) and serve the
+                                // verdict through it as well.
+                                let af_served = {
+                                    if af_is_lineage {
+                                        false
+                                    } else if crate::binder::recently_served(pid) {
+                                        true
+                                    } else {
+                                        let t =
+                                            z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(0);
+                                        t != 0 && t != pid && crate::binder::recently_served(t)
+                                    }
+                                };
                                 let af_cap_will_fire = if af_is_lineage {
                                     z306af_deaths < 32
                                 } else if af_served {
-                                    z309d_deaths < 6
+                                    // 6-Z309e: 10 — the tgid-extension admits
+                                    // the fleet's serving THREADS too; keep a
+                                    // margin above the fleet's early crashes
+                                    // so the era deaths (+173s+) still fit.
+                                    z309d_deaths < 10
                                 } else {
                                     false
                                 } && !z306af_delivery_dumped.contains(&pid)
