@@ -28757,3 +28757,30 @@ Stage Summary / NEXT LEG DECODE TREE:
 3. Recovery gate 4/4 GREEN mandatory for any kr64 change (the fix touches the block/DM surface shared with recovery guests — OrangeFox/TWRP mount flows are the corpus baseline).
 4. Do NOT chase: media.swcodec/keystore crash loops (same class, lower priority than vold — vold is on the boot path), the HOST logcat streams (red noise), the health-hal/widevine restarts (not on the bootstrap critical path).
 - DISPATCHED this leg: rn258 (34743913616) — decoded here. No new dispatch pending: the vold fix needs its own decode+implementation first (rn259 without it would reproduce the loop).
+
+---
+Task ID: 47
+Agent: Z.ai Code (Twoyi mission leg, webDevReview cron "Continue")
+Task: Decode the rn258 vold wall ("could not find logical partition system_b: Inappropriate ioctl for device", vold main.cpp:239) and land the generic production fix.
+
+Work Log:
+- Sandbox restored: PAT at /home/z/.twoyi-pat.b64 (outside the repo, never printed; /tmp/twoyi_pat re-derived from it), credential helper exec-ok, main in sync, rn258 artifacts on disk (/home/z/artifacts-rn34743913616) — the whole leg decoded OFFLINE.
+- THE VOLD WALL DECODED END-TO-END (every link pinned):
+  1. 6-Z272j materializes /vendor/etc/fstab.ranchu from the FIRST content-bearing image fstab in scan order (root, etc, system/etc, …, vendor/etc, …). For the vendored A11 rootfs the winner is /etc/fstab.postinstall (979B) — the ROM fstab.ranchu (1108B, cuttlefish vdc/metadata/sdcard rows) sits at vendor/etc, deeper in the scan order.
+  2. fstab.postinstall's row `system /postinstall ext4 ro,nosuid,nodev,noexec slotselect_other,logical` resolves through slotselect_other to system_b (current slot _a → other slot _b — exactly the name in the FATAL).
+  3. AOSP A11 vold process_config (main.cpp, confirmed against the googlesource tag android-11.0.0_r1): the entry loop runs `if (entry.fs_mgr_flags.logical && !fs_mgr_update_logical_partition(&entry)) PLOG(FATAL) << "could not find logical partition " << entry.blk_device;` — ANY logical row in ANY fstab kills vold at startup; line 239 is that PLOG.
+  4. fs_mgr_update_logical_partition → DeviceMapper::Instance() opens /dev/device-mapper → the materialized defensive stub (symlink to /dev/null, the init "Wait for device-mapper returned after 10007ms" fix) → ioctl(DM_DEV_STATUS, …) on /dev/null → ENOTTY — the exact errno string in the abort message.
+  5. Result: vold crash loop (71 signal-6 deaths/era from +3.5s) → StorageManagerService/vold-dependent services park the bootstrap → PMS never finishes (package_native ×5621 miss, activity ×13692 miss across +21.8s→+917.2s).
+- LANDED 99d57e69 (fix(fs) 6-Z310): the 6-Z272j materializer now drops ANY row carrying the `logical` fs_mgr flag (counter in the materialization log line). Generic semantics: device-mapper does not exist in the virtual block world, so a logical row could never resolve in ANY guest boot mode (recovery or full Android); the partition trees the rows describe are provided by path translation. No per-ROM hack — the rule applies to whatever fstab an image carries. The physical postinstall fallback row (slotselect_other, non-logical) survives: vold never FATALs on non-logical rows, and a failed optional mount is noise, not death.
+- NEW contract test fstab_ranchu_alias_drops_logical_rows_vold_fatal_6z310 reproduces the exact A11 postinstall shape (logical row dropped wholesale, physical fallback preserved, container /data row appended). Gates: fmt clean, clippy -D warnings clean, 852/852 (851 + new).
+- Expected post-fix fstab.ranchu for the A11 image: postinstall comments + physical /postinstall fallback row + container /data row; vold's process_config finds no logical row → no FATAL → vold runs its real startup (vm->start()).
+- NEXT LEG DECODE TREE (rn259):
+  1. PRIMARY: confirm vold survives (0 "could not find logical partition", 0 vold signal-6; "init.svc.vold" stays running in the guest property area).
+  2. EXPECT the frontier to move to the bootstrap-throughput wall (PMS constructor → package_native registration → AMS "activity" registration). Each SystemServerTiming marker past StartActivityManager names the next wall precisely. Watch for vold-adjacent progress: with vold alive, StorageManagerService gets its binder target instead of a crash-looping one.
+  3. Recovery gate 4/4 GREEN mandatory (the fix touches the shared fstab materialization used by every guest — recovery corpus is the regression baseline; logical rows were never satisfiable, so GREEN is expected without bisect).
+  4. Do NOT chase: media.swcodec/keystore crash loops (unchanged class, not on the bootstrap critical path), the HOST logcat streams (red noise), the leftover by-name/system_b slotselect_other mount noise in mount_all (failed optional mount = log line only).
+- DISPATCHED on 99d57e69: ladder rn259 (ui-e2e-android-arm64, boot_wait 900, stall_seconds 0, expect_rung 0 — diagnostic) + recovery-corpus pr-tier gate. In flight at worklog-write.
+
+Stage Summary:
+- The vold crash loop was a fstab-CONSISTENCY defect, not a kernel-surface gap: the materializer was handing vold rows describing a block world (device-mapper logical partitions) that the virtual world intentionally does not have. One rule — "materialized fstabs describe the materialized world" — removes the wall class.
+- If rn259 confirms vold stability, the frontier is the PMS/AMS bootstrap wall and rung 8 (SystemUI) becomes reachable for the first time.
