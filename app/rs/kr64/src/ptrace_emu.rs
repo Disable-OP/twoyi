@@ -25134,6 +25134,106 @@ pub fn run_ptrace_loop(
                                     ));
                                 }
                             }
+                            // ── 6-Z321: the NAMESPACE KILL ISOLATION ────
+                            //
+                            // rn268 (run 34769266637) decode: era-1
+                            // system_server PASSED the entire rn267 wall
+                            // (StartWatchdog completed, ReadingSystemConfig
+                            // done, adbd up, watchdog dumps completing) — and
+                            // at +223.4s the TRACER (libkr64.so, pid 2664)
+                            // died SILENTLY: no 6-Z89 loop-exit line, no
+                            // 6-Z311 fatal-signal last-gasp — SIGKILL-class,
+                            // the only death that leaves no trace in an
+                            // instrumented process. With the tracer gone,
+                            // every untraced guest syscall hit the seccomp
+                            // filter and the guest subtree collapsed 85→4
+                            // processes ("kr64 child zombie in ps"
+                            // post-mortem).
+                            //
+                            // The contract gap this arm closes is
+                            // architectural and independent of who pulled the
+                            // trigger: the guest sees the REAL host /proc
+                            // (only select nodes are virtualized), so a guest
+                            // process can ADDRESS a real host pid — the app
+                            // (2034), the tracer (2664), the host framework —
+                            // that a real pid-namespace kernel would never
+                            // even NAME. kill(2)/tgkill(2)/rt_sigqueueinfo(2)
+                            // against such a target is the one syscall class
+                            // that can DESTROY the virtualizing machinery
+                            // itself. Honest namespace semantics: a process
+                            // in a pid namespace CANNOT signal what its
+                            // namespace does not contain — the kernel answers
+                            // -ESRCH. We make that true: an out-of-subtree pid
+                            // argument is REWRITTEN (register-arg rewrite —
+                            // the PROVEN primitive, the same one the 6-Z266
+                            // translation above uses) to a pid that can never
+                            // exist, so the real kernel returns the real
+                            // -ESRCH. No syscall-number rewrite (the 6-Z306f
+                            // lesson: entry-stop number rewrites do not take
+                            // on this aarch64 kernel), no EXIT faking.
+                            //
+                            // In-subtree targets (every tracked pid) pass
+                            // through untouched: guest↔guest signaling, init's
+                            // service-group kills, abort/raise — all native,
+                            // as before. kill(0)/negative pids keep their
+                            // kernel-native process-group semantics (they can
+                            // never name a specific foreign pid). A fake
+                            // tgid (1/0) was already translated to the
+                            // caller's own group above — in-subtree by
+                            // definition.
+                            {
+                                let z321_target: Option<i64> = if fake_self {
+                                    // The fake-self path above resolved the
+                                    // argument to the caller's own real tgid —
+                                    // self-signaling, always in-subtree.
+                                    None
+                                } else {
+                                    Some(pid_arg)
+                                };
+                                if let Some(t) = z321_target {
+                                    if t > 1 && !tracked_pids.contains(&(t as libc::pid_t)) {
+                                        // Rewrite the target to a pid that can
+                                        // never exist → the kernel returns the
+                                        // honest -ESRCH for exactly the reason
+                                        // a real namespace would give.
+                                        set_syscall_arg(&mut regs, abi.reg_arg1, 0x7fff_ffff);
+                                        if let Err(e) = ptrace_setregs(pid, &regs, iov_len) {
+                                            log(&format!(
+                                                "6-Z321: kill-isolation setregs FAILED pid={}: {} — out-of-subtree {}({}={}, sig={}) WILL EXECUTE",
+                                                pid,
+                                                e,
+                                                syscall_label,
+                                                if is_tgkill { "tgid" } else { "pid" },
+                                                t,
+                                                sig_arg
+                                            ));
+                                        } else {
+                                            static Z321_DENY_LOGGED: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            let dn = Z321_DENY_LOGGED
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if dn < 24 {
+                                                let comm = std::fs::read_to_string(format!(
+                                                    "/proc/{}/comm",
+                                                    pid
+                                                ))
+                                                .map(|c| c.trim_end().to_string())
+                                                .unwrap_or_else(|_| "?".to_string());
+                                                log(&format!(
+                                                    "6-Z321 KILL-ISOLATION: pid={} comm={:?} {}({}={}, sig={}) → target OUT of guest subtree → rewritten to pid=0x7fffffff (native ESRCH) [deny #{}]",
+                                                    pid,
+                                                    comm,
+                                                    syscall_label,
+                                                    if is_tgkill { "tgid" } else { "pid" },
+                                                    t,
+                                                    sig_arg,
+                                                    dn + 1
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         n if n == abi.open || n == abi.openat || n == abi.openat2 => {
                             let path_arg_index = if syscall_num == abi.open {
