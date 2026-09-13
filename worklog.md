@@ -28955,3 +28955,28 @@ Stage Summary / NEXT-LEG DECODE TREE:
 4. The run artifacts from rn262-265 are at /home/z/artifacts-rn262/263/265 (rn264 partially extracted — disk pressure; old artifact dirs were pruned).
 5. Do NOT chase: the crash-loop fleet, HOST logs, the events-buffer subject.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 54
+Agent: Z.ai Code (webDevReview cron "Continue" session, fresh sandbox leg)
+Task: Decode rn266 (the 6-Z317 futex-waiter stack's first live run); land the next production step; dispatch rn267 + recovery gate.
+
+Work Log:
+- Authentication is provided through the private agent environment.
+- **6-Z317 LANDED (bd16934d)**: futex waiters (aarch64 nr=98) join the 6-Z314 stall stack-window capture (stall_stack_family() + honest uaddr= hex label via stall_stack_arg_label()); gates fmt/clippy/862/862 + mount-table OK locally, CI lint+test green (34762619528). rn266 ladder (34763033491) + recovery pr-tier gate (34763034434) dispatched on bd16934d.
+- **RN266 (34763033491) DECODED — rung 7, recovery gate SUCCESS (5th consecutive GREEN)**:
+  1. 6-Z317 PROVEN at the wire: nr=98 waiters now yield stacks (statsd, linker64/shlib, surfaceflinger, audioflinger, zygote-class) — the instrument works.
+  2. **THE RN265 "TID 1 POISON" WAS AN OFFSET ARTIFACT**: bionic LP64 pthread_mutex_internal = {state(+0), __unused(+4), owner_tid(+8)} — rn265's "owner@+4=tid 1" read __unused; the instrument now reports owner@+8 (correct). rn266's real fleet: audio-class abandoned mutexes (owner word 0 = NORMAL-mutex no-owner-recorded; owner@+8=tid 84 DEAD in audioserver threads 3310/3311). The abandoned-mutex fleet is AUDIO-class — NOT the system_server wall; the poisoned-mutex common-denominator theory (Task 52) is DISPROVEN as the boot wall.
+  3. **THE ERA ANATOMY NAMED — MAIN DOES NOT HANG, IT ABORTS**: per era: PMS constructor → suspend waitForHwService (~8-11s; RESOLVES: get hit 0xc → cast probe 0xf43484e delivered+replied → code=1 acquireWakeLock delivered + BC_REPLY_SG + client read at +179.404s) → getTransport(power@1.0)→EMPTY (+179.413s) → **23s silence → main (4899) SIGABRT at +202.297s** (6-Z306af death-site: x8=0x62 restarted-futex collateral; "child 4902 killed by signal 6 after 11960542 iterations" — the JDWP thread) → init kills the zygote group (signal 9) → next era. ≥5 eras, all identical. The rn262-265 "per-generation wedge variety" was the same abort class seen through generation-zoo artifacts.
+  4. **THE ABORT WAS INVISIBLE — THE 6-Z171a EVIDENCE GAP**: the twrp_fb_hook intercepted the abort (`*** abort() INTERCEPTED *** caller_pc=0x0000e5be0e31d13c die=1`) but the maps dump + abort-message scan are STDERR-writes — /dev/null for every init-spawned service. No Fatal banner, no tombstone, no abort message anywhere. The ANR traces (50KB, the first working dumps of the mission) captured only the EARLIER suspend wait (era-1 WAITED_HALF); trace2 is a stale re-dump (sizes differ 31B = timestamps).
+  5. cache_key.is_interactive never landed (consistent with the abort interrupting invalidateIsInteractiveCaches' property-set).
+- **LANDED 8003d7f5 (fix(instruments) 6-Z318)**: the fatal-evidence KLOG MIRROR — (a) the abort-message scan line + an explicit no-[anon:abort message]-mapping marker now ride write_kmsg_line (dual-channel /dev/kmsg→/dev/__kmsg__→/dev/twoyi-fatal.log); (b) NEW fatal_emit_caller_region(pc): streams the child's own /proc/self/maps once, finds the line containing caller_pc, mirrors it ("<3>[twrp_fb_hook] caller region: ...") — the child's own maps read is always alive (6-Z167) where the tracer's EXIT-event read was ENOENT; (c) the 6-Z305t-72 raw tid/pid diag mirrored to kmsg. All one-shot (g_fatal_entered), bounded, raw-syscall only; stderr behavior unchanged (recovery regression-safe). Host syntax check: error count identical to baseline (2 pre-existing bionic/glibc header diffs).
+- **DISPATCHED on 8003d7f5**: rn267 ladder (boot_wait 900, stall 0, expect_rung 0) + recovery pr-tier gate — in flight at worklog-write.
+
+Stage Summary / RN267 DECODE TREE:
+1. PRIMARY: the `<3>[twrp_fb_hook] abort message scan:` / `caller region:` / `abort-diag:` lines in the guest kmsg mirror — they NAME the post-wakelock SIGABRT (library+offset + cause text). Expect the aborter around PMS constructor tail / VibratorService nativeInit / a scudo hardening CHECK.
+2. If the abort message names a missing-HAL class: the fix is the honest HAL semantics on that path (registration or tolerated-absence per A11 behavior — PMS TOLERATES missing power HAL; find what makes OUR world fatal).
+3. If no-mapping marker fires (libbase LOG(FATAL)/std::terminate class): symbolize caller region against the A11 source and land the semantic fix on THAT site.
+4. Recovery gate 4/4 GREEN mandatory (the hook change is shared with recovery-class boots — the corpus validates it directly).
+5. Do NOT chase: the audio abandoned-mutex fleet (off the bootstrap path), the drm/nnapi VINTF crash-loop fleet, HOST logcat streams, iorapd misses.
+- Authentication is provided through the private agent environment.
