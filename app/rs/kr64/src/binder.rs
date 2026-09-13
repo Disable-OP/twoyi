@@ -3762,13 +3762,40 @@ fn handle_write_read(
                 let stolen = {
                     let mut b = bus.lock().expect("binder bus poisoned");
                     let my_pid = b.conns.get(&conn_id).map(|bx| bx.sender_pid).unwrap_or(0);
+                    // 6-Z309f: device-consistent steal. The kernel serves
+                    // /dev/binder, /dev/hwbinder and /dev/vndbinder as
+                    // SEPARATE devices — node work queued for one device
+                    // can NEVER be read from another. The per-thread
+                    // proxy conns of ONE guest process span devices (a
+                    // HIDL daemon has hwbinder pool conns AND a
+                    // vndbinder/binder vendor side), so the pid filter
+                    // alone lets the WRONG device's pool thread steal a
+                    // queued transaction. The rn257 decode nailed the
+                    // consequence: a vndbinder thread (conn=14, tid=2894)
+                    // stole a hwbinder IEffectsFactory interfaceChain
+                    // probe and served it through android::BBinder's
+                    // transact — whose onTransact slot index (16) does
+                    // not exist in the hardware::BHwBinder vtable ABI
+                    // (onTransact@11) — the slot read returned a literal
+                    // zero offset-to-top and `blr 0` killed the daemon
+                    // (pc=0x0 SIGSEGV, group-kill, SM-waiter era aborts).
+                    // Same class via conn=8 (dev=binder) on the suspend
+                    // daemon at +176.1s. Under-stealing is always safe:
+                    // the tx simply waits for its owning conn (the
+                    // kernel's process-queue order), so unknown-device
+                    // pairs (dev_code=0, legacy shlib) only steal among
+                    // themselves (0==0 preserves the legacy corpus
+                    // behavior unchanged).
+                    let my_dev = b.conns.get(&conn_id).map(|bx| bx.dev_code).unwrap_or(0);
                     if my_pid == 0 {
                         None
                     } else {
                         let mut sibs: Vec<ConnId> = b
                             .conns
                             .iter()
-                            .filter(|(cid, bx)| **cid != conn_id && bx.sender_pid == my_pid)
+                            .filter(|(cid, bx)| {
+                                **cid != conn_id && bx.sender_pid == my_pid && bx.dev_code == my_dev
+                            })
                             .map(|(cid, _)| *cid)
                             .collect();
                         sibs.sort();
@@ -8553,6 +8580,174 @@ mod tests {
             br2, BR_REPLY,
             "B gets the stolen conn's reply on its own read"
         );
+        let off_b = 4 + read_b + 8;
+        let dl_b = u32::from_ne_bytes(resp_b[off_b..off_b + 4].try_into().unwrap()) as usize;
+        assert_eq!(dl_b, reply_data.len());
+        let got = &resp_b[off_b + 12..off_b + 12 + dl_b];
+        assert_eq!(got, reply_data, "reply bytes exact");
+
+        drop(stream_a);
+        drop(stream_b);
+        drop(stream_a2);
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z309f_steal_is_device_consistent() {
+        // The rn257 decode (artifacts 34740065041): the audio daemon's
+        // vndbinder pool thread (conn=14, tid=2894) stole a HWBINDER
+        // transaction queued for a hwbinder sibling and served it through
+        // android::BBinder::transact — the AIDL class's onTransact vtable
+        // slot (16) does not exist in the hardware::BHwBinder ABI
+        // (onTransact@11) — the slot read hit a literal-zero offset-to-top
+        // and `blr 0` killed the daemon (pc=0x0, group-kill, era aborts).
+        // The kernel NEVER routes node work across /dev/binder,
+        // /dev/hwbinder and /dev/vndbinder: the steal must only consider
+        // siblings serving the SAME device. This test: a hwbinder tx
+        // queued for a busy hwbinder conn is REJECTED by a vndbinder
+        // sibling (BR_NOOP — under-steal is safe, the owner pops it
+        // later) and accepted by a hwbinder sibling (the z271g behavior,
+        // preserved for same-device pools and legacy dev=0 pairs).
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        // IDENT v2 payload: pid, uid, pad, magic "idex", tid, dev.
+        let ident_v2 = |pid: u32, tid: u32, dev: u32| {
+            let mut p = Vec::with_capacity(24);
+            p.extend_from_slice(&pid.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p.extend_from_slice(&IDENT_EXT_MAGIC.to_ne_bytes());
+            p.extend_from_slice(&tid.to_ne_bytes());
+            p.extend_from_slice(&dev.to_ne_bytes());
+            p
+        };
+
+        // ---- Conn A (pid 7777, dev=hwbinder): addService("svc_hw") ----
+        let mut stream_a = UnixStream::connect(&path).expect("connect A");
+        let (ret_i, _r) = exchange(&mut stream_a, WIRE_CMD_IDENT, &ident_v2(7777, 7701, 2));
+        assert_eq!(ret_i, 0, "IDENT A accepted");
+        let mut args = ParcelWriter::new();
+        args.write_string16("svc_hw");
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0x2222,
+            cookie: 0x4444,
+        });
+        args.write_i32(0);
+        args.write_i32(0);
+        let (ad, ao) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &ad, &ao, 4096);
+        let (ret, resp) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0, "ADD_SERVICE ok");
+        assert_eq!(
+            u32::from_ne_bytes(resp[8..12].try_into().unwrap()),
+            BR_REPLY
+        );
+        // A parks WITHOUT reading — the next tx queues in its inbox.
+
+        // ---- Conn B (pid 8888, dev=hwbinder): getService → handle ----
+        let mut stream_b = UnixStream::connect(&path).expect("connect B");
+        let (ret_i2, _r2) = exchange(&mut stream_b, WIRE_CMD_IDENT, &ident_v2(8888, 8801, 2));
+        assert_eq!(ret_i2, 0);
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("svc_hw");
+        let (bd, bo) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload2 = make_v2_write_read_payload(&bc2, &bd, &bo, 4096);
+        let (ret2, resp2) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0);
+        let read_size2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
+        let off2 = 4 + read_size2 + 8;
+        let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        let blob2 = &resp2[off2 + 12..off2 + 12 + dl2];
+        let routed_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+
+        // ---- Conn B: transact(code=42) — completes in-ioctl, parks ----
+        let mut tx_b = [0u8; 64];
+        tx_b[0..4].copy_from_slice(&routed_handle.to_ne_bytes());
+        tx_b[16..20].copy_from_slice(&42u32.to_ne_bytes());
+        let tx_data: &[u8] = b"hw-tx-payload";
+        let tx_off = Vec::new();
+        let mut bc3 = Vec::with_capacity(4 + 64);
+        bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc3.extend_from_slice(&tx_b);
+        let payload3 = make_v2_write_read_multi_payload(&bc3, &[(tx_data, &tx_off)], 4096);
+        let (ret3, resp3) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload3);
+        assert_eq!(ret3, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp3[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE
+        );
+
+        // ---- Conn A-/vndbinder (pid 7777, dev=vndbinder): read-only ----
+        // MUST NOT steal: the tx is hwbinder node work, this thread's
+        // IPCThreadState would serve it with the wrong class ABI.
+        let mut stream_av = UnixStream::connect(&path).expect("connect Av");
+        let (ret_i3, _r3) = exchange(&mut stream_av, WIRE_CMD_IDENT, &ident_v2(7777, 7702, 3));
+        assert_eq!(ret_i3, 0);
+        let mut wr_v = Vec::new();
+        wr_v.extend_from_slice(&0u32.to_ne_bytes());
+        wr_v.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_v, resp_v) = exchange(&mut stream_av, BINDER_WRITE_READ, &wr_v);
+        assert_eq!(ret_v, 0);
+        let br_v = u32::from_ne_bytes(resp_v[4..8].try_into().unwrap());
+        assert_ne!(
+            br_v, BR_TRANSACTION,
+            "6-Z309f: a vndbinder sibling NEVER steals hwbinder node work"
+        );
+        drop(stream_av);
+
+        // ---- Conn A2 (pid 7777, dev=hwbinder): read-only STEALS ----
+        let mut stream_a2 = UnixStream::connect(&path).expect("connect A2");
+        let (ret_i4, _r4) = exchange(&mut stream_a2, WIRE_CMD_IDENT, &ident_v2(7777, 7703, 2));
+        assert_eq!(ret_i4, 0);
+        let mut wr_a2 = Vec::new();
+        wr_a2.extend_from_slice(&0u32.to_ne_bytes());
+        wr_a2.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_a2, resp_a2) = exchange(&mut stream_a2, BINDER_WRITE_READ, &wr_a2);
+        assert_eq!(ret_a2, 0);
+        let br = u32::from_ne_bytes(resp_a2[4..8].try_into().unwrap());
+        assert_eq!(
+            br, BR_TRANSACTION,
+            "same-device sibling still steals (6-Z271g preserved)"
+        );
+        let tr = &resp_a2[8..8 + 64];
+        let code = u32::from_ne_bytes(tr[16..20].try_into().unwrap());
+        assert_eq!(code, 42, "stolen delivery carries the code");
+        let cookie = u64::from_ne_bytes(tr[8..16].try_into().unwrap());
+        assert_eq!(cookie, 0x4444, "owner cookie preserved across steal");
+
+        // ---- Conn A2: BC_REPLY → B resolves ----
+        let reply_data: &[u8] = b"hw-reply";
+        let mut reply = [0u8; 64];
+        reply[16..20].copy_from_slice(&0u32.to_ne_bytes());
+        let mut bc4 = Vec::with_capacity(4 + 64);
+        bc4.extend_from_slice(&BC_REPLY.to_ne_bytes());
+        bc4.extend_from_slice(&reply);
+        let payload4 = make_v2_write_read_multi_payload(&bc4, &[(reply_data, &tx_off)], 0);
+        let (ret_r, _resp_r) = exchange(&mut stream_a2, BINDER_WRITE_READ, &payload4);
+        assert_eq!(ret_r, 0);
+
+        // ---- Conn B: read-only ioctl → the deferred BR_REPLY ----
+        let mut wr_b = Vec::new();
+        wr_b.extend_from_slice(&0u32.to_ne_bytes());
+        wr_b.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_b, resp_b) = exchange(&mut stream_b, BINDER_WRITE_READ, &wr_b);
+        assert_eq!(ret_b, 0);
+        let read_b = u32::from_ne_bytes(resp_b[0..4].try_into().unwrap()) as usize;
+        let br2 = u32::from_ne_bytes(resp_b[4..8].try_into().unwrap());
+        assert_eq!(br2, BR_REPLY, "B gets the reply on its own read");
         let off_b = 4 + read_b + 8;
         let dl_b = u32::from_ne_bytes(resp_b[off_b..off_b + 4].try_into().unwrap()) as usize;
         assert_eq!(dl_b, reply_data.len());
