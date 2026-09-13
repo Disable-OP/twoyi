@@ -29131,3 +29131,28 @@ Stage Summary / RN273 DECODE TREE:
 5. Watch: a spawned-pool-thread BC_REGISTER_LOOPER line + the onRegistration delivery in the kr64 log prove the 6-Z324 mechanism live.
 6. fd-77/79/80 read-stall fleet: CLOSED (superseded by the ANR-era evidence — main's true park is the waitForHwService condvar; the read(fd) captures were the perfetto-class reader thread shape on other eras).
 - PAT location (propagate in every summary): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat), never printed/committed.
+
+---
+Task ID: 57b (same leg, rn273 decode)
+Agent: Z.ai Code (webDevReview continuation)
+Task: Decode rn273 (the 6-Z324 verification run); update the decode tree for the guest-side callback-execution leg.
+
+Work Log:
+- rn273 (34785199676, on 58c425e3) completed SUCCESS; classifier rung 7 SURFACEFLINGER, no post-mortem (the guest survived the watch; the run ended on the 900s cap era-cycling, not a collapse). Recovery gate on 58c425e3: 4/4 SUCCESS.
+- **THE 6-Z324 MECHANISM IS LIVE END-TO-END ON THE PROXY SIDE** (era pid 6930, conn=454 = main tid 6930):
+  1. +338276-338781: getTransport(suspend) → HWBINDER, get → handle 0xc, interfaceChain cast served (68B/384B) — the getSuspendHal once-body's getService (the waitForHwService before it took the isOnlyBinderThread()==true sleep(1) fallback — no binder pool threads existed yet at +337s).
+  2. +338782-339033: acquireWakeLock("PowerManager.SuspendLockout", code=1) served + replied (68B/56B) — disableAutoSuspend's own wakelock (A11 PMS.cpp:401-406).
+  3. +339037-339038: getTransport(POWER) → EMPTY (one-shot, tolerated), then **registerForNotifications(suspend) — the reply now carries BR_SPAWN_LOOPER (read_size=76 vs the pre-6-Z324 72)** and the immediate preexisting onRegistration is queued for conn=454.
+  4. +339057: **BC_REGISTER_LOOPER (0x630b) — THE POOL THREAD SPAWNED 19ms AFTER THE REPLY**; conn=456 IDENT pid=6930 tid=7091; **"process-pool steal: conn=456 takes tx #0 queued for a sibling (code=1)"** — the 6-Z271g same-pid+dev steal handed the queued onRegistration to the new pool thread; **"delivered transaction conn=456 <- conn=0 code=1 oneway=true"** (68B data + 84B trailer — parcel = [hidl_string fq][hidl_string default][i32 preexisting]).
+  5. **THE REMAINING GAP: the pool thread's next ioctl carried NO BC_FREE_BUFFER (ws=0) — the guest-side IPCThreadState::executeCommand(BR_TRANSACTION) never completed the transact→free cycle — so Waiter::onRegistration never ran, notify_one never fired, main never woke** (no further wire from conn=454; the era's ANR main stack = the same waitForHwService/Waiter::wait shape; the era died on the Watchdog ~+397s).
+- A11 sources fetched and pinned: ServiceManagement.cpp (Waiter: isOnlyBinderThread()==true → sleep(1)+re-poll; ==false → condvar wait woken ONLY by onRegistration RUNNING on a binder thread) + com_android_server_power_PowerManagerService.cpp (getSuspendHal once = [waitForHwService, getService, assert]; disableAutoSuspend = getSuspendHal + acquireWakeLock("PowerManager.SuspendLockout"); nativeAcquireSuspendBlocker uses the KERNEL wake-lock path, not the HAL — the code=1 at +338782 is disableAutoSuspend's own lockout wakelock).
+- Gates on 58c425e3: kr64 lint+test CI GREEN; recovery corpus 4/4.
+
+Stage Summary / NEXT-LEG DECODE TREE (guest-side callback execution):
+1. PRIMARY: why did the pool thread's executeCommand(BR_TRANSACTION) not complete? The delivered read = [BR_TRANSACTION + btd(64)] read_size=68, trailer 84B = v3 blob [dl=64][ol=0][sg=0] — the parcel decodes as [hidl_string 48][hidl_string 12][i32 4]. Decode targets: (a) the shlib v3 loader assembly for THIS delivery on a conn whose mailbox was filled by the STEAL path (a cross-conn blob attribution bug class); (b) the HIDL bool marshaling — the fire writes i32 (4B) while the A11 BnHw onTransact reads bool as ONE byte (readBool) — trailing bytes are normally tolerated, so (a) is the prime suspect; (c) whether the pool thread's transact hit the Waiter object at tr.cookie (the 6-Z306ad DELIVERY probe did NOT fire for tx #0 — extend it to steal-path deliveries).
+2. INSTRUMENT: log the steal-path delivery's blob (dl/ol/sg) + a bounded BC_FREE_BUFFER-watch on the delivering conn (if no free-buffer arrives within 1s, log the pool thread's next 2 BC streams).
+3. FIX DIRECTION: make the fired HIDL callback parcel byte-exact per the A11 BnHw parse ([hidl_string][hidl_string][u8 bool = 1 byte]) — cheap, testable; and audit the steal-path blob handoff (the tx's blob must ride the STEALING conn's response trailer, not the original target's).
+4. EXPECT after the fix: BC_FREE_BUFFER from conn=456-class within ms of the delivery → Waiter::onRegistration → notify → main wakes → wait() returns → done() (unregisterForNotifications wire) → the once-body's getService → gSuspendHal cached → StartPowerManager COMPLETES → markers advance → rung 8 (SYSTEMUI) reachable.
+5. Recovery gate 4/4 GREEN mandatory (the steal-path blob audit touches the shared delivery machinery the corpus validates).
+6. Do NOT chase: the nnapi crash-loop fleet, the tombstoned intercept failure (diagnostics-only), HOST logcat.
+- PAT location (propagate in every summary): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat), never printed/committed.
