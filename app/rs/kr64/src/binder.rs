@@ -4908,19 +4908,24 @@ fn servicemanager_proxy(
                 };
                 let already = {
                     let mut b = bus.lock().expect("binder bus poisoned");
-                    let handle = b.services.get(&name).map(|e| e.handle);
-                    match handle {
+                    // 6-Z323: the watcher registers UNCONDITIONALLY — the
+                    // real servicemanager adds the listener before the
+                    // preexisting check, so this caller is notified both by
+                    // the immediate fire below and by later addService calls.
+                    b.add_watcher(&name, w);
+                    match b.services.get(&name).map(|e| e.handle) {
                         Some(h) => {
-                            drop(b);
-                            // Already registered: immediate preexisting callback.
-                            let mut b2 = bus.lock().expect("binder bus poisoned");
-                            b2.fire_registration_callbacks(&name, h, true);
+                            // Already registered: immediate preexisting
+                            // callback — the fire now INCLUDES this caller
+                            // (the pre-6-Z323 shape dropped the constructed
+                            // watcher on the floor and fired only watchers
+                            // that predated the call, so the callback never
+                            // reached the requester — the AIDL twin of the
+                            // rn271 HIDL waitForHwService wall).
+                            b.fire_registration_callbacks(&name, h, true);
                             true
                         }
-                        None => {
-                            b.add_watcher(&name, w);
-                            false
-                        }
+                        None => false,
                     }
                 };
                 info!(
@@ -5675,27 +5680,41 @@ fn servicemanager_hidl(
             let key = format!("{}/{}", fq, inst);
             let registered = if let Some(f) = flat {
                 let mut b = bus.lock().expect("binder bus poisoned");
+                // 6-Z323: the watcher registers UNCONDITIONALLY — the real
+                // hwservicemanager's registerForNotifications adds the
+                // listener FIRST (ServiceManager.cpp: the callback goes
+                // into the listener list before any preexisting check), so
+                // future (re)registrations of this key notify this caller.
+                b.add_watcher(
+                    &key,
+                    ServiceWatcher {
+                        conn: conn_id,
+                        ptr: f.binder,
+                        cookie: f.cookie,
+                        hidl: true,
+                    },
+                );
                 match b.services.get(&key).map(|e| e.handle) {
                     Some(h) => {
-                        drop(b);
-                        // Already registered: immediate preexisting callback
-                        // (the real hwservicemanager behaviour).
-                        let mut b2 = bus.lock().expect("binder bus poisoned");
-                        b2.fire_registration_callbacks(&key, h, true);
+                        // Already registered: the immediate preexisting
+                        // callback. The fire walks the watcher list, which
+                        // NOW CONTAINS this caller — the
+                        // onRegistration(preexisting=true) oneway actually
+                        // reaches the just-registered callback.
+                        //
+                        // RN271 decode: the pre-6-Z323 shape fired only the
+                        // PRE-EXISTING watchers here and never stored the
+                        // new one — the waitForHwService caller (the A11
+                        // disableAutoSuspend once in system_server) got the
+                        // registerForNotifications reply but NEVER the
+                        // onRegistration transaction, and blocked forever in
+                        // libhidlbase Waiter::wait — the PMS.<init>
+                        // nativeSetAutoSuspend wall that parked every
+                        // system_server era at rung 7 (StartPowerManager).
+                        b.fire_registration_callbacks(&key, h, true);
                         true
                     }
-                    None => {
-                        b.add_watcher(
-                            &key,
-                            ServiceWatcher {
-                                conn: conn_id,
-                                ptr: f.binder,
-                                cookie: f.cookie,
-                                hidl: true,
-                            },
-                        );
-                        false
-                    }
+                    None => false,
                 }
             } else {
                 false
@@ -10238,6 +10257,175 @@ mod tests {
                 );
             }
             _ => panic!("HIDL onRegistration not queued"),
+        }
+    }
+
+    /// 6-Z323: `registerForNotifications` for an ALREADY-REGISTERED HIDL
+    /// service must (a) store the caller's watcher and (b) fire the
+    /// immediate preexisting `onRegistration` oneway — AT the caller.
+    /// RN271 decode: the pre-6-Z323 arm fired only watchers that predated
+    /// the call and never stored the new one, so the A11
+    /// `waitForHwService` caller (system_server's disableAutoSuspend once,
+    /// PMS.<init> nativeSetAutoSuspend) received the registerForNotifications
+    /// reply but NEVER the onRegistration transaction and blocked forever
+    /// in libhidlbase Waiter::wait — every system_server era parked at
+    /// StartPowerManager (rung-7 wall).
+    #[test]
+    fn z323_hidl_register_preexisting_fires_caller_callback() {
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        let cb_ptr: u64 = 0xABCD_0001;
+        let cb_cookie: u64 = 0xFEED_FACE;
+
+        // The service is ALREADY registered (the suspend HAL's
+        // addWithChain at +3982ms in the rn271 wire).
+        let svc = "android.system.suspend@1.0::ISystemSuspend/default";
+        let _handle = bus_state.add_guest_service(svc, PROXY_CONN_ID, 0xdead, 0xbeef);
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+
+        // The waitForHwService registration wire: [string fq][string
+        // instance][flat callback].
+        let req = hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|b| {
+            b.string_arg("android.system.suspend@1.0::ISystemSuspend");
+            b.string_arg("default");
+            b.binder_arg(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: cb_ptr,
+                cookie: cb_cookie,
+            });
+        });
+        match servicemanager_hidl(HIDL_SM_REGISTER_FOR_NOTIFICATIONS, &req, &bus, caller) {
+            TransactionResult::Reply { data, offsets, .. } => {
+                assert!(offsets.is_empty(), "no binder objects in the reply");
+                // [status ok][u8 1][3 pad]
+                assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+            }
+            other => panic!(
+                "registerForNotifications must Reply, got non-Reply variant: {}",
+                match other {
+                    TransactionResult::Failed => "Failed",
+                    TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::Reply { .. } => unreachable!(),
+                    TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
+                }
+            ),
+        }
+
+        // THE FIX: the onRegistration oneway is queued on the CALLER's
+        // inbox, targeted at ITS callback object.
+        let bx = bus
+            .lock()
+            .expect("bus")
+            .conns
+            .get(&caller)
+            .map(|c| c.inbox.len())
+            .expect("caller conn");
+        assert_eq!(bx, 1, "exactly one onRegistration queued");
+        let bus_state = bus.lock().expect("bus");
+        let bx = bus_state.conns.get(&caller).expect("caller conn");
+        let fired = match bx.inbox.front() {
+            Some(InboxItem::Tx(tx)) => {
+                assert_eq!(tx.code, 1, "onRegistration code");
+                assert!(tx.one_way, "callback is one-way");
+                assert_eq!(tx.txn_id, 0, "no reply bookkeeping for one-way");
+                assert_eq!(tx.ptr, cb_ptr, "targeted at the caller's callback");
+                assert_eq!(tx.cookie, cb_cookie);
+                let blob = tx.blob.as_ref().expect("HIDL callback parcel");
+                // [hidl_string fq][hidl_string instance][i32 preexisting=1]
+                let fq_len = i32::from_ne_bytes(blob.data[0..4].try_into().unwrap()) as usize;
+                assert_eq!(fq_len, "android.system.suspend@1.0::ISystemSuspend".len());
+                let fq_end = 4 + fq_len + 1;
+                let fq_end = (fq_end + 3) & !3;
+                let inst_len =
+                    i32::from_ne_bytes(blob.data[fq_end..fq_end + 4].try_into().unwrap()) as usize;
+                assert_eq!(inst_len, "default".len());
+                let inst_end = fq_end + 4 + inst_len + 1;
+                let inst_end = (inst_end + 3) & !3;
+                let preexisting =
+                    i32::from_ne_bytes(blob.data[inst_end..inst_end + 4].try_into().unwrap());
+                assert_eq!(preexisting, 1, "preexisting=true");
+                true
+            }
+            _ => panic!("onRegistration not queued on the caller's inbox"),
+        };
+        assert!(fired);
+    }
+
+    /// 6-Z323 AIDL twin: `registerForNotifications` for an
+    /// ALREADY-REGISTERED service fires the immediate preexisting
+    /// `onRegistration` AT the caller (and the watcher list is consumed by
+    /// the fire — the existing fire-once semantics).
+    #[test]
+    fn z323_aidl_register_preexisting_fires_caller_callback() {
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        let cb_ptr: u64 = 0x1234_5678;
+        let cb_cookie: u64 = 0x0BAD_C0DE;
+
+        let svc = "suspend_control";
+        let _handle = bus_state.add_guest_service(svc, PROXY_CONN_ID, 0x777, 0x888);
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+
+        // AIDL request: [header][string16 name][flat callback].
+        let mut args = ParcelWriter::new();
+        args.write_string16(svc);
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: cb_ptr,
+            cookie: cb_cookie,
+        });
+        let (d, o) = make_servicemanager_request_parcel(&mut args);
+        let blob = RequestBlob {
+            data: d,
+            offsets: o,
+            sg: Vec::new(),
+        };
+        match servicemanager_proxy(
+            SVC_MGR_REGISTER_FOR_NOTIFICATIONS,
+            &bus,
+            Some(&blob),
+            caller,
+        ) {
+            TransactionResult::Reply { .. } => {}
+            other => panic!(
+                "registerForNotifications must Reply, got non-Reply variant: {}",
+                match other {
+                    TransactionResult::Failed => "Failed",
+                    TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::Reply { .. } => unreachable!(),
+                    TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
+                }
+            ),
+        }
+
+        // The callback reaches the CALLER (pre-6-Z323 it never did).
+        let bus_state = bus.lock().expect("bus");
+        let bx = bus_state.conns.get(&caller).expect("caller conn");
+        match bx.inbox.front() {
+            Some(InboxItem::Tx(tx)) => {
+                assert_eq!(tx.code, 1, "onRegistration code");
+                assert!(tx.one_way, "callback is one-way");
+                assert_eq!(tx.ptr, cb_ptr);
+                assert_eq!(tx.cookie, cb_cookie);
+                let blob = tx.blob.as_ref().expect("AIDL callback parcel");
+                // [strict][work][SYST][string16 IServiceCallback]
+                // [string16 name][flat handle][stability].
+                assert_eq!(
+                    u32::from_ne_bytes(blob.data[8..12].try_into().unwrap()),
+                    AIDL_HEADER_TAG_SYST
+                );
+                let s = String::from_utf16_lossy(
+                    &blob.data[12..]
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                        .collect::<Vec<u16>>(),
+                );
+                assert!(s.contains("android.os.IServiceCallback"));
+                assert!(s.contains(svc), "service name string16 present");
+            }
+            _ => panic!("onRegistration not queued on the caller's inbox"),
         }
     }
 
