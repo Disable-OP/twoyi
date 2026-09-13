@@ -477,9 +477,12 @@ static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 // 6-Z305t-68: the HIDL wire's BINDER_TYPE_PTR SG-buffer capture.
 #define BP_WIRE_V3_MAGIC    0x30335657u       /* "WV30" little-endian */
 #define BP_BINDER_TYPE_PTR  0x70742a85u       /* B_PACK_CHARS('p','t','*',0x85) */
+#define BP_BUF_FLAG_HAS_PARENT 0x01u          /* BINDER_BUFFER_FLAG_HAS_PARENT */
 #define BP_SG_BUF_MAX       (256u * 1024u)    // per-PTR-object cap
 #define BP_SG_TOTAL_MAX     (384u * 1024u)    // per-transaction SG cap
-#define BP_SG_MAX_BUFS      128u              // per-transaction PTR count cap
+/* 6-Z309: 512 — the SM debugDump reply carries 2+3×128 PTR objects at the
+ * registry cap (386); 128 dropped the whole SG section (trailer desync). */
+#define BP_SG_MAX_BUFS      512u              // per-transaction PTR count cap
 #define BP_BR_REPLY      0x80407203u   /* _IOR('r', 3, binder_transaction_data=64) */
 #define BP_BR_TRANSACTION 0x80407202u  /* _IOR('r', 2, 64) — 6-Z271 server delivery */
 #define BP_TR_DATA_PTR_OFF     48u     /* binder_transaction_data.data.ptr.buffer */
@@ -541,6 +544,7 @@ static int g_diag_sm_consumed = 4;     // SM-REPLY-CONSUMED verdict budget
 static unsigned g_diag_bp_wr = 2;      // binder_proxy_write_read log budget
 static unsigned g_diag_bp_ioctl = 4;   // binder_proxy_ioctl log budget
 static int g_diag_z306z_gate = 8;      // 6-Z306z delivery-gate log budget
+static int g_diag_z309_gate = 8;       // 6-Z309 parent-fixup log budget
 
 static void bp_fork_child_diag_rearm(void) {
     g_diag_br_tx = 12;
@@ -552,6 +556,7 @@ static void bp_fork_child_diag_rearm(void) {
     g_diag_bp_wr = 2;
     g_diag_bp_ioctl = 4;
     g_diag_z306z_gate = 8;
+    g_diag_z309_gate = 8;
     // The inherited pending stash points at the PARENT's transaction —
     // a stale match in the child would poison the verdict observer.
     pthread_mutex_lock(&g_sm_pending_lock);
@@ -965,23 +970,123 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                     for (uint32_t s = 0; s < sg_seen; s++)
                         memcpy(back + (uint64_t)dlen + olen + sg_pad + sg_dst[s],
                                p + sg_src[s], sg_len[s]);
-                    // Fix up every BINDER_TYPE_PTR object's buffer field in
-                    // the WRITTEN copy — walk the offsets array in order
-                    // (the same order the entries were captured in).
+                    // 6-Z309 — kernel-true receiver-side fixup (linux v5.4
+                    // drivers/android/binder.c, the BINDER_TYPE_PTR case of
+                    // binder_transaction() + binder_fixup_parent()). Two
+                    // halves, both mandatory:
+                    //
+                    // 1. EVERY BINDER_TYPE_PTR object's `buffer` field = the
+                    //    address of its OWN SG copy in the backing (slots
+                    //    advance in offsets-array order — the loader's
+                    //    capture order). This half is what the old code did.
+                    //
+                    // 2. For every object carrying BINDER_BUFFER_FLAG_HAS_
+                    //    PARENT: the parent is addressed by its OFFSETS-ARRAY
+                    //    INDEX (libhwbinder writeEmbeddedBuffer writes
+                    //    .parent = parent_buffer_handle, an index into
+                    //    mObjects — Parcel.cpp:741 "We use an index into
+                    //    mObjects as a handle"; the kernel resolves it via
+                    //    binder_validate_ptr(index)). The CHILD's fixed slot
+                    //    address is WRITTEN INTO the parent's SG copy at
+                    //    parent_offset (kernel: buffer_offset = parent_offset
+                    //    + parent->buffer - user_data; copy &bp->buffer, 8
+                    //    bytes). That embedded pointer is what hidl_vec /
+                    //    hidl_string walks dereference (hidl_vec::mBuffer,
+                    //    hidl_string element mBuffer) and what A12+
+                    //    libhwbinder verifyBufferObject validates — its
+                    //    absence is the "hw-Parcel: Buffer in parent X
+                    //    differs from embedded buffer Y" fleet (219× in
+                    //    rn254) feeding "received incompatible service".
+                    //
+                    // Kernel-honest degradation: a malformed parent link is
+                    // SKIPPED (bounded diag), never written out of bounds —
+                    // the guest's own parcel validation then rejects the
+                    // parcel, mirroring the kernel's BR_FAILED_REPLY.
                     uint32_t fixed = 0;
-                    for (uint64_t j = 0; j + 8 <= (uint64_t)olen && fixed < sg_seen;
-                         j += 8) {
-                        uint64_t obj_off;
-                        memcpy(&obj_off, back + dlen + j, 8);
-                        if (obj_off > (uint64_t)dlen || obj_off + 40 > (uint64_t)dlen)
-                            continue;
-                        uint32_t typ;
-                        memcpy(&typ, back + obj_off, 4);
-                        if (typ != BP_BINDER_TYPE_PTR) continue;
-                        uint64_t target = (uint64_t)(uintptr_t)(back + (uint64_t)dlen +
-                                            olen + sg_pad + sg_dst[fixed]);
-                        memcpy(back + obj_off + 8, &target, 8);
-                        fixed++;
+                    uint64_t n_obj = (uint64_t)olen / 8;
+                    uint64_t *slot =
+                        (uint64_t *)calloc((size_t)(n_obj ? n_obj : 1), 8);
+                    if (slot) {
+                        for (uint64_t j = 0;
+                             j + 8 <= (uint64_t)olen && fixed < sg_seen; j += 8) {
+                            uint64_t obj_off;
+                            memcpy(&obj_off, back + dlen + j, 8);
+                            if (obj_off > (uint64_t)dlen ||
+                                obj_off + 40 > (uint64_t)dlen)
+                                continue;
+                            uint32_t typ;
+                            memcpy(&typ, back + obj_off, 4);
+                            if (typ != BP_BINDER_TYPE_PTR) continue;
+                            uint64_t target = (uint64_t)(uintptr_t)(
+                                back + (uint64_t)dlen + olen + sg_pad +
+                                sg_dst[fixed]);
+                            memcpy(back + obj_off + 8, &target, 8);
+                            slot[j / 8] = target;
+                            fixed++;
+                        }
+                        uint32_t pfix = 0, pskip = 0;
+                        for (uint64_t j = 0; j + 8 <= (uint64_t)olen; j += 8) {
+                            uint64_t obj_off;
+                            memcpy(&obj_off, back + dlen + j, 8);
+                            if (obj_off > (uint64_t)dlen ||
+                                obj_off + 40 > (uint64_t)dlen)
+                                continue;
+                            uint32_t typ, flags;
+                            memcpy(&typ, back + obj_off, 4);
+                            if (typ != BP_BINDER_TYPE_PTR) continue;
+                            memcpy(&flags, back + obj_off + 4, 4);
+                            if (!(flags & BP_BUF_FLAG_HAS_PARENT)) continue;
+                            uint64_t parent_idx, parent_offset, child_slot;
+                            memcpy(&parent_idx, back + obj_off + 24, 8);
+                            memcpy(&parent_offset, back + obj_off + 32, 8);
+                            child_slot = slot[j / 8];
+                            /* kernel binder_validate_fixup order: parents
+                             * precede children in the offsets array; both
+                             * must be fixed-up PTR objects. */
+                            if (parent_idx >= j / 8 || child_slot == 0 ||
+                                slot[parent_idx] == 0) {
+                                pskip++;
+                                continue;
+                            }
+                            uint64_t par_off;
+                            memcpy(&par_off, back + dlen + parent_idx * 8, 8);
+                            if (par_off > (uint64_t)dlen ||
+                                par_off + 40 > (uint64_t)dlen) {
+                                pskip++;
+                                continue;
+                            }
+                            uint32_t ptyp;
+                            memcpy(&ptyp, back + par_off, 4);
+                            uint64_t plen;
+                            memcpy(&plen, back + par_off + 16, 8);
+                            /* kernel binder_fixup_parent: "No space for a
+                             * pointer here!" — parent->length must cover
+                             * parent_offset + 8. */
+                            if (ptyp != BP_BINDER_TYPE_PTR || plen < 8 ||
+                                parent_offset > plen - 8) {
+                                pskip++;
+                                continue;
+                            }
+                            uint64_t dest = slot[parent_idx] + parent_offset;
+                            if (dest + 8 > (uint64_t)(uintptr_t)back + back_len) {
+                                pskip++;
+                                continue;
+                            }
+                            memcpy((void *)(uintptr_t)dest, &child_slot, 8);
+                            pfix++;
+                        }
+                        if ((pfix || pskip) && g_diag_z309_gate > 0) {
+                            char m[144];
+                            g_diag_z309_gate--;
+                            snprintf(m, sizeof(m),
+                                     "[twoyi_loader] 6-Z309: parent fixups %u "
+                                     "(skipped %u) dlen=%u olen=%u sg=%u "
+                                     "(pid=%d)\n",
+                                     pfix, pskip, dlen, olen, sg_seen,
+                                     g_real_pid);
+                            write_str(2, m);
+                        }
+                        free(slot);
                     }
                 }
                 // 6-Z306z gate 2b: embedded LOCAL flats — walk the offsets

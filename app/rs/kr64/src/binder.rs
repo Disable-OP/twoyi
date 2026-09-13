@@ -1554,12 +1554,22 @@ impl ParcelWriter {
     /// the SG region — the HIDL buffer model for reply values
     /// (writeBuffer/writeEmbeddedBuffer emulation). Returns the object's
     /// offsets-array index for parent linkage.
-    /// `hidl_vec<hidl_string>` — the SG wire shape (6-Z305t-69):
-    /// [PTR vec struct 16B {ptr, count@+8}][PTR array child, len =
-    /// count×16] then count × [PTR chars_j, parent = THE ARRAY,
-    /// parent_offset = j*16] — the element ptr-structs live INSIDE the
-    /// array buffer (loader-fixed from the chars objects), one string
-    /// per element. Used for getServiceCallback.onValues' chain (6-Z307b).
+    /// Write a `hidl_vec<hidl_string>` — the kernel-true wire shape
+    /// (6-Z305t-68 + 6-Z309):
+    /// * PTR(vec struct {mBuffer, mSize, mOwns}, top-level) — mSize =
+    ///   count; mBuffer is patched loader-side from the ARRAY object.
+    /// * PTR(array, HAS_PARENT parent_offset=0, content = count × 16) —
+    ///   each 16B element is a REAL `hidl_string` struct:
+    ///   `[mBuffer(8)=0 (patched from the chars PTR object, 6-Z309
+    ///   parent fixup)][mSize u32 @8][mOwns u8 @12][pad @13..16]`. The
+    ///   client's read walk takes each element's chars length from THIS
+    ///   mSize (`readEmbeddedFromParcel(hidl_string)` →
+    ///   `readEmbeddedBuffer(string.size()+1, …)` with string = the array
+    ///   copy element) — zeros here read as empty strings and make the
+    ///   length check fail (the rn254 "incompatible service" fleet).
+    /// * per element PTR(chars+NUL, HAS_PARENT parent_offset=j*16).
+    /// Used for IBase::interfaceChain (the SM cast probe) and
+    /// getServiceCallback.onValues' chain (6-Z307b).
     fn write_hidl_vec_string(&mut self, items: &[String]) {
         let count = items.len();
         let mut vs = vec![0u8; 16];
@@ -1567,7 +1577,12 @@ impl ParcelWriter {
         let vec_idx = self.next_object_index();
         self.write_ptr_object(vs, None, 0);
         let arr_idx = self.next_object_index();
-        self.write_ptr_object(vec![0u8; count * 16], Some(vec_idx), 0);
+        let mut array = vec![0u8; count * 16];
+        for (j, s) in items.iter().enumerate() {
+            let base = j * 16;
+            array[base + 8..base + 12].copy_from_slice(&(s.len() as u32).to_ne_bytes());
+        }
+        self.write_ptr_object(array, Some(vec_idx), 0);
         for (j, s) in items.iter().enumerate() {
             let mut ch = s.as_bytes().to_vec();
             ch.push(0);
@@ -5869,8 +5884,14 @@ fn servicemanager_hidl(
             writer.write_ptr_object(vs, None, 0);
             let arr_idx = writer.next_object_index();
             let mut array = vec![0u8; count * 64];
-            for (j, (_, _, pid)) in entries.iter().enumerate() {
+            for (j, (f, i, pid)) in entries.iter().enumerate() {
                 let base = j * 64;
+                // 6-Z309: the hidl_string header structs must carry the REAL
+                // mSize (interfaceName @+0, instanceName @+16) — the client's
+                // read walk takes the chars lengths from them; mBuffer slots
+                // are patched loader-side from the chars PTR objects.
+                array[base + 8..base + 12].copy_from_slice(&(f.len() as u32).to_ne_bytes());
+                array[base + 24..base + 28].copy_from_slice(&(i.len() as u32).to_ne_bytes());
                 array[base + 32..base + 36].copy_from_slice(&pid.to_ne_bytes());
                 array[base + 56] = HIDL_DEBUG_ARCH_UNKNOWN;
             }
@@ -5910,7 +5931,8 @@ fn servicemanager_hidl(
             };
             let count = pairs.len();
             // hidl_vec<Instance> wire (Instance = 2 packed hidl_string
-            // structs = 32 bytes per element).
+            // structs = 32 bytes per element). 6-Z309: the mSize fields
+            // (fqName @+8, instanceName @+24) carry the REAL lengths.
             let mut vs = vec![0u8; 16];
             vs[8..12].copy_from_slice(&(count as u32).to_ne_bytes());
             let vec_idx = writer.next_object_index();
@@ -5918,7 +5940,13 @@ fn servicemanager_hidl(
             // The ARRAY's parent = the VEC struct object; the chars'
             // parent = the ARRAY object (indices the client validates).
             let arr_idx = writer.next_object_index();
-            writer.write_ptr_object(vec![0u8; count * 32], Some(vec_idx), 0);
+            let mut array = vec![0u8; count * 32];
+            for (j, (f, i)) in pairs.iter().enumerate() {
+                let base = j * 32;
+                array[base + 8..base + 12].copy_from_slice(&(f.len() as u32).to_ne_bytes());
+                array[base + 24..base + 28].copy_from_slice(&(i.len() as u32).to_ne_bytes());
+            }
+            writer.write_ptr_object(array, Some(vec_idx), 0);
             for (j, (f, i)) in pairs.iter().enumerate() {
                 let mut fc = f.as_bytes().to_vec();
                 fc.push(0);
@@ -10470,6 +10498,142 @@ mod tests {
         assert_eq!(data.len(), 244);
         assert_eq!(offsets.len(), 6 * 8);
         let _ = conn;
+    }
+
+    /// 6-Z309: the kernel-fixup simulator — pins the receive-side contract
+    /// that BOTH the proxy writers (above) and the loader's receiver fixup
+    /// (twoyi_loader_shlib.c, bp_patch_reply_data) must satisfy. Simulates:
+    /// (1) the kernel/loader SG-slot assignment (every PTR object's
+    /// `buffer` = its own SG copy, offsets-array order), (2) the kernel's
+    /// binder_fixup_parent write (the child's slot address lands in the
+    /// parent's SG copy at parent_offset), then (3) the A12+ libhwbinder
+    /// client's verifyBufferObject walk (flags/parent-index/parent-offset
+    /// equality + the "Buffer in parent" pointer comparison) + the
+    /// hidl_vec<hidl_string> element reconstruction via the REAL mSize
+    /// fields. Any writer shape that fails here is the rn254
+    /// "incompatible service" fleet.
+    #[test]
+    fn z309_kernel_fixup_simulator_accepts_vec_hidl_string_reply() {
+        let chain = vec![
+            "android.hidl.manager@1.2::IServiceManager".to_string(),
+            "android.hidl.manager@1.1::IServiceManager".to_string(),
+            "android.hidl.manager@1.0::IServiceManager".to_string(),
+            "android.hidl.base@1.0::IBase".to_string(),
+        ];
+        let mut w = ParcelWriter::new();
+        w.write_status_ok();
+        w.write_hidl_vec_string(&chain);
+        let (data, offsets, mut sg) = w.into_parts_with_sg();
+
+        // ---- (1) object walk + SG-slot assignment (loader/kernel order) --
+        let objs: Vec<(usize, u32, u32, u64, u64, u64, u64)> = offsets
+            .chunks_exact(8)
+            .map(|c| {
+                let off = u64::from_ne_bytes(c.try_into().unwrap()) as usize;
+                let typ = u32::from_ne_bytes(data[off..off + 4].try_into().unwrap());
+                let flags = u32::from_ne_bytes(data[off + 4..off + 8].try_into().unwrap());
+                let length = u64::from_ne_bytes(data[off + 16..off + 24].try_into().unwrap());
+                let parent = u64::from_ne_bytes(data[off + 24..off + 32].try_into().unwrap());
+                let poff = u64::from_ne_bytes(data[off + 32..off + 40].try_into().unwrap());
+                (off, typ, flags, 0, length, parent, poff)
+            })
+            .collect();
+        assert_eq!(
+            objs.len(),
+            2 + chain.len(),
+            "vec struct + array + one chars object per element (the element structs are the ARRAY's SG content, not separate objects)"
+        );
+        assert_eq!(
+            sg.len(),
+            objs.len(),
+            "every PTR object carries one SG entry"
+        );
+        let mut slots = vec![0u64; objs.len()];
+        let mut pack = 0usize; // the loader packs SG bytes consecutively
+        for (i, o) in objs.iter().enumerate() {
+            assert_eq!(o.1, BINDER_TYPE_PTR, "all objects are PTR");
+            slots[i] = 0x1_0000 + pack as u64; // synthetic backing base
+            pack += sg[i].data.len();
+        }
+        // ---- (2) binder_fixup_parent writes into the parent's SG copy ---
+        for (i, o) in objs.iter().enumerate() {
+            if o.2 & BINDER_BUFFER_FLAG_HAS_PARENT == 0 {
+                continue;
+            }
+            let p = o.5 as usize;
+            assert!(p < i, "parents precede children (kernel fixup order)");
+            // kernel binder_fixup_parent: the PARENT's length must cover
+            // parent_offset + 8 ("No space for a pointer here!").
+            assert!(
+                objs[p].4 >= 8 && o.6 <= objs[p].4 - 8,
+                "child {i}: parent_offset must land inside the parent"
+            );
+            // Write into the PARENT's SG copy at parent_offset: the parent
+            // of the array is the vec struct (SG 16B, slot at 0..16), the
+            // parent of the chars is the array (SG = count×16, slot base).
+            // (The loader writes to the absolute slot[parent] + offset in
+            // the flat backing; here sg[p].data IS the parent's copy, so
+            // the in-copy offset is parent_offset alone.)
+            let child = slots[i].to_ne_bytes();
+            let po = o.6 as usize;
+            sg[p].data[po..po + 8].copy_from_slice(&child);
+        }
+        // ---- (3) the client's read walk --------------------------------
+        let read_u32 =
+            |b: &[u8], off: usize| u32::from_ne_bytes(b[off..off + 4].try_into().unwrap());
+        // vec struct (object 0): top-level, count at +8.
+        assert_eq!(
+            objs[0].2 & BINDER_BUFFER_FLAG_HAS_PARENT,
+            0,
+            "vec struct top-level"
+        );
+        let vec_sg = &sg[0].data;
+        assert_eq!(
+            read_u32(vec_sg, 8) as usize,
+            chain.len(),
+            "vec mSize = count"
+        );
+        // array (object 1): HAS_PARENT of the vec struct at offset 0 —
+        // the "Buffer in parent" check: *(vec_slot + 0) == array slot —
+        // the pointer lives INSIDE the vec struct's SG copy.
+        assert_eq!(
+            objs[1].2 & BINDER_BUFFER_FLAG_HAS_PARENT,
+            BINDER_BUFFER_FLAG_HAS_PARENT
+        );
+        assert_eq!(objs[1].5, 0, "array parent = vec struct index");
+        assert_eq!(objs[1].6, 0, "array parent_offset = kOffsetOfBuffer");
+        assert_eq!(
+            u64::from_ne_bytes(vec_sg[0..8].try_into().unwrap()),
+            slots[1],
+            "Buffer in parent (vec.mBuffer) == array slot"
+        );
+        // per element: chars object (2+i) HAS_PARENT of the array at i*16;
+        // the element struct's REAL mSize drives the chars length check.
+        let arr_sg = &sg[1].data;
+        for (i, s) in chain.iter().enumerate() {
+            let ci = 2 + i;
+            assert_eq!(
+                objs[ci].2 & BINDER_BUFFER_FLAG_HAS_PARENT,
+                BINDER_BUFFER_FLAG_HAS_PARENT
+            );
+            assert_eq!(objs[ci].5, 1, "chars parent = array index");
+            assert_eq!(objs[ci].6, (i * 16) as u64, "chars parent_offset = i*16");
+            // element struct mSize (array SG at i*16+8) = the REAL strlen —
+            // the client reads the chars length from HERE.
+            assert_eq!(
+                read_u32(arr_sg, i * 16 + 8) as usize,
+                s.len(),
+                "element mSize must be the real string length"
+            );
+            assert_eq!(sg[ci].data.len(), s.len() + 1, "chars = bytes + NUL");
+            assert_eq!(sg[ci].data[s.len()], 0, "chars NUL-terminated");
+            // "Buffer in parent" check: *(array_slot + i*16) == chars slot.
+            assert_eq!(
+                u64::from_ne_bytes(arr_sg[i * 16..i * 16 + 8].try_into().unwrap()),
+                slots[ci],
+                "Buffer in parent (element mBuffer) == chars slot"
+            );
+        }
     }
 
     /// 6-Z307: `debugDump` (code 7) answers the REAL vec<InstanceDebugInfo>
