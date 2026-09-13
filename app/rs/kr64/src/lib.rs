@@ -8069,6 +8069,26 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         ),
     }
 
+    // 6-Z313: guest-side logcat drain. Stage an init rc that runs the
+    // ROM's own logcat against the guest's own logd and writes the
+    // stream to {rootfs}/data/local/tmp/twoyi-guest-logcat.log (host-
+    // readable). This is the only path to the Watchdog kill SUBJECT and
+    // the guest's own logcat timeline (HidlServiceManagement,
+    // SystemServerTiming) — the harness logcat captures are the redroid
+    // HOST's Android, not the guest's. Skipped for recovery-class
+    // rootfs trees (no /system/etc/init), so the recovery gate is
+    // untouched by construction.
+    match devices::create_logdrain_rc(&rootfs_prefix) {
+        Ok(true) => {
+            info!("[KR64] PARENT: guest-logcat drain rc staged (6-Z313)");
+        }
+        Ok(false) => {}
+        Err(e) => warning!(
+            "[KR64] PARENT: failed to stage guest-logcat drain rc: {} (boot continues without the guest logcat artifact; 6-Z313)",
+            e
+        ),
+    }
+
     // RECOVERY INPUT: pre-create {rootfs}/dev/input/event0 + event1 as
     // EMPTY regular files (0644). minui's /dev/input scan (readdir +
     // fstatat probes) needs openable "event*" names to exist; when one

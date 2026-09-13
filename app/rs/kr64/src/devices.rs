@@ -1692,6 +1692,65 @@ pub fn create_vintf_virtual_hal_manifest(rootfs: &str) -> std::io::Result<bool> 
     Ok(true)
 }
 
+/// 6-Z313: the guest-side logcat drain rc.
+///
+/// The rn261 decode left exactly one datum unnamed: the A11 Watchdog's
+/// kill SUBJECT ("*** WATCHDOG KILLING SYSTEM PROCESS: <subject>") and
+/// the rest of the guest's own logcat timeline (HidlServiceManagement
+/// lines, SystemServerTiming markers, the crash-loop fleets' log lines)
+/// exist ONLY inside the guest logd ring buffers — a sink no host-side
+/// probe can read (the harness logcat captures are the redroid HOST's
+/// own Android; the guest is a subtree of the twoyi app). Without the
+/// subject, the per-generation Watchdog kill (the era cycle that has
+/// capped every run since the dex2oat wall fell) cannot be attributed
+/// to a checker, and the "same kill cadence, different main park shape"
+/// (#243 pipe read vs #244 futex_do_wait) stays ambiguous.
+///
+/// Fix class: OBSERVABILITY, not semantics. Stage a minimal init rc that
+/// runs the ROM's own /system/bin/logcat against the guest's own logd
+/// and writes the stream to /data/local/tmp (host-visible under the
+/// rootfs data dir — the same view the twoyi-loader.log capture reads).
+/// Rotation (-r 2048 -n 4) bounds the file set at ~10 MiB.
+///
+/// oneshot: when logd is absent (recovery-class rootfs boots), the first
+/// exec fails or exits and init does not restart oneshot services — the
+/// drain is Android-boot instrumentation, never a recovery dependency.
+/// The rc is (re)written every boot (idempotent same-content overwrite),
+/// and staging is SKIPPED entirely when the rootfs has no
+/// /system/etc/init dir at all (recovery-only trees) so nothing new can
+/// perturb the recovery gate.
+pub const TWOYI_LOGDRAIN_RC: &str = r#"# twoyi 6-Z313: guest-side logcat drain. The Watchdog kill subject and
+# the guest's own logcat timeline reach only the guest logd buffers;
+# this drains them into a host-readable file. oneshot: with no logd
+# (recovery) the exec fails once and is not restarted.
+service twoyi-logdrain /system/bin/logcat -f /data/local/tmp/twoyi-guest-logcat.log -r 2048 -n 4 -v threadtime *:V
+    class main
+    user root
+    group root
+    oneshot
+"#;
+
+/// Stage the 6-Z313 logdrain rc into the guest's /system/etc/init.
+/// Returns Ok(false) when the rootfs has no /system/etc/init dir
+/// (recovery-class trees) — nothing is created in that case.
+pub fn create_logdrain_rc(rootfs: &str) -> std::io::Result<bool> {
+    let dir = format!("{}/system/etc/init", rootfs);
+    if !Path::new(&dir).is_dir() {
+        info!(
+            "[KR64][devices] guest-logcat drain rc NOT staged: no {}/system/etc/init (recovery-class rootfs, 6-Z313)",
+            rootfs
+        );
+        return Ok(false);
+    }
+    let path = format!("{}/twoyi-logdrain.rc", dir);
+    fs::write(&path, TWOYI_LOGDRAIN_RC)?;
+    info!(
+        "[KR64][devices] guest-logcat drain rc staged at {} (twoyi-logdrain -> /data/local/tmp/twoyi-guest-logcat.log, 6-Z313)",
+        path
+    );
+    Ok(true)
+}
+
 /// Extract every `/dev/block/.../by-name/<part>` token from fstab text.
 /// fstab format (v1 and v2 both): the source block device is the FIRST
 /// whitespace-delimited token of a non-comment line.
@@ -2505,6 +2564,55 @@ mod tests {
             "no fragment file may exist"
         );
     }
+
+    #[test]
+    fn z313_logdrain_rc_staged_for_android_rootfs() {
+        let rootfs = tmpdir();
+        fs::create_dir_all(format!("{}/system/etc/init", rootfs)).unwrap();
+
+        let staged = create_logdrain_rc(&rootfs).expect("staging succeeds");
+        assert!(staged, "rc must be staged when /system/etc/init exists");
+
+        let p = format!("{}/system/etc/init/twoyi-logdrain.rc", rootfs);
+        let body = fs::read_to_string(&p).expect("rc file readable");
+        // The service must be named, drain to the host-visible data path,
+        // rotate (bounded size), and be oneshot so a logd-less recovery
+        // boot cannot restart-loop it.
+        assert!(body.contains("service twoyi-logdrain /system/bin/logcat"));
+        assert!(
+            body.contains("/data/local/tmp/twoyi-guest-logcat.log"),
+            "drain target must be the host-visible data dir"
+        );
+        assert!(body.contains("-r 2048"), "rotation must be bounded");
+        assert!(body.contains("oneshot"), "must be oneshot");
+
+        // Re-staging (second boot) is an idempotent overwrite.
+        fs::write(&p, "stale-from-previous-boot\n").unwrap();
+        create_logdrain_rc(&rootfs).expect("re-stage");
+        let body2 = fs::read_to_string(&p).unwrap();
+        assert!(
+            body2.contains("service twoyi-logdrain"),
+            "re-stage must overwrite stale content"
+        );
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z313_logdrain_rc_skipped_without_init_dir() {
+        let rootfs = tmpdir();
+        // A recovery-class tree: no /system/etc/init at all.
+        fs::create_dir_all(format!("{}/sbin", rootfs)).unwrap();
+
+        let staged = create_logdrain_rc(&rootfs).expect("skip path succeeds");
+        assert!(!staged, "rc must NOT be staged for a recovery-class rootfs");
+        assert!(
+            !std::path::Path::new(&format!("{}/system/etc/init/twoyi-logdrain.rc", rootfs))
+                .exists(),
+            "no rc file may exist"
+        );
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
     #[test]
     fn z305t10_userdata_node_carries_ext4_superblock() {
         // 6-Z305t-10 pt3: the staged /data device node must carry a
