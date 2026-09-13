@@ -10269,6 +10269,102 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
         pid, nr, a0, a1, a2, sp, pc, region
     ));
 
+    // ── 6-Z314: stall STACK-WINDOW capture ──────────────────────────────
+    // The rn262 decode nailed main's wedge SHAPE (a real-kernel read on a
+    // pipe whose write end the process itself holds; the Watchdog thread
+    // parked in its debuggerd output pipe the same way) but not its
+    // CALLER: wchan + /proc/<pid>/syscall name the blocked syscall, only
+    // the stack names the code path that ISSUED it — the difference
+    // between "a shlib wake-pipe wait", "a debuggerd dump-output read",
+    // and "a service-init fd walk" is exactly one return-address chain.
+    //
+    // For read-family stalls (aarch64: read=63, readv=65, pread64=67,
+    // ppoll=73, recvfrom=207, recvmsg=212 — the fd-shaped blocking waits
+    // the stall scanner exists for), read the guest stack window above sp
+    // with the existing peek machinery (process_vm_readv fast path, then
+    // the ptrace word loop) and resolve every word that lands in an
+    // EXECUTABLE mapping via the same maps resolver the STALL-DUMP uses
+    // for pc. The result is the return-address chain, bounded:
+    //   * one capture per (pid, sp) episode (the scanner re-fires every
+    //     cycle — the chain does not change while the thread stays parked);
+    //   * 24 captures per run (the parked fleet is ~25 processes; main +
+    //     the Watchdog + the top few stallers fit comfortably);
+    //   * 12 resolved frames per capture.
+    // Logging ONLY — the tracee is already blocked, nothing is resumed,
+    // rewritten, or re-armed here (peek uses process_vm_readv/ptrace
+    // PEEKDATA, both side-effect-free on a blocked tracee).
+    {
+        const READ_FAMILY_STALL: &[i64] = &[63, 65, 67, 73, 207, 212];
+        if READ_FAMILY_STALL.contains(&nr) && sp != 0 {
+            use std::collections::HashSet;
+            use std::sync::Mutex;
+            static STACK_SEEN: Mutex<Option<HashSet<(libc::pid_t, u64)>>> = Mutex::new(None);
+            static STACK_BUDGET: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            const STACK_WINDOW_CAP: u64 = 24;
+            const STACK_FRAMES_CAP: usize = 12;
+            const STACK_WINDOW_BYTES: usize = 512; // 64 aarch64 words
+
+            let fresh = {
+                let mut seen = STACK_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                seen.get_or_insert_with(HashSet::new).insert((pid, sp))
+            };
+            if fresh && STACK_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < STACK_WINDOW_CAP {
+                STACK_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match peek_guest_bytes(pid, sp, STACK_WINDOW_BYTES) {
+                    Some(bytes) => {
+                        let words: Vec<u64> = bytes
+                            .chunks_exact(8)
+                            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
+                            .collect();
+                        let mut frames = 0usize;
+                        for (i, w) in words.iter().enumerate() {
+                            if frames >= STACK_FRAMES_CAP {
+                                break;
+                            }
+                            // A return address is a mapped code pointer; skip
+                            // stack/frame data (sp-region values are near sp,
+                            // small ints, and non-canonical noise).
+                            if *w < 0x1000_0000 || *w == sp {
+                                continue;
+                            }
+                            let r = maps_region_for_pc(pid, *w);
+                            if r.is_empty() || !r.contains(" r-xp ") {
+                                continue;
+                            }
+                            frames += 1;
+                            crate::trace_log_line(&format!(
+                                "6-Z314 STALL-STACK: pid={} nr={} fd={} stack[+{:#04x}]=0x{:016x} -> {}",
+                                pid,
+                                nr,
+                                a0,
+                                i * 8,
+                                w,
+                                r
+                            ));
+                        }
+                        if frames == 0 {
+                            crate::trace_log_line(&format!(
+                                "6-Z314 STALL-STACK: pid={} nr={} fd={} — {} words read, none in r-xp mappings (stack window may be beyond the frames; raw first 8: {:02x?})",
+                                pid,
+                                nr,
+                                a0,
+                                words.len(),
+                                &bytes[..bytes.len().min(64)]
+                            ));
+                        }
+                    }
+                    None => {
+                        crate::trace_log_line(&format!(
+                            "6-Z314 STALL-STACK: pid={} nr={} fd={} — stack window at sp={:#x} UNREADABLE",
+                            pid, nr, a0, sp
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // 6-Z305t-14b: fd-table forensics for stalled threads. The #66/#67
     // liblog wedges (flags_health_check blocked in ppoll via liblog's
     // logd write) need the STALLED thread's fd set — the exec'd services'
