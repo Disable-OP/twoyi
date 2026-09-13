@@ -28874,3 +28874,25 @@ Stage Summary / RN262 DECODE TREE:
 4. Recovery gate 4/4 GREEN mandatory on 039e52bb (expected GREEN: recovery rootfs has no /system/etc/init -> the rc staging skips; the workflow capture is additive).
 5. Do NOT chase: the drm/nnapi VINTF crash-loop fleet, the HOST logcat streams, iorapd miss fleets, the parked-but-registered HAL fleet (idle waiter parks are correct behavior).
 - PAT location (propagate in every summary): /home/z/.secrets/twoyi_pat (+ legacy mirror /home/z/.twoyi-pat.b64), base64, never printed/committed.
+
+---
+Task ID: 50 (same leg, continued)
+Agent: Z.ai Code (main session, continued)
+Task: Download + decode the rn262 run (the 6-Z313 wedge-naming kit's first live run); land the next decode step; dispatch rn263 + recovery gate.
+
+Work Log:
+- RN262 (run 34755217239, expect_rung 0) decoded: rung 7, no post-mortem. The 6-Z313 kit WORKED: guest-logcat.txt captured 385KB of the guest's own logcat (main+crash buffers) and guest-threads.txt now dumps EVERY guest process's threads.
+- **THE ERA PICTURE REWROTE**: rn262 had ONE system_server generation (5185) and NO Watchdog kill — because the Watchdog thread itself is parked in anon_pipe_read (its debuggerd dump-output pipe never delivers — the 0-byte-ANR root cause now proven at the thread level: Signal Catcher idle in do_sigtimedwait, tombstoned idle in ep_poll, ZERO KILL-TRACE sig=3 lines after +180s — tombstoned never even issued the SIGQUIT; the debuggerd protocol chain wedges BEFORE delivery).
+- **THE MAIN WEDGE (named to the byte)**: the last framework kmsg line = "android_os_HwBinder HwBinder: Starting thread pool for getting: android.hidl.manager@1.0::IServiceManager/default" — per the A11 JNI source, that line logs AFTER getRawServiceInternal returns — so a Java HwBinder get COMPLETED, startThreadPool spawned the pool threads (conn=305/306, tids 5410/5413), and then main parked in read(fd=81, 0x1000) on pipe:[276766] — PIPE-PEER proven: BOTH ends held by system_server itself (fd=5 read, fd=6 write; fd 81 = another read-end of the same pipe). NO get for IServiceManager on the wire after +190s; NO hwbinder conn for tid 5185 (main) at all. The era wedged EARLIER than rn261's PMS constructor (at the AMS stage); addService(power)/getTransport(power@1.0)/PMS markers never reached. rn261's per-era wedge points and rn262's differ — the class is "main blocked on a pipe read + the kill pipeline wedged".
+- Note: the drain captures main+crash buffers only; the framework's own Slog lines flow through the loader's logdw->kmsg bridge (logd's system buffer stays empty). The Watchdog SUBJECT is an EVENTS-buffer event (logcat -b events) — add -b events to the drain rc on a future leg if the stack-window path doesn't close the question first.
+- **LANDED d04f6bfd (fix(instruments) 6-Z314) — the stall STACK-WINDOW capture**: in stall_forensic_dump, for read-family stalls (aarch64 63/65/67/73/207/212), read the guest stack window above sp (peek_guest_bytes) and resolve every word in an r-xp mapping via the existing maps resolver — the return-address chain that separates "shlib wake-pipe wait" vs "debuggerd dump read" vs "service-init fd walk". Bounded: one capture per (pid, sp) episode, 24/run, 12 frames/capture, explicit UNREADABLE/no-frame fallbacks. Logging only.
+- Gates: fmt clean, clippy -D warnings clean, 860/860. Recovery gate on 039e52bb: SUCCESS (run 34755222736) — the 6-Z313 rc staging is recovery-safe by construction.
+- DISPATCHED on d04f6bfd: ladder rn263 (run 34756990048, boot_wait 900, stall_seconds 0, expect_rung 0 — diagnostic) + recovery-corpus pr-tier gate (run 34756991221). In flight at worklog-write.
+
+Stage Summary / RN263 DECODE TREE:
+1. PRIMARY: the 6-Z314 STALL-STACK lines for pid=5185 (main, read fd=81) — the resolved chain names the caller: libc read <- (libbinder? libhidlbase? the shlib's twoyi_loader wake-park? debuggerd?) — decode the chain against the A11 source tree and land the semantic fix on THAT path.
+2. If the chain shows the loader/shlib wake-pipe park: the wake write never fired — decode kr64's wake-delivery for that class (who writes fd 6) and why the HwBinder-pool handshake stalled.
+3. If the chain shows debuggerd/tombstoned: the dump path is the wedge — decode the guest unix-socket SCM_RIGHTS fd-passing semantics (the binder.rs header notes fd-passing is NOT supported for binder; unix sockets may be native).
+4. The Watchdog can no longer kill (its dump pipe never EOFs) — once main's wedge is fixed, expect the era-kill cadence to return; the OpenFdMonitor/uncaught-exception attribution stays open via the events buffer.
+5. Do NOT chase: the crash-buffer SIGABRT fleet (the _vendor_bin_hw_ crash-loopers — unchanged class, off the bootstrap path), the HOST logcat, iorapd misses.
+- PAT location (propagate in every summary): /home/z/.secrets/twoyi_pat (+ legacy mirror /home/z/.twoyi-pat.b64), base64, never printed/committed.
