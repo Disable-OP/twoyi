@@ -19550,10 +19550,8 @@ pub fn run_ptrace_loop(
                                         if let Ok(t) = std::fs::read_link(ent.path()) {
                                             let ts = t.to_string_lossy().into_owned();
                                             if ts.starts_with("pipe:") {
-                                                if let Ok(fd) = ent
-                                                    .file_name()
-                                                    .to_string_lossy()
-                                                    .parse::<i32>()
+                                                if let Ok(fd) =
+                                                    ent.file_name().to_string_lossy().parse::<i32>()
                                                 {
                                                     if z319_pipes_seen.len() > 512 {
                                                         z319_pipes_seen.clear();
@@ -19760,10 +19758,8 @@ pub fn run_ptrace_loop(
                                         if let Ok(t) = std::fs::read_link(ent.path()) {
                                             let ts = t.to_string_lossy().into_owned();
                                             if ts.starts_with("pipe:") {
-                                                if let Ok(fd) = ent
-                                                    .file_name()
-                                                    .to_string_lossy()
-                                                    .parse::<i32>()
+                                                if let Ok(fd) =
+                                                    ent.file_name().to_string_lossy().parse::<i32>()
                                                 {
                                                     if z319_pipes_seen.len() > 512 {
                                                         z319_pipes_seen.clear();
@@ -24907,13 +24903,16 @@ pub fn run_ptrace_loop(
                             // 6-Z319: stash for the EXIT-side PIPE-DUP
                             // observation (the new fd does not exist at
                             // ENTRY; one-in-flight-per-thread stash, same
-                            // pattern as z305y_zclose_pending).
+                            // pattern as z305y_zclose_pending). Pin pid =
+                            // pre-first-fork zygote — counts as lineage
+                            // (see the pipe2 ENTRY arm).
                             if newfd > 2
-                                && z306_in_zygote_lineage(
-                                    pid,
-                                    &z306_zygote_lineage,
-                                    &mut z306_lineage_tgid_cache,
-                                )
+                                && (z305y_stdio_pin_pid == Some(pid)
+                                    || z306_in_zygote_lineage(
+                                        pid,
+                                        &z306_zygote_lineage,
+                                        &mut z306_lineage_tgid_cache,
+                                    ))
                             {
                                 z319_dup_pending.insert(pid, old_fd as i32);
                             }
@@ -24927,12 +24926,20 @@ pub fn run_ptrace_loop(
                         // writes nothing — pure observation.
                         n if n == libc::SYS_pipe2 as i64 => {
                             let paddr = get_syscall_arg(&regs, abi.reg_arg1);
+                            // The PIN PID is the zygote BEFORE its first
+                            // fork — z306_zygote_lineage only inserts it at
+                            // its first fork EVENT (the perfetto-class
+                            // Setup() pipe happens during Runtime::Init,
+                            // BEFORE any fork), so the lineage check alone
+                            // would miss the exact pipe this leg exists to
+                            // trace. Pin-pid counts as lineage here.
                             if paddr != 0
-                                && z306_in_zygote_lineage(
-                                    pid,
-                                    &z306_zygote_lineage,
-                                    &mut z306_lineage_tgid_cache,
-                                )
+                                && (z305y_stdio_pin_pid == Some(pid)
+                                    || z306_in_zygote_lineage(
+                                        pid,
+                                        &z306_zygote_lineage,
+                                        &mut z306_lineage_tgid_cache,
+                                    ))
                             {
                                 z319_pipe2_pending.insert(pid, paddr);
                             }
@@ -32283,10 +32290,7 @@ pub fn run_ptrace_loop(
                                 };
                                 if z319_pipe2_budget < 32 {
                                     z319_pipe2_budget += 1;
-                                    log(&format!(
-                                        "6-Z319 PIPE2: pid={} fds=[{},{}]",
-                                        pid, fa, fb
-                                    ));
+                                    log(&format!("6-Z319 PIPE2: pid={} fds=[{},{}]", pid, fa, fb));
                                 }
                                 if z319_pipes_seen.len() > 512 {
                                     z319_pipes_seen.clear();
@@ -32299,10 +32303,9 @@ pub fn run_ptrace_loop(
                     }
                     if let Some(old_fd) = z319_dup_pending.remove(&pid) {
                         if ret > 2 {
-                            let target =
-                                std::fs::read_link(format!("/proc/{}/fd/{}", pid, ret))
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
+                            let target = std::fs::read_link(format!("/proc/{}/fd/{}", pid, ret))
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default();
                             if target.starts_with("pipe:") {
                                 let z319_key = if z306_zygote_lineage.contains(&pid) {
                                     pid
