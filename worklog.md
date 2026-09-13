@@ -29057,3 +29057,27 @@ Stage Summary / RN269 DECODE TREE:
 5. Recovery gate 4/4 GREEN mandatory (the kill-isolation touches shared kill paths — the corpus validates abort/raise semantics directly: fake-pid self-kills (the abort storm class) must still work natively).
 6. Do NOT chase: the audio abandoned-mutex fleet, the drm/nnapi VINTF crash-loop fleet, HOST logcat streams.
 - PAT location (propagate in every summary): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat), never printed/committed.
+
+---
+Task ID: 55c (same leg, continued)
+Agent: Z.ai Code (main session, continued)
+Task: Decode rn269 (the 6-Z321 kill-isolation's first live run); land the sign-normalization fix; dispatch rn270 + recovery gate.
+
+Work Log:
+- **RN269 (34771274013) DECODED — THE GUEST SURVIVED THE FULL 914s WATCH: RUNG 7 = SURFACEFLINGER, NO POST-MORTEM** (vs rn268's death at +223.4s):
+  1. The 6-Z321 KILL-ISOLATION fired 24× — ALL at +945-989ms from guest init (comm=_system_bin_ini): kill(pid=4294964597=0xFFFFFF75, sig=9). **0xFFFFFF75 IS -139 AS i32** — init's LEGITIMATE process-group kills arrive ZERO-EXTENDED in x0 (written via w0) and the v1 arm misread them as huge positive out-of-subtree pids. 6-Z321c landed (cast through i32 FIRST): negatives keep kernel-native pgid semantics, real pids unchanged. THE MISFIRES ARE A LANDED-REGRESSION-FIXED-IN-PLACE (the boot survived them — init tolerates a failed kill(-pgid) — but the semantics must stay honest).
+  2. Whether the deny also caught the RN268 tracer-killer is UNRESOLVED BY DESIGN FLAW: the 24-entry deny log budget was consumed by the +945ms misfires — any later deny (the real killer, ~+223s class) would be silent. The kill budget must EXCLUDE the negative-pid class after 6-Z321c (they no longer deny) — rn270's log is then unambiguous.
+  3. Framework depth: StartInstaller (254ms) / ReadingSystemConfig (930ms) / **StartWatchdog (33ms)** / InitBeforeStartServices (3899ms) — same AMS-era depth as rn268; no marker beyond InitBeforeStartServices.
+  4. **MAIN (4815) PARKED at read(fd=77) at +204.76s** — fd 77 is a READ DUP of the child's own perfetto-class pipe:[224887] (fd 5 read / fd 6 write, created at +171.8s; the reader THREAD 4821 parked on fd 5 at +177.1s — the rn268 shape exactly). The 6-Z319 PIPE-DUP arm did NOT fire on fd 77 → the dup came from an UNINSTRUMENTED path (fcntl(F_DUPFD/F_DUPFD_CLOEXEC) or SCM_RIGHTS) — the fcntl-dup EXIT arm is the next instrument step. MAIN reading the dup (and parking) is the rn267-era wall shape; the reader-thread parking is real-device-harmless.
+  5. Recovery gate on 84b5bba6: SUCCESS (8th consecutive GREEN — the kill-isolation keeps abort/raise fake-pid semantics native).
+- Gates (6a9ebc3d): fmt clean, clippy -D warnings clean, 863/863.
+- DISPATCHED on 6a9ebc3d: rn270 ladder (run 34773030399, boot_wait 900, stall 90, expect_rung 0) + recovery-corpus pr-tier gate (run 34773031993). In flight at worklog-write.
+
+Stage Summary / RN270 DECODE TREE:
+1. PRIMARY: the KILL-ISOLATION deny lines with the sign fix — a clean log (no misfires) means any deny line IS the rn268 killer: name it, verify the tracer survives (the 900s watch runs to completion — it did in rn269), and close the tracer-death mystery.
+2. If the tracer still dies silently with NO deny line: the killer is NOT a guest kill() — pivot host-side (the app's own lifecycle, redroid OOM/lmkd, cgroup), and instrument the tracer's fork-side (the parent app's waitpid of the tracer + the tracer's own SIGKILL-era... the tracer cannot catch SIGKILL — the deny + host-side are the only levers).
+3. The fd 77/80-class dup: land the fcntl(F_DUPFD*) EXIT arm (PIPE-DUP coverage) — names WHO creates main's read target. THEN the semantic fix on that site (main must never read the perfetto-class pipe's dup — whatever code dups it into main's path is the defect).
+4. EXPECT: with the misfire noise gone, the framework markers past InitBeforeStartServices become readable — the next wall is in the PowerManagerService/Lights/SurfaceFlinger registration era (the rn266 post-wakelock abort path is live-nameable via the widened 6-Z318 scan).
+5. Recovery gate 4/4 GREEN mandatory (the sign fix touches the same kill path — the corpus's abort storms validate it directly).
+6. Do NOT chase: the audio abandoned-mutex fleet, the drm/nnapi VINTF crash-loop fleet, HOST logcat streams.
+- PAT location (propagate in every summary): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat), never printed/committed.
