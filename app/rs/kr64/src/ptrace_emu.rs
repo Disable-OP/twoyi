@@ -14993,6 +14993,12 @@ pub fn run_ptrace_loop(
     // loop while still naming EVERY first-time fatality).
     let mut z309c_verdict_logged: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // 6-Z309d: EXIT-event captures spent on the recently-served daemon
+    // class (lineage=false pids that received a routed transaction
+    // delivery within the TTL window — the rn255 suspend-daemon death:
+    // sig=11, no delivery stop, no capture). Separate 6-per-run budget
+    // so the crash-loop fleets cannot eat it.
+    let mut z309d_deaths: u64 = 0;
     // 6-Z306af-d: fork-time executable-maps snapshots for lineage
     // processes (taken at the PR_SET_NAME rename — see the 6-Z306x
     // hook). At the fatal-signal EXIT event the live
@@ -17581,9 +17587,21 @@ pub fn run_ptrace_loop(
                                         &z306_zygote_lineage,
                                         &mut z306_lineage_tgid_cache,
                                     );
-                                let af_cap_will_fire = z306af_deaths < 32
-                                    && af_is_lineage
-                                    && !z306af_delivery_dumped.contains(&pid)
+                                // 6-Z309d: daemons that received a routed
+                                // transaction delivery within the TTL window
+                                // get EXIT-capture priority too (the rn255
+                                // suspend-daemon death: sig=11, no delivery
+                                // stop, lineage=false → no capture → the
+                                // crash site stayed unnamed).
+                                let af_served =
+                                    !af_is_lineage && crate::binder::recently_served(pid);
+                                let af_cap_will_fire = if af_is_lineage {
+                                    z306af_deaths < 32
+                                } else if af_served {
+                                    z309d_deaths < 6
+                                } else {
+                                    false
+                                } && !z306af_delivery_dumped.contains(&pid)
                                     && (term_sig == libc::SIGSEGV
                                         || term_sig == libc::SIGBUS
                                         || term_sig == libc::SIGILL
@@ -17603,17 +17621,22 @@ pub fn run_ptrace_loop(
                                     let af_tgid_v =
                                         z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(0);
                                     log(&format!(
-                                        "6-Z309c: fatal-EXIT pid={} sig={} lineage={} tgid={} capture={} (cap {}/32)",
+                                        "6-Z309c: fatal-EXIT pid={} sig={} lineage={} served={} tgid={} capture={} (cap {}/32)",
                                         pid,
                                         term_sig,
                                         af_is_lineage,
+                                        af_served,
                                         af_tgid_v,
                                         af_cap_will_fire,
                                         z306af_deaths
                                     ));
                                 }
                                 if af_cap_will_fire {
-                                    z306af_deaths += 1;
+                                    if af_is_lineage {
+                                        z306af_deaths += 1;
+                                    } else {
+                                        z309d_deaths += 1;
+                                    }
                                     z306af_delivery_dumped.insert(pid);
                                     // #212 lesson: at the EXIT event after a
                                     // fatal signal the per-tid procfs reads

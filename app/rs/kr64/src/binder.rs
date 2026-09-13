@@ -3927,6 +3927,23 @@ fn handle_write_read(
                         if let Some(blob) = tx.blob {
                             resp_blobs.push(blob);
                         }
+                        // 6-Z309d: note the SERVED pid — the tracer's
+                        // EXIT-event death capture gives recently-served
+                        // daemons the same register evidence the zygote
+                        // lineage already gets (the rn255 suspend-daemon
+                        // class died sig=11 with NO delivery stop and NO
+                        // capture 2.6s after receiving the interfaceChain
+                        // probe — lineage=false, so the old gate skipped
+                        // it and the crash site stayed unnamed).
+                        {
+                            let served = {
+                                let b = bus.lock().expect("binder bus poisoned");
+                                b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                            };
+                            if served > 0 {
+                                note_served_pid(served);
+                            }
+                        }
                         info!(
                     "[KR64][binder][vm{}] delivered transaction conn={} <- conn={} code={} oneway={} (tx #{})",
                     vm_id, conn_id, tx.requester, tx.code, tx.one_way, tx.txn_id
@@ -6797,6 +6814,46 @@ fn push_br_transaction_complete(buf: &mut Vec<u8>) {
 static PROBE_CAPTURE_BUDGET: AtomicU32 = AtomicU32::new(32);
 static PROBE_SERVE_BUDGET: AtomicU32 = AtomicU32::new(32);
 static PROBE_DELIVERY_BUDGET: AtomicU32 = AtomicU32::new(96);
+
+/// 6-Z309d: the shared recently-served registry (pid → last-delivery
+/// instant), capped at 64 entries. The tracer's EXIT-event death capture
+/// consults this ( [`crate::binder::recently_served`] ) so a daemon that
+/// dies while/after serving a routed transaction gets the register
+/// + maps-snapshot evidence even though it is NOT in the zygote lineage
+/// (the suspend-daemon death class of rn255: sig=11, no delivery stop,
+/// no capture — the crash site stayed unnamed).
+fn served_pids() -> &'static std::sync::Mutex<std::collections::VecDeque<(i32, std::time::Instant)>>
+{
+    use std::sync::Mutex;
+    static SERVED: std::sync::OnceLock<
+        Mutex<std::collections::VecDeque<(i32, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    SERVED.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn note_served_pid(pid: i32) {
+    const CAP: usize = 64;
+    const TTL: std::time::Duration = std::time::Duration::from_secs(90);
+    let now = std::time::Instant::now();
+    let mut q = served_pids().lock().unwrap_or_else(|p| p.into_inner());
+    q.retain(|(p, at)| *p != pid && now.duration_since(*at) < TTL);
+    q.push_back((pid, now));
+    while q.len() > CAP {
+        q.pop_front();
+    }
+}
+
+/// 6-Z309d: whether `pid` received a routed transaction delivery within
+/// the TTL window (see [`note_served_pid`]).
+pub(crate) fn recently_served(pid: i32) -> bool {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(90);
+    let now = std::time::Instant::now();
+    served_pids()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|(p, at)| *p == pid && now.duration_since(*at) < TTL)
+}
 
 /// 6-Z306ag: bounded evidence that a connection is servicing
 /// NESTED/OVERLAPPING transactions — the exact shape the previous
