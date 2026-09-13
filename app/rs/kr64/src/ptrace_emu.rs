@@ -25191,6 +25191,20 @@ pub fn run_ptrace_loop(
                                     Some(pid_arg)
                                 };
                                 if let Some(t) = z321_target {
+                                    // 6-Z321c SIGN NORMALIZATION (rn269,
+                                    // run 34771274013): kill(2)'s pid argument
+                                    // is int — a NEGATIVE pid (init's
+                                    // process-group kill, kill(-139, SIGKILL))
+                                    // is written via w0 and arrives ZERO-
+                                    // EXTENDED in x0 (0xFFFFFF75), reading as
+                                    // a huge positive i64. The v1 arm denied
+                                    // those (24 misfires at +945ms — the boot
+                                    // survived, but init's pgid kills must
+                                    // keep their kernel-native semantics).
+                                    // Cast through i32 FIRST: real pids stay
+                                    // positive, negatives stay negative and
+                                    // are never denied.
+                                    let t = t as i32 as i64;
                                     if t > 1 && !tracked_pids.contains(&(t as libc::pid_t)) {
                                         // Rewrite the target to a pid that can
                                         // never exist → the kernel returns the
