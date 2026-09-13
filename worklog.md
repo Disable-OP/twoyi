@@ -28916,3 +28916,23 @@ Stage Summary / RN264 DECODE TREE:
 3. The libmeminfo->libandroid_runtime chain: identify the A11 caller (AMS-constructor-era MemInfoReader/Debug.getMemoryInfo-class call on main) to predict WHICH /proc file the fd must be.
 4. Do NOT chase: the crash-loop fleet, HOST logs, the events-buffer subject (only if the fd-target path stalls again).
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 52 (same leg, continued)
+Agent: Z.ai Code (main session, continued)
+Task: Decode rn264 (the 6-Z315 lineage-bypass's first live run); land the next decode step; dispatch rn265 + recovery gate.
+
+Work Log:
+- RN264 (run 34758635150) decoded: rung 7, no era deaths, same AMS-stage wedge (last framework kmsg line = the Java HwBinder IServiceManager get line; Watchdog WAITED_HALF). Recovery gate on 740fd148: SUCCESS.
+- **THE WEDGE SHAPE VARIES PER GENERATION — AND A POISONED SHARED MUTEX NAMED ITSELF**: this generation's system_server main (7526) sat in futex_do_wait, and thread 7694 blocked on a bionic mutex whose owner field reads tid 1 — "6-Z306i STALL-OWNER: ... owner@+4=tid 1 DEAD (abandoned mutex)". In the guest's fake-pid space a REAL owner tid can NEVER be 1 (guest pids start far above 1): the owner record is poisoned by the getpid-fake class — some thread took that shared lock while its recorded tid was the fake constant, then died/never unlocked; every later contender waits forever. A poisoned SHARED mutex explains the per-generation wedge variety (rn262: main read(pipe) self-held; rn263: main read via libmeminfo+libandroid_runtime; rn264: main futex): the first thread to touch the poisoned lock wedges, the downstream cascade differs.
+- NOTE: rn263's STALL-TARGET for main's fd 80 still did not fire (its budget-bypass fix landed AFTER that run's dispatch) — the "which /proc file" datum is still pending; the poisoned-mutex trail (6-Z316) may close the question at a higher level first.
+- **LANDED dd33d3b4 (fix(instruments) 6-Z316)**: the 6-Z306i STALL-OWNER line now resolves uaddr through the maps (maps[uaddr]=...) — the library owning the poisoned mutex (liblog / libbinder / libutils / an ART lock) selects between the poison sources.
+- Gates: fmt clean, clippy -D warnings clean, 860/860.
+- DISPATCHED on dd33d3b4: ladder rn265 (run 34760216231, boot_wait 900, stall_seconds 0, expect_rung 0) + recovery-corpus pr-tier gate (run 34760217227). In flight at worklog-write.
+
+Stage Summary / RN265 DECODE TREE:
+1. PRIMARY: the STALL-OWNER maps[uaddr]=... region — names the poisoned mutex's library. Then trace THAT library's lock init/use in the boot (who could take it while recording tid 1: the getpid-fake rewrite arms, the prctl/gettid caches — see the 6-Z305t-72 class), and land the semantic fix (either the fake-identity leak that poisons the owner record, or the abandoned-lock recovery semantics that the real kernel/bionic would provide).
+2. Cross-check: the STALL-TARGET line for main's read fd (the 6-Z315 bypass is now live) — if the fd is the perfetto pipe dup'd by the wrong code, the mutex and the read may be the SAME cascade (the libmeminfo caller blocked on a lock held by a thread blocked on the read).
+3. The Java HwBinder IServiceManager get line remains the last completed framework action; once the wedge cascade is fixed, expect the era to progress past StartActivityManager (DataLoaderManager/IncrementalService/PowerManager markers return).
+4. Do NOT chase: the crash-loop fleet, HOST logs, the events-buffer subject.
+- Authentication is provided through the private agent environment.
