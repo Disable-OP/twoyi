@@ -28661,3 +28661,22 @@ Stage Summary / RN255 DECODE TREE:
 3. Recovery gate 4/4 GREEN mandatory (the fix touches the shared SG wire; recovery guests are A11-era and emit no HAS_PARENT PTR objects, so the parent-fixup pass is a no-op for them — GREEN is the regression baseline).
 4. If system_server survives the window: the frontier moves to PMS/package_native registration (the bootstrap-throughput wall from rn251/252) → rung 6 SURVIVAL → rung 8 (SystemUI).
 5. The vold/media.swcodec/keystore signal-6 crash loops (DM_LIST_DEVICES/LOOP_GET_STATUS64 EPERM class — the virtual block-dev ioctl surface) remain the NEXT frontier after the cast wall; the JDWP accept-EINVAL flood is a cheap candidate after that.
+
+---
+Task ID: 45b (same leg, rn255 decode + follow-up dispatch)
+Agent: Z.ai Code (main session)
+Task: Decode rn255 (the 6-Z309 verification run); land the follow-up instrument; dispatch rn256.
+
+Work Log:
+- rn255 (900s diagnostic, fc7ff5eb) verdict: rung 7 SURFACEFLINGER, 5 eras, ROM = pure-stock-android11-aosp-arm64 RSR1. Artifacts at /home/z/artifacts-rn34736571276.
+- THE 6-Z309 FIX IS PROVEN AT THE WIRE: "incompatible service" 216× → 0; "Buffer in parent" 219× → 0; "found dead hwbinder" still 0; the loader's 6-Z309 parent-fixup diag fires with 0 skipped — the interfaceChain reply shape (dlen=244 olen=48 sg=6) gets exactly 5 fixups (4 chars + 1 array) per delivery, and the single-hidl_string shapes (dlen=84 olen=16 sg=2) get 1.
+- THE WALL MOVED TO THE DAEMON SIDE: the suspend daemon (pid 2783, conn=6) died sig=11 at +179.952s — 2.6s AFTER the routed IBase::interfaceChain probe was DELIVERED to it (6-Z306ad delivery-capture line at +177.356s, the object's weakref healthy: mStrong=1/mWeak=2/mBase intact). Same pc=0x0 / x1=0xf43484e BnHw-dispatch class as rn254's audio fleet (tid 2902 "Binder:2889_1"). Downstream chain: the probe's waiter resolves Dead at the daemon's conn death → "unable to call into hwbinder service for android.system.suspend" (4×, one per era) → the 84× "Waited one second for android.system.suspend@1.0::ISystemSuspend/default" retry loop → era SIGABRTs at ~164s spacing (pids 5369/7602/9763/11873, capture=true — the registers are parked-futex group-abort COLLATERAL, pc=syscall+0x1c/x8=0x62 futex — NOT the fault site) + 1 sig=11 era (13960).
+- DECODE HYGIENE (cost me a wrong turn): conn=6's apparent silence after +78.4s is a LOG BUDGET artifact — the proxy's per-conn wr_diag_budget is 200 (200 request + 199 response lines ≈ the 411 observed); the daemon kept polling invisibly. The routed-tx log is ALSO sampled (first 16 per (vm,owner), then every 500th). Unbudgeted lines (delivered-transaction, 6-Z306ad, 6-Z309c) are the reliable decode inputs.
+- The daemon crash registers were NOT captured (lineage=false, no delivery stop for this class) — LANDED b1f96420 (6-Z309d): a shared recently-served registry (binder.rs note_served_pid, 64 entries, 90s TTL) records pids that received a routed delivery; the tracer's EXIT-event capture gate admits recently-served pids under their own 6-per-run budget (z309d_deaths); the 6-Z309c verdict lines gain served=. Gates 850/850, fmt clean, clippy clean. No wire changes.
+- DISPATCHED on b1f96420: ladder rn256 (boot_wait 900, expect_rung 0) + recovery pr-tier gate. In flight at worklog-write.
+
+Stage Summary / RN256 DECODE TREE:
+1. PRIMARY: the daemon-side crash registers (the 6-Z309d captures) — pc/LR symbolized against the rename-time maps snapshot (remember: ROW-START-relative — symbolize as segment_vaddr + row_offset against the extracted libc/HWASO libs) name the exact daemon-side wall. The rn254 audio shape (pc=0x0, x1=0xf43484e) suggests a NULL virtual dispatch in the BnHw probe path; with registers + the fp-chain the precise frame resolves.
+2. EXPECT the suspend daemon to die the SAME way each era (the 84× retry loop continues) — the captured death repeats per era; dedupe by shape.
+3. If the daemon-side fix lands: the suspend lookup completes → PowerManagerService constructor returns → startOtherServices progresses → the bootstrap-throughput frontier (PMS/package_native registration) returns.
+4. Recovery gate 4/4 GREEN mandatory (no wire changes this time — GREEN is expected; a red gate means the tracer gate change regressed the corpus paths).
