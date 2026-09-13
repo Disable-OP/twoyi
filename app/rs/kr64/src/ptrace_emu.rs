@@ -12165,6 +12165,219 @@ extern "C" fn kr64_sigsys_catcher(
     KR64_SIGSYS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+// ── 6-Z311: the death last-gasp — fatal-signal capture for kr64 itself ──
+//
+// rn257 (+420s) and rn259 (+217s) both ended the same way: kr64's stderr
+// stops mid-line mid-traffic, no panic message, no loop-exit log, no
+// HOST-side kill record — and the process is a ZOMBIE at classification
+// (Z [libkr64.so] in the ps subtree). The rung verdict is then scored
+// from a FROZEN kr64: rn259's guest had already reached the
+// HAL/system_server era (init.svc_debug_pid carried zygote,
+// sys.system_server.start_count/start_elapsed/start_uptime; the kmsg
+// mirror shows the nnapi/VINTF registration era) while the classifier
+// scored rung 3 — a verdict artifact that poisons the ladder.
+//
+// Every waitpid-loop exit path logs loudly ("ending the ptrace loop
+// (return N)"), and no Rust panic/allocation-failure message appeared,
+// so the silent class is a RAW fatal signal (SIGSEGV/SIGBUS/SIGILL/
+// SIGFPE/SIGABRT) inside this unsafe-heavy process — which by default
+// leaves ZERO trace.
+//
+// This handler makes the death NAMEABLE: it renders one line (signal,
+// si_code, sender pid, fault address, the waitpid-loop heartbeat:
+// loop_count / last-waited pid / tracked-set size, this tracer tid)
+// into a stack buffer with an allocation-free formatter and write(2)s
+// it to fd 2 (the app's FileLogger mirrors kr64's stderr into
+// kr64.log), then resets the disposition to SIG_DFL and re-raises —
+// the death semantics stay deterministic (same signal, same timing
+// modulo one write syscall).
+//
+// Async-signal-safety: no allocation, no locks, no log(), write(2) +
+// sigaction + raise + gettid only. The traced children are unaffected:
+// their fatal signals arrive as ptrace signal-delivery-stops consumed
+// by the waitpid loop and never consult the tracer's dispositions (the
+// same argument the 6-Z62 SIGSYS catcher makes).
+static KR64_HB_LOOP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KR64_HB_LAST_WAITED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static KR64_HB_TRACKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The waitpid-loop heartbeat snapshot the last-gasp reports.
+#[derive(Clone, Copy)]
+struct LastGaspHeartbeat {
+    loop_count: u64,
+    last_waited: i32,
+    tracked: u64,
+}
+
+/// Allocation-free u64 → decimal writer. Returns the new position.
+fn lastgasp_push_u64(buf: &mut [u8], pos: usize, mut v: u64) -> usize {
+    let mut pos = pos;
+    if pos >= buf.len() {
+        return pos;
+    }
+    if v == 0 {
+        buf[pos] = b'0';
+        return pos + 1;
+    }
+    let start = pos;
+    while v > 0 && pos < buf.len() {
+        buf[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+        pos += 1;
+    }
+    buf[start..pos].reverse();
+    pos
+}
+
+/// Allocation-free i64 → decimal writer (si_code and pids go negative).
+fn lastgasp_push_i64(buf: &mut [u8], pos: usize, v: i64) -> usize {
+    if v < 0 {
+        let mut pos = pos;
+        if pos < buf.len() {
+            buf[pos] = b'-';
+            pos += 1;
+        }
+        lastgasp_push_u64(buf, pos, v.unsigned_abs())
+    } else {
+        lastgasp_push_u64(buf, pos, v as u64)
+    }
+}
+
+/// Allocation-free hex writer (fault addresses).
+fn lastgasp_push_hex(buf: &mut [u8], pos: usize, v: u64) -> usize {
+    let mut pos = lastgasp_push_str(buf, pos, "0x");
+    if v == 0 {
+        return lastgasp_push_u64(buf, pos, 0);
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let start = pos;
+    let mut v = v;
+    while v > 0 && pos < buf.len() {
+        buf[pos] = HEX[(v & 0xf) as usize];
+        v >>= 4;
+        pos += 1;
+    }
+    buf[start..pos].reverse();
+    pos
+}
+
+/// Allocation-free &str writer (bytes copied verbatim).
+fn lastgasp_push_str(buf: &mut [u8], pos: usize, s: &str) -> usize {
+    let mut pos = pos;
+    for &b in s.as_bytes() {
+        if pos >= buf.len() {
+            break;
+        }
+        buf[pos] = b;
+        pos += 1;
+    }
+    pos
+}
+
+/// Render one last-gasp death line. Pure function (no I/O, no globals)
+/// so the format is unit-testable.
+fn lastgasp_render(
+    buf: &mut [u8],
+    sig: i32,
+    si_code: i32,
+    sender_pid: i32,
+    addr: usize,
+    hb: LastGaspHeartbeat,
+    tracer_tid: i64,
+) -> usize {
+    let mut pos = 0usize;
+    pos = lastgasp_push_str(buf, pos, "[KR64 FATAL-SIGNAL] sig=");
+    pos = lastgasp_push_i64(buf, pos, sig as i64);
+    pos = lastgasp_push_str(buf, pos, " si_code=");
+    pos = lastgasp_push_i64(buf, pos, si_code as i64);
+    pos = lastgasp_push_str(buf, pos, " sender_pid=");
+    pos = lastgasp_push_i64(buf, pos, sender_pid as i64);
+    pos = lastgasp_push_str(buf, pos, " si_addr=");
+    pos = lastgasp_push_hex(buf, pos, addr as u64);
+    pos = lastgasp_push_str(buf, pos, " loop_iter=");
+    pos = lastgasp_push_u64(buf, pos, hb.loop_count);
+    pos = lastgasp_push_str(buf, pos, " last_waited=");
+    pos = lastgasp_push_i64(buf, pos, hb.last_waited as i64);
+    pos = lastgasp_push_str(buf, pos, " tracked=");
+    pos = lastgasp_push_u64(buf, pos, hb.tracked);
+    pos = lastgasp_push_str(buf, pos, " tracer_tid=");
+    pos = lastgasp_push_i64(buf, pos, tracer_tid);
+    pos = lastgasp_push_str(buf, pos, " — last-gasp before deterministic re-raise\n");
+    pos
+}
+
+/// The last-gasp handler: render + write(2) to stderr + deterministic
+/// re-raise (reset to SIG_DFL, raise, return — the kernel delivers the
+/// pending signal with the default disposition on handler return).
+extern "C" fn kr64_fatal_signal_lastgasp(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    unsafe {
+        let (si_code, sender_pid, addr) = if info.is_null() {
+            (0, 0, 0usize)
+        } else {
+            (
+                (*info).si_code,
+                (*info).si_pid(),
+                (*info).si_addr() as usize,
+            )
+        };
+        let mut buf = [0u8; 384];
+        let n = lastgasp_render(
+            &mut buf,
+            sig,
+            si_code,
+            sender_pid,
+            addr,
+            LastGaspHeartbeat {
+                loop_count: KR64_HB_LOOP_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                last_waited: KR64_HB_LAST_WAITED.load(std::sync::atomic::Ordering::Relaxed),
+                tracked: KR64_HB_TRACKED.load(std::sync::atomic::Ordering::Relaxed),
+            },
+            libc::syscall(libc::SYS_gettid),
+        );
+        if n > 0 {
+            libc::write(2, buf.as_ptr() as *const libc::c_void, n);
+        }
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_sigaction = libc::SIG_DFL as *const () as usize;
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
+        libc::raise(sig);
+    }
+}
+
+/// Install the last-gasp handlers for the raw fatal-signal class.
+/// Called once, right after the 6-Z62 SIGSYS catcher install, before
+/// the waitpid loop arms anything else.
+fn install_fatal_signal_lastgasp() {
+    const FATAL_SIGS: [libc::c_int; 5] = [
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGILL,
+        libc::SIGFPE,
+        libc::SIGABRT,
+    ];
+    for &s in FATAL_SIGS.iter() {
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_sigaction = kr64_fatal_signal_lastgasp as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            if libc::sigaction(s, &sa, std::ptr::null_mut()) != 0 {
+                let e = std::io::Error::last_os_error();
+                crate::trace_log_line(&format!(
+                    "6-Z311: fatal-signal last-gasp install FAILED for signal {}: {}",
+                    s, e
+                ));
+            }
+        }
+    }
+    crate::trace_log_line("6-Z311: fatal-signal last-gasp installed (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT) — a silent tracer death now names itself on stderr before the deterministic re-raise");
+}
+
 /// Task 6-Z62: the mmap2 ENTRY→EXIT handoff record. Created at the mmap2
 /// ENTRY stop in the SAME block that performs the anonymous rewrite, so
 /// the fields snapshot the ORIGINAL (pre-rewrite) arguments — the rewrite
@@ -13348,6 +13561,14 @@ pub fn run_ptrace_loop(
             }
         }
     }
+
+    // ── 6-Z311: install the fatal-signal last-gasp BEFORE the loop ──
+    //
+    // rn257 (+420s) and rn259 (+217s) died silently mid-boot (zombie at
+    // classification, verdict artifact — see the block comment on
+    // kr64_fatal_signal_lastgasp). With the handlers in place the next
+    // silent death names its signal, sender and fault address on stderr.
+    install_fatal_signal_lastgasp();
 
     // ── PTRACE_SETOPTIONS: trace forks + good-syscall-stops ──────────
     //
@@ -15882,6 +16103,16 @@ pub fn run_ptrace_loop(
             }
             return -1;
         }
+        // 6-Z311: heartbeat for the fatal-signal last-gasp — the handler
+        // reports the loop position at death time. Three relaxed stores
+        // per waitpid round-trip (~µs-scale cost at the worst observed
+        // stop rates, ~114k/sec): the death forensics are worth it.
+        KR64_HB_LOOP_COUNT.store(loop_count, std::sync::atomic::Ordering::Relaxed);
+        KR64_HB_LAST_WAITED.store(waited, std::sync::atomic::Ordering::Relaxed);
+        KR64_HB_TRACKED.store(
+            tracked_pids.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // ── 6-Z213 RAW STOP FORENSICS ──────────────────────────────────
         //
         // r24 (run 33248496503, commit 2db54ec) established a HARD fact:
@@ -46056,5 +46287,101 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
             super::z306anr_classify_proc_syscall("garbage"),
             "unparsable"
         );
+    }
+
+    // ── 6-Z311: the death last-gasp — fatal-signal capture format ────
+    //
+    // rn257/rn259 both ended with kr64 as a silent zombie (stderr cut
+    // mid-line, no panic, no loop-exit log, no HOST kill record) and the
+    // ladder scored a verdict artifact from the frozen supervisor while
+    // the guest kept progressing. The last-gasp makes the death name
+    // itself: these tests pin the rendered line (the format the next
+    // run's decode greps for) and the truncation safety of the
+    // allocation-free writers.
+
+    #[test]
+    fn z311_lastgasp_render_names_the_death() {
+        let mut buf = [0u8; 384];
+        let n = super::lastgasp_render(
+            &mut buf,
+            11,
+            1,
+            12345,
+            0xdeadbeef,
+            super::LastGaspHeartbeat {
+                loop_count: 10981120,
+                last_waited: 2688,
+                tracked: 151,
+            },
+            7001,
+        );
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            s.starts_with(
+                "[KR64 FATAL-SIGNAL] sig=11 si_code=1 sender_pid=12345 si_addr=0xdeadbeef"
+            ),
+            "{s}"
+        );
+        assert!(s.contains("loop_iter=10981120"), "{s}");
+        assert!(s.contains("last_waited=2688"), "{s}");
+        assert!(s.contains("tracked=151"), "{s}");
+        assert!(s.contains("tracer_tid=7001"), "{s}");
+        assert!(s.ends_with('\n'), "{s}");
+    }
+
+    #[test]
+    fn z311_lastgasp_render_zero_and_negative_values() {
+        let mut buf = [0u8; 384];
+        let n = super::lastgasp_render(
+            &mut buf,
+            6,
+            -6,
+            -1,
+            0,
+            super::LastGaspHeartbeat {
+                loop_count: 0,
+                last_waited: -1,
+                tracked: 0,
+            },
+            42,
+        );
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            s.contains("sig=6 si_code=-6 sender_pid=-1 si_addr=0x0"),
+            "{s}"
+        );
+        assert!(s.contains("loop_iter=0"), "{s}");
+        assert!(s.contains("last_waited=-1"), "{s}");
+        assert!(s.contains("tracked=0"), "{s}");
+    }
+
+    #[test]
+    fn z311_lastgasp_render_is_truncation_safe() {
+        // A too-small buffer must never panic and never grow past len.
+        let mut buf = [0u8; 24];
+        let n = super::lastgasp_render(
+            &mut buf,
+            11,
+            1,
+            1,
+            0x7fff_ffff_ffff_ffff,
+            super::LastGaspHeartbeat {
+                loop_count: u64::MAX,
+                last_waited: 1,
+                tracked: 1,
+            },
+            1,
+        );
+        assert!(n <= buf.len());
+        // The prefix always fits.
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(s.starts_with("[KR64 FATAL-SIGNAL] sig="), "{s}");
+    }
+
+    #[test]
+    fn z311_lastgasp_install_is_survivable() {
+        // Installing the handlers in the test process must succeed and
+        // must not disturb the harness (no fatal signal raised here).
+        super::install_fatal_signal_lastgasp();
     }
 }
