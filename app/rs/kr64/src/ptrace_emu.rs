@@ -24944,6 +24944,35 @@ pub fn run_ptrace_loop(
                                 z319_pipe2_pending.insert(pid, paddr);
                             }
                         }
+                        // ── 6-Z322: fcntl(F_DUPFD/F_DUPFD_CLOEXEC) ENTRY —
+                        // the THIRD dup path ──
+                        //
+                        // RN270 (run 34773030399) decode: system_server main
+                        // parked at read(fd=79) on a READ DUP of its own
+                        // perfetto-class pipe (rn267's fd 80, rn269's
+                        // fd 77 — same class), and the 6-Z319 PIPE-DUP arm
+                        // never fired on it: the dup/dup3 arms only cover
+                        // SYS_dup/SYS_dup3, but ART/bionic also duplicate
+                        // fds via fcntl(F_DUPFD=0 / F_DUPFD_CLOEXEC=1030).
+                        // Stash the old fd for the SAME EXIT handler (the
+                        // readlink + PIPE-DUP log is identical — the new fd
+                        // does not exist until EXIT, and the returned fd IS
+                        // the dup for both dup(2) and F_DUPFD*).
+                        n if n == libc::SYS_fcntl as i64 => {
+                            let cmd = get_syscall_arg(&regs, abi.reg_arg2) as i32;
+                            if cmd == 0 || cmd == 1030 {
+                                let old_fd = get_syscall_arg(&regs, abi.reg_arg1);
+                                if z305y_stdio_pin_pid == Some(pid)
+                                    || z306_in_zygote_lineage(
+                                        pid,
+                                        &z306_zygote_lineage,
+                                        &mut z306_lineage_tgid_cache,
+                                    )
+                                {
+                                    z319_dup_pending.insert(pid, old_fd as i32);
+                                }
+                            }
+                        }
                         n if n == abi.getpid => {
                             pending_getpid.insert(pid);
                             if loop_count <= 20 {
