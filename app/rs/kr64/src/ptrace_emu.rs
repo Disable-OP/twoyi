@@ -14760,7 +14760,19 @@ pub fn run_ptrace_loop(
     // 6-Z305t-40: binder-open forensics counter (budget 40) — every open of
     // a binder device node (orig or translated) with its node-existence
     // check; #97's servicemanager FATAL has zero shim-side evidence.
+    // 6-Z308a (the #251/#252 decode): the GLOBAL 40 budget is gone — the
+    // vold/media.swcodec crash-loop fleets burned it before the zygote
+    // even forked system_server, so the hwbinder client opens in the
+    // zygote→system_server lineage (the opens whose fate the #251
+    // wakelock::acquireWakeLock null-IMSystemSuspend SIGSEGV needs) were
+    // never logged. Replacement: per-(pid, translated-path) dedupe caps
+    // (3 per key; 12 per key for zygote-lineage members) under a raised
+    // global flood cap — every lineage open of /dev/hwbinder now lands
+    // in the artifact regardless of how many HAL processes crash-looped
+    // before it.
     let mut binder_open_diag_count: u64 = 0;
+    let mut z308_binder_open_keys: std::collections::HashMap<(libc::pid_t, String), u64> =
+        std::collections::HashMap::new();
     // 6-Z305t-42: binder fd table — (pid, fd) → the node path the open
     // resolved to. Populated at the open-EXIT registration when
     // is_binder_path(p); consumed by the ioctl/mmap ENTRY forensics to
@@ -25142,16 +25154,32 @@ pub fn run_ptrace_loop(
                                 // stash carries the translated path to the
                                 // fd-registration block, whose fd-target
                                 // identity the EXIT side can derive the same
-                                // way the kmsg block does — but binder opens
-                                // are few: one ENTRY line per open (budget
-                                // 40) plus a pre-open node check is enough
-                                // to answer ENOENT-vs-EACCES-vs-hook-never-
-                                // engaged in one artifact.
+                                // way the kmsg block does. 6-Z308a: the gate
+                                // below is now per-key dedupe (crash-loop
+                                // fleets can no longer starve the
+                                // zygote-lineage opens).
+                                // 6-Z308a: the dedupe gate replaces the old
+                                // global-40 budget (see the declaration
+                                // site) — crash-loop fleets can no longer
+                                // starve the zygote-lineage opens whose
+                                // fate names the #251-class walls.
                                 if is_binder_path(&path) || is_binder_path(&translated) {
                                     use std::os::unix::fs::MetadataExt;
+                                    let z308_lineage = z306_in_zygote_lineage(
+                                        pid,
+                                        &z306_zygote_lineage,
+                                        &mut z306_lineage_tgid_cache,
+                                    );
+                                    let z308_seen = z308_binder_open_keys
+                                        .entry((pid, translated.clone()))
+                                        .or_insert(0);
+                                    *z308_seen += 1;
+                                    let z308_per_key_cap = if z308_lineage { 12 } else { 3 };
                                     binder_open_diag_count =
                                         binder_open_diag_count.saturating_add(1);
-                                    if binder_open_diag_count <= 40 {
+                                    let z308_global_ok = binder_open_diag_count <= 600
+                                        || (z308_lineage && binder_open_diag_count <= 2000);
+                                    if *z308_seen <= z308_per_key_cap && z308_global_ok {
                                         let raw_flags = if syscall_num == abi.open {
                                             get_syscall_arg(&regs, abi.reg_arg2) as u32
                                         } else if syscall_num == abi.openat {
@@ -25183,13 +25211,15 @@ pub fn run_ptrace_loop(
                                             Err(e) => format!("node MISSING ({})", e),
                                         };
                                         log(&format!(
-                                            "6-Z305t-40 binder open ENTRY pid={} orig={:?} translated={:?} flags=0x{:x} {} (occurrence {})",
+                                            "6-Z305t-40/6-Z308a binder open ENTRY pid={} lineage={} key#{} orig={:?} translated={:?} flags=0x{:x} {} (global #{})",
                                             pid,
+                                            z308_lineage,
+                                            z308_seen,
                                             path,
                                             translated,
                                             raw_flags,
                                             node_note,
-                                            binder_open_diag_count
+                                            binder_open_diag_count,
                                         ));
                                     }
                                 }
@@ -37264,6 +37294,54 @@ pub fn run_ptrace_loop(
                                         tids.len(),
                                         tids.join(",")
                                     ));
+                                }
+                                // 6-Z308b (the #251/#252 decode): the dying
+                                // thread's fd table — the #251 system_server
+                                // SIGSEGV (wakelock::acquireWakeLock on a NULL
+                                // ISystemSuspend) needs the process's
+                                // binder-family fd state at death: whether an
+                                // /dev/hwbinder fd existed at all, and if so
+                                // whether it resolved to the vm0 binder socket
+                                // (the 6-Z305t-40 open→connect rewrite) or a
+                                // dead/never-connected node. The 6-Z305h fd
+                                // dump only arms for exit-0/exit-127, so
+                                // signal deaths carry no fd evidence. Bounded:
+                                // first 8 signal-death dumps per run, 24 fds
+                                // each; readlink failures are skipped (the mm
+                                // is often already torn down in the group
+                                // exit — the rung-#251 lesson: reads that fail
+                                // AFTER the group exit are honest gaps, not
+                                // coverage bugs).
+                                {
+                                    use std::sync::atomic::{AtomicU64, Ordering};
+                                    static Z308B_FD_DUMPS: AtomicU64 = AtomicU64::new(0);
+                                    if Z308B_FD_DUMPS.fetch_add(1, Ordering::Relaxed) < 8 {
+                                        let mut z308b_lines: Vec<String> = Vec::new();
+                                        for fd in 0..24i32 {
+                                            if let Ok(target) = std::fs::read_link(format!(
+                                                "/proc/{}/fd/{}",
+                                                pid, fd
+                                            )) {
+                                                z308b_lines.push(format!(
+                                                    "fd {} -> {}",
+                                                    fd,
+                                                    target.display()
+                                                ));
+                                            }
+                                        }
+                                        if z308b_lines.is_empty() {
+                                            log(&format!(
+                                                "6-Z308b fd-table pid={}: NO readlink-able fds (mm gone or all >24)",
+                                                pid
+                                            ));
+                                        } else {
+                                            log(&format!(
+                                                "6-Z308b fd-table pid={}: {}",
+                                                pid,
+                                                z308b_lines.join(" | ")
+                                            ));
+                                        }
+                                    }
                                 }
                                 // 6-Z180: stack window — 8 words below sp
                                 // and 24 above, word-PEEKed with the errno
