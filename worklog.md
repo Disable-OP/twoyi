@@ -28680,3 +28680,22 @@ Stage Summary / RN256 DECODE TREE:
 2. EXPECT the suspend daemon to die the SAME way each era (the 84× retry loop continues) — the captured death repeats per era; dedupe by shape.
 3. If the daemon-side fix lands: the suspend lookup completes → PowerManagerService constructor returns → startOtherServices progresses → the bootstrap-throughput frontier (PMS/package_native registration) returns.
 4. Recovery gate 4/4 GREEN mandatory (no wire changes this time — GREEN is expected; a red gate means the tracer gate change regressed the corpus paths).
+
+---
+Task ID: 45c (same leg, rn256 decode + dispatch)
+Agent: Z.ai Code (main session)
+Task: Decode rn256 (the 6-Z309d verification run); land the thread-capture fix; dispatch rn257.
+
+Work Log:
+- rn256 (900s diagnostic, b1f96420) verdict: rung 7 SURFACEFLINGER (same rung; the wall class unchanged downstream of the daemon crash). Cast fleet STILL 0/0 (the 6-Z309 fix holds); "Waited one second for android.system.suspend" down to 4 (one per era).
+- THE DELIVERY-CHAIN CORRECTION (decode-critical): the routed transaction to the suspend daemon's conn=6 is consumed by the 6-Z271g PROCESS-POOL STEAL — a sibling conn (conn=8) of the same guest pid takes the queued tx and the delivery logs land under the SIBLING's conn id ("process-pool steal: conn=8 takes tx #11 queued for a sibling" + "delivered transaction conn=8 <- conn=302 code=0xf43484e"). The rn255/rn256 "0 deliveries to conn=6" greps were the WRONG LENS — the daemon receives its probes (6-Z306ad delivery captures prove it).
+- The daemons' local objects are HEALTHY across repeated probes: the 6-Z306ad mem snapshots show mStrong/mWeak 1/2 → 2/3 across re-deliveries (the arm-A in-transaction mirror still holds; the object survives the client-side casts now).
+- THE DAEMON CRASH SHAPE (era 1, +173.836s): pids 2772/2777/2761 (tgid=2761) all died sig=11 in the same instant. 2761's registers (captured via 6-Z309d): pc = libc syscall+0x1c (the svc), x8=0xcf=207=recvfrom, x0=0x7 (fd), x1=stack buf, x2=8 — the thread was reading the NEXT 8-byte frame header off the binder socket — a COLLATERAL group-kill position, NOT the fault site. The REAL fault site = the SERVING THREAD (2772/2777), whose captures were skipped because the served registry tracks the TGID only.
+- LANDED 3766982b (6-Z309e): the af-capture gate resolves the dying tid's tgid through the 6-Z309c creation-pinned cache and admits the thread when its TGID was recently served; served-class budget 6 → 10. Gates 850/850, fmt clean, clippy clean.
+- DISPATCHED on 3766982b: ladder rn257 (boot_wait 900, expect_rung 0) + recovery pr-tier gate. In flight at worklog-write.
+
+Stage Summary / RN257 DECODE TREE:
+1. PRIMARY: the SERVING THREAD's registers (a 6-Z309e capture with tgid==the served daemon, distinct from the TGID's own recvfrom collateral) — pc/LR symbolized against the rename-time maps snapshot (ROW-START-relative!) name the daemon-side wall inside the BnHw probe dispatch (the rn254 audio shape pc=0x0/x1=0xf43484e predicts a NULL virtual call; the fp-chain may name the frame directly).
+2. The fleet's serving-thread crashes (audio, +15-40s) may consume budget first — they are the SAME class (audio serves cast probes too); either capture names the wall.
+3. If the daemon-side fix lands: the suspend lookup completes → PowerManagerService constructor returns → startOtherServices progresses → the bootstrap-throughput frontier (PMS/package_native registration) returns.
+4. Recovery gate 4/4 GREEN mandatory.
