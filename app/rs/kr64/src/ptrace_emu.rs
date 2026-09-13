@@ -10757,9 +10757,22 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                                 std::sync::atomic::Ordering::Relaxed,
                             ) < 64
                             {
+                                // 6-Z316: name the mutex's LIBRARY. rn264's
+                                // decode found system_server-era waiters on a
+                                // mutex whose owner field reads tid 1 — the
+                                // getpid-fake poison (a real owner tid can
+                                // never be 1 in the guest's fake space), i.e.
+                                // an ABANDONED shared lock whose real holder
+                                // recorded a poisoned tid. Which library owns
+                                // that mutex (liblog? libbinder? libutils?
+                                // an ART lock?) selects between the poison
+                                // sources; the maps lookup for the uaddr is
+                                // the same resolver STALL-DUMP uses for pc.
+                                let mutex_region =
+                                    maps_region_for_pc(pid, a0);
                                 crate::trace_log_line(&format!(
-                                    "6-Z306i STALL-OWNER: pid={} uaddr={:#x} {}",
-                                    pid, a0, desc
+                                    "6-Z306i STALL-OWNER: pid={} uaddr={:#x} {} maps[uaddr]={}",
+                                    pid, a0, desc, mutex_region
                                 ));
                             }
                             format!(
