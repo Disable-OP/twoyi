@@ -28784,3 +28784,23 @@ Work Log:
 Stage Summary:
 - The vold crash loop was a fstab-CONSISTENCY defect, not a kernel-surface gap: the materializer was handing vold rows describing a block world (device-mapper logical partitions) that the virtual world intentionally does not have. One rule — "materialized fstabs describe the materialized world" — removes the wall class.
 - If rn259 confirms vold stability, the frontier is the PMS/AMS bootstrap wall and rung 8 (SystemUI) becomes reachable for the first time.
+
+---
+Task ID: 47b (same leg, rn259 decode + the verdict-integrity instrument)
+Agent: Z.ai Code (main session)
+Task: Decode rn259 (the 6-Z310 verification run); handle the zombie-verdict artifact; land the death-forensics instrument.
+
+Work Log:
+- rn259 (34747001710, on af3bac5f) classifier verdict: rung 3 PROPERTY_SERVICE with post-mortem "kr64 child zombie in ps" — a VERDICT ARTIFACT (the known kr64-zombie incident class). Artifacts at /home/z/artifacts-rn34747001710.
+- THE 6-Z310 FIX IS PROVEN AT THE LOG LEVEL: 0 "could not find logical partition" lines anywhere; vold (pid 2744) has a SINGLE init.svc.vold=running state write — no restart loop; the 71-deaths-per-era crash fleet is GONE.
+- GUEST-TRUE PROGRESS (host/guest discipline per LOG-SOURCES): init.svc_debug_pid.zygote LANDED; sys.system_server.start_count/start_elapsed/start_uptime LANDED; the kmsg mirror tail carries the nnapi/VINTF registration era ("Service android.hardware.neuralnetworks@1.3::IDevice/nnapi-sample_float_slow must be in VINTF manifest", SampleDriver "Could not register service") and iorapd's "Waiting for service 'package_native'". THE GUEST REACHED THE SYSTEM_SERVER/HAL ERA while the classifier scored rung 3.
+- The rn258 "package_native ×5621" poller NAMED: conn=80 IDENT pid=3342 = iorapd (execve + comm _system_bin_ior). iorapd loops getService(package_native) until PMS registers — expected patient behavior; the miss counts are SYMPTOMS of the bootstrap not completing, not a defect of their own.
+- THE VERDICT-INTEGRITY WALL: kr64 died SILENTLY at +216.9s — stderr cut mid-line ("6-Z305t-62: epoll_pwait filter: events read FAILED (1 entries)" truncated; that filter path is a benign `return 0`); no panic message, no "ending the ptrace loop" log (every loop-exit path logs loudly), no HOST-side kill record (logcat + kernel log scanned); Z [libkr64.so] at classification; guest property-area writes continued past the freeze (mtimes 08:20 vs kr64 start 08:17:36 + 216.9s ≈ 08:21:13). Same shape as the rn257 incident (+420s). Conclusion: a RAW fatal signal in kr64 itself (the only class that leaves zero trace); the zombie = the app never waitpids.
+- LANDED 4bdd173d (fix(instruments) 6-Z311): async-signal-safe fatal-signal last-gasp for SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT — renders signal/si_code/sender_pid/si_addr + the waitpid-loop heartbeat (loop_count, last-waited pid, tracked-set size) with allocation-free writers, write(2)s to fd 2, then SIG_DFL + re-raise (deterministic). Installed after the 6-Z62 SIGSYS catcher; 3 relaxed heartbeat stores per waitpid round-trip. Children unaffected (ptrace stops never consult tracer dispositions). New tests ×4; gates fmt clean, clippy -D warnings clean, 856/856.
+- DISPATCHED on 4bdd173d: ladder rn260 (boot_wait 900, stall_seconds 0, expect_rung 0 — diagnostic) + recovery pr-tier gate (6-Z311 verification; 6-Z310's own gate ran in parallel on af3bac5f).
+
+Stage Summary / NEXT LEG DECODE TREE:
+1. PRIMARY (rn260): if kr64 dies again, the last-gasp line "[KR64 FATAL-SIGNAL] sig=… si_code=… sender_pid=… si_addr=… loop_iter=… last_waited=… tracked=…" NAMES the death — decode the fault address against kr64's own maps; suspect classes: unsafe ptrace/scratch handling under the guest crash-cascade load (the 6136/6141/6142 exit-code-1 cluster + a guest scudo abort message ("…SampleRate is < 0") landed within ~80ms of the death).
+2. If kr64 SURVIVES rn260: expect the verdict to be gated by the bootstrap wall instead — watch SystemServerTiming markers (StartPackageManagerService etc.), package_native/activity registration, and whether vold-backed services (StorageManagerService) proceed.
+3. Recovery gate 4/4 GREEN mandatory on both af3bac5f (6-Z310, in flight) and 4bdd173d (6-Z311).
+4. Do NOT chase: the HOST adbd JDWP flood (red noise), media.swcodec/keystore loops (below vold/bootstrap on the critical path), the app's zombie non-reaping (cosmetic for the classifier once the death is named).
