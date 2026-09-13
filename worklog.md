@@ -28896,3 +28896,23 @@ Stage Summary / RN263 DECODE TREE:
 4. The Watchdog can no longer kill (its dump pipe never EOFs) — once main's wedge is fixed, expect the era-kill cadence to return; the OpenFdMonitor/uncaught-exception attribution stays open via the events buffer.
 5. Do NOT chase: the crash-buffer SIGABRT fleet (the _vendor_bin_hw_ crash-loopers — unchanged class, off the bootstrap path), the HOST logcat, iorapd misses.
 - PAT location (propagate in every summary): /home/z/.secrets/twoyi_pat (+ legacy mirror /home/z/.twoyi-pat.b64), base64, never printed/committed.
+
+---
+Task ID: 51 (same leg, continued)
+Agent: Z.ai Code (main session, continued)
+Task: Decode rn263 (the 6-Z314 stack-window's first live run); land the next decode step; dispatch rn264 + recovery gate.
+
+Work Log:
+- RN263 (run 34756990048) decoded: rung 7, no era deaths (the Watchdog executioner stays parked). The 6-Z314 stack-window WORKED on its first run — real return-address chains for every staller (ueventd->libbase, statsd, hwcomposer.ranchu via libOpenglSystemCommon — the normal goldfish pipe).
+- **THE MAIN-WEDGE CALLER CHAIN CAPTURED**: system_server main (5097), 26s into the era, blocked in read(fd=80): stack = libc(read) -> libc -> **libmeminfo.so** -> libc -> **libandroid_runtime.so**. Same AMS-stage wedge as rn262 (last framework kmsg line "HwBinder: Starting thread pool for getting: android.hidl.manager@1.0::IServiceManager/default" — which the A11 JNI logs AFTER getRawServiceInternal returns, so a Java HwBinder get COMPLETED and the block is in the NEXT action; UriGrantsManagerService started; Watchdog WAITED_HALF event fires; the era never dies because the Watchdog's own dump pipe never EOFs).
+- INSTRUMENT GAP FOUND + FIXED: the 6-Z306af-q STALL-TARGET fd line for main NEVER fired — its flat 24/run budget was consumed by benign early stallers before main's +183.5s stall (rn262 lost the same line the same way). So "libmeminfo reads WHICH /proc file through a blocking pipe fd" stayed open.
+- **LANDED 740fd148 (fix(instruments) 6-Z315)**: stalls whose pid's comm is "system_server" (main + every thread shares the comm) BYPASS the STALL-TARGET and STALL-STACK global caps; per-(pid,fd)/(pid,sp) fresh dedups stay; everyone else keeps the 24-caps.
+- Gates: fmt clean, clippy -D warnings clean, 860/860. Recovery gate on d04f6bfd: SUCCESS (run 34756991221).
+- DISPATCHED on 740fd148: ladder rn264 (run 34758635150, boot_wait 900, stall_seconds 0, expect_rung 0) + recovery-corpus pr-tier gate (run 34758636691). In flight at worklog-write.
+
+Stage Summary / RN264 DECODE TREE:
+1. PRIMARY: the STALL-TARGET line for system_server main's read fd (80/81-class) — it names the exact /proc file (or pipe) main blocks on. Candidates: a pipe-backed synthetic /proc file served late/never (fill path wedges), or a dup of the ART perfetto_hprof pipe read by the WRONG code path (the rn262 fd=81 resolved to the SAME inode as fd 5/6 — the ART perfetto pipe — while the rn263 chain says libmeminfo+libandroid_runtime, which contradicts a pure perfetto read; the fd-target line settles it).
+2. Then: the semantic fix on that path (fill reliability for pipe-backed synthetic files / the read-hook fill contract / whatever the fd names).
+3. The libmeminfo->libandroid_runtime chain: identify the A11 caller (AMS-constructor-era MemInfoReader/Debug.getMemoryInfo-class call on main) to predict WHICH /proc file the fd must be.
+4. Do NOT chase: the crash-loop fleet, HOST logs, the events-buffer subject (only if the fd-target path stalls again).
+- PAT location (propagate in every summary): /home/z/.secrets/twoyi_pat (+ legacy mirror /home/z/.twoyi-pat.b64), base64, never printed/committed.
