@@ -28936,3 +28936,22 @@ Stage Summary / RN265 DECODE TREE:
 3. The Java HwBinder IServiceManager get line remains the last completed framework action; once the wedge cascade is fixed, expect the era to progress past StartActivityManager (DataLoaderManager/IncrementalService/PowerManager markers return).
 4. Do NOT chase: the crash-loop fleet, HOST logs, the events-buffer subject.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 53 (same leg, continued)
+Agent: Z.ai Code (main session, continued)
+Task: Decode rn265 (the 6-Z316 mutex-resolution's first live run); close the leg with the dispatch tree for the next session.
+
+Work Log:
+- RN265 (run 34760216231) decoded: the 6-Z316 instrument delivered on its first run — "6-Z306i STALL-OWNER: pid=5329 uaddr=0xed5212a392ac ... owner@+4=tid 1 DEAD (abandoned mutex) maps[uaddr]=... rw-p ... [anon:scudo:primary]". The poisoned/abandoned mutex is a HEAP-ALLOCATED C++ mutex in the scudo primary allocator region (not a static, not a named library lock). Recovery gate on dd33d3b4: SUCCESS (that is 4 consecutive GREEN gates this leg: 039e52bb, d04f6bfd, 740fd148, dd33d3b4).
+- TWO readings of the owner field, to resolve next: (a) the getpid-fake poison — some thread took the heap mutex while its recorded bionic tid was the fake constant 1, then died/never unlocked (the 6-Z305t-72 tid-cache-poison class); (b) a misread — for a NON-robust bionic futex mutex the second word may not be an owner tid at all, and the real story is a LIVE sibling holding a lock-order wedge. Either way the uaddr region (scudo heap) means the mutex belongs to a C++ object constructed at boot — find WHICH object by the locker's stack next.
+- The era picture held: AMS-stage wedge, the Java HwBinder IServiceManager get line as the last completed framework action, Watchdog parked (no era deaths), rung 7.
+- DISPATCHED on the final push: ladder rn266 + recovery-corpus pr-tier gate via the webDevReview cadence (the next "Continue" session picks the runs up from the trace).
+
+Stage Summary / NEXT-LEG DECODE TREE:
+1. PRIMARY: identify the scudo-heap mutex at uaddr: extend 6-Z306i ONE more notch — read the guest STACK of the WAITER (6-Z314 machinery, futex nr=98 is NOT in READ_FAMILY_STALL — ADD 98 to the capture list) — the waiter's chain names the C++ class whose lock is wedged (e.g. an android::String16 cache? a libhwui/libbinder object? the HwBinder ProcessState mutex?).
+2. Cross-check the 6-Z314 STACK-STACK for main (the 6-Z315 bypass is live): if main's chain also lands in the same object, the wedge is ONE lock.
+3. For reading (a): audit the kr64 getpid/gettid fake arms for a path that returns 1 to a NON-init guest thread (the 6-Z305t-72 fix was prctl/getpid-per-ABI — check gettid(178) and the pthread tid-cache seeds); for reading (b): the sibling STALL lines around the wedge name the LIVE holder — resume-class fixes are forbidden; the fix must make the holder make progress.
+4. The run artifacts from rn262-265 are at /home/z/artifacts-rn262/263/265 (rn264 partially extracted — disk pressure; old artifact dirs were pruned).
+5. Do NOT chase: the crash-loop fleet, HOST logs, the events-buffer subject.
+- Authentication is provided through the private agent environment.
