@@ -3508,6 +3508,12 @@ int ioctl(int fd, int request, ...) {
 // the raw tgkill.
 static volatile int g_fatal_entered = 0;
 
+// 6-Z318 forward decl: the dual-channel klog mirror (defined below) is
+// now also used by fatal_dump_maps — the abort-message scan and the
+// no-mapping marker must reach the klog on Android boots, where stderr
+// is /dev/null for every init-spawned service.
+static void write_kmsg_line(const char *buf, unsigned long len);
+
 // Dump up to ~32 KiB of /proc/self/maps to stderr — gives the exact load
 // bases needed to symbolize the printed caller PCs (the binaries are
 // stripped; module+offset + disasm context identifies the call site).
@@ -3659,6 +3665,135 @@ static void fatal_dump_maps(void) {
         }
         out[op++] = '\n';
         raw_syscall3(SYS_write, 2, (long)out, (long)op);
+        /* 6-Z318: the scan line is the abort CAUSE — mirror it to the
+         * klog channels (stderr is /dev/null for init-spawned services;
+         * the rn266 system_server SIGABRT was invisible for exactly this
+         * reason). Bounded one-shot line; a failing kmsg open is fine. */
+        write_kmsg_line(out, op);
+    } else {
+        /* 6-Z318: the mapping only exists after android_set_abort_message;
+         * its absence is itself a datum (libbase LOG(FATAL)/std::terminate
+         * class — the cause text rode stderr/logd). Name the class on the
+         * klog so the artifact distinguishes "silent abort" from "scan
+         * skipped". */
+        static const char nm[] = "<3>[twrp_fb_hook] abort message: no [anon:abort message] mapping (LOG(FATAL)/std::terminate class — cause text rode stderr/logd)\n";
+        write_kmsg_line(nm, sizeof(nm) - 1);
+    }
+}
+
+// 6-Z318: name the CALLER REGION on the klog mirror. The 6-Z305t-19
+// kmsg mirror carries only the one-line INTERCEPTED marker because the
+// maps dump is a stderr write — and on Android boots stderr is
+// /dev/null for EVERY init-spawned service (the rn266 decode:
+// system_server's post-wakelock SIGABRT left nothing but the raw
+// caller_pc, and the tracer-side maps read at the EXIT event was
+// already ENOENT — process teardown). The child's own /proc/self/maps
+// is always readable (6-Z167), so stream it ONCE here, find the single
+// line whose [start,end) contains pc, and mirror that line (bounded)
+// to the klog channels. One raw pass; no stdio; g_fatal_entered-guarded
+// upstream. Recovery boots are unaffected (their stderr is real; these
+// kmsg lines are additive).
+static void fatal_emit_caller_region(unsigned long pc) {
+    if (pc == 0) return;
+    volatile char mpath[17]; /* "/proc/self/maps" + NUL — volatile: the
+                              * 6-Z176b PEEK-blind .rodata class */
+    {
+        static const char src[] = "/proc/self/maps";
+        unsigned k;
+        for (k = 0; k < sizeof(src); k++) mpath[k] = src[k];
+    }
+    int mfd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
+                                (long)(const char *)mpath, 0 /*O_RDONLY*/, 0);
+    if (mfd < 0) {
+        static const char no[] = "<3>[twrp_fb_hook] caller region: maps open failed\n";
+        write_kmsg_line(no, sizeof(no) - 1);
+        return;
+    }
+    static char rbuf[1024];
+    char carry[200];
+    unsigned long carry_len = 0;
+    int found = 0;
+    for (;;) {
+        long n = raw_syscall3(SYS_read, mfd, (long)rbuf, (long)sizeof(rbuf));
+        if (n <= 0) break;
+        char win[sizeof(rbuf) + sizeof(carry)];
+        unsigned long wl = 0;
+        unsigned k;
+        for (k = 0; k < carry_len && wl < sizeof(win); k++) win[wl++] = carry[k];
+        for (k = 0; k < (unsigned long)n && wl < sizeof(win); k++) win[wl++] = rbuf[k];
+        win[wl] = '\0';
+        char *ls = win;
+        for (;;) {
+            /* one line at a time; the last (partial) line is deferred */
+            char *nl = ls;
+            while (*nl && *nl != '\n') nl++;
+            int complete = (*nl == '\n');
+            unsigned long len = (unsigned long)(nl - ls);
+            if (len > 0 && len < sizeof(win)) {
+                /* parse the leading "start-end" hex pair */
+                unsigned long start = 0, end = 0;
+                char *p = ls;
+                for (;;) {
+                    char c = *p; int d;
+                    if (c >= '0' && c <= '9') d = c - '0';
+                    else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                    else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                    else break;
+                    start = (start << 4) | (unsigned long)d; p++;
+                }
+                if (*p == '-') {
+                    p++;
+                    for (;;) {
+                        char c = *p; int d;
+                        if (c >= '0' && c <= '9') d = c - '0';
+                        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                        else break;
+                        end = (end << 4) | (unsigned long)d; p++;
+                    }
+                    if (pc >= start && pc < end) {
+                        static const char pre[] = "<3>[twrp_fb_hook] caller region: ";
+                        char out[420];
+                        unsigned long op = 0;
+                        unsigned q;
+                        for (q = 0; pre[q] && op < sizeof(out) - 8; q++) out[op++] = pre[q];
+                        for (q = 0; q < len && op < sizeof(out) - 2; q++) out[op++] = ls[q];
+                        out[op++] = '\n';
+                        write_kmsg_line(out, op);
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+            if (!complete) break;
+            ls = nl + 1;
+            if (*ls == '\0') break;
+        }
+        if (found) break;
+        /* carry = the last partial line of the window */
+        char *last_nl = NULL;
+        for (k = 0; k < wl; k++)
+            if (win[k] == '\n') last_nl = &win[k];
+        if (last_nl && last_nl + 1 < win + wl) {
+            unsigned long tl = (unsigned long)(win + wl - (last_nl + 1));
+            if (tl > sizeof(carry) - 1) tl = sizeof(carry) - 1;
+            for (k = 0; k < tl; k++) carry[k] = last_nl[1 + k];
+            carry[tl] = '\0';
+            carry_len = tl;
+        } else if (!last_nl) {
+            unsigned long tl = wl;
+            if (tl > sizeof(carry) - 1) tl = sizeof(carry) - 1;
+            for (k = 0; k < tl; k++) carry[k] = win[wl - tl + k];
+            carry[tl] = '\0';
+            carry_len = tl;
+        } else {
+            carry_len = 0;
+        }
+    }
+    raw_syscall1(SYS_close, mfd);
+    if (!found) {
+        static const char nf[] = "<3>[twrp_fb_hook] caller region: pc not in any mapping\n";
+        write_kmsg_line(nf, sizeof(nf) - 1);
     }
 }
 
@@ -3778,6 +3913,33 @@ static void fatal_evidence_once(const char *kind, void *pc) {
         line[p++] = '\n';
         write_kmsg_line(line, p);
     }
+    /* 6-Z318: mirror the raw tid/pid diag and the caller's maps region
+     * to the klog — the rn266 system_server abort was invisible because
+     * BOTH the diag and the maps dump were stderr-only, and the
+     * tracer-side maps read at the EXIT event hit process teardown. */
+    {
+        unsigned long long diag_tid = (unsigned long long)raw_syscall1(SYS_gettid, 0);
+        unsigned long long diag_pid = (unsigned long long)raw_syscall1(SYS_getpid, 0);
+        char dline[96];
+        static const char dpre[] = "<3>[twrp_fb_hook] abort-diag: raw tid=0x";
+        static const char dmid[] = " raw pid=0x";
+        unsigned long dp = 0;
+        unsigned q;
+        int i;
+        for (q = 0; dpre[q] && dp < sizeof(dline) - 40; q++) dline[dp++] = dpre[q];
+        for (i = 15; i >= 0 && dp < sizeof(dline) - 24; i--) {
+            int nib = (int)((diag_tid >> (i * 4)) & 0xF);
+            dline[dp++] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10);
+        }
+        for (q = 0; dmid[q] && dp < sizeof(dline) - 20; q++) dline[dp++] = dmid[q];
+        for (i = 15; i >= 0 && dp < sizeof(dline) - 3; i--) {
+            int nib = (int)((diag_pid >> (i * 4)) & 0xF);
+            dline[dp++] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10);
+        }
+        dline[dp++] = '\n';
+        write_kmsg_line(dline, dp);
+    }
+    fatal_emit_caller_region((unsigned long)(unsigned long)pc);
 }
 
 // 6-Z269: park forever instead of re-raising, with EXPLICIT NULL args.
