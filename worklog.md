@@ -29575,3 +29575,24 @@ Stage Summary / RN294 DECODE TREE:
 3. If rcChooseConfig fires with 0 matches for SF's attribs: read the logged RENDERABLE_TYPE request (the 6-Z339 mask vs the guest's expectations).
 4. Do NOT chase: nnapi/drm/ril/health-hal crash-loop fleets (53× health-hal signal-6 is the loudest but off the critical path), adbd JDWP noise, HOST logcat.
 - PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
+
+---
+Task ID: 76 (rn294 fast decoded: the trace budget was eaten by the gralloc fleet — SF's ops never fit; 6-Z345 raised the budget; rn295 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn294 (34869543926 on 65416af5 = 6-Z344) artifacts at /home/z/artifacts-rn294 (rn292 deleted for disk). Verdict rung 5; fast profile held (~19 min).
+- THE 6-Z344 TRACE DELIVERED THE PATTERN: 27 × (rcGetEGLVersion → rcGetConfigs(5248B) → 2×rcQueryEGLString(0x3053 EGL_VENDOR) → 2×rcQueryEGLString(0x3055 EGL_EXTENSIONS)) — a gralloc-class client init loop consuming ALL 160 op slots; ZERO rcGetGLString / rcChooseConfig / rcCreateContext / rcCreateWindowSurface / rcMakeCurrent ops VISIBLE. The 6-Z341 GLString serves still fired (12 = its own budget) on OTHER connections, "Unrecognized" warning still 0 (the token keeps flowing), ZERO "Cannot get host connection" ALOGEs.
+- INTERPRETATION: the visible 27 connections are gralloc/mapper-class clients (their init = EGL version + configs + strings for format selection); surfaceflinger's first era starts ~t+120s — BEYOND the 160-op budget. SF's actual op sequence remains unseen. NOT a transport bug signal: the fleet's inits complete cleanly server-side.
+- LANDED 6-Z345 (fix(instruments), c437e7a8): the op budget 160 → 4000 + tail sampling (every 25th op after the first 200) — rn295 will carry SF's COMPLETE op sequence.
+- DISPATCHED: rn295 on c437e7a8 with the FAST profile (HTTP 204).
+
+Stage Summary / RN295 DECODE TREE:
+1. PRIMARY: find the FIRST rcChooseConfig (or its absence past the gralloc fleet) and the first rcCreateContext. Expected healthy sequence for SF: … → rcChooseConfig(matches≥1) → rcCreateContext(config=<index>) → rcCreateWindowSurface → rcCreateColorBuffer → rcOpenColorBuffer → rcMakeCurrent → gl2 stream opens.
+2. Whatever op FAILS or goes missing first names the client's gate precisely:
+   - no rcChooseConfig past the fleet ⇒ the client's eglChooseConfig fails pre-host (display-init state mismatch in SF's process);
+   - rcChooseConfig 0 matches ⇒ read its logged RENDERABLE_TYPE (6-Z343) vs the masked table;
+   - rcCreateContext returns 0 ⇒ FBConfig::get(config) out-of-range (config id semantics) or the host eglCreateContext rejection (the 6-Z339 FAILED line names the branch);
+   - rcMakeCurrent fails ⇒ the surface/colorbuffer path (rcCreateWindowSurface config id, pbuffer binding).
+3. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
+- PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
