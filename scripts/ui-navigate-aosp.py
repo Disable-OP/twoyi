@@ -411,38 +411,93 @@ def main():
     screenshot("02b_popups_after")
     print(f"  Step 2b done: {n_popups} popup button(s) tapped")
 
-    print(f"\n  Step 3: Waiting {BOOT_WAIT}s for guest boot "
-          f"(screenshots every {SCREENSHOT_EVERY}s)")
+    print(f"\n  Step 3: Waiting up to {BOOT_WAIT}s for guest boot "
+          f"(screenshots every {SCREENSHOT_EVERY}s; evidence-saturation "
+          f"exits LIVE — 6-Z342)")
     t0 = time.time()
     shot = 0
     md5s = {}
+    # ── 6-Z342: evidence-saturation watch exits ─────────────────────
+    # The ladder's wall clock is dominated by the boot watch, and every
+    # recent churn-dominated run (rn286-290) burned its FULL boot_wait
+    # while adding ZERO new evidence after the first ~5 minutes: the
+    # crash-loop signature (service deaths, EGL errors, klog frontier)
+    # was complete by t+300s in each of them. Three honest exits,
+    # evaluated on the live kmsg snapshot this loop already pulls:
+    #   BOOT-COMPLETED — the guest reached the boot-completed frontier
+    #                    (end the watch minutes after success);
+    #   SATURATED      — a crash-loop fleet is alive NOW (>=8 deaths for
+    #                    one service, the most recent death is fresh) and
+    #                    NO new dying service has appeared for the whole
+    #                    saturation window (the frontier is stuck on that
+    #                    fleet — the signature is captured). A boot that
+    #                    merely has an old dead fleet (dex2oat stretch:
+    #                    no deaths at all) does NOT saturate;
+    #   STALLED        — the klog is byte-frozen for TWOYI_STALL_SECONDS
+    #                    (the stall-adaptive behavior the workflow ALWAYS
+    #                    advertised; this AOSP variant never implemented
+    #                    it — the 47.5-min rn290 step is the proof).
+    # The exit reason rides ART/BOOT-WATCH-EXIT.txt for the classifier
+    # and the decode; the run's verdict semantics are unchanged.
+    CRASH_LOOP_DEATHS = int(os.environ.get("CRASH_LOOP_DEATHS", "8"))
+    SATURATION_WINDOW_S = int(os.environ.get("SATURATION_WINDOW_S", "120"))
+    STALL_SECONDS = int(os.environ.get("TWOYI_STALL_SECONDS", "90"))
+    SATURATION_CHURN_S = 45   # the top fleet must still be dying NOW
+    death_re = re.compile(
+        r"init: Service '([^']+)' (?:\(pid \d+\) )?"
+        r"(?:received signal \d+|exited with status \d+)")
+    service_deaths = {}
+    dying_seen_at = {}      # svc -> t the service FIRST appeared dying
+    last_death_at = None    # t of the most recent ANY-service death
+    last_kmsg_tail = None
+    frozen_since = None
+    watch_exit = None
     while time.time() - t0 < BOOT_WAIT:
         shot += 1
         p = screenshot(f"07_boot_{shot * SCREENSHOT_EVERY}s")
         h = md5(p)
         md5s[h] = md5s.get(h, 0) + 1
+        ts = int(time.time() - t0)
+        # Live kmsg snapshot EVERY shot — the exit signals ride it
+        # (6-Z126: pulled directly because kr64 teardown never runs on
+        # a wedged guest).
+        rr = adb_shell(
+            f"run-as {PACKAGE} cat rootfs/dev/__kmsg__ 2>/dev/null "
+            f"| tail -c 200000", timeout=30)
+        if rr.stdout:
+            with open(f"{ART}/kmsg-live-{ts}s.txt", "w",
+                      errors="replace") as f:
+                f.write(rr.stdout)
+            for m in death_re.finditer(rr.stdout):
+                svc = m.group(1)
+                if svc not in service_deaths:
+                    dying_seen_at[svc] = ts
+                service_deaths[svc] = service_deaths.get(svc, 0) + 1
+                last_death_at = ts
+            if re.search(r"sys\.boot_completed|boot_completed=1",
+                         rr.stdout):
+                watch_exit = f"BOOT-COMPLETED (kmsg frontier at t={ts}s)"
+            # The last 12 lines tell us the current frontier.
+            tail = "\n".join(rr.stdout.rstrip().splitlines()[-12:])
+            print(f"    [kmsg@{ts}s] last lines:\n      "
+                  + "\n      ".join(tail.splitlines()[-6:]))
+            # Stall detection: the klog tail is byte-frozen.
+            tail_sig = rr.stdout[-2000:]
+            if tail_sig == last_kmsg_tail:
+                if frozen_since is None:
+                    frozen_since = ts
+                elif ts - frozen_since >= STALL_SECONDS:
+                    watch_exit = (f"STALLED (klog frozen for "
+                                  f"{STALL_SECONDS}s; t={ts}s)")
+            else:
+                frozen_since = None
+            last_kmsg_tail = tail_sig
         if shot % (15 // SCREENSHOT_EVERY) == 0:
-            print(f"    t={int(time.time() - t0)}s "
-                  f"activity={get_current_activity()} shots={shot}")
-            dump_ui(f"08_progress_{int(time.time() - t0)}s")
-            # 6-Z126: LIVE kmsg snapshot — the guest init's own messages
-            # are only copied to /sdcard at kr64 TEARDOWN, which never
-            # runs when the guest wedges instead of exiting (run
-            # 32773072503 lost ALL guest init messages that way). Pull
-            # the file directly every 60 s so a wedged boot still tells
-            # us exactly where init stalled / which service is looping.
-            ts = int(time.time() - t0)
-            rr = adb_shell(
-                f"run-as {PACKAGE} cat rootfs/dev/__kmsg__ 2>/dev/null "
-                f"| tail -c 200000", timeout=30)
-            if rr.stdout:
-                with open(f"{ART}/kmsg-live-{ts}s.txt", "w",
-                          errors="replace") as f:
-                    f.write(rr.stdout)
-                # The last 12 lines tell us the current frontier.
-                tail = "\n".join(rr.stdout.rstrip().splitlines()[-12:])
-                print(f"    [kmsg@{ts}s] last lines:\n      "
-                      + "\n      ".join(tail.splitlines()[-6:]))
+            top_deaths = sorted(service_deaths.items(),
+                                key=lambda kv: -kv[1])[:3]
+            print(f"    t={ts}s activity={get_current_activity()} "
+                  f"shots={shot} deaths={top_deaths}")
+            dump_ui(f"08_progress_{ts}s")
             # Guest process census — which guest processes are alive.
             ps = adb_shell(
                 "ps -A | grep -E 'twoyi|app_process|zygote|ueventd|"
@@ -451,6 +506,23 @@ def main():
                 with open(f"{ART}/guest-ps-{ts}s.txt", "w",
                           errors="replace") as f:
                     f.write(ps.stdout)
+        # Saturation: a deep, alive crash-loop AND a stuck frontier.
+        if not watch_exit and service_deaths and last_death_at is not None:
+            top_svc, top_n = max(service_deaths.items(),
+                                 key=lambda kv: kv[1])
+            churn = (ts - last_death_at) <= SATURATION_CHURN_S
+            frontier_stuck = ((ts - max(dying_seen_at.values()))
+                              >= SATURATION_WINDOW_S)
+            if top_n >= CRASH_LOOP_DEATHS and churn and frontier_stuck:
+                watch_exit = (f"SATURATED (crash-loop '{top_svc}' at "
+                              f"{top_n} deaths and still churning, no "
+                              f"new dying service for "
+                              f"{SATURATION_WINDOW_S}s; t={ts}s)")
+        if watch_exit:
+            print(f"\n  ✧✧✧ BOOT WATCH EARLY EXIT: {watch_exit}")
+            with open(f"{ART}/BOOT-WATCH-EXIT.txt", "w") as f:
+                f.write(watch_exit + "\n")
+            break
         time.sleep(SCREENSHOT_EVERY)
 
     dump_ui("09_final")

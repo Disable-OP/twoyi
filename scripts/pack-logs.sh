@@ -65,10 +65,16 @@ if [ "${#EXPANDED[@]}" -eq 0 ]; then
     exit 0
 fi
 
-# xz compression: -6 is the default and gives good ratio/speed tradeoff
-# for text logs. -T 0 uses all cores. --owner=0 --group=0 strips the
-# runner user's uid so the tarball is reproducible.
-echo "→ packing ${#EXPANDED[@]} entries into $OUT" >&2
+# xz compression: -1 is the SPEED preset (still ~5:1 on text logs; the
+# payload is PNG-heavy and PNGs are pre-compressed either way, so -6's
+# extra ratio bought nothing but minutes). -T 0 uses all cores — the
+# comment below USED to claim -T0 while the actual `tar -cJf` never
+# passed it (single-threaded xz -6 was ~3 min of the rn290 pack step).
+# XZ_OPT is honored by xz whenever tar spawns it, so both tar calls get
+# it. --owner=0 --group=0 strips the runner user's uid so the tarball is
+# reproducible. (6-Z342: the ladder must fit in ~15 min.)
+export XZ_OPT="${XZ_OPT:--1 -T0}"
+echo "→ packing ${#EXPANDED[@]} entries into $OUT (XZ_OPT='$XZ_OPT')" >&2
 tar -cJf "$OUT" \
     --owner=0 --group=0 --numeric-owner \
     "${EXPANDED[@]}" 2>&1 || {
