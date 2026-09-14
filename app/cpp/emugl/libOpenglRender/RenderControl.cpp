@@ -42,6 +42,7 @@
 // the strcpy — acceptable for the single-threaded per-stream protocol).
 static std::string s_6z339_glStringBuf;
 static std::string s_6z340_hostExt;
+static std::string s_6z346_extStr;
 
 static const GLint rendererVersion = 1;
 
@@ -72,6 +73,56 @@ static EGLint rcQueryEGLString(EGLenum name, void* buffer, EGLint bufferSize)
     const char *str = s_egl.eglQueryString(fb->getDisplay(), name);
     if (!str) {
         return 0;
+    }
+
+    // 6-Z346 (rn295 decode — the SF wall finally named): the redroid host
+    // EGL advertises EGL_KHR_no_config_context in EGL_EXTENSIONS, and the
+    // A11 client PASSES IT THROUGH via rcQueryEGLString(0x3055). A11
+    // GLESRenderEngine::create then takes the no-config fast path:
+    //   EGLConfig config = EGL_NO_CONFIG;   // chooseEglConfig SKIPPED
+    //   ... createEglContext(display, config=EGL_NO_CONFIG, ...)
+    // and the goldfish client's eglCreateContext rejects EGL_NO_CONFIG in
+    // VALIDATE_CONFIG (getIndexOfConfig(0) = 0xFFFFFFFF > m_numConfigs →
+    // EGL_BAD_CONFIG) BEFORE any host round-trip — "RenderEngine
+    // EGLContext creation failed" ×156, ZERO rcChooseConfig/context ops in
+    // the whole 6-Z344 trace (the 6-Z339 mask and the 3_0 token were both
+    // correct but unreachable). The REAL emulator's host EGL never
+    // advertises that token, so the fast path never fires there. The
+    // device the guest sees must be exactly what the goldfish protocol
+    // layer can serve: strip EGL_KHR_no_config_context from the
+    // EGL_EXTENSIONS reply so SF picks a real config via rcChooseConfig —
+    // the path this renderer was built for.
+    if (name == EGL_EXTENSIONS) {
+        // 6-Z346: the A11 client's GLExtensions::init takes the no-config
+        // fast path when EITHER token is present (GLExtensions.cpp:
+        // hasExtension("EGL_ANDROIDX_no_config_context") ||
+        // hasExtension("EGL_KHR_no_config_context")) — strip BOTH.
+        static const char *kNoConfigTokens[] = {
+            "EGL_KHR_no_config_context",
+            "EGL_ANDROIDX_no_config_context",
+        };
+        s_6z346_extStr.assign(str);
+        for (const char *tok : kNoConfigTokens) {
+            for (size_t pos = s_6z346_extStr.find(tok);
+                 pos != std::string::npos;
+                 pos = s_6z346_extStr.find(tok)) {
+                size_t end = pos + strlen(tok);
+                // eat one adjacent separator so the space-separated list
+                // stays well-formed for both the head and tail positions.
+                if (end < s_6z346_extStr.size() && s_6z346_extStr[end] == ' ') {
+                    end++;
+                } else if (pos > 0 && s_6z346_extStr[pos - 1] == ' ') {
+                    pos--;
+                }
+                s_6z346_extStr.erase(pos, end - pos);
+                static unsigned s_6z346_strips = 0;
+                if (s_6z346_strips < 4) {
+                    s_6z346_strips++;
+                    RLOG_6Z339("6-Z346 stripped a no-config-context token from the EGL_EXTENSIONS reply (strip #%u)", s_6z346_strips);
+                }
+            }
+        }
+        str = s_6z346_extStr.c_str();
     }
 
     int len = strlen(str) + 1;
