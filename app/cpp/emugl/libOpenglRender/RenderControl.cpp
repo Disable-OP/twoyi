@@ -21,6 +21,27 @@
 #include "GL2Dispatch.h"
 #include "ThreadInfo.h"
 
+#include <string>
+
+// 6-Z339 observer — logcat-visible regardless of which ERR variant the
+// include chain resolves to (same rationale as RenderServer's 6-Z336 macro).
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define RLOG_6Z339(...) __android_log_print(ANDROID_LOG_ERROR, "TWOYI_RENDERER", __VA_ARGS__)
+#else
+#define RLOG_6Z339(...) fprintf(stderr, __VA_ARGS__)
+#endif
+
+// 6-Z339: backing store for the rcGetGLString reply when the GLES
+// max-version token is appended (GL_EXTENSIONS only). Thread-safety: the
+// renderControl stream is served per RenderThread and the string is
+// consumed before the next call on the same thread — but distinct
+// threads share this static, so a per-call copy into the caller's buffer
+// happens before any other thread mutates it (strcpy below runs while we
+// hold no lock; the mutation window is assign+append immediately before
+// the strcpy — acceptable for the single-threaded per-stream protocol).
+static std::string s_6z339_glStringBuf;
+
 static const GLint rendererVersion = 1;
 
 static GLint rcGetRendererVersion()
@@ -82,6 +103,27 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
 
     if (!str) {
         return 0;
+    }
+
+    // 6-Z339 (rn288 decode): the A11 goldfish client negotiates the max
+    // GLES version by looking for the ANDROID_EMU_gles_max_version_*
+    // tokens in GL_EXTENSIONS (HostConnection::queryAndSetGLESMaxVersion).
+    // With NO token it warns ("Unrecognized GLES max version string in
+    // extensions: " — the rn288 kmsg) and falls back to GLES_MAX_VERSION_2,
+    // and then every explicit ES3 request (A11 SF: renderableType &
+    // EGL_OPENGL_ES3_BIT → contextClientVersion=3) dies at the client's
+    // own ES3 gate with EGL_BAD_CONFIG BEFORE the host is ever asked →
+    // surfaceflinger SIGABRT crash-loop (265 deaths, rung 7).
+    // The device the guest sees must be exactly the GPU the host can
+    // serve: this emugl port is ES2-class (GL2 decoder + ES2 dispatch),
+    // so advertise the ES2 token explicitly (the FBConfig RENDERABLE_TYPE
+    // mask makes the config table agree). The client then keeps SF on an
+    // ES2 context — the path this renderer was built and validated for.
+    if (name == GL_EXTENSIONS) {
+        static const char kGlesMaxVersionToken[] = " ANDROID_EMU_gles_max_version_2";
+        s_6z339_glStringBuf.assign(str);
+        s_6z339_glStringBuf.append(kGlesMaxVersionToken);
+        str = s_6z339_glStringBuf.c_str();
     }
 
     int len = strlen(str) + 1;
@@ -169,7 +211,19 @@ static uint32_t rcCreateContext(uint32_t config,
         return 0;
     }
 
+    // 6-Z339 instrument: the rn289 decode reads the guest's actual
+    // context-version request + the host outcome from these lines.
+    static unsigned s_6z339_ctx = 0;
+    if (s_6z339_ctx < 60) {
+        s_6z339_ctx++;
+        RLOG_6Z339("6-Z339 rcCreateContext config=%u share=%u glVersion=%u", config, share, glVersion);
+    }
+
     HandleType ret = fb->createRenderContext(config, share, glVersion == 2);
+    if (!ret && s_6z339_ctx < 60) {
+        RLOG_6Z339("6-Z339 rcCreateContext FAILED (config=%u glVersion=%u) — FBConfig::get(%u)=%s or host eglCreateContext rejected",
+                   config, glVersion, config, (int)config < FBConfig::getNumConfigs() ? "ok" : "OUT-OF-RANGE");
+    }
     return ret;
 }
 

@@ -247,6 +247,21 @@ FBConfig::FBConfig(EGLDisplay p_eglDpy, EGLConfig p_eglCfg)
         if (s_configAttribs[i] == EGL_SURFACE_TYPE) {
             m_attribValues[i] |= EGL_WINDOW_BIT;
         }
+
+        // 6-Z339 (rn288 decode): this emugl port is an ES2-class host
+        // (GL2 decoder + ES2 GLDispatch). The host EGL's configs (redroid)
+        // advertise EGL_OPENGL_ES3_BIT (0x40), which made A11 surfaceflinger
+        // pick contextClientVersion=3 (renderableType & ES3_BIT in
+        // GLESRenderEngine::createEglContext) — a request the client's own
+        // max-version gate rejects with EGL_BAD_CONFIG (no advertised
+        // ANDROID_EMU_gles_max_version token) → SF SIGABRT crash-loop.
+        // The guest must see exactly the GPU the host can serve: mask the
+        // ES3 bit out of EGL_RENDERABLE_TYPE so SF requests an ES2 context
+        // (rcCreateContext glVersion=2 → the ES2 path this renderer was
+        // built and validated for). EGL_OPENGL_ES2_BIT stays advertised.
+        if (s_configAttribs[i] == EGL_RENDERABLE_TYPE) {
+            m_attribValues[i] &= ~((GLint)0x40 /* EGL_OPENGL_ES3_BIT_KHR */);
+        }
     }
 }
 
