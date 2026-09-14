@@ -23,6 +23,17 @@
 #include "RenderThread.h"
 #include "FrameBuffer.h"
 #include <set>
+#include <stdio.h>
+
+// 6-Z336 wire observer — logcat-visible regardless of which ERR variant
+// the include chain resolves to (ErrorLog.h's fprintf leg loses the
+// evidence; the artifacts only capture logcat + the app's own streams).
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define RLOG_6Z336(...) __android_log_print(ANDROID_LOG_ERROR, "TWOYI_RENDERER", __VA_ARGS__)
+#else
+#define RLOG_6Z336(...) fprintf(stderr, __VA_ARGS__)
+#endif
 
 typedef std::set<RenderThread *> RenderThreadsSet;
 
@@ -63,20 +74,33 @@ RenderServer *RenderServer::create(int port)
 int RenderServer::Main()
 {
     RenderThreadsSet threads;
+    // 6-Z336 (rn285 decode): the composer deadlocked at its FIRST
+    // renderControl read while this loop sat silent — nothing in the
+    // artifacts could distinguish "renderer never accepted" from
+    // "accepted but desynced". Log the accept path (bounded: one line
+    // per accept + one per failed flags read; session counts are small).
+    static int s_6z336_accepts = 0;
 
     while(1) {
         SocketStream *stream = m_listenSock->accept();
         if (!stream) {
-            fprintf(stderr,"Error accepting connection, aborting\n");
+            ERR("Error accepting connection, aborting\n");
             break;
         }
+        ++s_6z336_accepts;
+        RLOG_6Z336("6-Z336 RenderServer: accept #%d ok", s_6z336_accepts);
 
         unsigned int clientFlags;
         if (!stream->readFully(&clientFlags, sizeof(unsigned int))) {
+            RLOG_6Z336("6-Z336 RenderServer: accept #%d clientFlags read FAILED"
+                       " (client hung up before sending 4-byte flags)",
+                       s_6z336_accepts);
             fprintf(stderr,"Error reading clientFlags\n");
             delete stream;
             continue;
         }
+        RLOG_6Z336("6-Z336 RenderServer: accept #%d clientFlags=0x%08x",
+                   s_6z336_accepts, clientFlags);
 
         DBG("\n\n\n\n Got new stream!!!! \n\n\n\n\n");
         // check if we have been requested to exit while waiting on accept

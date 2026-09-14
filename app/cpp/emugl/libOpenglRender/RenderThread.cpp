@@ -21,6 +21,10 @@
 #include "GLDispatch.h"
 #include "GL2Dispatch.h"
 #include "EGLDispatch.h"
+#include <stdio.h>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 #define STREAM_BUFFER_SIZE 4*1024*1024
 
@@ -45,6 +49,17 @@ RenderThread *RenderThread::create(IOStream *p_stream)
 
 int RenderThread::Main()
 {
+    // 6-Z336 (rn285 decode): the render thread is where a desynced
+    // stream would misparse silently — log the entry (bounded: one
+    // line per client thread) so the artifacts name the stage. Direct
+    // logcat write: ErrorLog.h's ERR may resolve to fprintf(stderr),
+    // which never reaches the captured artifacts.
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_ERROR, "TWOYI_RENDERER",
+                        "6-Z336 RenderThread: started (stream=%p)", (void*)m_stream);
+#else
+    fprintf(stderr, "6-Z336 RenderThread: started (stream=%p)\n", (void*)m_stream);
+#endif
     RenderThreadInfo * tInfo = getRenderThreadInfo();
     //
     // initialize decoders

@@ -18,18 +18,29 @@
 //! # Wire protocol
 //!
 //! 1. Guest opens `/dev/qemu_pipe` (our Unix socket).
-//! 2. Guest writes `"pipe:opengles"` (13 bytes, no NUL terminator).
-//! 3. Host reads the channel name, connects to `{rootfs}/opengles`.
+//! 2. Guest writes the service name: `"pipe:opengles"` — 13 bytes on
+//!    some goldfish-opengl builds, **14 bytes (`"pipe:opengles\0"`) on
+//!    others** (rn285 decode: the current A11 ranchu stack writes the
+//!    name NUL-terminated; sessions forwarded 1/5/1 tail bytes, the 1
+//!    being the NUL). On the REAL goldfish transport the service-open
+//!    parser consumes that NUL — it must NEVER enter the GL data
+//!    stream (a stray NUL shifts `RenderServer::Main`'s
+//!    `readFully(clientFlags, 4)` by one byte and deadlocks both
+//!    sides: the composer blocks in `read(512KiB)` waiting for the
+//!    first renderControl response, the renderer waits for flags that
+//!    already arrived garbled).
+//! 3. Host reads the channel name (consuming exactly one NUL
+//!    terminator when present), connects to `{rootfs}/opengles`.
 //! 4. Bytes flow bidirectionally: guest GL commands → renderer,
 //!    renderer responses → guest.
 //!
-//! The first message after the handshake is a 4-byte `clientFlags`
+//! The first DATA message after the handshake is a 4-byte `clientFlags`
 //! little-endian u32 (0 = normal session), then emugl command packets
 //! (8-byte header: u32 opcode + u32 packetLen, then payload).
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::{error, info, warning};
@@ -143,7 +154,9 @@ impl Drop for QemuPipeProxyHandle {
 fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Result<()> {
     // Step 1: read the "pipe:<channel>" handshake (plus any payload
     // bytes that arrived in the same packet — forwarded to the
-    // renderer below so the stream stays in sync).
+    // renderer below so the stream stays in sync). The NUL terminator
+    // (when the guest sends one) is CONSUMED here — it is part of the
+    // service-open command, not the data stream (6-Z336).
     let (channel, leftover) = read_channel_name(&mut guest)?;
     info!("[KR64][qemu_pipe] session {} channel = {}", sid, channel);
 
@@ -186,9 +199,42 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
         renderer.write_all(&leftover)?;
     }
 
-    // Step 3: spawn two pump threads for bidirectional forwarding.
+    // 6-Z336 wire observer: per-direction byte counters + a bounded
+    // stall watchdog. The rn285 deadlock was invisible because NOTHING
+    // counted the forwarded bytes — a session could sit half-silent
+    // forever. The watchdog fires at +30s and +120s (2 lines max per
+    // session): a healthy session closes long before; a stalled one
+    // names its direction (g2r==0 → the guest never sent clientFlags;
+    // g2r>0 && r2g==0 → the renderer consumed but never replied).
     let g2r_done = Arc::new(AtomicBool::new(false));
     let r2g_done = Arc::new(AtomicBool::new(false));
+    let g2r_bytes = Arc::new(AtomicU64::new(0));
+    let r2g_bytes = Arc::new(AtomicU64::new(0));
+    {
+        let g2r_bytes = g2r_bytes.clone();
+        let r2g_bytes = r2g_bytes.clone();
+        let g2r_done_wd = g2r_done.clone();
+        let r2g_done_wd = r2g_done.clone();
+        std::thread::Builder::new()
+            .name(format!("kr64-pipe-watchdog-{}", sid))
+            .spawn(move || {
+                // Re-check liveness at each fire; skip if already closed.
+                for (delay_ms, mark) in [(30_000u64, "+30s"), (120_000u64, "+120s")] {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    if g2r_done_wd.load(Ordering::Acquire) && r2g_done_wd.load(Ordering::Acquire) {
+                        return;
+                    }
+                    warning!(
+                        "[KR64][qemu_pipe] session {} STALL {}: g2r={}B r2g={}B (still open)",
+                        sid,
+                        mark,
+                        g2r_bytes.load(Ordering::Acquire),
+                        r2g_bytes.load(Ordering::Acquire)
+                    );
+                }
+            })
+            .ok();
+    }
 
     // We need two clones of each stream: one for reading, one for writing.
     // UnixStream::try_clone() duplicates the fd.
@@ -201,10 +247,18 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
     // the opposite direction has closed.
     let r2g_done_for_g2r = r2g_done.clone();
     let g2r_done_for_r2g = g2r_done.clone();
+    let g2r_bytes_for_g2r = g2r_bytes.clone();
+    let r2g_bytes_for_r2g = r2g_bytes.clone();
     let g2r_thread = std::thread::Builder::new()
         .name(format!("kr64-pipe-g2r-{}", sid))
         .spawn(move || {
-            pump(&mut guest, &mut renderer, &g2r_done, &r2g_done_for_g2r);
+            pump(
+                &mut guest,
+                &mut renderer,
+                &g2r_done,
+                &r2g_done_for_g2r,
+                Some(&g2r_bytes_for_g2r),
+            );
         })?;
 
     let r2g_thread = std::thread::Builder::new()
@@ -215,24 +269,31 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
                 &mut guest_for_write,
                 &r2g_done,
                 &g2r_done_for_r2g,
+                Some(&r2g_bytes_for_r2g),
             );
         })?;
 
     let _ = g2r_thread.join();
     let _ = r2g_thread.join();
 
-    info!("[KR64][qemu_pipe] session {} closed", sid);
+    info!(
+        "[KR64][qemu_pipe] session {} closed (g2r={}B r2g={}B)",
+        sid,
+        g2r_bytes.load(Ordering::Acquire),
+        r2g_bytes.load(Ordering::Acquire)
+    );
     Ok(())
 }
 
 /// Read the `"pipe:<channel>"` handshake from the guest.
 ///
-/// The guest writes the channel name (e.g. `"pipe:opengles"`) in a
-/// single `write()` call. We read up to 256 bytes and parse the
-/// channel name from the buffer. Returns `(name, leftover)` where
-/// `leftover` holds any bytes that arrived in the same packet(s)
-/// AFTER the channel name (e.g. the first clientFlags word) — the
-/// caller must forward them or the stream desyncs.
+/// The guest writes the channel name (e.g. `"pipe:opengles"` — with or
+/// without a trailing NUL, build-dependent) in a single `write()`
+/// call. We read up to 256 bytes and parse the channel name from the
+/// buffer. Returns `(name, leftover)` where `leftover` holds any bytes
+/// that arrived in the same packet(s) AFTER the name (and after the
+/// name's NUL terminator, which is consumed — 6-Z336): the caller must
+/// forward them or the stream desyncs.
 ///
 /// A parse is only accepted when the name is genuinely TERMINATED:
 /// either a non-printable byte follows it in the buffer, or the
@@ -272,9 +333,11 @@ const KNOWN_CHANNELS: [&str; 3] = ["opengles", "opengles2", "opengles3"];
 
 /// If `buf` starts with `"pipe:"` and contains a TERMINATED printable
 /// name, return `(name, total_bytes_consumed)` — consumed counts from
-/// the start of `buf` through the END of the name (not the terminator).
-/// Returns `None` if the buffer doesn't start with `"pipe:"`, the name
-/// is empty, or no terminator has arrived yet (keep reading).
+/// the start of `buf` through the END of the name, PLUS exactly one
+/// NUL terminator when the name is NUL-terminated (6-Z336: the NUL is
+/// part of the service-open command and must never enter the data
+/// stream). Returns `None` if the buffer doesn't start with `"pipe:"`,
+/// the name is empty, or no terminator has arrived yet (keep reading).
 ///
 /// No-terminator case (the guest sent the name alone and the connection
 /// stays open for the payload): the buffered bytes are accepted as the
@@ -325,17 +388,35 @@ fn parse_channel_name(buf: &[u8]) -> Option<(&str, usize)> {
         return None;
     }
     let name = std::str::from_utf8(&name_bytes[..end]).ok()?;
+    // 6-Z336 (rn285 decode): the service-name write is
+    // NUL-terminated on the current A11 ranchu stack ("pipe:opengles\0"
+    // = 14 bytes). On the REAL goldfish transport the service-open
+    // parser consumes that NUL — it is part of the open command, not
+    // the data stream. Consuming it (and forwarding only the bytes
+    // AFTER it) keeps `RenderServer::Main`'s readFully(clientFlags, 4)
+    // in sync; forwarding the NUL shifted the stream one byte and
+    // deadlocked the composer inside hwcomposer.ranchu.so's first
+    // renderControl read.
+    if name_bytes[end] == 0 {
+        return Some((name, PIPE_PREFIX.len() + end + 1));
+    }
+    // Non-NUL non-printable byte: that byte is stream DATA (e.g. the
+    // first clientFlags byte of a nonzero flags word after an
+    // unterminated name) — leave it for the caller's leftover.
     Some((name, PIPE_PREFIX.len() + end))
 }
 
 /// Bidirectional byte pump. Reads from `from`, writes to `to`.
 /// Sets `my_done` when its direction closes; checks `other_done`
 /// and exits early if the other direction has closed.
+/// `counter` (6-Z336 wire observer) accumulates the forwarded byte
+/// total for this direction when provided.
 fn pump(
     from: &mut UnixStream,
     to: &mut UnixStream,
     my_done: &Arc<AtomicBool>,
     other_done: &Arc<AtomicBool>,
+    counter: Option<&Arc<AtomicU64>>,
 ) {
     let mut buf = [0u8; 16 * 1024];
     loop {
@@ -348,6 +429,9 @@ fn pump(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
+        if let Some(c) = counter {
+            c.fetch_add(n as u64, Ordering::AcqRel);
+        }
         if to.write_all(&buf[..n]).is_err() {
             break;
         }
@@ -409,16 +493,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_with_trailing_garbage() {
-        // The guest may write a single packet that includes both the
-        // channel name and the first 4 bytes of clientFlags. The
-        // parser must stop at the first non-printable byte — and the
-        // consumed offset must stop at the END of the name so the
-        // caller can forward the tail.
+    fn parse_strips_nul_terminator() {
+        // 6-Z336 (rn285 decode): the current A11 ranchu stack writes the
+        // service name NUL-terminated (14 bytes). The NUL is part of the
+        // service-open command — it must be CONSUMED, never forwarded
+        // into the GL data stream (the stray-NUL desync deadlocked the
+        // composer inside hwcomposer.ranchu.so's first renderControl
+        // read).
         assert_eq!(
-            parse_channel_name(b"pipe:opengles\x00\x00\x00\x00"),
+            parse_channel_name(b"pipe:opengles\x00"),
+            Some(("opengles", 5 + 8 + 1))
+        );
+    }
+
+    #[test]
+    fn parse_with_trailing_garbage() {
+        // Non-NUL data byte after an unterminated name: that byte is
+        // stream DATA (the first byte of a nonzero clientFlags word) —
+        // the consumed offset stops BEFORE it so the caller forwards
+        // it as leftover.
+        assert_eq!(
+            parse_channel_name(b"pipe:opengles\x01\x00\x00\x00"),
             Some(("opengles", 5 + 8))
         );
+    }
+
+    #[test]
+    fn parse_unterminated_name_no_tail() {
+        // Classic shape (older goldfish-opengl builds): exactly
+        // "pipe:opengles", 13 bytes, no terminator, no tail.
+        assert_eq!(parse_channel_name(b"pipe:opengles"), Some(("opengles", 13)));
     }
 
     #[test]
@@ -471,15 +575,43 @@ mod tests {
     }
 
     #[test]
-    fn read_channel_name_with_client_flags() {
-        // Guest writes channel name + clientFlags in one packet — the
-        // flags must come back as leftover (they were previously
-        // dropped, desyncing the wire protocol).
+    fn read_channel_name_nul_terminated_later_flags() {
+        // rn285 session-1/5 shape: "pipe:opengles\0" (14 bytes), flags
+        // arrive in a LATER write. The terminator is consumed; nothing
+        // is forwarded from the handshake.
         let (mut server, mut client) = pair();
-        client.write_all(b"pipe:opengles\x00\x00\x00\x00").unwrap();
+        client.write_all(b"pipe:opengles\x00").unwrap();
+        let (name, leftover) = read_channel_name(&mut server).unwrap();
+        assert_eq!(name, "opengles");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn read_channel_name_nul_terminated_with_flags() {
+        // rn285 session-2 shape: name + NUL terminator + clientFlags(4)
+        // in ONE write (18 bytes total). Only the flags may survive as
+        // leftover — the NUL must be consumed, or the renderer's
+        // readFully(clientFlags, 4) desyncs by one byte.
+        let (mut server, mut client) = pair();
+        client
+            .write_all(b"pipe:opengles\x00\x00\x00\x00\x00")
+            .unwrap();
         let (name, leftover) = read_channel_name(&mut server).unwrap();
         assert_eq!(name, "opengles");
         assert_eq!(leftover, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn read_channel_name_with_client_flags() {
+        // Guest writes channel name + clientFlags in one packet with a
+        // NON-NUL first flags byte (no terminator): the flags must come
+        // back as leftover untouched (they were previously dropped,
+        // desyncing the wire protocol).
+        let (mut server, mut client) = pair();
+        client.write_all(b"pipe:opengles\x01\x00\x00\x00").unwrap();
+        let (name, leftover) = read_channel_name(&mut server).unwrap();
+        assert_eq!(name, "opengles");
+        assert_eq!(leftover, vec![1, 0, 0, 0]);
     }
 
     #[test]
@@ -529,10 +661,13 @@ mod tests {
         )
         .unwrap();
 
-        // Mock guest: writes channel name, then clientFlags, then a
-        // fake emugl packet, and reads back the echo.
+        // Mock guest: writes the rn285 NUL-terminated channel name,
+        // then clientFlags, then a fake emugl packet, and reads back
+        // the echo. The NUL terminator must be consumed by the proxy —
+        // if it were forwarded, the mock renderer's echo would carry a
+        // 1-byte shift and this test would catch the 6-Z336 class.
         let mut guest = UnixStream::connect(&pipe_path).unwrap();
-        guest.write_all(b"pipe:opengles").unwrap();
+        guest.write_all(b"pipe:opengles\x00").unwrap();
         // Give the proxy time to parse the channel name and connect
         // to the mock renderer.
         thread::sleep(std::time::Duration::from_millis(100));
