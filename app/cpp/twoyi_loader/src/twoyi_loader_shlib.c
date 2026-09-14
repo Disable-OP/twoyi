@@ -445,6 +445,11 @@ static const char *g_rootfs = NULL;
 // bp_binder_object_alive failed for the `power` object) never surfaced.
 static int g_z328_klog_budget = 8;
 
+// 6-Z329: the cached /proc/self/mem fd — declared here so the fork-child
+// re-arm (bp_fork_child_diag_rearm) can reset it; an inherited fd would
+// read the PARENT's memory after fork.
+static int g_z329_self_mem_fd = -1;
+
 // 6-Z328: write one line to the guest klog. Opened per call (rare —
 // budget-bounded by the callers); O_APPEND keeps concurrent writers
 // honest. /dev/__kmsg__ resolves through the same vfs translation the
@@ -729,7 +734,6 @@ static void bp_alloc_free(uintptr_t ptr) {
 // never-fault contract as before. The fd is cached per process and
 // RESET in the fork-child re-arm (an inherited fd would read the
 // PARENT's memory after fork).
-static int g_z329_self_mem_fd = -1;
 
 static int bp_self_peek(uintptr_t addr, uint8_t *out, size_t len) {
     ssize_t n;
