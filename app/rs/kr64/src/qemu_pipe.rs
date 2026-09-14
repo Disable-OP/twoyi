@@ -48,6 +48,11 @@ use crate::{error, info, warning};
 /// Magic prefix the guest writes immediately after connect.
 const PIPE_PREFIX: &str = "pipe:";
 
+/// 6-Z352: the global unknown-channel peek budget — 24 sessions per
+/// process, each peeking ≤160B / ≤240ms before the honest close (the
+/// decode evidence stays bounded; no session semantics change).
+static QZ352_PEEK_BUDGET: AtomicU64 = AtomicU64::new(24);
+
 /// Spawn the qemu_pipe proxy.
 ///
 /// Takes ownership of the `UnixListener` (extracted from the
@@ -167,6 +172,57 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
             sid,
             channel
         );
+        // 6-Z352 (rn303 decode): the goldfish GL stack's SUPPORT channels
+        // land here — 'GLProcessPipe' ×7 and 'refcount' ×6 in rn303 — and
+        // the composer's gralloc1 allocate died NO_RESOURCES in the same
+        // era (GraphicBufferAllocator "Failed to allocate (720 x 1600)
+        // usage a00: 5"), with the address-space device itself WORKING
+        // (offset 0x0 size 0x100). Before implementing the support
+        // protocols, capture WHAT the guest actually writes on them:
+        // bounded peek (≤160B, ≤4 reads × 60ms, 24-shot global budget)
+        // then the same honest close. No semantic change — the session
+        // closes as before; only the decode evidence improves.
+        if QZ352_PEEK_BUDGET.load(Ordering::Relaxed) > 0 {
+            QZ352_PEEK_BUDGET.fetch_sub(1, Ordering::Relaxed);
+            let _ = guest.set_read_timeout(Some(std::time::Duration::from_millis(60)));
+            let mut peek = [0u8; 160];
+            let mut got = 0usize;
+            for _ in 0..4 {
+                if got == peek.len() {
+                    break;
+                }
+                match std::io::Read::read(&mut guest, &mut peek[got..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got += n,
+                }
+            }
+            if got > 0 {
+                let hex: String = peek[..got]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join("");
+                let ascii: String = peek[..got]
+                    .iter()
+                    .map(|&b| {
+                        if (0x20..0x7f).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                info!(
+                    "[KR64][qemu_pipe] 6-Z352 session {} '{}' peek {}B hex={} ascii={}",
+                    sid, channel, got, hex, ascii
+                );
+            } else {
+                info!(
+                    "[KR64][qemu_pipe] 6-Z352 session {} '{}' peek: no bytes in the 60ms window",
+                    sid, channel
+                );
+            }
+        }
         return Ok(());
     }
 
