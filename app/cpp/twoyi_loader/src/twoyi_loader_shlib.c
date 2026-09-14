@@ -606,6 +606,108 @@ static unsigned g_diag_bp_ioctl = 4;   // binder_proxy_ioctl log budget
 static int g_diag_z306z_gate = 8;      // 6-Z306z delivery-gate log budget
 static int g_diag_z309_gate = 8;       // 6-Z309 parent-fixup log budget
 
+// 6-Z356: the OWNERSHIP REGISTRY — every LOCAL node (flat.binder,
+// flat.cookie) this process itself put on the wire as a strong
+// BINDER_TYPE_BINDER flat (addService payloads, registerCallback
+// callbacks, own-node returns). The proxy's 6-Z271 registry stores
+// EXACTLY these two fields from the same flat and stamps them back
+// VERBATIM on every routed BR_TRANSACTION / node-ref mirror command,
+// so a cookie match here is the kernel-true ownership oracle: the
+// node's object is pinned by the 6-Z306ae BR_ACQUIRE mirror for as
+// long as the proxy registry holds the service, hence ALIVE BY
+// CONSTRUCTION at delivery/mirror/echo time.
+//
+// WHY (rn306 decode): the shlib-side 6-Z306z gates (mirror, 2a target,
+// 2b echoed LOCAL flats) all vet the target with the 6-Z306ae-f HEAP
+// anchor, and rn305/rn306 PROVED that anchor false-deads on live
+// objects (the chunk-reuse class: "cannot distinguish 'object really
+// dead' from 'chunk reused while the registration stays live'"). The
+// composer's gate ate 8+ incoming getInterfaceHash probes addressed
+// to its OWN registered IComposer node ("6-Z306z: BR-TX dead target
+// W=0xf3f930c04d60 -> 17xBR_NOOP"), SF's 8s reply timeout fired
+// (BR_FAILED_REPLY) and SF abort message-less — a restart loop, rung
+// 7 forever. Registry-true ownership replaces the anchor guess for
+// the process's OWN nodes; strangers keep the anchor vetting (the
+// #235/#236/#237/#209 protection is untouched).
+#define BP_Z356_OWN_MAX 256
+static uint64_t g_z356_own[BP_Z356_OWN_MAX][2]; // [flat.binder, flat.cookie]
+static int g_z356_own_count = 0;
+static int g_diag_z356 = 8;            // harvest/registry-hit diag budget
+
+// Registry membership by COOKIE (kernel-true: the cookie is stamped
+// through the proxy verbatim in both directions; binder may be the
+// weakref or the object depending on the flat era, the cookie is
+// the stable node key).
+// Concurrency contract (per-thread conns run WITHOUT the wire lock,
+// 6-Z271g): entries are written BEFORE the count bump, slots are
+// static-zeroed, cookie=0 is rejected, and every value ever stored
+// is a genuinely-announced pair of THIS process — so a racing reader
+// can only see 0 (→ guard) or a real pair (→ correct hit). A missed
+// entry degrades to the anchor fallback (pre-6-Z356 behavior), never
+// to a wrong delivery. Same benign-race class as g_z330_pairs.
+static int bp_z356_own_cookie(uint64_t cookie) {
+    int i;
+    if (cookie == 0) return 0;
+    for (i = 0; i < g_z356_own_count; i++) {
+        if (g_z356_own[i][1] == cookie) return 1;
+    }
+    return 0;
+}
+
+// 6-Z356 harvest: scan ONE blob's offsets array for strong local
+// flats (BINDER_TYPE_BINDER; weak variants are wp<> sends of the same
+// owned node — harvest them too) and record (binder, cookie). Called
+// from bp_build_v2_request_trailer BEFORE the response-side gates of
+// the same exchange run, and strictly before any delivery that could
+// reference the node (the addService reply precedes every routed
+// transaction; the registerCallback send precedes every callback
+// fire). Bounded: first BP_Z356_OWN_MAX distinct pairs, dedupe by
+// (binder, cookie).
+static void bp_z356_harvest_own_flats(const uint8_t *data, uint32_t dlen,
+                                      const uint8_t *offsets, uint32_t olen) {
+    uint64_t j;
+    if (data == NULL || offsets == NULL) return;
+    for (j = 0; j + 8 <= (uint64_t)olen; j += 8) {
+        uint64_t obj_off;
+        uint32_t typ;
+        uint64_t f_binder;
+        uint64_t f_cookie;
+        int seen = 0;
+        int i;
+        memcpy(&obj_off, offsets + j, 8);
+        if (obj_off > (uint64_t)dlen || obj_off + BP_FLAT_SIZE > (uint64_t)dlen)
+            continue;
+        memcpy(&typ, data + obj_off, 4);
+        if (typ != BP_BINDER_TYPE_BINDER && typ != BP_BINDER_TYPE_WEAK_BINDER)
+            continue;
+        memcpy(&f_binder, data + obj_off + BP_FLAT_BINDER_OFF, 8);
+        memcpy(&f_cookie, data + obj_off + BP_FLAT_COOKIE_OFF, 8);
+        if (f_binder == 0 && f_cookie == 0) continue;
+        for (i = 0; i < g_z356_own_count; i++) {
+            if (g_z356_own[i][0] == f_binder && g_z356_own[i][1] == f_cookie) {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (g_z356_own_count >= BP_Z356_OWN_MAX) continue;
+        g_z356_own[g_z356_own_count][0] = f_binder;
+        g_z356_own[g_z356_own_count][1] = f_cookie;
+        g_z356_own_count++;
+        if (g_diag_z356 > 0) {
+            char m[160];
+            g_diag_z356--;
+            snprintf(m, sizeof(m),
+                     "[twoyi_loader] 6-Z356: own-node registered "
+                     "binder=0x%llx cookie=0x%llx (slot %d, pid=%d)\n",
+                     (unsigned long long)f_binder,
+                     (unsigned long long)f_cookie, g_z356_own_count,
+                     g_real_pid);
+            write_str(2, m);
+        }
+    }
+}
+
 static void bp_fork_child_diag_rearm(void) {
     g_diag_br_tx = 12;
     g_diag_reply_dump_done = 0;
@@ -626,6 +728,12 @@ static void bp_fork_child_diag_rearm(void) {
     g_z330_tr_klog_budget = 12;
     // 6-Z332: the CONSUMED klog budget re-arms per fork-child.
     g_z332_consumed_klog_budget = 16;
+    // 6-Z356: the ownership registry is PER-PROCESS by construction —
+    // the parent's node addresses are meaningless (and dangerous to
+    // trust) in the forked child; the child re-harvests from its own
+    // outgoing parcels as it registers.
+    g_z356_own_count = 0;
+    g_diag_z356 = 8;
     // The inherited pending stash points at the PARENT's transaction —
     // a stale match in the child would poison the verdict observer.
     pthread_mutex_lock(&g_sm_pending_lock);
@@ -717,6 +825,22 @@ static void bp_alloc_free(uintptr_t ptr) {
 // of the kr64 driver's mirror gate, now on the 6-Z306ae-f ROUND-TRIP
 // anchor (see bp_binder_object_alive below for the #236/#209 evidence
 // that killed the vptr&&mRefs-at-cookie contract).
+//
+// 6-Z356 (rn306 decode — SUPERSEDES the anchor for OWN nodes): every
+// gate leg below is REGISTRY-FIRST. The anchor remains ONLY for
+// pairs this process never registered. The anchor is PROVEN
+// false-dead on live objects (rn305/rn306 chunk-reuse class — the
+// proxy-side twin skipped 103 SF probes in rn305; the shlib twin ate
+// 8+ composer getInterfaceHash probes in rn306 → SF's 8s
+// BR_FAILED_REPLY timeout → message-less abort loop, rung 7
+// forever). Ownership is the kernel-true oracle: the proxy registry
+// stores the flat (binder, cookie) VERBATIM and stamps them back on
+// every routed transaction / mirror command / LOCAL-hit echo, and
+// the 6-Z306ae pin (queued BEFORE the addService reply) keeps the
+// object alive by construction. Harvest site:
+// bp_build_v2_request_trailer (outgoing BC blobs); fork clears the
+// table (bp_fork_child_diag_rearm). Strangers keep the anchor:
+// #235/#236/#237/#209 classes stay protected.
 //
 // EVIDENCE (ladder #235): the ENTIRE vendor-HAL fleet (1337 SIGSEGVs)
 // died at android::RefBase::incStrong+0x8 (libutils.so, si_addr=0x4,
@@ -880,6 +1004,10 @@ static int bp_binder_object_alive(uint64_t w, uint64_t b) {
 // 5×BR_NOOP rewrite is pairing-neutral for bp_patch_reply_data.
 // Liveness anchor: the payload's ptr field IS W (the weakref) — the
 // 6-Z306ae-f round-trip (bp_binder_object_alive) decides.
+// 6-Z356: REGISTRY-FIRST — a mirror command whose cookie is one of
+// THIS process's own registered nodes is executed unconditionally
+// (the node's object is pinned by construction; the anchor's chunk-
+// reuse false-dead must never drop the pin that keeps it that way).
 static void bp_gate_mirror_commands(uint8_t *stream, uint64_t len) {
     uint64_t pos = 0;
     static const uint32_t noop = BP_BR_NOOP;
@@ -894,7 +1022,9 @@ static void bp_gate_mirror_commands(uint8_t *stream, uint64_t len) {
             uint64_t cookie;
             memcpy(&ptr, stream + pos + 4, 8);
             memcpy(&cookie, stream + pos + 12, 8);
-            if (ptr == 0 || cookie == 0 || !bp_binder_object_alive(ptr, cookie)) {
+            if (ptr == 0 || cookie == 0 ||
+                (!bp_z356_own_cookie(cookie) &&
+                 !bp_binder_object_alive(ptr, cookie))) {
                 int i;
                 for (i = 0; i < 5; i++)
                     memcpy(stream + pos + 4 * (size_t)i, &noop, 4);
@@ -1000,7 +1130,16 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                 uint64_t t_cookie;
                 memcpy(&t_ptr, stream + pos + 4 + BP_TR_TARGET_OFF, 8);
                 memcpy(&t_cookie, stream + pos + 4 + BP_TR_COOKIE_OFF, 8);
+                // 6-Z356: registry-FIRST — a transaction targeted at one of
+                // THIS process's own registered nodes is delivered
+                // unconditionally (kernel-true ownership; the 6-Z306ae pin
+                // keeps the object alive). The anchor decides only for
+                // strangers. rn306: the composer's own IComposer node was
+                // anchor-false-dead and 8+ getInterfaceHash probes were
+                // eaten here — SF timed out (8s BR_FAILED_REPLY) and
+                // aborted message-less, forever.
                 if (t_ptr != 0 && t_cookie != 0 &&
+                    !bp_z356_own_cookie(t_cookie) &&
                     !bp_binder_object_alive(t_ptr, t_cookie)) {
                     static const uint32_t z306z_noop = BP_BR_NOOP;
                     int zi;
@@ -1246,6 +1385,14 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         memcpy(&f_cookie, back + obj_off + BP_FLAT_COOKIE_OFF, 8);
                         if (f_cookie == 0 && f_binder == 0) continue;
                         if (bp_binder_object_alive(f_binder, f_cookie)) continue;
+                        // 6-Z356: registry-FIRST — an echoed LOCAL flat for
+                        // one of THIS process's own registered nodes (the
+                        // owner-conn LOCAL-hit reply shape) is left intact:
+                        // the object is pinned by construction and the
+                        // anchor's chunk-reuse false-dead must not null the
+                        // guest's own service handle (the rn276 'power'
+                        // class, rung-8 wall).
+                        if (bp_z356_own_cookie(f_cookie)) continue;
                         // 6-Z330: the zeroing verdict dedupes PER (W,O) PAIR —
                         // the rn281 audio_flinger re-get fleet fired the SAME
                         // pair 8× per process and consumed every diag budget,
@@ -2215,6 +2362,14 @@ static unsigned char *bp_build_v2_request_trailer(
             sg_counts[i] = cnt;
             sg_totals[i] = sum;
         }
+        // 6-Z356: harvest this blob's OWN local-node flats into the
+        // ownership registry BEFORE the exchange — the response-side
+        // gates (mirror pass, BR_TRANSACTION target, echoed LOCAL
+        // flats) of THIS SAME WRITE_READ may reference the node (the
+        // addService reply carries the BR_ACQUIRE mirror pin; the
+        // LOCAL-hit echo carries the flat itself). One pass per blob,
+        // bounded table, dedupe inside.
+        bp_z356_harvest_own_flats(d, descs[i].data_len, o, descs[i].offsets_len);
         total += sg_totals[i] + (uint64_t)sg_counts[i] * 12;
     }
     // Frame budget: 8-byte wire header + stream + this trailer + slack.
