@@ -18,6 +18,15 @@
 #include "EGLDispatch.h"
 #include <stdio.h>
 
+// 6-Z347: logcat-visible diagnostics (same rationale as RenderControl's
+// 6-Z339 macro — ErrorLog.h's fprintf leg loses the evidence).
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define RLOG_6Z339(...) __android_log_print(ANDROID_LOG_ERROR, "TWOYI_RENDERER", __VA_ARGS__)
+#else
+#define RLOG_6Z339(...) fprintf(stderr, __VA_ARGS__)
+#endif
+
 FBConfig **FBConfig::s_fbConfigs = NULL;
 int FBConfig::s_numConfigs = 0;
 
