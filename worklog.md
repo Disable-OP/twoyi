@@ -29248,3 +29248,22 @@ Stage Summary / RN278 DECODE TREE:
 3. The recovery-corpus gate 4/4 GREEN mandatory (the peek change touches the shared liveness gate; the corpus's HAL clients validate it directly).
 4. Do NOT chase: the nnapi crash-loop fleet, the tombstoned intercept, HOST logcat.
 - PAT location (propagate in every summary; never print/commit the token): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat).
+
+---
+Task ID: 62 (rn279 decoded: THE POWERMANAGER NPE IS GONE — the boot is alive and dexopt-bound; the job cap raised; rn280 in flight)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn279 (34798555040 on c73e8abf/6-Z329): rung 7 (coarse classifier), no post-mortem — **THE POWERMANAGER NPE IS GONE: "FATAL EXCEPTION IN SYSTEM PROCESS" = 0** (rn275-278: 3-5 per run) — the honest /proc/self/mem liveness peek let the mirrored-pinned LOCAL flat survive → getSystemService("power") returned the local binder → InitPowerManagement completed → **ONE era for the WHOLE watch (the ~170s death cadence is GONE — ReadingSystemConfig ×2 lines = one era's pair)** — zygote64 + the guest binder pool threads alive at watch end.
+- THE NEW WALL = TIME, NOT A DEADLOCK: the boot is now DEXOPT-BOUND — the last traceBegin = "StartActivityManager" (in progress), 61 dex2oat lines with "DexInv: END '...jar' (SUCCESS)" (the installd/dex2oat chain WORKS), system_server polling "Waiting for service 'package_native'" (the A11 waitForService loop — package_native registers when PMS.main's scan+dexopt completes). The 900s watch + the 30-min job cap cut a GENUINELY-PROGRESSING boot (the stall detector never fired — klog growth throughout).
+- The "Null binder written with stability vintf" fleet dropped to 2880 — the honest peek still zeroes GENUINELY-dead LOCAL flats (correct semantics) + 8 klog zeroing verdicts visible (the audioserver-class pairs).
+- LANDED (36b3d9f4): the boot-job cap 30 → 55 min (the rn279 evidence in the workflow comment).
+- DISPATCHED: rn280 with boot_wait_seconds=2700 — BUT the dispatch raced the push (the ref cache served the parent c73e8abf) → the run rides the OLD 30-min job cap with the NEW 2700s watch input. In flight (34800199305); a follow-up dispatch on 36b3d9f4 (55-min cap) queued if rn280 is cap-cut.
+
+Stage Summary / RN280+ DECODE TREE:
+1. PRIMARY: with the 2700s watch, EXPECT PMS.main to complete the scan+dexopt churn → package_native registered → the waitForService poll resolves → the AMS.setSystemProcess/SystemUI/Launcher phases → rung 8 (SYSTEMUI) in the classifier and — the stretch — rung 9 (BOOT_COMPLETED, the honest sys.boot_completed=1 property write).
+2. If the dexopt churn outlasts even 45 min: the decode shifts to the dexopt THROUGHPUT (the dex2oat rate per jar; the installd/otapreopt chain) — a performance wall, not a correctness wall (the mission's kill-roots-not-timeouts rule applies to the CHURN — e.g. the per-jar dex2oat round-trip cost — but only if the boot stalls, not while the klog keeps growing).
+3. The classifier's rung sampling may lag the real depth — cross-check the rung against the klog markers + the final screenshot (the boot-log overlay switches to the guest framebuffer at the Render2Activity handoff).
+4. Recovery gate on c73e8abf: 4/4 GREEN (the 6-Z329b shlib fix preserved the corpus).
+5. Do NOT chase: the nnapi sample-driver crash-loop fleet (known VINTF class), the tombstoned intercept failure, HOST logcat.
+- PAT location (propagate in every summary; never print/commit the token): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat).
