@@ -1430,18 +1430,6 @@ impl ParcelWriter {
         }
     }
 
-    /// 6-Z276: write a HIDL `hidl_string` (libhwbinder `writeHidlString`):
-    /// `[i32 len][len bytes][NUL][zero-pad to 4-byte alignment]` — the
-    /// exact inverse of [`ParcelReader::read_hidl_string`].
-    fn write_hidl_string(&mut self, s: &str) {
-        self.write_i32(s.len() as i32);
-        self.data.extend_from_slice(s.as_bytes());
-        self.data.push(0); // trailing NUL
-        while self.data.len() % 4 != 0 {
-            self.data.push(0);
-        }
-    }
-
     /// Write an AIDL "structured parcelable" region — the android-12/13
     /// wire shape a REAL AIDL client deserializes:
     ///
@@ -2279,27 +2267,69 @@ impl BusState {
         for w in watchers {
             // Build the callback parcel in the watcher's own dialect.
             let mut writer = ParcelWriter::new();
-            if w.hidl {
+            let blob = if w.hidl {
                 // HIDL `IServiceNotification.onRegistration(fqName,
-                // instance, preexisting)` — NO interface-token header
-                // (libhwbinder parcels carry none), args are hidl_strings.
+                // instance, preexisting)` — 6-Z326: THE REAL A11 FIRE WIRE,
+                // byte-exact with the A11 hidl-gen BpHwIServiceNotification
+                // ::onRegistration over libhwbinder Parcel:
+                //   [CString token][align4]
+                //       writeInterfaceToken/enforceInterface descriptor
+                //       ("android.hidl.manager@1.0::IServiceNotification" —
+                //       libhwbinder writeInterfaceToken = writeCString, NO
+                //       length prefix; if the BnHw never enforces it the
+                //       leading bytes are inert to the object walk).
+                //   PTR(fq struct 16B {mBuffer=0 → 6-Z309 fixup, mSize@8,
+                //        mOwns@12})          writeBuffer(&hidl_string)
+                //   PTR(fq chars size+1, parent=fq-struct obj,
+                //        parent_offset=kOffsetOfBuffer=0)
+                //                            writeEmbeddedToParcel
+                //   PTR(inst struct)][PTR(inst chars, par=inst-struct, 0)]
+                //   [u8 preexisting][pad4]   writeBool = writeInt8 (A11
+                //                            libhwbinder Parcel::writeBool)
                 // fqName = the name before the '/' split the guest used at
                 // register time; our registry key is the FULL
                 // "fqName/instance" string, so send it as both halves of
                 // what we have (libhwbinder clients match on the
                 // descriptor + instance pair they registered).
+                //
+                // rn274 PROOF the pre-6-Z326 inline form was unparseable:
+                // the 6-Z325 mirror let the pool thread EXECUTE the oneway
+                // (freed after 2ms — transact + freeBuffer ran) yet the
+                // client's readEmbeddedBuffer failed on the inline bytes
+                // BEFORE the impl call — mRegistered never set, main still
+                // parked in Waiter::wait in every era (the ANR stacks).
                 let (fq, inst) = match name.rfind('/') {
                     Some(i) => (&name[..i], &name[i + 1..]),
                     None => (name, "default"),
                 };
-                writer.write_hidl_string(fq);
-                writer.write_hidl_string(inst);
-                writer.write_i32(preexisting as i32);
+                writer
+                    .data
+                    .extend_from_slice(b"android.hidl.manager@1.0::IServiceNotification");
+                writer.data.push(0);
+                while writer.data.len() % 4 != 0 {
+                    writer.data.push(0);
+                }
+                let mut fstruct = vec![0u8; 16];
+                fstruct[8..12].copy_from_slice(&(fq.len() as u32).to_ne_bytes());
+                let f0 = writer.write_ptr_object(fstruct, None, 0);
+                let mut fchars = fq.as_bytes().to_vec();
+                fchars.push(0);
+                writer.write_ptr_object(fchars, Some(f0), 0);
+                let mut istruct = vec![0u8; 16];
+                istruct[8..12].copy_from_slice(&(inst.len() as u32).to_ne_bytes());
+                let i0 = writer.write_ptr_object(istruct, None, 0);
+                let mut ichars = inst.as_bytes().to_vec();
+                ichars.push(0);
+                writer.write_ptr_object(ichars, Some(i0), 0);
+                writer.write_u8(preexisting as u8);
+                let (data, offsets, sg) = writer.into_parts_with_sg();
+                RequestBlob { data, offsets, sg }
             } else {
                 // AIDL `android.os.IServiceCallback.onRegistration(name,
                 // binder)` — standard writeInterfaceToken header + the
                 // service name + the HANDLE flat + the stability i32
-                // (6-Z271x: finishUnflattenBinder reads it back).
+                // (6-Z271x: finishUnflattenBinder reads it back). AIDL
+                // strings are INLINE string16s — no embedded-buffer model.
                 writer.write_i32(0); // strict-mode policy
                 writer.write_i32(-1); // kUnsetWorkSource
                 writer.write_u32(AIDL_HEADER_TAG_SYST);
@@ -2312,8 +2342,13 @@ impl BusState {
                     cookie: 0,
                 });
                 writer.write_i32(STABILITY_ANNOTATION_VINTF);
-            }
-            let (data, offsets) = writer.into_parts();
+                let (data, offsets) = writer.into_parts();
+                RequestBlob {
+                    data,
+                    offsets,
+                    sg: Vec::new(),
+                }
+            };
             let tx = IncomingTx {
                 // The proxy itself is the "sender" (kernel semantics: the
                 // context manager initiated this callback).
@@ -2326,11 +2361,7 @@ impl BusState {
                 one_way: true,
                 sender_pid: 0,
                 sender_euid: 0,
-                blob: Some(RequestBlob {
-                    data,
-                    offsets,
-                    sg: Vec::new(),
-                }),
+                blob: Some(blob),
                 ptr: w.ptr,
                 cookie: w.cookie,
             };
@@ -10476,18 +10507,21 @@ mod tests {
         match bx2.inbox.front() {
             Some(InboxItem::Tx(tx)) => {
                 let blob = tx.blob.as_ref().expect("HIDL callback carries a parcel");
-                // HIDL data = [i32 len]["android.hardware.health@2.1::IHealth"]
-                // + NUL + pad, [i32 len]["default"] + NUL + pad, [i32 0].
-                let fq_len = i32::from_ne_bytes(blob.data[0..4].try_into().unwrap());
+                // 6-Z326 fire wire: [CString token][PTR fq struct][PTR fq
+                // chars][PTR inst struct][PTR inst chars][u8 bool]. The
+                // fq/inst strings ride the SG section; the token + the four
+                // 40B buffer-object headers live in the data.
+                let mut rp = HidlParcel::new(blob).expect("fire parcel parses");
+                let tok = rp.token().expect("fire token");
+                assert_eq!(tok, "android.hidl.manager@1.0::IServiceNotification");
+                let fq = rp.read_string_arg().expect("fq embedded string");
+                assert_eq!(fq, "android.hardware.health@2.1::IHealth");
+                let inst = rp.read_string_arg().expect("instance embedded string");
+                assert_eq!(inst, "default");
                 assert_eq!(
-                    fq_len as usize,
-                    "android.hardware.health@2.1::IHealth".len()
-                );
-                let s = String::from_utf8_lossy(&blob.data);
-                assert!(s.contains("default"), "instance hidl_string present");
-                assert!(
-                    s.contains("android.hardware.health@2.1::IHealth"),
-                    "fqName hidl_string present"
+                    &blob.data[blob.data.len() - 4..],
+                    &[0, 0, 0, 0],
+                    "preexisting=false"
                 );
             }
             _ => panic!("HIDL onRegistration not queued"),
@@ -10569,19 +10603,37 @@ mod tests {
                 assert_eq!(tx.ptr, cb_ptr, "targeted at the caller's callback");
                 assert_eq!(tx.cookie, cb_cookie);
                 let blob = tx.blob.as_ref().expect("HIDL callback parcel");
-                // [hidl_string fq][hidl_string instance][i32 preexisting=1]
-                let fq_len = i32::from_ne_bytes(blob.data[0..4].try_into().unwrap()) as usize;
-                assert_eq!(fq_len, "android.system.suspend@1.0::ISystemSuspend".len());
-                let fq_end = 4 + fq_len + 1;
-                let fq_end = (fq_end + 3) & !3;
-                let inst_len =
-                    i32::from_ne_bytes(blob.data[fq_end..fq_end + 4].try_into().unwrap()) as usize;
-                assert_eq!(inst_len, "default".len());
-                let inst_end = fq_end + 4 + inst_len + 1;
-                let inst_end = (inst_end + 3) & !3;
-                let preexisting =
-                    i32::from_ne_bytes(blob.data[inst_end..inst_end + 4].try_into().unwrap());
-                assert_eq!(preexisting, 1, "preexisting=true");
+                // 6-Z326 fire wire: [CString token][PTR fq struct][PTR fq
+                // chars][PTR inst struct][PTR inst chars][u8 preexisting].
+                // Decode it with the proxy's own reader (the same walk the
+                // request-side parse uses — the client's BnHw gencode
+                // mirrors it object-for-object).
+                let mut rp = HidlParcel::new(blob).expect("callback parcel parses");
+                let tok = rp.token().expect("fire token");
+                assert_eq!(
+                    tok, "android.hidl.manager@1.0::IServiceNotification",
+                    "libhwbinder writeInterfaceToken = writeCString"
+                );
+                let fq = rp.read_string_arg().expect("fq embedded string");
+                assert_eq!(
+                    fq, "android.system.suspend@1.0::ISystemSuspend",
+                    "fqName embedded-string arg"
+                );
+                let inst = rp.read_string_arg().expect("instance embedded string");
+                assert_eq!(inst, "default", "instance embedded-string arg");
+                // writeBool = writeInt8 + align4: the final word is
+                // [1, 0, 0, 0] with preexisting=true.
+                assert_eq!(&blob.data[blob.data.len() - 4..], &[1, 0, 0, 0]);
+                assert_eq!(
+                    blob.sg.len(),
+                    4,
+                    "SG = [fq struct, fq chars, inst struct, inst chars]"
+                );
+                assert_eq!(blob.sg[0].data.len(), 16, "fq struct is a 16B hidl_string");
+                let fq_size = u32::from_ne_bytes(blob.sg[0].data[8..12].try_into().unwrap());
+                assert_eq!(fq_size, fq.len() as u32, "struct mSize excludes the NUL");
+                assert_eq!(blob.sg[1].data.len(), fq.len() + 1, "chars = size+1 (NUL)");
+                assert_eq!(*blob.sg[1].data.last().unwrap(), 0, "chars NUL-terminated");
                 true
             }
             _ => panic!("onRegistration not queued on the caller's inbox"),
