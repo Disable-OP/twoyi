@@ -4901,8 +4901,35 @@ fn servicemanager_proxy(
                         // Snapshot the object bytes NOW, from outside the
                         // guest, to pin whether the vtable word was already
                         // zero AT SERVE TIME.
+                        //
+                        // 6-Z328: the shared 32-slot serve budget was
+                        // consumed within seconds by the mediaserver's
+                        // repeated same-name self-gets (rn276: every
+                        // media.audio_flinger hit), leaving the boot-critical
+                        // LOCAL gets unprobed. The LOCAL-get probe now runs
+                        // on its OWN budget with a name-dedupe (a repeated
+                        // same-name hit re-probes nothing; distinct names
+                        // each get a slot) so the system_server-era
+                        // `power`-class serves are always captured.
                         let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
-                        probe_flat_mem("serve", &PROBE_SERVE_BUDGET, gpid, &name, ptr, cookie);
+                        {
+                            let mut seen =
+                                Z328_SERVE_NAMES.lock().expect("serve-name dedupe poisoned");
+                            if !seen.iter().any(|n| n == &name) {
+                                if seen.len() < 64 {
+                                    seen.push(name.clone());
+                                }
+                                drop(seen);
+                                probe_flat_mem(
+                                    "serve-local",
+                                    &PROBE_SERVE_LOCAL_BUDGET,
+                                    gpid,
+                                    &name,
+                                    ptr,
+                                    cookie,
+                                );
+                            }
+                        }
                     }
                     let obj = if is_owner {
                         FlatBinderObject {
@@ -7126,8 +7153,14 @@ fn push_br_transaction_complete(buf: &mut Vec<u8>) {
 /// Each probe class is bounded per boot; the log lines are the evidence
 /// that pins WHEN the object's first word became zero.
 static PROBE_CAPTURE_BUDGET: AtomicU32 = AtomicU32::new(32);
-static PROBE_SERVE_BUDGET: AtomicU32 = AtomicU32::new(32);
 static PROBE_DELIVERY_BUDGET: AtomicU32 = AtomicU32::new(96);
+
+/// 6-Z328: the LOCAL-get serve probe's own budget + the probed-name
+/// dedupe (max 64 distinct names per boot). The shared serve budget was
+/// exhausted by the early mediaserver self-get flood before the
+/// boot-critical system_server LOCAL gets ("power") ever ran.
+static PROBE_SERVE_LOCAL_BUDGET: AtomicU32 = AtomicU32::new(48);
+static Z328_SERVE_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// 6-Z325: bounded steal-delivery watches per boot. The rn273 decode leg
 /// needs the SUCCESS/FAIL signal of a steal-delivered oneway callback
