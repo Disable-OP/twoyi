@@ -41,6 +41,7 @@
 // hold no lock; the mutation window is assign+append immediately before
 // the strcpy — acceptable for the single-threaded per-stream protocol).
 static std::string s_6z339_glStringBuf;
+static std::string s_6z340_hostExt;
 
 static const GLint rendererVersion = 1;
 
@@ -119,10 +120,26 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
     // so advertise the ES2 token explicitly (the FBConfig RENDERABLE_TYPE
     // mask makes the config table agree). The client then keeps SF on an
     // ES2 context — the path this renderer was built and validated for.
+    // 6-Z340 (rn289 decode): the client's HostConnection::init queries
+    // GL_EXTENSIONS BEFORE any context is current — the proxy path below
+    // early-returns 0 there (rn289: the 6-Z339 token never reached the
+    // client; the reply stayed empty). Serve the token standalone for
+    // pre-context queries (it is the ONLY thing
+    // queryAndSetGLESMaxVersion parses at connection init); once any
+    // context is current the full host string is cached below and served
+    // with the token appended.
     if (name == GL_EXTENSIONS) {
-        static const char kGlesMaxVersionToken[] = " ANDROID_EMU_gles_max_version_2";
-        s_6z339_glStringBuf.assign(str);
-        s_6z339_glStringBuf.append(kGlesMaxVersionToken);
+        static const char kGlesMaxVersionToken[] = "ANDROID_EMU_gles_max_version_2";
+        if (str) {
+            s_6z340_hostExt.assign(str);
+        }
+        if (s_6z340_hostExt.empty()) {
+            s_6z339_glStringBuf.assign(kGlesMaxVersionToken);
+        } else {
+            s_6z339_glStringBuf.assign(s_6z340_hostExt);
+            s_6z339_glStringBuf.append(" ");
+            s_6z339_glStringBuf.append(kGlesMaxVersionToken);
+        }
         str = s_6z339_glStringBuf.c_str();
     }
 
@@ -219,7 +236,21 @@ static uint32_t rcCreateContext(uint32_t config,
         RLOG_6Z339("6-Z339 rcCreateContext config=%u share=%u glVersion=%u", config, share, glVersion);
     }
 
-    HandleType ret = fb->createRenderContext(config, share, glVersion == 2);
+    // 6-Z340: the A11 goldfish client IGNORES the app's EGL_CONTEXT_CLIENT_
+    // VERSION attrib (its eglCreateContext switch only knows the KHR names,
+    // the default case ALOGVs and falls through — GLESRenderEngine sends
+    // CLIENT_VERSION, so wantedMajorVersion stays false) and always sends
+    // rcMajorVersion=1 for that attrib style. The old "glVersion == 2" host
+    // mapping therefore handed EVERY A11 client an ES1 context — SF then
+    // read GL_VERSION 1.x and LOG_ALWAYS_FATAL("SurfaceFlinger requires
+    // OpenGL ES 2.0 minimum to run."). The client cannot be trusted as a
+    // version signal: this renderer IS an ES2-class host (GL2 decoder +
+    // ES2 dispatch, the masked config table advertises exactly this), so
+    // serve ES2 unconditionally. (Legacy A8-era ES1 clients sent the same
+    // "1" — their fixed-function path is not part of the A11 mission; the
+    // legacy distinction is recorded here honestly: glVersion is now
+    // informational only.)
+    HandleType ret = fb->createRenderContext(config, share, true);
     if (!ret && s_6z339_ctx < 60) {
         RLOG_6Z339("6-Z339 rcCreateContext FAILED (config=%u glVersion=%u) — FBConfig::get(%u)=%s or host eglCreateContext rejected",
                    config, glVersion, config, (int)config < FBConfig::getNumConfigs() ? "ok" : "OUT-OF-RANGE");
