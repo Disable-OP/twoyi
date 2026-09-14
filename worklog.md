@@ -29614,3 +29614,21 @@ Stage Summary / RN296 DECODE TREE:
 3. NEXT-LEG RISKS (in order): glGetString(GL_VERSION) reporting 3.x on an ES2 context (SF's parseGlesVersion → ES3 branch vs the ES2 GL2 decoder); the dummy pbuffer surface (createDummyEglPbufferSurface) path; gralloc buffer allocation via the address-space + renderer pipes; the composer's own GL needs.
 4. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 78 (rn296 fast decoded: 6-Z346 WORKED mechanically — SF now calls rcChooseConfig — but every request returns 0 matches; 6-Z347 identity intersection landed; rn297 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn296 (34874622297 on 06e7a1f9 = 6-Z346) artifacts at /home/z/artifacts-rn296 (rn294 deleted for disk). Verdict rung 7; fast profile held.
+- **6-Z346 PROVEN**: 4 "6-Z346 stripped a no-config-context token" lines (BOTH tokens present on the redroid host EGL — the dual strip was necessary!) and SF NOW CALLS rcChooseConfig (it never did before). The no-config fast path is dead.
+- NEW FRONTIER: rcChooseConfig fires per SF era with the EXPECTED request ladder — attribs_size=68 renderable=0x40 (ES3 first), then renderable=0x4 (ES2), then attribs_size=0 (no attribs) — and EVERY request → **0 matches**, even the no-attrib one. So the 6-Z339 mask is NOT the blocker (ES2 and no-attrib also fail): FBConfig::chooseConfig's inner host eglChooseConfig + the CONFIG_ID intersection are the failure site. (rn293's healthy "40 configs / 32 attribs" + the fleet's clean inits rule out an empty table.)
+- LANDED 6-Z347 (fix(gfx), c35084d2): the chooseConfig intersection is now EGLConfig IDENTITY (both lists come from the same fb->getDisplay() — pointer equality is exact; the per-display CONFIG_ID indirection is gone) + a bounded inner diagnostic (inner eglChooseConfig ok/n, table size, first matched CONFIG_ID vs table[0] CONFIG_ID — rn297 names any residue).
+- DISPATCHED: rn297 on c35084d2 with the FAST profile (HTTP 204).
+
+Stage Summary / RN297 DECODE TREE:
+1. PRIMARY: the 6-Z347 inner diagnostic + the 6-Z343 "matches" counts. Expect matches ≥ 1 for the ES2 and no-attrib requests → rcCreateContext (6-Z339) → window surface → color buffer → MakeCurrent → SF's "OpenGL ES informations:" block → composer@2.3 + surfaceflinger REGISTER → rung 8 (SYSTEMUI) FIRST TIME.
+2. If inner eglChooseConfig ok=0 or n=0: the redroid host EGL rejects the forced EGL_SURFACE_TYPE=PBUFFER_BIT attribs — the fix class is relaxing the forced pbuf attrib for window-surface-capable configs (the table already filters pbuffer-capable).
+3. If inner ok=1 with matches but the identity intersection still yields 0: the table and the inner query genuinely use different displays (FrameBuffer re-init churn) — the fix class is rebuilding the table lazily per query or pinning the display.
+4. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
+- Authentication is provided through the private agent environment.
