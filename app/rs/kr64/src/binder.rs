@@ -954,6 +954,41 @@ fn transport_name(t: u8) -> &'static str {
     }
 }
 
+/// 6-Z350 (rn300 decode): HIDL ancestor-version fallback. The REAL
+/// hwservicemanager answers `getTransport(pkg@M.m::IFace/inst)` with
+/// HWBINDER when the registered version is `pkg@M.m'::IFace/inst` for ANY
+/// m' ≤ m with the same major — interface inheritance means a @2.3
+/// registration IS reachable as @2.1/@2.2. rn300: the guest's composer
+/// registered `android.hardware.graphics.composer@2.3::IComposer/default`
+/// (addWithChain → handle 0x2a) but A11 surfaceflinger asks for
+/// `@2.1::IComposer/default` (the HWC2 base-version getService) and the
+/// exact-key lookup answered EMPTY ×83 → "failed to get hwcomposer
+/// service" aborts. Scans every minor of the same major up to the
+/// requested one; returns true on the first registered ancestor.
+fn hidl_ancestor_registered_6z350(
+    services: &BTreeMap<String, ServiceEntry>,
+    fq: &str,
+    name: &str,
+) -> bool {
+    let parsed = match crate::vintf::parse_fq(fq) {
+        Some(p) => p,
+        None => return false,
+    };
+    let mut it = parsed.version.split('.');
+    let major = it.next().unwrap_or("");
+    let req_minor: u32 = it.next().unwrap_or("0").parse().unwrap_or(0);
+    for minor in 0..=req_minor {
+        let key = format!(
+            "{}@{}.{}::{}/{}",
+            parsed.package, major, minor, parsed.iface, name
+        );
+        if services.contains_key(&key) {
+            return true;
+        }
+    }
+    false
+}
+
 // ============================================================================
 // Flat-binder-object type constants (kernel `B_PACK_CHARS(c1,c2,c3,0x85)`).
 // ============================================================================
@@ -5927,12 +5962,21 @@ fn servicemanager_hidl(
                     None => {
                         let hit = {
                             let b = bus.lock().expect("binder bus poisoned");
-                            b.services.contains_key(&key)
+                            if b.services.contains_key(&key) {
+                                Some("bus")
+                            } else if hidl_ancestor_registered_6z350(&b.services, &fq, &name) {
+                                // 6-Z350: a registered ancestor minor of the
+                                // same major satisfies the get (HIDL
+                                // interface inheritance — the real SM
+                                // semantic).
+                                Some("bus-ancestor")
+                            } else {
+                                None
+                            }
                         };
-                        if hit {
-                            (HIDL_TRANSPORT_HWBINDER, "bus")
-                        } else {
-                            (HIDL_TRANSPORT_EMPTY, "no-entry")
+                        match hit {
+                            Some(src) => (HIDL_TRANSPORT_HWBINDER, src),
+                            None => (HIDL_TRANSPORT_EMPTY, "no-entry"),
                         }
                     }
                 },
