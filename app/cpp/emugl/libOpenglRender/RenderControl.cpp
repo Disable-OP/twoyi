@@ -100,6 +100,14 @@ static EGLint rcQueryEGLString(EGLenum name, void* buffer, EGLint bufferSize)
         static const char *kNoConfigTokens[] = {
             "EGL_KHR_no_config_context",
             "EGL_ANDROIDX_no_config_context",
+            // 6-Z349 (rn299 decode): with surfaceless advertised, A11 SF
+            // SKIPS the dummy pbuffer and calls eglMakeCurrent(NO_SURFACE,
+            // NO_SURFACE, ctx) — the goldfish client rejects that binding
+            // (EGL_BAD_MATCH) before any host round-trip ("can't make
+            // dummy pbuffer current" ×76) — the same
+            // the-host-leaks-a-capability-the-protocol-layer-cannot-serve
+            // class as the no-config tokens.
+            "EGL_KHR_surfaceless_context",
         };
         s_6z346_extStr.assign(str);
         for (const char *tok : kNoConfigTokens) {
