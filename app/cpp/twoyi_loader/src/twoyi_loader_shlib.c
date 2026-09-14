@@ -445,6 +445,13 @@ static const char *g_rootfs = NULL;
 // bp_binder_object_alive failed for the `power` object) never surfaced.
 static int g_z328_klog_budget = 8;
 
+// 6-Z330: the zeroing-diag (W,O) pair dedupe — 16 distinct pairs per
+// process, then verdicts continue silently (the zeroing itself never
+// stops). The rn281 audio pair flooded every budget.
+static unsigned long long g_z330_pairs[16][2];
+static int g_z330_pair_count = 0;
+static int g_z330_tr_klog_budget = 12;
+
 // 6-Z329: the cached /proc/self/mem fd — declared here so the fork-child
 // re-arm (bp_fork_child_diag_rearm) can reset it; an inherited fd would
 // read the PARENT's memory after fork.
@@ -598,6 +605,10 @@ static void bp_fork_child_diag_rearm(void) {
     // 6-Z329: the cached /proc/self/mem fd points at the PARENT's memory
     // after fork — reset it so the child re-opens its own.
     g_z329_self_mem_fd = -1;
+    // 6-Z330: the pair-dedupe table and the tr-klog budget re-arm per
+    // fork-child (the inherited table would hide the child's own pairs).
+    g_z330_pair_count = 0;
+    g_z330_tr_klog_budget = 12;
     // The inherited pending stash points at the PARENT's transaction —
     // a stale match in the child would poison the verdict observer.
     pthread_mutex_lock(&g_sm_pending_lock);
@@ -1200,6 +1211,29 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         memcpy(&f_cookie, back + obj_off + BP_FLAT_COOKIE_OFF, 8);
                         if (f_cookie == 0 && f_binder == 0) continue;
                         if (bp_binder_object_alive(f_binder, f_cookie)) continue;
+                        // 6-Z330: the zeroing verdict dedupes PER (W,O) PAIR —
+                        // the rn281 audio_flinger re-get fleet fired the SAME
+                        // pair 8× per process and consumed every diag budget,
+                        // hiding the `power`-class verdicts underneath.
+                        {
+                            int seen = 0;
+                            for (int pi = 0; pi < g_z330_pair_count; pi++) {
+                                if (g_z330_pairs[pi][0] == f_binder &&
+                                    g_z330_pairs[pi][1] == f_cookie) {
+                                    seen = 1;
+                                    break;
+                                }
+                            }
+                            if (!seen && g_z330_pair_count < 16) {
+                                g_z330_pairs[g_z330_pair_count][0] = f_binder;
+                                g_z330_pairs[g_z330_pair_count][1] = f_cookie;
+                                g_z330_pair_count++;
+                            }
+                            if (seen) {
+                                memset(back + obj_off + BP_FLAT_BINDER_OFF, 0, 16);
+                                continue;
+                            }
+                        }
                         memset(back + obj_off + BP_FLAT_BINDER_OFF, 0, 16);
                         // 6-Z328: the zeroing verdict goes to the guest klog
                         // (survives the forked system_server's fd-2 detach)
@@ -1329,6 +1363,27 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         }
                         (void)off;
                         write_str(2, msg);
+                        // 6-Z330: the SM-TR dump rides the guest klog too —
+                        // THE decisive rn281 gap: the power-class LOCAL get
+                        // replies produced a client null WITHOUT the
+                        // null-binder ALOGE, i.e. either the blob patch never
+                        // ran (dptr=0 → the client's Parcel reads fail as
+                        // BAD_TYPE) or the zeroing verdict was hidden by the
+                        // audio-pair budget flood. The dump's dptr + the
+                        // backing re-read answer "patched vs not" from the
+                        // artifact. Gated to the HIT replies (the flat's
+                        // binder word non-zero — misses are {0,0}+ann) so the
+                        // boot-critical LOCAL gets are the ones captured;
+                        // own budget (12/process), independent of the
+                        // zeroing-diag budget.
+                        if (is_sm && olen >= 8 && g_z330_tr_klog_budget > 0) {
+                            uint64_t fb0 = 0;
+                            memcpy(&fb0, back + 4 + 8, 8);
+                            if (fb0 != 0) {
+                                g_z330_tr_klog_budget--;
+                                bp_klog_write(msg);
+                            }
+                        }
                         // Track the pending stash for the CONSUMED/NOFREE verdict.
                         pthread_mutex_lock(&g_sm_pending_lock);
                         g_sm_pending_stash = t_dptr;
