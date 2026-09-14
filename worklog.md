@@ -29644,3 +29644,20 @@ Work Log:
 
 Stage Summary / RN298 DECODE TREE: unchanged from Task 78 — the 6-Z347 inner diagnostic + matches counts decide the next leg (matches ≥1 ⇒ context path; inner ok=0 ⇒ relax the forced pbuf attrib; identity-0 ⇒ table/display divergence).
 - PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
+
+---
+Task ID: 80 (rn298 fast decoded: the HOST's own eglChooseConfig returns n=0 for everything — 6-Z348 table-based matching landed; rn299 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn298 (34878237617 on 64b36843 = 6-Z347b) artifacts at /home/z/artifacts-rn298 (rn296 deleted for disk). Verdict rung 5; fast profile held (~19 min).
+- **THE 6-Z347 DIAGNOSTIC IS DECISIVE**: "inner eglChooseConfig ok=1 n=0 (attribs=16); table=40 entries; first matched CONFIG_ID=-1 vs table[0] CONFIG_ID=21" — the HOST's own eglChooseConfig SUCCEEDS but matches NOTHING on the same display that enumerates 40 configs (and one no-attrib variant even returns ok=0). The redroid host EGL's chooser is not trustworthy; the CONFIG_ID intersection was downstream of that.
+- LANDED 6-Z348 (fix(gfx), 778e8fdc): FBConfig::chooseConfig now matches the client's attribs against OUR OWN table (40×32, the same bytes rcGetConfigs serves the client) with the EGL selection semantics — mask attribs (RENDERABLE_TYPE[2]/SURFACE_TYPE[3]/CONFORMANT[31]) bitwise, size attribs at-least (DEPTH[0]/STENCIL[1]/BUFFER_SIZE[5]/ALPHA[6]/BLUE[7]/GREEN[8]/RED[9]/SAMPLES[18]/SAMPLE_BUFFERS[19]/LUMINANCE[28]/ALPHA_MASK[29]), exact for the rest, absent = unconstrained; the host-chooser detour + CONFIG_ID indirection are GONE; the bounded 6-Z348 diagnostic logs the request's RENDERABLE_TYPE.
+- DISPATCHED: rn299 on 778e8fdc with the FAST profile (HTTP 204).
+
+Stage Summary / RN299 DECODE TREE:
+1. PRIMARY: "6-Z343 rcChooseConfig -> N matches" with N ≥ 1 for the ES2/no-attrib requests (the ES3 request stays 0 — the 6-Z339 mask is intentional) → rcCreateContext (6-Z339) → window surface → color buffer → MakeCurrent → SF's "OpenGL ES informations:" → composer@2.3 + surfaceflinger REGISTER → rung 8 (SYSTEMUI) FIRST TIME.
+2. If matches ≥1 but the context fails: the 6-Z339 FAILED line names the branch (FBConfig::get(config) range vs the host eglCreateContext rejection).
+3. If matches ≥1, context ok, MakeCurrent ok, and SF STILL aborts: the next leg is the GL2 stream (glGetString(GL_VERSION) value / opcode gaps) — the decode reads the kmsg's new fatal.
+4. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
+- PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
