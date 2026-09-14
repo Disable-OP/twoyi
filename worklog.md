@@ -29228,3 +29228,23 @@ Stage Summary / RN277 DECODE TREE:
 4. Recovery gate 4/4 GREEN mandatory (the klog write is additive; the shlib touch is diag-only).
 5. Do NOT chase: the nnapi crash-loop fleet, the tombstoned intercept, HOST logcat.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 61 (rn277 decoded: the liveness self-peek was getpid-fake-poisoned; 6-Z329 landed; rn278 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- RN277 DECODED (34796593835 on d4e8ba1b/6-Z328): rung 7, no post-mortem, the wall persists (3659 "Null binder..." ALOGEs, 3 FATAL system-process exceptions, 5 eras, SystemUI running). BUT the 6-Z328 instruments DELIVERED THE DECISIVE EVIDENCE:
+  1. The serve-local probe caught the `power` LOCAL flat at SERVE time with the object PERFECTLY ALIVE: mem[W] = {mStrong=1 (THE 6-Z306ae MIRROR PIN!), mWeak=2, mBase=O+0x38}, mem[O] = {valid vptr}. The zeroing that followed was a FALSE NEGATIVE.
+  2. The klog zeroing diags (surviving the fd-2 detach) named the failing legs: the audioserver-class pair (media.audio_flinger ×8) read R=[W+8]=O+0x648 with [R+8]=0; the other class read [W+8]=0x0 outright.
+- ROOT CAUSE (6-Z329): bp_self_peek() called process_vm_readv(getpid(), ...) — the guest's getpid is FAKED to FAKE_GUEST_PID=1 in the forked-system_server class (the seccomp/SIGSYS fake) → the peek targeted HOST PID 1 → EPERM → EVERY liveness leg failed → bp_binder_object_alive()=0 for perfectly alive, mirror-pinned objects → the 6-Z306z LOCAL-flat zeroing fleet zeroed every same-process getService reply in system_server → getSystemService("power") → null → the initPowerManagement NPE → THE rung-8 WALL. The exec'd daemons (audioserver) kept working peeks because their raw getpid bypasses the fake — why the bug hid for so many runs. (The [W+8]=0x0 class = genuinely dead weakrefs — the zeroing is correct for those; the false negatives were the getpid-poisoned reads.)
+- LANDED 6-Z329 (b3b99dbd): bp_self_peek reads /proc/self/mem via cached-fd pread — "self" resolves IN-KERNEL (no getpid, fake or real), pread returns EIO for unmapped (the honest never-fault contract); the fd is RESET in the fork-child re-arm (an inherited fd would read the PARENT's memory). The weakref round-trip accepts mRefs at R+0 OR R+8. BP_OBJ_SCAN 640 → 2048 (the audioserver-class shape has the RefBase vbase at Δ=0x648 — W at O+0x650, 16 bytes past the old window — a live object failed the scan).
+- DISPATCHED on b3b99dbd: rn278 ladder (boot_wait 900, stall 90, expect_rung 0) + recovery-corpus pr-tier gate. In flight at worklog-write.
+- Evidence: /home/z/artifacts-rn277 (serve-local probe lines + the 6-Z328 klog diags).
+
+Stage Summary / RN278 DECODE TREE:
+1. PRIMARY: the "Null binder written with stability vintf stability." fleet should COLLAPSE (only genuinely-dead zeroings may remain) and the PowerManager NPE must NOT recur. With the honest peek, the alive LOCAL flat survives → getSystemService("power") returns the local binder → InitPowerManagement NPE-free → startBootstrapServices runs to completion → PackageManagerService (the dexopt stretch) → SystemUI/Launcher → rung 8 SYSTEMUI in the classifier; BOOT_COMPLETED (rung 9) is the stretch.
+2. Watch the 6-Z328 klog diags for RESIDUAL zeroings: with the honest peek they now name GENUINELY dead objects (correct zeroings) — a legitimate fleet is fine; a fleet of (W match: NO) with R readable still names a shape gap.
+3. The recovery-corpus gate 4/4 GREEN mandatory (the peek change touches the shared liveness gate; the corpus's HAL clients validate it directly).
+4. Do NOT chase: the nnapi crash-loop fleet, the tombstoned intercept, HOST logcat.
+- Authentication is provided through the private agent environment.
