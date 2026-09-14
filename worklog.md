@@ -29539,3 +29539,22 @@ Stage Summary:
 - rn292 decode: the SAME 6-Z341 tree + verify the fast profile (the run should complete in ~15 min and BOOT-WATCH-EXIT.txt should exist with SATURATED/STALLED or the watch hits the 600s cap with the signature intact).
 - The ≤15-min mandate is now structural: even a forgotten 2700s dispatch cannot burn 45 min on churn (the exits cut it), and the fast profile is the default dispatch shape for the debugging phase.
 - PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
+
+---
+Task ID: 74 (rn291 CANCELLED by the ladder concurrency group (lesson recorded); rn292 FAST decoded: 6-Z341 PROVEN but SF's ES3 gate still ate the request; 6-Z343 landed; rn293 fast dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- LESSON: the boot-ladder workflow has a cancel-in-progress concurrency group — dispatching rn292 while rn291 was mid-watch CANCELLED rn291 (34862197416, no artifacts). NEVER dispatch a ladder while one is in flight (the earlier "cancelled" 025e30b1 gate child was the same mechanism via per-image groups).
+- **rn292 (34863365310 on 68b67769 = 6-Z341+6-Z342) COMPLETED IN ~19 MIN end-to-end** (the fast profile + 6-Z342 exits work; artifacts at /home/z/artifacts-rn292). Verdict rung 5.
+- 6-Z341 PROVEN: 8+ "6-Z341 rcGetGLString(GL_EXTENSIONS) serve #" lines, all ctx=PRE-CONTEXT, reply_len=30 (the bare token) — the client parsed it: **the "Unrecognized GLES max version" kmsg warning is GONE (0 hits, was 25 in rn290)**. The empty-reply hole is closed for good.
+- BUT: ZERO 6-Z339 rcCreateContext calls still; SF died at "RenderEngine EGLContext creation failed" ×35 (SurfaceFlinger "Initializing graphics H/W..." ×35 → the fatal), "Disabling blur effects" (blur OFF — no blur fatal), the same client-side eglCreateContext(1590) EGL_BAD_CONFIG. Pinned from the fetched A11 sources: GLESRenderEngine passes a REAL config → its ES2-fallback retry is SKIPPED by design (`if (config != EGL_NO_CONFIG) return context;`) → whichever max-version gate variant the vendored client takes (the CLIENT_VERSION attrib is ignored in android11-release; the GSI's build may alias it), the ES3 request never reaches the host.
+- LANDED 6-Z343 (fix(gfx), 96aa009d): advertise **ANDROID_EMU_gles_max_version_3_0** (the client now ACCEPTS the ES3 request; the host's 6-Z340 rcCreateContext serves an ES2 context regardless of the requested version — GL_VERSION reports 2.0 → SF's parseGlesVersion picks the ES2 engine path; the 6-Z339 masked config table agrees — the honest-device contract is intact: the DEVICE is ES2-class, only the negotiation protocol stops lying by omission) + bounded 6-Z343 instruments: rcGetNumConfigs (table size), rcChooseConfig (request attribs incl. RENDERABLE_TYPE + match count), 12-shot budgets.
+- DISPATCHED: rn293 on 96aa009d with the FAST profile (boot_wait 600, stall 60, HTTP 204). No corpus gate (emugl-C++-only commit; the ladder's Build-APK stage is the compile gate).
+
+Stage Summary / RN293 DECODE TREE:
+1. PRIMARY: the 6-Z343 rcChooseConfig lines (what does SF ASK for — RENDERABLE_TYPE value — and how many matches does the host return) + the 6-Z339 rcCreateContext lines MUST now fire. If a context reaches SF: GL_VERSION 2.0 → "OpenGL ES informations:" ALOGI block → composer@2.3 + surfaceflinger REGISTER → rung 8 (SYSTEMUI) for the FIRST TIME.
+2. If rcCreateContext fires but SF still aborts: read the NEW fatal (GL desync/opcode gaps from ES3-style calls would name themselves; gralloc/mapper paths next).
+3. If rcChooseConfig returns 0 matches for SF's attribs: the masked table lost a required attrib (e.g. SF asks RENDERABLE_TYPE=ES3_BIT|ES2_BIT — the mask keeps ES2 so it should match; a 0-match would point at a different attrib like EGL_RECORDABLE_ANDROID).
+4. Do NOT chase: nnapi/keystore/ril fleets, adbd JDWP noise, HOST logcat, iorapd polling.
+- PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
