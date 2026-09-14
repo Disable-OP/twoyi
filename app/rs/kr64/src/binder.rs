@@ -976,8 +976,13 @@ fn hidl_ancestor_registered_6z350(
     };
     let mut it = parsed.version.split('.');
     let major = it.next().unwrap_or("");
-    let req_minor: u32 = it.next().unwrap_or("0").parse().unwrap_or(0);
-    for minor in 0..=req_minor {
+    // 6-Z350b (rn301 decode): the first cut scanned minors UP TO the
+    // requested one — but the registered version sits ABOVE it (the
+    // composer registered @2.3 while SF asks @2.1). The real-SM semantic
+    // is "any minor of the same major serves the get": scan the full
+    // minor space (HIDL minors are tiny; the map lookups are cheap).
+    let _ = it.next();
+    for minor in 0..=64u32 {
         let key = format!(
             "{}@{}.{}::{}/{}",
             parsed.package, major, minor, parsed.iface, name
