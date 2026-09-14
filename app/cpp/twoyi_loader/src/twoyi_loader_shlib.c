@@ -433,6 +433,33 @@ volatile int g_runtime_ready = 0;
 volatile int g_sigsys_count = 0;
 static const char *g_rootfs = NULL;
 
+// 6-Z328: bounded klog zeroing diags per process — the fd-2 diag is DEAD
+// for the forked system_server (Zygote's DetachDescriptors rebinds
+// stdio), while the guest klog (/dev/__kmsg__ → the artifact's
+// dev-__kmsg__ mirror) is the ONLY always-visible channel there. The
+// rn276 decode needed exactly this: 4268 client-side "Null binder
+// written with stability vintf stability" ALOGEs prove the LOCAL-flat
+// zeroing fleet fires, but the zeroing verdicts (which leg of
+// bp_binder_object_alive failed for the `power` object) never surfaced.
+static int g_z328_klog_budget = 8;
+
+// 6-Z328: write one line to the guest klog. Opened per call (rare —
+// budget-bounded by the callers); O_APPEND keeps concurrent writers
+// honest. /dev/__kmsg__ resolves through the same vfs translation the
+// twrp_fb_hook klog path uses, so the line lands in the artifact's
+// dev-__kmsg__ mirror.
+static void bp_klog_write(const char *s) {
+    if (g_z328_klog_budget <= 0) return;
+    g_z328_klog_budget--;
+    size_t l = 0;
+    while (s[l]) l++;
+    if (l == 0) return;
+    long fd = twoyi_sys_open("/dev/__kmsg__", O_WRONLY | O_APPEND, 0);
+    if (fd < 0) return;
+    syscall(NR_write, fd, s, l);
+    syscall(NR_close, fd);
+}
+
 // 6-Z139: the REAL pid of this process (captured at loader init via a
 // raw syscall BEFORE any hooks install). bionic's abort() does
 // tgkill(getpid(), gettid(), SIGABRT) — with the getpid hook returning
@@ -1117,6 +1144,38 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         if (f_cookie == 0 && f_binder == 0) continue;
                         if (bp_binder_object_alive(f_binder, f_cookie)) continue;
                         memset(back + obj_off + BP_FLAT_BINDER_OFF, 0, 16);
+                        // 6-Z328: the zeroing verdict goes to the guest klog
+                        // (survives the forked system_server's fd-2 detach)
+                        // WITH the liveness legs — rn276's `power` LOCAL flat
+                        // was zeroed client-visibly (the "Null binder written
+                        // with stability vintf" ALOGE) while the fd-2 diag
+                        // never surfaced, leaving the failing leg unnamed.
+                        // leg1 R = [W+8] (the weakref's mBase), leg1_back =
+                        // [R+8] (must equal W for a live weakref); leg2 scans
+                        // [O..O+640) for the VALUE W.
+                        if (g_z328_klog_budget > 0) {
+                            unsigned long long r = 0, r8 = 0;
+                            uint8_t leg[8];
+                            if (bp_self_peek((uintptr_t)f_binder + 8, leg, 8)) {
+                                memcpy(&r, leg, 8);
+                                if (r && bp_self_peek((uintptr_t)r + 8, leg, 8))
+                                    memcpy(&r8, leg, 8);
+                            }
+                            char k[288];
+                            snprintf(k, sizeof(k),
+                                     "<6>[twoyi_loader] 6-Z328: LOCAL flat zeroed "
+                                     "W=0x%llx O=0x%llx R=[W+8]=0x%llx "
+                                     "[R+8]=0x%llx (W match: %s) in %s dlen=%u "
+                                     "(pid=%d)\n",
+                                     (unsigned long long)f_binder,
+                                     (unsigned long long)f_cookie,
+                                     r, r8,
+                                     (r8 == (unsigned long long)f_binder) ? "yes"
+                                                                          : "NO",
+                                     (cmd == BP_BR_TRANSACTION) ? "BR-TX" : "BR-RPY",
+                                     dlen, g_real_pid);
+                            bp_klog_write(k);
+                        }
                         if (g_diag_z306z_gate > 0) {
                             char m[192];
                             g_diag_z306z_gate--;
