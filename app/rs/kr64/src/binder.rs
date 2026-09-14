@@ -2207,6 +2207,41 @@ impl BusState {
 
     /// Register (or overwrite) a guest-owned service. Returns the handle.
     fn add_guest_service(&mut self, name: &str, owner: ConnId, ptr: u64, cookie: u64) -> u32 {
+        self.add_guest_service_impl(name, owner, ptr, cookie, None)
+    }
+
+    /// 6-Z351 (rn302 decode): CHAIN-ALIAS registration — the SAME service
+    /// object under another interfaceChain key. AOSP ServiceManager.cpp
+    /// addImpl (android-11.0.0_r1) inserts the ONE HidlService under EVERY
+    /// chain fqName (`for i in 0..interfaceChain.size() {
+    /// mServiceMap[chain[i]].insertService/setService(...);
+    /// sendPackageRegistrationNotification(chain[i], name); }`), so a
+    /// @2.3 registration is reachable through the @2.1 key with the SAME
+    /// binder object. A fresh alias must NOT mint a new node identity:
+    /// the real kernel hands the same process the same handle for the
+    /// same node, so the alias reuses `fresh_handle` (the chain[0]
+    /// handle) and by_handle stays canonical on chain[0]. Everything
+    /// else — virtual takeover, overwrite, old-owner registry-ref
+    /// release — is exactly add_guest_service.
+    fn add_guest_service_alias(
+        &mut self,
+        name: &str,
+        owner: ConnId,
+        ptr: u64,
+        cookie: u64,
+        fresh_handle: u32,
+    ) -> u32 {
+        self.add_guest_service_impl(name, owner, ptr, cookie, Some(fresh_handle))
+    }
+
+    fn add_guest_service_impl(
+        &mut self,
+        name: &str,
+        owner: ConnId,
+        ptr: u64,
+        cookie: u64,
+        fresh_handle: Option<u32>,
+    ) -> u32 {
         if let Some(entry) = self.services.get_mut(name) {
             // 6-Z298/6-Z299: a guest addService OVER a virtual-service
             // name takes ownership (native servicemanager "overwrite"
@@ -2258,8 +2293,17 @@ impl BusState {
             // race with the registering thread).
             return entry.handle;
         }
-        let h = self.next_handle;
-        self.next_handle += 1;
+        // 6-Z351: a chain alias reuses the chain[0] handle (ONE node
+        // identity under every chain key) and never repoints by_handle
+        // (the canonical chain[0] entry owns the handle→name route).
+        let h = match fresh_handle {
+            Some(h) => h,
+            None => {
+                let h = self.next_handle;
+                self.next_handle += 1;
+                h
+            }
+        };
         self.services.insert(
             name.to_string(),
             ServiceEntry {
@@ -2272,7 +2316,9 @@ impl BusState {
                 virtual_fallback: None,
             },
         );
-        self.by_handle.insert(h, name.to_string());
+        if fresh_handle.is_none() {
+            self.by_handle.insert(h, name.to_string());
+        }
         h
     }
 
@@ -6281,6 +6327,44 @@ fn servicemanager_hidl(
                 h
             };
             writer.write_u8(1); // bool success = true
+                                // 6-Z351 (rn302 decode): the REAL hwservicemanager registers
+                                // the service under EVERY interfaceChain entry — AOSP
+                                // ServiceManager.cpp addImpl (android-11.0.0_r1): per chain
+                                // fqName, insertService/setService + a per-fq
+                                // sendPackageRegistrationNotification — ONE HidlService
+                                // object, many fq keys. rn302 proved the wall: the composer
+                                // registered @2.3::IComposer/default (chain[0] = [@2.3, @2.2,
+                                // @2.1, IBase], handle 0x28) and the 6-Z350b ancestor
+                                // getTransport answered SF's @2.1 transport probe — but the
+                                // SUBSEQUENT `sm->get(@2.1::IComposer/default)`
+                                // (getRawServiceInternal, after the transport hit) is an
+                                // EXACT map lookup that missed → "getService: Trying again
+                                // for android.hardware.graphics.composer@2.1::IComposer/
+                                // default" ×537 → SF never published → rung 7. With the
+                                // chain inserted, the real SM's exact-key get() hits — the
+                                // whole ancestor-get class (composer@2.1, keymaster@4.0,
+                                // soundtrigger@2.0/2.1, wifi@1.0-1.3, camera@2.4/2.5,
+                                // bluetooth@1.0, thermal@1.0 …) is served by registration
+                                // shape, not by a lookup hack. Aliases share the chain[0]
+                                // HANDLE (one node identity — the kernel hands the same
+                                // process the same handle for the same node) and fire their
+                                // own onRegistration callbacks (the real loop notifies per
+                                // chain entry); by_handle stays canonical on chain[0].
+            let mut alias_count = 0usize;
+            for alias_fq in chain.iter().skip(1) {
+                let alias_key = format!("{}/{}", alias_fq, name);
+                if alias_key == key {
+                    continue;
+                }
+                let mut b = bus.lock().expect("binder bus poisoned");
+                b.add_guest_service_alias(&alias_key, conn_id, ptr, cookie, handle);
+                b.fire_registration_callbacks(&alias_key, handle, false);
+                alias_count += 1;
+            }
+            info!(
+                "[KR64][binder][svc] 6-Z351: addWithChain '{}' → {} chain-alias keys (full AOSP addImpl multi-fq registration)",
+                key, alias_count
+            );
             info!(
                 "[KR64][binder][svc] HIDL addWithChain({}) → handle 0x{:08x} (conn={}, chain={:?})",
                 key, handle, conn_id, chain
@@ -12330,6 +12414,227 @@ mod tests {
             .expect("bus")
             .services
             .contains_key("android.hardware.audio@6.0::IDevicesFactory/default"));
+    }
+
+    /// 6-Z351 (rn302 decode): the AOSP addImpl semantic — the service is
+    /// reachable under EVERY interfaceChain entry with the SAME handle.
+    /// The composer scenario byte-for-byte from rn302's +17876ms wire:
+    /// chain [@2.3, @2.2, @2.1, IBase]; A11 surfaceflinger's exact
+    /// `get(@2.1::IComposer/default)` must HIT carrying the chain[0]
+    /// handle (rn302: the 6-Z350b ancestor getTransport hit + the exact
+    /// get miss = "Trying again" ×537, SF never published, rung 7).
+    #[test]
+    fn z351_add_with_chain_registers_every_chain_entry() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        let req = hidl_sm_request("android.hidl.manager@1.2::IServiceManager", &|b| {
+            b.string_arg("default");
+            b.binder_arg(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0x2222,
+                cookie: 0x3333,
+            });
+            b.vec_string_arg(&[
+                "android.hardware.graphics.composer@2.3::IComposer",
+                "android.hardware.graphics.composer@2.2::IComposer",
+                "android.hardware.graphics.composer@2.1::IComposer",
+                "android.hidl.base@1.0::IBase",
+            ]);
+        });
+        match servicemanager_hidl(HIDL_SM_ADD_WITH_CHAIN, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { data, .. } => {
+                assert_eq!(data, vec![0, 0, 0, 0, 1, 0, 0, 0])
+            }
+            _ => panic!("addWithChain must Reply"),
+        }
+        let h0 = {
+            let b = bus.lock().expect("bus");
+            for fq in [
+                "android.hardware.graphics.composer@2.3::IComposer",
+                "android.hardware.graphics.composer@2.2::IComposer",
+                "android.hardware.graphics.composer@2.1::IComposer",
+                "android.hidl.base@1.0::IBase",
+            ] {
+                let key = format!("{}/default", fq);
+                let e = b
+                    .services
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("{} missing (6-Z351 chain registration)", key));
+                assert_eq!(e.owner, PROXY_CONN_ID, "{}", key);
+                assert_eq!(e.ptr, 0x2222, "{}", key);
+                assert_eq!(e.cookie, 0x3333, "{}", key);
+            }
+            let h0 = b
+                .services
+                .get("android.hardware.graphics.composer@2.3::IComposer/default")
+                .unwrap()
+                .handle;
+            // ONE node identity: every chain key aliases the chain[0]
+            // handle — the real kernel hands the same process the same
+            // handle for the same node.
+            for fq in [
+                "android.hardware.graphics.composer@2.2::IComposer",
+                "android.hardware.graphics.composer@2.1::IComposer",
+                "android.hidl.base@1.0::IBase",
+            ] {
+                let key = format!("{}/default", fq);
+                assert_eq!(
+                    b.services.get(&key).unwrap().handle,
+                    h0,
+                    "{} must alias the chain[0] handle",
+                    key
+                );
+            }
+            // by_handle stays canonical (the handle→name route lands on
+            // chain[0], not on whichever alias registered last).
+            assert_eq!(
+                b.by_handle.get(&h0).map(String::as_str),
+                Some("android.hardware.graphics.composer@2.3::IComposer/default")
+            );
+            h0
+        };
+        // End-to-end: SF's exact get(@2.1::IComposer/default) HITS with
+        // the chain[0] handle — the rn302 wall, served by registration
+        // shape (AOSP addImpl), not by a lookup hack.
+        let req = hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|b| {
+            b.string_arg("android.hardware.graphics.composer@2.1::IComposer");
+            b.string_arg("default");
+        });
+        match servicemanager_hidl(HIDL_SM_GET, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { data, offsets, .. } => {
+                let boff = u64::from_ne_bytes(offsets[0..8].try_into().unwrap()) as usize;
+                let ty = u32::from_ne_bytes(data[boff..boff + 4].try_into().unwrap());
+                let handle = u64::from_ne_bytes(data[boff + 8..boff + 16].try_into().unwrap());
+                assert_eq!(ty, BINDER_TYPE_HANDLE, "get(@2.1) hit must be a handle");
+                assert_eq!(
+                    handle as u32, h0,
+                    "get(@2.1) must carry the chain[0] handle"
+                );
+            }
+            _ => panic!("get(@2.1) must Reply"),
+        }
+        // A key OUTSIDE the chain still misses (no ancestor fabrications
+        // beyond what the chain itself declares).
+        let req = hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|b| {
+            b.string_arg("android.hardware.graphics.composer@2.0::IComposer");
+            b.string_arg("default");
+        });
+        match servicemanager_hidl(HIDL_SM_GET, &req, &bus, PROXY_CONN_ID) {
+            TransactionResult::Reply { data, offsets, .. } => {
+                let boff = u64::from_ne_bytes(offsets[0..8].try_into().unwrap()) as usize;
+                let ty = u32::from_ne_bytes(data[boff..boff + 4].try_into().unwrap());
+                let binder = u64::from_ne_bytes(data[boff + 8..boff + 16].try_into().unwrap());
+                assert_eq!(ty, BINDER_TYPE_BINDER, "miss reply is a null base");
+                assert_eq!(binder, 0, "get(@2.0) must miss");
+            }
+            _ => panic!("get(@2.0) must Reply"),
+        }
+    }
+
+    /// 6-Z351: the alias keys die WITH their owner — one HidlService
+    /// object means serviceDied removes every map entry that references
+    /// it (AOSP removeService walks the same map the registration
+    /// inserted into). A client holding the shared handle gets the death
+    /// notification exactly once per watching key.
+    #[test]
+    fn z351_chain_aliases_die_with_their_owner() {
+        let mut b = BusState::new();
+        let hal = b.register_conn();
+        let client = b.register_conn();
+        let h0 = b.add_guest_service(
+            "android.hardware.graphics.composer@2.3::IComposer/default",
+            hal,
+            0x4444,
+            0x5555,
+        );
+        b.add_guest_service_alias(
+            "android.hardware.graphics.composer@2.1::IComposer/default",
+            hal,
+            0x4444,
+            0x5555,
+            h0,
+        );
+        // Death watch on the shared node, from the client.
+        b.conns
+            .get_mut(&client)
+            .unwrap()
+            .death_watch
+            .insert(h0, 0x9999);
+        b.unregister_conn(hal);
+        assert!(
+            !b.services
+                .contains_key("android.hardware.graphics.composer@2.3::IComposer/default"),
+            "canonical key dies"
+        );
+        assert!(
+            !b.services
+                .contains_key("android.hardware.graphics.composer@2.1::IComposer/default"),
+            "alias key dies with its owner"
+        );
+        assert!(!b.by_handle.contains_key(&h0));
+        match b.conns.get(&client).unwrap().inbox.front() {
+            Some(InboxItem::Death(cookie)) => assert_eq!(*cookie, 0x9999),
+            other => panic!("expected death notification, got {:?}", other.is_some()),
+        }
+    }
+
+    /// 6-Z351: a PRE-EXISTING alias key follows the established overwrite
+    /// semantics (same name → same handle, new owner, old owner loses its
+    /// registry strong ref) — the real addImpl setService replaces the
+    /// object under that key the same way ("Detected instance of …
+    /// registering over instance of or with base of" is a WARNING, not a
+    /// rejection).
+    #[test]
+    fn z351_chain_alias_overwrite_keeps_registry_invariants() {
+        let mut b = BusState::new();
+        let old_hal = b.register_conn();
+        let new_hal = b.register_conn();
+        // An older @2.1-only composer owns the @2.1 key first.
+        let old_handle = b.add_guest_service(
+            "android.hardware.graphics.composer@2.1::IComposer/default",
+            old_hal,
+            0xAAAA,
+            0xBBBB,
+        );
+        // The @2.3 composer registers its chain — the @2.1 alias key is
+        // taken → overwrite (same handle, new owner), NOT a duplicate.
+        let h23 = b.add_guest_service(
+            "android.hardware.graphics.composer@2.3::IComposer/default",
+            new_hal,
+            0xCCCC,
+            0xDDDD,
+        );
+        let aliased = b.add_guest_service_alias(
+            "android.hardware.graphics.composer@2.1::IComposer/default",
+            new_hal,
+            0xCCCC,
+            0xDDDD,
+            h23,
+        );
+        assert_eq!(
+            aliased, old_handle,
+            "overwrite keeps the pre-existing handle (established semantic)"
+        );
+        let e = b
+            .services
+            .get("android.hardware.graphics.composer@2.1::IComposer/default")
+            .unwrap();
+        assert_eq!(e.owner, new_hal, "the @2.3 composer owns the @2.1 key now");
+        assert_eq!(e.ptr, 0xCCCC);
+        assert_eq!(e.cookie, 0xDDDD);
+        // The canonical chain[0] entry is untouched by the alias overwrite.
+        let e23 = b
+            .services
+            .get("android.hardware.graphics.composer@2.3::IComposer/default")
+            .unwrap();
+        assert_eq!(e23.handle, h23);
+        assert_eq!(e23.owner, new_hal);
+        // NOTE: the old owner's registry-strong-ref RELEASE mirror
+        // (BR_RELEASE into the old owner's reply_queue) is gated by
+        // mirror_ref_ok — a live-guest liveness anchor the host unit
+        // test cannot satisfy (peek_guest_bytes on a fake pid fails) —
+        // so the release itself is exercised on-device only; the
+        // registry invariants above ARE the host-testable truth.
     }
 
     /// listManifestByInterface (code 13) answers the REAL vec<Instance>
