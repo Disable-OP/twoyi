@@ -29517,3 +29517,25 @@ Stage Summary / RN291 DECODE TREE:
 3. KNOWN RISKS: the host ES2 context's GL_VERSION may report 3.x (→ SF's ES3 code branch vs the ES2 GL2 decoder — would name itself as GL desyncs); "Blurs require OpenGL ES 3.0" fatal if the guest build enables blur (fix class = guest-prop mask); gralloc/ES3 callers; the client's rcMajorVersion=1 rides ES2 per 6-Z340 (informational only).
 4. Do NOT chase: nnapi/keystore/ril fleets, adbd JDWP noise, HOST logcat, iorapd polling.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 73 (USER MANDATE: ladder ≤15 min — 6-Z342 evidence-saturation watch exits + fast pack + the fast dispatch profile landed; rn292 fast-profile dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- MEASURED, not guessed (rn290 jobs API): build 3.0 min + setup/redroid 1.0 + "UI navigation — import rootfs + boot Android" 47.5 min (85% of the wall clock) + pack 3.3 min. The 47.5 min = the boot watch burning its FULL 2700s cap on every churn-dominated run while the decode signature was complete by t+300s in rn286-290 alike.
+- ROOT CAUSE OF THE WASTE: the workflow ALWAYS advertised a stall-adaptive watch ("ends the watch as soon as BOTH freeze") but scripts/ui-navigate-aosp.py NEVER implemented any early exit — the loop ran the full BOOT_WAIT unconditionally.
+- LANDED 6-Z342 (perf(ci), 68b67769):
+  1. BOOT-COMPLETED exit — `sys.boot_completed` in the live kmsg ends the watch minutes after success (the future deep-boot runs will not hang the cap either);
+  2. SATURATED exit — one service with ≥8 deaths (CRASH_LOOP_DEATHS) AND its most recent death fresh (≤45s, the fleet is alive NOW) AND no NEW dying service for 120s (SATURATION_WINDOW_S) → the crash-loop signature is captured, the frontier is provably stuck on that fleet. An old dead fleet or the no-death dex2oat stretch does NOT saturate (the churn/frontier guards are separate so the PMS stretch stays watchable);
+  3. STALLED exit — the klog byte-frozen for TWOYI_STALL_SECONDS (the advertised-but-never-implemented stall semantics; a dead guest now ends the watch in ~90s instead of 45 min).
+  The kmsg snapshot cadence went 15s→5s (every shot; it already carried the exits' signal). The exit reason rides ART/BOOT-WATCH-EXIT.txt for the classifier + decode.
+  4. pack-logs.sh: the comment CLAIMED xz -T0 while `tar -cJf` never passed it — XZ_OPT='-1 -T0' now actually applies (multi-core, speed preset; the PNG-heavy payload gains nothing from -6). rn290's pack step was 3.3 min.
+- DISPATCH POLICY (effective immediately, all future sessions MUST follow): dispatch the ladder with boot_wait_seconds=600 + stall_seconds=60 while the boot is stuck at rung ≤7 walls (the fast profile); switch back to boot_wait_seconds=2700 ONLY once the boot reaches rung ≥8 (the PMS dexopt stretch needs the long watch and no early exit fires there — no churn, alive klog). Expected fast-profile cycle: build 3 + setup 1 + import ~3 + watch 5-7 (saturation) + pack ~1.5 ≈ **~15 min**.
+- DISPATCHED: rn292 on 68b67769 with the FAST profile (boot_wait 600, stall 60, HTTP 204) — rn291 (4e9fe3f3, the 6-Z341 decode, slow profile) was already mid-watch and keeps its 2700s run; the corpus gate is NOT re-dispatched for 6-Z342 (the change touches only the AOSP ladder script + pack script — the recovery corpus harness is disjoint).
+
+Stage Summary:
+- rn291 decode (when it lands): per the Task 72 tree (6-Z341 serve lines → token visible → rcCreateContext fires → SF's ES2 context).
+- rn292 decode: the SAME 6-Z341 tree + verify the fast profile (the run should complete in ~15 min and BOOT-WATCH-EXIT.txt should exist with SATURATED/STALLED or the watch hits the 600s cap with the signature intact).
+- The ≤15-min mandate is now structural: even a forgotten 2700s dispatch cannot burn 45 min on churn (the exits cut it), and the fast profile is the default dispatch shape for the debugging phase.
+- Authentication is provided through the private agent environment.
