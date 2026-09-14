@@ -29313,3 +29313,23 @@ Stage Summary / RN283 DECODE TREE:
 3. The recovery-corpus gate 4/4 GREEN mandatory.
 4. Do NOT chase: the audio re-get stale-pair fleet, the nnapi loop, the tombstoned intercept, HOST logcat.
 - PAT location (propagate in every summary; never print/commit the token): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat).
+
+---
+Task ID: 65 (rn283 decoded: ALL 5 power replies are BYTE-PERFECT — the null is client-side; 6-Z332 landed; rn284 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn283 (34809496925 on 70536dfa/6-Z331): rung 7, 6 eras, 5 FATAL PowerManager NPEs. **THE DECISIVE EVIDENCE LANDED**:
+  1. The 6-Z330/331 klog SM-TR dumps: **5 AIDL 32B dumps — ONE PER POWER GET, correlating 1:1 with the 5 NPE eras** — ALL byte-perfect: `dsize=32 osize=8 dptr=<valid> stash[d0]=00000000 (EX_NONE) stash[d+28..]=3f000000 (the VINTF ann) stash[o0]=04000000 00000000 (offsets=[4])`. The client receives a TEXTBOOK-PERFECT patched LOCAL-flat reply.
+  2. The visible CONSUMED verdicts were all "8 stash bytes" (the VS-class) — the shared klog budget (8) was consumed before the 32B SM verdicts fired (6-Z332 fixes the budgeting).
+- THE STATE OF THE WALL: the proxy wire is PROVEN correct end-to-end (the add, the registry, the LOCAL flat, the SG-free reply, the patch, the backing bytes). The null arises INSIDE the client parse of a perfect parcel OR the reply never reaches waitForResponse. The binary discriminator = the 32B CONSUMED verdict (6-Z332's own-budget klog verdict + the <16B skip).
+- LANDED 6-Z332 (f2febdea): the CONSUMED klog verdict gets its OWN budget (16/process, re-armed per fork-child) and SKIPS <16B stashes.
+- DISPATCHED on f2febdea: rn284 ladder (2700s watch). In flight at worklog-write.
+
+Stage Summary / RN284 DECODE TREE:
+1. PRIMARY: the klog "SM-REPLY-CONSUMED (client freed the reply parcel; 32 stash bytes)" lines for the power-class gets:
+   - **CONSUMED present** → the client's waitForResponse DID populate + tear down the reply Parcel → the null arises INSIDE the AIDL/JAVA marshalling → the next decode: fetch the A11 BpServiceManager gencode + the ServiceManagerShim, walk the parse of the exact 32B reply (the interface token, the readExceptionCode, the readStrongBinder path, the object-list validation) against the artifact bytes — the reply IS the evidence; the parse has a step our shape violates (candidates: the AIDL C++ backend's readStatus/readExceptionCode position, the markForBinder/parcel validation, the object-hint state).
+   - **CONSUMED absent (32B stashes never freed)** → transport-level: the reply never reached waitForResponse (the conn's read path, the mIn desync, the loader's stream rewrite) → instrument the loader's read path for the forked system_server.
+2. The recovery-corpus gate + the 55-min cap unchanged.
+3. Do NOT chase: the audio re-get stale-pair fleet, the nnapi loop, the tombstoned intercept, HOST logcat.
+- PAT location (propagate in every summary; never print/commit the token): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat).
