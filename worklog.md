@@ -29291,3 +29291,25 @@ Stage Summary / RN282 DECODE TREE:
 3. The recovery-corpus gate for this commit + the 55-min cap unchanged.
 4. Do NOT chase: the audio re-get stale-pair fleet (real, non-blocking), the nnapi loop, the tombstoned intercept, HOST logcat.
 - PAT location (propagate in every summary; never print/commit the token): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat).
+
+---
+Task ID: 64 (rn282 decoded: the blob patch RUNS (valid dptr) — the power null is deeper in the client parse; 6-Z331 klog CONSUMED verdict landed; rn283 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn282 (34805928053 on 4e82b7c9/6-Z330): rung 7, 2 FATAL PowerManager NPEs (down from 4), 4 eras, the power add/get flow textbook every era (LOCAL hits, ret=0 read_size=72 trailer=60B). ALL "Null binder" ALOGEs STILL audioserver's (12175) — system_server never logs one.
+- **THE SM-TR KLOG DUMPS DELIVERED**: the first 8 dumps show VALID dptr (f38e3f40f510-class) + the offsets array [4] intact in the backing — **the reply blob patch RUNS in the forked system_server** — the "unpatched blob" hypothesis is DEAD. The visible dumps were the HIDL 28B hits (dsize=28 osize=8 — [status][flat] — the HIDL get shape with NO annotation word) — the AIDL 32B LOCAL-hit shape (the power path) was eaten by the budget gate again (the HIDL hits fired first) — fixed in 6-Z331 (the dump gate now targets dlen==32 with a non-zero flat binder).
+- THE REMAINING NULL PATH (client-side, after a verified-patched reply): readExceptionCode → 0, readStrongBinder → unflattenBinder → readObject → the LOCAL cast → incStrong → finishUnflattenBinder → the ann read + Stability::set — OR the transact failed before Parcel teardown. The loader's EXISTING SM-REPLY-CONSUMED/NOFREE verdict answers this DIRECTLY (BC_FREE_BUFFER for the pending stash = consumed; free-less = transport-level) — it rode fd 2 (invisible) — 6-Z331 routes it to the klog.
+- LANDED 6-Z331 (70536dfa):
+  1. The SM-REPLY-CONSUMED verdict → the guest klog (per-consumption, budget via g_z328_klog_budget).
+  2. The SM-TR klog dump gate: dlen==32 + non-zero flat binder (the AIDL LOCAL-hit shape) — the HIDL 28B hits no longer eat the budget.
+- DISPATCHED on 70536dfa: rn283 ladder (2700s watch) + recovery-corpus pr-tier gate. In flight at worklog-write.
+
+Stage Summary / RN283 DECODE TREE:
+1. PRIMARY: the klog "SM-REPLY-CONSUMED (client freed the reply parcel; 32 stash bytes)" lines for the power-class gets:
+   - CONSUMED present + the NPE persists → the null arises INSIDE the AIDL marshalling (the JAVA-side getService → the IPC parse) — the next decode reads the client's parse step-by-step (the AIDL C++ backend's readStrongBinder vs the reply bytes — fetch the A11 BpServiceManager gencode).
+   - CONSUMED absent (NOFREE) → the transact failed before Parcel teardown — transport-level (the reply never reached waitForResponse — the conn's read path).
+2. The zeroing verdicts (pair-deduped) for any power-class zeroings.
+3. The recovery-corpus gate 4/4 GREEN mandatory.
+4. Do NOT chase: the audio re-get stale-pair fleet, the nnapi loop, the tombstoned intercept, HOST logcat.
+- PAT location (propagate in every summary; never print/commit the token): /home/z/.twoyi-pat.b64 (canonical, base64; mirrors /home/z/.secrets/twoyi_pat + /home/z/.twoyi_pat + /tmp/twoyi_pat).
