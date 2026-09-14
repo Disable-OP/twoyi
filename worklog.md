@@ -29377,3 +29377,23 @@ Stage Summary / RN285 DECODE TREE:
 4. The recovery-corpus gate 4/4 GREEN mandatory (the echo never touches virtual/HIDL replies, but the gate proves it).
 5. Do NOT chase: the audio re-get stale-pair zeroing fleet (real, non-blocking), the nnapi loop, the tombstoned intercept, HOST logcat.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 68 (corpus self-heal 6-Z334 landed; 92 rotated LineageOS URLs redated; rn285 decode pending)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- Authentication is provided through the private agent environment.
+- CI triage on daa73aab: Recovery Corpus Nightly SUCCESS; kr64 lint+test green; rn285 ladder in flight. ONE pr-gate child FAILED — the "UI-only ARM64 (TWRP)" job (a static matrix name) carrying lineage-22.2-sailfish died in 37s: `curl: (22) The requested URL returned error: 404` for mirrorbits.lineageos.org/full/sailfish/20260823/boot.img. NOT a 6-Z333 regression (the corpus nightly + 3 other E2E children green on the same commit).
+- Full manifest probe: **92 of 296 LineageOS URLs DEAD** — the 2026-09-13 nightly rotation deleted the whole dated builds the manifest pinned (2026-08-21…28). The old fix_lineage_urls.py only swapped artifact TYPE within a fixed date — it could not survive a redate.
+- LANDED 6-Z334 (fix(corpus)):
+  1. fix_lineage_urls.py gains the builds-API fallback — when EVERY artifact of (dev,date) 404s, it queries download.lineageos.org/api/v2/devices/{dev}/builds, walks builds newest-first × (recovery → vendor_boot → boot) and redates the entry, taking the AUTHORITATIVE sha256 from the API; stale md5/sha256 pins are cleared ("" = computed at CI) so the download gate stays honest. Fixed a re.sub template bug en route (a hex sha256 starting with digits parses as \1205… group ref — lambda replacement).
+  2. Ran it: **92 redate(s), 0 unfixable**; re-probe: 296/296 ALIVE (one transient CDN timeout re-verified OK). lineage-22.2-sailfish → 20260913/boot.img, sha256 2058fbc6… (matches the API).
+  3. dispatch_corpus.sh now runs the fixer BEFORE dispatch — the single choke point (nightly schedule + manual pr-gate + release) self-heals every run; ~2 min for 296 URLs.
+- DISPATCHED: re-ran the pr-tier corpus gate on the new HEAD (4 children) to restore the green gate.
+
+Stage Summary:
+- The corpus now survives upstream rotation by construction; the next rotation self-heals at dispatch.
+- NEXT (in priority): decode rn285 when it lands — the 6-Z333 echo's live verdict (addService ann captured lines; the "Interface being set with vintf" fleet must be gone; StartBootstrapServices past initPowerManagement; PMS dexopt stretch budget). Full decode tree in Task 67.
+- Do NOT chase: audio re-get stale-pair fleet, nnapi loop, tombstoned intercept, HOST logcat.
+- Authentication is provided through the private agent environment.
