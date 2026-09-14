@@ -466,26 +466,82 @@ static int rcUpdateColorBuffer(uint32_t colorBuffer,
     return 0;
 }
 
+// ── 6-Z344: renderControl op trampolines ────────────────────────────
+// rn293's decode stalled on a contradiction (SF dies between "GLES
+// Backend" and the context while the config endpoints never log a call)
+// that cannot be resolved from the guest side: the vendored A11 client's
+// exact gate is invisible. These log-then-call wrappers cover the
+// negotiation + surface-lifecycle ops that had no instrument yet
+// (bounded globally: the first 160 op invocations of the boot name the
+// whole negotiation + the first SF eras), so the next decode reads the
+// client's ACTUAL op sequence instead of inferring it.
+static unsigned s_6z344_rc_ops = 0;
+
+static EGLint rcQueryEGLString_6z344(EGLenum name, void* buffer, EGLint bufferSize)
+{
+    if (s_6z344_rc_ops < 160) {
+        s_6z344_rc_ops++;
+        RLOG_6Z339("6-Z344 rc-op #%u rcQueryEGLString name=0x%x", s_6z344_rc_ops, (unsigned)name);
+    }
+    return rcQueryEGLString(name, buffer, bufferSize);
+}
+
+static EGLint rcGetConfigs_6z344(uint32_t bufSize, GLuint* buffer)
+{
+    if (s_6z344_rc_ops < 160) {
+        s_6z344_rc_ops++;
+        RLOG_6Z339("6-Z344 rc-op #%u rcGetConfigs bufSize=%u", s_6z344_rc_ops, bufSize);
+    }
+    return rcGetConfigs(bufSize, buffer);
+}
+
+static uint32_t rcCreateWindowSurface_6z344(uint32_t config, uint32_t width, uint32_t height)
+{
+    if (s_6z344_rc_ops < 160) {
+        s_6z344_rc_ops++;
+        RLOG_6Z339("6-Z344 rc-op #%u rcCreateWindowSurface config=%u %ux%u", s_6z344_rc_ops, config, width, height);
+    }
+    return rcCreateWindowSurface(config, width, height);
+}
+
+static int rcMakeCurrent_6z344(uint32_t context, uint32_t drawSurf, uint32_t readSurf)
+{
+    if (s_6z344_rc_ops < 160) {
+        s_6z344_rc_ops++;
+        RLOG_6Z339("6-Z344 rc-op #%u rcMakeCurrent ctx=%u draw=%u read=%u", s_6z344_rc_ops, context, drawSurf, readSurf);
+    }
+    return rcMakeCurrent(context, drawSurf, readSurf);
+}
+
+static int rcGetEGLVersion_6z344(EGLint* major, EGLint* minor)
+{
+    if (s_6z344_rc_ops < 160) {
+        s_6z344_rc_ops++;
+        RLOG_6Z339("6-Z344 rc-op #%u rcGetEGLVersion", s_6z344_rc_ops);
+    }
+    return rcGetEGLVersion(major, minor);
+}
+
 void initRenderControlContext(renderControl_decoder_context_t *dec)
 {
     dec->set_rcGetRendererVersion(rcGetRendererVersion);
-    dec->set_rcGetEGLVersion(rcGetEGLVersion);
-    dec->set_rcQueryEGLString(rcQueryEGLString);
+    dec->set_rcGetEGLVersion(rcGetEGLVersion_6z344);
+    dec->set_rcQueryEGLString(rcQueryEGLString_6z344);
     dec->set_rcGetGLString(rcGetGLString);
     dec->set_rcGetNumConfigs(rcGetNumConfigs);
-    dec->set_rcGetConfigs(rcGetConfigs);
+    dec->set_rcGetConfigs(rcGetConfigs_6z344);
     dec->set_rcChooseConfig(rcChooseConfig);
     dec->set_rcGetFBParam(rcGetFBParam);
     dec->set_rcCreateContext(rcCreateContext);
     dec->set_rcDestroyContext(rcDestroyContext);
-    dec->set_rcCreateWindowSurface(rcCreateWindowSurface);
+    dec->set_rcCreateWindowSurface(rcCreateWindowSurface_6z344);
     dec->set_rcDestroyWindowSurface(rcDestroyWindowSurface);
     dec->set_rcCreateColorBuffer(rcCreateColorBuffer);
     dec->set_rcOpenColorBuffer(rcOpenColorBuffer);
     dec->set_rcCloseColorBuffer(rcCloseColorBuffer);
     dec->set_rcSetWindowColorBuffer(rcSetWindowColorBuffer);
     dec->set_rcFlushWindowColorBuffer(rcFlushWindowColorBuffer);
-    dec->set_rcMakeCurrent(rcMakeCurrent);
+    dec->set_rcMakeCurrent(rcMakeCurrent_6z344);
     dec->set_rcFBPost(rcFBPost);
     dec->set_rcFBSetSwapInterval(rcFBSetSwapInterval);
     dec->set_rcBindTexture(rcBindTexture);
