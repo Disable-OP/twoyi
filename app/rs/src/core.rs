@@ -1055,6 +1055,11 @@ pub fn init_renderer(
                 // Task 6-Z24: write the PID lock so subsequent init_renderer
                 // calls (surface recreation) skip the spawn + pgrep-kill.
                 mark_renderer_initialized_for_this_process();
+                // 6-Z335: the death-attribution probe — names the loader's
+                // death class (clean exit / catchable fatal / UNCAUGHT
+                // SIGKILL) + the cgroup oom_kill delta. rn257/rn259/rn285
+                // all died silently; this is the bisect instrument.
+                spawn_kr64_death_probe(child.id());
             }
             Err(e) => {
                 log::error!("[CORE] FAILED to spawn container init: {}", e);
@@ -1879,4 +1884,176 @@ unsafe fn twrp_blit_to_surface(
     // Unlock and post the buffer to the display.
     let _ = ANativeWindow_unlockAndPost(window);
     true
+}
+
+// ── 6-Z335: the death-attribution probe (the app side of the kr64 pair) ──
+//
+// rn257 (+420s), rn259 (+216.9s) and rn285 (+208.7s) all ended the same
+// way: kr64 died SILENTLY mid-traffic and the whole guest tree vanished;
+// the run's verdict was scored from a frozen world. The 6-Z311 in-process
+// last-gasp proved the class is NOT a catchable fatal signal (0 fires
+// across every incident) — so the remaining candidates are an UNCAUGHT
+// SIGKILL from outside or a silent clean-exit path. This probe names the
+// class from the PARENT side, where waitid's siginfo survives the death:
+//
+//   * CLD_EXITED(n)     — kr64 exited through some exit(n) path (every
+//                         loop-exit path logs loudly, so a clean exit with
+//                         no exit log names a NEW silent-exit path);
+//   * CLD_KILLED(sig)   — terminated by a signal with no core. sig=9 is
+//                         the uncatchable SIGKILL — the killer is outside
+//                         the process (kernel OOM, lmkd, or an explicit
+//                         kill) and by construction left no last-gasp;
+//   * CLD_DUMPED(sig)   — fatal signal with a core attempt (the 6-Z311
+//                         last-gasp should have fired first — if it did
+//                         NOT, this row is decisive on its own).
+//
+// Together with the app's cgroup memory.events oom_kill counter (read
+// before the wait and again at death), a CLD_KILLED(9) resolves into
+// "kernel OOM" (delta>0) vs "an explicit SIGKILL sender" (delta==0) —
+// the bisect the silent-death class has needed since rn257.
+//
+// WNOWAIT semantics: the probe NEVER reaps. The child stays a zombie
+// (the classifier's post-mortem marker and the 6-Z21 keep-alive contract
+// are unchanged); the kernel keeps the waitable state so a later
+// debugger can still wait() it.
+
+/// Best-effort read of the app's own cgroup `memory.events` oom_kill
+/// counter. Returns None when the kernel layout doesn't expose it (v1
+/// hosts, restricted mounts) — the probe logs that honestly instead of
+/// guessing.
+fn read_oom_kill_counter() -> Option<u64> {
+    // cgroup v2: the unified hierarchy line "0::<path>" names the group
+    // under /sys/fs/cgroup. Android hosts (S+) expose memory.events there.
+    let self_cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let v2_path = self_cg
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(|p| p.trim().to_string())?;
+    let events = std::fs::read_to_string(format!("/sys/fs/cgroup{v2_path}/memory.events"))
+        .or_else(|_| std::fs::read_to_string("/sys/fs/cgroup/memory.events"))
+        .ok()?;
+    events.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some("oom_kill"), Some(n)) => n.parse::<u64>().ok(),
+            _ => None,
+        }
+    })
+}
+
+/// Pure decode of waitid's (si_code, si_status) into one human string —
+/// unit-testable, no I/O.
+fn decode_loader_death(si_code: libc::c_int, si_status: libc::c_int) -> String {
+    match si_code {
+        libc::CLD_EXITED => format!("clean-exit code={si_status}"),
+        libc::CLD_KILLED => {
+            if si_status == libc::SIGKILL {
+                "killed-by-signal sig=9 (UNCATCHABLE SIGKILL from outside — \
+                 6-Z311 last-gasp cannot see this class; decide kernel-OOM \
+                 vs explicit sender via the oom_kill delta)"
+                    .to_string()
+            } else {
+                format!("killed-by-signal sig={si_status} (no core)")
+            }
+        }
+        libc::CLD_DUMPED => {
+            format!(
+                "killed-by-signal sig={si_status} (core-attempted — the 6-Z311 \
+                     last-gasp should have named this death; its absence is itself \
+                     a datum)"
+            )
+        }
+        libc::CLD_TRAPPED => "ptrace-trapped (unexpected for the app's child)".to_string(),
+        other => format!("si_code={other} status={si_status}"),
+    }
+}
+
+/// The probe thread body: poll waitid(WEXITED|WNOWAIT|WNOHANG) at 250 ms
+/// until the kr64 child reaches a waitable exit state, then render ONE
+/// loud death record (signal class + oom_kill delta) and leave the child
+/// unreaped. Never returns (daemon for the app's lifetime).
+fn kr64_death_probe(child_pid: i32) {
+    let baseline = read_oom_kill_counter();
+    let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let outcome: Option<(libc::c_int, libc::c_int)> = loop {
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child_pid as libc::id_t,
+                &mut si,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc == 0 {
+            break Some((si.si_code, unsafe { si.si_status() }));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ECHILD) {
+            break None; // already reaped by someone else — log that too
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
+    let at_death = read_oom_kill_counter();
+    let oom = match (baseline, at_death) {
+        (Some(b), Some(a)) => format!("oom_kill={b}→{a} (delta={})", a.saturating_sub(b)),
+        _ => "oom_kill=unreadable (no cgroup v2 memory.events — kernel-OOM \
+              attribution unavailable on this host)"
+            .to_string(),
+    };
+    let body = match outcome {
+        Some((code, status)) => decode_loader_death(code, status),
+        None => "already-reaped-by-someone-else (the death record was consumed \
+                 before the probe saw it)"
+            .to_string(),
+    };
+    let line = format!(
+        "[6-Z335 LOADER-DEATH] pid={child_pid} {body}; {oom}; probe stays \
+         WNOWAIT (zombie preserved for the classifier)",
+    );
+    alog_error(&line);
+    log::error!("{line}");
+}
+
+/// Spawn the death probe as a daemon thread for a freshly spawned kr64
+/// child. Best-effort: if the thread cannot be created the boot proceeds
+/// unchanged (the probe is diagnostics, not control flow).
+fn spawn_kr64_death_probe(child_pid: u32) {
+    if let Err(e) = thread::Builder::new()
+        .name("kr64-death-probe".into())
+        .spawn(move || kr64_death_probe(child_pid as i32))
+    {
+        log::error!("[CORE] 6-Z335: could not spawn death probe: {e}");
+    }
+}
+
+#[cfg(test)]
+mod z335_tests {
+    use super::{decode_loader_death, read_oom_kill_counter};
+
+    #[test]
+    fn z335_decode_covers_the_incident_classes() {
+        // The rn285 class: silent uncatchable SIGKILL.
+        let s = decode_loader_death(libc::CLD_KILLED, libc::SIGKILL);
+        assert!(s.contains("UNCATCHABLE SIGKILL"), "{s}");
+        // A clean exit must read as clean (names a silent-exit path).
+        let s = decode_loader_death(libc::CLD_EXITED, 0);
+        assert!(s.contains("clean-exit code=0"), "{s}");
+        // A core-attempted death must flag the last-gasp contradiction.
+        let s = decode_loader_death(libc::CLD_DUMPED, libc::SIGABRT);
+        assert!(s.contains("core-attempted"), "{s}");
+        // The rn259 "raw fatal signal" class, if it ever fires.
+        let s = decode_loader_death(libc::CLD_KILLED, libc::SIGSEGV);
+        assert!(s.contains("sig=11"), "{s}");
+    }
+
+    #[test]
+    fn z335_oom_counter_read_is_honest() {
+        // Must NEVER panic and must be None on hosts without cgroup v2
+        // memory.events (e.g. the dev sandbox) — the probe logs that.
+        let v = read_oom_kill_counter();
+        if let Some(n) = v {
+            // A readable counter is a u64; sanity only.
+            assert!(n < u64::MAX);
+        }
+    }
 }
