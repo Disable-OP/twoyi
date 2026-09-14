@@ -29558,3 +29558,20 @@ Stage Summary / RN293 DECODE TREE:
 3. If rcChooseConfig returns 0 matches for SF's attribs: the masked table lost a required attrib (e.g. SF asks RENDERABLE_TYPE=ES3_BIT|ES2_BIT — the mask keeps ES2 so it should match; a 0-match would point at a different attrib like EGL_RECORDABLE_ANDROID).
 4. Do NOT chase: nnapi/keystore/ril fleets, adbd JDWP noise, HOST logcat, iorapd polling.
 - PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
+
+---
+Task ID: 75 (rn293 fast decoded: the config table is HEALTHY (40/32) yet ZERO rcChooseConfig — the client's op sequence is the missing evidence; 6-Z344 op trampolines landed; rn294 fast dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn293 (34866751535 on 96aa009d = 6-Z343) completed in ~11 MIN (fast profile delivering). Artifacts /home/z/artifacts-rn293 (rn291's run was cancelled-then-overwritten; rn292 deleted for disk).
+- Decode: verdict rung 4 CORE_DAEMONS; the 6-Z343 instruments FIRED — rcGetNumConfigs → 40 configs / 32 attribs ×8 client display inits (the client parses the table fine). BUT: ZERO rcChooseConfig calls AND zero 6-Z339 rcCreateContext calls, SF still "EGLContext creation failed" ×51-52 / error 0x3005 ×104 (2 per era = RenderEngine's main + protected/2nd context), "RenderEngine GLES Backend" ×52, blur disabled (no blur fatal), 55 host connections established. The config table + the max-version token are both PROVEN good — SF dies between "GLES Backend" and the context WITHOUT ever calling the config endpoint. A contradiction unresolvable from the guest side (the vendored A11 client's gate is invisible; ALOGV paths don't reach the kmsg mirror).
+- LANDED 6-Z344 (fix(instruments), 65416af5): log-then-call trampolines on the five UNinstrumented renderControl endpoints (rcGetEGLVersion, rcQueryEGLString, rcGetConfigs, rcCreateWindowSurface, rcMakeCurrent) with a bounded 160-op global budget — rn294 will read the client's ACTUAL op sequence (negotiation → config → surface → context) and name the exact divergence.
+- DISPATCHED: rn294 on 65416af5 with the FAST profile (boot_wait 600, stall 60, HTTP 204).
+
+Stage Summary / RN294 DECODE TREE:
+1. PRIMARY: read the 6-Z344 op sequence for the first SF-era connection. Expect: rcGetEGLVersion → rcQueryEGLString(EGL_EXTENSIONS?) → rcGetGLString(GL_EXTENSIONS ×2: the two-call sizing) → rcGetNumConfigs → rcGetConfigs → [rcChooseConfig?] → [rcCreateContext?]. The FIRST MISSING op is the client's gate.
+2. If the sequence STOPS after rcGetConfigs (no rcChooseConfig): the client's eglChooseConfig failed pre-host (VALIDATE_DISPLAY_INIT or the DEFINE_AND_VALIDATE failure — the 55 connections vs 8 inits mismatch is the next lead: per-THREAD connections in a process whose display init FAILED would skip chooseConfig entirely).
+3. If rcChooseConfig fires with 0 matches for SF's attribs: read the logged RENDERABLE_TYPE request (the 6-Z339 mask vs the guest's expectations).
+4. Do NOT chase: nnapi/drm/ril/health-hal crash-loop fleets (53× health-hal signal-6 is the loudest but off the critical path), adbd JDWP noise, HOST logcat.
+- PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
