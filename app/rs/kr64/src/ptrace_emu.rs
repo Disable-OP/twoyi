@@ -5365,6 +5365,144 @@ fn is_ashmem_backing_path(path: &str) -> bool {
     path.starts_with('/') && path.rsplit('/').next() == Some("ashmem")
 }
 
+// ── 6-Z338: the /dev/goldfish_address_space stand-in (rn287 decode) ──
+//
+// rn287 (the first run with a working GL transport, 6-Z336): the composer
+// crashed on GoldfishMapper:84 — "GoldfishAddressSpaceHostMemoryAllocator
+// failed to open" — because the guest's ro.hardware=goldfish pulls in the
+// goldfish gralloc/mapper stack and its GoldfishAddressSpaceBlockProvider
+// opens /dev/goldfish_address_space (O_RDWR), a REAL goldfish char device
+// (drivers/staging/android/goldfish_address_space) that no rootless host
+// can provide. The composer crash-looped → HWC never registered → SF
+// stalled → rung 7. The stand-in follows the /dev/ashmem precedent
+// (6-Z203): a regular file + tracer-level ioctl virtualization.
+//
+// Contract (A11 device/generic/goldfish-opengl,
+// shared/GoldfishAddressSpace/include/{goldfish_address_space.h,
+// goldfish_address_space_android.impl} — fetched, pinned in /tmp):
+//   open("/dev/goldfish_address_space", O_RDWR)
+//   ioctl PING  {version=40, metadata=SubdeviceType(5|6)}  → set mode, ACK 0
+//   hostMalloc: ioctl ALLOCATE_BLOCK {size→offset,phys_addr} (non-shared
+//               slots), or PING {metadata=1, size→offset} (shared slots);
+//               then PING {offset, size, metadata=1} → ACK metadata=0;
+//               then the caller mmaps the fd at the returned offset — a
+//               NATIVE file-backed MAP_SHARED mmap (the arm64 tracer does
+//               NOT rewrite file-backed mmaps, 6-Z240), so the backing
+//               file is ftruncate-grown BEFORE the ack. hostFree: PING
+//               {metadata=2}; goldfish_address_space_close may also
+//               DEALLOCATE / UNCLAIM_SHARED.
+
+/// asm-generic ioctl type byte 'G' (GOLDFISH_ADDRESS_SPACE_IOCTL_MAGIC).
+pub const GOLDFISH_ASPACE_MAGIC: u64 = 0x47;
+
+/// struct goldfish_address_space_ping.command metadata values
+/// (HOST_MEMORY_ALLOCATOR_COMMAND_*).
+pub const GOLDFISH_ASPACE_PING_ALLOCATE_ID: u64 = 1;
+pub const GOLDFISH_ASPACE_PING_UNALLOCATE_ID: u64 = 2;
+
+/// GoldfishAddressSpaceSubdeviceType values (A11 header).
+pub const GOLDFISH_ASPACE_SUBDEV_HOST_MEMORY_ALLOCATOR: u64 = 5;
+pub const GOLDFISH_ASPACE_SUBDEV_SHARED_SLOTS: u64 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoldfishAspaceOp {
+    Allocate,
+    Deallocate,
+    Ping,
+    ClaimShared,
+    UnclaimShared,
+}
+
+/// Decode an ioctl request for the goldfish_address_space contract.
+/// asm-generic `_IOWR('G', nr, T)` = (3<<30) | (sizeof(T)<<16) | ('G'<<8) | nr.
+/// Struct sizes from the A11 header: allocate_block = 24 (3×u64), u64 = 8,
+/// ping = 40 (3×u64 + 4×u32), claim_shared = 16 (2×u64).
+pub fn goldfish_aspace_op(req: u64) -> Option<GoldfishAspaceOp> {
+    let dir = (req >> 30) & 0x3;
+    let size = (req >> 16) & 0x3fff;
+    let ty = (req >> 8) & 0xff;
+    let nr = req & 0xff;
+    if dir != 3 || ty != GOLDFISH_ASPACE_MAGIC {
+        return None;
+    }
+    match (nr, size) {
+        (10, 24) => Some(GoldfishAspaceOp::Allocate),
+        (11, 8) => Some(GoldfishAspaceOp::Deallocate),
+        (12, 40) => Some(GoldfishAspaceOp::Ping),
+        (13, 16) => Some(GoldfishAspaceOp::ClaimShared),
+        (14, 8) => Some(GoldfishAspaceOp::UnclaimShared),
+        _ => None,
+    }
+}
+
+/// The guest page size (aarch64) — the guest's NATIVE file-backed mmap on
+/// the host kernel requires a page-aligned offset, so every block is
+/// page-granular.
+pub const GOLDFISH_ASPACE_PAGE: u64 = 4096;
+
+/// 6-Z338: the address-space arena. ONE backing regular file is shared by
+/// every opener (the stand-in node), so offsets are GLOBAL across guest
+/// processes and must never collide — exactly what the real goldfish
+/// device's shared address space provides for cross-process buffer sharing.
+#[derive(Debug, Default)]
+pub struct GoldfishAspaceArena {
+    next_offset: u64,
+    live: Vec<(u64, u64)>,
+    free_list: Vec<(u64, u64)>,
+}
+
+impl GoldfishAspaceArena {
+    fn round(size: u64) -> u64 {
+        if size == 0 {
+            0
+        } else {
+            ((size + GOLDFISH_ASPACE_PAGE - 1) / GOLDFISH_ASPACE_PAGE) * GOLDFISH_ASPACE_PAGE
+        }
+    }
+
+    /// Allocate `size` bytes; returns (page-aligned offset, rounded size).
+    /// Exact-fit holes are reused, bigger holes are split, then the bump
+    /// pointer grows. `phys_addr` mirrors the offset (informational on the
+    /// A11 client: physAddr() feeds cache-maintenance paths only).
+    pub fn allocate(&mut self, size: u64) -> Option<(u64, u64)> {
+        let rounded = Self::round(size);
+        if rounded == 0 {
+            return None;
+        }
+        let picked = if let Some(pos) = self.free_list.iter().position(|&(_, s)| s == rounded) {
+            let (off, _) = self.free_list.remove(pos);
+            off
+        } else if let Some(pos) = self.free_list.iter().position(|&(_, s)| s > rounded) {
+            let (off, big) = self.free_list.remove(pos);
+            self.free_list.push((off + rounded, big - rounded));
+            off
+        } else {
+            let off = self.next_offset;
+            self.next_offset += rounded;
+            off
+        };
+        self.live.push((picked, rounded));
+        Some((picked, rounded))
+    }
+
+    /// Release the live block at `offset` (None = double/unknown free —
+    /// the honest contract; the caller logs it but does not fail the ioctl).
+    pub fn free(&mut self, offset: u64) -> Option<(u64, u64)> {
+        let pos = self.live.iter().position(|&(o, _)| o == offset)?;
+        let r = self.live.remove(pos);
+        self.free_list.push(r);
+        Some(r)
+    }
+
+    pub fn live_count(&self) -> usize {
+        self.live.len()
+    }
+
+    pub fn live_end(&self) -> u64 {
+        self.live.iter().map(|&(o, s)| o + s).fold(0u64, u64::max)
+    }
+}
+
 /// 6-Z217: derive the GUEST-visible cwd from a kernel getcwd() result.
 ///
 /// The guest's cwd physically lives under the host rootfs backing dir,
@@ -14578,6 +14716,17 @@ pub fn run_ptrace_loop(
     // virtualization needs the size for GET_SIZE + ftruncate on SET_SIZE.
     let mut ashmem_fd_sizes: std::collections::HashMap<(libc::pid_t, i32), i64> =
         std::collections::HashMap::new();
+    // 6-Z338: the goldfish_address_space stand-in state. (pid, fd) → the
+    // fd's subdevice mode (5 = HostMemoryAllocator, 6 = SharedSlots — set
+    // by the mode-set PING right after open). The ARENA is a loop local
+    // too: one global allocator for the single shared backing file, so
+    // offsets never collide across guest processes. The arena dies with
+    // the tracer (a fresh kr64 run restarts from offset 0 over a freshly
+    // truncated stand-in file — devices.rs keeps those in lockstep).
+    let mut goldfish_aspace_fd_mode: std::collections::HashMap<(libc::pid_t, i32), u64> =
+        std::collections::HashMap::new();
+    let mut goldfish_aspace_arena: GoldfishAspaceArena = GoldfishAspaceArena::default();
+    let mut goldfish_aspace_diag: u32 = 0;
     const Z121_LOG_CAP: u32 = 60;
 
     // ── Task 6-U diagnostic state ────────────────────────────────────
@@ -28375,6 +28524,235 @@ pub fn run_ptrace_loop(
                                 log(&format!(
                                     "6-Z203: ioctl(fd={}, req={:#x}) ASHMEM nr={} on the /dev/ashmem stand-in -> faked {} (6-Z203)",
                                     fd, req, nr, fake_ret
+                                ));
+                            }
+                        }
+                    }
+
+                    // ── 6-Z338: tracer-level goldfish_address_space ioctl
+                    // virtualization (ENTRY) ──
+                    //
+                    // rn287: the composer crash-looped on GoldfishMapper:84
+                    // ("GoldfishAddressSpaceHostMemoryAllocator failed to
+                    // open") — the /dev/goldfish_address_space char device
+                    // does not exist on a rootless host. The stand-in is a
+                    // regular file (devices.rs); this handler speaks the
+                    // goldfish ioctl contract on the fd, ftruncate-grows
+                    // the backing file so the caller's NATIVE file-backed
+                    // MAP_SHARED mmap (arm64 tracer never rewrites those,
+                    // 6-Z240) serves real shared pages, and swaps the
+                    // syscall to getpid with a pending fake return — the
+                    // exact 6-Z203 ashmem pattern. Guest-struct I/O rides
+                    // read_child_bytes / write_child_u64s_unchecked; the
+                    // request structs are little-endian u64 arrays.
+                    if abi.ioctl_nr != -1 && syscall_num == abi.ioctl_nr {
+                        let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                        let req = get_syscall_arg(&regs, abi.reg_arg2);
+                        let arg = get_syscall_arg(&regs, abi.reg_arg3);
+                        let aspace_backed = open_fd_owner_paths
+                            .get(&(pid, fd))
+                            .map(|p| {
+                                p.starts_with('/')
+                                    && p.rsplit('/').next() == Some("goldfish_address_space")
+                            })
+                            .unwrap_or(false);
+                        if aspace_backed {
+                            if let Some(op) = goldfish_aspace_op(req) {
+                                goldfish_aspace_diag = goldfish_aspace_diag.saturating_add(1);
+                                let mut fake_ret: i64 = 0;
+                                // (guest struct addr, words to write back before the ack)
+                                let mut resp_words: Option<(u64, [u64; 5], usize)> = None;
+                                // ftruncate the stand-in file to `end` so the
+                                // caller's mmap has real pages behind it.
+                                let mut grow_to: Option<u64> = None;
+                                match op {
+                                    GoldfishAspaceOp::Ping => {
+                                        // struct ping (40B): {offset, size, metadata,
+                                        // version, wait_fd, wait_flags, direction}
+                                        match read_child_bytes(pid, arg, 40) {
+                                            Some(buf) => {
+                                                let w: [u64; 5] = [
+                                                    u64::from_le_bytes(
+                                                        buf[0..8].try_into().unwrap(),
+                                                    ),
+                                                    u64::from_le_bytes(
+                                                        buf[8..16].try_into().unwrap(),
+                                                    ),
+                                                    u64::from_le_bytes(
+                                                        buf[16..24].try_into().unwrap(),
+                                                    ),
+                                                    u64::from_le_bytes(
+                                                        buf[24..32].try_into().unwrap(),
+                                                    ),
+                                                    u64::from_le_bytes(
+                                                        buf[32..40].try_into().unwrap(),
+                                                    ),
+                                                ];
+                                                let metadata = w[2];
+                                                if metadata
+                                                    == GOLDFISH_ASPACE_SUBDEV_HOST_MEMORY_ALLOCATOR
+                                                    || metadata
+                                                        == GOLDFISH_ASPACE_SUBDEV_SHARED_SLOTS
+                                                {
+                                                    // set_address_space_subdevice_type: just ACK.
+                                                    goldfish_aspace_fd_mode
+                                                        .insert((pid, fd), metadata);
+                                                } else if metadata
+                                                    == GOLDFISH_ASPACE_PING_ALLOCATE_ID
+                                                {
+                                                    let mode = goldfish_aspace_fd_mode
+                                                        .get(&(pid, fd))
+                                                        .copied()
+                                                        .unwrap_or(GOLDFISH_ASPACE_SUBDEV_HOST_MEMORY_ALLOCATOR);
+                                                    if mode == GOLDFISH_ASPACE_SUBDEV_SHARED_SLOTS {
+                                                        // shared slots: WE carve the block
+                                                        // and hand the offset back in word 0.
+                                                        match goldfish_aspace_arena.allocate(w[1]) {
+                                                            Some((off, rounded)) => {
+                                                                let mut out = w;
+                                                                out[0] = off;
+                                                                out[2] = 0;
+                                                                resp_words = Some((arg, out, 40));
+                                                                grow_to = Some(off + rounded);
+                                                            }
+                                                            None => fake_ret = -12, // -ENOMEM
+                                                        }
+                                                    } else {
+                                                        // non-shared slots: the caller already
+                                                        // ran ioctl ALLOCATE (offset=w[0],
+                                                        // size=w[1]); ACK metadata=0.
+                                                        let mut out = w;
+                                                        out[2] = 0;
+                                                        resp_words = Some((arg, out, 40));
+                                                        grow_to = Some(w[0] + w[1]);
+                                                    }
+                                                } else if metadata
+                                                    == GOLDFISH_ASPACE_PING_UNALLOCATE_ID
+                                                {
+                                                    if goldfish_aspace_arena.free(w[0]).is_none() {
+                                                        // double/unknown free: honest ACK, logged.
+                                                    }
+                                                    let mut out = w;
+                                                    out[2] = 0;
+                                                    resp_words = Some((arg, out, 40));
+                                                } else {
+                                                    // Unknown metadata: ACK 0 (logged) so a
+                                                    // future command class names itself in
+                                                    // the klog instead of hanging the guest.
+                                                }
+                                            }
+                                            None => fake_ret = -14, // -EFAULT
+                                        }
+                                    }
+                                    GoldfishAspaceOp::Allocate => {
+                                        // struct allocate_block (24B): {size, offset, phys_addr}
+                                        match read_child_bytes(pid, arg, 24) {
+                                            Some(buf) => {
+                                                let size = u64::from_le_bytes(
+                                                    buf[0..8].try_into().unwrap(),
+                                                );
+                                                match goldfish_aspace_arena.allocate(size) {
+                                                    Some((off, rounded)) => {
+                                                        let out = [size, off, off, 0, 0];
+                                                        resp_words = Some((arg, out, 24));
+                                                        grow_to = Some(off + rounded);
+                                                    }
+                                                    None => fake_ret = -12, // -ENOMEM
+                                                }
+                                            }
+                                            None => fake_ret = -14, // -EFAULT
+                                        }
+                                    }
+                                    GoldfishAspaceOp::Deallocate => {
+                                        // arg points at one u64 offset.
+                                        match read_child_bytes(pid, arg, 8) {
+                                            Some(buf) => {
+                                                let off = u64::from_le_bytes(
+                                                    buf[0..8].try_into().unwrap(),
+                                                );
+                                                goldfish_aspace_arena.free(off);
+                                            }
+                                            None => fake_ret = -14, // -EFAULT
+                                        }
+                                    }
+                                    GoldfishAspaceOp::ClaimShared => {
+                                        // struct claim_shared (16B): {offset, size} —
+                                        // registering a claim on an existing block.
+                                        match read_child_bytes(pid, arg, 16) {
+                                            Some(buf) => {
+                                                let off = u64::from_le_bytes(
+                                                    buf[0..8].try_into().unwrap(),
+                                                );
+                                                let sz = u64::from_le_bytes(
+                                                    buf[8..16].try_into().unwrap(),
+                                                );
+                                                grow_to = Some(off + sz);
+                                            }
+                                            None => fake_ret = -14, // -EFAULT
+                                        }
+                                    }
+                                    GoldfishAspaceOp::UnclaimShared => {
+                                        match read_child_bytes(pid, arg, 8) {
+                                            Some(buf) => {
+                                                let off = u64::from_le_bytes(
+                                                    buf[0..8].try_into().unwrap(),
+                                                );
+                                                goldfish_aspace_arena.free(off);
+                                            }
+                                            None => fake_ret = -14, // -EFAULT
+                                        }
+                                    }
+                                }
+                                if let Some(end) = grow_to {
+                                    if let Some(path) = open_fd_owner_paths.get(&(pid, fd)).cloned()
+                                    {
+                                        if let Ok(f) =
+                                            std::fs::OpenOptions::new().write(true).open(&path)
+                                        {
+                                            if let Err(e) = f.set_len(end) {
+                                                log(&format!(
+                                                    "6-Z338: ftruncate({}) to {} failed: {} — the caller's mmap may fail",
+                                                    path, end, e
+                                                ));
+                                                fake_ret = -12; // -ENOMEM: do not ACK a mapless block
+                                            }
+                                        } else {
+                                            fake_ret = -12;
+                                        }
+                                    } else {
+                                        fake_ret = -12;
+                                    }
+                                }
+                                if let Some((addr, words, len)) = resp_words {
+                                    let words = &words[..len / 8];
+                                    if !write_child_u64s_unchecked(pid, addr, words) {
+                                        log(&format!(
+                                            "6-Z338: response write-back to {:#x} FAILED (pid {}) — the caller may read stale bytes",
+                                            addr, pid
+                                        ));
+                                    }
+                                }
+                                set_syscall_num(&mut regs, &abi, abi.getpid);
+                                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                    pending_sandbox_deny.insert(pid, fake_ret);
+                                    if goldfish_aspace_diag <= 40 {
+                                        log(&format!(
+                                            "6-Z338: ioctl(fd={}, req={:#x}) goldfish_address_space op={:?} pid={} -> faked {} (live={} arena_end={})",
+                                            fd,
+                                            req,
+                                            op,
+                                            pid,
+                                            fake_ret,
+                                            goldfish_aspace_arena.live_count(),
+                                            goldfish_aspace_arena.live_end()
+                                        ));
+                                    }
+                                }
+                            } else if goldfish_aspace_diag <= 40 {
+                                goldfish_aspace_diag = goldfish_aspace_diag.saturating_add(1);
+                                log(&format!(
+                                    "6-Z338: untracked 'G'-family ioctl req={:#x} on the goldfish_address_space stand-in (pid {}, fd {}) — left REAL (expect ENOTTY)",
+                                    req, pid, fd
                                 ));
                             }
                         }
@@ -47036,5 +47414,108 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         // Installing the handlers in the test process must succeed and
         // must not disturb the harness (no fatal signal raised here).
         super::install_fatal_signal_lastgasp();
+    }
+}
+
+#[cfg(test)]
+mod z338_goldfish_aspace_tests {
+    use super::{goldfish_aspace_op, GoldfishAspaceArena, GoldfishAspaceOp, GOLDFISH_ASPACE_MAGIC};
+
+    // _IOWR('G', nr, T) = (3<<30)|(sizeof(T)<<16)|('G'<<8)|nr — the exact
+    // bytes the A11 goldfish-opengl client builds (pinned from
+    // goldfish_address_space_android.impl, fetched from
+    // device/generic/goldfish-opengl@android11-release).
+    const REQ_ALLOCATE: u64 = (3 << 30) | (24 << 16) | (0x47 << 8) | 10;
+    const REQ_DEALLOCATE: u64 = (3 << 30) | (8 << 16) | (0x47 << 8) | 11;
+    const REQ_PING: u64 = (3 << 30) | (40 << 16) | (0x47 << 8) | 12;
+    const REQ_CLAIM_SHARED: u64 = (3 << 30) | (16 << 16) | (0x47 << 8) | 13;
+    const REQ_UNCLAIM_SHARED: u64 = (3 << 30) | (8 << 16) | (0x47 << 8) | 14;
+
+    #[test]
+    fn z338_op_decode_pins_the_iowr_bytes() {
+        assert_eq!(
+            goldfish_aspace_op(REQ_ALLOCATE),
+            Some(GoldfishAspaceOp::Allocate)
+        );
+        assert_eq!(
+            goldfish_aspace_op(REQ_DEALLOCATE),
+            Some(GoldfishAspaceOp::Deallocate)
+        );
+        assert_eq!(goldfish_aspace_op(REQ_PING), Some(GoldfishAspaceOp::Ping));
+        assert_eq!(
+            goldfish_aspace_op(REQ_CLAIM_SHARED),
+            Some(GoldfishAspaceOp::ClaimShared)
+        );
+        assert_eq!(
+            goldfish_aspace_op(REQ_UNCLAIM_SHARED),
+            Some(GoldfishAspaceOp::UnclaimShared)
+        );
+        // The magic byte is 'G'.
+        assert_eq!((REQ_PING >> 8) & 0xff, GOLDFISH_ASPACE_MAGIC);
+    }
+
+    #[test]
+    fn z338_op_decode_rejects_non_contract_requests() {
+        // The ashmem family ('a'... 0x77 type byte, _IOW) must never match.
+        assert_eq!(goldfish_aspace_op(0x4008_7704), None);
+        // Wrong direction (_IOC_READ) with the right type/nr.
+        assert_eq!(
+            goldfish_aspace_op((1 << 30) | (40 << 16) | (0x47 << 8) | 12),
+            None
+        );
+        // Right type + nr, wrong struct size (a client built on a
+        // different header revision must fall through to the REAL ioctl
+        // and name itself in the diag, not be silently translated).
+        assert_eq!(
+            goldfish_aspace_op((3 << 30) | (32 << 16) | (0x47 << 8) | 12),
+            None
+        );
+        // Untracked 'G' op.
+        assert_eq!(
+            goldfish_aspace_op((3 << 30) | (8 << 16) | (0x47 << 8) | 99),
+            None
+        );
+    }
+
+    #[test]
+    fn z338_arena_rounds_to_pages_and_never_collides() {
+        let mut a = GoldfishAspaceArena::default();
+        // Small sizes round up to one page.
+        assert_eq!(a.allocate(100), Some((0, 4096)));
+        // The next block starts at the page boundary.
+        assert_eq!(a.allocate(4096), Some((4096, 4096)));
+        // 5000 bytes = 2 pages.
+        assert_eq!(a.allocate(5000), Some((8192, 8192)));
+        assert_eq!(a.live_count(), 3);
+        assert_eq!(a.live_end(), 8192 + 8192);
+        // Zero-size is an honest None.
+        assert_eq!(a.allocate(0), None);
+    }
+
+    #[test]
+    fn z338_arena_reuses_freed_blocks() {
+        let mut a = GoldfishAspaceArena::default();
+        let (off1, _) = a.allocate(8192).unwrap();
+        let (off2, _) = a.allocate(4096).unwrap();
+        assert_eq!((off1, off2), (0, 8192));
+        // Free the first block; the next exact-fit request reuses it.
+        assert_eq!(a.free(off1), Some((0, 8192)));
+        assert_eq!(a.allocate(8192), Some((0, 8192)));
+        // A smaller request splits the hole instead of wasting it.
+        assert_eq!(a.free(off1), Some((0, 8192)));
+        assert_eq!(a.allocate(4096), Some((0, 4096)));
+        assert_eq!(a.allocate(4096), Some((4096, 4096)));
+    }
+
+    #[test]
+    fn z338_arena_free_of_unknown_offset_is_honest() {
+        let mut a = GoldfishAspaceArena::default();
+        let (off, _) = a.allocate(4096).unwrap();
+        // Double free and unknown offsets return None (the tracer logs
+        // them but the ioctl still ACKs — the real driver's deallocate is
+        // idempotent from the client's point of view).
+        assert_eq!(a.free(off), Some((off, 4096)));
+        assert_eq!(a.free(off), None);
+        assert_eq!(a.free(0xdead_0000), None);
     }
 }
