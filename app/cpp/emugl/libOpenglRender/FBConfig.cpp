@@ -203,21 +203,39 @@ int FBConfig::chooseConfig(FrameBuffer *fb, EGLint * attribs, uint32_t * configs
     }
 #endif
 
-    s_egl.eglChooseConfig(dpy, newAttribs, matchedConfigs, nConfigs, &nConfigs);
+    EGLBoolean inner_ok = s_egl.eglChooseConfig(dpy, newAttribs, matchedConfigs, nConfigs, &nConfigs);
+
+    // 6-Z347 (rn296 decode): SF's rcChooseConfig requests ALL returned
+    // 0 matches — even the no-attrib request — so the CONFIG_ID
+    // intersection below never fired. The inner host eglChooseConfig's
+    // own outcome was invisible; instrument it (bounded) and switch the
+    // intersection to EGLConfig IDENTITY: both lists come from the SAME
+    // display (fb->getDisplay()), so pointer equality is exact and the
+    // CONFIG_ID indirection (which depends on per-display id plumbing
+    // that evidently diverges on the redroid host EGL) disappears.
+    static unsigned s_6z347_inner = 0;
+    if (s_6z347_inner < 12) {
+        s_6z347_inner++;
+        EGLint probeId = -1;
+        if (nConfigs > 0) {
+            s_egl.eglGetConfigAttrib(dpy, matchedConfigs[0], EGL_CONFIG_ID, &probeId);
+        }
+        EGLint tblId = (s_numConfigs > 0) ? s_fbConfigs[0]->m_attribValues[4] : -2;
+        RLOG_6Z339("6-Z347 inner eglChooseConfig ok=%d n=%d (attribs=%d); table=%d entries; first matched CONFIG_ID=%d vs table[0] CONFIG_ID=%d",
+                   (int)inner_ok, nConfigs, attribCnt, s_numConfigs, probeId, tblId);
+    }
 
     delete[] newAttribs;
 
     //
-    // From all matchedConfigs we need only config_size FBConfigs, so we intersect both lists compating the CONFIG_ID attribute
+    // From all matchedConfigs we need only config_size FBConfigs — the
+    // intersection is by EGLConfig IDENTITY (same display, exact match).
     //
     uint32_t nVerifiedCfgs = 0;
     for (int matchedIdx=0; matchedIdx<nConfigs; matchedIdx++) {
         if ((configs != NULL) && (configs_size > 0) && (nVerifiedCfgs >= configs_size)) break; //We have enouhgt configs
-        int sCfgId;
-        s_egl.eglGetConfigAttrib(dpy, matchedConfigs[matchedIdx], EGL_CONFIG_ID, &sCfgId);
         for (int fbIdx=0; fbIdx<s_numConfigs; fbIdx++) {
-            int dCfgId = s_fbConfigs[fbIdx]->m_attribValues[4]; //CONFIG_ID
-            if (sCfgId == dCfgId) {
+            if (s_fbConfigs[fbIdx]->getEGLConfig() == matchedConfigs[matchedIdx]) {
                 //This config matches the requested attributes and filtered into fbConfigs, so we're happy with it
                 if (configs && nVerifiedCfgs < configs_size) {
                     configs[nVerifiedCfgs] = fbIdx;
