@@ -476,49 +476,48 @@ static int rcUpdateColorBuffer(uint32_t colorBuffer,
 // whole negotiation + the first SF eras), so the next decode reads the
 // client's ACTUAL op sequence instead of inferring it.
 static unsigned s_6z344_rc_ops = 0;
+static unsigned s_6z344_rc_ops_logged = 0;
+// 6-Z345 (rn294 decode): the 160-op budget was consumed by ~27 gralloc-class
+// client inits (6 ops each) BEFORE surfaceflinger's first era — SF's ops
+// never fit in the trace. 4000 ops + tail sampling (every 25th after the
+// first 200) covers the whole boot within a bounded count.
+inline void rc_op_trace_6z344(const char* name) {
+    s_6z344_rc_ops++;
+    if (s_6z344_rc_ops <= 200 || (s_6z344_rc_ops % 25) == 0) {
+        if (s_6z344_rc_ops_logged < 4000) {
+            s_6z344_rc_ops_logged++;
+            RLOG_6Z339("6-Z344 rc-op #%u %s", s_6z344_rc_ops, name);
+        }
+    }
+}
 
 static EGLint rcQueryEGLString_6z344(EGLenum name, void* buffer, EGLint bufferSize)
 {
-    if (s_6z344_rc_ops < 160) {
-        s_6z344_rc_ops++;
-        RLOG_6Z339("6-Z344 rc-op #%u rcQueryEGLString name=0x%x", s_6z344_rc_ops, (unsigned)name);
-    }
+    rc_op_trace_6z344("rcQueryEGLString");
     return rcQueryEGLString(name, buffer, bufferSize);
 }
 
 static EGLint rcGetConfigs_6z344(uint32_t bufSize, GLuint* buffer)
 {
-    if (s_6z344_rc_ops < 160) {
-        s_6z344_rc_ops++;
-        RLOG_6Z339("6-Z344 rc-op #%u rcGetConfigs bufSize=%u", s_6z344_rc_ops, bufSize);
-    }
+    rc_op_trace_6z344("rcGetConfigs");
     return rcGetConfigs(bufSize, buffer);
 }
 
 static uint32_t rcCreateWindowSurface_6z344(uint32_t config, uint32_t width, uint32_t height)
 {
-    if (s_6z344_rc_ops < 160) {
-        s_6z344_rc_ops++;
-        RLOG_6Z339("6-Z344 rc-op #%u rcCreateWindowSurface config=%u %ux%u", s_6z344_rc_ops, config, width, height);
-    }
+    rc_op_trace_6z344("rcCreateWindowSurface");
     return rcCreateWindowSurface(config, width, height);
 }
 
 static int rcMakeCurrent_6z344(uint32_t context, uint32_t drawSurf, uint32_t readSurf)
 {
-    if (s_6z344_rc_ops < 160) {
-        s_6z344_rc_ops++;
-        RLOG_6Z339("6-Z344 rc-op #%u rcMakeCurrent ctx=%u draw=%u read=%u", s_6z344_rc_ops, context, drawSurf, readSurf);
-    }
+    rc_op_trace_6z344("rcMakeCurrent");
     return rcMakeCurrent(context, drawSurf, readSurf);
 }
 
 static int rcGetEGLVersion_6z344(EGLint* major, EGLint* minor)
 {
-    if (s_6z344_rc_ops < 160) {
-        s_6z344_rc_ops++;
-        RLOG_6Z339("6-Z344 rc-op #%u rcGetEGLVersion", s_6z344_rc_ops);
-    }
+    rc_op_trace_6z344("rcGetEGLVersion");
     return rcGetEGLVersion(major, minor);
 }
 
