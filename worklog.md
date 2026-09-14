@@ -29460,3 +29460,23 @@ Stage Summary / RN288 DECODE TREE:
 3. The SIGPIPE (signal 13) composer death class noted in rn287's kmsg: if it recurs post-6-Z338, instrument the composer's fd-53+ writes; do NOT chase preemptively.
 4. Do NOT chase: nnapi/keystore/ril crash-loop fleets (status-1/signal-6 churn, off the critical path), adbd JDWP noise, HOST logcat, iorapd package_native polling.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 70b (rn288 decoded: the composer is HEALED — surfaceflinger's ES3-request wall named; 6-Z339 landed; rn289 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn288 (34839703863 on f784f02c = 6-Z338) artifacts at /home/z/artifacts-rn288 (the older artifact sets rn279..rn286 were DELETED for disk space — their decodes live in the worklogs). Classifier rung 7; kr64 alive the FULL watch (+2716978ms). **The honest 6-Z337 probe: ZERO LOADER-DEATH lines for the whole run** (no false positive, no death) — the death-attribution instrument is now trustworthy.
+- **6-Z338 PROVEN**: the /dev/goldfish_address_space stand-in created at +1ms; the full goldfish ioctl contract flowed — PING{mode-set} → ALLOCATE → PING → (one client: PING→ALLOCATE(4.6MB!)→PING→PING→Deallocate) — GoldfishMapper:84 crash GONE (0 hits), zero composer service deaths (the crash-loop is dead), the composer now boots and allocates host memory.
+- **NEW WALL = surfaceflinger SIGABRT crash-loop ×265** (+13.4s → +2706.3s, ~10s cadence, every death signal 6). Decisive chain from the artifact + fetched A11 sources (/tmp/a11-gf-egl.cpp, /tmp/a11-glesre.cpp, /tmp/a11-hostconn.cpp, /tmp/a11-efi.h):
+  1. the A11 client's HostConnection::queryAndSetGLESMaxVersion greps GL_EXTENSIONS for the ANDROID_EMU_gles_max_version_* tokens; our host advertised NONE → the kmsg smoking gun "Unrecognized GLES max version string in extensions: " → GLES_MAX_VERSION_2 fallback;
+  2. the host's config table (from the redroid host EGL) ADVERTISED EGL_OPENGL_ES3_BIT;
+  3. A11 GLESRenderEngine::createEglContext picks contextClientVersion=3 (renderableType & ES3_BIT) → the client's own ES3 gate ("no ES 3 support") rejects with EGL_BAD_CONFIG BEFORE the host is asked → SF aborts → init respawns → 265 deaths.
+- LANDED 6-Z339 (fix(gfx), 3d6c1236): the guest must see exactly the GPU the host can serve — (1) rcGetGLString(GL_EXTENSIONS) appends " ANDROID_EMU_gles_max_version_2" (the exact EmulatorFeatureInfo.h token) → the client pins GLES_MAX_VERSION_2; (2) FBConfig masks EGL_OPENGL_ES3_BIT (0x40) out of every advertised EGL_RENDERABLE_TYPE → A11 SF requests an ES2 context (rcCreateContext glVersion=2 → the ES2 path this renderer was built and validated for); (3) bounded 6-Z339 rcCreateContext instruments (config/share/glVersion/host outcome). A11 sources pinned in /tmp (a11-gf-egl.cpp, a11-glesre.cpp, a11-hostconn.cpp/h, a11-efi.h).
+- DISPATCHED on 3d6c1236: rn289 Android Boot Ladder (boot_wait 2700, stall 90, expect_rung 0, HTTP 204) + recovery-corpus pr-tier gate. NOTE: this commit touches the emugl C++ (not the kr64 Rust) — the ladder's own Build-APK stage is the compile gate (no local NDK); the repo's /tmp/6z336stub headers were extended (khrplatform typedefs, EGL/eglext.h, GLES/gl.h+gl2.h stubs) for partial host syntax passes.
+
+Stage Summary / RN289 DECODE TREE:
+1. PRIMARY: expect "6-Z339 rcCreateContext config=… share=… glVersion=…" lines — glVersion MUST be 2 for SF's context; ZERO "eglCreateContext(...): error 0x3005" in the guest kmsg; SF's "SurfaceFlinger requires OpenGL ES 2.0 minimum" LOG_ALWAYS_FATAL must NOT appear. If SF gets past GL init: composer@2.3 + surfaceflinger REGISTER → rung 8 (SYSTEMUI) reachable for the first time.
+2. KNOWN NEXT-LEG RISKS (do not be surprised): (a) the redroid host ES2 context's GL_VERSION string may report 3.x → SF's parseGlesVersion → GLES_VERSION_3_0 branch → SF runs ES3-style calls against the ES2 GL2 decoder (opcode-table gaps would name themselves as GL desyncs); (b) "Blurs require OpenGL ES 3.0" LOG_ALWAYS_FATAL if this guest build enables background blur (the fix class = the guest-prop mask, like ro.opengles.version); (c) ES3 entry-point calls from other clients (gralloc?).
+3. Do NOT chase: nnapi/keystore/ril fleets, adbd JDWP noise, HOST logcat, iorapd polling.
+- Authentication is provided through the private agent environment.
