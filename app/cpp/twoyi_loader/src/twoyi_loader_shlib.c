@@ -663,6 +663,19 @@ static void bp_alloc_free(uintptr_t ptr) {
     // failed before Parcel teardown (transport-level).
     pthread_mutex_lock(&g_sm_pending_lock);
     if (g_sm_pending_stash != 0 && ptr == (uintptr_t)g_sm_pending_stash) {
+        // 6-Z331: the CONSUMED verdict rides the guest klog — the fd-2
+        // capture is dead for the forked system_server (Zygote's
+        // DetachDescriptors), and this verdict IS the client-side parse
+        // answer the rn281/rn282 decode needs: consumed = the reply Parcel
+        // was populated + torn down (the null arises INSIDE the AIDL
+        // marshalling); never-consumed = the transact failed before
+        // Parcel teardown.
+        char kmsg[128];
+        snprintf(kmsg, sizeof(kmsg),
+            "<6>[twoyi_loader] *** SM-REPLY-CONSUMED (client freed the reply "
+            "parcel; %u stash bytes) (pid=%d)\n",
+            (unsigned)g_sm_pending_stash_len, g_real_pid);
+        bp_klog_write(kmsg);
         if (g_diag_sm_consumed > 0) {
             g_diag_sm_consumed--;
             char msg[128];
@@ -1379,7 +1392,11 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                         if (is_sm && olen >= 8 && g_z330_tr_klog_budget > 0) {
                             uint64_t fb0 = 0;
                             memcpy(&fb0, back + 4 + 8, 8);
-                            if (fb0 != 0) {
+                            /* 6-Z331: target the AIDL LOCAL-hit shape — the
+                             * power-class reply is dlen=32 olen=8 with a
+                             * non-zero flat binder; the HIDL 28B hits fired
+                             * first in rn282 and ate the budget. */
+                            if (fb0 != 0 && dlen == 32) {
                                 g_z330_tr_klog_budget--;
                                 bp_klog_write(msg);
                             }
