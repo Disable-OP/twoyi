@@ -29596,3 +29596,21 @@ Stage Summary / RN295 DECODE TREE:
    - rcMakeCurrent fails ⇒ the surface/colorbuffer path (rcCreateWindowSurface config id, pbuffer binding).
 3. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 77 (rn295 fast decoded: THE SF WALL NAMED — the no-config-context fast path; 6-Z346 landed; rn296 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn295 (34872039618 on c437e7a8 = 6-Z345) artifacts at /home/z/artifacts-rn295 (rn293 deleted for disk). Verdict rung 7; the 4000-op trace held.
+- THE FULL OP CENSUS: 34 × (rcGetEGLVersion + rcGetConfigs + 4×rcQueryEGLString) — the gralloc-class fleet ONLY. ZERO rcChooseConfig, rcCreateContext, rcCreateWindowSurface, rcMakeCurrent ops FROM ANYONE in the whole run. 84 renderer accepts; "EGLContext creation failed" ×156; "RenderEngine GLES Backend" ×79.
+- **THE WALL NAMED** (the fetched A11 GLESRenderEngine::create + GLExtensions.cpp, /tmp/a11-glesre.cpp): when the EGL_EXTENSIONS string contains **EGL_KHR_no_config_context OR EGL_ANDROIDX_no_config_context**, SF takes the no-config fast path — `EGLConfig config = EGL_NO_CONFIG;` with chooseEglConfig SKIPPED — and the goldfish client's eglCreateContext rejects config 0 in VALIDATE_CONFIG (getIndexOfConfig(0) = 0xFFFFFFFF > m_numConfigs → EGL_BAD_CONFIG) BEFORE any host round-trip. The redroid host EGL advertises the token; the REAL emulator's host never does. That is why every SF era died since the first GL run while the config table, the mask, and the max-version token were all provably good — SF never even LOOKED at them.
+- LANDED 6-Z346 (fix(gfx), 06e7a1f9): rcQueryEGLString(EGL_EXTENSIONS) now strips BOTH no-config-context tokens from the reply (bounded strip instrument) — SF falls back to chooseEglConfig → rcChooseConfig (the 6-Z339-masked table) → rcCreateContext (6-Z340 ES2) → the ES2 path this renderer was built for.
+- DISPATCHED: rn296 on 06e7a1f9 with the FAST profile (HTTP 204).
+
+Stage Summary / RN296 DECODE TREE:
+1. PRIMARY: the "6-Z346 stripped ... (strip #N)" line proves the token reached the stripper; then the 6-Z344 trace must show SF's REAL sequence: rcChooseConfig (6-Z343 line: the RENDERABLE_TYPE request + matches ≥1) → rcCreateContext (6-Z339: config=<index> → handle≠0) → rcCreateWindowSurface → rcCreateColorBuffer → rcOpenColorBuffer → rcMakeCurrent → the gl2 stream.
+2. If a context + surface + MakeCurrent all succeed: SF initializes GL ("OpenGL ES informations:" ALOGI block with vendor/renderer/version) → composer@2.3 + surfaceflinger REGISTER → **rung 8 (SYSTEMUI) for the FIRST TIME**.
+3. NEXT-LEG RISKS (in order): glGetString(GL_VERSION) reporting 3.x on an ES2 context (SF's parseGlesVersion → ES3 branch vs the ES2 GL2 decoder); the dummy pbuffer surface (createDummyEglPbufferSurface) path; gralloc buffer allocation via the address-space + renderer pipes; the composer's own GL needs.
+4. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
+- Authentication is provided through the private agent environment.
