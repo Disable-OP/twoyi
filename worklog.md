@@ -29267,3 +29267,27 @@ Stage Summary / RN280+ DECODE TREE:
 4. Recovery gate on c73e8abf: 4/4 GREEN (the 6-Z329b shlib fix preserved the corpus).
 5. Do NOT chase: the nnapi sample-driver crash-loop fleet (known VINTF class), the tombstoned intercept failure, HOST logcat.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 63 (rn280/281 decoded: the NPE persists via a NULL path that is NOT the zeroing; 6-Z330 pair-dedupe + klog SM-TR landed; rn282 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn280 (34800199305): CANCELLED at the 30-min job cap — the dispatch raced the push (the ref cache served the parent c73e8abf), so the 2700s watch rode the old cap. No artifacts.
+- rn281 (34802255468 on f542236b, the FULL 55-min cap + the 2700s watch): 5 eras, **4 FATAL PowerManager NPEs** — the wall is BACK after rn279's clean-looking run. THE CRITICAL NEGATIVE: **ALL 9618 "Null binder written with stability vintf stability" ALOGEs are AUDIOSSERVER's — system_server NEVER logged one** — the power-class LOCAL get replies produced a client null WITHOUT the zeroed-flat signature. (rn279's "0 FATALs" was just a SLOWER boot that never reached initPowerManagement within the watch — not a fix.)
+- The per-era power flow is textbook on the proxy side: addService(power) → handle, getService(power) → LOCAL binder hit (the serve-local probe: mStrong=1 = the mirror pin, mBase=O+0x38, valid vptr), ret=0 read_size=72 trailer=60B — every era. The client null therefore comes from (a) the reply blob patch never running in the forked system_server's loader (dptr=0 → the client's Parcel reads fail as BAD_TYPE — no ALOGE), or (b) a zeroing hidden by the diag budget flood (the audio pair fired 8× per process and ate every budget).
+- The audioserver-class zeroings (8× the SAME (W,O) pair, Δ=0x648, [R+8]=0 with the honest peek) continue — the re-get fleet re-serving a stale pair; a real but NON-blocking class.
+- LANDED 6-Z330 (4e82b7c9, instruments):
+  1. The zeroing klog verdict dedupes PER (W,O) PAIR (16/process) — the audio pair logs once, the power-class verdicts surface.
+  2. The SM-TR dump (the FINAL patched tr + the backing re-read — the artifact-level "patched vs not" answer) rides the guest klog for HIT replies (the flat's binder word non-zero), own 12/process budget.
+  3. Both re-arm per fork-child.
+- DISPATCHED on 4e82b7c9: rn282 ladder (boot_wait 2700, stall 90, expect_rung 0, the 55-min cap). In flight at worklog-write.
+
+Stage Summary / RN282 DECODE TREE:
+1. PRIMARY: the klog "SM-TR flags=... dptr=... optr=... stash[d0]=..." lines for the power-class HIT replies (the first 12 HITs per era):
+   - dptr=0x0 → THE BLOB PATCH NEVER RAN for the forked system_server's loader — the response-processing path is bypassed (the conn version, the pairing, or the fork-child's intercept state) — the fix is in the loader's read path.
+   - dptr=<addr> + the stash bytes intact → the patch ran; the null arises INSIDE the client parse (then the 6-Z328 verdict lines name which leg — with the pair-dedupe they will now surface for power).
+2. The power-class zeroing verdicts (if any) with the pair-dedupe.
+3. The recovery-corpus gate for this commit + the 55-min cap unchanged.
+4. Do NOT chase: the audio re-get stale-pair fleet (real, non-blocking), the nnapi loop, the tombstoned intercept, HOST logcat.
+- Authentication is provided through the private agent environment.
