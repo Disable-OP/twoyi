@@ -156,108 +156,106 @@ void FBConfig::packConfigsInfo(GLuint *buffer)
 
 int FBConfig::chooseConfig(FrameBuffer *fb, EGLint * attribs, uint32_t * configs, uint32_t configs_size)
 {
-    EGLDisplay dpy = fb->getDisplay();
-    int ret = 0;
+    // 6-Z348 (rn298 decode): the previous implementation delegated the
+    // match to the HOST's eglChooseConfig (with a forced EGL_SURFACE_TYPE
+    // = EGL_PBUFFER_BIT) and intersected by CONFIG_ID. On the redroid
+    // host EGL the inner chooser returns ok=1 with ZERO matches for every
+    // request — including the no-attrib one — while the SAME display
+    // enumerates 40 configs; the host chooser is simply not trustworthy
+    // here. We OWN the full config table (40 entries × 32 attribs, the
+    // same data rcGetConfigs serves to the client), so match the client's
+    // attribs against it directly with the EGL selection semantics:
+    //   mask attribs (RENDERABLE_TYPE / SURFACE_TYPE / CONFORMANT):
+    //       (cfg & req) == req;
+    //   size attribs (RED/GREEN/BLUE/ALPHA/DEPTH/STENCIL/BUFFER_SIZE/
+    //                 SAMPLES/SAMPLE_BUFFERS/LUMINANCE/ALPHA_MASK):
+    //       cfg >= req;
+    //   everything else: exact match. An absent attrib imposes no
+    //   constraint (the pragmatic subset the A11 guests actually send).
+    // The 6-Z347 inner diagnostic stays for one more run as evidence.
+    (void)fb;
 
-    if (dpy == EGL_NO_DISPLAY) {
-        fprintf(stderr,"Could not get EGL Display\n");
-        return ret;
-    }
-    //
-    // Query the num of configs in the EGL backend
-    //
-    EGLint nConfigs;
-    if (!s_egl.eglGetConfigs(dpy, NULL, 0, &nConfigs)) {
-        fprintf(stderr, "Could not get number of available configs\n");
-        return ret;
-    }
-    //
-    // Query the max matching configs in the backend
-    //
-    EGLConfig *matchedConfigs = new EGLConfig[nConfigs];
-
-    //
-    //Until we have EGLImage implementation, we force pbuf configs
-    //
-    bool needToAddPbufAttr = true;
-    int attribCnt = 0;
-    EGLint * attrib_p = attribs;
-    if (attribs) {
-        while (attrib_p[0] != EGL_NONE) {
-            if (attrib_p[0] == EGL_SURFACE_TYPE) {
-                attrib_p[1] = EGL_PBUFFER_BIT; //replace whatever was there before
-                needToAddPbufAttr = false;
+    static unsigned s_6z348_tbl = 0;
+    if (s_6z348_tbl < 12) {
+        s_6z348_tbl++;
+        int req_renderable = -1;
+        if (attribs) {
+            for (EGLint *ap = attribs; ap[0] != EGL_NONE; ap += 2) {
+                if (ap[0] == EGL_RENDERABLE_TYPE) { req_renderable = ap[1]; break; }
             }
-            attrib_p += 2;
-            attribCnt += 2;
         }
-    }
-    EGLint * newAttribs = new EGLint[attribCnt + 1 + ((needToAddPbufAttr) ? 2 : 0)];
-    attrib_p = newAttribs;
-    if (needToAddPbufAttr) {
-        *(attrib_p++) = EGL_SURFACE_TYPE;
-        *(attrib_p++) = EGL_PBUFFER_BIT;
-    }
-    memcpy(attrib_p, attribs, attribCnt*sizeof(EGLint));
-    attrib_p += attribCnt;
-    *attrib_p = EGL_NONE;
-
-#if 0
-    if (newAttribs) {
-        EGLint * attrib_p = newAttribs;
-        while (attrib_p[0] != EGL_NONE) {
-            DBG("attr: 0x%x %d, ", attrib_p[0], attrib_p[1]);
-            attrib_p += 2;
-        }
-    }
-#endif
-
-    EGLBoolean inner_ok = s_egl.eglChooseConfig(dpy, newAttribs, matchedConfigs, nConfigs, &nConfigs);
-
-    // 6-Z347 (rn296 decode): SF's rcChooseConfig requests ALL returned
-    // 0 matches — even the no-attrib request — so the CONFIG_ID
-    // intersection below never fired. The inner host eglChooseConfig's
-    // own outcome was invisible; instrument it (bounded) and switch the
-    // intersection to EGLConfig IDENTITY: both lists come from the SAME
-    // display (fb->getDisplay()), so pointer equality is exact and the
-    // CONFIG_ID indirection (which depends on per-display id plumbing
-    // that evidently diverges on the redroid host EGL) disappears.
-    static unsigned s_6z347_inner = 0;
-    if (s_6z347_inner < 12) {
-        s_6z347_inner++;
-        EGLint probeId = -1;
-        if (nConfigs > 0) {
-            s_egl.eglGetConfigAttrib(dpy, matchedConfigs[0], EGL_CONFIG_ID, &probeId);
-        }
-        EGLint tblId = (s_numConfigs > 0) ? s_fbConfigs[0]->m_attribValues[4] : -2;
-        RLOG_6Z339("6-Z347 inner eglChooseConfig ok=%d n=%d (attribs=%d); table=%d entries; first matched CONFIG_ID=%d vs table[0] CONFIG_ID=%d",
-                   (int)inner_ok, nConfigs, attribCnt, s_numConfigs, probeId, tblId);
+        RLOG_6Z339("6-Z348 table-based chooseConfig: %d entries, request RENDERABLE_TYPE=0x%x",
+                   s_numConfigs, (unsigned)req_renderable);
     }
 
-    delete[] newAttribs;
-
-    //
-    // From all matchedConfigs we need only config_size FBConfigs — the
-    // intersection is by EGLConfig IDENTITY (same display, exact match).
-    //
     uint32_t nVerifiedCfgs = 0;
-    for (int matchedIdx=0; matchedIdx<nConfigs; matchedIdx++) {
-        if ((configs != NULL) && (configs_size > 0) && (nVerifiedCfgs >= configs_size)) break; //We have enouhgt configs
-        for (int fbIdx=0; fbIdx<s_numConfigs; fbIdx++) {
-            if (s_fbConfigs[fbIdx]->getEGLConfig() == matchedConfigs[matchedIdx]) {
-                //This config matches the requested attributes and filtered into fbConfigs, so we're happy with it
-                if (configs && nVerifiedCfgs < configs_size) {
-                    configs[nVerifiedCfgs] = fbIdx;
-                }
-                nVerifiedCfgs++;
-                break;
+    if (!attribs || s_numConfigs <= 0) {
+        // No constraints: the whole table in order (config 0 first).
+        for (int fbIdx = 0; fbIdx < s_numConfigs; fbIdx++) {
+            if (configs && nVerifiedCfgs < configs_size) {
+                configs[nVerifiedCfgs] = (uint32_t)fbIdx;
             }
+            nVerifiedCfgs++;
+        }
+        return (int)nVerifiedCfgs;
+    }
+
+    for (int fbIdx = 0; fbIdx < s_numConfigs; fbIdx++) {
+        GLint *cfg = s_fbConfigs[fbIdx]->m_attribValues;
+        bool ok = true;
+        for (EGLint *ap = attribs; ok && ap[0] != EGL_NONE; ap += 2) {
+            const EGLint req = ap[1];
+            switch (ap[0]) {
+            case EGL_RENDERABLE_TYPE:
+            case EGL_SURFACE_TYPE:
+            case EGL_CONFORMANT:
+                // mask semantics, resolved explicitly per attrib:
+                if (ap[0] == EGL_RENDERABLE_TYPE)      ok = ((cfg[2] & req) == req);
+                else if (ap[0] == EGL_SURFACE_TYPE)    ok = ((cfg[3] & req) == req);
+                else                                   ok = ((cfg[31] & req) == req);
+                break;
+            case EGL_DEPTH_SIZE:      ok = (cfg[0]  >= req); break;
+            case EGL_STENCIL_SIZE:    ok = (cfg[1]  >= req); break;
+            case EGL_BUFFER_SIZE:     ok = (cfg[5]  >= req); break;
+            case EGL_ALPHA_SIZE:      ok = (cfg[6]  >= req); break;
+            case EGL_BLUE_SIZE:       ok = (cfg[7]  >= req); break;
+            case EGL_GREEN_SIZE:      ok = (cfg[8]  >= req); break;
+            case EGL_RED_SIZE:        ok = (cfg[9]  >= req); break;
+            case EGL_CONFIG_CAVEAT:         ok = (cfg[10] == req); break;
+            case EGL_LEVEL:                 ok = (cfg[11] == req); break;
+            case EGL_MAX_PBUFFER_HEIGHT:    ok = (cfg[12] >= req); break;
+            case EGL_MAX_PBUFFER_PIXELS:    ok = (cfg[13] >= req); break;
+            case EGL_MAX_PBUFFER_WIDTH:     ok = (cfg[14] >= req); break;
+            case EGL_NATIVE_RENDERABLE:     ok = (cfg[15] == req); break;
+            case EGL_NATIVE_VISUAL_ID:      ok = (cfg[16] == req); break;
+            case EGL_NATIVE_VISUAL_TYPE:    ok = (cfg[17] == req); break;
+            case EGL_SAMPLES:               ok = (cfg[18] >= req); break;
+            case EGL_SAMPLE_BUFFERS:        ok = (cfg[19] >= req); break;
+            case EGL_TRANSPARENT_TYPE:      ok = (cfg[20] == req); break;
+            case EGL_TRANSPARENT_BLUE_VALUE:  ok = (cfg[21] == req); break;
+            case EGL_TRANSPARENT_GREEN_VALUE: ok = (cfg[22] == req); break;
+            case EGL_TRANSPARENT_RED_VALUE:   ok = (cfg[23] == req); break;
+            case EGL_BIND_TO_TEXTURE_RGB:   ok = (cfg[24] == req); break;
+            case EGL_BIND_TO_TEXTURE_RGBA:  ok = (cfg[25] == req); break;
+            case EGL_MIN_SWAP_INTERVAL:     ok = (cfg[26] <= req); break;
+            case EGL_MAX_SWAP_INTERVAL:     ok = (cfg[27] >= req); break;
+            case EGL_LUMINANCE_SIZE:        ok = (cfg[28] >= req); break;
+            case EGL_ALPHA_MASK_SIZE:       ok = (cfg[29] >= req); break;
+            case EGL_COLOR_BUFFER_TYPE:     ok = (cfg[30] == req); break;
+            case EGL_CONFIG_ID:             ok = (cfg[4]  == req); break;
+            case EGL_MATCH_NATIVE_PIXMAP:   ok = true; break; // not supported
+            default: ok = true; break; // unknown attribs don't filter
+            }
+        }
+        if (ok) {
+            if (configs && nVerifiedCfgs < configs_size) {
+                configs[nVerifiedCfgs] = (uint32_t)fbIdx;
+            }
+            nVerifiedCfgs++;
         }
     }
 
-    delete[] matchedConfigs;
-
-    return nVerifiedCfgs;
+    return (int)nVerifiedCfgs;
 }
 
 FBConfig::FBConfig(EGLDisplay p_eglDpy, EGLConfig p_eglCfg)
