@@ -12519,12 +12519,26 @@ extern "C" fn kr64_fatal_signal_lastgasp(
 /// Called once, right after the 6-Z62 SIGSYS catcher install, before
 /// the waitpid loop arms anything else.
 fn install_fatal_signal_lastgasp() {
-    const FATAL_SIGS: [libc::c_int; 5] = [
+    // 6-Z335: the set extends past the raw fatal class. rn285 re-confirmed
+    // the death class is NOT any of the original five (0 last-gasp fires at
+    // +208.7s) — so the catchable terminate-class signals join the net:
+    // SIGINT/SIGHUP/SIGQUIT/SIGUSR1/SIGUSR2 all default-terminate and none
+    // is used by kr64 itself. SIGTERM is deliberately EXCLUDED (kr64's own
+    // graceful-shutdown handler owns it), and SIGPIPE too (Rust's default
+    // SIGPIPE=ignore semantics are load-bearing: writes must return EPIPE,
+    // not die). SIGKILL stays invisible by kernel design — the app-side
+    // 6-Z335 waitid probe + the oom_kill delta bisect THAT class.
+    const FATAL_SIGS: [libc::c_int; 10] = [
         libc::SIGSEGV,
         libc::SIGBUS,
         libc::SIGILL,
         libc::SIGFPE,
         libc::SIGABRT,
+        libc::SIGINT,
+        libc::SIGHUP,
+        libc::SIGQUIT,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
     ];
     for &s in FATAL_SIGS.iter() {
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -12541,7 +12555,7 @@ fn install_fatal_signal_lastgasp() {
             }
         }
     }
-    crate::trace_log_line("6-Z311: fatal-signal last-gasp installed (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT) — a silent tracer death now names itself on stderr before the deterministic re-raise");
+    crate::trace_log_line("6-Z311: fatal-signal last-gasp installed (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT + 6-Z335 terminate-class SIGINT/SIGHUP/SIGQUIT/SIGUSR1/SIGUSR2; SIGTERM/SIGPIPE/SIGKILL excluded) — a silent tracer death now names itself on stderr before the deterministic re-raise");
 }
 
 /// Task 6-Z62: the mmap2 ENTRY→EXIT handoff record. Created at the mmap2
