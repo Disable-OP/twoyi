@@ -29500,3 +29500,20 @@ Stage Summary / RN290 DECODE TREE:
 3. KNOWN RISKS (from Task 70b): the host ES2 context's GL_VERSION string may report 3.x (mesa/swiftshader) → SF's parseGlesVersion → GLES_VERSION_3_0 branch → ES3-style calls against the ES2 GL2 decoder (would name itself as GL desyncs/opcode gaps); "Blurs require OpenGL ES 3.0" fatal if the guest build enables background blur (fix class = guest-prop mask); gralloc/ES3 callers.
 4. Do NOT chase: nnapi/keystore/ril fleets, adbd JDWP noise, HOST logcat, iorapd polling.
 - Authentication is provided through the private agent environment.
+
+---
+- Authentication is provided through the private agent environment.
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn290 (34855028937 on 40877c7c = 6-Z340) artifacts at /home/z/artifacts-rn290 (rn288/rn289 deleted for disk): verdict rung 5 ZYGOTE again; ZERO 6-Z339 instrument lines; the "Unrecognized GLES max version string in extensions: <empty>" kmsg warning PERSISTED (25×), 24 EGL 0x3005, 22 SF signal-6 deaths (slower cadence — the watch's era reboots), "requires OpenGL ES 2.0" fatal absent.
+- ROOT CAUSE OF THE NON-EFFECT (self-inflicted, honest): the 6-Z340 GL_EXTENSIONS token block sat BEHIND rcGetGLString's `if (!tInfo || !tInfo->currContext.Ptr()) return 0;` early return — dead code for exactly the pre-context query it was built for. The client's HostConnection::init (queryAndSetGLESMaxVersion → queryGLExtensions → rcGetGLString(GL_EXTENSIONS, buf, 1024)) runs BEFORE any context is current, got 0 → empty → GLES_MAX_VERSION_2 fallback → SF's ES3 request (config table pre-6-Z339-mask... the mask WAS live but the client's ES3 gate still fired because the client's max stayed 2 and GLESRenderEngine still saw ES3 renderable? NO — the mask is live: SF's request shape is unchanged from rn288 because the client-side max-version fallback is the SAME; with the mask SF requests ES2 via CLIENT_VERSION — which the client IGNORES — so the client's own ES3 gate never fires... the remaining 0x3005s ride the unmasked paths/other processes; the decisive hole remains the empty extensions reply).
+- LANDED 6-Z341 (fix(gfx), 4e9fe3f3): rcGetGLString's GL_EXTENSIONS branch now OWNS the whole path BEFORE the current-context gate — caches the host string whenever a context IS current, serves the ANDROID_EMU_gles_max_version_2 token standalone until then; + a bounded 12-serve instrument ("6-Z341 rcGetGLString(GL_EXTENSIONS) serve #N ctx=current|PRE-CONTEXT host_ext=cached|<none-yet> reply_len=M") so rn291's decode PROVES the token flow; all other GL strings keep the proxy semantics.
+- DISPATCHED on 4e9fe3f3: rn291 Android Boot Ladder (boot_wait 2700, stall 90, expect_rung 0, HTTP 204) + recovery-corpus pr-tier gate (4/4 OK).
+
+Stage Summary / RN291 DECODE TREE:
+1. PRIMARY: the "6-Z341 rcGetGLString(GL_EXTENSIONS) serve #" lines MUST appear (TWOYI_RENDERER tag) with the first serve ctx=PRE-CONTEXT; the "Unrecognized GLES max version" kmsg warning must DISAPPEAR (the client now reads the token); then the 6-Z339 rcCreateContext lines must FIRE — SF's context finally reaches the host.
+2. If SF gets a context: the ES2 GL_VERSION string → parseGlesVersion → GLES_VERSION_2_0 → SF init proceeds → composer@2.3 + surfaceflinger REGISTER → rung 8 (SYSTEMUI) reachable for the FIRST TIME.
+3. KNOWN RISKS: the host ES2 context's GL_VERSION may report 3.x (→ SF's ES3 code branch vs the ES2 GL2 decoder — would name itself as GL desyncs); "Blurs require OpenGL ES 3.0" fatal if the guest build enables blur (fix class = guest-prop mask); gralloc/ES3 callers; the client's rcMajorVersion=1 rides ES2 per 6-Z340 (informational only).
+4. Do NOT chase: nnapi/keystore/ril fleets, adbd JDWP noise, HOST logcat, iorapd polling.
+- Authentication is provided through the private agent environment.
