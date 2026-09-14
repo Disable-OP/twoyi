@@ -85,15 +85,17 @@ static EGLint rcQueryEGLString(EGLenum name, void* buffer, EGLint bufferSize)
 
 static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
 {
-    // 6-Z341 (rn290 decode): GL_EXTENSIONS MUST be served BEFORE the
-    // current-context gate — the A11 client's HostConnection::init runs
-    // queryAndSetGLESMaxVersion BEFORE any context is current, and the
-    // rn289/rn290 artifacts proved the 6-Z340 block sat BEHIND this
-    // function's early return (dead code: the reply stayed empty, the
-    // client kept its GLES_MAX_VERSION_2 fallback, SF's ES3 request kept
-    // dying at the client's own EGL_BAD_CONFIG gate). The GL_EXTENSIONS
-    // branch now owns the whole path: cache the host string whenever a
-    // context IS current, serve token-only until then.
+    // 6-Z343 (rn292 decode): the client parsed the token (the "Unrecognized
+    // GLES max version" warning is GONE, reply_len=30) — but A11 SF still
+    // died at "RenderEngine EGLContext creation failed" ×35 with ZERO
+    // rcCreateContext calls: SF's ES3 attempt (a real config → the ES2
+    // fallback retry is skipped by design) dies at the client's own
+    // max-version gate whichever variant their build takes. The client's
+    // ES3 request is now ACCEPTED (the 3_0 token) and the host's 6-Z340
+    // rcCreateContext serves an ES2 context regardless of the requested
+    // version — the context's GL_VERSION reports 2.0, SF's
+    // parseGlesVersion picks the ES2 engine path, the masked config table
+    // and the decoder agree. The whole ES-version class dies here.
     if (name == GL_EXTENSIONS) {
         RenderThreadInfo *tInfo = getRenderThreadInfo();
         const bool haveCtx = tInfo && tInfo->currContext.Ptr();
@@ -113,7 +115,7 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
                 s_6z340_hostExt.assign(live);
             }
         }
-        static const char kGlesMaxVersionToken[] = "ANDROID_EMU_gles_max_version_2";
+        static const char kGlesMaxVersionToken[] = "ANDROID_EMU_gles_max_version_3_0";
         if (s_6z340_hostExt.empty()) {
             s_6z339_glStringBuf.assign(kGlesMaxVersionToken);
         } else {
@@ -176,6 +178,12 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
 
 static EGLint rcGetNumConfigs(uint32_t* numAttribs)
 {
+    static unsigned s_6z343_numcfg = 0;
+    if (s_6z343_numcfg < 8) {
+        s_6z343_numcfg++;
+        RLOG_6Z339("6-Z343 rcGetNumConfigs -> %d configs / %d attribs",
+                   FBConfig::getNumConfigs(), FBConfig::getNumAttribs());
+    }
     if (numAttribs) {
         *numAttribs = FBConfig::getNumAttribs();
     }
@@ -194,14 +202,35 @@ static EGLint rcGetConfigs(uint32_t bufSize, GLuint* buffer)
     return nConfigs;
 }
 
+static FrameBuffer *fb6z343();
+
 static EGLint rcChooseConfig(EGLint *attribs, uint32_t attribs_size, uint32_t *configs, uint32_t configs_size)
 {
-    FrameBuffer *fb = FrameBuffer::getFB();
-    if (!fb) {
-        return 0;
+    static unsigned s_6z343_choose = 0;
+    if (s_6z343_choose < 12) {
+        s_6z343_choose++;
+        // surface the RENDERABLE_TYPE request if the client sent one — the
+        // rn292 decode hinges on whether the guest still asks for ES3.
+        EGLint renderable = -1;
+        if (attribs) {
+            for (EGLint *ap = attribs; ap[0] != EGL_NONE; ap += 2) {
+                if (ap[0] == EGL_RENDERABLE_TYPE) { renderable = ap[1]; break; }
+            }
+        }
+        RLOG_6Z339("6-Z343 rcChooseConfig attribs_size=%u renderable=0x%x configs_size=%u",
+                   attribs_size, (unsigned)renderable, configs_size);
     }
+    EGLint rc6z343 = FBConfig::chooseConfig(fb6z343(), attribs, configs, configs_size);
+    if (s_6z343_choose <= 12) {
+        RLOG_6Z339("6-Z343 rcChooseConfig -> %d matches (first=%u)",
+                   rc6z343, rc6z343 > 0 ? configs[0] : 0);
+    }
+    return rc6z343;
+}
 
-    return FBConfig::chooseConfig(fb, attribs, configs, configs_size);
+static FrameBuffer *fb6z343()
+{
+    return FrameBuffer::getFB();
 }
 
 static EGLint rcGetFBParam(EGLint param)
