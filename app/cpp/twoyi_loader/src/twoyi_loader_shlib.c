@@ -474,6 +474,21 @@ static void bp_klog_write(const char *s) {
     syscall(NR_close, fd);
 }
 
+// 6-Z332: the CONSUMED verdict's own klog writer — NO shared budget (the
+// caller bounds it); the rn283 8-byte VS verdicts ate the shared budget
+// and hid the 32-byte SM-reply verdicts.
+static int g_z332_consumed_klog_budget = 16;
+
+static void bp_klog_write_raw(const char *s) {
+    size_t l = 0;
+    while (s[l]) l++;
+    if (l == 0) return;
+    long fd = twoyi_sys_open("/dev/__kmsg__", O_WRONLY | O_APPEND, 0);
+    if (fd < 0) return;
+    syscall(NR_write, fd, s, l);
+    syscall(NR_close, fd);
+}
+
 // 6-Z139: the REAL pid of this process (captured at loader init via a
 // raw syscall BEFORE any hooks install). bionic's abort() does
 // tgkill(getpid(), gettid(), SIGABRT) — with the getpid hook returning
@@ -609,6 +624,8 @@ static void bp_fork_child_diag_rearm(void) {
     // fork-child (the inherited table would hide the child's own pairs).
     g_z330_pair_count = 0;
     g_z330_tr_klog_budget = 12;
+    // 6-Z332: the CONSUMED klog budget re-arms per fork-child.
+    g_z332_consumed_klog_budget = 16;
     // The inherited pending stash points at the PARENT's transaction —
     // a stale match in the child would poison the verdict observer.
     pthread_mutex_lock(&g_sm_pending_lock);
@@ -663,19 +680,24 @@ static void bp_alloc_free(uintptr_t ptr) {
     // failed before Parcel teardown (transport-level).
     pthread_mutex_lock(&g_sm_pending_lock);
     if (g_sm_pending_stash != 0 && ptr == (uintptr_t)g_sm_pending_stash) {
-        // 6-Z331: the CONSUMED verdict rides the guest klog — the fd-2
-        // capture is dead for the forked system_server (Zygote's
+        // 6-Z331/6-Z332: the CONSUMED verdict rides the guest klog — the
+        // fd-2 capture is dead for the forked system_server (Zygote's
         // DetachDescriptors), and this verdict IS the client-side parse
-        // answer the rn281/rn282 decode needs: consumed = the reply Parcel
-        // was populated + torn down (the null arises INSIDE the AIDL
-        // marshalling); never-consumed = the transact failed before
-        // Parcel teardown.
-        char kmsg[128];
-        snprintf(kmsg, sizeof(kmsg),
-            "<6>[twoyi_loader] *** SM-REPLY-CONSUMED (client freed the reply "
-            "parcel; %u stash bytes) (pid=%d)\n",
-            (unsigned)g_sm_pending_stash_len, g_real_pid);
-        bp_klog_write(kmsg);
+        // answer: consumed = the reply Parcel was populated + torn down
+        // (the null arises INSIDE the AIDL marshalling); never-consumed =
+        // the transact failed before Parcel teardown. 6-Z332: the klog
+        // verdict has its OWN budget and SKIPS the <16B (VS-class) stashes
+        // — the rn283 8-byte verdicts consumed the shared budget and hid
+        // the 32-byte SM-reply verdicts the decode needs.
+        if (g_sm_pending_stash_len >= 16 && g_z332_consumed_klog_budget > 0) {
+            g_z332_consumed_klog_budget--;
+            char kmsg[128];
+            snprintf(kmsg, sizeof(kmsg),
+                "<6>[twoyi_loader] *** SM-REPLY-CONSUMED (client freed the reply "
+                "parcel; %u stash bytes) (pid=%d)\n",
+                (unsigned)g_sm_pending_stash_len, g_real_pid);
+            bp_klog_write_raw(kmsg);
+        }
         if (g_diag_sm_consumed > 0) {
             g_diag_sm_consumed--;
             char msg[128];
