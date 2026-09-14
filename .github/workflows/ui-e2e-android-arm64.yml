@@ -185,8 +185,11 @@ jobs:
     # a frozen guest in ~90s), so a raised job cap only ever buys runway for a
     # GENUINELY-PROGRESSING boot (klog growth resets the stall budget). At the
     # 15-min cap, #199 was cut mid-SystemServer.startBootstrapServices (AMS in
-    # flight) while the guest was still actively progressing.
-    timeout-minutes: 30
+    # flight) while the guest was still actively progressing. At the 30-min
+    # cap, rn279 was cut mid-PMS dexopt-churn (61 successful dex2oats, the
+    # package_native waitForService poll alive, zero era deaths) — the
+    # 6-Z329-honest boot is dexopt-BOUND, not stuck; give it 55 minutes.
+    timeout-minutes: 55
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
