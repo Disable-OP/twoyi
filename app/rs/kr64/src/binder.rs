@@ -1839,6 +1839,28 @@ struct ServiceEntry {
     owner: ConnId,
     ptr: u64,
     cookie: u64,
+    /// 6-Z333: the stability annotation i32 the OWNER's own addService
+    /// parcel carried — the value the owner's libbinder stamped right
+    /// after the flat via `finishFlattenBinder` →
+    /// `writeInt32(Stability::get(binder))` (for an A11 system-partition
+    /// client that is `Level::SYSTEM` = 12, because `tryMarkCompilationUnit`
+    /// ran just before the write). The real servicemanager stores that
+    /// stability on its proxy record and ECHOES it in every later
+    /// getService reply (`BnServiceManager` gencode: `writeStrongBinder`
+    /// → `finishFlattenBinder` → the proxy's stored level). Our
+    /// LOCAL-flat hit reply must do the same: the owner's
+    /// `unflattenBinder` decodes its OWN local object (6-Z306ac) and
+    /// `finishUnflattenBinder` → `Stability::set(local, ann)` returns
+    /// BAD_TYPE for every ann != the level the object already carries
+    /// (rn284: "Interface being set with vintf stability but it is
+    /// already marked as system stability." → readStrongBinder → null →
+    /// the initPowerManagement NPE). Cross-process HANDLE replies keep
+    /// the VINTF annotation (fresh proxies accept it, and the VINTF
+    /// level feeds the call-time `requiresVintfDeclaration` gate the
+    /// recovery corpus depends on). `None` = the add parcel did not
+    /// yield a declared ann (synthetic/legacy shapes) → the reply falls
+    /// back to the pre-6-Z333 annotation (no behavior change).
+    ann_add: Option<i32>,
     virtual_kind: Option<VirtualService>,
     /// 6-Z299: the virtual service this name BELONGS to when a guest has
     /// taken it over via addService (native last-wins semantics). While
@@ -2130,6 +2152,7 @@ impl BusState {
                     owner: PROXY_CONN_ID,
                     ptr: 0,
                     cookie: 0,
+                    ann_add: None,
                     virtual_kind: Some(*kind),
                     virtual_fallback: None,
                 },
@@ -2204,12 +2227,23 @@ impl BusState {
                 owner,
                 ptr,
                 cookie,
+                ann_add: None,
                 virtual_kind: None,
                 virtual_fallback: None,
             },
         );
         self.by_handle.insert(h, name.to_string());
         h
+    }
+
+    /// 6-Z333: record the stability annotation the OWNER's addService
+    /// parcel carried (see ServiceEntry::ann_add). Called only when the
+    /// add parcel actually yielded a DECLARED stability repr; every
+    /// later owner-conn LOCAL hit reply echoes it.
+    fn set_service_ann(&mut self, name: &str, ann: i32) {
+        if let Some(entry) = self.services.get_mut(name) {
+            entry.ann_add = Some(ann);
+        }
     }
 
     /// 6-Z276: record a `registerForNotifications` watcher for `name`.
@@ -4663,6 +4697,26 @@ fn flat_at_first_binder_offset(blob: &RequestBlob) -> Option<FlatBinderObject> {
     })
 }
 
+/// 6-Z333: the stability-repr values an A11/A12 libbinder's
+/// `Stability::set` accepts (`isDeclaredStability`): the A11 plain
+/// Levels {VENDOR = 0b0000_11 = 3, SYSTEM = 0b0011_00 = 12,
+/// VINTF = 0b1111_11 = 63} and the android-12+ Category repr (version
+/// byte 1 in the low byte, Level in the high byte — e.g. VINTF =
+/// 0x3F000001). Used to gate the add-ann capture: a value the client
+/// could not have stamped (allowIsolated ∈ {0,1}, dumpPriority ∈ 1..7,
+/// garbage) must not be echoed back — the pre-6-Z333 fallback keeps
+/// the wire unchanged for those shapes.
+fn is_declared_stability_repr(v: i32) -> bool {
+    match v {
+        0b0000_11 | 0b0011_00 | 0b1111_11 => true,
+        v => {
+            let level = ((v >> 24) & 0xff) as u8;
+            let version = (v & 0xff) as u8;
+            version == 1 && matches!(level, 0b0000_11 | 0b0011_00 | 0b1111_11)
+        }
+    }
+}
+
 /// 6-Z306ae-c: the POSITION of the first binder-typed flat among the
 /// offsets-array objects (None when absent/malformed/out of range).
 fn flat_at_first_binder_offset_pos(blob: &RequestBlob) -> Option<usize> {
@@ -4872,9 +4926,9 @@ fn servicemanager_proxy(
             let entry_info = b
                 .services
                 .get(&name)
-                .map(|e| (e.handle, e.owner, e.ptr, e.cookie));
+                .map(|e| (e.handle, e.owner, e.ptr, e.cookie, e.ann_add));
             match entry_info {
-                Some((handle, owner, ptr, cookie)) => {
+                Some((handle, owner, ptr, cookie, ann_add)) => {
                     // 6-Z306ac: SAME-PROCESS LOOKUP = LOCAL BINDER. The
                     // kernel returns BINDER_TYPE_BINDER (cookie = the
                     // owner's BBinder*) when the lookup comes from the
@@ -4947,10 +5001,20 @@ fn servicemanager_proxy(
                         }
                     };
                     writer.write_flat_binder(&obj);
-                    // 6-Z271x: a stability annotation follows the flat;
-                    // 6-Z306ab: the form (plain Level vs A12 Category)
-                    // self-tunes per connection — see the flip block above.
-                    writer.write_i32(ann_hit);
+                    // 6-Z333: the LOCAL hit reply ECHOES the owner's own
+                    // add stability (the real servicemanager semantic —
+                    // the reply ann = the add ann). The owner's
+                    // finishUnflattenBinder → Stability::set accepts ONLY
+                    // the level its own object already carries (rn284:
+                    // "Interface being set with vintf stability but it is
+                    // already marked as system stability." → BAD_TYPE →
+                    // readStrongBinder → null → the initPowerManagement
+                    // NPE). Falls back to the pre-6-Z333 annotation when
+                    // the add parcel yielded no declared ann. Cross-proc
+                    // HANDLE replies below keep ann_hit (fresh proxies
+                    // accept it; the VINTF level feeds the call-time
+                    // requiresVintfDeclaration gate the corpus needs).
+                    writer.write_i32(ann_add.unwrap_or(ann_hit));
                     if is_owner {
                         info!(
                             "[KR64][binder][svc] getService({}) hit → LOCAL binder (owner conn={}, ptr=0x{:x}, cookie=0x{:x})",
@@ -5003,12 +5067,41 @@ fn servicemanager_proxy(
             // 6-Z306ae: the offsets-array flat is the kernel's own
             // object map — prefer it over the sequential cursor guess.
             let flat = flat_at_first_binder_offset(blob).or(flat_seq);
+            // 6-Z333: capture the add's stability annotation — the i32 the
+            // owner's own libbinder wrote IMMEDIATELY after the flat
+            // (finishFlattenBinder: writeObject(flat) + writeInt32(
+            // Stability::get(binder)); for an A11 system-partition client
+            // that is Level::SYSTEM = 12, tryMarkCompilationUnit having
+            // run just before). Stored per service and ECHOED in the
+            // owner-conn LOCAL hit reply — the real servicemanager
+            // semantic (see ServiceEntry::ann_add). Gated on the
+            // declared-repr validator so allowIsolated (0/1),
+            // dumpPriority bytes or garbage are never echoed as a
+            // stability (those shapes keep the pre-6-Z333 wire).
+            let ann_add = req_blob
+                .and_then(flat_at_first_binder_offset_pos)
+                .and_then(|pos| {
+                    let d = &req_blob?.data;
+                    if pos + 28 <= d.len() {
+                        Some(i32::from_le_bytes(d[pos + 24..pos + 28].try_into().ok()?))
+                    } else {
+                        None
+                    }
+                })
+                .filter(|v| is_declared_stability_repr(*v));
             let (ptr, cookie) = match &flat {
                 Some(f) => (f.binder, f.cookie),
                 None => (0, 0),
             };
             let mut b = bus.lock().expect("binder bus poisoned");
             let handle = b.add_guest_service(&name, conn_id, ptr, cookie);
+            if let Some(ann) = ann_add {
+                b.set_service_ann(&name, ann);
+                info!(
+                    "[KR64][binder][svc] 6-Z333: addService({}) stability ann captured = 0x{:08x} (echoed on owner-conn LOCAL hits)",
+                    name, ann
+                );
+            }
             // 6-Z306ad: capture-time snapshot — the object bytes as the
             // owner registered them (baseline for the serve-time probe).
             let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
@@ -8479,6 +8572,121 @@ mod tests {
             "reply offsets[0] = flat object's data offset"
         );
 
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    /// 6-Z333: the LOCAL hit reply ECHOES the owner's own addService
+    /// stability annotation. The real servicemanager stores the add's
+    /// stability on its proxy record and returns it in every later
+    /// getService reply; the owner's `finishUnflattenBinder` →
+    /// `Stability::set(local, ann)` accepts ONLY the level its own
+    /// object already carries (`tryMarkCompilationUnit` marked it at
+    /// addService — for an A11 system client that is Level::SYSTEM=12).
+    /// rn284 proved the pre-fix wire (ann=63 VINTF on every reply)
+    /// dies exactly there: "Interface being set with vintf stability
+    /// but it is already marked as system stability." → BAD_TYPE →
+    /// readStrongBinder → null → the initPowerManagement NPE.
+    ///
+    /// Byte-verified end-to-end over the v2 wire with an A11-shaped add
+    /// parcel `[name][flat][ann=12][allowIsolated=0][dumpPriority=1]`:
+    /// 1. owner-conn GET → LOCAL flat + ann = 12 (the echo);
+    /// 2. second-conn GET → HANDLE flat + ann = 12 (the real-SM echo —
+    ///    a fresh proxy accepts SYSTEM; VIRTUAL/HIDL services keep the
+    ///    VINTF annotation via the fallback since their adds carry no
+    ///    declared ann — covered by z271x and the synthetic-shape test
+    ///    above, which still pins the fallback = 63).
+    #[test]
+    fn z333_sm_reply_echoes_owner_add_stability() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        // ---- owner conn: A11-shaped ADD_SERVICE "pwr_svc" ----
+        let mut args = ParcelWriter::new();
+        args.write_string16("pwr_svc");
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0xdead,
+            cookie: 0xbeef,
+        });
+        args.write_i32(12); // 6-Z333: the A11 finishFlattenBinder ann = Level::SYSTEM
+        args.write_i32(0); // allowIsolated
+        args.write_i32(1); // dumpPriority
+        let (req_data, req_off) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &req_data, &req_off, 4096);
+        let (ret, _resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0, "ADD_SERVICE WRITE_READ should succeed");
+
+        // ---- owner conn: GET → LOCAL flat + the ECHOED add ann ----
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("pwr_svc");
+        let (req_data2, req_off2) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload2 = make_v2_write_read_payload(&bc2, &req_data2, &req_off2, 4096);
+        let (ret2, resp2) = exchange(&mut stream, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0, "GET_SERVICE WRITE_READ should succeed");
+        let read_size2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
+        let off2 = 4 + read_size2 + 8;
+        let dlen2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        assert_eq!(dlen2, 4 + 24 + 4, "hit blob = EX_NONE + flat + ann i32");
+        let blob2 = &resp2[off2 + 12..off2 + 12 + dlen2];
+        let flat_type2 = u32::from_ne_bytes(blob2[4..8].try_into().unwrap());
+        assert_eq!(
+            flat_type2, BINDER_TYPE_BINDER,
+            "owner-conn GET hit → LOCAL BINDER_TYPE_BINDER"
+        );
+        let local_ptr = u64::from_ne_bytes(blob2[12..20].try_into().unwrap());
+        let local_cookie = u64::from_ne_bytes(blob2[20..28].try_into().unwrap());
+        assert_eq!(local_ptr, 0xdead, "local flat.binder = the registered ptr");
+        assert_eq!(
+            local_cookie, 0xbeef,
+            "local flat.cookie = the registered cookie"
+        );
+        let stability2 = i32::from_ne_bytes(blob2[28..32].try_into().unwrap());
+        assert_eq!(
+            stability2, 12,
+            "6-Z333: LOCAL hit ann = the owner's own add ann (Level::SYSTEM=12) — the client's Stability::set accepts exactly this"
+        );
+
+        // ---- second conn: GET → HANDLE flat + the echoed ann ----
+        // The real servicemanager echoes the stored add stability on
+        // cross-process replies too (a fresh proxy accepts SYSTEM).
+        let mut stream2 = UnixStream::connect(&path).expect("connect-2");
+        let payload3 = make_v2_write_read_payload(&bc2, &req_data2, &req_off2, 4096);
+        let (ret3, resp3) = exchange(&mut stream2, BINDER_WRITE_READ, &payload3);
+        assert_eq!(ret3, 0, "cross-conn GET_SERVICE should succeed");
+        let read_size3 = u32::from_ne_bytes(resp3[0..4].try_into().unwrap()) as usize;
+        let off3 = 4 + read_size3 + 8;
+        let dlen3 = u32::from_ne_bytes(resp3[off3..off3 + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            dlen3,
+            4 + 24 + 4,
+            "cross hit blob = EX_NONE + flat + ann i32"
+        );
+        let blob3 = &resp3[off3 + 12..off3 + 12 + dlen3];
+        let flat_type3 = u32::from_ne_bytes(blob3[4..8].try_into().unwrap());
+        assert_eq!(
+            flat_type3, BINDER_TYPE_HANDLE,
+            "cross-conn GET hit → BINDER_TYPE_HANDLE"
+        );
+        let stability3 = i32::from_ne_bytes(blob3[28..32].try_into().unwrap());
+        assert_eq!(
+            stability3, 12,
+            "6-Z333: cross-conn hit ann = the echoed add ann (the real-SM semantic)"
+        );
+
+        drop(stream2);
         drop(stream);
         drop(handle);
         let _ = fs::remove_dir_all(&rootfs);
