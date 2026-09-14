@@ -14,18 +14,32 @@ This script probes, per manifest device+date, recovery.img →
 vendor_boot.img → boot.img and rewrites the manifest URL to the first
 artifact that exists (HTTP 200/302). Manifest is data; no workflow edits.
 
-Usage: fix_lineage_urls.py corpus/manifest.yaml [--probe-limit N]
+6-Z334 (2026-09-14): the 2026-09-13 nightly rotation DELETED whole dated
+builds (92/296 manifest URLs → 404; the lineage-22.2-sailfish pr-gate child
+died on `curl: (22) 404` in run 34820533069). New fallback: when EVERY
+artifact of (device, date) is gone, query the official builds API
+(https://download.lineageos.org/api/v2/devices/{dev}/builds) and redate the
+entry to the newest build that still ships one of the artifacts, taking the
+authoritative sha256 from the API. Pinned md5/sha256 that no longer match
+the rewritten artifact are cleared ("empty = computed at CI") so the
+download gate stays honest instead of failing pre-boot.
+
+Usage: fix_lineage_urls.py corpus/manifest.yaml
 """
 import concurrent.futures
+import json
 import re
 import sys
 import urllib.request
 
 MIRROR = "https://mirrorbits.lineageos.org/full/{dev}/{date}/{art}"
+BUILDS_API = "https://download.lineageos.org/api/v2/devices/{dev}/builds"
 ORDER = ["recovery", "vendor_boot", "boot"]
 URL_RE = re.compile(
-    r"https://mirrorbits\.lineageos\.org/full/([a-z0-9_]+)/([0-9]{8})/(recovery|vendor_boot|boot)"
+    r"^\s*url:\s*https://mirrorbits\.lineageos\.org"
+    r"/full/([a-z0-9_]+)/([0-9]{8})/(recovery|vendor_boot|boot)\.img\s*$"
 )
+NAME_RE = re.compile(r"^  - name:")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -55,48 +69,134 @@ def exists(url: str) -> bool:
         return False
 
 
+def probe_artifact(dev: str, date: str, art: str) -> bool:
+    return exists(MIRROR.format(dev=dev, date=date, art=art) + ".img")
+
+
+_api_cache: dict[str, list | None] = {}
+
+
+def builds_for(dev: str) -> list | None:
+    """Official builds list, newest first. None = API unreachable/empty."""
+    if dev in _api_cache:
+        return _api_cache[dev]
+    try:
+        with urllib.request.urlopen(BUILDS_API.format(dev=dev), timeout=30) as r:
+            data = json.load(r)
+        _api_cache[dev] = data if isinstance(data, list) and data else None
+    except Exception:
+        _api_cache[dev] = None
+    return _api_cache[dev]
+
+
+def resolve(dev: str, date: str, art: str) -> dict:
+    """Decide what to do with one (dev, date, art) URL.
+
+    Returns {"action": "keep" | "swap" | "redate" | "dead", ...}:
+      keep   — current URL is alive.
+      swap   — another artifact of the SAME date is alive (art=…).
+      redate — whole dated build deleted; newest build with a usable
+               artifact found via the builds API (date/art/sha256 set).
+      dead   — device has no usable artifact anywhere (warn, leave as-is).
+    """
+    if probe_artifact(dev, date, art):
+        return {"action": "keep"}
+    # Same-date artifact swap (6-Z272b behavior, unchanged).
+    for alt in ORDER:
+        if alt != art and probe_artifact(dev, date, alt):
+            return {"action": "swap", "art": alt}
+    # 6-Z334: whole dated build deleted by the nightly rotation — redate
+    # from the builds API (newest build first, artifact ORDER within it).
+    for build in builds_for(dev) or []:
+        files = {f.get("filename", ""): f for f in build.get("files", [])}
+        for a in ORDER:
+            f = files.get(a + ".img")
+            if f:
+                return {
+                    "action": "redate",
+                    "art": a,
+                    "date": build.get("date", "").replace("-", ""),
+                    "sha256": f.get("sha256", ""),
+                }
+    return {"action": "dead"}
+
+
 def main() -> int:
     path = sys.argv[1] if len(sys.argv) > 1 else "corpus/manifest.yaml"
-    src = open(path).read()
+    lines = open(path).readlines()
 
-    urls = sorted(set(URL_RE.findall(src)))
+    # ── collect entries: (url_idx, sha256_idx, md5_idx, match) ──────────
+    entries: list[tuple[int, int | None, int | None, re.Match]] = []
+    cur: tuple[int, int | None, int | None, re.Match] | None = None
+    for i, line in enumerate(lines):
+        if NAME_RE.match(line):
+            cur = None  # a new entry starts; url/sha/md5 lines re-bind below
+        m = URL_RE.match(line.rstrip("\n"))
+        if m:
+            cur = (i, None, None, m)
+            entries.append(cur)
+        elif cur is not None:
+            if re.match(r"^\s*sha256:", line) and cur[1] is None:
+                cur = (cur[0], i, cur[2], cur[3])
+                entries[-1] = cur
+            elif re.match(r"^\s*md5:", line) and cur[2] is None:
+                cur = (cur[0], cur[1], i, cur[3])
+                entries[-1] = cur
+
+    urls = sorted(set((m.group(1), m.group(2), m.group(3)) for *_, m in entries))
     print(f"{len(urls)} LineageOS mirror URLs in manifest")
 
-    # 6-Z272b: probe in parallel (284 devices x sequential HEADs exceeded the
-    # interactive time budget; 32 workers finish in ~2 min).
-    probe_targets = [(dev, date, art) for dev, date, _ in urls for art in ORDER]
+    # Parallel probe+resolve (6-Z272b: 32 workers; probe GETs return
+    # immediately; the API fallback fires at most once per dead device).
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
-        probe_ok = set(
-            pool.map(
-                lambda t: (t[0], t[1], t[2])
-                # 6-Z272l: the probe URL must carry the .img extension —
-                # mirrorbits 404s extension-less paths (the original probe
-                # silently answered False for EVERY artifact because of the
-                # missing suffix, so no URL was ever rewritten).
-                if exists(MIRROR.format(dev=t[0], date=t[1], art=t[2]) + ".img")
-                else (t[0], t[1], None),
-                probe_targets,
-            )
-        )
-    available: dict[tuple[str, str], str] = {}
-    for dev, date, art in probe_ok:
-        if art is not None:
-            available.setdefault((dev, date), art)  # ORDER order preserved
+        results = dict(zip(urls, pool.map(lambda t: resolve(*t), urls)))
 
-    swapped = 0
-    for dev, date, current in urls:
-        chosen = available.get((dev, date), current)
-        if chosen != current:
-            old = f"/full/{dev}/{date}/{current}.img"
-            new = f"/full/{dev}/{date}/{chosen}.img"
-            src = src.replace(old, new)
+    swapped = redated = dead = 0
+    for dev, date, art in urls:
+        r = results[(dev, date, art)]
+        mine = [e for e in entries
+                if e[3].group(1) == dev and e[3].group(2) == date
+                and e[3].group(3) == art]
+        if r["action"] == "keep":
+            print(f"{dev}/{date}: keeping {art}.img")
+        elif r["action"] == "swap":
+            old = f"/full/{dev}/{date}/{art}.img"
+            new = f"/full/{dev}/{date}/{r['art']}.img"
+            for ui, si, mi, _ in mine:
+                lines[ui] = lines[ui].replace(old, new)
+                # Stale pins would fail the CI checksum gate — clear them.
+                if si is not None and 'sha256: ""' not in lines[si]:
+                    lines[si] = re.sub(r"(sha256:\s*).*", r'\1""', lines[si])
+                if mi is not None and 'md5: ""' not in lines[mi]:
+                    lines[mi] = re.sub(r"(md5:\s*).*", r'\1""', lines[mi])
             swapped += 1
-            print(f"{dev}: {current}.img -> {chosen}.img")
+            print(f"{dev}: {art}.img -> {r['art']}.img (same date, pins cleared)")
+        elif r["action"] == "redate":
+            for ui, si, mi, _ in mine:
+                lines[ui] = lines[ui].replace(
+                    f"/full/{dev}/{date}/", f"/full/{dev}/{r['date']}/"
+                ).replace(f"/{art}.img", f"/{r['art']}.img")
+                if si is not None:
+                    # lambda repl: a hex sha256 would be parsed as a group
+                    # reference when interpolated into the template (\1205…).
+                    lines[si] = re.sub(
+                        r"(sha256:\s*).*",
+                        lambda m, s=r["sha256"]: m.group(1) + s,
+                        lines[si],
+                    )
+                if mi is not None:
+                    lines[mi] = re.sub(r"(md5:\s*).*", r'\1""', lines[mi])
+            redated += 1
+            print(
+                f"{dev}: {date}/{art}.img -> {r['date']}/{r['art']}.img "
+                f"(build rotated; sha256 {r['sha256'][:12]}… from builds API)"
+            )
         else:
-            print(f"{dev}: keeping {current}.img")
+            dead += 1
+            print(f"{dev}/{date}: DEAD and no newer build — leaving as-is (WARN)")
 
-    open(path, "w").write(src)
-    print(f"done: {swapped} URL(s) rewritten")
+    open(path, "w").writelines(lines)
+    print(f"done: {swapped} artifact swap(s), {redated} redate(s), {dead} unfixable")
     return 0
 
 

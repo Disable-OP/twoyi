@@ -33,6 +33,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MANIFEST="${SCRIPT_DIR}/../../corpus/manifest.yaml"
 [ -f "$MANIFEST" ] || { echo "manifest not found: $MANIFEST"; exit 1; }
 
+# 6-Z334: self-heal LineageOS URLs before dispatch. The upstream nightly
+# rotation DELETES whole dated builds (2026-09-13: 92/296 manifest URLs
+# went 404 and the lineage-22.2-sailfish pr-gate child died on curl 22).
+# fix_lineage_urls.py probes every mirrorbits URL and redates dead entries
+# from the official builds API (idempotent; ~2 min for 296 URLs). This is
+# the single choke point shared by the nightly schedule, the manual pr-tier
+# gate and release runs — every dispatch path heals first.
+python3 "${SCRIPT_DIR}/fix_lineage_urls.py" "${MANIFEST}"
+
 # ── parse manifest entries (name, url, referer, md5, tier) ──────────────
 ENTRIES=$(python3 - "$MANIFEST" "$SELECT" <<'EOF'
 import sys, json
