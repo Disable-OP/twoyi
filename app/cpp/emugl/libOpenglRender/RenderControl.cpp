@@ -85,6 +85,59 @@ static EGLint rcQueryEGLString(EGLenum name, void* buffer, EGLint bufferSize)
 
 static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
 {
+    // 6-Z341 (rn290 decode): GL_EXTENSIONS MUST be served BEFORE the
+    // current-context gate — the A11 client's HostConnection::init runs
+    // queryAndSetGLESMaxVersion BEFORE any context is current, and the
+    // rn289/rn290 artifacts proved the 6-Z340 block sat BEHIND this
+    // function's early return (dead code: the reply stayed empty, the
+    // client kept its GLES_MAX_VERSION_2 fallback, SF's ES3 request kept
+    // dying at the client's own EGL_BAD_CONFIG gate). The GL_EXTENSIONS
+    // branch now owns the whole path: cache the host string whenever a
+    // context IS current, serve token-only until then.
+    if (name == GL_EXTENSIONS) {
+        RenderThreadInfo *tInfo = getRenderThreadInfo();
+        const bool haveCtx = tInfo && tInfo->currContext.Ptr();
+        if (haveCtx) {
+            const char *live = NULL;
+#ifdef WITH_GLES2
+            if (tInfo->currContext->isGL2()) {
+                live = (const char *)s_gl2.glGetString(name);
+            }
+            else {
+#endif
+                live = (const char *)s_gl.glGetString(name);
+#ifdef WITH_GLES2
+            }
+#endif
+            if (live) {
+                s_6z340_hostExt.assign(live);
+            }
+        }
+        static const char kGlesMaxVersionToken[] = "ANDROID_EMU_gles_max_version_2";
+        if (s_6z340_hostExt.empty()) {
+            s_6z339_glStringBuf.assign(kGlesMaxVersionToken);
+        } else {
+            s_6z339_glStringBuf.assign(s_6z340_hostExt);
+            s_6z339_glStringBuf.append(" ");
+            s_6z339_glStringBuf.append(kGlesMaxVersionToken);
+        }
+        static unsigned s_6z341_ext_serves = 0;
+        if (s_6z341_ext_serves < 12) {
+            s_6z341_ext_serves++;
+            RLOG_6Z339("6-Z341 rcGetGLString(GL_EXTENSIONS) serve #%u ctx=%s host_ext=%s reply_len=%zu",
+                       s_6z341_ext_serves, haveCtx ? "current" : "PRE-CONTEXT",
+                       s_6z340_hostExt.empty() ? "<none-yet>" : "cached",
+                       s_6z339_glStringBuf.size());
+        }
+        const char *str = s_6z339_glStringBuf.c_str();
+        const int len = (int)strlen(str) + 1;
+        if (!buffer || len > bufferSize) {
+            return -len;
+        }
+        strcpy((char *)buffer, str);
+        return len;
+    }
+
     RenderThreadInfo *tInfo = getRenderThreadInfo();
     if (!tInfo || !tInfo->currContext.Ptr()) {
         return 0;
@@ -106,42 +159,11 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize)
         return 0;
     }
 
-    // 6-Z339 (rn288 decode): the A11 goldfish client negotiates the max
-    // GLES version by looking for the ANDROID_EMU_gles_max_version_*
-    // tokens in GL_EXTENSIONS (HostConnection::queryAndSetGLESMaxVersion).
-    // With NO token it warns ("Unrecognized GLES max version string in
-    // extensions: " — the rn288 kmsg) and falls back to GLES_MAX_VERSION_2,
-    // and then every explicit ES3 request (A11 SF: renderableType &
-    // EGL_OPENGL_ES3_BIT → contextClientVersion=3) dies at the client's
-    // own ES3 gate with EGL_BAD_CONFIG BEFORE the host is ever asked →
-    // surfaceflinger SIGABRT crash-loop (265 deaths, rung 7).
-    // The device the guest sees must be exactly the GPU the host can
-    // serve: this emugl port is ES2-class (GL2 decoder + ES2 dispatch),
-    // so advertise the ES2 token explicitly (the FBConfig RENDERABLE_TYPE
-    // mask makes the config table agree). The client then keeps SF on an
-    // ES2 context — the path this renderer was built and validated for.
-    // 6-Z340 (rn289 decode): the client's HostConnection::init queries
-    // GL_EXTENSIONS BEFORE any context is current — the proxy path below
-    // early-returns 0 there (rn289: the 6-Z339 token never reached the
-    // client; the reply stayed empty). Serve the token standalone for
-    // pre-context queries (it is the ONLY thing
-    // queryAndSetGLESMaxVersion parses at connection init); once any
-    // context is current the full host string is cached below and served
-    // with the token appended.
-    if (name == GL_EXTENSIONS) {
-        static const char kGlesMaxVersionToken[] = "ANDROID_EMU_gles_max_version_2";
-        if (str) {
-            s_6z340_hostExt.assign(str);
-        }
-        if (s_6z340_hostExt.empty()) {
-            s_6z339_glStringBuf.assign(kGlesMaxVersionToken);
-        } else {
-            s_6z339_glStringBuf.assign(s_6z340_hostExt);
-            s_6z339_glStringBuf.append(" ");
-            s_6z339_glStringBuf.append(kGlesMaxVersionToken);
-        }
-        str = s_6z339_glStringBuf.c_str();
-    }
+    // 6-Z339/6-Z340 history: the GLES max-version negotiation originally
+    // rode this proxy path; since 6-Z341 the GL_EXTENSIONS negotiation is
+    // served by the dedicated pre-context-aware branch above (the client's
+    // connection-init query has NO current context — the proxy path below
+    // can never see it). All other GL strings keep the proxy semantics.
 
     int len = strlen(str) + 1;
     if (!buffer || len > bufferSize) {
