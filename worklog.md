@@ -29333,3 +29333,20 @@ Stage Summary / RN284 DECODE TREE:
 2. The recovery-corpus gate + the 55-min cap unchanged.
 3. Do NOT chase: the audio re-get stale-pair fleet, the nnapi loop, the tombstoned intercept, HOST logcat.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 66 (rn284 decoded: CONSUMED×60 — the client parses the perfect parcel and still returns null; the wall is inside the AIDL/JAVA marshalling — the final inch)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn284 (34813332771 on f2febdea/6-Z332): rung 7, 9 eras, 5 FATAL PowerManager NPEs, the boot reaches the AMS/initPowerManagement phase every era (StartPowerManager/StartThermalManager ✓, 19108 package_native waits, 30 dexopts). **THE 6-Z332 CONSUMED VERDICT ANSWERED THE BINARY QUESTION: "SM-REPLY-CONSUMED (client freed the reply parcel; 32 stash bytes)" ×60** — the client's waitForResponse populates + tears down the 32B SM reply Parcels (the 6-Z329/330/331/332 evidence chain: the reply is byte-perfect [EX_NONE][flat BINDER{W,O}][63] offsets=[4], patched, delivered, CONSUMED) — **AND THE NPE PERSISTS**. ALL "Null binder" ALOGEs remain audioserver's (11822) — the zeroing is NOT the power null's cause in this class.
+- CONCLUSION: **the null arises INSIDE the client's AIDL/JAVA marshalling of a byte-perfect parcel.** The CONSUMED verdict does NOT distinguish "parsed fine" from "BAD_TYPE" (the Parcel teardown happens regardless). The parse chain to walk against the artifact bytes: the JAVA ServiceManagerProxy.getService (the JAVA AIDL — _reply.readException() + _reply.readStrongBinder()) → android_os_Parcel_readStrongBinder → the native Parcel::readStrongBinder → readObject(false) (the object-hint walk) → unflattenBinder (the BINDER_TYPE_BINDER local cast) → finishUnflattenBinder (the ann read + Stability::set). NOTE: the A11 JAVA readException reads the exception code as an i32 — our reply's [0..4] = 0 ✓; the A11 readObject validation + the JAVA readStrongBinder's ibinderForJavaObject conversion are the unverified steps.
+- DISPATCHED: no new run this wave — the decode is now a SOURCE-WALK (offline), not a measurement. rn284's artifacts are the evidence base.
+
+Stage Summary / NEXT LEG (the source-walk):
+1. Fetch the A11 sources: frameworks/base/core/java/android/os/ServiceManagerProxy.java (getService) + android_os_Parcel.cpp (readStrongBinder JNI) + the A11 Parcel.cpp readObject POST-found validation (the code after "Found it!" — the mNextObjectHint update + any type/stability validation) + Binder.java's android.os.Binder — walk the exact 32B reply bytes through every step; the step that rejects is the wall.
+2. PRIME SUSPECT (unverified): the JAVA readException/readStrongBinder pair — the JAVA Parcel's object handling (the JNI conversion of a LOCAL JavaBBinder reply) — the reply's flat points at a JavaBBinder in the SAME process: the JNI's ibinderForJavaObject path for a LOCAL JavaBBinder should return the JAVA BinderProxy of the object() — if the JNI path mis-handles the LOCAL (BINDER_TYPE_BINDER) case (vs the HANDLE case), the JAVA gets null.
+3. The fix lands in the proxy only if the wire shape is wrong for the JAVA client — else the fix is the loader's reply shaping (the wire is OURS to shape; the goal stays: the JAVA getSystemService("power") returns a non-null binder).
+4. The infra: rn284's artifacts at /home/z/artifacts-rn284; the A11 sources cached in /tmp (libhwbinder-IPCThreadState.cpp, libhwbinder-Parcel.cpp, libbinder-Parcel.cpp, HidlBinderSupport.cpp, Stability.h/.cpp, RefBase.h); the older artifacts cleaned (disk pressure — keep rn279+).
+5. Do NOT chase: the audio re-get stale-pair fleet, the nnapi loop, the tombstoned intercept, HOST logcat.
+- Authentication is provided through the private agent environment.
