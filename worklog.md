@@ -29661,3 +29661,20 @@ Stage Summary / RN299 DECODE TREE:
 3. If matches ≥1, context ok, MakeCurrent ok, and SF STILL aborts: the next leg is the GL2 stream (glGetString(GL_VERSION) value / opcode gaps) — the decode reads the kmsg's new fatal.
 4. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 81 (rn299 fast decoded: 6-Z348 PROVEN (20 matches, contexts CREATED, config ids confirmed) — the surfaceless fast path named; 6-Z349 landed; rn300 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn299 (34880662665 on 778e8fdc = 6-Z348) artifacts at /home/z/artifacts-rn299 (rn298 deleted for disk). Verdict rung 7; fast profile held.
+- **6-Z348 PROVEN**: rcChooseConfig → 20 matches (the ES2/no-attrib requests; the ES3 request stays 0 by the 6-Z339 mask — intentional); **rcCreateContext config=20 share=0 glVersion=3 FIRES with ZERO FAILED lines** (the 6-Z340 unconditional-ES2 host context is created); the client's config-id semantics CONFIRMED (SF's "EGLSurface: 8-8-8-8, config=0x15" = index 20 + 1 exactly as the A11 eglDisplay maps them).
+- NEW WALL: "can't make dummy pbuffer current" ×76 with ZERO rcMakeCurrent ops — the client's eglMakeCurrent(EGL_NO_SURFACE, EGL_NO_SURFACE, ctx) EGL_BAD_MATCH early return (the (read==NO_SURFACE && draw==NO_SURFACE && ctx!=NO_CONTEXT) check) — reached because SF's hasSurfacelessContext() (EGL_KHR_surfaceless_context, passed through from the redroid host EGL via rcQueryEGLString) SKIPPED the dummy pbuffer entirely. The real emulator's host never advertises surfaceless.
+- LANDED 6-Z349 (fix(gfx), deb27661): EGL_KHR_surfaceless_context joins the 6-Z346 strip list (the same the-host-leaks-a-capability-the-protocol-layer-cannot-serve class).
+- DISPATCHED: rn300 on deb27661 with the FAST profile (HTTP 204).
+
+Stage Summary / RN300 DECODE TREE:
+1. PRIMARY: SF's full GL init sequence — dummy pbuffer created → rcMakeCurrent fires → GL strings (glGetString GL_VENDOR/RENDERER/VERSION/EXTENSIONS proxied) → the "OpenGL ES informations:" ALOGI block (vendor/renderer/version lines) → the engine constructs → **composer@2.3 + surfaceflinger REGISTER → rung 8 (SYSTEMUI) for the FIRST TIME**.
+2. NEXT-LEG RISKS (in order): (a) glGetString(GL_VERSION) reporting 3.x on the ES2 context → SF's parseGlesVersion → GLES_VERSION_3_0 engine branch → ES3-style calls vs the ES2 GL2 decoder (opcode gaps would name themselves as desyncs/crashes); (b) the gl2 encoder handshake on the RenderThread; (c) gralloc buffer allocation via the address-space + renderer pipes for SF's framebuffer targets.
+3. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
+- Authentication is provided through the private agent environment.
