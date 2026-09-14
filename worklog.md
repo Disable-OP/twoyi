@@ -29734,3 +29734,26 @@ Stage Summary / RN304 DECODE TREE:
 2. NEXT-LEG RISKS: (a) if the peeks are EMPTY (no bytes in 60ms), the guest only OPENED the channel and waits for a reply — the protocol is renderer→guest-driven; read goldfish-opengl process_pipe.cpp / address_space refcount sources (device/generic/goldfish-opengl @ android11-release, same pin as 6-Z338) and implement the service side accordingly; (b) the composer's gralloc1 allocate may ALSO need the legacy gralloc module's ashmem/memfd path verified (no memfd/ashmem ops surfaced in rn303 — the failure predates them or the module loads a different backend); (c) mapper 3.0 passthrough dlopen seems to WORK (the address-space 0x100 alloc is mapper-impl activity) — do NOT chase the mapper.
 3. Do NOT chase: nnapi/drm/ril/health-hal/keymaster fleets, qemud:sensors, adbd JDWP noise, HOST logcat.
 - PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
+
+---
+Task ID: 85 (rn304 fast decoded: 6-Z351 stable (8 composer get hits, ZERO retries); 6-Z352 captured the support-channel wire bytes (GLProcessPipe=0x64, refcount=3/6/9); the gralloc1 NO_RESOURCES wall reproduced; the support-channel protocol implementation is the next fix)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn304 (run 34896014608 on 7ad981a1 = 6-Z352) artifacts at /home/z/artifacts-rn304 (rn303 kept on disk). Verdict rung 4 — a ps-SNAPSHOT TIMING artifact: the klog timeline shows 44 surfaceflinger-era entries (zygote + SF eras ran; the artifact ps scan landed mid-churn). The REAL progress equals rn303.
+- **6-Z351 STABLE**: addWithChain(composer@2.3, handle 0x28, full chain) → "HIDL get(composer@2.1) hit" ×8, "Trying again" ×0 (was ×537 in rn302). The ancestor-get class stays dead.
+- The gralloc1 wall REPRODUCED verbatim: svclogs "GraphicBufferAllocator Failed to allocate (720 x 1600) layerCount 1 format 1 usage a00: 5" (gralloc1 NO_RESOURCES; usage 0xa00 = HW_COMPOSER|HW_RENDER — NOT the fb0 path, the fb0 stand-in was never opened).
+- **6-Z352 PEEK DECODE (the support channels' first writes)**:
+  - 'GLProcessPipe': the guest writes 4B LE `64 00 00 00` (0x64 = 100) right after open, EVERY session (retried per SF era: sessions 3/6/9/12/16/19/22).
+  - 'refcount': 4B LE counters `03000000` / `06000000` / `09000000` — +3 per session pair; some sessions (7/20) wrote NOTHING within the 60ms window (the first write can come late).
+  - 'qemud:boot-properties': `0004list` (the qemud multiplexer "list" command — boot-properties fleet, do-not-chase).
+  - 'qemud:sensors': `0011time:…list-sensors` (sensors fleet, do-not-chase).
+- NO rn305 dispatched on this tree: the peeks are captured; the next run must carry the SUPPORT-CHANNEL IMPLEMENTATION (6-Z353), not a repeat.
+
+Stage Summary / 6-Z353 IMPLEMENTATION TREE (next session):
+1. PIN the A11 sources first (same discipline as 6-Z338): fetch device/generic/goldfish-opengl @ android11-release — system/process_pipe.cpp (GLProcessPipe client: what 0x64 means, whether the open failure is graceful) + the refcount-pipe client (grep the tree for goldfish_pipe_open("refcount") — the address-space host-allocator cleanup path) + system/gralloc/gralloc_ranchu.cpp (the HW_COMPOSER|HW_RENDER allocate path: which backend — rcCreateColorBuffer over opengles (the stream WORKS) vs a local alloc that dies NO_RESOURCES).
+2. Implement the two support channels at the qemu_pipe proxy (generic goldfish semantics — the REAL emulator's pipe device serves them): GLProcessPipe (process attach/detach bookkeeping — likely needs an honest ACK + per-process cleanup hook) and refcount (color-buffer refcount acks — route to the emugl port's color-buffer table or the hostbridge).
+3. If the gralloc allocate dies BEFORE the host round-trip (gralloc_ranchu's local backend), the fix is in the container's ashmem/memfd/address-space stand-ins (6-Z203 precedent) — NOT a gralloc-specific hack.
+4. Regression: recovery-corpus pr-tier after every 6-Z353 commit (the proxy is shared).
+- Do NOT chase: qemud:sensors/qemud:boot-properties fleets, nnapi/drm/ril/health-hal/keymaster fleets, adbd JDWP noise, HOST logcat.
+- PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
