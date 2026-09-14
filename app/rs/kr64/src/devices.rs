@@ -840,6 +840,10 @@ pub fn create_all_devices(rootfs: &str, data_dir: &str) -> std::io::Result<Devic
     let key = create_key_device(rootfs)?;
     let event = create_event_socket(data_dir)?;
     let gb = create_graphics_buffer_devices(rootfs)?;
+    // 6-Z338 (rn287 decode): the composer's goldfish gralloc/mapper stack
+    // opens /dev/goldfish_address_space — without the stand-in it
+    // crash-loops on GoldfishMapper:84 and HWC never registers.
+    create_goldfish_address_space(rootfs)?;
 
     info!("[KR64][devices] all MVP devices created:");
     info!(
@@ -1314,6 +1318,42 @@ pub fn create_twrp_framebuffer(rootfs: &str, width: u32, height: u32) -> std::io
         );
     }
 
+    Ok(())
+}
+
+/// Create `{rootfs}/dev/goldfish_address_space` — the composer's
+/// GoldfishAddressSpaceHostMemoryAllocator device (6-Z338, rn287 decode).
+///
+/// On real goldfish hardware this is a kernel char device
+/// (drivers/staging/android/goldfish_address_space); inside the jail we
+/// create a plain regular-file stand-in whose ioctl contract is
+/// virtualized at the tracer level (ptrace_emu 6-Z338): the goldfish
+/// ALLOCATE/PING/CLAIM ioctls carve page-granular blocks, the backing
+/// file is ftruncate-grown BEFORE each ack, and the caller's NATIVE
+/// file-backed MAP_SHARED mmap (the arm64 tracer never rewrites those,
+/// 6-Z240) serves real shared pages. Without it the composer
+/// crash-loops on "GoldfishAddressSpaceHostMemoryAllocator failed to
+/// open" (rn287, GoldfishMapper:84) → HWC never registers → rung 7.
+///
+/// Fresh (truncated) each boot so the tracer's fresh arena (offset 0)
+/// always matches the file state — the same lockstep the ashmem
+/// stand-in relies on for its SET_SIZE truncations.
+pub fn create_goldfish_address_space(rootfs: &str) -> std::io::Result<()> {
+    let path = format!("{}/dev/goldfish_address_space", rootfs);
+    let _ = fs::remove_file(&path);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        f.set_len(1)?;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o666));
+    }
+    info!(
+        "[KR64][devices] /dev/goldfish_address_space stand-in ready (regular file; 6-Z338 tracer ioctl virtualization)"
+    );
     Ok(())
 }
 
