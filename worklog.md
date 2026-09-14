@@ -29203,3 +29203,28 @@ Stage Summary / RN276 DECODE TREE:
 4. Recovery gate 4/4 GREEN mandatory (the 6-Z327 gate leaves the unknown-SDK path untouched — verified by test).
 5. Do NOT chase: the nnapi sample-driver crash-loop fleet, the tombstoned intercept failure, HOST logcat.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 60 (rn276 decoded: the 6-Z327 gate works; the LOCAL-flat zeroing fleet named; 6-Z328 instruments landed; rn277 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- RN276 DECODED (34793455763 on 17757863/6-Z327): rung 7, no post-mortem. **THE 6-Z327 GATE WORKED**: "Can only set known stability" = 0 occurrences (rn275: hundreds). The boot still blows past StartPowerManager (StartWatchdog/StartThermalManager/StartPowerManager/StartInstaller/StartIncrementalService/StartFileIntegrityService/StartDataLoaderManagerService/StartActivityManager/InitBeforeStartServices ALL completed ×5 eras) and SystemUI runs (com.android.systemui in the census). But the SAME PowerManager NPE (ActivityStackSupervisor.initPowerManagement:485 → FATAL EXCEPTION IN SYSTEM PROCESS) kills every era — now WITHOUT the annotation rejection.
+- NEW DECODE: the klog carries **4268 client-side ALOGEs: "Null binder written with stability vintf stability."** — the exact A11 Stability::set fingerprint for a NULL binder annotated VINTF (A11 Stability.cpp: "null binder is always written w/ UNDECLARED stability"; non-UNDECLARED + null → BAD_TYPE). That is the signature of the shlib 6-Z306z LOCAL-flat ZEROING (the zero keeps the annotation word): every zeroed LOCAL getService reply = a clean client null. The `power` LOCAL flat (addService +173804 → getService HIT +173817, same conn=286, object mirrored-pinned at add) was zeroed → null → ServiceNotFoundException → **negative-cached by A11's service availability cache** (one wire get per era — explains the 1:1 get/NPE mapping) → getSystemService null → the NPE → era death.
+- DIAG VISIBILITY ROOT-CAUSED: the zeroing diag rides fd 2 — DEAD for the forked system_server (Zygote DetachDescriptors rebinds stdio; the 6-Z306aa re-arm line at +154530 precedes the framework.jar open at +154536) — while the CLIENT's ALOGE reaches the klog via logd→kmsg. Zero 6-Z272k/6-Z306z/SM-TR lines from the era pid (fresh budgets, working capture) pin the fd-2 loss. The proxy-side serve probe's shared 32-slot budget was consumed in seconds by the mediaserver same-name self-get flood (media.audio_flinger re-gets) — the boot-critical LOCAL gets ran unprobed.
+- LANDED 6-Z328 (d4e8ba1b, instruments-only, no behavior change):
+  1. binder.rs: the LOCAL-get serve probe runs on a DEDICATED 48-slot budget (PROBE_SERVE_LOCAL_BUDGET) with a 64-name dedupe (Z328_SERVE_NAMES) — tag "serve-local" — distinct boot-critical serves ("power" class) are always captured with the (W,O) memory snapshot at serve time.
+  2. shlib: the LOCAL-flat zeroing verdict goes to the GUEST KLOG (/dev/__kmsg__ → the dev-__kmsg__ artifact mirror — survives the fd-2 detach), bounded 8/process (g_z328_klog_budget), WITH the liveness legs: R=[W+8], [R+8], and the W round-trip match verdict.
+- Gates: fmt clean, clippy -D warnings clean, 869/869.
+- DISPATCHED on d4e8ba1b: rn277 ladder (boot_wait 900, stall 90, expect_rung 0) + recovery-corpus pr-tier gate. In flight at worklog-write.
+
+Stage Summary / RN277 DECODE TREE:
+1. PRIMARY: the "6-Z328: LOCAL flat zeroed W=... O=... R=[W+8]=... [R+8]=... (W match: yes|NO)" lines in dev-__kmsg__ for the `power`-class zeroings — the failing leg names the fix:
+   - "(W match: NO)" + R readable → leg 1 fails → the weakref round-trip model is wrong for JavaBBinder-shaped objects (mBase not at W+8, or mRefs not at R+8) → fix = a JavaBBinder-aware liveness contract.
+   - R=0/unreadable → the weakref memory is genuinely gone/reused → the object died DESPITE the 6-Z306ae-e mirror → the mirror path leaks the pin (e.g. the guest's BR_ACQUIRE never ran — check the BC_ACQUIRE_DONE ack on the add conn).
+   - "(W match: yes)" → leg 1 passed and leg 2 (the [O..O+640) scan) failed → the scan window/Δ is wrong → widen/derive Δ from the probe.
+2. The "serve-local" probe lines for `power` (kr64.log) give the (W,O) memory at SERVE time — cross-check the zeroing verdict against the serve-time state (dead-at-serve vs dead-at-check).
+3. EXPECT the boot shape to be UNCHANGED this wave (instruments only): the NPE wall persists until the zeroing verdict names the fix; rung 7 + the 5-era cadence is the baseline.
+4. Recovery gate 4/4 GREEN mandatory (the klog write is additive; the shlib touch is diag-only).
+5. Do NOT chase: the nnapi crash-loop fleet, the tombstoned intercept, HOST logcat.
+- Authentication is provided through the private agent environment.
