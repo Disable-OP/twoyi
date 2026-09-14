@@ -91,6 +91,7 @@ typedef struct prop_info prop_info;
   #define NR_close    3
   #define NR_write    1
   #define NR_read     0
+  #define NR_pread64  18
   #define NR_getpid   39
   #define NR_setuid   105
   #define NR_setgid   106
@@ -143,6 +144,7 @@ typedef struct prop_info prop_info;
   #define NR_close    57
   #define NR_write    64
   #define NR_read     63
+  #define NR_pread64  67
   #define NR_getpid   172
   #define NR_setuid   146
   #define NR_setgid   144
@@ -530,7 +532,11 @@ static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 #define BP_BR_DECREFS    0x8010720au  /* _IOR('r',10, binder_ptr_cookie=16) */
 #define BP_BR_NOOP       0x0000720cu  /* _IO('r', 12) — cmd-only, payload size 0 */
 #define BP_BR_DEAD_REPLY 0x00007205u  /* _IO('r', 5) — cmd-only, payload size 0 */
-#define BP_OBJ_SCAN      640u         /* 6-Z306d-b: cookie-chunk scan window */
+#define BP_OBJ_SCAN      2048u        /* 6-Z329: was 640 — the rn277 serve-local
+                                       probe caught the audioserver-class shape
+                                       with the RefBase vbase at Δ=0x648 (W at
+                                       O+0x650, sixteen bytes past the old
+                                       window) — a LIVE object failed the scan */
 
 #define BP_REPLY_ALLOC_MAX 32
 struct bp_reply_alloc {
@@ -584,6 +590,9 @@ static void bp_fork_child_diag_rearm(void) {
     g_diag_bp_ioctl = 4;
     g_diag_z306z_gate = 8;
     g_diag_z309_gate = 8;
+    // 6-Z329: the cached /proc/self/mem fd points at the PARENT's memory
+    // after fork — reset it so the child re-opens its own.
+    g_z329_self_mem_fd = -1;
     // The inherited pending stash points at the PARENT's transaction —
     // a stale match in the child would poison the verdict observer.
     pthread_mutex_lock(&g_sm_pending_lock);
@@ -703,18 +712,53 @@ static void bp_alloc_free(uintptr_t ptr) {
 // 8/16-byte peek into OUR OWN address space. The kernel validates the
 // remote range and returns -1/EFAULT for unmapped or unreadable
 // addresses — no signal, no fault, honest failure.
+// 6-Z329: THE SELF-PEEK NO LONGER DEPENDS ON getpid(). The old path
+// called process_vm_readv(getpid(), ...) — and the guest's getpid is
+// FAKED (FAKE_GUEST_PID=1 via the seccomp/SIGSYS fake in the
+// forked-system_server class) → the peek targeted host pid 1 → EPERM →
+// EVERY liveness leg failed → bp_binder_object_alive()=0 for PERFECTLY
+// ALIVE objects → the 6-Z306z LOCAL-flat zeroing fleet (4268 client-side
+// "Null binder written with stability vintf stability." ALOGEs in
+// rn276/rn277) → getSystemService("power") → null → the
+// ActivityStackSupervisor.initPowerManagement NPE — THE rung-8 WALL.
+// The rn277 serve-local probe proved the object ALIVE at serve time
+// (mStrong=1 = the 6-Z306ae mirror pin, mBase=O+0x38, valid vptr).
+//
+// /proc/self/mem: the "self" resolves IN-KERNEL (no getpid, fake or
+// real) and pread returns EIO for unmapped ranges — the same honest
+// never-fault contract as before. The fd is cached per process and
+// RESET in the fork-child re-arm (an inherited fd would read the
+// PARENT's memory after fork).
+static int g_z329_self_mem_fd = -1;
+
 static int bp_self_peek(uintptr_t addr, uint8_t *out, size_t len) {
-    struct iovec local;
-    struct iovec remote;
     ssize_t n;
     if (addr == 0) return 0;
-    local.iov_base = out;
-    local.iov_len = len;
-    remote.iov_base = (void *)addr;
-    remote.iov_len = len;
-    n = syscall(SYS_process_vm_readv, (long)syscall(SYS_getpid),
-                &local, 1, &remote, 1, 0);
-    return n == (ssize_t)len;
+#ifdef NR_pread64
+    if (g_z329_self_mem_fd < 0) {
+        g_z329_self_mem_fd = (int)twoyi_sys_open("/proc/self/mem", O_RDONLY, 0);
+    }
+    if (g_z329_self_mem_fd >= 0) {
+        n = syscall(NR_pread64, g_z329_self_mem_fd, out, len, (long long)addr);
+        if (n == (ssize_t)len) return 1;
+        /* EIO/ESRCH-class: unmapped — honest failure. EBADF means the
+         * cached fd went bad (closed out from under us) — drop it and
+         * let the next call re-open; this call falls back below. */
+        if (n != -1 || errno != EBADF) return 0;
+        g_z329_self_mem_fd = -1;
+    }
+#endif
+    {
+        struct iovec local;
+        struct iovec remote;
+        local.iov_base = out;
+        local.iov_len = len;
+        remote.iov_base = (void *)addr;
+        remote.iov_len = len;
+        n = syscall(SYS_process_vm_readv, (long)syscall(NR_getpid),
+                    &local, 1, &remote, 1, 0);
+        return n == (ssize_t)len;
+    }
 }
 
 // 6-Z306ae-f (#236 decode): the ROUND-TRIP liveness anchor — the
@@ -746,9 +790,18 @@ static int bp_binder_object_alive(uint64_t w, uint64_t b) {
     if (!bp_self_peek((uintptr_t)w + 8, buf, 8)) return 0;
     memcpy(&r, buf, 8);
     if (r == 0) return 0;
-    if (!bp_self_peek((uintptr_t)r + 8, buf, 8)) return 0;
+    if (!bp_self_peek((uintptr_t)r, buf, 8)) return 0;
     memcpy(&refs_back, buf, 8);
-    if (refs_back != w) return 0;
+    if (refs_back != w) {
+        // 6-Z329: mRefs sits at R+8 for the A11 RefBase ({vptr, mRefs} —
+        // virtual dtor) but at R+0 for non-virtual-RefBase builds; a live
+        // object has W in one of the two header slots. (rn277: the
+        // power-class pair read [R+8]=0 through the EPERM-poisoned peek —
+        // the /proc/self/mem peek above now reads the truth.)
+        if (!bp_self_peek((uintptr_t)r + 8, buf, 8)) return 0;
+        memcpy(&refs_back, buf, 8);
+        if (refs_back != w) return 0;
+    }
     // 6-Z306d-b (#237 decode): leg 2 — the W↔B ASSOCIATION. A freed-and-
     // REUSED weakref chunk can pass leg 1 for a NEW object (W.mBase=R,
     // [R+8]==W) while the registered cookie B belongs to a completely
