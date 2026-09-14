@@ -4229,10 +4229,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/a52q/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/a52q/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 04b3db50d568ffef5caa8883793646ff1e8c34df152f8283a87c139cb71feb1a
     notes: >-
       LineageOS recovery-in-boot via boot.img for device a52q.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -4271,10 +4271,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/a72q/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/a72q/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: fa65b22e3224559d680e10ba634156e68a8f45be6c68f325102d19d7e88bac47
     notes: >-
       LineageOS recovery-in-boot via boot.img for device a72q.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -4551,10 +4551,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/baracus_tab/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/baracus_tab/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: ebb5eb92526e1cde39b3db31bd63d153502f8c4a2eefbd7998e6417a0070d9a2
     notes: >-
       LineageOS recovery-in-boot via boot.img for device baracus_tab.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -4733,10 +4733,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/blueline/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/blueline/20260914/boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: ae5b3c56ba0de64cba89297a9409b439d0a82803fac16eaab703590b64363a47
     notes: >-
       LineageOS recovery-in-boot via boot.img for device blueline.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -4873,10 +4873,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/casuarina/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/casuarina/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: a564747f91febb6311cf7f7c9e8150c530d045a6103509bdafeae10f3ddce98c
     notes: >-
       LineageOS recovery-in-boot via boot.img for device casuarina.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -4929,10 +4929,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/cheeseburger/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/cheeseburger/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: fde012e2f473f7327d3c79d32c5afee75560fe3d1daf3d330d9048013a2a7d55
     notes: >-
       LineageOS recovery-in-boot via boot.img for device cheeseburger.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -5027,10 +5027,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/corvette/20260824/vendor_boot.img
+    url: https://mirrorbits.lineageos.org/full/corvette/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 225f9a5dbe6d0257824cf36d63e954f94262a20d7ab4010de7eae6506a3b5363
     notes: >-
       LineageOS recovery-in-boot via boot.img for device corvette.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -5475,10 +5475,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/foster/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/foster/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 5567c119523c676f4b06e6eeb72633d9a23644ee864ba214d9f998997db61e78
     notes: >-
       LineageOS recovery-in-boot via boot.img for device foster.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -5503,10 +5503,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/fuxi/20260824/vendor_boot.img
+    url: https://mirrorbits.lineageos.org/full/fuxi/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: b9bfecb84703e26696da143d20e7ff268e3a5c18425af1604323eadcc252d113
     notes: >-
       LineageOS recovery-in-boot via boot.img for device fuxi.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -5797,10 +5797,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/gts7lwifi/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/gts7lwifi/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 1c15ce99cb34564b3a144722380a930b8ba636eca5eb7f1eb9f79727fd05ee12
     notes: >-
       LineageOS recovery-in-boot via boot.img for device gts7lwifi.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -5811,10 +5811,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/guacamole/20260825/boot.img
+    url: https://mirrorbits.lineageos.org/full/guacamole/20260914/boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: a5d72ab33c31d4b76eb1ae3ee8e2c2e5715e543587785bdc2996bc18d3346bc3
     notes: >-
       LineageOS recovery-in-boot via boot.img for device guacamole.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -5853,10 +5853,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/guamp/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/guamp/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: d8a51ffeba3018e838065de85e5e2715ade1423ef4621c4792ab128f6a12b692
     notes: >-
       LineageOS recovery-in-boot via boot.img for device guamp.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -5937,10 +5937,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/h872/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/h872/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 9f1f59af131aaf96579c2868c5c1746b5fd66419fd5f97692f750c789121d21a
     notes: >-
       LineageOS recovery-in-boot via boot.img for device h872.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -5993,10 +5993,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/h990/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/h990/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 8cbcaa944e2855bcaa14ba9e0d6bbcd30a52de399da9d209b493b9da7aa41fe8
     notes: >-
       LineageOS recovery-in-boot via boot.img for device h990.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6203,10 +6203,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/kane/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/kane/20260914/boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: ed8c85a3e1adc6fcb149df065d94e31e03311f2ec406789a33a5ea991855f623
     notes: >-
       LineageOS recovery-in-boot via boot.img for device kane.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6273,10 +6273,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/l01k/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/l01k/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 970561ec1c36e0689bc3fdde07aabb11df7657d98dfd3c2cec60711e840552d0
     notes: >-
       LineageOS recovery-in-boot via boot.img for device l01k.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6329,10 +6329,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/lemonade/20260824/vendor_boot.img
+    url: https://mirrorbits.lineageos.org/full/lemonade/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: cfcbdf78098c0ff9fa3a64c31065a2ee9d1746583f6a8b641ad701edb8745d1d
     notes: >-
       LineageOS recovery-in-boot via boot.img for device lemonade.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6343,10 +6343,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/lemonadep/20260824/vendor_boot.img
+    url: https://mirrorbits.lineageos.org/full/lemonadep/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: d9a173488a50f6fd342cacbd1e4b403ba6eb9f4481b641a5de2ec4fb5f996a9a
     notes: >-
       LineageOS recovery-in-boot via boot.img for device lemonadep.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6469,10 +6469,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/m52xq/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/m52xq/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: cea7009d6f222b699fcd096882b0b2c5a297ae86516e7299be3fee2ca91338f1
     notes: >-
       LineageOS recovery-in-boot via boot.img for device m52xq.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6553,10 +6553,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/martini/20260824/vendor_boot.img
+    url: https://mirrorbits.lineageos.org/full/martini/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 4edd441f967556eaf064038bb0d02bcb8132305a031d18ec26214459badc9e35
     notes: >-
       LineageOS recovery-in-boot via boot.img for device martini.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6637,10 +6637,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/miatoll/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/miatoll/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: c0841a0d63ad927cda244dca451c1427b8b85761dfe61a7761048c5251a42b3e
     notes: >-
       LineageOS recovery-in-boot via boot.img for device miatoll.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6679,10 +6679,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/munch/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/munch/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: b30c2aa4385a6c735ee108575fcbd0eeff14c1fd5f45e7633cb574a6c056a941
     notes: >-
       LineageOS recovery-in-boot via boot.img for device munch.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6693,10 +6693,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nairo/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/nairo/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 7197550d216ed8a3397a9e482e4c8566c2efeca16d6c8abea1111465d602870e
     notes: >-
       LineageOS recovery-in-boot via boot.img for device nairo.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6777,10 +6777,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/nio/20260824/vendor_boot.img
+    url: https://mirrorbits.lineageos.org/full/nio/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 0ceddcb3c92551404f0dbf1e1b55e7f42c25112b0ec4d8428403d86c997c659c
     notes: >-
       LineageOS recovery-in-boot via boot.img for device nio.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -6987,10 +6987,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/oriole/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/oriole/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 2ef22c1d5fc670f971b996b323f4be5d2e53219b704d460a6466557d77a114ca
     notes: >-
       LineageOS recovery-in-boot via boot.img for device oriole.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7001,10 +7001,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/oscar/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/oscar/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 22da0a62e9220b3314a0e1979a3f2c0ccdc5ae154f559cc5a8a9368c022e5ba7
     notes: >-
       LineageOS recovery-in-boot via boot.img for device oscar.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7015,10 +7015,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/oscaro/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/oscaro/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 2963f04e4ca914c20f7d478607c9bf75b42f92b76a08cd63566c0aa5af93e7bc
     notes: >-
       LineageOS recovery-in-boot via boot.img for device oscaro.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7337,10 +7337,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pro1x/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/pro1x/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: a532d4cb44912e160b0e553480ab879da8bbc68236e10659f42ba7cab33573a9
     notes: >-
       LineageOS recovery-in-boot via boot.img for device pro1x.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7351,10 +7351,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/pstar/20260824/vendor_boot.img
+    url: https://mirrorbits.lineageos.org/full/pstar/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: d57240ab94c5747e6fbdcd80c80511a39dd5e97cb921039d97b11f6b2c2876ab
     notes: >-
       LineageOS recovery-in-boot via boot.img for device pstar.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7449,10 +7449,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/r8s/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/r8s/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 101c22f525305d654dbd82043a588985f5fdbb6a6e626f9972b185b19668211b
     notes: >-
       LineageOS recovery-in-boot via boot.img for device r8s.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7533,10 +7533,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/raven/20260824/vendor_boot.img
+    url: https://mirrorbits.lineageos.org/full/raven/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 70bd1fcb8cc084d0fed1992a5d4f124deefa8974063daff4bc291c797b18bcb5
     notes: >-
       LineageOS recovery-in-boot via boot.img for device raven.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7547,10 +7547,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/redfin/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/redfin/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 6706143c5fe4fa5814d461b5262a43860af77119617560b25b33e67cc4bc55c1
     notes: >-
       LineageOS recovery-in-boot via boot.img for device redfin.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7743,10 +7743,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/scorpio/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/scorpio/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: e2c251c6fc3663a6286bc0bd4d483f25eafa25fc0c801199a5fd651cee3b2e36
     notes: >-
       LineageOS recovery-in-boot via boot.img for device scorpio.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7841,10 +7841,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/surya/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/surya/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: fdbae065c22d36e05c96ae64c30b965039a7dae688a357f2842189dca1e2c64d
     notes: >-
       LineageOS recovery-in-boot via boot.img for device surya.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7953,10 +7953,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/tokay/20260824/vendor_boot.img
+    url: https://mirrorbits.lineageos.org/full/tokay/20260914/vendor_boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: e9df6a8c39ad8bb683c25d08d18d9e3c791974fc72a09f44b73cafdfd9b45f72
     notes: >-
       LineageOS recovery-in-boot via boot.img for device tokay.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7981,10 +7981,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/troika/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/troika/20260914/boot.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 3983f2622d577d997ce2b866dc61c67f95bb49bbf30713d48f07be842d2ff4fa
     notes: >-
       LineageOS recovery-in-boot via boot.img for device troika.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -7995,10 +7995,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/tucana/20260824/boot.img
+    url: https://mirrorbits.lineageos.org/full/tucana/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: 4bcafec304e31652c4aa1c22fe7aa0c304e01bd2a18eb23514b097102b34546f
     notes: >-
       LineageOS recovery-in-boot via boot.img for device tucana.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
@@ -8079,10 +8079,10 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/us996d/20260824/recovery.img
+    url: https://mirrorbits.lineageos.org/full/us996d/20260914/recovery.img
     referer: ""
     md5: ""
-    sha256: ""
+    sha256: acbae4af4940b5c03a087ed117bc6b9cdbc72ef584f2c21ef75e5a21d34244ab
     notes: >-
       LineageOS recovery-in-boot via boot.img for device us996d.
       Modern Android 14/15 recovery shape (A/B + dynamic partitions).
