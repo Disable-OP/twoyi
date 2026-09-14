@@ -29632,3 +29632,15 @@ Stage Summary / RN297 DECODE TREE:
 3. If inner ok=1 with matches but the identity intersection still yields 0: the table and the inner query genuinely use different displays (FrameBuffer re-init churn) — the fix class is rebuilding the table lazily per query or pinning the display.
 4. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 79 (rn297 build failure triaged: FBConfig.cpp lacked the RLOG_6Z339 macro; 6-Z347b landed; rn298 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn297 (34877059665 on c35084d2) FAILED at the Build APK step — the 6-Z347 diagnostic used RLOG_6Z339 which is defined only in RenderControl.cpp; FBConfig.cpp didn't have it.
+- LANDED 6-Z347b (64b36843): the same guarded macro definition added to FBConfig.cpp.
+- DISPATCHED: rn298 on 64b36843 with the FAST profile (HTTP 204). NOTE: rn297 produced NO boot artifacts (build-stage failure) — the decode target is rn298 (same tree as rn297's intended content).
+
+Stage Summary / RN298 DECODE TREE: unchanged from Task 78 — the 6-Z347 inner diagnostic + matches counts decide the next leg (matches ≥1 ⇒ context path; inner ok=0 ⇒ relax the forced pbuf attrib; identity-0 ⇒ table/display divergence).
+- Authentication is provided through the private agent environment.
