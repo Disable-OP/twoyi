@@ -29678,3 +29678,20 @@ Stage Summary / RN300 DECODE TREE:
 2. NEXT-LEG RISKS (in order): (a) glGetString(GL_VERSION) reporting 3.x on the ES2 context → SF's parseGlesVersion → GLES_VERSION_3_0 engine branch → ES3-style calls vs the ES2 GL2 decoder (opcode gaps would name themselves as desyncs/crashes); (b) the gl2 encoder handshake on the RenderThread; (c) gralloc buffer allocation via the address-space + renderer pipes for SF's framebuffer targets.
 3. Do NOT chase: nnapi/drm/ril/health-hal fleets, adbd JDWP noise, HOST logcat.
 - PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
+
+---
+Task ID: 82 (rn300 fast decoded: 6-Z349 PROVEN (rcMakeCurrent fires, SF's GL init COMPLETES) — the composer@2.1-ancestor-get wall named; 6-Z350 landed; rn301 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn300 (34883098566 on deb27661 = 6-Z349) artifacts at /home/z/artifacts-rn300 (rn299 deleted for disk). Verdict rung 5; fast profile held.
+- **6-Z349 PROVEN**: rcMakeCurrent ops FIRE (op #8/#16/#24...); SF's GL init COMPLETES — "OpenGL ES informations" with vendor "Google Inc. (Google)" / version "OpenGL ES 3.1.0 (ANGLE 2.1.1...)" (the redroid host EGL is ANGLE — the ES3-string risk is REAL but parseGlesVersion handled it: the engine constructed, GL_MAX_TEXTURE_SIZE=8192 printed) — the GL2 stream works end-to-end.
+- NEW WALL: "failed to get hwcomposer service" ×83 — A11 surfaceflinger (HwcComposer) asks for **@2.1::IComposer/default** (the HWC2 base-version getService — SF never asks 2.4/2.3/2.2) while the guest's composer registered **@2.3::IComposer/default** (addWithChain → handle 0x2a at +18.3s, the composer alive since 6-Z338) and the exact-key bus lookup answered EMPTY. The REAL hwservicemanager answers ancestor minors of the same major (HIDL interface inheritance).
+- LANDED 6-Z350 (fix(binder), 847211cf): hidl_ancestor_registered_6z350 — getTransport scans every minor of the same major up to the requested one (source tag "bus-ancestor"); the whole class of ancestor-version gets (composer@2.1→2.3, every HAL version skew) is fixed generically. Gates: 879/879, clippy -D warnings + fmt clean.
+- DISPATCHED: rn301 on 847211cf with the FAST profile (HTTP 204) + recovery-corpus pr-tier gate (4/4 OK).
+
+Stage Summary / RN301 DECODE TREE:
+1. PRIMARY: "HIDL getTransport(...composer@2.1::IComposer/default) → HWBINDER (bus-ancestor)" → SF's IComposer get succeeds → HWC2 client created → composer commands flow (the DISPLAY leg!) → surfaceflinger publishes → **composer@2.3 + surfaceflinger REGISTER → rung 8 (SYSTEMUI) for the FIRST TIME**.
+2. NEXT-LEG RISKS: (a) the HWC2 client's createClient + command queue (the composer's own pipe to the renderer — display/framebuffer handles); (b) gralloc allocation for SF's framebuffer targets (the address-space + renderer pipes); (c) IBase::interfaceChain cast probes on the ancestor handles (the 6-Z307d machinery must answer the 2.1 descriptor for a 2.3 object — if the cast probe fails, the client nulls the service AFTER the transport hit — watch for "unable to call into hwbinder service").
+3. Do NOT chase: nnapi/drm/ril/health-hal/keymaster fleets, adbd JDWP noise, HOST logcat.
+- PAT location (propagate in every summary; the file is base64, never print/commit the decoded token): /home/z/.twoyi-pat.b64 (canonical; mirrors /home/z/.secrets/twoyi_pat.b64, /home/z/.secrets/twoyi_pat, /home/z/.twoyi_pat, /tmp/twoyi_pat, /home/z/my-project/PATH).
