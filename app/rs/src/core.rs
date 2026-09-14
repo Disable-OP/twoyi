@@ -1968,6 +1968,16 @@ fn decode_loader_death(si_code: libc::c_int, si_status: libc::c_int) -> String {
     }
 }
 
+/// 6-Z337: pure predicate for waitid's rc==0 outcome. waitid(2): "If
+/// WNOHANG was specified in who and there were no children in a waitable
+/// state, then waitid() returns 0 immediately and the state of the
+/// siginfo_t structure is unspecified." So rc==0 alone is NOT an event.
+/// A REAL event always fills si_pid with the waited child's pid; the
+/// zeroed buffer (and the usual unspecified state) reads si_pid=0.
+fn waitid_event_is_real(si_pid: libc::pid_t, child_pid: i32) -> bool {
+    si_pid == child_pid
+}
+
 /// The probe thread body: poll waitid(WEXITED|WNOWAIT|WNOHANG) at 250 ms
 /// until the kr64 child reaches a waitable exit state, then render ONE
 /// loud death record (signal class + oom_kill delta) and leave the child
@@ -1984,8 +1994,19 @@ fn kr64_death_probe(child_pid: i32) {
                 libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
             )
         };
-        if rc == 0 {
+        // 6-Z337 (rn286 decode): rc==0 fires EVERY poll while the child
+        // is alive — the rn286 probe reported a false "si_code=0 status=0"
+        // clean-exit on its FIRST poll and stopped monitoring for the rest
+        // of the run. Only a siginfo whose si_pid names the child is a
+        // real waitable event; anything else (incl. the unspecified
+        // zeroed state) means "still alive" — keep polling.
+        if rc == 0 && waitid_event_is_real(unsafe { si.si_pid() }, child_pid) {
             break Some((si.si_code, unsafe { si.si_status() }));
+        }
+        if rc == 0 {
+            // rc==0 without an event: reset the buffer so stale bytes can
+            // never masquerade as the next event's payload.
+            si = unsafe { std::mem::zeroed() };
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ECHILD) {
@@ -2044,6 +2065,17 @@ mod z335_tests {
         // The rn259 "raw fatal signal" class, if it ever fires.
         let s = decode_loader_death(libc::CLD_KILLED, libc::SIGSEGV);
         assert!(s.contains("sig=11"), "{s}");
+    }
+
+    #[test]
+    fn z337_waitid_no_event_is_not_a_death() {
+        // The rn286 false positive: rc==0 + zeroed/unspecified siginfo
+        // (si_pid=0) while the child is ALIVE must NOT decode as a death.
+        assert!(!super::waitid_event_is_real(0, 2650));
+        // A real event names the child.
+        assert!(super::waitid_event_is_real(2650, 2650));
+        // Garbage from the unspecified state can never match a pid ≥ 1.
+        assert!(!super::waitid_event_is_real(-1, 2650));
     }
 
     #[test]
