@@ -22,6 +22,7 @@
 #include "ThreadInfo.h"
 
 #include <string>
+#include <atomic>
 
 // 6-Z339 observer — logcat-visible regardless of which ERR variant the
 // include chain resolves to (same rationale as RenderServer's 6-Z336 macro).
@@ -410,6 +411,64 @@ static uint32_t rcCreateColorBuffer(uint32_t width,
     return fb->createColorBuffer(width, height, internalFormat);
 }
 
+// 6-Z353: the guest's ProcessPipe handshake now completes (the kr64 proxy
+// serves the GLProcessPipe channel and mints the puid), so every GL client
+// announces its per-process identity over the renderControl stream as op
+// 10033. The real renderer keys per-process cleanup on the puid; this port
+// tears down every per-connection resource when the RenderThread session
+// ends — the same net effect — so accept and account (bounded log: the
+// first 8 announcements name the puid handoff, then silence).
+static void rcSetPuid_6z353(uint64_t puid)
+{
+    static std::atomic<int> s_logBudget(8);
+    int budget = s_logBudget.fetch_sub(1);
+    if (budget > 0) {
+        RLOG_6Z339("6-Z353 rcSetPuid: puid %llu accepted (per-connection teardown covers cleanup)",
+                   (unsigned long long)puid);
+    }
+}
+
+// 6-Z353: the goldfish allocator (allocator3.cpp / gralloc_30.cpp) creates
+// the composer's HW_COMPOSER|HW_RENDER framebuffer targets via the DMA
+// variant, op 10035. The DMA difference is the host-side CPU mapping of the
+// backing store; the ranchu composer's GL pipeline composes and renders on
+// the GPU and never CPU-maps these targets, so the honest minimal semantics
+// alias to the plain color-buffer create (frameworkFormat only
+// distinguishes YUV camera/video layouts).
+static uint32_t rcCreateColorBufferDMA_6z353(uint32_t width, uint32_t height,
+                                             GLenum internalFormat,
+                                             uint32_t frameworkFormat)
+{
+    (void)frameworkFormat;
+    return rcCreateColorBuffer(width, height, internalFormat);
+}
+
+// 6-Z353: the mapper unlock flush, op 10034 — the wire packet carries only
+// the DMA address + size (the pixel bytes live in the address-space block
+// the client wrote on its side; they NEVER travel in this packet). This
+// port's renderer has no mapping of the kr64-backed address-space block, so
+// the GPU copy of the color buffer is not updated; the honest reply is 0
+// (the client ignores the retval) and the wire stays in sync — the
+// alternative (unknownOpcode) wedges the guest's gralloc stream. A real
+// pixel path needs the kr64↔renderer address-space sharing story and is
+// named as the follow-up in the 6-Z353 decode tree.
+static int rcUpdateColorBufferDMA_6z353(uint32_t colorbuffer, GLint x, GLint y,
+                                        GLint width, GLint height, GLenum format,
+                                        GLenum type, uint64_t dmaAddr,
+                                        uint32_t pixels_size)
+{
+    (void)x; (void)y; (void)width; (void)height;
+    (void)format; (void)type; (void)dmaAddr; (void)pixels_size;
+    static std::atomic<int> s_logBudget(8);
+    int budget = s_logBudget.fetch_sub(1);
+    if (budget > 0) {
+        RLOG_6Z339("6-Z353 rcUpdateColorBufferDMA: cb %u %dx%d %dB dma=0x%llx — no-op (no address-space mapping), wire answered",
+                   colorbuffer, (int)width, (int)height, (int)pixels_size,
+                   (unsigned long long)dmaAddr);
+    }
+    return 0;
+}
+
 static void rcOpenColorBuffer(uint32_t colorbuffer)
 {
     FrameBuffer *fb = FrameBuffer::getFB();
@@ -607,4 +666,8 @@ void initRenderControlContext(renderControl_decoder_context_t *dec)
     dec->set_rcColorBufferCacheFlush(rcColorBufferCacheFlush);
     dec->set_rcReadColorBuffer(rcReadColorBuffer);
     dec->set_rcUpdateColorBuffer(rcUpdateColorBuffer);
+    // 6-Z353: support-channel ops
+    dec->set_rcSetPuid(rcSetPuid_6z353);
+    dec->set_rcUpdateColorBufferDMA(rcUpdateColorBufferDMA_6z353);
+    dec->set_rcCreateColorBufferDMA(rcCreateColorBufferDMA_6z353);
 }
