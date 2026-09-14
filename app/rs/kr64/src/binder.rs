@@ -2604,6 +2604,15 @@ impl HandleTable {
 /// are best-effort removed before bind (errors are logged but not
 /// propagated).
 pub fn create_binder_device(rootfs: &str, vm_id: u32) -> std::io::Result<String> {
+    // 6-Z327: record the guest rootfs — the SM get arm consults the
+    // guest's OWN declared SDK level (ro.build.version.sdk from
+    // {rootfs}/system/build.prop) before serving the A12-Category
+    // stability annotation. Lazy + cached (early boot pays nothing).
+    {
+        let mut g = GUEST_ROOTFS.write().expect("guest rootfs lock");
+        *g = Some(rootfs.to_string());
+        *GUEST_SDK_CACHE.write().expect("guest sdk lock") = None;
+    }
     let vm_dir = format!("{}/vm{}", rootfs, vm_id);
     let vm_dev = format!("{}/dev", vm_dir);
     let sock_path = format!("{}/dev/binder", vm_dir);
@@ -4833,7 +4842,7 @@ fn servicemanager_proxy(
                 let now = std::time::Instant::now();
                 match b.conns.get_mut(&conn_id) {
                     Some(bx) => {
-                        if !bx.sm_annotate_a12 {
+                        if !bx.sm_annotate_a12 && a12_annotation_allowed() {
                             if let Some((last, ts)) = &bx.last_sm_get {
                                 if *last == name
                                     && bx.sm_last_was_hit
@@ -7126,6 +7135,57 @@ static PROBE_DELIVERY_BUDGET: AtomicU32 = AtomicU32::new(96);
 /// like the probe classes so the watch can never turn into log flood.
 static Z325_STEAL_WATCH_BUDGET: AtomicU32 = AtomicU32::new(8);
 
+/// 6-Z327: the guest rootfs the binder proxy serves (recorded at
+/// [`create_binder_device`]) — the SM get arm consults the guest's OWN
+/// declared SDK level (ro.build.version.sdk from {rootfs}/system/
+/// build.prop) before serving the A12-Category stability annotation.
+static GUEST_ROOTFS: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+static GUEST_SDK_CACHE: std::sync::RwLock<Option<Option<u32>>> = std::sync::RwLock::new(None);
+
+/// 6-Z327: the guest's declared SDK level, read ONCE from
+/// `{rootfs}/system/build.prop` (`ro.build.version.sdk=N`). `None` =
+/// unknown — the recovery-class rootfs images ship no /system; the
+/// legacy per-conn heuristic stays in charge for exactly those guests.
+fn guest_sdk() -> Option<u32> {
+    if let Some(cached) = GUEST_SDK_CACHE.read().expect("guest sdk lock").as_ref() {
+        return *cached;
+    }
+    let rootfs = GUEST_ROOTFS.read().expect("guest rootfs lock").clone();
+    let sdk = rootfs.and_then(|r| {
+        let path = std::path::Path::new(&r).join("system/build.prop");
+        let text = std::fs::read_to_string(&path).ok()?;
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("ro.build.version.sdk=") {
+                return rest.trim().parse::<u32>().ok();
+            }
+        }
+        None
+    });
+    *GUEST_SDK_CACHE.write().expect("guest sdk lock") = Some(sdk);
+    sdk
+}
+
+/// 6-Z327: serve the A12-Category stability annotation ONLY to guests
+/// whose own libbinder accepts it (SDK >= 31). The A11 guest's
+/// Stability::set() rejects everything but the bare Level values — every
+/// A12-annotated handle reply then unflattens to NULL. The 6-Z306ab
+/// retry-after-hit flip is a GUESS that misfires on A11 guests whose
+/// frameworks legitimately double-fetch a service right after a hit
+/// (rn275: the flip poisoned system_server conns mid-boot →
+/// getSystemService("power") → null → the ActivityStackSupervisor
+/// .initPowerManagement NPE → FATAL EXCEPTION IN SYSTEM PROCESS → era
+/// death — AFTER the 6-Z325/6-Z326 callback chain had finally carried the
+/// boot past StartPowerManager). Unknown-SDK guests (the recovery-class
+/// images without /system/build.prop) keep the legacy heuristic — the
+/// corpus path is byte-identical.
+fn a12_annotation_allowed() -> bool {
+    match guest_sdk() {
+        Some(sdk) => sdk >= 31,
+        None => true,
+    }
+}
+
 /// 6-Z309d: the shared recently-served registry (pid → last-delivery
 /// instant), capped at 64 entries. The tracer's EXIT-event death capture
 /// consults this ( [`crate::binder::recently_served`] ) so a daemon that
@@ -8479,6 +8539,11 @@ mod tests {
     /// single-get shape and the hit/miss bookkeeping here).
     #[test]
     fn servicemanager_proxy_v2_get_retry_after_hit_flips_to_a12() {
+        // 6-Z327: serialize with the other guest-rootfs-global tests. The
+        // empty tmpdir below has no /system/build.prop → unknown SDK → the
+        // legacy flip stays allowed (the a12_annotation_allowed gate is
+        // open for None).
+        let _g = Z327_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rootfs = tmpdir();
         let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
         let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
@@ -10890,6 +10955,101 @@ mod tests {
             !bus.lock().expect("bus").watchers.contains_key(svc),
             "watcher removed"
         );
+    }
+
+    /// 6-Z327 test serialization: the guest-rootfs global is process-wide
+    /// and the flip tests mutate it.
+    static Z327_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(test)]
+    fn test_set_guest_rootfs(rootfs: Option<String>) {
+        *GUEST_ROOTFS.write().expect("guest rootfs lock") = rootfs;
+        *GUEST_SDK_CACHE.write().expect("guest sdk lock") = None;
+    }
+
+    /// 6-Z327: an A11 guest (rootfs declares ro.build.version.sdk=30) NEVER
+    /// flips to the A12 Category annotation — the retry-after-hit signature
+    /// is a NORMAL A11 double-fetch, and every A12-annotated handle reply
+    /// unflattens to NULL in the A11 client (the rn275 PowerManager NPE).
+    #[test]
+    fn z327_a11_guest_get_retry_after_hit_stays_plain() {
+        let _g = Z327_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rootfs = tmpdir();
+        let root = std::path::Path::new(&rootfs);
+        fs::create_dir_all(root.join("system")).unwrap();
+        fs::write(root.join("system/build.prop"), "ro.build.version.sdk=30\n").unwrap();
+        test_set_guest_rootfs(Some(rootfs.clone()));
+
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        let _h = bus_state.add_guest_service("power", PROXY_CONN_ID, 0x777, 0x888);
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+
+        let get = |bus: &std::sync::Arc<std::sync::Mutex<BusState>>| -> i32 {
+            let mut args = ParcelWriter::new();
+            args.write_string16("power");
+            let (d, o) = make_servicemanager_request_parcel(&mut args);
+            let blob = RequestBlob {
+                data: d,
+                offsets: o,
+                sg: Vec::new(),
+            };
+            match servicemanager_proxy(SVC_MGR_GET_SERVICE, bus, Some(&blob), caller) {
+                TransactionResult::Reply { data, .. } => {
+                    i32::from_ne_bytes(data[28..32].try_into().unwrap())
+                }
+                other => panic!("expected Reply, got {}", tr_label(&other)),
+            }
+        };
+        let ann1 = get(&bus);
+        // The same-name re-get right after a HIT — the flip signature. For
+        // an A11 guest it must NOT flip.
+        let ann2 = get(&bus);
+        assert_eq!(ann1, STABILITY_ANNOTATION_VINTF, "first hit serves plain");
+        assert_eq!(
+            ann2, STABILITY_ANNOTATION_VINTF,
+            "A11 guest never flips to the A12 Category form"
+        );
+        test_set_guest_rootfs(None);
+    }
+
+    /// 6-Z327: an UNKNOWN-SDK guest (recovery-class rootfs, no
+    /// /system/build.prop) keeps the legacy 6-Z306ab heuristic — the
+    /// corpus path is byte-identical.
+    #[test]
+    fn z327_unknown_guest_get_retry_after_hit_flips_legacy() {
+        let _g = Z327_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_set_guest_rootfs(None);
+
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        let _h = bus_state.add_guest_service("power", PROXY_CONN_ID, 0x777, 0x888);
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+
+        let get = |bus: &std::sync::Arc<std::sync::Mutex<BusState>>| -> i32 {
+            let mut args = ParcelWriter::new();
+            args.write_string16("power");
+            let (d, o) = make_servicemanager_request_parcel(&mut args);
+            let blob = RequestBlob {
+                data: d,
+                offsets: o,
+                sg: Vec::new(),
+            };
+            match servicemanager_proxy(SVC_MGR_GET_SERVICE, bus, Some(&blob), caller) {
+                TransactionResult::Reply { data, .. } => {
+                    i32::from_ne_bytes(data[28..32].try_into().unwrap())
+                }
+                other => panic!("expected Reply, got {}", tr_label(&other)),
+            }
+        };
+        let ann1 = get(&bus);
+        let ann2 = get(&bus);
+        assert_eq!(ann1, STABILITY_ANNOTATION_VINTF, "first hit serves plain");
+        assert_eq!(
+            ann2, STABILITY_ANNOTATION_VINTF_A12,
+            "unknown-SDK guests keep the legacy flip"
+        );
+        test_set_guest_rootfs(None);
     }
 
     // ====================================================================
