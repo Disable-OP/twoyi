@@ -10094,7 +10094,11 @@ fn fb0_log(msg: &str) {
 ///   no /proc entry at all                              => DEAD + reaped
 /// (The comm field in parentheses can itself contain ')' and spaces, so we
 /// anchor on the LAST ')' — rfind — before reading the state char.)
-fn traced_child_alive(pid: libc::pid_t) -> bool {
+/// Fresh /proc liveness probe for a TRACED child — the kernel-true
+/// process-liveness oracle (6-Z354: the virtual binder's transaction
+/// delivery gate uses this instead of heap-peek anchors; the real kernel
+/// can only ever know PROCESS liveness). `pub(crate)` for binder.rs.
+pub(crate) fn traced_child_alive(pid: libc::pid_t) -> bool {
     match std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
         Ok(stat) => {
             // field 3 (state) is the char after the comm field ") "

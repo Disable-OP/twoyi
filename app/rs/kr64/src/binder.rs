@@ -4109,12 +4109,13 @@ fn handle_write_read(
             }
             match delivery {
                 Delivery::Tx(tx) => {
-                    // 6-Z306an: delivery-time TARGET LIVENESS GATE. Kernel
-                    // semantics: a transaction whose target object died
-                    // while queued is NEVER delivered to the server — the
-                    // kernel releases the node's pending work and the
+                    // 6-Z354 (supersedes the 6-Z306an heap-anchor gate):
+                    // delivery-time TARGET LIVENESS GATE, now KERNEL-TRUE.
+                    // Kernel semantics: a transaction whose target node's
+                    // OWNER PROCESS died while queued is NEVER delivered —
+                    // the kernel releases the node's pending work and the
                     // REQUESTER's read surfaces BR_DEAD_REPLY. Delivering
-                    // it here anyway forces the server's libhwbinder/
+                    // to a dead owner forced the server's libhwbinder/
                     // libbinder to either incStrong a dead cookie (the
                     // #235/#237/#238 SIGSEGV fleet) or — after the 6-Z306z
                     // shlib neutralization — parse a BR_DEAD_REPLY in the
@@ -4122,60 +4123,91 @@ fn handle_write_read(
                     // executeCommand does not handle ("*** BAD COMMAND
                     // 29189" → LOG_ALWAYS_FATAL abort — the #239
                     // audioserver/system_server fleet: 30 aborts in one
-                    // run, system_server dead at +181.9s). The anchor is
-                    // the full 6-Z306ae-f round-trip + 6-Z306d-b
-                    // association chain (tri-state: only a POSITIVE Dead
-                    // verdict rejects — an unreadable anchor never drops a
-                    // possibly-live transaction).
+                    // run, system_server dead at +181.9s). The 6-Z306an
+                    // heap anchor COULD NOT distinguish "object really
+                    // dead" from "the chunk was reused while the process
+                    // and its registration stay live" — rn305's composer
+                    // proved the latter happens in production (103
+                    // spurious rejections; see the gate body below).
                     let mut tx_rejected = false;
-                    // The gate needs a readable guest target process to
-                    // verify against: no conn identity (dpid<=0 — the
-                    // unit-test bus conns never announce IDENT) or no
-                    // local object (handle-form, cookie==0) → no verdict
-                    // possible → deliver exactly as before. Only a
-                    // POSITIVE Dead verdict from the anchor rejects.
+                    // The gate needs a conn identity with a live owner
+                    // process (dpid>0): no identity (the unit-test bus
+                    // conns never announce IDENT) or no local object
+                    // (handle-form, cookie==0) → deliver exactly as
+                    // before. 6-Z354: the decision is KERNEL-TRUE —
+                    // process liveness via a fresh /proc probe (the 6-Z89
+                    // mechanism, zero waitpid side effects). The 6-Z306ae-f
+                    // heap anchor is DEMOTED to a bounded diagnostic: rn305
+                    // caught it ruling the COMPOSER's service object
+                    // "Dead" ([R+8]=0 at +14.96s) 5 s after the SAME W/B
+                    // pair PASSED the anchor at ADD (+9.78s) — 103 spurious
+                    // BR_DEAD_REPLYs, ZERO deliveries to the composer's
+                    // hwbinder connection, surfaceflinger death-looping on
+                    // "found dead hwbinder service" — while the composer
+                    // process demonstrably lived, served and held its
+                    // resources the whole run. The real kernel cannot and
+                    // does not inspect server heap state.
                     if tx.cookie != 0 {
                         let dpid = {
                             let b = bus.lock().expect("binder bus poisoned");
                             b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
                         };
-                        if dpid > 0
-                            && matches!(mirror_ref_check(dpid, tx.ptr, tx.cookie), Liveness::Dead)
-                        {
-                            // Undo the delivery bookkeeping done at pop
-                            // time (both the direct pop and the 6-Z271g
-                            // steal push the txn_stack frame; pending_in
-                            // was already retained away there) and resolve
-                            // the requester with BR_DEAD_REPLY.
-                            if tx.txn_id != 0 {
-                                let mut b = bus.lock().expect("binder bus poisoned");
-                                if let Some(bx) = b.conns.get_mut(&conn_id) {
-                                    if bx.txn_stack.last() == Some(&tx.txn_id) {
-                                        bx.txn_stack.pop();
-                                    } else {
-                                        bx.txn_stack.retain(|id| *id != tx.txn_id);
+                        if dpid > 0 {
+                            let owner_alive = crate::ptrace_emu::traced_child_alive(dpid);
+                            if tx_delivery_reject_6z354(dpid, owner_alive) {
+                                // Kernel semantics: the node's owner PROCESS
+                                // died — release the pending work and
+                                // resolve the requester with BR_DEAD_REPLY.
+                                // Undo the delivery bookkeeping done at pop
+                                // time (both the direct pop and the 6-Z271g
+                                // steal push the txn_stack frame; pending_in
+                                // was already retained away there).
+                                if tx.txn_id != 0 {
+                                    let mut b = bus.lock().expect("binder bus poisoned");
+                                    if let Some(bx) = b.conns.get_mut(&conn_id) {
+                                        if bx.txn_stack.last() == Some(&tx.txn_id) {
+                                            bx.txn_stack.pop();
+                                        } else {
+                                            bx.txn_stack.retain(|id| *id != tx.txn_id);
+                                        }
+                                    }
+                                    if let Some(requester) = b.waiters.remove(&tx.txn_id) {
+                                        if let Some(rb) = b.conns.get_mut(&requester) {
+                                            rb.reply_queue.push_back(DeferredReply::Dead);
+                                        }
                                     }
                                 }
-                                if let Some(requester) = b.waiters.remove(&tx.txn_id) {
-                                    if let Some(rb) = b.conns.get_mut(&requester) {
-                                        rb.reply_queue.push_back(DeferredReply::Dead);
-                                    }
+                                if Z306AN_REJECT_LOG.load(Ordering::Relaxed) > 0 {
+                                    Z306AN_REJECT_LOG.fetch_sub(1, Ordering::Relaxed);
+                                    info!(
+                                        "[KR64][binder][vm{}] 6-Z354: dead-OWNER transaction rejected conn={} <- conn={} code={} oneway={} ptr=0x{:x} cookie=0x{:x} (owner pid={} per fresh /proc probe) → BR_DEAD_REPLY to requester (tx #{}, {} left)",
+                                        vm_id, conn_id, tx.requester, tx.code, tx.one_way,
+                                        tx.ptr, tx.cookie, dpid, tx.txn_id,
+                                        Z306AN_REJECT_LOG.load(Ordering::Relaxed)
+                                    );
                                 }
-                            }
-                            if Z306AN_REJECT_LOG.load(Ordering::Relaxed) > 0 {
-                                Z306AN_REJECT_LOG.fetch_sub(1, Ordering::Relaxed);
+                                // Kernel semantics: every BINDER_WRITE_READ
+                                // returns at least BR_NOOP — never an empty
+                                // read buffer.
+                                push_br_noop(&mut read_buf);
+                                tx_rejected = true;
+                            } else if Z354_ANCHOR_LOG.load(Ordering::Relaxed) > 0
+                                && matches!(
+                                    mirror_ref_check(dpid, tx.ptr, tx.cookie),
+                                    Liveness::Dead
+                                )
+                            {
+                                // The anchor contradicts a LIVE owner —
+                                // rn305's composer shape. Deliver (the
+                                // kernel-true choice) and log the
+                                // contradiction while the budget lasts; once
+                                // spent, the anchor is never evaluated again.
+                                Z354_ANCHOR_LOG.fetch_sub(1, Ordering::Relaxed);
                                 info!(
-                                    "[KR64][binder][vm{}] 6-Z306an: dead-target transaction rejected conn={} <- conn={} code={} oneway={} ptr=0x{:x} cookie=0x{:x} → BR_DEAD_REPLY to requester (tx #{}, {} left)",
-                                    vm_id, conn_id, tx.requester, tx.code, tx.one_way,
-                                    tx.ptr, tx.cookie, tx.txn_id,
-                                    Z306AN_REJECT_LOG.load(Ordering::Relaxed)
+                                    "[KR64][binder][vm{}] 6-Z354: heap anchor says Dead but owner pid={} is ALIVE — delivering anyway (kernel-true; rn305 composer class)",
+                                    vm_id, dpid
                                 );
                             }
-                            // Kernel semantics: every BINDER_WRITE_READ
-                            // returns at least BR_NOOP — never an empty
-                            // read buffer.
-                            push_br_noop(&mut read_buf);
-                            tx_rejected = true;
                         }
                     }
                     if tx_rejected {
@@ -7501,6 +7533,12 @@ static Z306AG_NESTED_LOG_BUDGET: AtomicU32 = AtomicU32::new(16);
 /// stay quiet after).
 static Z306AN_REJECT_LOG: AtomicU32 = AtomicU32::new(24);
 
+/// 6-Z354: bounded budget for the ANCHOR-CONTRADICTION diagnostics — how
+/// many times the (now diagnostic-only) 6-Z306ae-f heap anchor may log a
+/// "Dead verdict on a LIVE owner" contradiction per process before it
+/// stops being evaluated entirely (zero hot-path cost after the budget).
+static Z354_ANCHOR_LOG: AtomicU32 = AtomicU32::new(24);
+
 fn z306ag_note_stack_depth(depth: usize) {
     if depth < 2 {
         return;
@@ -7694,6 +7732,16 @@ fn mirror_ref_check(guest_pid: i32, ptr: u64, cookie: u64) -> Liveness {
 /// false exactly as every unreadable case did before the tri-state.
 fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
     matches!(mirror_ref_check(guest_pid, ptr, cookie), Liveness::Alive)
+}
+
+/// 6-Z354: the TRANSACTION-delivery decision, pure for tests. Reject the
+/// queued transaction iff the target node's OWNER process is provably
+/// dead (the kernel-true oracle: a fresh /proc probe). The heap anchor
+/// NEVER decides — rn305 proved it contradicts live owners (the composer's
+/// service object: Alive at ADD, "Dead" 5 s later while the process
+/// served — 103 spurious BR_DEAD_REPLYs, the SF death-loop).
+fn tx_delivery_reject_6z354(dpid: i32, owner_alive: bool) -> bool {
+    dpid > 0 && !owner_alive
 }
 
 /// Push `[BR_REPLY][binder_transaction_data]` with `tr.data_size` and
@@ -7981,6 +8029,30 @@ mod tests {
         // And the shlib's BP_BR_NOOP must equal the kernel BR_NOOP the
         // guest's executeCommand switches on.
         assert_eq!(BR_NOOP, 0x0000720C);
+    }
+
+    #[test]
+    fn z354_delivery_rejects_only_dead_owner() {
+        // The kernel-true delivery decision: reject iff the target node's
+        // OWNER process is provably dead. The rn305 composer case is the
+        // regression lock: a LIVE owner with a "Dead" heap anchor MUST
+        // deliver (the anchor never decides).
+        assert!(
+            !tx_delivery_reject_6z354(2965, true),
+            "live owner ⇒ deliver (the rn305 composer class: heap anchor said Dead, the process served)"
+        );
+        assert!(
+            tx_delivery_reject_6z354(2965, false),
+            "dead owner ⇒ reject with BR_DEAD_REPLY (kernel node-work release)"
+        );
+        assert!(
+            !tx_delivery_reject_6z354(0, false),
+            "no conn identity (unit-test bus conns) ⇒ deliver as before"
+        );
+        assert!(
+            !tx_delivery_reject_6z354(-1, true),
+            "negative pid ⇒ deliver as before"
+        );
     }
 
     #[test]
@@ -9187,6 +9259,12 @@ mod tests {
         let _handle = proxy.spawn().expect("BinderProxy::spawn");
         std::thread::sleep(Duration::from_millis(50));
 
+        // 6-Z354: the delivery gate is KERNEL-TRUE now — the node owner's
+        // pid must be a LIVE process (fresh /proc probe), so the test
+        // announces the test process's own pid instead of a fake one (a
+        // fake pid is a dead owner and the gate would BR_DEAD_REPLY the
+        // delivery — correct production behavior, wrong test fixture).
+        let live_pid = std::process::id();
         let ident_payload = |pid: u32| {
             let mut p = Vec::with_capacity(12);
             p.extend_from_slice(&pid.to_ne_bytes());
@@ -9195,9 +9273,9 @@ mod tests {
             p
         };
 
-        // ---- Conn A (pid 7777): addService("svc_a") ----
+        // ---- Conn A (pid live): addService("svc_a") ----
         let mut stream_a = UnixStream::connect(&path).expect("connect A");
-        let (ret_i, _r) = exchange(&mut stream_a, WIRE_CMD_IDENT, &ident_payload(7777));
+        let (ret_i, _r) = exchange(&mut stream_a, WIRE_CMD_IDENT, &ident_payload(live_pid));
         assert_eq!(ret_i, 0, "IDENT A accepted");
         let mut args = ParcelWriter::new();
         args.write_string16("svc_a");
@@ -9224,7 +9302,11 @@ mod tests {
 
         // ---- Conn B (pid 8888): getService → handle ----
         let mut stream_b = UnixStream::connect(&path).expect("connect B");
-        let (ret_i2, _r2) = exchange(&mut stream_b, WIRE_CMD_IDENT, &ident_payload(8888));
+        let (ret_i2, _r2) = exchange(
+            &mut stream_b,
+            WIRE_CMD_IDENT,
+            &ident_payload(std::process::id()),
+        );
         assert_eq!(ret_i2, 0);
         let mut args2 = ParcelWriter::new();
         args2.write_string16("svc_a");
@@ -9262,7 +9344,7 @@ mod tests {
 
         // ---- Conn A2 (pid 7777, SIBLING): read-only ioctl STEALS ----
         let mut stream_a2 = UnixStream::connect(&path).expect("connect A2");
-        let (ret_i3, _r3) = exchange(&mut stream_a2, WIRE_CMD_IDENT, &ident_payload(7777));
+        let (ret_i3, _r3) = exchange(&mut stream_a2, WIRE_CMD_IDENT, &ident_payload(live_pid));
         assert_eq!(ret_i3, 0);
         let mut wr_a2 = Vec::new();
         wr_a2.extend_from_slice(&0u32.to_ne_bytes());
@@ -9352,7 +9434,11 @@ mod tests {
 
         // ---- Conn A (pid 7777, dev=hwbinder): addService("svc_hw") ----
         let mut stream_a = UnixStream::connect(&path).expect("connect A");
-        let (ret_i, _r) = exchange(&mut stream_a, WIRE_CMD_IDENT, &ident_v2(7777, 7701, 2));
+        let (ret_i, _r) = exchange(
+            &mut stream_a,
+            WIRE_CMD_IDENT,
+            &ident_v2(std::process::id(), 7701, 2),
+        );
         assert_eq!(ret_i, 0, "IDENT A accepted");
         let mut args = ParcelWriter::new();
         args.write_string16("svc_hw");
@@ -9379,7 +9465,11 @@ mod tests {
 
         // ---- Conn B (pid 8888, dev=hwbinder): getService → handle ----
         let mut stream_b = UnixStream::connect(&path).expect("connect B");
-        let (ret_i2, _r2) = exchange(&mut stream_b, WIRE_CMD_IDENT, &ident_v2(8888, 8801, 2));
+        let (ret_i2, _r2) = exchange(
+            &mut stream_b,
+            WIRE_CMD_IDENT,
+            &ident_v2(std::process::id(), 8801, 2),
+        );
         assert_eq!(ret_i2, 0);
         let mut args2 = ParcelWriter::new();
         args2.write_string16("svc_hw");
@@ -9417,7 +9507,11 @@ mod tests {
         // MUST NOT steal: the tx is hwbinder node work, this thread's
         // IPCThreadState would serve it with the wrong class ABI.
         let mut stream_av = UnixStream::connect(&path).expect("connect Av");
-        let (ret_i3, _r3) = exchange(&mut stream_av, WIRE_CMD_IDENT, &ident_v2(7777, 7702, 3));
+        let (ret_i3, _r3) = exchange(
+            &mut stream_av,
+            WIRE_CMD_IDENT,
+            &ident_v2(std::process::id(), 7702, 3),
+        );
         assert_eq!(ret_i3, 0);
         let mut wr_v = Vec::new();
         wr_v.extend_from_slice(&0u32.to_ne_bytes());
@@ -9433,7 +9527,11 @@ mod tests {
 
         // ---- Conn A2 (pid 7777, dev=hwbinder): read-only STEALS ----
         let mut stream_a2 = UnixStream::connect(&path).expect("connect A2");
-        let (ret_i4, _r4) = exchange(&mut stream_a2, WIRE_CMD_IDENT, &ident_v2(7777, 7703, 2));
+        let (ret_i4, _r4) = exchange(
+            &mut stream_a2,
+            WIRE_CMD_IDENT,
+            &ident_v2(std::process::id(), 7703, 2),
+        );
         assert_eq!(ret_i4, 0);
         let mut wr_a2 = Vec::new();
         wr_a2.extend_from_slice(&0u32.to_ne_bytes());
