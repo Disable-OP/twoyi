@@ -424,6 +424,76 @@ size_t renderControl_decoder_context_t::decode(void *buf, size_t len, IOStream *
 			sprintf(lastCall, "rcUpdateColorBuffer");
 #endif
 			break;
+			// 6-Z353: the three support-channel ops (wire layouts pinned
+			// from the A11 goldfish-opengl renderControl_enc.cpp). Without
+			// these cases the decode loop stalls on unknownOpcode and the
+			// guest's GL/allocator stream wedges.
+			case OP_rcSetPuid:
+			{
+#ifdef DEBUG_PRINTOUT
+			fprintf(stderr,"renderControl: rcSetPuid(0x%016llx )\n",(unsigned long long)*(uint64_t *)(ptr + 8));
+#endif
+			{
+				uint64_t puid_6z353;
+				memcpy(&puid_6z353, ptr + 8, sizeof(puid_6z353));
+				this->rcSetPuid(puid_6z353);
+			}
+			pos += *(int *)(ptr + 4);
+			ptr += *(int *)(ptr + 4);
+			}
+#ifdef CHECK_GL_ERROR
+			sprintf(lastCall, "rcSetPuid");
+#endif
+			break;
+			case OP_rcUpdateColorBufferDMA:
+			{
+			// Wire: [op][len][cb:4][x:4][y:4][w:4][h:4][fmt:4][type:4]
+			//       [dmaAddr:8][pixels_size:4] — the pixel bytes are NOT
+			// in the packet (they live in the address-space block the
+			// client wrote via its DMA binding). Reply: int.
+			size_t totalTmpSize = sizeof(int);
+			unsigned char *tmpBuf = stream->alloc(totalTmpSize);
+#ifdef DEBUG_PRINTOUT
+			fprintf(stderr,"renderControl: rcUpdateColorBufferDMA(0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%016llx %u )\n",*(uint32_t *)(ptr + 8), *(GLint *)(ptr + 8 + 4), *(GLint *)(ptr + 8 + 4 + 4), *(GLint *)(ptr + 8 + 4 + 4 + 4), *(GLint *)(ptr + 8 + 4 + 4 + 4 + 4), *(GLenum *)(ptr + 8 + 4 + 4 + 4 + 4 + 4), *(GLenum *)(ptr + 8 + 4 + 4 + 4 + 4 + 4 + 4), (unsigned long long)*(uint64_t *)(ptr + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4), *(uint32_t *)(ptr + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 8));
+#endif
+			{
+				uint64_t dmaAddr_6z353;
+				memcpy(&dmaAddr_6z353, ptr + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4, sizeof(dmaAddr_6z353));
+				*(int *)(&tmpBuf[0]) = this->rcUpdateColorBufferDMA(
+					*(uint32_t *)(ptr + 8),
+					*(GLint *)(ptr + 8 + 4),
+					*(GLint *)(ptr + 8 + 4 + 4),
+					*(GLint *)(ptr + 8 + 4 + 4 + 4),
+					*(GLint *)(ptr + 8 + 4 + 4 + 4 + 4),
+					*(GLenum *)(ptr + 8 + 4 + 4 + 4 + 4 + 4),
+					*(GLenum *)(ptr + 8 + 4 + 4 + 4 + 4 + 4 + 4),
+					dmaAddr_6z353,
+					*(uint32_t *)(ptr + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 8));
+			}
+			stream->flush();
+			pos += *(int *)(ptr + 4);
+			ptr += *(int *)(ptr + 4);
+			}
+#ifdef CHECK_GL_ERROR
+			sprintf(lastCall, "rcUpdateColorBufferDMA");
+#endif
+			break;
+			case OP_rcCreateColorBufferDMA:
+			{
+			size_t totalTmpSize = sizeof(uint32_t);
+			unsigned char *tmpBuf = stream->alloc(totalTmpSize);
+#ifdef DEBUG_PRINTOUT
+			fprintf(stderr,"renderControl: rcCreateColorBufferDMA(0x%08x 0x%08x 0x%08x 0x%08x )\n",*(uint32_t *)(ptr + 8), *(uint32_t *)(ptr + 8 + 4), *(GLenum *)(ptr + 8 + 4 + 4), *(uint32_t *)(ptr + 8 + 4 + 4 + 4));
+#endif
+			*(uint32_t *)(&tmpBuf[0]) = 			this->rcCreateColorBufferDMA(*(uint32_t *)(ptr + 8), *(uint32_t *)(ptr + 8 + 4), *(GLenum *)(ptr + 8 + 4 + 4), *(uint32_t *)(ptr + 8 + 4 + 4 + 4));
+			stream->flush();
+			pos += *(int *)(ptr + 4);
+			ptr += *(int *)(ptr + 4);
+			}
+#ifdef CHECK_GL_ERROR
+			sprintf(lastCall, "rcCreateColorBufferDMA");
+#endif
+			break;
 			default:
 				unknownOpcode = true;
 		} //switch

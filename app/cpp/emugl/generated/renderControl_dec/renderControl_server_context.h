@@ -33,6 +33,10 @@ struct renderControl_server_context_t {
 	rcColorBufferCacheFlush_server_proc_t rcColorBufferCacheFlush;
 	rcReadColorBuffer_server_proc_t rcReadColorBuffer;
 	rcUpdateColorBuffer_server_proc_t rcUpdateColorBuffer;
+	// 6-Z353: support-channel ops
+	rcSetPuid_server_proc_t rcSetPuid;
+	rcUpdateColorBufferDMA_server_proc_t rcUpdateColorBufferDMA;
+	rcCreateColorBufferDMA_server_proc_t rcCreateColorBufferDMA;
 	//Accessors 
 	virtual rcGetRendererVersion_server_proc_t set_rcGetRendererVersion(rcGetRendererVersion_server_proc_t f) { rcGetRendererVersion_server_proc_t retval = rcGetRendererVersion; rcGetRendererVersion = f; return retval;}
 	virtual rcGetEGLVersion_server_proc_t set_rcGetEGLVersion(rcGetEGLVersion_server_proc_t f) { rcGetEGLVersion_server_proc_t retval = rcGetEGLVersion; rcGetEGLVersion = f; return retval;}
@@ -59,6 +63,10 @@ struct renderControl_server_context_t {
 	virtual rcColorBufferCacheFlush_server_proc_t set_rcColorBufferCacheFlush(rcColorBufferCacheFlush_server_proc_t f) { rcColorBufferCacheFlush_server_proc_t retval = rcColorBufferCacheFlush; rcColorBufferCacheFlush = f; return retval;}
 	virtual rcReadColorBuffer_server_proc_t set_rcReadColorBuffer(rcReadColorBuffer_server_proc_t f) { rcReadColorBuffer_server_proc_t retval = rcReadColorBuffer; rcReadColorBuffer = f; return retval;}
 	virtual rcUpdateColorBuffer_server_proc_t set_rcUpdateColorBuffer(rcUpdateColorBuffer_server_proc_t f) { rcUpdateColorBuffer_server_proc_t retval = rcUpdateColorBuffer; rcUpdateColorBuffer = f; return retval;}
+	// 6-Z353: support-channel ops
+	virtual rcSetPuid_server_proc_t set_rcSetPuid(rcSetPuid_server_proc_t f) { rcSetPuid_server_proc_t retval = rcSetPuid; rcSetPuid = f; return retval;}
+	virtual rcUpdateColorBufferDMA_server_proc_t set_rcUpdateColorBufferDMA(rcUpdateColorBufferDMA_server_proc_t f) { rcUpdateColorBufferDMA_server_proc_t retval = rcUpdateColorBufferDMA; rcUpdateColorBufferDMA = f; return retval;}
+	virtual rcCreateColorBufferDMA_server_proc_t set_rcCreateColorBufferDMA(rcCreateColorBufferDMA_server_proc_t f) { rcCreateColorBufferDMA_server_proc_t retval = rcCreateColorBufferDMA; rcCreateColorBufferDMA = f; return retval;}
 	 virtual ~renderControl_server_context_t() {}
 	int initDispatchByName( void *(*getProc)(const char *name, void *userData), void *userData);
 };

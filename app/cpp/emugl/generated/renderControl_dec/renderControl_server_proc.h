@@ -35,5 +35,13 @@ typedef EGLint (renderControl_APIENTRY *rcColorBufferCacheFlush_server_proc_t) (
 typedef void (renderControl_APIENTRY *rcReadColorBuffer_server_proc_t) (uint32_t, GLint, GLint, GLint, GLint, GLenum, GLenum, void*);
 typedef int (renderControl_APIENTRY *rcUpdateColorBuffer_server_proc_t) (uint32_t, GLint, GLint, GLint, GLint, GLenum, GLenum, void*);
 
+// 6-Z353: support-channel ops (wire layouts pinned from A11 goldfish-opengl
+// renderControl_enc.cpp). rcUpdateColorBufferDMA carries the DMA address +
+// size on the wire (the pixels live in the address-space block, never
+// inline), so the server proc takes the address instead of a host pointer.
+typedef void (renderControl_APIENTRY *rcSetPuid_server_proc_t) (uint64_t);
+typedef int (renderControl_APIENTRY *rcUpdateColorBufferDMA_server_proc_t) (uint32_t, GLint, GLint, GLint, GLint, GLenum, GLenum, uint64_t, uint32_t);
+typedef uint32_t (renderControl_APIENTRY *rcCreateColorBufferDMA_server_proc_t) (uint32_t, uint32_t, GLenum, uint32_t);
+
 
 #endif

@@ -53,6 +53,18 @@ const PIPE_PREFIX: &str = "pipe:";
 /// decode evidence stays bounded; no session semantics change).
 static QZ352_PEEK_BUDGET: AtomicU64 = AtomicU64::new(24);
 
+/// 6-Z353: goldfish SUPPORT channels served by the proxy itself — no
+/// renderer socket exists for them and the pinned client protocols are
+/// self-contained (see the two serve_* handlers below).
+const SERVICE_CHANNELS: [&str; 2] = ["refcount", "GLProcessPipe"];
+
+/// 6-Z353: monotonically increasing per-process unique IDs for the
+/// goldfish "GLProcessPipe" handshake. `0` is the client's no-puid
+/// sentinel (ProcessPipe.cpp leaves sProcUID = 0 when the handshake
+/// fails), so the host-assigned space starts at 1 — the puid is
+/// "assigned by the host", never derived from the pid.
+static NEXT_GL_PROCESS_PUID: AtomicU64 = AtomicU64::new(1);
+
 /// Spawn the qemu_pipe proxy.
 ///
 /// Takes ownership of the `UnixListener` (extracted from the
@@ -165,7 +177,18 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
     let (channel, leftover) = read_channel_name(&mut guest)?;
     info!("[KR64][qemu_pipe] session {} channel = {}", sid, channel);
 
-    if !KNOWN_CHANNELS.contains(&channel.as_str()) {
+    // 6-Z353: the support channels are served in-process; the leftover
+    // handshake bytes ride along (the confirm int / first handle write
+    // may have arrived coalesced with the name — the rn285 session-2
+    // shape).
+    if channel == "refcount" {
+        return serve_refcount_channel(guest, sid, leftover);
+    }
+    if channel == "GLProcessPipe" {
+        return serve_gl_process_pipe_channel(guest, sid, leftover);
+    }
+
+    if !FORWARD_CHANNELS.contains(&channel.as_str()) {
         // Unknown channel — close. (Future: route "audio", "camera", etc.)
         warning!(
             "[KR64][qemu_pipe] session {} unknown channel '{}', closing",
@@ -384,8 +407,15 @@ fn read_channel_name(stream: &mut UnixStream) -> std::io::Result<(String, Vec<u8
     ))
 }
 
-/// Channel names [`handle_session`](fn.handle_session.html) accepts.
-const KNOWN_CHANNELS: [&str; 3] = ["opengles", "opengles2", "opengles3"];
+/// Channels proxied to a renderer socket under the rootfs
+/// (`{rootfs}/{channel}`, served by libOpenglRender's RenderServer).
+const FORWARD_CHANNELS: [&str; 3] = ["opengles", "opengles2", "opengles3"];
+
+/// A channel name the proxy accepts at all (forwarded OR served in
+/// process — 6-Z353 added the two support channels to the accepted set).
+fn is_known_channel(name: &str) -> bool {
+    FORWARD_CHANNELS.contains(&name) || SERVICE_CHANNELS.contains(&name)
+}
 
 /// If `buf` starts with `"pipe:"` and contains a TERMINATED printable
 /// name, return `(name, total_bytes_consumed)` — consumed counts from
@@ -422,7 +452,7 @@ fn parse_channel_name(buf: &[u8]) -> Option<(&str, usize)> {
         // stays open for the payload).
         None => {
             let candidate = std::str::from_utf8(name_bytes).ok()?;
-            if KNOWN_CHANNELS.contains(&candidate) {
+            if is_known_channel(candidate) {
                 return Some((candidate, buf.len()));
             }
             // Split-delivery patience: a PROPER PREFIX of a known
@@ -431,7 +461,8 @@ fn parse_channel_name(buf: &[u8]) -> Option<(&str, usize)> {
             // become a known channel, so treat it as a complete
             // (unknown) name; the caller logs + closes instead of
             // blocking forever on the next read.
-            if KNOWN_CHANNELS
+            if [FORWARD_CHANNELS.as_slice(), SERVICE_CHANNELS.as_slice()]
+                .concat()
                 .iter()
                 .any(|known| known.len() > candidate.len() && known.starts_with(candidate))
             {
@@ -460,6 +491,116 @@ fn parse_channel_name(buf: &[u8]) -> Option<(&str, usize)> {
     // first clientFlags byte of a nonzero flags word after an
     // unterminated name) — leave it for the caller's leftover.
     Some((name, PIPE_PREFIX.len() + end))
+}
+
+// ============================================================================
+// 6-Z353: goldfish support channels
+// ============================================================================
+
+/// Serve the goldfish `refcount` support channel.
+///
+/// Pinned client: goldfish-opengl @ android11-release. `allocator3.cpp`
+/// (the IAllocator service that turned rn303/rn304's composer allocate
+/// into "GraphicBufferAllocator Failed to allocate (720 x 1600) usage
+/// a00: 5") opens one connection per allocated color buffer and writes
+/// the 4-byte host handle — and HARD-fails the whole allocation with
+/// gralloc1 NO_RESOURCES when the open or the write fails, BEFORE any
+/// renderer round-trip. `gralloc_30.cpp` is the same shape (the fd is
+/// then kept inside the gralloc buffer handle, crossing processes);
+/// `gralloc_old.cpp` / `egl.cpp` use it best-effort. The client NEVER
+/// reads from this pipe: open + write success is the entire contract,
+/// and closing the pipe is the reference-drop event (the real
+/// emulator's RefCountPipe service keys color-buffer lifetime to it:
+/// every write pins the handle, pipe close drops the pin).
+///
+/// This port's color buffers live until the owning GL session tears
+/// down (rcCloseColorBuffer still frees), so the accounting here is
+/// bookkeeping: one summary line per session, no per-write logging.
+fn serve_refcount_channel(
+    mut guest: UnixStream,
+    sid: u64,
+    leftover: Vec<u8>,
+) -> std::io::Result<()> {
+    let mut bytes = leftover.len() as u64;
+    let mut buf = [0u8; 64];
+    loop {
+        match guest.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => bytes += n as u64,
+            Err(_) => break,
+        }
+    }
+    info!(
+        "[KR64][qemu_pipe] session {} refcount closed ({} handle writes served)",
+        sid,
+        bytes / 4
+    );
+    Ok(())
+}
+
+/// Serve the goldfish `GLProcessPipe` support channel.
+///
+/// Pinned client: goldfish-opengl @ android11-release `ProcessPipe.cpp`
+/// (`sQemuPipeInit`): once per process the GL stack opens the channel,
+/// writes an `int32` confirmation (`100` — the 6-Z352 peek's
+/// `64000000`), then BLOCKS reading the host-assigned per-process
+/// unique ID (8 bytes, LE). With the handshake complete the client
+/// announces the puid on the renderControl stream (`rcSetPuid`, op
+/// 10033 — decoded by the renderer since 6-Z353); a failed handshake
+/// degrades to the pre-6-Z353 fallback (open fails → "Process pipe
+/// failed" → the default resource-cleanup path), which is exactly
+/// today's close-on-open behavior.
+fn serve_gl_process_pipe_channel(
+    mut guest: UnixStream,
+    sid: u64,
+    leftover: Vec<u8>,
+) -> std::io::Result<()> {
+    // The confirm int may have arrived coalesced with the handshake
+    // (the rn285 session-2 shape); consume what is already buffered and
+    // read the remainder. A client that opens but never confirms would
+    // wedge this thread forever — the real device would wait, but a
+    // bounded 10 s guard turns a broken guest into the same
+    // graceful-fallback close.
+    let mut confirm = [0u8; 4];
+    let from_leftover = leftover.len().min(4);
+    confirm[..from_leftover].copy_from_slice(&leftover[..from_leftover]);
+    if from_leftover < 4 {
+        let _ = guest.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        if guest.read_exact(&mut confirm[from_leftover..]).is_err() {
+            warning!(
+                "[KR64][qemu_pipe] session {} GLProcessPipe: no confirmation int, closing",
+                sid
+            );
+            return Ok(());
+        }
+        let _ = guest.set_read_timeout(None);
+    }
+    let puid = NEXT_GL_PROCESS_PUID.fetch_add(1, Ordering::Relaxed);
+    if guest.write_all(&puid.to_le_bytes()).is_err() {
+        return Ok(());
+    }
+    info!(
+        "[KR64][qemu_pipe] session {} GLProcessPipe: puid {} assigned (confirm={})",
+        sid,
+        puid,
+        u32::from_le_bytes(confirm)
+    );
+    // Hold the pipe open — the client keeps it for the process lifetime
+    // (gralloc stores the fd inside the buffer handle); EOF is the
+    // process-exit event. No further protocol is defined on the pipe.
+    let mut sink = [0u8; 64];
+    loop {
+        match guest.read(&mut sink) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    info!(
+        "[KR64][qemu_pipe] session {} GLProcessPipe: puid {} exited",
+        sid, puid
+    );
+    Ok(())
 }
 
 /// Bidirectional byte pump. Reads from `from`, writes to `to`.
@@ -782,6 +923,156 @@ mod tests {
         assert!(
             result.is_err() || result.unwrap() == 0,
             "expected EOF or error after unknown channel"
+        );
+
+        drop(guest);
+        drop(proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 6-Z353 support-channel tests ----
+
+    #[test]
+    fn parse_service_channels() {
+        // The service channels must parse NUL-terminated…
+        assert_eq!(
+            parse_channel_name(b"pipe:refcount\x00"),
+            Some(("refcount", 5 + 8 + 1))
+        );
+        assert_eq!(
+            parse_channel_name(b"pipe:GLProcessPipe\x00"),
+            Some(("GLProcessPipe", 5 + 13 + 1))
+        );
+        // …and unterminated (older goldfish-opengl builds send the bare
+        // name and keep the connection open for the payload).
+        assert_eq!(
+            parse_channel_name(b"pipe:refcount"),
+            Some(("refcount", 5 + 8))
+        );
+        assert_eq!(
+            parse_channel_name(b"pipe:GLProcessPipe"),
+            Some(("GLProcessPipe", 5 + 13))
+        );
+        // No prefix overlap with the forward channels: "refc" must keep
+        // waiting for the rest of the name, not parse early.
+        assert_eq!(parse_channel_name(b"pipe:refc"), None);
+        assert_eq!(parse_channel_name(b"pipe:GLProcess"), None);
+    }
+
+    #[test]
+    fn refcount_channel_serves_handle_writes_and_holds_open() {
+        let dir = tmpdir();
+        let pipe_path = dir.join("dev").join("qemu_pipe");
+        std::fs::create_dir_all(pipe_path.parent().unwrap()).unwrap();
+
+        let proxy_listener = UnixListener::bind(&pipe_path).unwrap();
+        let proxy = spawn_qemu_pipe_proxy(
+            proxy_listener,
+            pipe_path.to_str().unwrap().to_string(),
+            dir.to_str().unwrap().to_string(),
+        )
+        .unwrap();
+
+        let mut guest = UnixStream::connect(&pipe_path).unwrap();
+        guest.write_all(b"pipe:refcount\x00").unwrap();
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        // Two 4-byte host-handle writes (the entire client contract —
+        // allocator3.cpp / gralloc_30.cpp) must both be ACCEPTED while
+        // the session stays open. A close-on-open regression would make
+        // the second write fail with EPIPE, failing this test.
+        guest.write_all(&0x24u32.to_le_bytes()).unwrap();
+        thread::sleep(std::time::Duration::from_millis(100));
+        guest.write_all(&0x25u32.to_le_bytes()).unwrap();
+
+        // The session holds until the guest drops it (gralloc keeps the
+        // fd inside the buffer handle).
+        thread::sleep(std::time::Duration::from_millis(100));
+        guest
+            .write_all(&0x26u32.to_le_bytes())
+            .expect("refcount session must stay open for the fd lifetime");
+
+        drop(guest);
+        drop(proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gl_process_pipe_mints_unique_nonzero_puids() {
+        let dir = tmpdir();
+        let pipe_path = dir.join("dev").join("qemu_pipe");
+        std::fs::create_dir_all(pipe_path.parent().unwrap()).unwrap();
+
+        let proxy_listener = UnixListener::bind(&pipe_path).unwrap();
+        let proxy = spawn_qemu_pipe_proxy(
+            proxy_listener,
+            pipe_path.to_str().unwrap().to_string(),
+            dir.to_str().unwrap().to_string(),
+        )
+        .unwrap();
+
+        // Process 1: handshake with the confirm int COALESCED into the
+        // open write (the rn285 session-2 shape) — the puid must still
+        // come back.
+        let mut g1 = UnixStream::connect(&pipe_path).unwrap();
+        g1.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut open = b"pipe:GLProcessPipe\x00".to_vec();
+        open.extend_from_slice(&100u32.to_le_bytes());
+        g1.write_all(&open).unwrap();
+        let mut buf1 = [0u8; 8];
+        g1.read_exact(&mut buf1).unwrap();
+        let p1 = u64::from_le_bytes(buf1);
+        assert_ne!(p1, 0, "0 is the client's no-puid sentinel");
+        drop(g1);
+
+        // Process 2: the confirm int in a SEPARATE write (the classic
+        // shape) — must get a DIFFERENT, unique puid.
+        let mut g2 = UnixStream::connect(&pipe_path).unwrap();
+        g2.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        g2.write_all(b"pipe:GLProcessPipe\x00").unwrap();
+        g2.write_all(&100u32.to_le_bytes()).unwrap();
+        let mut buf2 = [0u8; 8];
+        g2.read_exact(&mut buf2).unwrap();
+        let p2 = u64::from_le_bytes(buf2);
+        assert_ne!(p2, 0);
+        assert_ne!(p2, p1, "puids must be unique per process");
+
+        drop(g2);
+        drop(proxy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gl_process_pipe_without_confirm_closes_gracefully() {
+        let dir = tmpdir();
+        let pipe_path = dir.join("dev").join("qemu_pipe");
+        std::fs::create_dir_all(pipe_path.parent().unwrap()).unwrap();
+
+        let proxy_listener = UnixListener::bind(&pipe_path).unwrap();
+        let proxy = spawn_qemu_pipe_proxy(
+            proxy_listener,
+            pipe_path.to_str().unwrap().to_string(),
+            dir.to_str().unwrap().to_string(),
+        )
+        .unwrap();
+
+        // A client that opens the channel but never sends the confirm
+        // int gets the graceful close (the pre-6-Z353 fallback shape),
+        // not a wedged proxy thread. The guard is 10 s; this test would
+        // take that long only on regression — acceptable as a slow
+        // failure, never a hang.
+        let mut guest = UnixStream::connect(&pipe_path).unwrap();
+        guest
+            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
+            .unwrap();
+        guest.write_all(b"pipe:GLProcessPipe\x00").unwrap();
+        let mut sink = [0u8; 8];
+        let result = guest.read(&mut sink);
+        assert!(
+            result.is_err() || result.unwrap() == 0,
+            "expected the graceful close after the missing confirm int"
         );
 
         drop(guest);
