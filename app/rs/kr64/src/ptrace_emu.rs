@@ -6837,10 +6837,16 @@ fn peek_word_errno(pid: libc::pid_t, addr: u64) -> i32 {
     }
 }
 
-/// 6-Z167: given the child's /proc/<pid>/maps content, return the mapping
-/// line containing `addr` (plus the preceding mapping for context) or the
-/// two neighbours when `addr` falls in a gap. Pure helper (content in) so
-/// the mapping-bracket logic is unit-testable.
+/// 6-Z363: parse a /proc/pid/maps line's "start-end" range. Returns
+/// (start, end) on success, None for malformed lines.
+fn scan_maps_range(line: &str) -> Option<(u64, u64)> {
+    let (range, _rest) = line.split_once(' ')?;
+    let (s, e) = range.split_once('-')?;
+    let s0 = u64::from_str_radix(s, 16).ok()?;
+    let e0 = u64::from_str_radix(e, 16).ok()?;
+    Some((s0, e0))
+}
+
 fn maps_bracket_in(content: &str, addr: u64) -> String {
     let mut prev: Option<&str> = None;
     for line in content.lines() {
@@ -15062,6 +15068,12 @@ pub fn run_ptrace_loop(
     // The mask's bits are cleared as each 6-Z362_MILESTONES threshold is
     // first crossed, so each pid logs one milestone line per threshold.
     let mut big_mmap_stats: std::collections::HashMap<libc::pid_t, (u64, u64, u64, u32)> =
+        std::collections::HashMap::new();
+    // 6-Z363: per-pid deep-detail budget (armed to 8 at each ≥1 GiB milestone
+    // crossing; decremented per logged deep line; removed at 0). Keeps the
+    // ballooning pid's own call shapes visible past the boot-wide detail cap
+    // without re-opening the hot path to per-event logging.
+    let mut big_mmap_deep_budget: std::collections::HashMap<libc::pid_t, u32> =
         std::collections::HashMap::new();
 
     // Runtime-detected syscall/register layout for the child. `None`
@@ -29159,6 +29171,10 @@ pub fn run_ptrace_loop(
                                 // owed for BIG_ANON_MMAP_MILESTONES[i]).
                                 let mut owed = st.3;
                                 let mut ms_text = String::new();
+                                // 6-Z363: the LARGEST threshold crossed in this
+                                // update — gates the milestone deep-dive to the
+                                // 1 GiB-class and above crossings (index 2+).
+                                let mut ms_index_hit: Option<usize> = None;
                                 for (i, th) in BIG_ANON_MMAP_MILESTONES.iter().enumerate() {
                                     if owed & (1u32 << i) != 0 && st.1 >= *th {
                                         owed &= !(1u32 << i);
@@ -29166,6 +29182,7 @@ pub fn run_ptrace_loop(
                                             " {:.2}GiB",
                                             *th as f64 / 1073741824.0
                                         ));
+                                        ms_index_hit = Some(i);
                                     }
                                 }
                                 st.3 = owed;
@@ -29174,6 +29191,105 @@ pub fn run_ptrace_loop(
                                         "6-Z362: big-anon-mmap MILESTONE pid={} crossed{} total={} count={} max={} — display-era leak class names itself here",
                                         pid, ms_text, st.1, st.0, st.2
                                     ));
+                                    // ── 6-Z363: milestone deep-dive ──
+                                    //
+                                    // rn316 proved the milestone TOTALS catch
+                                    // the balloon (pid 3439: 12.05 → 57.89 GiB
+                                    // in one window) but the boot-wide detail
+                                    // budget was long exhausted by the early
+                                    // scudo reservations, so the balloon's
+                                    // per-CALL sizes/flags and its CALLER were
+                                    // still invisible. On every 1 GiB-class or
+                                    // larger crossing, dump (bounded): (a) the
+                                    // guest PC of THIS mmap and its library
+                                    // bracket from /proc/pid/maps — the caller
+                                    // names the subsystem (SF? RenderEngine?
+                                    // scudo? the goldfish EGL host-region
+                                    // client?); (b) the process's VmSize/VmRSS
+                                    // pair — virtual vs touched, the RSS kill
+                                    // chain's direct input; (c) the largest
+                                    // regions currently mapped. ONE dump per
+                                    // crossing, ≤4 per pid by the milestone
+                                    // count itself, no hot-path cost.
+                                    let deep363 = ms_index_hit.map(|i| i >= 2).unwrap_or(false);
+                                    if deep363 {
+                                        let pc363 = guest_pc_of(&regs);
+                                        let maps363 =
+                                            std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                                .ok();
+                                        let pc_br363 = maps363
+                                            .as_deref()
+                                            .map(|c| maps_bracket_in(c, pc363))
+                                            .unwrap_or_else(|| "<maps unreadable>".to_string());
+                                        let status363 = std::fs::read_to_string(format!(
+                                            "/proc/{}/status",
+                                            pid
+                                        ))
+                                        .ok();
+                                        let mut vsz363 = String::from("VmSize=?");
+                                        let mut rss363 = String::from("VmRSS=?");
+                                        if let Some(s) = status363.as_deref() {
+                                            for line in s.lines() {
+                                                if line.starts_with("VmSize:") {
+                                                    vsz363 = line.to_string();
+                                                } else if line.starts_with("VmRSS:") {
+                                                    rss363 = line.to_string();
+                                                }
+                                            }
+                                        }
+                                        let mut regions363 = String::new();
+                                        if let Some(c) = maps363.as_deref() {
+                                            let mut big: Vec<(u64, &str)> = Vec::new();
+                                            for line in c.lines() {
+                                                if let Some((s0, s1)) = scan_maps_range(line) {
+                                                    let sz = s1 - s0;
+                                                    if sz >= 256 * 1024 * 1024 {
+                                                        big.push((sz, line));
+                                                    }
+                                                }
+                                            }
+                                            big.sort_by_key(|a| std::cmp::Reverse(a.0));
+                                            for (_, line) in big.iter().take(6) {
+                                                regions363.push_str(&format!(
+                                                    "\n6-Z363 region: {}",
+                                                    line
+                                                ));
+                                            }
+                                        }
+                                        log(&format!(
+                                            "6-Z363: milestone-deep pid={} total={:.2}GiB pc={:#x} {} {}\n6-Z363 pc-bracket: {}{}",
+                                            pid,
+                                            st.1 as f64 / 1073741824.0,
+                                            pc363,
+                                            vsz363,
+                                            rss363,
+                                            pc_br363,
+                                            regions363
+                                        ));
+                                        // 6-Z363: arm the per-pid detail
+                                        // budget — the NEXT 8 big mmaps of
+                                        // THIS pid log their len/flags even
+                                        // past the boot-wide detail cap (the
+                                        // balloon's exact call shape).
+                                        big_mmap_deep_budget.insert(pid, 8);
+                                    }
+                                } else if let Some(deep_left) = big_mmap_deep_budget.get_mut(&pid) {
+                                    // 6-Z363: the per-pid detail budget armed at a
+                                    // 1 GiB-class milestone crossing — the balloon
+                                    // pid's own calls log past the boot-wide cap.
+                                    log(&format!(
+                                        "6-Z363: deep pid={} len={} flags={:#x} ret={:#x} total={:.2}GiB (deep budget {} left)",
+                                        pid,
+                                        m_len,
+                                        m_flags,
+                                        m_ret,
+                                        st.1 as f64 / 1073741824.0,
+                                        *deep_left
+                                    ));
+                                    *deep_left -= 1;
+                                    if *deep_left == 0 {
+                                        big_mmap_deep_budget.remove(&pid);
+                                    }
                                 } else if detail_n < BIG_ANON_MMAP_DETAIL_CAP {
                                     log(&format!(
                                         "6-Z362: big-anon-mmap pid={} len={} flags={:#x} ret={:#x} (event #{}, detail {}/{})",
