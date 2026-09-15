@@ -30307,3 +30307,17 @@ Work Log:
 Stage Summary:
 - Two decode→fix→dispatch cycles in one session; the keystore enumerate chain is now 2 hops from closing (bare-name entries → try_get_device("default") → alias-hit → halVersion → kmDevices[TE]).
 - EXPECT rn334: 0 kmDevices + 0 CHECK(device) aborts; keystore ALIVE; the storm window clears further; rungs advance if system_server survives. Then the joinRpcThreadpool class (32×) is the next named wall.
+
+---
+Task ID: 118 (rn334 decoded same-session: 6-Z377 VERIFIED — the keystore crash storm is GONE and a GUEST keystore is ALIVE in the fleet; the next wall = the joinRpcThreadpool loop)
+
+Work Log:
+- rn334 = workflow run 35020444385 (run_number 334, sha 9ccb7100 = 6-Z377), artifact cached /home/z/artifacts-rn334/. Verdict rung 7 (verifier lag unchanged — no liveness evidence lost).
+- **6-Z377 VERIFIED — the keystore crash storm is GONE**: kmDevices aborts 40→0-loop (1 single abort = the first instance's init race); CHECK(device) aborts 33→1 (same single first-instance race); the fleet SELF-HEALED: instance 2 resolved the device at +21878ms (get(4.0/default) hit → handle 0xb), instance 3 at +48529ms (handle 0x4a) — **getTransport(4.0/default) → HWBINDER (manifest range) + get → alias hit — the full 6-Z373+6-Z351+6-Z377 chain works end-to-end**.
+- **A GUEST keystore is ALIVE in the fleet**: ps-dockerexec guest subtree = 75 processes including keystore, surfaceflinger, zygote64 (HOST≠GUEST classified via the PPID walk from libkr64.so 2772). mem-watch tail: system_server 9793 @ 391MB (the guest's, same late-PID pattern as rn330/331). No BOOT_COMPLETED yet.
+- The one residual keystore race: the FIRST instance's getTransport(4.0/default) got EMPTY once (the 6-Z350 ancestor helper checks the registered-ANCESTOR direction; a registered DESCENDANT (4.1 for a 4.0 query) relies on the alias key — one early probe raced the alias registration; every later probe answered HWBINDER). NON-BLOCKING: the restart self-heals. Candidate hardening later: extend the bus-ancestor rule to registered-descendants (same major+iface, registered minor ≥ query minor).
+- The NEXT wall (taxonomy in rn334): joinRpcThreadpool 22× (pids 3634+, every ~10-12s = one looping second-wave service; the kmsg era shows android.hardware.media.omx@1.0-service "mediacodecservice starting" + libminijail "prctl(seccomp_filter) failed: Permission denied" + abort in the same window — likely the omx/mediacodec class; the svclog head + exec lines are the next decode's first stop), hwcomposer-get 9× (SF display era), Failed HIDL return 2×, socket-from-init 2×.
+
+Stage Summary:
+- The keystore chain is CLOSED (6-Z373 manifest ranges + 6-Z351 aliases + 6-Z376 vec<string> + 6-Z377 bare names, verified across rn330→rn334).
+- Next session: decode the joinRpcThreadpool loop (identify the looping binary; implement the kernel-true semantic — likely the configureRpcThreadpool flag or the minijail seccomp prctl denial class), gates → push → dispatch. Then the hwcomposer-get class. Then rungs 8/9.
