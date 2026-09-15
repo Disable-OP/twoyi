@@ -5440,6 +5440,26 @@ pub fn goldfish_aspace_op(req: u64) -> Option<GoldfishAspaceOp> {
 /// page-granular.
 pub const GOLDFISH_ASPACE_PAGE: u64 = 4096;
 
+/// 6-Z361 (rn314 decode): the arena's HARD ceiling. On the real goldfish
+/// device the address space is bounded by the host's RAM given to the VM;
+/// our backing is a regular file, and rn314 proved the display-era gralloc
+/// retry loop (importBufferImpl fails — the 6-Z355 fd-passing wall) leaks
+/// ~4.5 MB goldfish blocks at ~25 MB/s until the guest's own surfaceflinger
+/// process ballooned to 10.05 GB RSS and the host OOM-killed it. 512 MiB
+/// is ~100× any sane live buffer set for the A11 goldfish display stack
+/// (1080×1920 framebuffer targets are ~4.5 MB each) yet far below the
+/// kill threshold, so a stuck loop surfaces ONE honest -ENOMEM (→ the
+/// guest's gralloc NO_RESOURCES propagation) instead of an unbounded
+/// balloon. Reuse of already-carved free-list holes is NOT bounded — the
+/// ceiling only stops the backing FILE from growing.
+pub const GOLDFISH_ASPACE_CEILING: u64 = 512 * 1024 * 1024;
+
+/// 6-Z361: how many per-grow ftruncate log lines are emitted before the
+/// sampler switches to the every-512th-grow aggregate (bounded diagnostics
+/// discipline — no per-event logging on a hot path the rn314 decode proved
+/// can run for ~90 s at ~25 MB/s).
+pub const GOLDFISH_ASPACE_GROW_LOG_CAP: u64 = 32;
+
 /// 6-Z338: the address-space arena. ONE backing regular file is shared by
 /// every opener (the stand-in node), so offsets are GLOBAL across guest
 /// processes and must never collide — exactly what the real goldfish
@@ -5460,10 +5480,21 @@ impl GoldfishAspaceArena {
         }
     }
 
+    /// The bump pointer's end — the current size the backing file must grow
+    /// to serve every live+free block carved so far (6-Z361: what the
+    /// ftruncate ceiling bounds).
+    pub fn bump_end(&self) -> u64 {
+        self.next_offset
+    }
+
     /// Allocate `size` bytes; returns (page-aligned offset, rounded size).
     /// Exact-fit holes are reused, bigger holes are split, then the bump
     /// pointer grows. `phys_addr` mirrors the offset (informational on the
     /// A11 client: physAddr() feeds cache-maintenance paths only).
+    /// 6-Z361: the bump branch refuses to grow past GOLDFISH_ASPACE_CEILING
+    /// and returns None (the caller fakes -ENOMEM, kernel-true for the real
+    /// goldfish driver's allocation-failure path); free-list reuse is never
+    /// ceiling-bound.
     pub fn allocate(&mut self, size: u64) -> Option<(u64, u64)> {
         let rounded = Self::round(size);
         if rounded == 0 {
@@ -5477,6 +5508,9 @@ impl GoldfishAspaceArena {
             self.free_list.push((off + rounded, big - rounded));
             off
         } else {
+            if self.next_offset.checked_add(rounded)? > GOLDFISH_ASPACE_CEILING {
+                return None;
+            }
             let off = self.next_offset;
             self.next_offset += rounded;
             off
@@ -14731,6 +14765,12 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     let mut goldfish_aspace_arena: GoldfishAspaceArena = GoldfishAspaceArena::default();
     let mut goldfish_aspace_diag: u32 = 0;
+    // 6-Z361: bounded grow accounting — every ftruncate growth of the
+    // goldfish_address_space backing file logs its cumulative size (first
+    // GOLDFISH_ASPACE_GROW_LOG_CAP events, then every 512th as an
+    // aggregate; the display-era retry loop of rn314 made this curve the
+    // mission's first boot-critical memory signal).
+    let mut goldfish_aspace_grow_count: u64 = 0;
     const Z121_LOG_CAP: u32 = 60;
 
     // ── Task 6-U diagnostic state ────────────────────────────────────
@@ -28825,7 +28865,26 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                                 if let Some(end) = grow_to {
-                                    if let Some(path) = open_fd_owner_paths.get(&(pid, fd)).cloned()
+                                    if end > GOLDFISH_ASPACE_CEILING {
+                                        // 6-Z361: an honest hard bound (never a
+                                        // silent wrap) — the caller gets -ENOMEM,
+                                        // the same errno the real goldfish driver's
+                                        // allocate path returns under pressure, and
+                                        // no offset/mmap is ACKed for a block the
+                                        // backing file cannot serve.
+                                        log(&format!(
+                                            "6-Z361: goldfish_address_space grow to {} REFUSED (ceiling {}) — honest -ENOMEM (live={} bump_end={})",
+                                            end,
+                                            GOLDFISH_ASPACE_CEILING,
+                                            goldfish_aspace_arena.live_count(),
+                                            goldfish_aspace_arena.bump_end()
+                                        ));
+                                        fake_ret = -12;
+                                        // Drop the stale response so a refused
+                                        // block is never written back as success.
+                                        resp_words = None;
+                                    } else if let Some(path) =
+                                        open_fd_owner_paths.get(&(pid, fd)).cloned()
                                     {
                                         if let Ok(f) =
                                             std::fs::OpenOptions::new().write(true).open(&path)
@@ -28836,6 +28895,22 @@ pub fn run_ptrace_loop(
                                                     path, end, e
                                                 ));
                                                 fake_ret = -12; // -ENOMEM: do not ACK a mapless block
+                                            } else {
+                                                // 6-Z361: bounded growth accounting —
+                                                // the rn314 mem-watch curve showed this
+                                                // file climbing at ~25 MB/s; the klog
+                                                // now carries the same curve cheaply.
+                                                goldfish_aspace_grow_count =
+                                                    goldfish_aspace_grow_count.saturating_add(1);
+                                                if goldfish_aspace_grow_count
+                                                    <= GOLDFISH_ASPACE_GROW_LOG_CAP
+                                                    || goldfish_aspace_grow_count % 512 == 0
+                                                {
+                                                    log(&format!(
+                                                        "6-Z361: goldfish_address_space backing grown to {} bytes (grow #{})",
+                                                        end, goldfish_aspace_grow_count
+                                                    ));
+                                                }
                                             }
                                         } else {
                                             fake_ret = -12;
@@ -47540,7 +47615,10 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
 
 #[cfg(test)]
 mod z338_goldfish_aspace_tests {
-    use super::{goldfish_aspace_op, GoldfishAspaceArena, GoldfishAspaceOp, GOLDFISH_ASPACE_MAGIC};
+    use super::{
+        goldfish_aspace_op, GoldfishAspaceArena, GoldfishAspaceOp, GOLDFISH_ASPACE_CEILING,
+        GOLDFISH_ASPACE_MAGIC, GOLDFISH_ASPACE_PAGE,
+    };
 
     // _IOWR('G', nr, T) = (3<<30)|(sizeof(T)<<16)|('G'<<8)|nr — the exact
     // bytes the A11 goldfish-opengl client builds (pinned from
@@ -47638,5 +47716,71 @@ mod z338_goldfish_aspace_tests {
         assert_eq!(a.free(off), Some((off, 4096)));
         assert_eq!(a.free(off), None);
         assert_eq!(a.free(0xdead_0000), None);
+    }
+
+    // ── 6-Z361: the hard ceiling (rn314's 10.05 GB SF balloon) ──────
+
+    #[test]
+    fn z361_ceiling_refuses_bump_growth_beyond_512mib() {
+        let mut a = GoldfishAspaceArena::default();
+        // Fill right up to the ceiling with 4 MiB blocks (the rn314
+        // display-era block size was 4.5 MB): 512 MiB / 4 MiB = 128
+        // allocations succeed, the 129th must refuse.
+        let block = 4 * 1024 * 1024;
+        let mut last_off = 0u64;
+        for i in 0..128 {
+            let (off, rounded) = a
+                .allocate(block)
+                .unwrap_or_else(|| panic!("allocate #{} within ceiling failed", i));
+            last_off = off + rounded;
+        }
+        assert_eq!(a.bump_end(), GOLDFISH_ASPACE_CEILING);
+        assert_eq!(last_off, GOLDFISH_ASPACE_CEILING);
+        // The ceiling trip: an honest None → the caller fakes -ENOMEM.
+        assert_eq!(a.allocate(block), None);
+        // The refused attempt consumed nothing.
+        assert_eq!(a.bump_end(), GOLDFISH_ASPACE_CEILING);
+    }
+
+    #[test]
+    fn z361_ceiling_never_blocks_free_list_reuse() {
+        let mut a = GoldfishAspaceArena::default();
+        let block = 4 * 1024 * 1024;
+        for _ in 0..128 {
+            a.allocate(block).unwrap();
+        }
+        assert_eq!(a.allocate(block), None); // ceiling reached
+                                             // Free two blocks; reuse of the carved holes must STILL work —
+                                             // the ceiling bounds the backing FILE growth, not the live set.
+        assert!(a.free(0).is_some());
+        assert!(a.free(block).is_some());
+        assert_eq!(a.allocate(block), Some((0, block)));
+        assert_eq!(a.allocate(block), Some((block, block)));
+        // And a NEW carve past the ceiling is still refused.
+        assert_eq!(a.allocate(block), None);
+    }
+
+    #[test]
+    fn z361_ceiling_split_reuse_survives_and_ceiling_holds() {
+        let mut a = GoldfishAspaceArena::default();
+        let block = 4 * 1024 * 1024;
+        for _ in 0..128 {
+            a.allocate(block).unwrap();
+        }
+        // Free the LAST block and ask for a smaller size: the split
+        // branch serves it from the hole without growing the file.
+        let last_off = GOLDFISH_ASPACE_CEILING - block;
+        assert!(a.free(last_off).is_some());
+        let (off, rounded) = a.allocate(1024).unwrap();
+        assert_eq!((off, rounded), (last_off, GOLDFISH_ASPACE_PAGE));
+        assert_eq!(a.bump_end(), GOLDFISH_ASPACE_CEILING);
+        // The remainder hole still serves exact-fit requests.
+        assert_eq!(
+            a.allocate(block - GOLDFISH_ASPACE_PAGE),
+            Some((
+                last_off + GOLDFISH_ASPACE_PAGE,
+                block - GOLDFISH_ASPACE_PAGE
+            ))
+        );
     }
 }
