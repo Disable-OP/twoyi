@@ -416,7 +416,7 @@ jobs:
 
           # 6-Z360: the runner kernel's oom-killer/kill records — invisible
           # to the container, decisive for the rn310-313 death class.
-          sudo dmesg -T 2>/dev/null | rg -i 'oom|out of memory|killed process|memory cgroup' \
+          sudo dmesg -T 2>/dev/null | grep -iE 'oom|out of memory|killed process|memory cgroup' \
             > /tmp/ui-e2e-artifacts/runner-dmesg-oom.txt 2>&1 || true
 
           # ── final evidence dumps (docker exec — survives adb death) ──
