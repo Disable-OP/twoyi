@@ -1980,6 +1980,15 @@ enum DeferredReply {
     /// reply_queue so it lands BEFORE the addService reply that would
     /// otherwise let the temporary sp<> die.
     RefCmd { br: u32, ptr: u64, cookie: u64 },
+    /// 6-Z359: a KERNEL-TRUE node-ref mirror — the decision to send it
+    /// came from the proxy's OWN node refcounts (a recipient released or
+    /// died), never from a memory probe, so the delivery-time gate is the
+    /// owner-process /proc liveness check only (the 6-Z354 pattern).
+    /// The owner's IPCThreadState runs decStrong/decWeak natively (the
+    /// 6-Z306ae machinery) — for the composer this is the
+    /// onClientDestroyed path that finally lets createClient #2+
+    /// proceed past waitForClientDestroyedLocked.
+    RefCmd359 { br: u32, ptr: u64, cookie: u64 },
 }
 
 /// An incoming transaction queued for delivery to a server connection.
@@ -2114,8 +2123,47 @@ pub struct BusState {
     /// (the real servicemanagers' `ServiceCallback::onRegistration` /
     /// HIDL `IServiceNotification::onRegistration` analogue).
     watchers: HashMap<String, Vec<ServiceWatcher>>,
+    /// 6-Z359: guest-owned NODES exported OUTSIDE their own connection —
+    /// the objects a server hands out in REPLY/TRANSACTION parcels (the
+    /// composer's IComposerClient in createClient's reply, callback
+    /// objects, …). The real kernel: every such flat crosses as a
+    /// BINDER_TYPE_HANDLE in the recipient's view, backed by an in-driver
+    /// node with strong/weak refcounts; the recipient's death (or its
+    /// BC_RELEASE) decrements, and the LAST decrement mirrors BR_RELEASE
+    /// to the OWNER process so its object can be destroyed. The bus
+    /// previously kept NO such nodes: the raw ptr-form flat crossed to
+    /// the client verbatim (its shlib gate zeroed it as a foreign "dead"
+    /// local — SF read a NULL client and FATALed), and no release ever
+    /// reached the owner (the composer's mClient stayed immortal →
+    /// waitForClientDestroyedLocked failed forever → createClient #2/#3
+    /// wedged both binder threads inside the condvar → the SF restart
+    /// cascade, rung 5 at rn309's snapshot).
+    /// handle → node (0x7F000001+ — disjoint from the dense service
+    /// handles; the two handle spaces never mix).
+    nodes: HashMap<u32, GuestNode>,
+    /// (owner, ptr, cookie) → handle. Kernel-true handle identity: the
+    /// same node handed out repeatedly gets the SAME handle.
+    node_by_key: HashMap<(ConnId, u64, u64), u32>,
+    /// Monotonic node-handle allocator.
+    next_node_handle: u32,
     next_conn: u64,
     next_txn: u64,
+}
+
+/// 6-Z359: one guest-owned node (see [`BusState::nodes`]).
+struct GuestNode {
+    owner: ConnId,
+    ptr: u64,
+    cookie: u64,
+    /// Per-recipient strong-ref counts. One count is granted at each
+    /// strong-flat delivery (the kernel's in-transaction grant); each
+    /// recipient BC_RELEASE drops one; at the recipient's death all of
+    /// its counts drop. The LAST strong count dropping mirrors
+    /// BR_RELEASE to the owner (its IPCThreadState decStrongs the local
+    /// BBinder — the composer's onClientDestroyed path).
+    strong: HashMap<ConnId, u32>,
+    /// Per-recipient weak-ref counts (weak flats / BC_INCREFS era).
+    weak: HashMap<ConnId, u32>,
 }
 
 impl BusState {
@@ -2127,6 +2175,12 @@ impl BusState {
             conns: HashMap::new(),
             waiters: HashMap::new(),
             watchers: HashMap::new(),
+            nodes: HashMap::new(),
+            node_by_key: HashMap::new(),
+            // 6-Z359: node handles live in a disjoint high range so a
+            // node handle can NEVER collide with a service handle (the
+            // services registry stays dense from PROXY_HANDLE_BASE+1).
+            next_node_handle: 0x7F00_0001,
             next_conn: PROXY_CONN_ID + 1,
             next_txn: 1,
         };
@@ -2604,6 +2658,48 @@ impl BusState {
         }
         // 6-Z276: a dying connection's registerForNotifications watchers
         // are gone with it — no callback may target a dead conn's mailbox.
+        // 6-Z359: FIRST drop every node ref the dying conn held — the
+        // LAST strong drop mirrors BR_RELEASE to the node's owner (the
+        // kernel's process-death semantics: all refs die with the
+        // process). Then, nodes this conn OWNED die with it: remove them
+        // and fire death notifications to their watchers (the same shape
+        // as the named-services cleanup above).
+        {
+            let node_watchers: Vec<(u32, Vec<(ConnId, u64)>)> = {
+                let dead_node_handles: Vec<u32> = self
+                    .nodes
+                    .iter()
+                    .filter(|(_, n)| n.owner == conn)
+                    .map(|(h, _)| *h)
+                    .collect();
+                dead_node_handles
+                    .iter()
+                    .map(|h| {
+                        let watchers: Vec<(ConnId, u64)> = self
+                            .conns
+                            .iter()
+                            .filter_map(|(id, b)| b.death_watch.get(h).map(|c| (*id, *c)))
+                            .collect();
+                        (*h, watchers)
+                    })
+                    .collect()
+            };
+            for (h, ws) in node_watchers {
+                // Every OTHER conn's refs on this dead node are moot —
+                // their release mirrors would target a dead owner; just
+                // drop the entries and fail future transactions.
+                self.nodes.remove(&h);
+                self.node_by_key.retain(|_, vh| *vh != h);
+                for (watcher, wcookie) in ws {
+                    if let Some(wb) = self.conns.get_mut(&watcher) {
+                        wb.inbox.push_back(InboxItem::Death(wcookie));
+                    }
+                }
+            }
+            // Drop this conn's refs on OTHER conns' nodes (may mirror
+            // releases to live owners).
+            self.z359_drop_conn_refs(conn);
+        }
         self.remove_watchers_of_conn(conn);
     }
 
@@ -2620,6 +2716,198 @@ impl BusState {
             }
             _ => false,
         }
+    }
+
+    // ── 6-Z359: kernel-true node handles + refcount mirroring ───────────
+    //
+    // The real driver: a BINDER_TYPE_BINDER flat in a parcel that crosses
+    // to ANOTHER process is rewritten to BINDER_TYPE_HANDLE (the
+    // recipient's handle table), backed by an in-driver node; the
+    // transaction grant is one strong ref; the recipient's BC_RELEASE
+    // (or its death) drops it; the LAST drop mirrors BR_RELEASE to the
+    // node's owner so its userspace object can be destroyed. Two rn309
+    // walls hang on exactly this: (1) the composer's IComposerClient
+    // crossed to SF as a raw ptr-form flat → SF's shlib gate zeroed it
+    // as a foreign dead local → "failed to create composer client"
+    // FATAL ~600 ms after every createClient that got a reply; (2) no
+    // release was EVER mirrored → the composer's mClient stayed
+    // immortal → ComposerImpl::createClient's
+    // waitForClientDestroyedLocked failed → createClient #2 (pool thread
+    // 3394, stolen) and #3 (main 3327) wedged forever inside the HAL's
+    // condvar (STALL-DUMP: futex WAIT_BITSET val=2, stack libc++ →
+    // composer@2.3.so) → every later SF generation 8s-timeouts → the
+    // init restart cascade → rung 5.
+
+    /// Bounded 6-Z359 diag budgets (the registration storm must not flood).
+    fn z359_alloc_log() -> &'static std::sync::atomic::AtomicU32 {
+        static N: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+        N.get_or_init(|| std::sync::atomic::AtomicU32::new(12))
+    }
+    fn z359_release_log() -> &'static std::sync::atomic::AtomicU32 {
+        static N: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+        N.get_or_init(|| std::sync::atomic::AtomicU32::new(8))
+    }
+
+    /// Look up (or allocate) the node handle for a sender-local node,
+    /// and grant `recipient` one strong/weak ref. Kernel-true identity:
+    /// the same (owner, ptr, cookie) key reuses the same handle.
+    fn z359_grant_node(
+        &mut self,
+        sender: ConnId,
+        recipient: ConnId,
+        ptr: u64,
+        cookie: u64,
+        strong: bool,
+    ) -> u32 {
+        let handle = match self.node_by_key.get(&(sender, ptr, cookie)) {
+            Some(h) => *h,
+            None => {
+                let h = self.next_node_handle;
+                self.next_node_handle += 1;
+                self.node_by_key.insert((sender, ptr, cookie), h);
+                self.nodes.insert(
+                    h,
+                    GuestNode {
+                        owner: sender,
+                        ptr,
+                        cookie,
+                        strong: HashMap::new(),
+                        weak: HashMap::new(),
+                    },
+                );
+                h
+            }
+        };
+        if let Some(n) = self.nodes.get_mut(&handle) {
+            let refs = if strong { &mut n.strong } else { &mut n.weak };
+            *refs.entry(recipient).or_insert(0) += 1;
+        }
+        handle
+    }
+
+    /// Rewrite every LOCAL flat in `data`/`offsets` that crosses from
+    /// `sender` to a DIFFERENT `recipient` connection into HANDLE form
+    /// (kernel semantics) and grant the refs. Self-connection flats are
+    /// left verbatim — the owner's own unflattenBinder decodes its OWN
+    /// local object (the 6-Z306ac owner-conn LOCAL-hit shape, and the
+    /// keystore2 in-process chain depends on it).
+    fn z359_translate_flats(
+        &mut self,
+        vm_id: u32,
+        sender: ConnId,
+        recipient: ConnId,
+        data: &mut [u8],
+        offsets: &mut [u8],
+        what: &str,
+    ) {
+        if sender == recipient || offsets.is_empty() || data.is_empty() {
+            return;
+        }
+        let count = offsets.len() / 8;
+        for i in 0..count {
+            let Some(off_usize) = (|| {
+                let off = u64::from_ne_bytes(offsets[i * 8..i * 8 + 8].try_into().ok()?) as usize;
+                if off + 24 <= data.len() {
+                    Some(off)
+                } else {
+                    None
+                }
+            })() else {
+                continue;
+            };
+            let typ = u32::from_ne_bytes(data[off_usize..off_usize + 4].try_into().unwrap());
+            let (is_strong_local, handle_type) = match typ {
+                t if t == BINDER_TYPE_BINDER => (true, BINDER_TYPE_HANDLE),
+                t if t == BINDER_TYPE_WEAK_BINDER => (false, BINDER_TYPE_WEAK_HANDLE),
+                // Already handle-form (a proxy the sender received
+                // earlier and now forwards) or an fd/ptr entry: leave it.
+                _ => continue,
+            };
+            let ptr = u64::from_ne_bytes(data[off_usize + 8..off_usize + 16].try_into().unwrap());
+            let cookie =
+                u64::from_ne_bytes(data[off_usize + 16..off_usize + 24].try_into().unwrap());
+            if ptr == 0 && cookie == 0 {
+                // Explicit null-binder flat — leave verbatim.
+                continue;
+            }
+            let handle = self.z359_grant_node(sender, recipient, ptr, cookie, is_strong_local);
+            // Rewrite in place: [type][flags][handle u64][cookie=0].
+            data[off_usize..off_usize + 4].copy_from_slice(&handle_type.to_ne_bytes());
+            data[off_usize + 8..off_usize + 16].copy_from_slice(&(handle as u64).to_ne_bytes());
+            data[off_usize + 16..off_usize + 24].copy_from_slice(&0u64.to_ne_bytes());
+            if Self::z359_alloc_log().load(Ordering::Relaxed) > 0 {
+                Self::z359_alloc_log().fetch_sub(1, Ordering::Relaxed);
+                info!(
+                    "[KR64][binder][vm{}] 6-Z359: node handle 0x{:08x} → conn={} (owner conn={} ptr=0x{:x} cookie=0x{:x} strong={}) in {}",
+                    vm_id, handle, recipient, sender, ptr, cookie, is_strong_local, what
+                );
+            }
+        }
+    }
+
+    /// Drop every node ref `conn` holds; mirror the last-release to the
+    /// node owner (kernel: a dying process releases all its refs).
+    /// Called from `unregister_conn`.
+    fn z359_drop_conn_refs(&mut self, conn: ConnId) {
+        let handles: Vec<u32> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.strong.contains_key(&conn) || n.weak.contains_key(&conn))
+            .map(|(h, _)| *h)
+            .collect();
+        for h in handles {
+            self.z359_unref_node(0, h, conn, true);
+            self.z359_unref_node(0, h, conn, false);
+        }
+    }
+
+    /// Decrement `holder`'s strong/weak ref on node `handle`; mirror
+    /// BR_RELEASE / BR_DECREFS to the owner when THAT holder's count
+    /// hits zero (kernel: the mirror is per-recipient-ref, not global).
+    /// `strong=false` handles the weak side.
+    fn z359_unref_node(&mut self, vm_id: u32, handle: u32, holder: ConnId, strong: bool) {
+        let mirror = {
+            let Some(n) = self.nodes.get_mut(&handle) else {
+                return;
+            };
+            let refs = if strong { &mut n.strong } else { &mut n.weak };
+            let Some(c) = refs.get_mut(&holder) else {
+                return;
+            };
+            *c -= 1;
+            if *c > 0 {
+                None
+            } else {
+                refs.remove(&holder);
+                Some((n.owner, n.ptr, n.cookie))
+            }
+        };
+        let Some((owner, ptr, cookie)) = mirror else {
+            return;
+        };
+        let br = if strong { BR_RELEASE } else { BR_DECREFS };
+        // Kernel-true mirror: push the RefCmd onto the OWNER's
+        // reply_queue — the owner's IPCThreadState runs
+        // decStrong/decWeak on the local BBinder (the composer's
+        // onClientDestroyed). The heap anchor NEVER gates this (the
+        // 6-Z354 lesson): the release decision came from OUR OWN
+        // refcounts, not from a memory probe. Delivery-time liveness is
+        // the owner process /proc probe, checked in the RefCmd359 arm.
+        if let Some(box_) = self.conns.get_mut(&owner) {
+            box_.reply_queue
+                .push_back(DeferredReply::RefCmd359 { br, ptr, cookie });
+            if Self::z359_release_log().load(Ordering::Relaxed) > 0 {
+                Self::z359_release_log().fetch_sub(1, Ordering::Relaxed);
+                info!(
+                    "[KR64][binder][vm{}] 6-Z359: last ref from conn={} on node 0x{:08x} released → {} mirrored to owner conn={} (ptr=0x{:x} cookie=0x{:x})",
+                    vm_id, holder, handle, if strong { "BR_RELEASE" } else { "BR_DECREFS" }, owner, ptr, cookie
+                );
+            }
+        }
+        // The node entry STAYS (the key map must stay consistent — the
+        // owner may re-export the same node and the handle must be
+        // stable); the entry is a few dozen bytes and the boot creates
+        // O(100). Freed when the OWNER connection dies (unregister_conn).
     }
 }
 
@@ -3755,6 +4043,20 @@ fn handle_write_read(
                         match requester {
                             Some(rc) => {
                                 let mut b = bus.lock().expect("binder bus poisoned");
+                                // 6-Z359: translate the reply's LOCAL flats
+                                // into HANDLE form for the recipient (kernel
+                                // semantics) and grant the refs. The
+                                // composer's IComposerClient crosses HERE.
+                                let mut data = data;
+                                let mut offsets = offsets;
+                                b.z359_translate_flats(
+                                    vm_id,
+                                    conn_id,
+                                    rc,
+                                    &mut data,
+                                    &mut offsets,
+                                    "BC_REPLY",
+                                );
                                 match b.conns.get_mut(&rc) {
                                     Some(rbx) => {
                                         rbx.reply_queue.push_back(DeferredReply::Reply {
@@ -3790,9 +4092,29 @@ fn handle_write_read(
                 }
             }
             BC_ACQUIRE | BC_RELEASE | BC_INCREFS | BC_DECREFS => {
-                // Strong/weak refcount changes on remote handles. The bus
-                // keeps no refcounts (guest-owned nodes live as long as
-                // their owning connection).
+                // 6-Z359: strong/weak refcount changes on remote handles.
+                // Payload: __u32 handle (kernel UAPI — the 4-byte arg of
+                // _IOW('c', 4..7)). For 6-Z359 NODE handles these drive
+                // the kernel-true refcounting: a BC_RELEASE from the last
+                // holder mirrors BR_RELEASE to the node's OWNER (its
+                // decStrong → the object can finally be destroyed — the
+                // composer's onClientDestroyed). Service handles keep the
+                // historical no-op behavior (their lifetime is tied to
+                // their owning connection, which the teardown already
+                // handles).
+                if cmd == BC_RELEASE || cmd == BC_DECREFS {
+                    if cmd_payload.len() >= 4 {
+                        let handle = u32::from_ne_bytes(cmd_payload[0..4].try_into().unwrap());
+                        let mut b = bus.lock().expect("binder bus poisoned");
+                        if b.nodes.contains_key(&handle) {
+                            b.z359_unref_node(vm_id, handle, conn_id, cmd == BC_RELEASE);
+                        }
+                    }
+                }
+                // BC_ACQUIRE / BC_INCREFS: the delivery grant already
+                // accounted the recipient's ref (kernel-true in-transaction
+                // grant) — nothing to do; the refcount stays balanced
+                // because every strong flat delivery granted exactly one.
             }
             BC_ACQUIRE_DONE | BC_INCREFS_DONE => {
                 // Acknowledgements of refcount operations on local binders.
@@ -3962,6 +4284,35 @@ fn handle_write_read(
                         // Skipped by the invariant gate — never hand the
                         // guest an empty read buffer (kernel semantics:
                         // every BINDER_WRITE_READ returns at least BR_NOOP).
+                        push_br_noop(&mut read_buf);
+                    }
+                }
+                DeferredReply::RefCmd359 { br, ptr, cookie } => {
+                    // 6-Z359: kernel-true node-ref mirror. The decision
+                    // was made from the proxy's own refcounts at
+                    // BC_RELEASE/death time — the ONLY delivery gate is
+                    // the owner process's liveness (fresh /proc probe,
+                    // the 6-Z354 oracle): a dead owner cannot run
+                    // decStrong and the conn teardown is already
+                    // dismantling its mailbox.
+                    let dpid = {
+                        let b = bus.lock().expect("binder bus poisoned");
+                        b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                    };
+                    let owner_alive = dpid > 0 && crate::ptrace_emu::traced_child_alive(dpid);
+                    if owner_alive {
+                        read_buf.extend_from_slice(&br.to_ne_bytes());
+                        read_buf.extend_from_slice(&ptr.to_ne_bytes());
+                        read_buf.extend_from_slice(&cookie.to_ne_bytes());
+                        info!(
+                            "[KR64][binder][vm{}] 6-Z359: node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
+                            vm_id, conn_id, br, ptr, cookie
+                        );
+                    } else {
+                        info!(
+                            "[KR64][binder][vm{}] 6-Z359: node-ref mirror skipped — owner conn={} pid={} gone/dead",
+                            vm_id, conn_id, dpid
+                        );
                         push_br_noop(&mut read_buf);
                     }
                 }
@@ -4563,14 +4914,23 @@ fn handle_transaction(
         return servicemanager_proxy(code, bus, req_blob.as_ref(), conn_id);
     }
 
-    // Route to a registered service (guest-owned or in-proxy virtual).
+    // Route to a registered service (guest-owned or in-proxy virtual),
+    // falling back to the 6-Z359 NODE table (objects exported via reply
+    // parcels — the composer's IComposerClient, callbacks, …).
     let route = {
         let b = bus.lock().expect("binder bus poisoned");
-        b.by_handle.get(&target_handle).and_then(|name| {
-            b.services
-                .get(name)
-                .map(|e| (e.owner, e.ptr, e.cookie, e.virtual_kind))
-        })
+        b.by_handle
+            .get(&target_handle)
+            .and_then(|name| {
+                b.services
+                    .get(name)
+                    .map(|e| (e.owner, e.ptr, e.cookie, e.virtual_kind))
+            })
+            .or_else(|| {
+                b.nodes
+                    .get(&target_handle)
+                    .map(|n| (n.owner, n.ptr, n.cookie, None))
+            })
     };
     let (owner, ptr, cookie, virtual_kind) = match route {
         Some(r) => r,
@@ -4694,6 +5054,18 @@ fn handle_transaction(
         if !one_way {
             b.waiters.insert(txn_id, conn_id);
         }
+        // 6-Z359: translate the request's LOCAL flats for the OWNER conn
+        // (kernel semantics — a flat that crosses conns crosses as a
+        // handle) and grant the refs. Callback objects ride THIS path.
+        let mut blob = blob;
+        b.z359_translate_flats(
+            vm_id,
+            conn_id,
+            owner,
+            &mut blob.data,
+            &mut blob.offsets,
+            "BC_TX",
+        );
         let queued = b.queue_transaction(
             IncomingTx {
                 requester: conn_id,
@@ -9394,6 +9766,207 @@ mod tests {
         drop(stream_a);
         drop(stream_b);
         drop(stream_a2);
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z359_reply_local_flat_becomes_handle_and_release_mirrors_to_owner() {
+        // rn309 decode: the composer's createClient reply carried the
+        // IComposerClient as a raw ptr-form LOCAL flat. The client (SF)
+        // never saw a usable object (its shlib gate zeroed the foreign
+        // local → "failed to create composer client" FATAL) and no
+        // release EVER reached the composer (its mClient stayed immortal
+        // → waitForClientDestroyedLocked failed → createClient #2/#3
+        // wedged the HAL's condvar). Kernel-true shape proven here:
+        // (1) a LOCAL flat crossing conns arrives as BINDER_TYPE_HANDLE;
+        // (2) the recipient's BC_RELEASE mirrors BR_RELEASE (ptr, cookie)
+        // to the OWNER conn — the composer's onClientDestroyed path.
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let live_pid = std::process::id();
+        let ident_payload = |pid: u32| {
+            let mut p = Vec::with_capacity(12);
+            p.extend_from_slice(&pid.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p
+        };
+
+        // ---- Conn A (the composer stand-in): addService ----
+        let mut stream_a = UnixStream::connect(&path).expect("connect A");
+        let (ret_i, _r) = exchange(&mut stream_a, WIRE_CMD_IDENT, &ident_payload(live_pid));
+        assert_eq!(ret_i, 0);
+        let mut args = ParcelWriter::new();
+        args.write_string16("z359_svc");
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0x1234,
+            cookie: 0x5678,
+        });
+        args.write_i32(0);
+        args.write_i32(0);
+        let (ad, ao) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &ad, &ao, 4096);
+        let (ret, _resp) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0, "ADD_SERVICE ok");
+
+        // ---- Conn B (the SF stand-in): getService → handle ----
+        let mut stream_b = UnixStream::connect(&path).expect("connect B");
+        let (ret_i2, _r2) = exchange(&mut stream_b, WIRE_CMD_IDENT, &ident_payload(live_pid));
+        assert_eq!(ret_i2, 0);
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("z359_svc");
+        let (bd, bo) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload2 = make_v2_write_read_payload(&bc2, &bd, &bo, 4096);
+        let (ret2, resp2) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0);
+        let off2 = 4 + u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize + 8;
+        let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        let blob2 = &resp2[off2 + 12..off2 + 12 + dl2];
+        let svc_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+
+        // ---- Conn B: transact(code=7) → A receives BR_TRANSACTION ----
+        let mut tx_b = [0u8; 64];
+        tx_b[0..4].copy_from_slice(&svc_handle.to_ne_bytes());
+        tx_b[16..20].copy_from_slice(&7u32.to_ne_bytes());
+        let tx_data: &[u8] = b"create-client";
+        let tx_off: Vec<u8> = Vec::new();
+        let mut bc3 = Vec::with_capacity(4 + 64);
+        bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc3.extend_from_slice(&tx_b);
+        let payload3 = make_v2_write_read_multi_payload(&bc3, &[(tx_data, &tx_off)], 4096);
+        let (ret_t, _resp_t) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload3);
+        assert_eq!(ret_t, 0);
+        let mut wr_a = Vec::new();
+        wr_a.extend_from_slice(&0u32.to_ne_bytes());
+        wr_a.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_a, resp_a) = exchange(&mut stream_a, BINDER_WRITE_READ, &wr_a);
+        assert_eq!(ret_a, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp_a[4..8].try_into().unwrap()),
+            BR_TRANSACTION,
+            "A receives the transaction"
+        );
+
+        // ---- Conn A: BC_REPLY carrying a LOCAL flat (the IComposerClient) ----
+        // Parcel: [status=0 i32][pad i32][flat: type/binder/cookie] with
+        // the offsets array naming the flat at byte 8.
+        let mut reply_data: Vec<u8> = Vec::new();
+        reply_data.extend_from_slice(&0i32.to_ne_bytes()); // status NONE
+        reply_data.extend_from_slice(&0i32.to_ne_bytes()); // pad
+        reply_data.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        reply_data.extend_from_slice(&0u32.to_ne_bytes()); // flags
+        reply_data.extend_from_slice(&0xaaaa_u64.to_ne_bytes()); // binder ptr
+        reply_data.extend_from_slice(&0xbeef_u64.to_ne_bytes()); // cookie
+        let mut reply_off: Vec<u8> = Vec::new();
+        reply_off.extend_from_slice(&8u64.to_ne_bytes());
+        let reply = [0u8; 64];
+        let mut bc4 = Vec::with_capacity(4 + 64);
+        bc4.extend_from_slice(&BC_REPLY.to_ne_bytes());
+        bc4.extend_from_slice(&reply);
+        let payload4 =
+            make_v2_write_read_multi_payload(&bc4, &[(reply_data.as_slice(), &reply_off)], 0);
+        let (ret_r, _resp_r) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload4);
+        assert_eq!(ret_r, 0);
+
+        // ---- Conn B: the reply's flat MUST arrive as BINDER_TYPE_HANDLE ----
+        let mut wr_b = Vec::new();
+        wr_b.extend_from_slice(&0u32.to_ne_bytes());
+        wr_b.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_b, resp_b) = exchange(&mut stream_b, BINDER_WRITE_READ, &wr_b);
+        assert_eq!(ret_b, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp_b[4..8].try_into().unwrap()),
+            BR_REPLY,
+            "B's deferred BR_REPLY"
+        );
+        let read_b = u32::from_ne_bytes(resp_b[0..4].try_into().unwrap()) as usize;
+        let off_b = 4 + read_b + 8;
+        let dl_b = u32::from_ne_bytes(resp_b[off_b..off_b + 4].try_into().unwrap()) as usize;
+        assert_eq!(dl_b, reply_data.len(), "reply blob size preserved");
+        let got = &resp_b[off_b + 12..off_b + 12 + dl_b];
+        let flat_type = u32::from_ne_bytes(got[8..12].try_into().unwrap());
+        assert_eq!(
+            flat_type, BINDER_TYPE_HANDLE,
+            "6-Z359: the LOCAL flat crossed as a HANDLE (was a raw ptr-form flat)"
+        );
+        let node_handle = u64::from_ne_bytes(got[16..24].try_into().unwrap()) as u32;
+        assert!(
+            node_handle >= 0x7F00_0001,
+            "the node handle lives in the disjoint 6-Z359 range, got 0x{node_handle:08x}"
+        );
+        assert_eq!(
+            u64::from_ne_bytes(got[24..32].try_into().unwrap()),
+            0,
+            "handle-form cookie is 0 (the 6-Z306z shlib gate skips it)"
+        );
+
+        // ---- Conn B: BC_RELEASE {handle u32} → the mirror reaches the owner ----
+        // Kernel UAPI: BC_RELEASE carries a bare __u32 handle (4 bytes).
+        let mut rel = Vec::with_capacity(4 + 4);
+        rel.extend_from_slice(&BC_RELEASE.to_ne_bytes());
+        rel.extend_from_slice(&node_handle.to_ne_bytes());
+        let mut payload_rel = Vec::with_capacity(8 + rel.len());
+        payload_rel.extend_from_slice(&(rel.len() as u32).to_ne_bytes());
+        payload_rel.extend_from_slice(&0u32.to_ne_bytes());
+        payload_rel.extend_from_slice(&rel);
+        let (ret_rel, _resp_rel) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload_rel);
+        assert_eq!(ret_rel, 0, "BC_RELEASE accepted");
+
+        // ---- Conn A: its next read surfaces [BR_RELEASE][ptr][cookie] ----
+        let mut wr_a2 = Vec::new();
+        wr_a2.extend_from_slice(&0u32.to_ne_bytes());
+        wr_a2.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_a2, resp_a2) = exchange(&mut stream_a, BINDER_WRITE_READ, &wr_a2);
+        assert_eq!(ret_a2, 0);
+        let read_a2 = u32::from_ne_bytes(resp_a2[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            u32::from_ne_bytes(resp_a2[4..8].try_into().unwrap()),
+            BR_RELEASE,
+            "6-Z359: the release mirrored to the owner conn"
+        );
+        assert_eq!(read_a2, 4 + 16, "BR_RELEASE + binder_ptr_cookie");
+        let mirrored_ptr = u64::from_ne_bytes(resp_a2[8..16].try_into().unwrap());
+        let mirrored_cookie = u64::from_ne_bytes(resp_a2[16..24].try_into().unwrap());
+        assert_eq!(mirrored_ptr, 0xaaaa, "mirror carries the OWNER's ptr");
+        assert_eq!(mirrored_cookie, 0xbeef, "mirror carries the OWNER's cookie");
+
+        // ---- A second BC_RELEASE must NOT double-mirror (count spent) ----
+        let mut rel2 = Vec::with_capacity(4 + 4);
+        rel2.extend_from_slice(&BC_RELEASE.to_ne_bytes());
+        rel2.extend_from_slice(&node_handle.to_ne_bytes());
+        let mut payload_rel2 = Vec::with_capacity(8 + rel2.len());
+        payload_rel2.extend_from_slice(&(rel2.len() as u32).to_ne_bytes());
+        payload_rel2.extend_from_slice(&0u32.to_ne_bytes());
+        payload_rel2.extend_from_slice(&rel2);
+        let (ret_rel2, _r2) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload_rel2);
+        assert_eq!(ret_rel2, 0);
+        let mut wr_a3 = Vec::new();
+        wr_a3.extend_from_slice(&0u32.to_ne_bytes());
+        wr_a3.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_a3, resp_a3) = exchange(&mut stream_a, BINDER_WRITE_READ, &wr_a3);
+        assert_eq!(ret_a3, 0);
+        let read_a3 = u32::from_ne_bytes(resp_a3[0..4].try_into().unwrap()) as usize;
+        assert_ne!(
+            u32::from_ne_bytes(resp_a3[4..8].try_into().unwrap()),
+            BR_RELEASE,
+            "no double mirror: the recipient's ref was already spent"
+        );
+        assert!(read_a3 >= 4, "BR_NOOP keeps the buffer non-empty");
+
+        drop(stream_a);
+        drop(stream_b);
         drop(_handle);
         let _ = fs::remove_dir_all(&rootfs);
     }
