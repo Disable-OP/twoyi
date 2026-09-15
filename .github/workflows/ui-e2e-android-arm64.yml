@@ -399,8 +399,14 @@ jobs:
                   echo "-- host-ps sample (RAW HOST redroid view — the HOST runs its own"
                   echo "-- init/zygote/system_server/surfaceflinger; these are NOT guest"
                   echo "-- evidence. Guest = subtree of io.twoyi.debug, see LOG-SOURCES.txt):"
+                  # 6-Z374 verifier gap: the classifier unions these samples into
+                  # the guest subtree — the filter MUST keep the guest chain
+                  # complete down to SystemUI/launcher (zygote->system_server->
+                  # systemui), and head -12 truncated deep guest subtrees once the
+                  # host's own 7 rows were counted first (rn328 samples sat at
+                  # exactly 12 rows).
                   sudo docker exec redroid sh -c \
-                    "ps -A -o PID,PPID,NAME 2>/dev/null | grep -E 'twoyi|kr64|init|zygote|system_server|surfaceflinger'" 2>&1 | head -12
+                    "ps -A -o PID,PPID,NAME 2>/dev/null | grep -E 'twoyi|kr64|init|zygote|system_server|surfaceflinger|systemui|launcher'" 2>&1 | head -48
                 else
                   echo "-- container: NOT RUNNING"
                   sudo docker logs redroid 2>&1 | tail -n 30
