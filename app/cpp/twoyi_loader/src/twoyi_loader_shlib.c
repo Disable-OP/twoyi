@@ -622,6 +622,7 @@ static unsigned g_diag_bp_ioctl = 4;   // binder_proxy_ioctl log budget
 static unsigned g_diag_z355_fd = 16;   // 6-Z355 fd-passing diag budget
 static int g_diag_z306z_gate = 8;      // 6-Z306z delivery-gate log budget
 static int g_diag_z309_gate = 8;       // 6-Z309 parent-fixup log budget
+static int g_diag_z375_gate = 3;       // 6-Z375 post-fixup reply-wire dump budget
 
 // 6-Z356: the OWNERSHIP REGISTRY — every LOCAL node (flat.binder,
 // flat.cookie) this process itself put on the wire as a strong
@@ -1391,6 +1392,88 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                                      pfix, pskip, dlen, olen, sg_seen,
                                      g_real_pid);
                             write_str(2, m);
+                        }
+                        /* 6-Z375 — client-side post-fixup reply dump: for
+                         * the first 3 SG-bearing replies per boot, log the
+                         * full object graph (type/len/parent/parent_offset
+                         * per offsets entry) and the POST-FIXUP SG bytes
+                         * (the mBuffer slots the client's read walk
+                         * dereferences). Pairs with the proxy-side
+                         * 6-Z375 diag (kr64 binder.rs) — rn329 named the
+                         * vec<Instance> 1-entry reply as the kmDevices
+                         * wall's failing wire; this names the exact bytes
+                         * the client actually sees. */
+                        if (sg_seen > 0 && g_diag_z375_gate > 0) {
+                            g_diag_z375_gate--;
+                            size_t mcap = 2048;
+                            char *mbuf = (char *)malloc(mcap);
+                            if (mbuf) {
+                                size_t used = 0;
+                                used += (size_t)snprintf(
+                                    mbuf + used, mcap - used,
+                                    "[twoyi_loader] 6-Z375 reply wire: "
+                                    "dlen=%u olen=%u sg=%u (pid=%d)",
+                                    dlen, olen, sg_seen, g_real_pid);
+                                for (uint64_t j = 0;
+                                     j + 8 <= (uint64_t)olen && used < mcap;
+                                     j += 8) {
+                                    uint64_t obj_off;
+                                    memcpy(&obj_off, back + dlen + j, 8);
+                                    if (obj_off > (uint64_t)dlen ||
+                                        obj_off + 40 > (uint64_t)dlen) {
+                                        used += (size_t)snprintf(
+                                            mbuf + used, mcap - used,
+                                            " [%llu:OOB]",
+                                            (unsigned long long)(j / 8));
+                                        continue;
+                                    }
+                                    uint32_t otyp;
+                                    uint64_t olen_, par, poff;
+                                    memcpy(&otyp, back + obj_off, 4);
+                                    memcpy(&olen_, back + obj_off + 16, 8);
+                                    memcpy(&par, back + obj_off + 24, 8);
+                                    memcpy(&poff, back + obj_off + 32, 8);
+                                    if (otyp == BP_BINDER_TYPE_PTR) {
+                                        used += (size_t)snprintf(
+                                            mbuf + used, mcap - used,
+                                            " [%llu:PTR len=%llu par=%llu "
+                                            "poff=%llu]",
+                                            (unsigned long long)(j / 8),
+                                            (unsigned long long)olen_,
+                                            (unsigned long long)par,
+                                            (unsigned long long)poff);
+                                    } else {
+                                        used += (size_t)snprintf(
+                                            mbuf + used, mcap - used,
+                                            " [%llu:0x%x]",
+                                            (unsigned long long)(j / 8),
+                                            otyp);
+                                    }
+                                }
+                                for (uint32_t s = 0;
+                                     s < sg_seen && used < mcap; s++) {
+                                    used += (size_t)snprintf(
+                                        mbuf + used, mcap - used,
+                                        " sg%u[%u]=", s, sg_len[s]);
+                                    uint32_t hexn = sg_len[s] < 24
+                                                        ? sg_len[s]
+                                                        : 24;
+                                    for (uint32_t h = 0;
+                                         h < hexn && used + 2 < mcap; h++) {
+                                        used += (size_t)snprintf(
+                                            mbuf + used, mcap - used,
+                                            "%02x",
+                                            *(back + dlen + olen + sg_pad +
+                                              sg_dst[s] + h));
+                                    }
+                                }
+                                if (used < mcap - 1) {
+                                    mbuf[used++] = '\n';
+                                    mbuf[used] = '\0';
+                                    write_str(2, mbuf);
+                                }
+                                free(mbuf);
+                            }
                         }
                         free(slot);
                     }
