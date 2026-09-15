@@ -409,10 +409,30 @@ jobs:
             done
           ) &
           WATCHER=$!
+          # ── 6-Z365: HOST-survival CPU policy ──────────────────────
+          # rn318 death chain: the guest fleet (app + libkr64 + the
+          # ptrace'd guest init/zygote/SF fleet) were the TOP CPU
+          # consumers of the whole system (the HOST AMS watchdog dump
+          # named them one by one as "not a java proc"), HOST
+          # system_server starved → Watchdog killed it → runtime restart
+          # → the restart SIGKILLed every app process → the ENTIRE guest
+          # subtree died ~111s into the guest boot. The policy below
+          # renices the whole io.twoyi.debug subtree to +15 so the HOST's
+          # watchdog checkers keep their slice; the guest fleet still
+          # gets all idle CPU. Testbench policy — NOT guest semantics.
+          (
+            while [ ! -f /tmp/ui-e2e-artifacts/nav-done ]; do
+              timeout 20 sudo docker exec -i redroid /system/bin/sh \
+                < scripts/twoyi-cpu-policy.sh \
+                >> /tmp/ui-e2e-artifacts/cpu-policy.log 2>&1 || true
+              sleep 10
+            done
+          ) &
+          CPUPOLICY=$!
           RC=0
           python3 -u scripts/ui-navigate.py || RC=$?
           touch /tmp/ui-e2e-artifacts/nav-done
-          kill $WATCHER $MEMWATCH 2>/dev/null || true
+          kill $WATCHER $MEMWATCH $CPUPOLICY 2>/dev/null || true
 
           # 6-Z360: the runner kernel's oom-killer/kill records — invisible
           # to the container, decisive for the rn310-313 death class.
@@ -446,6 +466,25 @@ jobs:
             grep -cE "lowmemorykiller: epoll_wait failed" /tmp/ui-e2e-artifacts/logcat-dockerexec.txt | sed 's/^/epoll-wait-failed-count=/';
             grep -E "Lost connection to lmkd|Connection with lmkd established" /tmp/ui-e2e-artifacts/logcat-dockerexec.txt | head -8;
           } > /tmp/ui-e2e-artifacts/host-lmkd-kills.txt 2>&1 || true
+          # ── 6-Z365: HOST watchdog/restart forensics ───────────────
+          # rn318's actual death chain was a HOST runtime restart
+          # (Watchdog killed system_server after the guest fleet starved
+          # it), invisible in every per-run artifact until hand-grepping
+          # logcat-dockerexec.txt. Promote the three markers to a
+          # first-class bounded artifact: watchdog/restart lines, the AMS
+          # "Skipping next CPU consuming process" starvation count, and
+          # the host SF composition-error spam on the twoyi SurfaceView
+          # (a known host-CPU drain to track). BENCH-health evidence —
+          # the classifier never reads this file for rung decisions.
+          {
+            echo "-- HOST watchdog / runtime-restart markers --"
+            grep -E "WATCHDOG|Restarting the runtime|Restarting system_server|Fatal signal.*system_server" \
+              /tmp/ui-e2e-artifacts/logcat-dockerexec.txt | head -40
+            echo "-- HOST AMS CPU-starvation marker count (Skipping next CPU consuming process) --"
+            grep -c "Skipping next CPU consuming process" /tmp/ui-e2e-artifacts/logcat-dockerexec.txt || true
+            echo "-- HOST SF composition-error count on the twoyi SurfaceView --"
+            grep -c "Invalid device requested composition" /tmp/ui-e2e-artifacts/logcat-dockerexec.txt || true
+          } > /tmp/ui-e2e-artifacts/host-restart-forensics.txt 2>&1 || true
           timeout 30 sudo docker exec redroid /system/bin/sh -c "ps -A" \
             > /tmp/ui-e2e-artifacts/ps-dockerexec.txt 2>&1 || true
           # ── 6-Z305p: THREAD-level view of the guest subtree ─────────────
