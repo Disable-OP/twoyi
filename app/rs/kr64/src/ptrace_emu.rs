@@ -15413,7 +15413,16 @@ pub fn run_ptrace_loop(
     // cap keeps the /dev/twoyi-svclogs tree bounded even in a
     // crash-loop storm (each service generation redirects once).
     let mut svclog_redirects: u64 = 0;
-    const SVCLOG_REDIRECT_CAP: u64 = 400;
+    // 6-Z357 (rn307 decode): 400 was consumed by the early HAL
+    // crash-loop fleet BEFORE the boot-critical late processes ever
+    // started — surfaceflinger (pid 4247+, first spawn +100s) had NO
+    // svclog in rn306/rn307, so the composer-side wedge that starves
+    // every SF generation (the +52.6s code=4 handler that never
+    // replies) is undecodable. 3000 bounds the same worst case at a
+    // still-trivial disk cost (≤ ~24 MB of small text files) while
+    // covering a full 15-min boot with several crash-looping
+    // services; the ladder's per-file dump stays grep/tail-bounded.
+    const SVCLOG_REDIRECT_CAP: u64 = 3000;
     let mut pending_mount_enodev: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     // 6-Z168: log cap for the block-storage mount -ENODEV overrides (the
