@@ -52,6 +52,13 @@ static int qemu_pipe_open_fallback(const char *path, int real_fd, int saved_errn
 #include <sys/statfs.h>  // 6-Z143: struct statfs (the selinuxfs magic hook)
 #include <sys/socket.h>
 #include <sys/un.h>
+// 6-Z355: SCM_RIGHTS ancillary support — alloca for the cmsg buffer, and
+// MSG_CMSG_CLOEXEC when the libc headers predate it (the kernel value is
+// stable; raw-syscall use needs no glibc feature macros).
+#include <alloca.h>
+#ifndef MSG_CMSG_CLOEXEC
+#define MSG_CMSG_CLOEXEC 0x40000000
+#endif
 // Android system property constants (from sys/system_properties.h)
 // These are Android-specific and not available on the host build system.
 // We define them here so the loader compiles on the host.
@@ -533,6 +540,15 @@ static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 // 6-Z305t-68: the HIDL wire's BINDER_TYPE_PTR SG-buffer capture.
 #define BP_WIRE_V3_MAGIC    0x30335657u       /* "WV30" little-endian */
 #define BP_BINDER_TYPE_PTR  0x70742a85u       /* B_PACK_CHARS('p','t','*',0x85) */
+/* 6-Z355: fd-carrying flat types + the fd-count tail marker ("FDT0"). The
+ * fds themselves ride the frame's SCM_RIGHTS ancillary block in blob
+ * order; the tail gives the per-blob split so the recipient's patch loop
+ * consumes them in kernel fixup order (offsets-array order). */
+#define BP_WIRE_FD_TAIL_MAGIC 0x30544446u     /* "FDT0" little-endian */
+#define BP_BINDER_TYPE_FD     0x66642a85u     /* B_PACK_CHARS('f','d','*',0x85) */
+#define BP_BINDER_TYPE_FDA    0x66646185u     /* B_PACK_CHARS('f','d','a',0x85) */
+#define BP_BLOB_FD_MAX        512u            /* per-frame fd cap */
+#define BP_BLOB_MAX_CMDS      32u             /* cap before falling back to v1 */
 #define BP_BUF_FLAG_HAS_PARENT 0x01u          /* BINDER_BUFFER_FLAG_HAS_PARENT */
 #define BP_SG_BUF_MAX       (256u * 1024u)    // per-PTR-object cap
 #define BP_SG_TOTAL_MAX     (384u * 1024u)    // per-transaction SG cap
@@ -603,6 +619,7 @@ static int g_diag_bc = 12;             // outgoing BC tx/reply diag
 static int g_diag_sm_consumed = 4;     // SM-REPLY-CONSUMED verdict budget
 static unsigned g_diag_bp_wr = 2;      // binder_proxy_write_read log budget
 static unsigned g_diag_bp_ioctl = 4;   // binder_proxy_ioctl log budget
+static unsigned g_diag_z355_fd = 16;   // 6-Z355 fd-passing diag budget
 static int g_diag_z306z_gate = 8;      // 6-Z306z delivery-gate log budget
 static int g_diag_z309_gate = 8;       // 6-Z309 parent-fixup log budget
 
@@ -1047,10 +1064,21 @@ static void bp_gate_mirror_commands(uint8_t *stream, uint64_t len) {
     }
 }
 
+// 6-Z355: forward declaration — the tail locator is defined with the
+// request-side helpers further down; the response patcher needs it.
+static int bp_locate_fd_tail(const uint8_t *tail, uint64_t tail_len, int is_v3,
+                             uint32_t *out_counts);
+
 /// Walk the copied BR stream for BR_REPLY commands and give every one a
 /// real backing allocation from the proxy's reply-blob trailer.
+/// 6-Z355: xfds/nxfds carry the SCM_RIGHTS fds that rode THIS response
+/// frame; the per-blob counts come from the trailer's fd tail. Each blob's
+/// fd flats are patched with the received dup numbers (kernel
+/// binder_translate_fd's RECIPIENT half — the fds are already in this
+/// process's table; the flat's handle field must name them).
 static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
-                                const uint8_t *tail, uint64_t tail_len) {
+                                const uint8_t *tail, uint64_t tail_len,
+                                const int *xfds, uint32_t nxfds) {
     if (tail_len < 8) return;
     uint32_t magic;
     memcpy(&magic, tail, 4);
@@ -1066,6 +1094,15 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
     const uint8_t *p = tail + 8;
     uint64_t rem = tail_len - 8;
     uint32_t blob_idx = 0;
+
+    // 6-Z355: per-blob fd counts + the cross-blob cursor.
+    uint32_t fd_counts[BP_BLOB_MAX_CMDS];
+    uint32_t nfd_counts = 0;
+    uint32_t fd_cursor = 0;
+    if (nxfds > 0 &&
+        bp_locate_fd_tail(tail, tail_len, is_v3, fd_counts)) {
+        nfd_counts = blob_count;
+    }
 
     uint64_t pos = 0;
     while (pos + 4 <= stream_len && blob_idx < blob_count) {
@@ -1461,6 +1498,109 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                                      (cmd == BP_BR_TRANSACTION) ? "BR-TX"
                                                                 : "BR-RPY",
                                      dlen, g_real_pid);
+                            write_str(2, m);
+                        }
+                    }
+                }
+                // 6-Z355: fd-flat patching (kernel binder_translate_fd's
+                // RECIPIENT half). The fds arrived as kernel dups in THIS
+                // process's table; their NUMBERS are written into the
+                // delivered copy — BINDER_TYPE_FD flats take one fd each,
+                // BINDER_TYPE_FDA objects take numFds ints written into
+                // the parent buffer's SG copy at parent_offset (the
+                // parent's `buffer` field was already fixed to that copy
+                // above). Order: offsets-array order across the blob —
+                // exactly the kernel's fixup order.
+                {
+                    uint32_t want = (nfd_counts && blob_idx < nfd_counts)
+                                        ? fd_counts[blob_idx]
+                                        : 0;
+                    if (want > 0) {
+                        uint32_t avail = (nxfds > fd_cursor)
+                                             ? (nxfds - fd_cursor)
+                                             : 0;
+                        uint32_t usable =
+                            (want <= avail) ? want : avail;
+                        uint32_t fdi = fd_cursor;
+                        uint32_t patched = 0, skipped = 0;
+                        for (uint64_t j = 0; j + 8 <= (uint64_t)olen; j += 8) {
+                            uint64_t obj_off;
+                            memcpy(&obj_off, back + dlen + j, 8);
+                            if (obj_off > (uint64_t)dlen ||
+                                obj_off + 8 > (uint64_t)dlen)
+                                continue;
+                            uint32_t typ;
+                            memcpy(&typ, back + obj_off, 4);
+                            if (typ == BP_BINDER_TYPE_FD) {
+                                int64_t v = (fdi < fd_cursor + usable)
+                                                ? (int64_t)xfds[fdi]
+                                                : (int64_t)-1;
+                                if (v < 0) skipped++;
+                                fdi++;
+                                uint64_t h = (uint64_t)v;
+                                memcpy(back + obj_off + 8, &h, 8);
+                                patched++;
+                            } else if (typ == BP_BINDER_TYPE_FDA) {
+                                if (obj_off + 28 > (uint64_t)dlen) continue;
+                                uint32_t num_fds;
+                                uint64_t parent_idx, parent_offset;
+                                memcpy(&num_fds, back + obj_off + 4, 4);
+                                memcpy(&parent_idx, back + obj_off + 12, 8);
+                                memcpy(&parent_offset, back + obj_off + 20, 8);
+                                if (num_fds == 0 || parent_idx >= j / 8) {
+                                    skipped += num_fds;
+                                    fdi += num_fds;
+                                    continue;
+                                }
+                                uint64_t par_off;
+                                memcpy(&par_off, back + dlen + parent_idx * 8, 8);
+                                if (par_off > (uint64_t)dlen ||
+                                    par_off + 40 > (uint64_t)dlen) {
+                                    skipped += num_fds;
+                                    fdi += num_fds;
+                                    continue;
+                                }
+                                uint32_t ptyp;
+                                uint64_t plen, pbuf;
+                                memcpy(&ptyp, back + par_off, 4);
+                                memcpy(&plen, back + par_off + 16, 8);
+                                memcpy(&pbuf, back + par_off + 8, 8);
+                                /* kernel: parent_offset + 4*numFds must fit
+                                 * the parent's length; the copy address is
+                                 * the parent's patched buffer field. */
+                                if (ptyp != BP_BINDER_TYPE_PTR || pbuf == 0 ||
+                                    plen < (uint64_t)4 * num_fds ||
+                                    parent_offset > plen - 4ull * num_fds ||
+                                    pbuf + parent_offset + 4ull * num_fds >
+                                        (uint64_t)(uintptr_t)back + back_len) {
+                                    skipped += num_fds;
+                                    fdi += num_fds;
+                                    continue;
+                                }
+                                uint8_t *dest = (uint8_t *)(uintptr_t)(
+                                    pbuf + parent_offset);
+                                for (uint32_t f = 0; f < num_fds; f++) {
+                                    int64_t v = (fdi < fd_cursor + usable)
+                                                    ? (int64_t)xfds[fdi]
+                                                    : (int64_t)-1;
+                                    if (v < 0) skipped++;
+                                    fdi++;
+                                    int32_t s32 = (int32_t)v;
+                                    memcpy(dest + (size_t)f * 4, &s32, 4);
+                                    patched++;
+                                }
+                            }
+                        }
+                        fd_cursor += want;
+                        if ((skipped > 0 || usable < want) && g_diag_z355_fd > 0) {
+                            g_diag_z355_fd--;
+                            char m[192];
+                            snprintf(m, sizeof(m),
+                                "[twoyi_loader] 6-Z355: blob #%u fd patch: "
+                                "want=%u patched=%u skipped=%u shortfall=%u "
+                                "(pid=%d)\n",
+                                blob_idx, want, patched, skipped,
+                                want - usable, g_real_pid);
                             write_str(2, m);
                         }
                     }
@@ -1867,35 +2007,176 @@ static int bp_recv_all(int fd, void *buf, size_t len) {
     return 0;
 }
 
+// 6-Z355: send the 8-byte frame header WITH an SCM_RIGHTS ancillary block
+// (raw sendmsg — no PLT hooks). The ancillary always accompanies the FIRST
+// byte of the message, so the peer's control-buffered header read captures
+// it. Returns 0 / -1 with errno set.
+static int bp_send_hdr_anc(int fd, const unsigned char *hdr,
+                           const int *fds, uint32_t nfds) {
+    if (nfds == 0 || fds == NULL) {
+        return bp_send_all(fd, hdr, 8);
+    }
+    struct iovec iov;
+    iov.iov_base = (void *)hdr;
+    iov.iov_len = 8;
+    // CMSG_SPACE(sizeof(int) * nfds) — computed manually to avoid
+    // pulling the CMSG macros onto the raw-syscall path.
+    size_t clen = CMSG_SPACE(sizeof(int) * nfds);
+    unsigned char *cbuf = (unsigned char *)alloca(clen);
+    memset(cbuf, 0, clen);
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = clen;
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int) * nfds);
+    memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * nfds);
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_sendmsg, fd, &msg, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        // The 8-byte header may itself be short-sent; complete it plain
+        // (the cmsg landed with the first chunk).
+        if ((size_t)n < 8) {
+            return bp_send_all(fd, hdr + n, 8 - (size_t)n);
+        }
+        return 0;
+    }
+}
+
+// 6-Z355: receive the 8-byte response header via recvmsg WITH a control
+// buffer, collecting any SCM_RIGHTS fds into *fds_out (malloc'd, caller
+// frees; *nfds_out set). fds are kernel dups into THIS process's fd
+// table (the recipient-side fd installation — the patch loop only writes
+// their numbers into the blob flats). Returns 0 / -1 with errno set.
+static int bp_recv_hdr_anc(int fd, unsigned char *hdr,
+                           int **fds_out, uint32_t *nfds_out) {
+    *fds_out = NULL;
+    *nfds_out = 0;
+    size_t got = 0;
+    while (got < 8) {
+        struct iovec iov;
+        iov.iov_base = hdr + got;
+        iov.iov_len = 8 - got;
+        // Room for 32 fds in one block (a frame carries ≤ BP_BLOB_FD_MAX
+        // in principle; a larger block is truncated — MSG_CTRUNC names it
+        // via the mismatch warn downstream).
+        unsigned char cbuf[CMSG_SPACE(sizeof(int) * 32)];
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf;
+        msg.msg_controllen = sizeof(cbuf);
+        ssize_t n = (ssize_t)syscall(SYS_recvmsg, fd, &msg, MSG_CMSG_CLOEXEC);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) { errno = ECONNRESET; return -1; }
+        got += (size_t)n;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c != NULL;
+             c = CMSG_NXTHDR(&msg, c)) {
+            if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+                continue;
+            size_t payload = c->cmsg_len - CMSG_LEN(0);
+            uint32_t nfd = (uint32_t)(payload / sizeof(int));
+            if (nfd == 0) continue;
+            int *arr = (int *)malloc(sizeof(int) * nfd);
+            if (!arr) return -1;
+            memcpy(arr, CMSG_DATA(c), sizeof(int) * nfd);
+            // Multiple RIGHTS blocks are appended (never observed on one
+            // sendmsg, but honest).
+            if (*fds_out != NULL && *nfds_out > 0) {
+                int *merged = (int *)realloc(arr, sizeof(int) * (*nfds_out + nfd));
+                if (!merged) { free(arr); return -1; }
+                // realloc moved only arr's block; re-copy both halves.
+                memcpy(merged, arr, sizeof(int) * nfd);
+                memcpy(merged + nfd, *fds_out, sizeof(int) * *nfds_out);
+                free(*fds_out);
+                arr = merged;
+                nfd += *nfds_out;
+            }
+            *fds_out = arr;
+            *nfds_out = nfd;
+        }
+    }
+    return 0;
+}
+
 // One request->response exchange. Returns a malloc'd payload buffer (caller
 // frees; never NULL when *resp_len is 0 — a 1-byte sentinel is returned) or
 // NULL on transport failure with errno set. *ret_out receives the proxy's
 // i32 ret (0 success, negative errno), *resp_len the payload size.
-static unsigned char *bp_exchange(int fd, uint32_t cmd,
-                                  const void *req_payload, uint32_t req_len,
-                                  int32_t *ret_out, uint32_t *resp_len) {
+// 6-Z355: req_fds (may be NULL) rides the request header's SCM_RIGHTS
+// block; received response fds are returned via *resp_fds_out (malloc'd
+// array, caller frees, may be NULL when none arrived).
+static unsigned char *bp_exchange_anc(int fd, uint32_t cmd,
+                                      const void *req_payload, uint32_t req_len,
+                                      const int *req_fds, uint32_t req_nfds,
+                                      int **resp_fds_out, uint32_t *resp_nfds_out,
+                                      int32_t *ret_out, uint32_t *resp_len) {
     unsigned char hdr[8];
     memcpy(hdr + 0, &cmd, 4);
     memcpy(hdr + 4, &req_len, 4);
-    if (bp_send_all(fd, hdr, 8) != 0) return NULL;
+    if (bp_send_hdr_anc(fd, hdr, req_fds, req_nfds) != 0) return NULL;
     if (req_len > 0 && bp_send_all(fd, req_payload, req_len) != 0) return NULL;
 
-    if (bp_recv_all(fd, hdr, 8) != 0) return NULL;
+    int *rfds = NULL;
+    uint32_t rnfds = 0;
+    if (bp_recv_hdr_anc(fd, hdr, &rfds, &rnfds) != 0) return NULL;
     int32_t ret;
     uint32_t rlen;
     memcpy(&ret, hdr + 0, 4);
     memcpy(&rlen, hdr + 4, 4);
-    if (rlen > BP_MAX_FRAME) { errno = EPROTO; return NULL; }
+    if (rlen > BP_MAX_FRAME) {
+        for (uint32_t i = 0; i < rnfds; i++) syscall(NR_close, rfds[i]);
+        free(rfds);
+        errno = EPROTO;
+        return NULL;
+    }
 
     unsigned char *p = (unsigned char *)malloc(rlen > 0 ? rlen : 1);
-    if (!p) { errno = ENOMEM; return NULL; }
+    if (!p) {
+        for (uint32_t i = 0; i < rnfds; i++) syscall(NR_close, rfds[i]);
+        free(rfds);
+        errno = ENOMEM;
+        return NULL;
+    }
     if (rlen > 0 && bp_recv_all(fd, p, rlen) != 0) {
+        for (uint32_t i = 0; i < rnfds; i++) syscall(NR_close, rfds[i]);
+        free(rfds);
         free(p);
         return NULL;
     }
     *ret_out = ret;
     *resp_len = rlen;
+    if (resp_fds_out) {
+        *resp_fds_out = rfds;
+        *resp_nfds_out = rnfds;
+    } else if (rfds) {
+        // Caller wants no fds — close them so nothing leaks.
+        for (uint32_t i = 0; i < rnfds; i++) syscall(NR_close, rfds[i]);
+        free(rfds);
+    }
+    if (resp_nfds_out) *resp_nfds_out = rnfds;
     return p;
+}
+
+// Legacy-shape wrapper: no fds either direction (every non-WRITE_READ
+// command — VERSION, IDENT, SET_MAX_THREADS, …).
+static unsigned char *bp_exchange(int fd, uint32_t cmd,
+                                  const void *req_payload, uint32_t req_len,
+                                  int32_t *ret_out, uint32_t *resp_len) {
+    return bp_exchange_anc(fd, cmd, req_payload, req_len, NULL, 0,
+                           NULL, NULL, ret_out, resp_len);
 }
 
 // Real guest pid WITHOUT the getpid fake: the tracer's synthetic
@@ -2222,7 +2503,6 @@ static int bp_conn_for_ioctl(int binder_fd) {
 #define BP_BC_TRANSACTION_SG 0x40486311u  // _IOW('c', 17, 72)
 #define BP_BC_REPLY_SG       0x40486312u  // _IOW('c', 18, 72)
 #define BP_BLOB_MAX          (512u * 1024u)  // per-buffer sanity cap
-#define BP_BLOB_MAX_CMDS     32u             // cap before falling back to v1
 
 struct bp_blob_desc {
     uint64_t data_len;
@@ -2301,6 +2581,144 @@ static uint32_t bp_scan_tx_blobs(const uint8_t *stream, uint64_t len,
     }
     (void)tx_cmds;
     return n;
+}
+
+// ---------------------------------------------------------------------------
+// 6-Z355: fd-carrying flat collection (the kernel's SENDER-side fd
+// translation, split across the wire). Walks each blob's offsets array IN
+// ORDER: a BINDER_TYPE_FD flat contributes its `handle` field (the sender's
+// fd number); a BINDER_TYPE_FDA object contributes numFds ints read from
+// the PARENT buffer region at parent_offset (readable in-process — the
+// shlib runs inside the sending guest process, exactly where the kernel
+// would read them). The collected list rides SCM_RIGHTS to the proxy in
+// this order; the recipient's shlib patches the same order.
+// ---------------------------------------------------------------------------
+struct bp_fd_collect {
+    uint32_t counts[BP_BLOB_MAX_CMDS];  /* per-blob fd counts */
+    int      fds[BP_BLOB_FD_MAX];       /* blob-order fd numbers */
+    uint32_t total;
+    int      truncated;                 /* BP_BLOB_FD_MAX hit */
+    int      bad_parent;                /* an FDA could not be resolved */
+};
+
+static void bp_collect_blob_fds(const struct bp_blob_desc *descs, uint32_t n,
+                                struct bp_fd_collect *out) {
+    memset(out, 0, sizeof(*out));
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *d = (const uint8_t *)(uintptr_t)descs[i].data_ptr;
+        const uint8_t *o = (const uint8_t *)(uintptr_t)descs[i].offsets_ptr;
+        for (uint64_t j = 0; d != NULL && o != NULL && j + 8 <= descs[i].offsets_len;
+             j += 8) {
+            uint64_t obj_off;
+            memcpy(&obj_off, o + j, 8);
+            if (obj_off > descs[i].data_len) continue;
+            uint32_t typ;
+            memcpy(&typ, d + obj_off, 4);
+            if (typ == BP_BINDER_TYPE_FD) {
+                /* flat_binder_object: handle at +8 (kernel stores the fd
+                 * there — binder_transaction()'s BINDER_TYPE_FD case). */
+                if (obj_off + 16 > descs[i].data_len) continue;
+                uint64_t h;
+                memcpy(&h, d + obj_off + 8, 8);
+                if (out->total >= BP_BLOB_FD_MAX) { out->truncated = 1; return; }
+                out->fds[out->total++] = (int)(int64_t)h;
+                out->counts[i]++;
+            } else if (typ == BP_BINDER_TYPE_FDA) {
+                /* binder_fd_array_object (28 B): hdr@0 numFds@4 pad@8
+                 * parent@12 parent_offset@20 — the fd INTS live in the
+                 * parent buffer at parent_offset. */
+                if (obj_off + 28 > descs[i].data_len) continue;
+                uint32_t num_fds;
+                uint64_t parent_idx, parent_offset;
+                memcpy(&num_fds, d + obj_off + 4, 4);
+                memcpy(&parent_idx, d + obj_off + 12, 8);
+                memcpy(&parent_offset, d + obj_off + 20, 8);
+                if (num_fds == 0) continue;
+                if (num_fds > BP_BLOB_FD_MAX || parent_idx >= j / 8) {
+                    out->bad_parent = 1;
+                    continue;
+                }
+                /* The parent is a PTR object EARLIER in the offsets array
+                 * (kernel binder_validate_ptr order); its `buffer` field
+                 * is the guest address of the fd array. */
+                uint64_t par_off;
+                memcpy(&par_off, o + parent_idx * 8, 8);
+                if (par_off > descs[i].data_len || par_off + 40 > descs[i].data_len) {
+                    out->bad_parent = 1;
+                    continue;
+                }
+                uint32_t ptyp;
+                uint64_t pbuf;
+                memcpy(&ptyp, d + par_off, 4);
+                memcpy(&pbuf, d + par_off + 8, 8);
+                if (ptyp != BP_BINDER_TYPE_PTR || pbuf == 0 ||
+                    pbuf > UINT64_MAX - parent_offset) {
+                    out->bad_parent = 1;
+                    continue;
+                }
+                const uint8_t *src = (const uint8_t *)(uintptr_t)(pbuf + parent_offset);
+                for (uint32_t f = 0; f < num_fds; f++) {
+                    int v;
+                    memcpy(&v, src + (size_t)f * 4, 4);
+                    if (out->total >= BP_BLOB_FD_MAX) { out->truncated = 1; return; }
+                    out->fds[out->total++] = v;
+                    out->counts[i]++;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6-Z355 (response side): locate the fd-count tail after the LAST blob of
+// the response trailer. Walks the blob lengths structurally (no content
+// interpretation) and, when the remaining bytes carry the FDT0 marker,
+// parses the per-blob counts. Returns 1 + fills *out_counts (caller's
+// array, cap BP_BLOB_MAX_CMDS) or 0 when absent.
+// ---------------------------------------------------------------------------
+static int bp_locate_fd_tail(const uint8_t *tail, uint64_t tail_len, int is_v3,
+                             uint32_t *out_counts) {
+    if (tail_len < 8) return 0;
+    uint32_t magic;
+    memcpy(&magic, tail, 4);
+    if (magic != BP_WIRE_V2_MAGIC && magic != BP_WIRE_V3_MAGIC) return 0;
+    uint32_t blob_count;
+    memcpy(&blob_count, tail + 4, 4);
+    if (blob_count == 0 || blob_count > BP_BLOB_MAX_CMDS) return 0;
+    const uint8_t *p = tail + 8;
+    uint64_t rem = tail_len - 8;
+    for (uint32_t i = 0; i < blob_count; i++) {
+        if (rem < 8) return 0;
+        uint32_t dlen, olen;
+        memcpy(&dlen, p, 4);
+        memcpy(&olen, p + 4, 4);
+        p += 8; rem -= 8;
+        uint32_t sg_count = 0;
+        if (is_v3) {
+            if (rem < 4) return 0;
+            memcpy(&sg_count, p, 4);
+            p += 4; rem -= 4;
+        }
+        if (rem < (uint64_t)dlen + olen) return 0;
+        p += (uint64_t)dlen + olen;
+        rem -= (uint64_t)dlen + olen;
+        for (uint32_t s = 0; s < sg_count; s++) {
+            if (rem < 12) return 0;
+            uint32_t blen;
+            memcpy(&blen, p + 8, 4);
+            if (rem < 12 + (uint64_t)blen) return 0;
+            p += 12 + (uint64_t)blen;
+            rem -= 12 + (uint64_t)blen;
+        }
+    }
+    /* The tail: [FDT0][blob_count][counts...]. */
+    if (rem < 8 + 4ull * blob_count) return 0;
+    uint32_t fmagic, fn;
+    memcpy(&fmagic, p, 4);
+    memcpy(&fn, p + 4, 4);
+    if (fmagic != BP_WIRE_FD_TAIL_MAGIC || fn != blob_count) return 0;
+    memcpy(out_counts, p + 8, 4ull * blob_count);
+    return 1;
 }
 
 // Build the v2 request trailer: [WIRE_V2_MAGIC][blob_count]
@@ -2482,6 +2900,48 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
             (const uint8_t *)(uintptr_t)(bwr->write_buffer + bwr->write_consumed),
             ws, &trailer_len);
     }
+    // 6-Z355: collect this request's fd-carrying flats (kernel SENDER-side
+    // fd translation) and append the fd-count tail to the trailer. The fds
+    // themselves ride the frame header's SCM_RIGHTS block to the proxy.
+    struct bp_fd_collect fc;
+    memset(&fc, 0, sizeof(fc));
+    int req_fds[BP_BLOB_FD_MAX];
+    uint32_t req_nfds = 0;
+    if (trailer != NULL && ws > 0 && bwr->write_buffer != 0) {
+        struct bp_blob_desc descs[BP_BLOB_MAX_CMDS];
+        uint32_t n = bp_scan_tx_blobs(
+            (const uint8_t *)(uintptr_t)(bwr->write_buffer + bwr->write_consumed),
+            ws, descs);
+        if (n > 0) {
+            bp_collect_blob_fds(descs, n, &fc);
+            if (fc.truncated && g_diag_z355_fd > 0) {
+                g_diag_z355_fd--;
+                char m[160];
+                snprintf(m, sizeof(m),
+                    "[twoyi_loader] 6-Z355: fd collection TRUNCATED at %u "
+                    "(pid=%d)\n", (unsigned)BP_BLOB_FD_MAX, g_real_pid);
+                write_str(2, m);
+            }
+            if (fc.total > 0) {
+                uint64_t tail_len = 8ull + 4ull * n;
+                unsigned char *nt =
+                    (unsigned char *)realloc(trailer, (size_t)trailer_len + (size_t)tail_len);
+                if (nt) {
+                    trailer = nt;
+                    uint32_t fmagic = BP_WIRE_FD_TAIL_MAGIC;
+                    memcpy(trailer + trailer_len, &fmagic, 4);
+                    memcpy(trailer + trailer_len + 4, &n, 4);
+                    memcpy(trailer + trailer_len + 8, fc.counts, 4ull * n);
+                    trailer_len += (uint32_t)tail_len;
+                    memcpy(req_fds, fc.fds, sizeof(int) * fc.total);
+                    req_nfds = fc.total;
+                } else if (g_diag_z355_fd > 0) {
+                    g_diag_z355_fd--;
+                    write_str(2, "[twoyi_loader] 6-Z355: trailer realloc failed — fds dropped (honest v3 shape)\n");
+                }
+            }
+        }
+    }
     uint32_t req_len = (uint32_t)(8 + ws + trailer_len);
 
     unsigned char *req = (unsigned char *)malloc(req_len);
@@ -2506,16 +2966,20 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
 
     int32_t ret = 0;
     uint32_t rlen = 0;
-    unsigned char *resp = bp_exchange(fd, BP_IOC_WRITE_READ, req, req_len,
-                                      &ret, &rlen);
+    int *resp_fds = NULL;
+    uint32_t resp_nfds = 0;
+    unsigned char *resp = bp_exchange_anc(fd, BP_IOC_WRITE_READ, req, req_len,
+                                          req_nfds > 0 ? req_fds : NULL, req_nfds,
+                                          &resp_fds, &resp_nfds,
+                                          &ret, &rlen);
     if (log_budget > 0) {
         // 6-Z271 evidence: log whether the v2 trailer was attached and how
         // many blobs it carried (first exchanges only — bounded logging).
         log_budget--;
         char msg[192];
         snprintf(msg, sizeof(msg),
-            "[twoyi_loader] binder proxy WRITE_READ: ws=%llu blobs=%u -> "
-            "exchanged\n", (unsigned long long)ws, blob_count_logged);
+            "[twoyi_loader] binder proxy WRITE_READ: ws=%llu blobs=%u fds=%u -> "
+            "exchanged\n", (unsigned long long)ws, blob_count_logged, req_nfds);
         write_str(2, msg);
     }
     free(req);
@@ -2556,7 +3020,8 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
         // recovery + keystore2 SIGSEGV class).
         if ((uint64_t)rlen > 4ull + srv_read) {
             bp_patch_reply_data((uint8_t *)(uintptr_t)bwr->read_buffer, ncopy,
-                                resp + 4 + srv_read, (uint64_t)rlen - 4ull - srv_read);
+                                resp + 4 + srv_read, (uint64_t)rlen - 4ull - srv_read,
+                                resp_fds, resp_nfds);
         }
         if (ncopy < (uint64_t)srv_read) {
             char msg[192];
@@ -2583,6 +3048,12 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
         write_str(2, msg);
     }
     g_diag_bp_wr = log_budget; // 6-Z306aa: persist the budget for forked children
+    // 6-Z355: the received fds are NOW OWNED BY THIS PROCESS (the kernel
+    // duped them at recvmsg; the patch loop wrote their numbers into the
+    // delivered flats). The ARRAY is freed; the fds live until the
+    // guest's native_handle/BufferQueue closes them — the kernel's own
+    // recipient-side ownership.
+    free(resp_fds);
     free(resp);
     return 0;
 }

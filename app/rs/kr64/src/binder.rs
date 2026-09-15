@@ -1186,6 +1186,88 @@ pub const WIRE_V2_MAGIC: u32 = u32::from_ne_bytes(*b"WV20");
 /// Bytes are `'W' 'V' '3' '0'` in native-endian word order.
 pub const WIRE_V3_MAGIC: u32 = u32::from_ne_bytes(*b"WV30");
 
+/// 6-Z355: the fd-tail marker. A WRITE_READ request/response whose blobs
+/// carry `BINDER_TYPE_FD`/`BINDER_TYPE_FDA` flats appends AFTER the last
+/// blob: `[WIRE_FD_TAIL_MAGIC][u32 blob_count][blob_count × u32 fd_count]`
+/// — the per-blob fd counts in blob order — while the fds themselves ride
+/// the frame's SCM_RIGHTS ancillary block in the SAME order. Both sides
+/// also re-derive the counts by scanning the blobs' offsets arrays and
+/// cross-check (bounded warn on mismatch). Old peers that never send fds
+/// never append the tail, and the trailing bytes of a v1/v2 frame are
+/// ignored by design — backward compatible in both directions. Bytes are
+/// `'F' 'D' 'T' '0'` in native-endian word order.
+pub const WIRE_FD_TAIL_MAGIC: u32 = u32::from_ne_bytes(*b"FDT0");
+
+/// 6-Z355: how many fd-tail cross-check diagnostics are logged per boot
+/// (bounded — the composer/allocator fleet can carry fds on every call).
+static FD_TAIL_MISMATCH_LOG: AtomicU32 = AtomicU32::new(16);
+
+/// 6-Z355: per-blob fd count from a blob's offsets array — the same scan
+/// the loader-side builder runs. `BINDER_TYPE_FD` contributes 1 (the flat
+/// `handle` field IS the sender's fd number); `BINDER_TYPE_FDA`
+/// contributes the flat's `numFds` (the fd VALUES live in the parent
+/// region, which only the loader needs to read — the proxy carries the
+/// received SCM_RIGHTS list verbatim). Malformed offsets are skipped
+/// (kernel: validate-and-fail; here the count just comes out smaller and
+/// the cross-check names it).
+fn blob_fd_count(data: &[u8], offsets: &[u8]) -> u32 {
+    let mut n = 0u32;
+    let count = offsets.len() / 8;
+    for i in 0..count {
+        let off = match u64::from_ne_bytes(offsets[i * 8..i * 8 + 8].try_into().unwrap()) as usize {
+            o if o + 8 <= data.len() => o,
+            _ => continue,
+        };
+        let typ = u32::from_ne_bytes(data[off..off + 4].try_into().unwrap());
+        if typ == BINDER_TYPE_FD {
+            n = n.saturating_add(1);
+        } else if typ == BINDER_TYPE_FDA {
+            // binder_fd_array_object { hdr u32, numFds u32, pad u32, ... }
+            if off + 8 <= data.len() {
+                let num_fds = u32::from_ne_bytes(data[off + 4..off + 8].try_into().unwrap());
+                n = n.saturating_add(num_fds);
+            }
+        }
+    }
+    n
+}
+
+/// 6-Z355: parse the optional fd tail at `off`; returns the per-blob
+/// counts. `None` when no tail is present (or it is malformed — the
+/// caller logs and falls back to no-fd delivery).
+fn parse_fd_tail(payload: &[u8], off: usize, blob_count: usize) -> Option<Vec<u32>> {
+    if blob_count == 0 {
+        return None;
+    }
+    let need = 8 + 4 * blob_count;
+    if off + need > payload.len() {
+        return None;
+    }
+    let magic = u32::from_ne_bytes(payload[off..off + 4].try_into().unwrap());
+    if magic != WIRE_FD_TAIL_MAGIC {
+        return None;
+    }
+    let n = u32::from_ne_bytes(payload[off + 4..off + 8].try_into().unwrap()) as usize;
+    if n != blob_count {
+        return None;
+    }
+    let mut counts = Vec::with_capacity(blob_count);
+    for i in 0..blob_count {
+        let b = off + 8 + i * 4;
+        counts.push(u32::from_ne_bytes(payload[b..b + 4].try_into().unwrap()));
+    }
+    Some(counts)
+}
+
+/// 6-Z355: append the fd tail (`counts.len()` must equal the blob count).
+fn append_fd_tail(payload: &mut Vec<u8>, counts: &[u32]) {
+    payload.extend_from_slice(&WIRE_FD_TAIL_MAGIC.to_ne_bytes());
+    payload.extend_from_slice(&(counts.len() as u32).to_ne_bytes());
+    for c in counts {
+        payload.extend_from_slice(&c.to_ne_bytes());
+    }
+}
+
 /// `BINDER_BUFFER_FLAG_HAS_PARENT` — kernel uapi binder.h.
 pub const BINDER_BUFFER_FLAG_HAS_PARENT: u32 = 0x01;
 
@@ -1270,6 +1352,44 @@ struct Frame {
     payload: Vec<u8>,
 }
 
+/// 6-Z355: one fd the proxy holds on a guest's behalf while a blob that
+/// references it is in flight. Received from the SENDING guest process via
+/// SCM_RIGHTS (its kernel dup of the sender's fd), handed to the
+/// RECIPIENT's connection via SCM_RIGHTS on the response sendmsg, and
+/// closed here when the last reference drops — a dead recipient, a dropped
+/// transaction or an unconsumed virtual-service request all release their
+/// fds exactly like the kernel's binder_fd translation cleanup.
+/// MSG_CMSG_CLOEXEC marks the dup so an exec (guest process restart) can
+/// never leak a cross-process handle fd.
+pub struct FdGuard(i32);
+
+impl FdGuard {
+    /// Adopt a raw fd received from recvmsg ancillary data (ownership
+    /// transfers; the fd is closed on drop).
+    pub fn from_raw(fd: i32) -> Self {
+        FdGuard(fd)
+    }
+
+    pub fn as_raw(&self) -> i32 {
+        self.0
+    }
+
+    /// Share the fd across blob clones (close on last drop).
+    pub fn into_arc(self) -> Arc<FdGuard> {
+        Arc::new(self)
+    }
+}
+
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+}
+
 /// A response frame sent back to the guest.
 struct Resp {
     /// Return value: 0 on success, negative errno on failure.
@@ -1277,6 +1397,21 @@ struct Resp {
     /// Variable-length response payload (the bytes the ioctl would have
     /// written into `arg`).
     payload: Vec<u8>,
+    /// 6-Z355: fds to deliver with THIS frame via SCM_RIGHTS (empty for
+    /// every non-fd-bearing response). Ownership: the guards are consumed
+    /// by the sendmsg — the kernel dups them into the recipient's table
+    /// and the proxy's copies close right after the send.
+    fds: Vec<Arc<FdGuard>>,
+}
+
+impl Resp {
+    fn new(ret: i32, payload: Vec<u8>) -> Self {
+        Resp {
+            ret,
+            payload,
+            fds: Vec::new(),
+        }
+    }
 }
 
 /// Serialised `BINDER_WRITE_READ` request payload (our own wire format —
@@ -1669,6 +1804,16 @@ struct RequestBlob {
     /// 6-Z305t-68: the BINDER_TYPE_PTR SG-buffer contents (v3 wire).
     /// Empty for v2 requests — HIDL string arguments then fail honestly.
     sg: Vec<SgBuf>,
+    /// 6-Z355: the fds this blob's BINDER_TYPE_FD / BINDER_TYPE_FDA flats
+    /// reference, in kernel translation order (offsets-array order; FDA
+    /// entries in the parent region's array order). Received from the
+    /// sender via SCM_RIGHTS, delivered to the recipient the same way —
+    /// the flat `handle` fields keep the SENDER's numbers on the wire and
+    /// the RECIPIENT's shlib patches them with the received dup numbers
+    /// (kernel binder_translate_fd semantics, split across the wire).
+    /// Arc-shared: a blob clone (the BC stream walk hands out clones) has
+    /// the same close-on-last-drop contract as the kernel's fd refs.
+    fds: Vec<Arc<FdGuard>>,
 }
 
 impl Clone for RequestBlob {
@@ -1677,6 +1822,7 @@ impl Clone for RequestBlob {
             data: self.data.clone(),
             offsets: self.offsets.clone(),
             sg: self.sg.clone(),
+            fds: self.fds.clone(),
         }
     }
 }
@@ -1948,10 +2094,13 @@ enum DeferredReply {
     /// `[BR_REPLY][binder_transaction_data]` + the blob trailer. `sg`
     /// carries the BINDER_TYPE_PTR contents of routed HIDL replies
     /// (6-Z305t-68 — the same kernel SG-copy semantic as requests).
+    /// 6-Z355: `fds` are the reply blob's fd references — delivered to the
+    /// requester's connection via SCM_RIGHTS when this reply drains.
     Reply {
         data: Vec<u8>,
         offsets: Vec<u8>,
         sg: Vec<SgBuf>,
+        fds: Vec<Arc<FdGuard>>,
     },
     /// `[BR_FAILED_REPLY]` (reply timeout / server died).
     Failed,
@@ -2497,7 +2646,12 @@ impl BusState {
                 writer.write_ptr_object(ichars, Some(i0), 0);
                 writer.write_u8(preexisting as u8);
                 let (data, offsets, sg) = writer.into_parts_with_sg();
-                RequestBlob { data, offsets, sg }
+                RequestBlob {
+                    data,
+                    offsets,
+                    sg,
+                    fds: Vec::new(),
+                }
             } else {
                 // AIDL `android.os.IServiceCallback.onRegistration(name,
                 // binder)` — standard writeInterfaceToken header + the
@@ -2521,6 +2675,7 @@ impl BusState {
                     data,
                     offsets,
                     sg: Vec::new(),
+                    fds: Vec::new(),
                 }
             };
             let tx = IncomingTx {
@@ -3516,7 +3671,9 @@ fn connection_loop(
     // 200/con × a handful of conns stays bounded (~2 KB).
     let mut wr_diag_budget: u32 = 200;
     loop {
-        let req = match read_frame(stream) {
+        // 6-Z355: the request frame may carry SCM_RIGHTS fds (fd-bearing
+        // blobs) — captured by the control-buffered header read.
+        let (req, wire_fds) = match read_frame_with_fds(stream) {
             Ok(r) => r,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 info!(
@@ -3542,7 +3699,7 @@ fn connection_loop(
                 vm_id, conn_id, ws, rc
             );
         }
-        let resp = dispatch_request(&req, vm_id, bus, conn_id);
+        let resp = dispatch_request(&req, vm_id, bus, conn_id, wire_fds);
         if req.cmd == BINDER_WRITE_READ && wr_diag_budget > 0 {
             let (rs, blobs) = if resp.payload.len() >= 4 {
                 let rs = u32::from_ne_bytes(resp.payload[0..4].try_into().unwrap());
@@ -3565,7 +3722,16 @@ fn connection_loop(
 // ============================================================================
 
 /// Dispatch one parsed request frame to the appropriate handler.
-fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id: ConnId) -> Resp {
+fn dispatch_request(
+    req: &Frame,
+    vm_id: u32,
+    bus: &Arc<Mutex<BusState>>,
+    conn_id: ConnId,
+    // 6-Z355: SCM_RIGHTS fds that rode this request frame. Only
+    // BINDER_WRITE_READ consumes them; every other arm drops (closes) the
+    // guard — an fd without a consuming transaction must not leak.
+    wire_fds: Vec<FdGuard>,
+) -> Resp {
     match req.cmd {
         BINDER_VERSION => handle_version(vm_id),
 
@@ -3616,10 +3782,7 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
                     "ignored — SO_PEERCRED already stamped real pid"
                 }
             );
-            Resp {
-                ret: 0,
-                payload: Vec::new(),
-            }
+            Resp::new(0, Vec::new())
         }
 
         BINDER_SET_MAX_THREADS => {
@@ -3632,10 +3795,7 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
                 "[KR64][binder][vm{}] SET_MAX_THREADS = {} (acknowledged)",
                 vm_id, n
             );
-            Resp {
-                ret: 0,
-                payload: Vec::new(),
-            }
+            Resp::new(0, Vec::new())
         }
 
         BINDER_ENABLE_ONEWAY_SPAM_DETECTION => {
@@ -3646,10 +3806,7 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
                 "[KR64][binder][vm{}] ENABLE_ONEWAY_SPAM_DETECTION (acknowledged)",
                 vm_id
             );
-            Resp {
-                ret: 0,
-                payload: Vec::new(),
-            }
+            Resp::new(0, Vec::new())
         }
 
         BINDER_SET_CONTEXT_MGR | BINDER_SET_CONTEXT_MGR_KERNEL => {
@@ -3663,21 +3820,15 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
                 "[KR64][binder][vm{}] SET_CONTEXT_MGR (0x{:08x}) — proxy is the servicemanager",
                 vm_id, req.cmd
             );
-            Resp {
-                ret: 0,
-                payload: Vec::new(),
-            }
+            Resp::new(0, Vec::new())
         }
 
         BINDER_THREAD_EXIT => {
             info!("[KR64][binder][vm{}] THREAD_EXIT", vm_id);
-            Resp {
-                ret: 0,
-                payload: Vec::new(),
-            }
+            Resp::new(0, Vec::new())
         }
 
-        BINDER_WRITE_READ => handle_write_read(&req.payload, vm_id, bus, conn_id),
+        BINDER_WRITE_READ => handle_write_read(&req.payload, vm_id, bus, conn_id, wire_fds),
 
         other => {
             warning!(
@@ -3686,10 +3837,7 @@ fn dispatch_request(req: &Frame, vm_id: u32, bus: &Arc<Mutex<BusState>>, conn_id
                 other,
                 req.payload.len()
             );
-            Resp {
-                ret: -(libc::EINVAL),
-                payload: Vec::new(),
-            }
+            Resp::new(-(libc::EINVAL), Vec::new())
         }
     }
 }
@@ -3700,10 +3848,7 @@ fn handle_version(vm_id: u32) -> Resp {
         "[KR64][binder][vm{}] VERSION → {}",
         vm_id, BINDER_CURRENT_PROTOCOL_VERSION
     );
-    Resp {
-        ret: 0,
-        payload: BINDER_CURRENT_PROTOCOL_VERSION.to_ne_bytes().to_vec(),
-    }
+    Resp::new(0, BINDER_CURRENT_PROTOCOL_VERSION.to_ne_bytes().to_vec())
 }
 
 // ============================================================================
@@ -3740,13 +3885,14 @@ fn handle_write_read(
     vm_id: u32,
     bus: &Arc<Mutex<BusState>>,
     conn_id: ConnId,
+    // 6-Z355: fds received via SCM_RIGHTS on this request frame (empty for
+    // every non-fd-bearing client). Split per blob below; unconsumed
+    // members close on drop.
+    wire_fds: Vec<FdGuard>,
 ) -> Resp {
     // Parse the v1 wire header: [u32 write_size][u32 read_capacity][write_size BC_* bytes].
     if payload.len() < 8 {
-        return Resp {
-            ret: -(libc::EINVAL),
-            payload: Vec::new(),
-        };
+        return Resp::new(-(libc::EINVAL), Vec::new());
     }
     let write_size = u32::from_ne_bytes(payload[0..4].try_into().unwrap()) as usize;
     let read_capacity = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
@@ -3757,10 +3903,7 @@ fn handle_write_read(
             write_size,
             payload.len().saturating_sub(8)
         );
-        return Resp {
-            ret: -(libc::EINVAL),
-            payload: Vec::new(),
-        };
+        return Resp::new(-(libc::EINVAL), Vec::new());
     }
     let write_buf = &payload[8..8 + write_size];
 
@@ -3837,7 +3980,81 @@ fn handle_write_read(
                         break; // truncated SG section — stop consuming blobs
                     }
                 }
-                req_blobs.push(RequestBlob { data, offsets, sg });
+                req_blobs.push(RequestBlob {
+                    data,
+                    offsets,
+                    sg,
+                    fds: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // 6-Z355: split the frame's SCM_RIGHTS fds per blob. The fd tail
+    // ([WIRE_FD_TAIL_MAGIC][blob_count][counts...]) sits right after the
+    // last blob when the loader attached any fds; the per-blob scan
+    // (blob_fd_count) cross-checks the loader's counts and the cmsg list
+    // length. Attach in order: blob 0's fds first, then blob 1's, … —
+    // exactly the kernel's fixup order (offsets-array order within each
+    // transaction buffer).
+    if !req_blobs.is_empty() {
+        // `off` sits at the end of the last blob the trailer parse
+        // consumed (a truncated parse leaves it shorter — then no tail
+        // can be trusted either).
+        let counts = parse_fd_tail(payload, off, req_blobs.len());
+        match counts {
+            Some(counts) => {
+                let total: usize = counts.iter().map(|&c| c as usize).sum();
+                if wire_fds.len() < total {
+                    if FD_TAIL_MISMATCH_LOG.load(Ordering::Relaxed) > 0 {
+                        FD_TAIL_MISMATCH_LOG.fetch_sub(1, Ordering::Relaxed);
+                        warning!(
+                            "[KR64][binder][vm{}] 6-Z355: fd tail wants {} fds, cmsg carried {} — shortfall fills -1 at the recipient (conn={})",
+                            vm_id,
+                            total,
+                            wire_fds.len(),
+                            conn_id
+                        );
+                    }
+                }
+                let mut iter = wire_fds.into_iter();
+                let mut scan_total = 0u32;
+                for (i, blob) in req_blobs.iter_mut().enumerate() {
+                    let want = counts[i] as usize;
+                    let have = iter.by_ref().take(want);
+                    blob.fds = have.map(FdGuard::into_arc).collect();
+                    // Pad a shortfall with an absent-fd marker count so the
+                    // recipient's patch loop sees the gap (it fills -1).
+                    if blob.fds.len() < want {
+                        blob.fds.resize(want, Arc::new(FdGuard::from_raw(-1)));
+                    }
+                    scan_total =
+                        scan_total.saturating_add(blob_fd_count(&blob.data, &blob.offsets));
+                }
+                // Leftover fds (tail counts < cmsg count): dropped here =
+                // closed (kernel: unreferenced transaction fds released).
+                drop(iter);
+                if scan_total as usize != total && FD_TAIL_MISMATCH_LOG.load(Ordering::Relaxed) > 0
+                {
+                    FD_TAIL_MISMATCH_LOG.fetch_sub(1, Ordering::Relaxed);
+                    warning!(
+                        "[KR64][binder][vm{}] 6-Z355: fd-tail counts ({}) vs offsets-array scan ({}) disagree (conn={}) — tail trusted, decode names the sender",
+                        vm_id, total, scan_total, conn_id
+                    );
+                }
+            }
+            None => {
+                // No tail on a frame that carried fds (old shlib / partial
+                // write): the fds have no blob binding — close them (drop).
+                if !wire_fds.is_empty() && FD_TAIL_MISMATCH_LOG.load(Ordering::Relaxed) > 0 {
+                    FD_TAIL_MISMATCH_LOG.fetch_sub(1, Ordering::Relaxed);
+                    warning!(
+                        "[KR64][binder][vm{}] 6-Z355: {} cmsg fds with NO fd tail — closed unconsumed (conn={})",
+                        vm_id,
+                        wire_fds.len(),
+                        conn_id
+                    );
+                }
             }
         }
     }
@@ -3940,7 +4157,12 @@ fn handle_write_read(
                         // then loops to read BR_REPLY.
                         push_br_transaction_complete(&mut read_buf);
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
-                        resp_blobs.push(RequestBlob { data, offsets, sg });
+                        resp_blobs.push(RequestBlob {
+                            data,
+                            offsets,
+                            sg,
+                            fds: Vec::new(),
+                        });
                     }
                     TransactionResult::ReplySpawnLooper {
                         mirror,
@@ -3974,7 +4196,12 @@ fn handle_write_read(
                         }
                         push_br_transaction_complete(&mut read_buf);
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
-                        resp_blobs.push(RequestBlob { data, offsets, sg });
+                        resp_blobs.push(RequestBlob {
+                            data,
+                            offsets,
+                            sg,
+                            fds: Vec::new(),
+                        });
                     }
                     TransactionResult::ReplyMirrored {
                         br,
@@ -3994,7 +4221,12 @@ fn handle_write_read(
                         read_buf.extend_from_slice(&cookie.to_ne_bytes());
                         push_br_transaction_complete(&mut read_buf);
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
-                        resp_blobs.push(RequestBlob { data, offsets, sg });
+                        resp_blobs.push(RequestBlob {
+                            data,
+                            offsets,
+                            sg,
+                            fds: Vec::new(),
+                        });
                         info!(
                             "[KR64][binder][vm{}] 6-Z306ae-e: in-transaction mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
                             vm_id, conn_id, br, ptr, cookie
@@ -4022,9 +4254,9 @@ fn handle_write_read(
                 };
                 match inflight {
                     Some(txn_id) => {
-                        let (data, offsets, sg) = match reply_blob {
-                            Some(rb) => (rb.data, rb.offsets, rb.sg),
-                            None => (Vec::new(), Vec::new(), Vec::new()),
+                        let (data, offsets, sg, reply_fds) = match reply_blob {
+                            Some(rb) => (rb.data, rb.offsets, rb.sg, rb.fds),
+                            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
                         };
                         // 6-Z271i: kernel-true deferred resolution — the
                         // requester is no longer blocked inside its ioctl;
@@ -4063,6 +4295,7 @@ fn handle_write_read(
                                             data,
                                             offsets,
                                             sg,
+                                            fds: reply_fds,
                                         });
                                     }
                                     None => {
@@ -4250,9 +4483,19 @@ fn handle_write_read(
                 .and_then(|bx| bx.reply_queue.pop_front())
         } {
             match dr {
-                DeferredReply::Reply { data, offsets, sg } => {
+                DeferredReply::Reply {
+                    data,
+                    offsets,
+                    sg,
+                    fds,
+                } => {
                     push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
-                    resp_blobs.push(RequestBlob { data, offsets, sg });
+                    resp_blobs.push(RequestBlob {
+                        data,
+                        offsets,
+                        sg,
+                        fds,
+                    });
                 }
                 DeferredReply::Failed => {
                     push_br_failed_reply(&mut read_buf);
@@ -4666,9 +4909,28 @@ fn handle_write_read(
         }
     }
 
+    // 6-Z355: collect the response blobs' fds (blob order) and append the
+    // fd tail when any blob carries them — the recipient's shlib patches
+    // its flats from the SCM_RIGHTS dups that ride the frame sendmsg.
+    let mut resp_fds: Vec<Arc<FdGuard>> = Vec::new();
+    {
+        let mut counts: Vec<u32> = Vec::with_capacity(resp_blobs.len());
+        for blob in &resp_blobs {
+            counts.push(blob.fds.len() as u32);
+            resp_fds.extend(blob.fds.iter().cloned());
+        }
+        if resp_fds.iter().any(|f| f.as_raw() >= 0) {
+            append_fd_tail(&mut resp_payload, &counts);
+        } else {
+            // Only -1 placeholders (a shortfall pad): no real fd to send.
+            resp_fds.clear();
+        }
+    }
+
     Resp {
         ret: 0,
         payload: resp_payload,
+        fds: resp_fds,
     }
 }
 
@@ -7700,11 +7962,53 @@ fn virtual_sharedsecret(code: u32, _reader: &mut ParcelReader) -> TransactionRes
 // Wire-framing I/O helpers.
 // ============================================================================
 
-/// Read one [`Frame`] from the stream. Blocks until a full frame is
-/// available. Returns `UnexpectedEof` if the stream closes mid-frame.
-fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
+/// 6-Z355: read one frame AND any SCM_RIGHTS fds attached to it. The
+/// first chunk of the frame is received via recvmsg with a control
+/// buffer — ancillary data always accompanies the FIRST bytes of the
+/// sender's sendmsg, so a single control-buffered header read is
+/// sufficient and every plain read after it is cmsg-free. fds arrive as
+/// kernel dups into THIS process's table (wrapped in [`FdGuard`]).
+fn read_frame_with_fds(stream: &mut UnixStream) -> io::Result<(Frame, Vec<FdGuard>)> {
     let mut hdr = [0u8; 8]; // [u32 cmd][u32 arg_len]
-    stream.read_exact(&mut hdr)?;
+    let mut fds: Vec<FdGuard> = Vec::new();
+    let fd = stream.as_raw_fd();
+
+    // First recvmsg: capture both the header bytes and any ancillary data.
+    let mut got = 0usize;
+    while got < 8 {
+        let mut iov = [libc::iovec {
+            iov_base: hdr[got..].as_mut_ptr() as *mut libc::c_void,
+            iov_len: 8 - got,
+        }];
+        let mut cbuf = [0u8; 128]; // room for 32 fds worth of SCM_RIGHTS
+        let mut msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov.as_mut_ptr(),
+            msg_iovlen: 1,
+            msg_control: cbuf.as_mut_ptr() as *mut libc::c_void,
+            msg_controllen: cbuf.len(),
+            msg_flags: 0,
+        };
+        let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read_frame_with_fds: peer closed",
+            ));
+        }
+        got += n as usize;
+        // Harvest any SCM_RIGHTS block that rode THIS chunk.
+        unsafe { harvest_scm_rights(&msg, &mut fds) };
+    }
+
     let cmd = u32::from_ne_bytes(hdr[0..4].try_into().unwrap());
     let arg_len = u32::from_ne_bytes(hdr[4..8].try_into().unwrap()) as usize;
     // Cap payload size to prevent DoS — a malicious guest could send
@@ -7722,7 +8026,31 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
     }
     let mut payload = vec![0u8; arg_len];
     stream.read_exact(&mut payload)?;
-    Ok(Frame { cmd, payload })
+    Ok((Frame { cmd, payload }, fds))
+}
+
+/// 6-Z355: walk a received msghdr's control messages and collect every
+/// SCM_RIGHTS fd (each wrapped in an owning [`FdGuard`]). Non-RIGHTS
+/// control blocks are skipped. SAFETY: `msg` must be a completed recvmsg
+/// whose msg_control buffer is still valid.
+unsafe fn harvest_scm_rights(msg: &libc::msghdr, out: &mut Vec<FdGuard>) {
+    let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+    while !cmsg.is_null() {
+        let clen = (*cmsg).cmsg_len as usize;
+        if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+            let data = libc::CMSG_DATA(cmsg) as *const u8;
+            // cmsg_len covers the header + payload; payload = clen - hdr.
+            let hdr_sz = libc::CMSG_LEN(0) as usize;
+            if clen >= hdr_sz {
+                let nfds = (clen - hdr_sz) / 4;
+                for i in 0..nfds {
+                    let raw = *(data.add(i * 4) as *const i32);
+                    out.push(FdGuard::from_raw(raw));
+                }
+            }
+        }
+        cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+    }
 }
 
 /// Write one [`Resp`] to the stream.
@@ -7731,7 +8059,53 @@ fn write_frame(stream: &mut UnixStream, resp: &Resp) -> io::Result<()> {
     buf.extend_from_slice(&resp.ret.to_ne_bytes());
     buf.extend_from_slice(&(resp.payload.len() as u32).to_ne_bytes());
     buf.extend_from_slice(&resp.payload);
-    stream.write_all(&buf)
+
+    if resp.fds.is_empty() {
+        return stream.write_all(&buf);
+    }
+
+    // 6-Z355: the response carries fds — ONE sendmsg delivers the frame
+    // bytes plus the SCM_RIGHTS block (ancillary always rides the FIRST
+    // byte of the message, so the recipient's control-buffered header
+    // read captures it). A short send (large frame vs socket buffer) is
+    // completed with plain writes — the cmsg already landed with the
+    // first chunk. The proxy's own fd copies close when `resp` drops.
+    let fd = stream.as_raw_fd();
+    let raw: Vec<i32> = resp.fds.iter().map(|f| f.as_raw()).collect();
+    let mut iov = [libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    }];
+    let cmsg_space = unsafe { libc::CMSG_SPACE((4 * raw.len()) as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+    let msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: iov.as_mut_ptr(),
+        msg_iovlen: 1,
+        msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+        msg_controllen: cmsg_buf.len(),
+        msg_flags: 0,
+    };
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN((4 * raw.len()) as u32) as usize;
+        std::ptr::copy_nonoverlapping(
+            raw.as_ptr() as *const u8,
+            libc::CMSG_DATA(cmsg) as *mut u8,
+            4 * raw.len(),
+        );
+    }
+    let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (n as usize) < buf.len() {
+        stream.write_all(&buf[n as usize..])?;
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -10986,6 +11360,7 @@ mod tests {
             req.write_i32(timeout_ms); // on(in int timeoutMs)
             let (data, offsets) = req.into_parts();
             RequestBlob {
+                fds: Vec::new(),
                 data,
                 offsets,
                 sg: Vec::new(),
@@ -11046,6 +11421,7 @@ mod tests {
             req.write_i32(strength); // ... in EffectStrength strength, ...
             let (data, offsets) = req.into_parts();
             RequestBlob {
+                fds: Vec::new(),
                 data,
                 offsets,
                 sg: Vec::new(),
@@ -11777,6 +12153,7 @@ mod tests {
         });
         let (d, o) = make_servicemanager_request_parcel(&mut args);
         let blob = RequestBlob {
+            fds: Vec::new(),
             data: d,
             offsets: o,
             sg: Vec::new(),
@@ -11953,6 +12330,7 @@ mod tests {
             });
             let (d, o) = make_servicemanager_request_parcel(&mut args);
             RequestBlob {
+                fds: Vec::new(),
                 data: d,
                 offsets: o,
                 sg: Vec::new(),
@@ -12035,6 +12413,7 @@ mod tests {
             args.write_string16("power");
             let (d, o) = make_servicemanager_request_parcel(&mut args);
             let blob = RequestBlob {
+                fds: Vec::new(),
                 data: d,
                 offsets: o,
                 sg: Vec::new(),
@@ -12076,6 +12455,7 @@ mod tests {
             args.write_string16("power");
             let (d, o) = make_servicemanager_request_parcel(&mut args);
             let blob = RequestBlob {
+                fds: Vec::new(),
                 data: d,
                 offsets: o,
                 sg: Vec::new(),
@@ -12917,6 +13297,7 @@ mod tests {
 
         fn build(self) -> RequestBlob {
             RequestBlob {
+                fds: Vec::new(),
                 data: self.data,
                 offsets: self.offsets,
                 sg: self.sg,
@@ -13484,7 +13865,12 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_ne_bytes())
             .collect();
-        let blob = RequestBlob { data, offsets, sg };
+        let blob = RequestBlob {
+            data,
+            offsets,
+            sg,
+            fds: Vec::new(),
+        };
 
         let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
         match servicemanager_hidl(HIDL_SM_ADD_WITH_CHAIN, &blob, &bus, PROXY_CONN_ID) {
@@ -13522,6 +13908,7 @@ mod tests {
             data: req.data,
             offsets: req.offsets,
             sg: Vec::new(),
+            fds: Vec::new(),
         };
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
             TransactionResult::Failed => {}
@@ -13545,6 +13932,7 @@ mod tests {
             data: req.data,
             offsets: req.offsets,
             sg: req.sg[1..].to_vec(),
+            fds: Vec::new(),
         };
         match servicemanager_hidl(HIDL_SM_GET_TRANSPORT, &req, &bus, PROXY_CONN_ID) {
             TransactionResult::Failed => {}
@@ -13624,6 +14012,357 @@ mod tests {
                 !z306am_skip_prefix(7, 7) && !z306am_skip_prefix(7, 9),
                 "arm A: the gate is inert — prefix behavior identical to 6-Z306ae-e"
             );
+        }
+    }
+
+    // ── 6-Z355: BINDER_TYPE_FD / FDA crossing (SCM_RIGHTS over the
+    //    per-connection sockets) ─────────────────────────────────────
+
+    /// Sender-side helper mirroring twoyi_loader_shlib.c's bp_send_hdr_anc:
+    /// the frame header (with the SCM_RIGHTS block when fds exist) goes in
+    /// ONE sendmsg, the payload follows plain.
+    fn send_frame_with_fds(stream: &mut UnixStream, cmd: u32, payload: &[u8], fds: &[i32]) {
+        let mut hdr = [0u8; 8];
+        hdr[0..4].copy_from_slice(&cmd.to_ne_bytes());
+        hdr[4..8].copy_from_slice(&(payload.len() as u32).to_ne_bytes());
+        if fds.is_empty() {
+            stream.write_all(&hdr).expect("write hdr");
+        } else {
+            let fd = stream.as_raw_fd();
+            let mut iov = [libc::iovec {
+                iov_base: hdr.as_mut_ptr() as *mut libc::c_void,
+                iov_len: 8,
+            }];
+            let cmsg_space = unsafe { libc::CMSG_SPACE((4 * fds.len()) as u32) } as usize;
+            let mut cmsg_buf = vec![0u8; cmsg_space];
+            let msg = libc::msghdr {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: iov.as_mut_ptr(),
+                msg_iovlen: 1,
+                msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+                msg_controllen: cmsg_buf.len(),
+                msg_flags: 0,
+            };
+            unsafe {
+                let c = libc::CMSG_FIRSTHDR(&msg);
+                (*c).cmsg_level = libc::SOL_SOCKET;
+                (*c).cmsg_type = libc::SCM_RIGHTS;
+                (*c).cmsg_len = libc::CMSG_LEN((4 * fds.len()) as u32) as usize;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr() as *const u8,
+                    libc::CMSG_DATA(c) as *mut u8,
+                    4 * fds.len(),
+                );
+            }
+            let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
+            assert!(n >= 8, "sendmsg delivered the whole header");
+        }
+        if !payload.is_empty() {
+            stream.write_all(payload).expect("write payload");
+        }
+    }
+
+    /// Receiver-side helper mirroring bp_recv_hdr_anc: the response header
+    /// is received via recvmsg WITH a control buffer; received fds are
+    /// returned raw (the test closes them).
+    fn recv_resp_with_fds(stream: &mut UnixStream) -> (i32, Vec<u8>, Vec<i32>) {
+        let mut hdr = [0u8; 8];
+        let mut fds: Vec<i32> = Vec::new();
+        let fd = stream.as_raw_fd();
+        let mut got = 0usize;
+        while got < 8 {
+            let mut iov = [libc::iovec {
+                iov_base: hdr[got..].as_mut_ptr() as *mut libc::c_void,
+                iov_len: 8 - got,
+            }];
+            let mut cbuf = [0u8; 128];
+            let mut msg = libc::msghdr {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: iov.as_mut_ptr(),
+                msg_iovlen: 1,
+                msg_control: cbuf.as_mut_ptr() as *mut libc::c_void,
+                msg_controllen: cbuf.len(),
+                msg_flags: 0,
+            };
+            let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) };
+            assert!(n > 0, "recvmsg got header bytes");
+            got += n as usize;
+            unsafe {
+                let mut c = libc::CMSG_FIRSTHDR(&msg);
+                while !c.is_null() {
+                    let clen = (*c).cmsg_len as usize;
+                    if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                        let data = libc::CMSG_DATA(c) as *const u8;
+                        let hdr_sz = libc::CMSG_LEN(0) as usize;
+                        if clen >= hdr_sz {
+                            let nf = (clen - hdr_sz) / 4;
+                            for i in 0..nf {
+                                fds.push(*(data.add(i * 4) as *const i32));
+                            }
+                        }
+                    }
+                    c = libc::CMSG_NXTHDR(&msg, c);
+                }
+            }
+        }
+        let ret = i32::from_ne_bytes(hdr[0..4].try_into().unwrap());
+        let arg_len = u32::from_ne_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; arg_len];
+        stream.read_exact(&mut payload).expect("read payload");
+        (ret, payload, fds)
+    }
+
+    /// Unit: the proxy-side per-blob fd scan (the cross-check leg) — FD
+    /// flats count 1, FDA objects count numFds, in offsets order.
+    #[test]
+    fn z355_blob_fd_count_scans_fd_and_fda_flats() {
+        // Blob data: [FD flat 24B][FDA obj 28B] with offsets [0, 24].
+        let mut data = Vec::new();
+        data.extend_from_slice(&BINDER_TYPE_FD.to_ne_bytes());
+        data.extend_from_slice(&0u32.to_ne_bytes()); // flags
+        data.extend_from_slice(&11u64.to_ne_bytes()); // handle = fd 11
+        data.extend_from_slice(&0u64.to_ne_bytes()); // cookie
+        data.extend_from_slice(&BINDER_TYPE_FDA.to_ne_bytes());
+        data.extend_from_slice(&3u32.to_ne_bytes()); // numFds = 3
+        data.extend_from_slice(&0u32.to_ne_bytes()); // pad
+        data.extend_from_slice(&0u64.to_ne_bytes()); // parent
+        data.extend_from_slice(&0u64.to_ne_bytes()); // parent_offset
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        offsets.extend_from_slice(&24u64.to_ne_bytes());
+        assert_eq!(blob_fd_count(&data, &offsets), 4);
+        // Data truncated before the FDA object: the FD flat still counts,
+        // the unreadable numFds is skipped (the cross-check names the gap).
+        assert_eq!(blob_fd_count(&data[..20], &offsets), 1);
+        assert_eq!(blob_fd_count(&[], &[]), 0);
+    }
+
+    /// Unit: the fd-count tail codec round-trips; a malformed tail is
+    /// rejected (None) rather than guessed.
+    #[test]
+    fn z355_fd_tail_codec_round_trip() {
+        let mut payload = vec![0xa5u8; 10]; // arbitrary prefix
+        append_fd_tail(&mut payload, &[1, 0, 2]);
+        let counts = parse_fd_tail(&payload, 10, 3).expect("tail parses");
+        assert_eq!(counts, vec![1, 0, 2]);
+        // Wrong start offset → None.
+        assert_eq!(parse_fd_tail(&payload, 9, 3), None);
+        // Wrong blob count → None.
+        assert_eq!(parse_fd_tail(&payload, 10, 2), None);
+        // Truncated tail → None.
+        assert_eq!(parse_fd_tail(&payload[..13], 10, 3), None);
+    }
+
+    /// END-TO-END through the REAL proxy: a guest→guest routed
+    /// transaction whose blob carries a BINDER_TYPE_FD flat (the
+    /// IAllocator gralloc-handle shape — the exact rn309+ wall). The fd
+    /// rides SCM_RIGHTS B→proxy→A on the delivery, and A's BC_REPLY fd
+    /// rides proxy→B on the drain — the kernel's fd translation split
+    /// across our wire, with the fd flat `handle` fields staying
+    /// sender-side numbers on the wire (the recipient shlib patches
+    /// them). Pipe identity proves the dups are the SAME open file.
+    #[test]
+    fn z355_fds_cross_connections_via_scm_rights() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let live_pid = std::process::id();
+
+        // The SENDER's fd: the read end of a pipe (identity check: the
+        // recipient's dup reads bytes the sender writes to the write end).
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let (pr, pw) = (pipe_fds[0], pipe_fds[1]);
+
+        // ---- Conn A (the mapper stand-in): addService ----
+        let mut stream_a = UnixStream::connect(&path).expect("connect A");
+        let mut ident = Vec::new();
+        ident.extend_from_slice(&live_pid.to_ne_bytes());
+        ident.extend_from_slice(&0u32.to_ne_bytes());
+        ident.extend_from_slice(&0u32.to_ne_bytes());
+        let (ri, _ri_resp) = exchange(&mut stream_a, WIRE_CMD_IDENT, &ident);
+        assert_eq!(ri, 0);
+        let mut args = ParcelWriter::new();
+        args.write_string16("z355_svc");
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0x1111,
+            cookie: 0x2222,
+        });
+        args.write_i32(0);
+        args.write_i32(0);
+        let (ad, ao) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::new();
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let (ret, _r) = exchange(
+            &mut stream_a,
+            BINDER_WRITE_READ,
+            &make_v2_write_read_payload(&bc, &ad, &ao, 4096),
+        );
+        assert_eq!(ret, 0, "ADD_SERVICE ok");
+
+        // ---- Conn B (the composer stand-in): getService ----
+        let mut stream_b = UnixStream::connect(&path).expect("connect B");
+        let (ri2, _ri2_resp) = exchange(&mut stream_b, WIRE_CMD_IDENT, &ident);
+        assert_eq!(ri2, 0);
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("z355_svc");
+        let (bd, bo) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::new();
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let (ret2, resp2) = exchange(
+            &mut stream_b,
+            BINDER_WRITE_READ,
+            &make_v2_write_read_payload(&bc2, &bd, &bo, 4096),
+        );
+        assert_eq!(ret2, 0);
+        let off2 = 4 + u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize + 8;
+        let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        let blob2 = &resp2[off2 + 12..off2 + 12 + dl2];
+        let svc_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+
+        // ---- Conn B: transact with an FD-flat blob + SCM_RIGHTS fd ----
+        // Parcel: one flat_binder_object {type=FD, handle=pr} at offset 0.
+        let mut tx_data = Vec::new();
+        tx_data.extend_from_slice(&BINDER_TYPE_FD.to_ne_bytes());
+        tx_data.extend_from_slice(&0u32.to_ne_bytes()); // flags
+        tx_data.extend_from_slice(&(pr as u64).to_ne_bytes()); // sender fd
+        tx_data.extend_from_slice(&0u64.to_ne_bytes()); // cookie
+        let mut tx_off = Vec::new();
+        tx_off.extend_from_slice(&0u64.to_ne_bytes());
+        let mut tx_b = [0u8; 64];
+        tx_b[0..4].copy_from_slice(&svc_handle.to_ne_bytes());
+        tx_b[16..20].copy_from_slice(&7u32.to_ne_bytes());
+        let mut bc3 = Vec::new();
+        bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc3.extend_from_slice(&tx_b);
+        let mut payload3 =
+            make_v2_write_read_multi_payload(&bc3, &[(tx_data.as_slice(), &tx_off)], 4096);
+        // The fd tail: [FDT0][blob_count=1][counts=[1]].
+        append_fd_tail(&mut payload3, &[1]);
+        send_frame_with_fds(
+            &mut stream_b,
+            BINDER_WRITE_READ,
+            &payload3,
+            &[pr], // SCM_RIGHTS: the sender's fd rides the frame
+        );
+        let (ret_t, _resp_t, none_fds) = recv_resp_with_fds(&mut stream_b);
+        assert_eq!(ret_t, 0);
+        assert!(none_fds.is_empty(), "TX-complete response carries no fds");
+
+        // ---- Conn A: the delivery carries the fd via SCM_RIGHTS ----
+        let mut wr_a = Vec::new();
+        wr_a.extend_from_slice(&0u32.to_ne_bytes());
+        wr_a.extend_from_slice(&4096u32.to_ne_bytes());
+        send_frame_with_fds(&mut stream_a, BINDER_WRITE_READ, &wr_a, &[]);
+        let (ret_a, resp_a, fds_a) = recv_resp_with_fds(&mut stream_a);
+        assert_eq!(ret_a, 0);
+        assert_eq!(fds_a.len(), 1, "delivery delivers exactly one fd");
+        assert_eq!(
+            u32::from_ne_bytes(resp_a[4..8].try_into().unwrap()),
+            BR_TRANSACTION
+        );
+        // The fd tail rode the response payload.
+        assert_eq!(
+            u32::from_ne_bytes(
+                resp_a[resp_a.len() - 12..resp_a.len() - 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            WIRE_FD_TAIL_MAGIC,
+            "the fd tail is appended after the blob trailer"
+        );
+        // The delivered flat still names the SENDER's fd number on the
+        // wire — the kernel-true split (the shlib patches the flat with
+        // the dup it received; the proxy never rewrites it).
+        let read_a = u32::from_ne_bytes(resp_a[0..4].try_into().unwrap()) as usize;
+        let off_a = 4 + read_a + 8;
+        let dl_a = u32::from_ne_bytes(resp_a[off_a..off_a + 4].try_into().unwrap()) as usize;
+        let blob_a = &resp_a[off_a + 12..off_a + 12 + dl_a];
+        assert_eq!(
+            u64::from_ne_bytes(blob_a[8..16].try_into().unwrap()),
+            pr as u64,
+            "the FD flat's handle field keeps the sender's fd number"
+        );
+        // Pipe identity: the received dup reads what the sender writes.
+        let dup_a = fds_a[0];
+        let w = b"z355!";
+        assert_eq!(
+            unsafe { libc::write(pw, w.as_ptr() as *const _, w.len()) },
+            5
+        );
+        let mut rb = [0u8; 5];
+        assert_eq!(
+            unsafe { libc::read(dup_a, rb.as_mut_ptr() as *mut _, 5) },
+            5
+        );
+        assert_eq!(&rb, b"z355!");
+
+        // ---- Conn A: BC_REPLY carrying ITS dup fd (the IAllocator reply
+        // shape) — the fd crosses back to B through the drain ----
+        let mut reply_data = Vec::new();
+        reply_data.extend_from_slice(&0i32.to_ne_bytes()); // status NONE
+        reply_data.extend_from_slice(&0i32.to_ne_bytes()); // pad
+        reply_data.extend_from_slice(&BINDER_TYPE_FD.to_ne_bytes());
+        reply_data.extend_from_slice(&0u32.to_ne_bytes()); // flags
+        reply_data.extend_from_slice(&(dup_a as u64).to_ne_bytes()); // A's dup
+        reply_data.extend_from_slice(&0u64.to_ne_bytes()); // cookie
+        let mut reply_off = Vec::new();
+        reply_off.extend_from_slice(&8u64.to_ne_bytes());
+        let reply = [0u8; 64];
+        let mut bc4 = Vec::new();
+        bc4.extend_from_slice(&BC_REPLY.to_ne_bytes());
+        bc4.extend_from_slice(&reply);
+        let mut payload4 =
+            make_v2_write_read_multi_payload(&bc4, &[(reply_data.as_slice(), &reply_off)], 0);
+        append_fd_tail(&mut payload4, &[1]);
+        send_frame_with_fds(&mut stream_a, BINDER_WRITE_READ, &payload4, &[dup_a]);
+        let (ret_r, _resp_r, none_r) = recv_resp_with_fds(&mut stream_a);
+        assert_eq!(ret_r, 0);
+        assert!(none_r.is_empty());
+
+        // ---- Conn B: the drained BR_REPLY carries A's fd via SCM_RIGHTS
+        // and the tail — the same open pipe, proven by reading it ----
+        let mut wr_b = Vec::new();
+        wr_b.extend_from_slice(&0u32.to_ne_bytes());
+        wr_b.extend_from_slice(&4096u32.to_ne_bytes());
+        send_frame_with_fds(&mut stream_b, BINDER_WRITE_READ, &wr_b, &[]);
+        let (ret_b, resp_b, fds_b) = recv_resp_with_fds(&mut stream_b);
+        assert_eq!(ret_b, 0);
+        assert_eq!(fds_b.len(), 1, "the reply delivers exactly one fd");
+        assert_eq!(
+            u32::from_ne_bytes(resp_b[4..8].try_into().unwrap()),
+            BR_REPLY
+        );
+        let dup_b = fds_b[0];
+        let w2 = b"PROXY";
+        assert_eq!(unsafe { libc::write(pw, w2.as_ptr() as *const _, 5) }, 5);
+        let mut rb2 = [0u8; 5];
+        assert_eq!(
+            unsafe { libc::read(dup_b, rb2.as_mut_ptr() as *mut _, 5) },
+            5
+        );
+        assert_eq!(&rb2, b"PROXY", "B's dup is the SAME pipe A's dup came from");
+        assert_ne!(
+            dup_b, dup_a,
+            "the two recipients hold DISTINCT fd-table slots (kernel dup semantics)"
+        );
+
+        // Cleanup: the test owns the received fds (the proxy closed its
+        // copies after each sendmsg).
+        for fd in fds_a.iter().copied().chain(fds_b.iter().copied()) {
+            unsafe { libc::close(fd) };
+        }
+        unsafe {
+            libc::close(pr);
+            libc::close(pw);
         }
     }
 }
