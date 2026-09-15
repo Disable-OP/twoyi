@@ -485,12 +485,20 @@ jobs:
           # head -80 listing cap hid the same files. timeout 30→120,
           # listing head 80→400 (still bounded: per-file output stays
           # grep-30 + tail-24).
-          timeout 120 sudo docker exec redroid sh -c \
+          # 6-Z357 (rn307 decode): the loader's SVCLOG_REDIRECT_CAP is
+          # now 3000, so the file count can reach four digits in a
+          # crash-loop-heavy boot — timeout 120→240 keeps the sweep
+          # from being killed half-way again, listing head 400→800,
+          # and the grep pattern gains '6-Z' so the loader/proxy diag
+          # lines (6-Z272k per-TX targets, 6-Z356 registry harvests,
+          # 6-Z306z gate verdicts — the exact lines the decodes need)
+          # surface in the filtered dump, not only in the tail-24.
+          timeout 240 sudo docker exec redroid sh -c \
             "d=/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs; \
-             ls -la \$d 2>/dev/null | head -400; \
+             ls -la \$d 2>/dev/null | head -800; \
              for f in \$d/svc-*.log; do \
                [ -f \$f ] && echo \"== \$(basename \$f) (\$(stat -c%s \$f) bytes) ==\" && \
-               grep -aE 'linker|CANNOT LINK|cannot locate|not found|WARNING|virtualization|binder_open_fallback|proxy|TWOYI_ROOTFS|logdw|abort message|abort\(\) INTERCEPTED|FATAL|exited|exiting|Could not|cannot|Failed|failed' \$f | grep -av 'anon:' | head -30; \
+               grep -aE 'linker|CANNOT LINK|cannot locate|not found|WARNING|virtualization|binder_open_fallback|proxy|TWOYI_ROOTFS|logdw|abort message|abort\(\) INTERCEPTED|FATAL|exited|exiting|Could not|cannot|Failed|failed|6-Z' \$f | grep -av 'anon:' | head -30; \
                echo \"-- tail 3072 --\"; tail -c 3072 \$f | grep -av 'anon:' | tail -24; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs.txt 2>&1 || true
@@ -540,6 +548,29 @@ jobs:
                done; \
              done" \
             > /tmp/ui-e2e-artifacts/anr-dropbox.txt 2>&1 || true
+          # ── 6-Z357: the guest's OWN tombstones ──────────────────────
+          # rn306/rn307 named the class: surfaceflinger (and the HAL
+          # fleet) die with MESSAGE-LESS SIGABRTs (no [anon:abort
+          # message] VMA — twrp_fb_hook logs "cause text rode
+          # stderr/logd" — and the 6-Z309c death-site capture budget is
+          # consumed by the early fleet before SF ever spawns). The
+          # guest's own tombstoned DOES receive the crash requests
+          # ("tombstoned: received crash request for pid N" in klog)
+          # and writes the full backtrace to /data/tombstones —
+          # previously never collected. Bounded: list the dir, then
+          # the 5 NEWEST tombstones head-capped at 48 KiB each (A11
+          # tombstones are text: the signal line, the aborting
+          # pid/tid, and the full backtrace are all in the head).
+          timeout 60 sudo docker exec redroid sh -c \
+            "t=/data/user/0/io.twoyi.debug/profiles/default/rootfs/data/tombstones; \
+             if [ -d \$t ]; then \
+               echo \"== \$t ==\"; ls -la \$t 2>/dev/null | head -40; \
+               ls -t \$t/tombstone_* 2>/dev/null | head -5 | while read f; do \
+                 echo \"-- TOMBSTONE \$f (\$(stat -c%s \$f) bytes) head 49152 --\"; \
+                 head -c 49152 \$f; echo; \
+               done; \
+             else echo \"NO TOMBSTONES DIR at \$t\"; fi" \
+            > /tmp/ui-e2e-artifacts/tombstones.txt 2>&1 || true
           # ── 6-Z306p complement: the loader shlib's own log ──────────
           # The shlib execvp hook + the staged exec's init log to
           # /data/local/tmp/twoyi-loader.log (guest view) =
