@@ -6539,7 +6539,7 @@ images:
     arch: arm64
     generation: "15"
     tier: nightly
-    url: https://mirrorbits.lineageos.org/full/mars/20260826/boot.img
+    url: https://mirrorbits.lineageos.org/full/mars/20260826/vendor_boot.img
     referer: ""
     md5: ""
     sha256: ""
