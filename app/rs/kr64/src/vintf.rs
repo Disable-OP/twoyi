@@ -32,6 +32,28 @@
 //!   the container has no vendor SKU properties.
 //! - `<regex-instance>` entries are skipped (no regex engine here);
 //!   their clients take the honest EMPTY/no-entry path.
+//!
+//! 6-Z372 (rn327 decode — the HAL registration restart-loop): the parse
+//! dropped REAL manifest declarations, so `getTransport` answered EMPTY
+//! for services the device DOES ship and `registerAsServiceInternal`
+//! (ServiceManagement.cpp:872) refused their registration client-side —
+//! no `addWithChain` ever reached the proxy, the HAL CHECK-aborted, and
+//! init restart-looped it (health-hal-2-1 25×, drm clearkey/widevine
+//! 24× each, nn samples, light/power/rebootescrow). Two dropped shapes,
+//! now parsed:
+//! - **HIDL version RANGES** (`<version>2.0-2.1</version>`): libvintf
+//!   stores a VersionRange and answers getHal for ANY version inside
+//!   it; the parser stored the range string verbatim so BOTH endpoints
+//!   missed.
+//! - **AIDL `<fqname>` entries**: the compact AIDL manifest shape
+//!   (`<hal format="aidl"><name>pkg</name><fqname>IFace/instance
+//!   </fqname></hal>` — hardware/interfaces light/aidl ships
+//!   lights-default.xml exactly like this). libvintf accepts the
+//!   relative (IFace/instance) and fully-qualified (pkg.IFace/instance)
+//!   spellings; both are indexed.
+//! A fragment that STILL parses to zero entries now logs a bounded
+//! skeleton of its content so the next decode sees the residual shape
+//! instead of a bare counter.
 //! - The bus-registry fallback in the caller (`binder.rs`
 //!   HIDL_SM_GET_TRANSPORT) answers HWBINDER for in-proxy virtual
 //!   services — kernel-provided services that exist before any guest
@@ -152,7 +174,16 @@ fn merge_file(out: &mut VintfManifests, rootfs: &str, rel: &str) {
     if let Ok(xml) = fs::read_to_string(&path) {
         let parsed = parse_manifest(&xml);
         if parsed.is_empty() {
-            warning!("[KR64][vintf] {} parsed to zero entries", rel);
+            // 6-Z372: a bare counter forced a CI round-trip per shape
+            // guess (rn327: 9 fragments parsed to zero and EVERY one of
+            // them restarted-looped its HAL). Log a bounded skeleton of
+            // the actual content — the manifest cache loads once per
+            // run, so this fires at most once per broken file.
+            warning!(
+                "[KR64][vintf] {} parsed to zero entries — skeleton: {}",
+                rel,
+                xml_skeleton(&xml)
+            );
         } else {
             info!("[KR64][vintf] {} → {} entries", rel, parsed.len());
         }
@@ -160,6 +191,120 @@ fn merge_file(out: &mut VintfManifests, rootfs: &str, rel: &str) {
     }
     // Absent manifests are the NORMAL case (GSI without vendor,
     // system_ext without entries) — silence, not a warning.
+}
+
+/// Bounded one-line skeleton of a manifest that parsed to zero
+/// entries: comments stripped, whitespace collapsed, capped at 240
+/// chars. Diagnostic only — the shape (or emptiness) of the file names
+/// the parser gap on the next decode.
+fn xml_skeleton(xml: &str) -> String {
+    let clean = strip_comments(xml);
+    let mut out = String::new();
+    for tok in clean.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(tok);
+        if out.len() >= 240 {
+            break;
+        }
+    }
+    if out.len() > 240 {
+        out.truncate(240);
+        out.push('…');
+    }
+    if out.is_empty() {
+        out.push_str("<EMPTY FILE>");
+    }
+    out
+}
+
+/// Expand libvintf version RANGES into every declared endpoint.
+///
+/// Real semantic: libvintf stores `<version>2.0-2.1</version>` as a
+/// VersionRange and answers `getHal(pkg, version)` for ANY version
+/// inside it (HalManifest.cpp compareVersion — low <= v <= high on the
+/// declared major). Storing the range string verbatim made BOTH
+/// endpoint lookups miss (rn327: health@2.1 registration pre-check
+/// FAILED client-side → health-hal-2-1 restart-looped 25×).
+/// Multi-major ranges expand across majors; the expansion clamps at
+/// 32 versions per range so a malformed range cannot flood the index.
+fn expand_version_ranges(versions: &[String]) -> Vec<String> {
+    const MAX_EXPANSION: usize = 32;
+    let mut out = Vec::new();
+    for v in versions {
+        let range = match v.split_once('-') {
+            Some((lo, hi)) => (lo.trim(), hi.trim()),
+            None => {
+                out.push(v.clone());
+                continue;
+            }
+        };
+        let parse = |s: &str| -> Option<(u32, u32)> {
+            let (maj, min) = s.split_once('.')?;
+            let maj = maj.trim().parse::<u32>().ok()?;
+            let min = min.trim().parse::<u32>().ok()?;
+            Some((maj, min))
+        };
+        match (parse(range.0), parse(range.1)) {
+            (Some((lmaj, lmin)), Some((hmaj, hmin))) if hmaj >= lmaj => {
+                let mut maj = lmaj;
+                while maj <= hmaj && out.len() < MAX_EXPANSION {
+                    let mlo = if maj == lmaj { lmin } else { 0 };
+                    let mhi = if maj == hmaj { hmin } else { 15 };
+                    let mut min = mlo;
+                    while min <= mhi && out.len() < MAX_EXPANSION {
+                        out.push(format!("{}.{}", maj, min));
+                        min += 1;
+                    }
+                    maj += 1;
+                }
+            }
+            _ => out.push(v.clone()),
+        }
+    }
+    out
+}
+
+/// Index one AIDL `<fqname>` declaration against its `<hal>` package.
+///
+/// libvintf accepts two spellings inside `<hal format="aidl">`:
+/// - relative: `<fqname>ILights/default</fqname>` (IFace/instance,
+///   resolved against `<name>`),
+/// - fully-qualified: `<fqname>android.hardware.light.ILights/default
+///   </fqname>`.
+/// A version component (`IFace/1/instance`, the compatibility-matrix
+/// shape) is tolerated and dropped — manifest entries key unversioned.
+fn insert_aidl_fqname(fq: &str, package: &str, out: &mut VintfManifests) {
+    let fq = fq.trim();
+    if fq.is_empty() || package.is_empty() {
+        return;
+    }
+    let (head, instance) = match fq.rsplit_once('/') {
+        Some((l, r)) => (l, r.trim()),
+        None => return,
+    };
+    if instance.is_empty() {
+        return;
+    }
+    // Drop a trailing version component (matrix spelling).
+    let mut iface = head.to_string();
+    if let Some((l, _maybe_version)) = iface.rsplit_once('/') {
+        iface = l.to_string();
+    }
+    // Strip the package prefix on the fully-qualified spelling.
+    let prefixed = format!("{}.", package);
+    let iface = match iface.strip_prefix(&prefixed) {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => iface,
+    };
+    if iface.is_empty() || iface.contains('/') {
+        return;
+    }
+    out.insert(
+        format!("{}{}::{}/{}", AIDL_KEY_PREFIX, package, iface, instance),
+        TRANSPORT_HWBINDER,
+    );
 }
 
 fn sorted_fragments(rootfs: &str, rel_dir: &str) -> Vec<String> {
@@ -307,6 +452,11 @@ fn parse_hal_block(body: &str, aidl: bool, out: &mut VintfManifests) {
         }
     }
     versions.dedup();
+    // 6-Z372: version RANGES ("2.0-2.1") must answer for every
+    // endpoint — the real HalManifest stores a VersionRange and
+    // answers getHal for any version inside it; a verbatim key made
+    // BOTH endpoints miss (health-hal-2-1 restart-loop, rn327).
+    let versions = expand_version_ranges(&versions);
 
     let kind = match kind {
         Some(k) => k,
@@ -350,6 +500,15 @@ fn parse_hal_block(body: &str, aidl: bool, out: &mut VintfManifests) {
                 // <regex-instance> entries are deliberately skipped — no
                 // regex engine here; clients take the honest EMPTY path.
             }
+        }
+    }
+    // 6-Z372: the compact AIDL `<fqname>` shape (lights-default.xml,
+    // power-default.xml, rebootescrow-default.xml ship it) — an AIDL
+    // hal block may declare its instance WITHOUT an <interface> block
+    // at all, in which case the loop above produced nothing.
+    if aidl {
+        for fq in all_child_texts(body, "fqname") {
+            insert_aidl_fqname(&fq, &package, out);
         }
     }
 }
@@ -589,6 +748,131 @@ mod tests {
             m.lookup("android.hardware.foo@1.0::INotThere", "default"),
             None
         );
+    }
+
+    // ── 6-Z372: the rn327 restart-loop shapes ────────────────────────
+
+    #[test]
+    fn version_range_answers_every_endpoint() {
+        // The health-hal-2-1 class: a RANGE declaration must answer for
+        // both endpoints (libvintf VersionRange semantics). Storing the
+        // range verbatim made getTransport(2.1) → EMPTY → the client-side
+        // registerAsServiceInternal pre-check refused the registration
+        // and the HAL CHECK-aborted into an init restart-loop.
+        let xml = r#"
+<manifest version="1.0" type="device">
+    <hal format="hidl">
+        <name>android.hardware.health</name>
+        <transport>hwbinder</transport>
+        <version>2.0-2.1</version>
+        <interface>
+            <name>IHealth</name>
+            <instance>default</instance>
+        </interface>
+    </hal>
+</manifest>
+"#;
+        let m = parse_manifest(xml);
+        assert_eq!(
+            m.lookup("android.hardware.health@2.0::IHealth", "default"),
+            Some(TRANSPORT_HWBINDER),
+            "range low endpoint must answer"
+        );
+        assert_eq!(
+            m.lookup("android.hardware.health@2.1::IHealth", "default"),
+            Some(TRANSPORT_HWBINDER),
+            "range high endpoint must answer"
+        );
+        assert_eq!(
+            m.lookup("android.hardware.health@3.0::IHealth", "default"),
+            None,
+            "versions outside the range stay EMPTY"
+        );
+        // Sibling versions still work unchanged.
+        let m2 = parse_manifest(
+            r#"<hal format="hidl"><name>p</name><transport>hwbinder</transport>
+               <version>1.0</version><version>2.0</version>
+               <interface><name>I</name><instance>d</instance></interface></hal>"#,
+        );
+        assert_eq!(m2.lookup("p@1.0::I", "d"), Some(TRANSPORT_HWBINDER));
+        assert_eq!(m2.lookup("p@2.0::I", "d"), Some(TRANSPORT_HWBINDER));
+    }
+
+    #[test]
+    fn aidl_fqname_relative_and_fully_qualified() {
+        // The lights/power/rebootescrow class: the compact AIDL shape
+        // declares the instance via <fqname> with NO <interface> block.
+        let xml = r#"
+<manifest version="1.0" type="device">
+    <hal format="aidl">
+        <name>android.hardware.light</name>
+        <fqname>ILights/default</fqname>
+    </hal>
+    <hal format="aidl">
+        <name>android.hardware.rebootescrow</name>
+        <fqname>android.hardware.rebootescrow.IRebootEscrow/default</fqname>
+    </hal>
+    <hal format="aidl">
+        <name>android.hardware.power</name>
+        <fqname>IPower/2/default</fqname>
+    </hal>
+</manifest>
+"#;
+        let m = parse_manifest(xml);
+        assert_eq!(
+            m.lookup("aidl-never-matches-hidl", "x"),
+            None,
+            "aidl keys are namespaced away from HIDL lookups"
+        );
+        let entries = m.len();
+        assert!(
+            entries >= 3,
+            "all three fqname hal blocks must index: got {}",
+            entries
+        );
+        // The AIDL keys use the aidl: prefix (same scheme the existing
+        // interface/instance AIDL arm uses).
+        let key = format!("{}android.hardware.light::ILights/default", AIDL_KEY_PREFIX);
+        assert!(
+            m.entries.contains_key(&key),
+            "relative fqname must index as aidl:pkg::IFace/instance"
+        );
+        let key2 = format!(
+            "{}android.hardware.rebootescrow::IRebootEscrow/default",
+            AIDL_KEY_PREFIX
+        );
+        assert!(
+            m.entries.contains_key(&key2),
+            "fully-qualified fqname must strip the package prefix"
+        );
+        let key3 = format!("{}android.hardware.power::IPower/default", AIDL_KEY_PREFIX);
+        assert!(
+            m.entries.contains_key(&key3),
+            "matrix spelling (IFace/version/instance) drops the version"
+        );
+    }
+
+    #[test]
+    fn version_range_expansion_caps_and_passthrough() {
+        let v = expand_version_ranges(&["2.0".to_string(), "1.0-1.2".to_string()]);
+        assert_eq!(v, vec!["2.0", "1.0", "1.1", "1.2"]);
+        // Malformed ranges pass through verbatim (honest EMPTY path).
+        let v2 = expand_version_ranges(&["x-y".to_string(), "2.0".to_string()]);
+        assert_eq!(v2, vec!["x-y", "2.0"]);
+        // Reverse ranges pass through (hmaj >= lmaj gate).
+        let v3 = expand_version_ranges(&["3.0-2.0".to_string()]);
+        assert_eq!(v3, vec!["3.0-2.0"]);
+    }
+
+    #[test]
+    fn xml_skeleton_bounded_and_names_empty() {
+        assert_eq!(xml_skeleton(""), "<EMPTY FILE>");
+        assert_eq!(xml_skeleton("   \n\t "), "<EMPTY FILE>");
+        let long: String = "x".repeat(5000);
+        let sk = xml_skeleton(&long);
+        assert!(sk.chars().count() <= 242, "skeleton must stay bounded");
+        let cmt = "<manifest><!-- only a comment --></manifest>";
+        assert_eq!(xml_skeleton(cmt), "<manifest></manifest>");
     }
 
     #[test]
