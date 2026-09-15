@@ -6847,6 +6847,106 @@ fn scan_maps_range(line: &str) -> Option<(u64, u64)> {
     Some((s0, e0))
 }
 
+/// 6-Z364: bounded AArch64 frame-pointer walk for the 6-Z362/6-Z363
+/// milestone deep-dive. The 6-Z285 walk lives inside stall_forensic_dump
+/// (event-stall paths, sp from /proc/pid/syscall); this standalone walker
+/// serves the big-anon-mmap deep-dive, where the LIVE stop's sp is already
+/// in hand (abi.reg_sp). Same heuristics as 6-Z285, tightened bounds:
+/// scan the first 512 bytes above sp for a stack-resident fp whose record
+/// decodes to (next-fp, exec-resident ret), then walk ≤8 frames with
+/// monotonically increasing fp. Pure diagnostics — the child is stopped,
+/// all reads through read_child_bytes, ZERO register writes.
+fn bt_walk_6z364(pid: libc::pid_t, sp: u64) {
+    if sp == 0 {
+        return;
+    }
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).unwrap_or_default();
+    let regions: Vec<(u64, u64, bool, String)> = maps
+        .lines()
+        .filter_map(|l| {
+            let mut r = l.splitn(2, ' ');
+            let range = r.next()?;
+            let mut b = range.split('-');
+            let lo = u64::from_str_radix(b.next()?, 16).ok()?;
+            let hi = u64::from_str_radix(b.next()?, 16).ok()?;
+            let perms = r.next().unwrap_or("");
+            Some((lo, hi, perms.contains('x'), l.to_string()))
+        })
+        .collect();
+    let name_of = |pc: u64| -> String {
+        for (lo, hi, _, line) in &regions {
+            if pc >= *lo && pc < *hi {
+                let path = line.split_whitespace().last().unwrap_or("?");
+                if path.starts_with('[') {
+                    return path.to_string();
+                }
+                let comps: Vec<&str> = path.rsplitn(3, '/').collect();
+                let short = if comps.len() >= 2 {
+                    format!("{}/{}", comps[1], comps[0])
+                } else {
+                    path.to_string()
+                };
+                return format!("{}+{:#x}", short, pc - lo);
+            }
+        }
+        "?".to_string()
+    };
+    let Some(win) = read_child_bytes(pid, sp, 512) else {
+        crate::trace_log_line(&format!(
+            "6-Z364 BT: pid={} stack unreadable above sp={:#x}",
+            pid, sp
+        ));
+        return;
+    };
+    let mut chain = None;
+    for i in 0..win.len() / 8 {
+        let v = u64::from_ne_bytes(win[i * 8..i * 8 + 8].try_into().unwrap());
+        if v <= sp || v >= sp + 0x100000 || v & 7 != 0 {
+            continue;
+        }
+        if let Some(rec) = read_child_bytes(pid, v, 16) {
+            let next = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+            let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+            let ret_exec = regions
+                .iter()
+                .any(|(lo, hi, x, _)| *x && ret >= *lo && ret < *hi);
+            let next_stack = next > sp && next < sp + 0x100000 && next & 7 == 0;
+            if ret_exec && (next_stack || (ret != 0 && next == 0)) {
+                chain = Some(v);
+                break;
+            }
+        }
+    }
+    let Some(mut fp) = chain else {
+        crate::trace_log_line(&format!(
+            "6-Z364 BT: pid={} no frame record in the first 512 bytes above sp={:#x}",
+            pid, sp
+        ));
+        return;
+    };
+    for depth in 0..8 {
+        let Some(rec) = read_child_bytes(pid, fp, 16) else {
+            break;
+        };
+        let next = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+        let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+        if ret == 0 {
+            break;
+        }
+        crate::trace_log_line(&format!(
+            "6-Z364 BT: pid={} frame={} ret={:#x} {}",
+            pid,
+            depth,
+            ret,
+            name_of(ret)
+        ));
+        if next <= fp || next >= sp + 0x100000 {
+            break;
+        }
+        fp = next;
+    }
+}
+
 fn maps_bracket_in(content: &str, addr: u64) -> String {
     let mut prev: Option<&str> = None;
     for line in content.lines() {
@@ -15062,7 +15162,7 @@ pub fn run_ptrace_loop(
     // length arg is UNRECOVERABLE at EXIT. Only ≥8 MiB entries are stored,
     // so the map holds a handful of slots per boot (small allocations never
     // touch it).
-    let mut pending_big_mmap: std::collections::HashMap<libc::pid_t, (u64, u64)> =
+    let mut pending_big_mmap: std::collections::HashMap<libc::pid_t, (u64, u64, u64)> =
         std::collections::HashMap::new();
     // Per-pid counters: (events, total_bytes, max_single, milestone_mask).
     // The mask's bits are cleared as each 6-Z362_MILESTONES threshold is
@@ -27514,7 +27614,20 @@ pub fn run_ptrace_loop(
                             {
                                 let m_len362 = get_syscall_arg(&regs, abi.reg_arg2);
                                 if m_len362 >= BIG_ANON_MMAP_MIN {
-                                    pending_big_mmap.insert(pid, (m_len362, flags as u64));
+                                    // 6-Z364: the ADDRESS rides along too —
+                                    // rn317's 47.62 GiB balloon carried
+                                    // MAP_FIXED (0x10) in its flags; whether
+                                    // addr was nonzero decides fixed-vs-hint
+                                    // and names the map-the-whole-region
+                                    // callers.
+                                    pending_big_mmap.insert(
+                                        pid,
+                                        (
+                                            m_len362,
+                                            flags as u64,
+                                            get_syscall_arg(&regs, abi.reg_arg1),
+                                        ),
+                                    );
                                 }
                             }
                             // ── 6-Z305t-42: binder-fd mmap probe (ENTRY) ──
@@ -29141,7 +29254,7 @@ pub fn run_ptrace_loop(
                     // only drops the stash entry (counters measure REAL
                     // mappings, mirroring RSS).
                     if syscall_num == abi.mmap || syscall_num == abi.mmap2 {
-                        if let Some((m_len, m_flags)) = pending_big_mmap.remove(&pid) {
+                        if let Some((m_len, m_flags, m_addr)) = pending_big_mmap.remove(&pid) {
                             let m_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                             if m_ret > 0 {
                                 static BIG_MMAP_DETAIL: std::sync::atomic::AtomicU64 =
@@ -29266,6 +29379,32 @@ pub fn run_ptrace_loop(
                                             pc_br363,
                                             regions363
                                         ));
+                                        // ── 6-Z364: the CALLING FRAME ──
+                                        //
+                                        // rn317 resolved the 47.62 GiB balloon's
+                                        // mmap to libc's TEXT (the syscall
+                                        // wrapper) — the interesting caller is
+                                        // one frame up. Walk the frame-pointer
+                                        // chain (bounded, 6-Z285 heuristics,
+                                        // live sp from the current stop) and
+                                        // log the mmap's requested ADDRESS +
+                                        // MAP_FIXED status (rn317's flags
+                                        // 0x32 = PRIVATE|ANON|MAP_FIXED — the
+                                        // addr arg decides fixed-vs-hint).
+                                        log(&format!(
+                                            "6-Z364: mmap-args pid={} addr={:#x} len={} flags={:#x}{} total={:.2}GiB",
+                                            pid,
+                                            m_addr,
+                                            m_len,
+                                            m_flags,
+                                            if m_flags & 0x10 != 0 {
+                                                " [MAP_FIXED]"
+                                            } else {
+                                                ""
+                                            },
+                                            st.1 as f64 / 1073741824.0
+                                        ));
+                                        bt_walk_6z364(pid, get_syscall_arg(&regs, abi.reg_sp));
                                         // 6-Z363: arm the per-pid detail
                                         // budget — the NEXT 8 big mmaps of
                                         // THIS pid log their len/flags even
