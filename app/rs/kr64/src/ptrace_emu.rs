@@ -29141,9 +29141,16 @@ pub fn run_ptrace_loop(
                                     + 1;
                                 let detail_n = BIG_MMAP_DETAIL
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let st = big_mmap_stats
-                                    .entry(pid)
-                                    .or_insert((0u64, 0u64, 0u64, 0u32));
+                                let st = big_mmap_stats.entry(pid).or_insert((
+                                    0u64,
+                                    0u64,
+                                    0u64,
+                                    // 6-Z362: every milestone starts OWED
+                                    // (bit set = still owed) — the mask
+                                    // must begin ALL-ONES or no
+                                    // milestone line could ever fire.
+                                    (1u32 << BIG_ANON_MMAP_MILESTONES.len()) - 1,
+                                ));
                                 st.0 = st.0.saturating_add(1);
                                 st.1 = st.1.saturating_add(m_len);
                                 st.2 = st.2.max(m_len);
