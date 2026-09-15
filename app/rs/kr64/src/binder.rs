@@ -1713,6 +1713,51 @@ impl ParcelWriter {
         (self.data, self.offsets, self.sg)
     }
 
+    /// 6-Z375 — bounded reply-wire dump: every offsets-array object
+    /// (type, inline length, parent index, parent_offset) plus the SG
+    /// content hex. This is the PROXY-SIDE pre-fixup truth; the loader's
+    /// 6-Z375 line carries the client-side post-fixup view. Together they
+    /// name any divergence from the kernel-true wire in one run.
+    fn diag_object_graph(&self) -> String {
+        let n_obj = self.offsets.len() / 8;
+        let mut s = format!("dlen={} offs({})=", self.data.len(), n_obj);
+        for j in 0..n_obj {
+            let off = u64::from_ne_bytes(
+                self.offsets[j * 8..j * 8 + 8]
+                    .try_into()
+                    .unwrap_or([0u8; 8]),
+            ) as usize;
+            if off + 40 > self.data.len() {
+                s.push_str(&format!(" [{}:OOB@{}]", j, off));
+                continue;
+            }
+            let typ = u32::from_ne_bytes(self.data[off..off + 4].try_into().unwrap_or([0u8; 4]));
+            let len =
+                u64::from_ne_bytes(self.data[off + 16..off + 24].try_into().unwrap_or([0u8; 8]));
+            let parent =
+                u64::from_ne_bytes(self.data[off + 24..off + 32].try_into().unwrap_or([0u8; 8]));
+            let poff =
+                u64::from_ne_bytes(self.data[off + 32..off + 40].try_into().unwrap_or([0u8; 8]));
+            if typ == BINDER_TYPE_PTR {
+                s.push_str(&format!(
+                    " [{}:PTR len={} par={} poff={}]",
+                    j, len, parent, poff
+                ));
+            } else {
+                s.push_str(&format!(" [{}:0x{:x}]", j, typ));
+            }
+        }
+        s.push_str(&format!(" sg({})=", self.sg.len()));
+        for (i, b) in self.sg.iter().enumerate() {
+            let mut h = String::new();
+            for x in b.data.iter().take(24) {
+                h.push_str(&format!("{:02x}", x));
+            }
+            s.push_str(&format!(" sg{}[{}]={}", i, b.data.len(), h));
+        }
+        s
+    }
+
     /// Write a `binder_buffer_object` (BINDER_TYPE_PTR) whose bytes ride
     /// the SG region — the HIDL buffer model for reply values
     /// (writeBuffer/writeEmbeddedBuffer emulation). Returns the object's
@@ -7239,6 +7284,28 @@ fn servicemanager_hidl(
                 "[KR64][binder][svc] HIDL listManifestByInterface({}) → {} entries",
                 fq, count
             );
+            // 6-Z375 — the kmDevices wall (rn329 decode): the A11 keystore
+            // enumerate consumes vec<Instance> list replies; the 0-ENTRY
+            // reply parses client-side (the Keymaster3 fallback getService
+            // → getTransport(3.0/default) ran 36×) while the 1-ENTRY reply
+            // (keymaster@4.0 → 1 entry) never reaches try_get_device's
+            // getService — ZERO getTransport(4.0)/get(4.0) probes on the
+            // wire, CHECK(kmDevices[TRUSTED_ENVIRONMENT]) aborts 36× (the
+            // run's biggest crash class; cameraserver's provider list shows
+            // the same never-get shape, non-fatally). The proxy-side graph
+            // mirrors the PROVEN interfaceChain vec<string> mechanics, so
+            // the divergence is a byte-level detail this dump names in one
+            // run: the full reply object graph + SG hex, bounded to the
+            // first 3 NON-EMPTY replies per boot (the empty reply parses).
+            static Z375_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if count > 0 && Z375_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                info!(
+                    "[KR64][binder][svc] 6-Z375 listManifest reply wire: fq={} count={} {}",
+                    fq,
+                    count,
+                    writer.diag_object_graph()
+                );
+            }
         }
         _ => {
             hidl_sm_parse_fail_diag("catch-all", code, blob);
