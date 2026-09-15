@@ -30048,3 +30048,20 @@ Stage Summary / rn318 DECODE TREE (next session):
 3. If the BT walk fails on the real stack (no frame record), fall back to the 6-Z314-style STALL-STACK pc-resolver at the NEXT crossing — the pc itself is in libc but the CALLER's ret is in the wrapper's frame.
 4. Recovery first: any boot-semantics change waits for the caller to be named; NO speculative caps.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 101 (rn318 decoded — THE BREAKTHROUGH SHAPE: the 47.62 GiB balloon DID NOT RECUR and the composer's first instance SURVIVED for the first time (vendor.hwcomposer-2-3 + surfaceflinger + zygote each started ONCE with ZERO death records); the guest booted +109.9s ALIVE — init still starting services at the cut (llkd at +108.0s), zero memory pressure (peak 8.9 GB used, 7 GB free), the app never died (one filelogger_init), and the run's "failure" conclusion is just the ladder's 180 s HARD CAP cutting a STILL-PROGRESSING boot (boot-watch exit code), not a crash. THE CAUSAL MODEL IS NOW NAMED: the composer gen-1 SEGV (NULL-deref in libutils.so, si_addr=0x0, pc 0xfc0c1852a9a0, +13.8 s, parked since Task 94) is a RACE — rn315/316/317 fired it → init restart cascade → the RESTARTED SF generation made the deterministic 47.62 GiB MAP_FIXED|ANON mmap (the balloon) → RSS touched progressively → host memory death; rn318 did NOT fire it → the fully healthy path ran and the boot progressed deeper than any run before it. KILLING THE COMPOSER SEGV MAKES THIS PATH DETERMINISTIC. 6-Z365 landed: the fatal-signal handler now runs bt_walk_6z364 on the stopped crashing thread (bounded, read-only, ≤8 frames) — the next SEGV names its exact caller, and the fix design follows from the named library. The 6-Z364 mmap-args + BT lines also PROVEN live in rn318 (reservations decode cleanly: addr=0x0 flags=0x4022; the FP walker resolves chains where frames exist and reports honestly when the bionic wrapper prologue keeps none).)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn318 (run 34939759460 on dea2dc31, workflow conclusion failure = 180s cap on a progressing boot) downloaded to /home/z/artifacts-rn318 and decoded. No balloon (top pid 16.53 GiB = reservations; zero 0x32-huge calls; SF-era clean). SF/composer/zygote 1 start each, 0 deaths. klog active to +108s. Mem peak 8.9 GB. host-lmkd-kills.txt v2 bounded clean.
+- The causal chain across rn315-318 pinned: composer gen-1 SEGV (race) → restart cascade → restarted-SF 47.62 GiB MAP_FIXED balloon → progressive-touch RSS death. rn318 broke the chain by NOT firing the SEGV.
+- Landed 6-Z365 (fix(kr64)): bt_walk_6z364 wired into the SIGSEGV arm of the fatal-signal handler — the stopped crashing thread's frames walk ≤8 deep (6-Z285 heuristics; read_child_bytes only; zero register writes; the arm32 stacks simply report "no frame record").
+- Gates ALL green: fmt clean, clippy -D warnings clean, 894/894.
+
+Stage Summary / rn319 DECODE TREE (next session):
+1. If the composer SEGV fires: the 6-Z365 BT names the caller (expect the RefBase/HwBinder death-notification or registration path in libutils/libhidlbase) — implement the targeted fix (likely a missed virtual-base adjustment or a NULL-capture in our 6-Z306ae/6-Z359 machinery feeding the composer a bad object; the fix is OURS, in the proxy/shlib semantics, generic).
+2. If the SEGV does NOT fire again (healthy path repeats): the boot continues deeper — the rung verdict should improve past rung 3 (the classifier needs BOOT_COMPLETED-era evidence; the 180 s cap may now need boot_wait raised to see system_server — consider boot_wait_seconds 240 + stall 90 for the next dispatch).
+3. If a NEW wall appears (system_server/zygote-app class), decode with the full 6-Z362-365 stack now live.
+4. fd-passing engagement remains zero across all runs — after the SEGV class closes, the display-buffer path decode is next (why no FD flat ever crosses: IAllocator failing upstream vs mapper loopback).
+- Authentication is provided through the private agent environment.

@@ -39013,6 +39013,21 @@ pub fn run_ptrace_loop(
                                     "SIGSEGV details: tid={} si_code={} (1=MAPERR unmapped, 2=ACCERR permission), si_addr={:#x}, pc={:#x}, sp={:#x}{}",
                                     pid, si_code, si_addr, pc, rsp, extra_regs
                                 ));
+                                // ── 6-Z365: the CALLING FRAMES of a fatal ──
+                                //
+                                // rn315's blocking-adjacent class (the composer
+                                // gen-1 NULL-deref in libutils, si_addr=0x0,
+                                // pc in the r-xp text) recorded pc+sp but not
+                                // WHO CALLED — and the class is a race (rn318
+                                // never fired it and the whole boot turned
+                                // healthy: SF/zygote once each, zero deaths,
+                                // +110s of progress at the 180s cap). Making
+                                // the healthy path deterministic means naming
+                                // the caller; the child is STOPPED here, the
+                                // stack is readable, and the 6-Z364 walker is
+                                // pure read-only diagnostics. Bounded: one
+                                // walk per fatal, ≤8 frames.
+                                bt_walk_6z364(pid, rsp);
                                 // ── 6-Z306u: faulting-object memory peek ──
                                 //
                                 // #234 decode: the vendor-gralloc crash loop
