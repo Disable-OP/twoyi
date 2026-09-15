@@ -4555,6 +4555,14 @@ fn handle_write_read(
                             "[KR64][binder][vm{}] 6-Z306ae: node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
                             vm_id, conn_id, br, ptr, cookie
                         );
+                        // 6-Z366: a kernel-true BR_ACQUIRE hold just crossed
+                        // to a live owner — request the mRefs-field hardware
+                        // watchpoint on the owner's threads (the destroyer-
+                        // naming instrument for the composer createClient
+                        // paradox: rn323's Scudo invalid-chunk class).
+                        if br == BR_ACQUIRE {
+                            crate::ptrace_emu::z366_request_watch(dpid2, ptr, cookie);
+                        }
                     } else {
                         // Skipped by the invariant gate — never hand the
                         // guest an empty read buffer (kernel semantics:
