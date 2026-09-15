@@ -397,6 +397,23 @@ fn write_proc_cmdline(proc_dir: &str) -> std::io::Result<()> {
         "androidboot.veritymode=enforcing ",
         "androidboot.fstab_suffix=default ",
         "androidboot.zygote=zygote64_32 ",
+        // 6-Z378: the Android emulator boot contract. init's
+        // ProcessKernelCmdline (property_service.cpp) runs its ro.kernel.*
+        // export pass ONLY when pass 1 saw a bare "qemu" key on the cmdline
+        // (the for_emulator gate — vendored reference:
+        // docs/reference/aosp-init/property_service.cpp). Without it
+        // ro.kernel.qemu is never set and every emulator-conditional guest
+        // consumer breaks. rn334 decode: goldfish-ril's isInEmulator()
+        // (device/generic/goldfish radio/ril/misc.c) is a pure
+        // __system_property_get("ro.kernel.qemu") existence probe → false →
+        // RIL_Init returned NULL → RIL_register(NULL) early-returned (the
+        // configureRpcThreadpool in radio::registerService never ran) →
+        // rild's rilc_thread_pool() hit libhwbinder's LOG_ALWAYS_FATAL
+        // "HIDL joinRpcThreadpool without calling configureRpcThreadPool."
+        // → init restart loop 22×. The recovery cmdline already carries
+        // qemu=1 (lib.rs twrp-cmdline); the android boot now matches the
+        // reference ranchu boot (init.ranchu.rc consumers included).
+        "qemu=1 ",
         "kpti=off ",
         "ssbd=force-off ",
         "rcu_nocbs=0-7 ",
@@ -1246,6 +1263,9 @@ mod tests {
         let c = std::fs::read_to_string(format!("{}/proc/cmdline", rootfs)).unwrap();
         assert!(c.contains("androidboot.hardware=twoyi"));
         assert!(c.contains("androidboot.bootdevice=virtual"));
+        // 6-Z378: the qemu flag trips init's for_emulator gate (ro.kernel.*
+        // export pass → ro.kernel.qemu=1 → goldfish-ril isInEmulator()).
+        assert!(c.contains("qemu=1"));
         let _ = std::fs::remove_dir_all(&rootfs);
     }
 
