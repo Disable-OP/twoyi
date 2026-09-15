@@ -7160,17 +7160,23 @@ fn servicemanager_hidl(
         }
         // A11 `android.hidl.manager@1.2::IServiceManager
         // .listManifestByInterface(string fqName) generates
-        // (vec<Instance> instances)` (code 13) — the caller (e.g.
-        // cameraserver enumerating camera providers) aborts on an
-        // unchecked failed Return when this fails ("Failed HIDL return
-        // status not checked", 53× in ladder #125), so the honest answer
-        // is the REAL shape: every bus-registered "fq/instance" whose fq
-        // matches, marshaled as vec<Instance{hidl_string fqName,
-        // hidl_string instance}> — [status ok][PTR vec struct {ptr,size}]
-        // [PTR array child 0][PTR chars per field, parent = THE ARRAY,
-        // parent_offset = j*32 (+0 fqName, +16 instance)]. The SG bytes
-        // ride the v3 resp trailer and the loader applies the receiver
-        // pointer fixup (the 6-Z305t-68 machinery).
+        // (vec<string> instances)` (code 13) — the caller (keystore's
+        // enumerate, cameraserver's provider walk) reads count ×
+        // sizeof(hidl_string) per element. 6-Z376 (rn330 decode): the
+        // pre-6-Z376 vec<Instance{fqName,instance}> shape was
+        // UNCONSUMABLE — the guest logd verdict, 42×: "hw-Parcel: Buffer
+        // length 32 does not match expected size 16." (the client
+        // expected 16 B/element, hit the 32 B Instance array; keystore
+        // 40× + cameraserver 2×). The 6-Z305t-69 comment had conflated
+        // this method with debugDump's vec<InstanceDebugInfo> struct.
+        // The honest answer: every bus-registered "fq/instance" key whose
+        // fq matches, marshaled as vec<hidl_string> via
+        // write_hidl_vec_string — the shape family the SM cast probes
+        // have consumed client-side since 6-Z307d ([status ok][PTR vec
+        // struct {ptr,size}][PTR array child 0][PTR chars per element,
+        // parent = THE ARRAY, parent_offset = j*16]). The SG bytes ride
+        // the v3 resp trailer and the loader applies the receiver pointer
+        // fixup (the 6-Z305t-68 machinery).
         // 1.0 `debugDump()` — code 7. The A11 Watchdog's
         // getInterestingHalPids() consumes this INSIDE the WAITED_HALF
         // branch (Watchdog.java:616 → :517); on real hwservicemanager
@@ -7243,60 +7249,44 @@ fn servicemanager_hidl(
                     return TransactionResult::Failed;
                 }
             };
-            let pairs: Vec<(String, String)> = {
+            // 6-Z376 (rn330 decode): the reply is **vec<hidl_string>** of the
+            // FULL "fq/instance" names — NOT vec<Instance{fqName,instanceName}>.
+            // The rn330 guest logd carried the verdict verbatim, 42×:
+            //   "hw-Parcel: Buffer length 32 does not match expected size 16."
+            // the client's vec read expected count × sizeof(hidl_string) = 16
+            // per element and hit our 32B-per-element Instance array
+            // (keystore 40× + cameraserver 2×). The pre-6-Z376 shape came
+            // from the 6-Z305t-69 comment conflating this method with
+            // debugDump's vec<InstanceDebugInfo> struct; the 1.2 .hal's
+            // listManifestByInterface generates (vec<string> instances) —
+            // the same shape family as the 1.0 listByInterface and the
+            // PROVEN interfaceChain vec<string> reply (write_hidl_vec_string,
+            // consumed client-side by the SM cast probes since 6-Z307d).
+            // Entries = the matching registry keys verbatim ("fq/instance") —
+            // the 6-Z351 chain aliases are REAL hwservicemanager map keys
+            // (addImpl inserts the ONE HidlService under EVERY chain fq),
+            // so the @4.0 query lists "@4.0::IKeymasterDevice/default" and
+            // keystore's try_get_device resolves it through getTransport
+            // (manifest range) + get (alias hit). The client's enumerate
+            // callback then finally runs: kmDevices[TRUSTED_ENVIRONMENT]
+            // fills, the 36-40× CHECK abort loop dies.
+            let names: Vec<String> = {
                 let b = bus.lock().expect("binder bus poisoned");
                 b.services
                     .keys()
-                    .filter_map(|k| {
-                        let (f, i) = k.split_once('/')?;
-                        (f == fq).then(|| (f.to_string(), i.to_string()))
-                    })
+                    .filter(|k| k.split_once('/').map(|(f, _)| f == fq).unwrap_or(false))
                     .take(128)
+                    .cloned()
                     .collect()
             };
-            let count = pairs.len();
-            // hidl_vec<Instance> wire (Instance = 2 packed hidl_string
-            // structs = 32 bytes per element). 6-Z309: the mSize fields
-            // (fqName @+8, instanceName @+24) carry the REAL lengths.
-            let mut vs = vec![0u8; 16];
-            vs[8..12].copy_from_slice(&(count as u32).to_ne_bytes());
-            let vec_idx = writer.next_object_index();
-            writer.write_ptr_object(vs, None, 0);
-            // The ARRAY's parent = the VEC struct object; the chars'
-            // parent = the ARRAY object (indices the client validates).
-            let arr_idx = writer.next_object_index();
-            let mut array = vec![0u8; count * 32];
-            for (j, (f, i)) in pairs.iter().enumerate() {
-                let base = j * 32;
-                array[base + 8..base + 12].copy_from_slice(&(f.len() as u32).to_ne_bytes());
-                array[base + 24..base + 28].copy_from_slice(&(i.len() as u32).to_ne_bytes());
-            }
-            writer.write_ptr_object(array, Some(vec_idx), 0);
-            for (j, (f, i)) in pairs.iter().enumerate() {
-                let mut fc = f.as_bytes().to_vec();
-                fc.push(0);
-                writer.write_ptr_object(fc, Some(arr_idx), (j * 32) as u64);
-                let mut ic = i.as_bytes().to_vec();
-                ic.push(0);
-                writer.write_ptr_object(ic, Some(arr_idx), (j * 32 + 16) as u64);
-            }
+            let count = names.len();
+            writer.write_hidl_vec_string(&names);
             info!(
                 "[KR64][binder][svc] HIDL listManifestByInterface({}) → {} entries",
                 fq, count
             );
-            // 6-Z375 — the kmDevices wall (rn329 decode): the A11 keystore
-            // enumerate consumes vec<Instance> list replies; the 0-ENTRY
-            // reply parses client-side (the Keymaster3 fallback getService
-            // → getTransport(3.0/default) ran 36×) while the 1-ENTRY reply
-            // (keymaster@4.0 → 1 entry) never reaches try_get_device's
-            // getService — ZERO getTransport(4.0)/get(4.0) probes on the
-            // wire, CHECK(kmDevices[TRUSTED_ENVIRONMENT]) aborts 36× (the
-            // run's biggest crash class; cameraserver's provider list shows
-            // the same never-get shape, non-fatally). The proxy-side graph
-            // mirrors the PROVEN interfaceChain vec<string> mechanics, so
-            // the divergence is a byte-level detail this dump names in one
-            // run: the full reply object graph + SG hex, bounded to the
-            // first 3 NON-EMPTY replies per boot (the empty reply parses).
+            // 6-Z375: bounded reply-wire dump (first 3 NON-empty replies per
+            // boot) — kept as the shape-change witness for the next decode.
             static Z375_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             if count > 0 && Z375_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
                 info!(
@@ -13809,9 +13799,11 @@ mod tests {
         // registry invariants above ARE the host-testable truth.
     }
 
-    /// listManifestByInterface (code 13) answers the REAL vec<Instance>
-    /// shape: [status ok][PTR vec struct {0,count}][PTR array child 0][PTR
-    /// chars per field, parent = the array, offset j*32 (+0/+16)] — and
+    /// listManifestByInterface (code 13) answers the REAL vec<hidl_string>
+    /// shape (6-Z376: the rn330 guest logd verdict "Buffer length 32 does
+    /// not match expected size 16" pinned the old vec<Instance> shape as
+    /// unconsumable): [status ok][PTR vec struct {0,count}][PTR array child
+    /// 0][PTR chars per element, parent = the array, offset j*16] — and
     /// the reply's SG section rides the v3 resp trailer so the loader can
     /// apply the receiver pointer fixup.
     #[test]
@@ -13835,19 +13827,32 @@ mod tests {
         let TransactionResult::Reply { data, offsets, sg } = result else {
             panic!("listManifestByInterface must Reply");
         };
-        // status(4) + vec-struct PTR(40) + array PTR(40) + 2 field chars
-        // PTR(80) = 164 (one Instance = fqName + instance).
-        assert_eq!(data.len(), 164);
-        // offsets: 4 objects, u64 each.
-        assert_eq!(offsets.len(), 32);
-        // SG: [vec struct 16, array 32 (1 instance × 32), fq chars, inst chars].
+        // 6-Z376: the reply is vec<hidl_string> of the FULL "fq/instance"
+        // names (the rn330 verdict "Buffer length 32 does not match expected
+        // size 16" pinned the old vec<Instance> shape as unconsumable).
+        // status(4) + vec-struct PTR(40) + array PTR(40) + chars PTR(40)
+        // = 124 (one "fq/instance" string element).
+        assert_eq!(data.len(), 124);
+        // offsets: 3 objects, u64 each.
+        assert_eq!(offsets.len(), 24);
+        // SG: [vec struct 16, array 16 (1 string × 16), chars 62+1].
         let lens: Vec<usize> = sg.iter().map(|b| b.data.len()).collect();
-        assert_eq!(lens, vec![16, 32, 54, 9]); // 53+1 fq, 8+1 instance
-                                               // vec struct: {ptr=0, size=1}.
+        assert_eq!(lens, vec![16, 16, 63]);
+        // vec struct: {ptr=0, size=1}.
         assert_eq!(u64::from_ne_bytes(sg[0].data[8..16].try_into().unwrap()), 1);
+        // array element: {ptr=0 (patched loader-side), size=62}.
+        assert_eq!(
+            u64::from_ne_bytes(sg[1].data[8..16].try_into().unwrap()),
+            62
+        );
+        // chars = the FULL registry key + NUL.
+        assert_eq!(
+            &sg[2].data,
+            b"android.hardware.camera.provider@2.6::ICameraProvider/legacy/0\0"
+        );
         // The vec-struct PTR object carries NO parent; the array PTR has
-        // parent = the vec object's index, offset 0; the chars objects'
-        // parent = the ARRAY's index.
+        // parent = the vec object's index, offset 0; the chars object's
+        // parent = the ARRAY's index, offset 0 (the string header slot).
         let obj_at = |i: usize| -> (u32, u32, u64, u64, u64, u64) {
             let off = u64::from_ne_bytes(offsets[i * 8..(i + 1) * 8].try_into().unwrap()) as usize;
             (
@@ -13866,16 +13871,14 @@ mod tests {
         let (t1, f1, _p1, l1, par1, po1) = obj_at(1);
         assert_eq!(t1, BINDER_TYPE_PTR);
         assert_eq!(f1, BINDER_BUFFER_FLAG_HAS_PARENT);
-        assert_eq!(l1, 32);
+        assert_eq!(l1, 16);
         assert_eq!(par1, 0); // parent = vec object (index 0)
         assert_eq!(po1, 0);
-        let (_t2, f2, _p2, _l2, par2, po2) = obj_at(2);
+        let (_t2, f2, _p2, l2, par2, po2) = obj_at(2);
         assert_eq!(f2, BINDER_BUFFER_FLAG_HAS_PARENT);
         assert_eq!(par2, 1); // parent = the ARRAY (index 1)
-        assert_eq!(po2, 0); // fqName at element offset 0
-        let (_t3, _f3, _p3, _l3, par3, po3) = obj_at(3);
-        assert_eq!(par3, 1);
-        assert_eq!(po3, 16); // instance at element offset 16
+        assert_eq!(po2, 0); // the string header at element offset 0
+        assert_eq!(l2, 63); // the chars: the full name + NUL
     }
 
     /// Reproduction of the ladder-#129 code=12 wire dump (byte-exact from
