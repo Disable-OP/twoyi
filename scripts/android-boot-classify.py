@@ -74,14 +74,13 @@ def parse_ps_rows(ps_text):
     return rows
 
 
-def guest_process_view(ps_text):
-    """(guest_names_text, guest_name_list, app_pid, guest_dead)."""
-    rows = parse_ps_rows(ps_text)
+def guest_subtree_names(rows):
+    """names of the io.twoyi.debug subtree for one ps snapshot (any format)."""
     procs = {pid: (ppid, name) for pid, ppid, name in rows}
     app_pid = next((pid for pid, (_ppid, name) in procs.items()
                     if name.rstrip("]").endswith("io.twoyi.debug")), None)
     if app_pid is None:
-        return "", [], None, False
+        return []
     guests = {app_pid}
     changed = True
     while changed:
@@ -90,8 +89,55 @@ def guest_process_view(ps_text):
             if ppid in guests and pid not in guests:
                 guests.add(pid)
                 changed = True
-    names = [name for pid, (_ppid, name) in sorted(procs.items())
-             if pid in guests]
+    return [name for pid, (_ppid, name) in sorted(procs.items())
+            if pid in guests]
+
+
+def parse_watch_samples(watch_text):
+    """[(offset_s, ps_rows)] per '===== liveness @Ns =====' block.
+
+    The watch sampler (6-Z367) appends filtered `ps -A -o PID,PPID,NAME`
+    rows — 3-column rows, a DIFFERENT shape from the final full `ps -A`
+    (parse_ps_rows expects >=8 columns and would skip every watch row).
+    Rows are grep-filtered by the sampler, so a row joins the guest
+    subtree only when its own parent chain (app -> libkr64 -> init ->
+    zygote -> ...) was ALSO matched by the filter — the workflow keeps
+    that chain complete (6-Z374 added systemui/launcher to it).
+    """
+    samples = []
+    offset = None
+    rows = []
+    for line in watch_text.splitlines():
+        m = re.match(r"===== liveness @(\d+)s", line)
+        if m:
+            if offset is not None and rows:
+                samples.append((offset, rows))
+            offset, rows = int(m.group(1)), []
+            continue
+        if offset is None:
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            pid_i, ppid_i = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        rows.append((pid_i, ppid_i, " ".join(parts[2:])))
+    if offset is not None and rows:
+        samples.append((offset, rows))
+    return samples
+
+
+def guest_process_view(ps_text):
+    """(guest_names_text, guest_name_list, app_pid, guest_dead)."""
+    rows = parse_ps_rows(ps_text)
+    procs = {pid: (ppid, name) for pid, ppid, name in rows}
+    app_pid = next((pid for pid, (_ppid, name) in procs.items()
+                    if name.rstrip("]").endswith("io.twoyi.debug")), None)
+    if app_pid is None:
+        return "", [], None, False
+    names = guest_subtree_names(rows)
     dead = any("kr64" in name and name.startswith("[")
                for pid, (ppid, name) in procs.items()
                if ppid == app_pid)
@@ -115,6 +161,26 @@ def main(art, out_path):
     kr_all = kr + "\n" + kr_kr + "\n" + kr_fl
     ps = read(os.path.join(art, "ps-dockerexec.txt"))
     props = read(os.path.join(art, "property-area-state.txt"))
+    # 6-Z374 (rn327/328 verifier gap): the FINAL ps is one snapshot — if
+    # SystemUI/launcher lived and died (watchdog abort) or the guest
+    # advanced between the last sample and the final dump, the mid-watch
+    # evidence was invisible to the classifier. The liveness watcher
+    # samples the container ps every 30s; UNION the guest subtree across
+    # ALL samples (each labeled with its @offset for the timeline) so a
+    # rung once reached stays claimed. guest-logcat.txt is the GUEST's own
+    # logd tail (staged by twoyi-logdrain.rc INSIDE the guest rootfs —
+    # host redroid content cannot appear in it), so its zygote/AMS
+    # "Start proc PID:pkg/uid" lines are guest-attributed by
+    # construction; the line shape is verified framework format (host
+    # logcat ground truth rn328: 'Start proc 668:com.android.systemui/
+    # u0a64 for service {...}').
+    watch = read(os.path.join(art, "docker-exec-watch.log"))
+    watch_rows = []
+    for offset, rows in parse_watch_samples(watch):
+        for name in guest_subtree_names(rows):
+            watch_rows.append(f"@{offset}s {name}")
+    watch_names_text = "\n".join(watch_rows)
+    guest_logcat = read(os.path.join(art, "guest-logcat.txt"))
 
     guest_names, guest_name_list, app_pid, ps_dead = guest_process_view(ps)
     # guest death: init's reboot path observed in the trace (kr64 bridges
@@ -158,17 +224,23 @@ def main(art, out_path):
     # so no klog pattern is asserted for rung 6 (ps-only until a run
     # captures the real line — no speculative patterns).
     if hit("CORE_DAEMONS", r"\bservicemanager\b|\bvold\b|\bkeystore2\b|\blogd\b", guest_names, "guest-ps") or \
+       hit("CORE_DAEMONS", r"\bservicemanager\b|\bvold\b|\bkeystore2\b|\blogd\b", watch_names_text, "watch-ps") or \
        hit("CORE_DAEMONS", r"starting service '(?:servicemanager|logd|vold|keystore2|hwservicemanager)'", kr_all, "kr64-klog"):
         rung, stage = 4, "CORE_DAEMONS"
     if hit("ZYGOTE", r"zygote", guest_names, "guest-ps") or \
+       hit("ZYGOTE", r"zygote", watch_names_text, "watch-ps") or \
        hit("ZYGOTE", r"starting service 'zygote'", kr_all, "kr64-klog"):
         rung, stage = 5, "ZYGOTE"
-    if hit("SYSTEM_SERVER", r"system_server", guest_names, "guest-ps"):
+    if hit("SYSTEM_SERVER", r"system_server", guest_names, "guest-ps") or \
+       hit("SYSTEM_SERVER", r"system_server", watch_names_text, "watch-ps"):
         rung, stage = 6, "SYSTEM_SERVER"
     if hit("SURFACEFLINGER", r"surfaceflinger", guest_names, "guest-ps") or \
+       hit("SURFACEFLINGER", r"surfaceflinger", watch_names_text, "watch-ps") or \
        hit("SURFACEFLINGER", r"starting service 'surfaceflinger'", kr_all, "kr64-klog"):
         rung, stage = 7, "SURFACEFLINGER"
-    if hit("SYSTEMUI_LAUNCHER", r"com\.android\.systemui|launcher", guest_names, "guest-ps"):
+    if hit("SYSTEMUI_LAUNCHER", r"com\.android\.systemui|launcher", guest_names, "guest-ps") or \
+       hit("SYSTEMUI_LAUNCHER", r"com\.android\.systemui|launcher", watch_names_text, "watch-ps") or \
+       hit("SYSTEMUI_LAUNCHER", r"Start proc \d+:[^ ]*(?:systemui|launcher)", guest_logcat, "guest-logcat"):
         rung, stage = 8, "SYSTEMUI_LAUNCHER"
     # 9 BOOT_COMPLETED — the ONLY honest source: the kr64 bridge line
     if hit("BOOT_COMPLETED", r"BOOT_COMPLETED sent to @", kr_all, "kr64"):
@@ -237,7 +309,11 @@ def main(art, out_path):
                        "REAL sys.boot_completed=1 property write observed on the "
                        "emulated property wire — never synthesized. Guest process "
                        "rungs require the io.twoyi.debug process subtree (host "
-                       "redroid processes are excluded).",
+                       "redroid processes are excluded) — final full ps UNION the "
+                       "per-30s liveness-watch samples (6-Z374, @offset-labeled) — "
+                       "or, rung 8 only, the guest's OWN logd 'Start proc PID:pkg' "
+                       "line via twoyi-logdrain.rc (guest-attributed by "
+                       "construction).",
     }
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)
