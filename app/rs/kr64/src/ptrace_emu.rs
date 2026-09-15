@@ -6827,6 +6827,45 @@ fn read_child_string_pvm(pid: libc::pid_t, addr: u64) -> Option<String> {
     }
 }
 
+/// 6-Z369: shared frame-record validity for the 6-Z364 walker (both the
+/// sp-window scan and the live-x29 fallback). A record is walkable when
+/// its ret lands in an executable region and its next-fp is either a
+/// plausible stack address above sp or the chain terminator (0 with a
+/// non-zero exec ret — the __libc_start-main-style root).
+fn z369_record_walkable(
+    next: u64,
+    ret: u64,
+    sp: u64,
+    regions: &[(u64, u64, bool, String)],
+) -> bool {
+    if ret == 0 {
+        return false;
+    }
+    let ret_exec = regions
+        .iter()
+        .any(|(lo, hi, x, _)| *x && ret >= *lo && ret < *hi);
+    if !ret_exec {
+        return false;
+    }
+    let next_stack = next > sp && next < sp + 0x100000 && next & 7 == 0;
+    next_stack || next == 0
+}
+
+/// 6-Z369: the live LR/x29 pair for the 6-Z364 fallback walk. aarch64
+/// semantics: x30 (raw offset 30 of user_pt_regs) is the interrupted
+/// function's return address; x29 (offset 29) is the live frame-pointer
+/// chain root. Other ABIs report (0, 0) — the sp-window scan remains the
+/// primary path there.
+#[cfg(target_arch = "aarch64")]
+fn bt_lr_fp_of(regs: &Regs) -> (u64, u64) {
+    (get_syscall_arg(regs, 30), get_syscall_arg(regs, 29))
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn bt_lr_fp_of(_regs: &Regs) -> (u64, u64) {
+    (0, 0)
+}
+
 /// 6-Z167: errno of a single PEEK attempt (only meaningful when the PEEK
 /// returned -1). Named helper so the 6-Z164 open ENTRY path-read-failure
 /// DIAG can name WHY the read failed (EIO vs ESRCH vs EINVAL…).
@@ -6856,7 +6895,16 @@ fn scan_maps_range(line: &str) -> Option<(u64, u64)> {
 /// decodes to (next-fp, exec-resident ret), then walk ≤8 frames with
 /// monotonically increasing fp. Pure diagnostics — the child is stopped,
 /// all reads through read_child_bytes, ZERO register writes.
-fn bt_walk_6z364(pid: libc::pid_t, sp: u64) {
+///
+/// 6-Z369 (rn324 decode): the bionic syscall wrapper keeps NO frame record
+/// in the sp window — the 47.62 GiB MAP_FIXED deep-dive reported "no frame
+/// record in the first 512 bytes above sp" on BOTH crossings. When that
+/// happens, two further read-only fallbacks name the caller:
+/// (1) the live LR (x30) — the interrupted function's own return address,
+///     i.e. the caller of libc's mmap wrapper by definition;
+/// (2) the live x29 — a leaf wrapper leaves the CALLER's frame record
+///     mounted, so the same validated chain walk applies from it.
+fn bt_walk_6z364(pid: libc::pid_t, sp: u64, lr: u64, fp: u64) {
     if sp == 0 {
         return;
     }
@@ -6907,21 +6955,53 @@ fn bt_walk_6z364(pid: libc::pid_t, sp: u64) {
         if let Some(rec) = read_child_bytes(pid, v, 16) {
             let next = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
             let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
-            let ret_exec = regions
-                .iter()
-                .any(|(lo, hi, x, _)| *x && ret >= *lo && ret < *hi);
-            let next_stack = next > sp && next < sp + 0x100000 && next & 7 == 0;
-            if ret_exec && (next_stack || (ret != 0 && next == 0)) {
+            if z369_record_walkable(next, ret, sp, &regions) {
                 chain = Some(v);
                 break;
             }
         }
     }
-    let Some(mut fp) = chain else {
+    // ── 6-Z369: the rn324 fallbacks (only when the sp window kept no
+    // record — the bionic leaf-wrapper shape). Read-only, bounded.
+    if chain.is_none() {
         crate::trace_log_line(&format!(
             "6-Z364 BT: pid={} no frame record in the first 512 bytes above sp={:#x}",
             pid, sp
         ));
+        // (1) the live LR (x30): the interrupted function's own return
+        // address — one frame above libc's mmap wrapper by definition.
+        if lr != 0 {
+            crate::trace_log_line(&format!(
+                "6-Z364 BT: pid={} lr={:#x} {} (live x30: the interrupted wrapper's own return)",
+                pid,
+                lr,
+                name_of(lr)
+            ));
+        }
+        // (2) the live x29 chain: a leaf wrapper leaves the CALLER's frame
+        // record mounted, so the same validated walk applies from it.
+        if fp > sp && fp < sp + 0x100000 && fp & 7 == 0 {
+            if let Some(rec) = read_child_bytes(pid, fp, 16) {
+                let next = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+                let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+                if z369_record_walkable(next, ret, sp, &regions) {
+                    chain = Some(fp);
+                    crate::trace_log_line(&format!(
+                        "6-Z364 BT: pid={} walking the live x29 chain from {:#x} (the wrapper kept no record of its own)",
+                        pid, fp
+                    ));
+                }
+            }
+        }
+        if chain.is_none() {
+            crate::trace_log_line(&format!(
+                "6-Z364 BT: pid={} live x29={:#x} not a usable frame record either (bionic leaf wrapper)",
+                pid, fp
+            ));
+            return;
+        }
+    }
+    let Some(mut fp) = chain else {
         return;
     };
     for depth in 0..8 {
@@ -6944,6 +7024,77 @@ fn bt_walk_6z364(pid: libc::pid_t, sp: u64) {
             break;
         }
         fp = next;
+    }
+}
+
+#[cfg(test)]
+mod z369_tests {
+    use super::*;
+
+    fn regions() -> Vec<(u64, u64, bool, String)> {
+        vec![
+            (0x1000, 0x2000, false, "rw stack".to_string()),
+            (0x8000, 0x9000, true, "libc.so text".to_string()),
+            (
+                0xA000,
+                0xB000,
+                true,
+                "libsurfaceflinger.so text".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn z369_walkable_record_needs_exec_ret() {
+        let r = regions();
+        // ret in libc text, next above sp → walkable.
+        assert!(z369_record_walkable(0x3000 + 0x40, 0x8040, 0x3000, &r));
+        // ret in a NON-exec region → refuse (data pointer, not a return).
+        assert!(!z369_record_walkable(0x3000 + 0x40, 0x1040, 0x3000, &r));
+        // ret == 0 → refuse.
+        assert!(!z369_record_walkable(0x3000 + 0x40, 0, 0x3000, &r));
+    }
+
+    #[test]
+    fn z369_walkable_record_accepts_chain_terminator() {
+        let r = regions();
+        // next == 0 with a non-zero exec ret = the __libc_start_main-style
+        // root record — walkable exactly once, then the loop breaks.
+        assert!(z369_record_walkable(0, 0x8040, 0x3000, &r));
+    }
+
+    #[test]
+    fn z369_walkable_record_rejects_bad_next_fp() {
+        let r = regions();
+        // next BELOW sp (frames live above sp on a growing-down stack).
+        assert!(!z369_record_walkable(0x2000, 0x8040, 0x3000, &r));
+        // next beyond the 1 MiB stack window.
+        assert!(!z369_record_walkable(0x3000 + 0x200000, 0x8040, 0x3000, &r));
+        // misaligned next (not 8-byte).
+        assert!(!z369_record_walkable(0x3000 + 0x41, 0x8040, 0x3000, &r));
+    }
+
+    #[test]
+    fn z369_aarch64_lr_fp_offsets_match_user_pt_regs() {
+        // The 6-Z369 fallback reads the live x30/x29 by raw u64 offset of
+        // user_pt_regs (29 = x29, 30 = x30). On aarch64 the helper must
+        // return exactly those slots; the compile-time layout is asserted
+        // through a zeroed struct with two planted values.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut regs: Regs = unsafe { std::mem::zeroed() };
+            regs.regs[29] = 0xDEAD_0000_0000_0029;
+            regs.regs[30] = 0xDEAD_0000_0000_0030;
+            let (lr, fp) = bt_lr_fp_of(&regs);
+            assert_eq!(lr, 0xDEAD_0000_0000_0030);
+            assert_eq!(fp, 0xDEAD_0000_0000_0029);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let regs: Regs = unsafe { std::mem::zeroed() };
+            let (lr, fp) = bt_lr_fp_of(&regs);
+            assert_eq!((lr, fp), (0, 0));
+        }
     }
 }
 
@@ -7268,16 +7419,16 @@ fn z366_plain_sigtrap(pid: libc::pid_t) -> Z366PlainTrap {
     // stopped; zero register writes). aarch64-only at runtime: hits
     // require armed aarch64 watchpoints.
     #[cfg(target_arch = "aarch64")]
-    let (pc, sp, lr) = {
+    let (pc, sp, lr, wfp) = {
         let mut regs: Regs = unsafe { std::mem::zeroed() };
         if ptrace_getregs(pid, &mut regs).is_ok() {
-            (regs.pc, regs.sp, regs.regs[30]) // pc, sp, x30=lr
+            (regs.pc, regs.sp, regs.regs[30], regs.regs[29]) // pc, sp, x30=lr, x29=fp
         } else {
-            (0u64, 0u64, 0u64)
+            (0u64, 0u64, 0u64, 0u64)
         }
     };
     #[cfg(target_arch = "x86_64")]
-    let (pc, sp, lr) = (0u64, 0u64, 0u64);
+    let (pc, sp, lr, wfp) = (0u64, 0u64, 0u64, 0u64);
 
     // 48 bytes around the watched field (bounded, read-only).
     let mut around = String::from("unreadable");
@@ -7304,8 +7455,10 @@ fn z366_plain_sigtrap(pid: libc::pid_t) -> Z366PlainTrap {
             pid, addr, pc, lr, sp, hit_no, Z366_HIT_LOG_BUDGET, around
         ));
         // Bounded frame walk of the WRITER (the child stays stopped;
-        // read-only, zero register writes — same heuristics as 6-Z365).
-        bt_walk_6z364(pid, sp);
+        // read-only, zero register writes — same heuristics as 6-Z365;
+        // 6-Z369: the live LR/x29 fall back when the writer's own stack
+        // window keeps no frame record).
+        bt_walk_6z364(pid, sp, lr, wfp);
     }
     Z366PlainTrap::Hit
 }
@@ -29834,7 +29987,17 @@ pub fn run_ptrace_loop(
                                             },
                                             st.1 as f64 / 1073741824.0
                                         ));
-                                        bt_walk_6z364(pid, get_syscall_arg(&regs, abi.reg_sp));
+                                        // 6-Z369: the live LR/x29 pair —
+                                        // rn324 proved the wrapper keeps no
+                                        // record in the sp window exactly on
+                                        // the 47.62 GiB crossing.
+                                        let (z364_lr, z364_fp) = bt_lr_fp_of(&regs);
+                                        bt_walk_6z364(
+                                            pid,
+                                            get_syscall_arg(&regs, abi.reg_sp),
+                                            z364_lr,
+                                            z364_fp,
+                                        );
                                         // 6-Z363: arm the per-pid detail
                                         // budget — the NEXT 8 big mmaps of
                                         // THIS pid log their len/flags even
@@ -39476,7 +39639,11 @@ pub fn run_ptrace_loop(
                                 // stack is readable, and the 6-Z364 walker is
                                 // pure read-only diagnostics. Bounded: one
                                 // walk per fatal, ≤8 frames.
-                                bt_walk_6z364(pid, rsp);
+                                // 6-Z369: the live LR/x29 pair feeds the
+                                // same fallback (fatal handlers hit the same
+                                // leaf-wrapper shape on aarch64).
+                                let (z365_lr, z365_fp) = bt_lr_fp_of(&crash_regs);
+                                bt_walk_6z364(pid, rsp, z365_lr, z365_fp);
                                 // ── 6-Z306u: faulting-object memory peek ──
                                 //
                                 // #234 decode: the vendor-gralloc crash loop
