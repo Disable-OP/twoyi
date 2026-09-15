@@ -1797,15 +1797,30 @@ def main():
 
     # ── 6-Z305n: stall-adaptive early exit (FAST-FAIL) ──
     # Guest progress signature = (kr64-app-stderr.log bytes, guest-process
-    # count), sampled docker-exec side (adb-independent — survives adbd
-    # death, same lesson as the 6-Z305 evidence dumps). When BOTH are
-    # frozen for stall_seconds past a 60s startup grace, the guest is
-    # parked: more waiting only re-proves the stall, so end the watch and
-    # let the classifier + evidence bundle describe it. Any klog growth
-    # or process churn resets the budget, so a live boot is never cut.
+    # count, FLEET CPU TIME), sampled docker-exec side (adb-independent —
+    # survives adbd death, same lesson as the 6-Z305 evidence dumps). When
+    # ALL are frozen for stall_seconds past a 60s startup grace, the guest
+    # is parked: more waiting only re-proves the stall, so end the watch
+    # and let the classifier + evidence bundle describe it. Any growth
+    # resets the budget, so a live boot is never cut.
+    #
+    # 6-Z368 (rn322 decode): the bytes+procs signature goes BLIND exactly
+    # when the boot leaves the init service-spawn era. rn322: klog froze
+    # at +34.4s (neuralnetworks HALs — the last klog noise) while the
+    # boot kept advancing (zygote/system_server boot writes logcat, not
+    # kmsg, and the tracer's stderr is DELIBERATELY quiet there — bounded
+    # DIAG sampling; the fleet was also fully spawned, so no proc churn).
+    # The stall detector starved and fast-failed a HEALTHY boot at 115s.
+    # Third signal: the guest subtree's CUMULATIVE CPU TIME (toybox ps
+    # TIME over the io.twoyi.debug BFS — the same probe already runs).
+    # A live guest burns tracer+guest CPU continuously (ptrace
+    # translation), so TIME grows every sample; a parked or dead fleet
+    # freezes (and the procs count drops). This is the same honest
+    # attribution rule as the classifier: the io.twoyi subtree ONLY.
     def guest_progress_signature():
         size = -1
         procs = -1
+        fleet_time_cs = -1  # cumulative CPU centiseconds over the subtree
         for p in (f"/data/user/0/{PACKAGE}/kr64-app-stderr.log",
                   f"/data/data/{PACKAGE}/kr64-app-stderr.log"):
             try:
@@ -1829,23 +1844,33 @@ def main():
         # BFS the subtree here (same semantics as
         # scripts/android-boot-classify.py guest_process_view).
         try:
-            r = subprocess.run(
-                ["sudo", "docker", "exec", "redroid", "sh", "-c",
-                 "ps -A -o PID,PPID,NAME 2>/dev/null"],
-                capture_output=True, text=True, errors="replace", timeout=15)
+            # 6-Z368: TIME column preferred (fleet CPU signal); if this
+            # toybox build lacks it, fall back to the 6-Z305o 3-column
+            # probe so the procs signal never regresses.
+            r = None
+            for cmd in ("ps -A -o PID,PPID,TIME,NAME 2>/dev/null",
+                        "ps -A -o PID,PPID,NAME 2>/dev/null"):
+                r = subprocess.run(
+                    ["sudo", "docker", "exec", "redroid", "sh", "-c", cmd],
+                    capture_output=True, text=True, errors="replace", timeout=15)
+                if len((r.stdout or "").splitlines()) > 1:
+                    break
             rows = []
             for line in (r.stdout or "").splitlines():
                 parts = line.split()
                 if len(parts) < 3:
                     continue
                 try:
-                    rows.append((int(parts[0]), int(parts[1]), parts[-1]))
+                    if len(parts) >= 4:
+                        rows.append((int(parts[0]), int(parts[1]), parts[2], parts[-1]))
+                    else:
+                        rows.append((int(parts[0]), int(parts[1]), "", parts[-1]))
                 except ValueError:
                     continue  # header line
             if rows:
-                parent = {pid: ppid for pid, ppid, _name in rows}
+                parent = {pid: ppid for pid, ppid, _t, _name in rows}
                 app = None
-                for pid, _ppid, name in rows:
+                for pid, _ppid, _t, name in rows:
                     if name.rstrip("]").endswith(PACKAGE):
                         app = pid
                         break
@@ -1859,11 +1884,31 @@ def main():
                                 guests.add(pid)
                                 changed = True
                     procs = len(guests)
+                    # 6-Z368: subtree cumulative CPU time. toybox TIME is
+                    # "MM:SS.mm" (or "HH:MM:SS" for large values — handle
+                    # both); centiseconds make the growth threshold
+                    # cheap ("≥100cs = 1s of CPU since the last sample").
+                    total_cs = 0
+                    for pid, _ppid, t, _name in rows:
+                        if pid not in guests:
+                            continue
+                        try:
+                            if t.count(":") == 2:
+                                hh, mm, ss = t.split(":")
+                                total_cs += (int(hh) * 3600 + int(mm) * 60
+                                             + float(ss)) * 100
+                            elif t.count(":") == 1:
+                                mm, ss = t.split(":")
+                                total_cs += (int(mm) * 60 + float(ss)) * 100
+                        except ValueError:
+                            continue
+                    fleet_time_cs = total_cs
                 else:
                     procs = 0  # app process gone: guest definitively not running
+                    fleet_time_cs = 0
         except Exception:
             pass
-        return size, procs
+        return size, procs, fleet_time_cs
 
     stall_budget = stall_seconds
     # 6-Z305n iter-4: a parked guest still SPAMS klog (watchdog/healthd
@@ -1876,6 +1921,7 @@ def main():
     STALL_KLOG_DELTA = 65536
     base_bytes = -1
     base_procs = -1
+    base_time_cs = -1
     last_progress_at = 0
     stalled_at = 0
 
@@ -1909,19 +1955,38 @@ def main():
                           f"ui-navigate-recovery-menu.py)")
                     aosp_bailed = True
                     break
-            klog, procs = guest_progress_signature()
+            klog, procs, fleet_time_cs = guest_progress_signature()
             if base_bytes < 0:
-                base_bytes, base_procs, last_progress_at = klog, procs, elapsed
-                print(f"  [watch @ {elapsed}s] klog={klog}B guest_procs={procs}")
+                base_bytes, base_procs, base_time_cs = klog, procs, fleet_time_cs
+                last_progress_at = elapsed
+                print(f"  [watch @ {elapsed}s] klog={klog}B guest_procs={procs} "
+                      f"fleet_cpu={fleet_time_cs}cs")
             else:
                 dk = (klog - base_bytes) if (klog >= 0 and base_bytes >= 0) else 0
-                moved = dk >= STALL_KLOG_DELTA or (procs != base_procs and procs >= 0)
+                dt = ((fleet_time_cs - base_time_cs)
+                      if (fleet_time_cs >= 0 and base_time_cs >= 0) else 0)
+                # 6-Z368: a size DROP on the bytes signal can only be a
+                # rotation/truncation of a drain file — that is active
+                # writing, not death. Reset the baseline and call it
+                # progress so a rotating guest logcat can never fake a
+                # permanent negative delta.
+                if dk < 0:
+                    base_bytes = klog
+                    dk = 0
+                    moved = True
+                else:
+                    moved = (dk >= STALL_KLOG_DELTA
+                             or (procs != base_procs and procs >= 0)
+                             or dt >= 100)  # ≥1s of fleet CPU since baseline
                 if moved:
                     print(f"  [progress @ {elapsed}s] klog={klog}B (Δ{dk}) "
-                          f"guest_procs={procs}")
+                          f"guest_procs={procs} fleet_cpu={fleet_time_cs}cs "
+                          f"(Δ{dt}cs)")
                     if klog >= 0 and dk >= 0:
                         base_bytes = klog
                     base_procs = procs
+                    if fleet_time_cs >= 0:
+                        base_time_cs = fleet_time_cs
                     last_progress_at = elapsed
                 elif elapsed >= 60 and elapsed - last_progress_at >= stall_budget:
                     # 6-Z321b (rn268 decode): the workflow input documents
@@ -1937,8 +2002,8 @@ def main():
                     print()
                     print("=" * 60)
                     print(f"  ⚑ STALL DETECTED at {elapsed}s: guest klog moved "
-                          f"<{STALL_KLOG_DELTA // 1024}KB and process table frozen "
-                          f"for {stall_budget}s "
+                          f"<{STALL_KLOG_DELTA // 1024}KB, process table frozen, "
+                          f"and fleet CPU frozen for {stall_budget}s "
                           f"(last progress at {last_progress_at}s)")
                     print("  FAST-FAIL (6-Z305n): ending the boot watch early —")
                     print("  the evidence bundle below IS the decode payload.")
@@ -1950,7 +2015,8 @@ def main():
                                     f"last_progress_seconds={last_progress_at}\n"
                                     f"klog_bytes={klog}\n"
                                     f"klog_delta_bytes={dk}\n"
-                                    f"guest_procs={procs}\n")
+                                    f"guest_procs={procs}\n"
+                                    f"fleet_cpu_cs={fleet_time_cs}\n")
                     except Exception:
                         pass
                     break
