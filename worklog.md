@@ -30115,3 +30115,23 @@ Stage Summary / NEXT DECODE TREE:
 3. After the destroyer is named: targeted kernel-true fix → the composer survives deterministically (rn318 proved the healthy path exists) → boot reaches system_server era → THEN the 6-Z367 CPU/class honesty stack carries the MAKE IT FAST phase.
 4. The host SF composition-error spam on the twoyi SurfaceView is a NEW parked class (host-CPU drain; may matter for MAKE IT FAST later).
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 105 (rn322 decoded — the 6-Z367 bench fixes PROVEN (host survived: 0 starvation/restart markers); the SEGV+balloon class reproduced with a flag-variant (0x4022 NORESERVE vs rn317's 0x32 MAP_FIXED, 13.9GB touched); NEW WALL named: the stall detector's bytes+procs proxy went blind in the logcat era and fast-failed a HEALTHY boot at 115s — 6-Z368 fleet-CPU signal landed; rn323 dispatched)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn322 (run 34949976196 on 2774528c-lineage, concluded SUCCESS) decoded. The 6-Z367 fixes worked end to end: cpu-policy.log shows renice +15 every 10s cycle across both app instances; host-restart-forensics.txt = ZERO watchdog/restart markers and ZERO CPU-starvation markers (rn318's host-death class ELIMINATED); 833 composition-error lines confirm the parked host-SF spam class.
+- Guest story: TWO boot sequences (app 2056 → relaunch 3672); boot 2 reached the neuralnetworks-HAL era (+34.4s); the composer SEGV class fired again (68 fatals, cascade); the restarted-SF generation made the ~47.62GiB anon mmap at +29.6s with flags 0x4022 (MAP_NORESERVE) addr=0x0 — rn317's was 0x32 (MAP_FIXED): the giant-reservation shape is FLAG-AGNOSTIC; runner-level RSS showed 13.9GB TOUCHED on a guest-SF-binary process — the balloon materializes regardless of flag variant.
+- NEW WALL (testbench, not guest): the stall detector's progress proxy (kr64 stderr bytes + subtree proc count) froze at ~+34s precisely because the boot entered the logcat era — kmsg goes quiet, the tracer's stderr is deliberately bounded, the fleet is fully spawned (no churn) — so the detector starved and fast-failed a PROGRESSING boot at 115s (stall-detection.txt: last_progress 22s, klog_delta 0, fleet gone at final ps = [app, logcat, sh]).
+- Also parked: twoyi-logdrain rc parses (+853ms) but init NEVER starts the service (no 'starting service twoyi-logdrain' line; drain file 0 bytes) — the 6-Z313 guest-logcat timeline is dark; needs its own decode (service-start gating class).
+- LANDED 6-Z368 (a01171d1): guest_progress_signature gains the third signal — the io.twoyi subtree's cumulative CPU TIME (ps TIME column, graceful fallback to the 3-column probe, MM:SS.mm/HH:MM:SS parser); a live guest burns tracer CPU every sample, a parked/dead fleet freezes; bytes-DROP now resets baseline (rotation ≠ death); stall-detection.txt records fleet_cpu_cs. py_compile green; single caller verified.
+- rn323 dispatched from a01171d1 (240/90/300) — validates 6-Z368 on the healthy path and continues instance accumulation on the SEGV path.
+- Task 103's 5 recovery-corpus runs remained QUEUED all cycle — untouched (no-duplicates).
+
+Stage Summary / rn323 DECODE TREE:
+1. Healthy path: with the false stall gone, boot 2 should run its full 240s watch — expect the boot to cross deeper into the framework era (system_server spawn in guest ps subtree; classifier rung 6 via ps now that the subtree survives; the rung-6 klog pattern is still ps-only by design).
+2. SEGV path: instance accumulation continues; 6-Z366 (the hardware-watchpoint writer-trace) remains THE designed next implementation — the rn321 refined sub-shape (vptr-set/mRefs-null vs foreign-vptr) is what the watchpoint hits will discriminate.
+3. The twoyi-logdrain never-started class: decode init's service registration (guest klog service-list / parse errors around the rc) — the guest logcat timeline unblocks both the rung-8/9 evidence path and richer decodes.
+4. MAKE IT FAST stays behind the boot-completion wall; the parked host-SF composition spam (833 lines) is a later optimization target.
+- Authentication is provided through the private agent environment.
