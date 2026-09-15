@@ -427,6 +427,19 @@ jobs:
           # classifier needs the tail, not the whole history.
           timeout 60 sudo docker exec redroid /system/bin/logcat -d -t 20000 \
             > /tmp/ui-e2e-artifacts/logcat-dockerexec.txt 2>&1 || true
+          # 6-Z362 (rn315 decode): the HOST redroid's lowmemorykiller kill
+          # records as a FIRST-CLASS artifact. rn315's death chain
+          # (guest SF 14 GB balloon → lmkd watermark breach → mass kill
+          # → app tree SIGKILL at oom_score_adj 0) was fully attributable
+          # ONLY after hand-grepping logcat-dockerexec.txt — and the
+          # runner-dmesg-oom.txt capture legitimately stays EMPTY because
+          # lmkd kills are userspace SIGKILLs inside the container, not
+          # kernel OOM records. Bounded grep (lmkd lines only), packed
+          # with the rest, so every future decode gets the kill chain
+          # without hunting.
+          grep -iE "lowmemorykiller|lmkd|kill.*oom_score|OomAdjuster" \
+            /tmp/ui-e2e-artifacts/logcat-dockerexec.txt \
+            > /tmp/ui-e2e-artifacts/host-lmkd-kills.txt 2>&1 || true
           timeout 30 sudo docker exec redroid /system/bin/sh -c "ps -A" \
             > /tmp/ui-e2e-artifacts/ps-dockerexec.txt 2>&1 || true
           # ── 6-Z305p: THREAD-level view of the guest subtree ─────────────
