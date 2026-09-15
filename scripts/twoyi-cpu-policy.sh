@@ -2,7 +2,7 @@
 # scripts/twoyi-cpu-policy.sh — keep the HOST responsive while the twoyi
 # guest fleet hogs CPU.
 #
-# 6-Z365 (rn318 decode): the guest fleet (io.twoyi.debug + libkr64 + the
+# 6-Z367 (rn318 decode): the guest fleet (io.twoyi.debug + libkr64 + the
 # ptrace'd guest init/zygote/SF fleet) were the TOP CPU CONSUMERS of the
 # whole system — the HOST's own AMS watchdog dump named them one by one
 # ("Skipping next CPU consuming process, not a java proc: 2027 2647 27xx…").

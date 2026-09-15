@@ -2693,7 +2693,7 @@ def main():
             "#                                   starvation + SF composition-error counts\n"
             "#                                   (bench health ONLY; the classifier never\n"
             "#                                   reads this for rung decisions)\n"
-            "# HOST   cpu-policy.log             6-Z365 renice +15 over the io.twoyi\n"
+            "# HOST   cpu-policy.log             6-Z367 renice +15 over the io.twoyi\n"
             "#                                   subtree, one line per 10s cycle (bench\n"
             "#                                   survival policy; rn318 host-watchdog\n"
             "#                                   restart killed the guest fleet)\n"
