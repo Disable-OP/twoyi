@@ -368,6 +368,24 @@ jobs:
           ADB_SERIAL: localhost:5555
         run: |
           mkdir -p /tmp/ui-e2e-artifacts
+          # 6-Z360: runner-kernel memory/kill recorder — the rn310-313 kill
+          # wave was invisible to the container (the runner's dmesg carries
+          # the oom-killer records). Sample free -m + the top RSS processes
+          # + memory PSI every 5s, and capture the runner's oom traces.
+          (
+            while [ ! -f /tmp/ui-e2e-artifacts/nav-done ]; do
+              {
+                date -u '+===== mem @%H:%M:%S ====='
+                free -m | head -3
+                echo '-- top RSS (whole container):'
+                ps -eo rss,pid,comm --sort=-rss 2>/dev/null | head -9
+                echo '-- mem PSI:'
+                cat /proc/pressure/memory 2>/dev/null || true
+              } >> /tmp/ui-e2e-artifacts/mem-watch.log 2>&1
+              sleep 5
+            done
+          ) &
+          MEMWATCH=$!
           # adb-independent liveness watcher (light — same as the TWRP suite)
           rm -f /tmp/ui-e2e-artifacts/nav-done
           (
@@ -394,7 +412,12 @@ jobs:
           RC=0
           python3 -u scripts/ui-navigate.py || RC=$?
           touch /tmp/ui-e2e-artifacts/nav-done
-          kill $WATCHER 2>/dev/null || true
+          kill $WATCHER $MEMWATCH 2>/dev/null || true
+
+          # 6-Z360: the runner kernel's oom-killer/kill records — invisible
+          # to the container, decisive for the rn310-313 death class.
+          sudo dmesg -T 2>/dev/null | rg -i 'oom|out of memory|killed process|memory cgroup' \
+            > /tmp/ui-e2e-artifacts/runner-dmesg-oom.txt 2>&1 || true
 
           # ── final evidence dumps (docker exec — survives adb death) ──
           # 6-Z305n iter-4: EVERY dump is `timeout`-wrapped and size-bounded.
