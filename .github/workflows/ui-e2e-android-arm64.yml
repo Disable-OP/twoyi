@@ -209,6 +209,23 @@ jobs:
               echo "  ✗ Runner is $(uname -m), expected aarch64. ubuntu-24.04-arm required."
               exit 1
           fi
+          echo "── Provision 6 GB swap (rn310/311/312 decode) ──"
+          # The boot now reaches the SF/RenderEngine era (SwiftShader/ANGLE
+          # GL + the zygote preloads) — the deepest guest work yet — and the
+          # HOST redroid Android thrashed into direct reclaim at exactly
+          # that phase on a 16 GB runner with ~300 MB of swap
+          # ('device is low on swap (88kB < 314572kB) and thrashing (206%)'
+          # killed the app tree in rn310; rn311/312 died the same way in
+          # mass uid kill-waves). A swapfile does NOT change any boot
+          # semantics — it removes the runner's resource ceiling so the
+          # ladder can observe the guest's real progress. Idempotent.
+          if ! swapon --show=NAME | grep -q '/mnt/twoyi-swap'; then
+              sudo fallocate -l 6G /mnt/twoyi-swap || sudo dd if=/dev/zero of=/mnt/twoyi-swap bs=1M count=6144 status=none
+              sudo chmod 600 /mnt/twoyi-swap
+              sudo mkswap /mnt/twoyi-swap
+              sudo swapon /mnt/twoyi-swap
+          fi
+          free -h
           echo "── Install kernel modules + native arm64 adb ──"
           # binder_linux.ko lives in linux-modules-extra for the RUNNING
           # kernel — install it ALWAYS (a preinstalled adb must not skip
