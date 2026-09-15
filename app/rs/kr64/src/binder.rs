@@ -3670,6 +3670,17 @@ fn connection_loop(
     // the deadlock window, leaving the exact stopping frame invisible.
     // 200/con × a handful of conns stays bounded (~2 KB).
     let mut wr_diag_budget: u32 = 200;
+    // 6-Z362: fd-passing success counters. rn315 proved the FAILURE side
+    // of the 6-Z355 fd crossing logs (shortfall/diag lines) but the
+    // SUCCESS side is invisible — zero lines can mean "clean pass" OR
+    // "no fd traffic at all", and the decode cannot tell the IAllocator's
+    // gralloc handles actually crossed. These counters + the one
+    // summary line per connection close (bounded, no hot-path logging)
+    // make the engagement itself decodable.
+    let mut fd_frames_in: u64 = 0;
+    let mut fds_in_total: u64 = 0;
+    let mut fd_frames_out: u64 = 0;
+    let mut fds_out_total: u64 = 0;
     loop {
         // 6-Z355: the request frame may carry SCM_RIGHTS fds (fd-bearing
         // blobs) — captured by the control-buffered header read.
@@ -3680,10 +3691,24 @@ fn connection_loop(
                     "[KR64][binder][vm{}] client disconnected (conn={})",
                     vm_id, conn_id
                 );
+                info!(
+                    "[KR64][binder][vm{}] 6-Z362: conn={} fd-summary: frames-with-fds-in={} fds-in={} frames-with-fds-out={} fds-out={}",
+                    vm_id, conn_id, fd_frames_in, fds_in_total, fd_frames_out, fds_out_total
+                );
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                info!(
+                    "[KR64][binder][vm{}] 6-Z362: conn={} fd-summary (error exit: {}): frames-with-fds-in={} fds-in={} frames-with-fds-out={} fds-out={}",
+                    vm_id, conn_id, e, fd_frames_in, fds_in_total, fd_frames_out, fds_out_total
+                );
+                return Err(e);
+            }
         };
+        if !wire_fds.is_empty() {
+            fd_frames_in += 1;
+            fds_in_total += wire_fds.len() as u64;
+        }
         if req.cmd == BINDER_WRITE_READ && wr_diag_budget > 0 {
             wr_diag_budget -= 1;
             let (ws, rc) = if req.payload.len() >= 8 {
@@ -3712,6 +3737,13 @@ fn connection_loop(
                 "[KR64][binder][vm{}] conn={} -> ret={} read_size={} trailer={}B",
                 vm_id, conn_id, resp.ret, rs, blobs
             );
+        }
+        // 6-Z362: count the OUT side — the fds this response carries via
+        // SCM_RIGHTS on THIS connection's socket (the recipient sees them
+        // as its fds-in). One compare per frame; zero hot-path logging.
+        if !resp.fds.is_empty() {
+            fd_frames_out += 1;
+            fds_out_total += resp.fds.len() as u64;
         }
         write_frame(stream, &resp)?;
     }
