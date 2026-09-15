@@ -2491,7 +2491,9 @@ impl BusState {
         cookie: u64,
         fresh_handle: Option<u32>,
     ) -> u32 {
-        if let Some(entry) = self.services.get_mut(name) {
+        // 6-Z379: capture the overwrite target under a SHORT borrow so
+        // the per-key registry-ref scan below can read the whole map.
+        let overwritten = self.services.get_mut(name).map(|entry| {
             // 6-Z298/6-Z299: a guest addService OVER a virtual-service
             // name takes ownership (native servicemanager "overwrite"
             // semantics: same name → same handle, new owner) — but the
@@ -2506,14 +2508,36 @@ impl BusState {
                 entry.virtual_kind = None;
                 entry.virtual_fallback = Some(kind);
             }
-            // 6-Z306ae: the OLD owner loses its registry strong ref
-            // (kernel: the old handle's node ref drops → BR_RELEASE to
-            // the old owner's process). Gated on the ref invariant —
-            // see mirror_ref_ok.
+            // Native servicemanager "overwrite" semantics: same name →
+            // same handle, new owner.
             let old_owner = entry.owner;
             let old_ptr = entry.ptr;
             let old_cookie = entry.cookie;
-            if old_owner != owner && old_ptr != 0 {
+            entry.owner = owner;
+            entry.ptr = ptr;
+            entry.cookie = cookie;
+            (entry.handle, old_owner, old_ptr, old_cookie)
+        });
+        if let Some((handle, old_owner, old_ptr, old_cookie)) = overwritten {
+            // 6-Z306ae/6-Z379: the OLD owner loses its registry strong
+            // ref only when THIS was the last registry key still pinning
+            // the old node (see overwrite_release_due). The real
+            // hwservicemanager holds one sp<IBase> PER chain key (AOSP
+            // addImpl: every interfaceChain entry gets its own
+            // HidlService holding its own sp), so the EVERY-HAL shared
+            // android.hidl.base@1.0::IBase/default alias overwrite must
+            // NOT release the previous owner — its concrete chain keys
+            // (@2.3/@2.2/@2.1) still pin the object. Releasing on every
+            // overwrite murdered every HAL wrapper ~500 ms after the
+            // next HAL registered (rn334/rn335: the composer's wrapper
+            // BR_RELEASEd at +9.2 s, SF's interfaceChain at +11.7 s
+            // SEGV'd in decStrong on the corpse — the 42× libutils
+            // refcount SEGV class, rung 7 SURFACEFLINGER). Gated on the
+            // ref invariant — see mirror_ref_ok.
+            if old_owner != owner
+                && old_ptr != 0
+                && overwrite_release_due(&self.services, name, old_owner, old_ptr, old_cookie)
+            {
                 let old_pid = self
                     .conns
                     .get(&old_owner)
@@ -2529,18 +2553,15 @@ impl BusState {
                     }
                 }
             }
-            // Native servicemanager "overwrite" semantics: same name →
-            // same handle, new owner.
-            entry.owner = owner;
-            entry.ptr = ptr;
-            entry.cookie = cookie;
-            // 6-Z306ae: the registry handle now holds a strong node ref
-            // on the NEW object. The ACQUIRE mirror rides the arm's
-            // ReplyMirrored (in-transaction, gated — see the arms); only
-            // the OLD owner's RELEASE stays queue-delivered here (the
-            // old owner is a different process — no free-then-acquire
-            // race with the registering thread).
-            return entry.handle;
+            // The registry handle now holds a strong node ref on the NEW
+            // object (one MORE registry ref than before — the overwritten
+            // key's ref was the old object's, the same key now pins the
+            // new one). The ACQUIRE mirror rides the arm's ReplyMirrored
+            // (in-transaction, gated — see the arms); only the OLD
+            // owner's RELEASE stays queue-delivered here (the old owner
+            // is a different process — no free-then-acquire race with
+            // the registering thread).
+            return handle;
         }
         // 6-Z351: a chain alias reuses the chain[0] handle (ONE node
         // identity under every chain key) and never repoints by_handle
@@ -8596,6 +8617,38 @@ fn tx_delivery_reject_6z354(dpid: i32, owner_alive: bool) -> bool {
     dpid > 0 && !owner_alive
 }
 
+/// 6-Z379: the overwrite-release decision, pure for tests. The registry
+/// strong ref is PER KEY (AOSP hwservicemanager addImpl holds one
+/// sp<IBase> per interfaceChain entry — every chain key's HidlService
+/// pins the service object with its OWN sp), so overwriting one key
+/// releases the old node only when NO OTHER registry key still pins the
+/// same (owner, ptr, cookie). The EVERY-HAL shared
+/// `android.hidl.base@1.0::IBase/default` alias overwrite must therefore
+/// NOT release the previous owner — its concrete chain keys
+/// (@2.3/@2.2/@2.1) still hold refs (rn334/rn335 decode: the composer's
+/// wrapper was BR_RELEASEd 500 ms after thermal claimed IBase/default;
+/// SF's interfaceChain then SEGV'd in decStrong on the corpse — the 42×
+/// libutils refcount SEGV class, rung 7 SURFACEFLINGER). A genuine
+/// whole-service replacement (every chain key overwritten) releases
+/// exactly once, at the LAST key; the single-key AIDL addService
+/// overwrite (the 6-Z306ae suspend-daemon semantics) releases
+/// immediately, unchanged.
+fn overwrite_release_due(
+    services: &std::collections::BTreeMap<String, ServiceEntry>,
+    overwritten_key: &str,
+    old_owner: ConnId,
+    old_ptr: u64,
+    old_cookie: u64,
+) -> bool {
+    old_ptr != 0
+        && !services.iter().any(|(k, e)| {
+            k != overwritten_key
+                && e.owner == old_owner
+                && e.ptr == old_ptr
+                && e.cookie == old_cookie
+        })
+}
+
 /// Push `[BR_REPLY][binder_transaction_data]` with `tr.data_size` and
 /// `tr.offsets_size` stamped from the reply parcel; `tr.data_ptr` and
 /// `tr.offsets_ptr` stay 0 on the wire — the v2 client patches them from
@@ -12417,6 +12470,114 @@ mod tests {
                 .contains_key("android.system.suspend@1.0::ISystemSuspend/default"),
             "watcher removed"
         );
+    }
+
+    /// 6-Z379: the registry strong ref is PER CHAIN KEY. The every-HAL
+    /// shared `android.hidl.base@1.0::IBase/default` alias overwrite must
+    /// NOT release the previous owner (its concrete chain keys still pin
+    /// the node); a whole-service replacement releases exactly once, at
+    /// the LAST overwritten key; a single-key overwrite (AIDL addService)
+    /// releases immediately (the 6-Z306ae suspend-daemon semantics).
+    /// rn334/rn335 decode: releasing on EVERY overwrite murdered the
+    /// composer's wrapper 500 ms after thermal registered — SF's
+    /// interfaceChain then SEGV'd in decStrong on the corpse (the 42×
+    /// libutils refcount SEGV class, rung 7 SURFACEFLINGER).
+    #[test]
+    fn z379_chain_alias_overwrite_keeps_previous_owner_pinned() {
+        let mut bus = BusState::new();
+        let composer = bus.register_conn();
+        let thermal = bus.register_conn();
+        let next_gen = bus.register_conn();
+
+        let composer_ptr: u64 = 0xE4C0_0000_1000;
+        let composer_cookie: u64 = 0xE4C0_0000_2000;
+        let thermal_ptr: u64 = 0xF4A0_0000_3000;
+        let thermal_cookie: u64 = 0xF4A0_0000_4000;
+        let next_ptr: u64 = 0xE4C0_0000_5000;
+        let next_cookie: u64 = 0xE4C0_0000_6000;
+
+        const COMPOSER_KEYS: [&str; 4] = [
+            "android.hardware.graphics.composer@2.3::IComposer/default",
+            "android.hardware.graphics.composer@2.2::IComposer/default",
+            "android.hardware.graphics.composer@2.1::IComposer/default",
+            "android.hidl.base@1.0::IBase/default",
+        ];
+        const THERMAL_KEYS: [&str; 3] = [
+            "android.hardware.thermal@2.0::IThermal/default",
+            "android.hardware.thermal@1.0::IThermal/default",
+            "android.hidl.base@1.0::IBase/default",
+        ];
+
+        // The composer registers its full chain (the rn334 wire shape).
+        let h = bus.add_guest_service(COMPOSER_KEYS[0], composer, composer_ptr, composer_cookie);
+        for k in &COMPOSER_KEYS[1..] {
+            assert_eq!(
+                bus.add_guest_service_alias(k, composer, composer_ptr, composer_cookie, h),
+                h,
+                "aliases share the chain[0] handle (one node identity)"
+            );
+        }
+
+        // Thermal registers — its shared IBase/default alias overwrites
+        // the composer's IBase entry (the +9.22 s step of the decode).
+        let ht = bus.add_guest_service(THERMAL_KEYS[0], thermal, thermal_ptr, thermal_cookie);
+        for k in &THERMAL_KEYS[1..] {
+            bus.add_guest_service_alias(k, thermal, thermal_ptr, thermal_cookie, ht);
+        }
+
+        // THE FIX: the IBase/default overwrite must not release the
+        // composer — 3 concrete keys still pin it.
+        assert!(
+            !overwrite_release_due(
+                &bus.services,
+                THERMAL_KEYS[2],
+                composer,
+                composer_ptr,
+                composer_cookie,
+            ),
+            "the IBase/default alias overwrite must not release the composer — concrete chain keys still pin it"
+        );
+
+        // A whole-service replacement overwrites the concrete keys one by
+        // one (pre-overwrite decision each step): the release fires
+        // exactly once, at the LAST remaining pin.
+        let concrete = [COMPOSER_KEYS[0], COMPOSER_KEYS[1], COMPOSER_KEYS[2]];
+        for (i, k) in concrete.iter().enumerate() {
+            let due =
+                overwrite_release_due(&bus.services, k, composer, composer_ptr, composer_cookie);
+            bus.add_guest_service(k, next_gen, next_ptr, next_cookie);
+            assert_eq!(
+                due,
+                i + 1 == concrete.len(),
+                "key {k}: overwrite releases only at the last pin"
+            );
+        }
+
+        // Single-key overwrite (the AIDL addService shape): the old
+        // owner's ONLY registry ref drops — release due immediately.
+        let solo = bus.register_conn();
+        let solo_ptr: u64 = 0xAA00_0000_1000;
+        let solo_cookie: u64 = 0xAA00_0000_2000;
+        bus.add_guest_service(
+            "some.single@1.0::ISolo/default",
+            solo,
+            solo_ptr,
+            solo_cookie,
+        );
+        assert!(
+            overwrite_release_due(
+                &bus.services,
+                "some.single@1.0::ISolo/default",
+                solo,
+                solo_ptr,
+                solo_cookie,
+            ),
+            "single-key overwrite releases immediately (6-Z306ae semantics preserved)"
+        );
+
+        // The zero-ptr guard: nothing to release for virtual/anonymous
+        // registry entries.
+        assert!(!overwrite_release_due(&bus.services, "any", composer, 0, 0));
     }
 
     /// 6-Z325 AIDL twin: registerForNotifications mirrors BR_ACQUIRE for a
