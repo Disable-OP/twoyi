@@ -30031,3 +30031,20 @@ Stage Summary / rn317 DECODE TREE (next session):
 4. host-lmkd-kills.txt v2: the lmkd crash markers are now first-class evidence; if the HOST lmkd crash repeats, consider pinning the HOST's kill order away from the app tree — NO, that would be masking; the honest path is removing the balloon.
 5. Do NOT revert any prior fix — every prior class stays fixed; the frontier is one allocation site deeper, now with full instrumentation aimed at it.
 - Authentication is provided through the private agent environment.
+
+---
+Task ID: 100 (rn317 decoded with the 6-Z363 machinery: THE BALLOON IS ONE CALL — "6-Z363: deep pid=3334 len=51136958464 flags=0x32" = 47.62 GiB MAP_PRIVATE|ANONYMOUS|MAP_FIXED, DETERMINISTIC across rn316/rn317, pid 3334 = surfaceflinger in both; successful on the overcommit host; VmRSS at the crossing only 24 MB → the 14 GB RSS face of rn315/316 is the PROGRESSIVE TOUCH of this one mapping. pc-bracket = libc.so text (the syscall wrapper) — the caller is one frame up. Every other big mmap = per-process scudo VA reservations (0x4022 NORESERVE, zero-RSS). Recovery pr-tier 4/4 SUCCESS on this tree. 6-Z364 landed: the stash now carries the mmap ADDRESS (aarch64-clobber pre-EXIT), the deep lines log '6-Z364: mmap-args pid= addr= len= flags= [MAP_FIXED] total=', and bt_walk_6z364 (standalone bounded 6-Z285-style FP walk, live sp, ≤8 frames, zero register writes) fires once per ≥1 GiB deep-dive — rn318 names the calling library.)
+Agent: Z.ai Code (webDevReview continuation)
+
+Work Log:
+- rn317 (run 34938140537 on 03e82d95) downloaded to /home/z/artifacts-rn317 and decoded. Verdict rung 3 (post-mortem artifact). 6-Z363 PROVEN: milestone-deep dumps landed (pc-brackets + VmSize/VmRSS + region scans; early crossings bracket into libc/linker — the reservation callers); the per-pid deep budget caught the balloon's exact call ('deep pid=3334 len=51136958464 flags=0x32 ret=0xea474edfe000 total=105.52GiB'); the boot-wide top-pid table (3334 = 57.89 GiB peak; everyone else ≤16.5 GiB = reservations) confirmed SF as the sole ballooning process.
+- Recovery pr-tier on 03e82d95: 4/4 SUCCESS (twrp-2.8.7.0-angler, twrp-3.7.0_9-0-angler, twrp-3.7.0_9-0-whyred, lineage-22.2-sailfish). kr64 CI green.
+- LANDED 6-Z364 (fix(kr64)): pending_big_mmap → (len, flags, addr); the deep-dive logs the mmap-args line (addr + MAP_FIXED marker + running total) and calls bt_walk_6z364(pid, live sp) — the standalone bounded FP walker (6-Z285 heuristics: 512-byte root scan above sp, ≤8 frames, monotonic fp, exec-resident ret, read_child_bytes only, zero register writes; crate::trace_log_line output).
+- Gates ALL green: fmt clean, clippy -D warnings clean, 894/894.
+
+Stage Summary / rn318 DECODE TREE (next session):
+1. The 6-Z364 BT frames for pid=SF name the CALLING LIBRARY of the 47.62 GiB mmap — candidates by shape: (a) libEGL/goldfish-opengl address-space host-region client (map-the-whole-region); (b) a gralloc/mapper staging malloc fed by a GARBAGE size field (the deterministic-but-not-clean 47.62 GiB = 0xbe8001000 smells like a corrupted size: e.g. stride/height fields read from untranslated/stale reply bytes); (c) a renderer-side "total memory" reservation. The addr arg (MAP_FIXED?) further discriminates.
+2. THE FIX follows the caller: (b) → the fd-passing engagement gap is the driver (zero fds ever crossed — the reply blob's size/offset fields are the suspect: decode the IAllocator/mapper reply shapes in the SF svclog against the pinned A11 buffer_defs); (a)/(c) → bound or right-size the reservation at the proxy/stand-in honestly.
+3. If the BT walk fails on the real stack (no frame record), fall back to the 6-Z314-style STALL-STACK pc-resolver at the NEXT crossing — the pc itself is in libc but the CALLER's ret is in the wrapper's frame.
+4. Recovery first: any boot-semantics change waits for the caller to be named; NO speculative caps.
+- Authentication is provided through the private agent environment.
