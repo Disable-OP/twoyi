@@ -434,12 +434,18 @@ jobs:
           # ONLY after hand-grepping logcat-dockerexec.txt — and the
           # runner-dmesg-oom.txt capture legitimately stays EMPTY because
           # lmkd kills are userspace SIGKILLs inside the container, not
-          # kernel OOM records. Bounded grep (lmkd lines only), packed
-          # with the rest, so every future decode gets the kill chain
-          # without hunting.
-          grep -iE "lowmemorykiller|lmkd|kill.*oom_score|OomAdjuster" \
-            /tmp/ui-e2e-artifacts/logcat-dockerexec.txt \
-            > /tmp/ui-e2e-artifacts/host-lmkd-kills.txt 2>&1 || true
+          # kernel OOM records.
+          # 6-Z363 (rn316 lesson): rn316's HOST lmkd CRASHED under the
+          # pressure peak ("Lost connection to lmkd" + endless
+          # "epoll_wait failed (errno=22)" spam — 20000 lines flooded the
+          # rn316 artifact and drowned the zero actual kills). The
+          # artifact now bounds to actual Kill/reason lines (tail 400)
+          # plus the lmkd crash/liveness markers that ARE the evidence.
+          {
+            grep -E "lowmemorykiller: Kill |reason: " /tmp/ui-e2e-artifacts/logcat-dockerexec.txt | tail -400;
+            grep -cE "lowmemorykiller: epoll_wait failed" /tmp/ui-e2e-artifacts/logcat-dockerexec.txt | sed 's/^/epoll-wait-failed-count=/';
+            grep -E "Lost connection to lmkd|Connection with lmkd established" /tmp/ui-e2e-artifacts/logcat-dockerexec.txt | head -8;
+          } > /tmp/ui-e2e-artifacts/host-lmkd-kills.txt 2>&1 || true
           timeout 30 sudo docker exec redroid /system/bin/sh -c "ps -A" \
             > /tmp/ui-e2e-artifacts/ps-dockerexec.txt 2>&1 || true
           # ── 6-Z305p: THREAD-level view of the guest subtree ─────────────
