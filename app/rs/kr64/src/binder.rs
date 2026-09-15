@@ -7249,34 +7249,35 @@ fn servicemanager_hidl(
                     return TransactionResult::Failed;
                 }
             };
-            // 6-Z376 (rn330 decode): the reply is **vec<hidl_string>** of the
-            // FULL "fq/instance" names — NOT vec<Instance{fqName,instanceName}>.
-            // The rn330 guest logd carried the verdict verbatim, 42×:
-            //   "hw-Parcel: Buffer length 32 does not match expected size 16."
-            // the client's vec read expected count × sizeof(hidl_string) = 16
-            // per element and hit our 32B-per-element Instance array
-            // (keystore 40× + cameraserver 2×). The pre-6-Z376 shape came
-            // from the 6-Z305t-69 comment conflating this method with
-            // debugDump's vec<InstanceDebugInfo> struct; the 1.2 .hal's
-            // listManifestByInterface generates (vec<string> instances) —
-            // the same shape family as the 1.0 listByInterface and the
-            // PROVEN interfaceChain vec<string> reply (write_hidl_vec_string,
-            // consumed client-side by the SM cast probes since 6-Z307d).
-            // Entries = the matching registry keys verbatim ("fq/instance") —
-            // the 6-Z351 chain aliases are REAL hwservicemanager map keys
-            // (addImpl inserts the ONE HidlService under EVERY chain fq),
-            // so the @4.0 query lists "@4.0::IKeymasterDevice/default" and
-            // keystore's try_get_device resolves it through getTransport
-            // (manifest range) + get (alias hit). The client's enumerate
-            // callback then finally runs: kmDevices[TRUSTED_ENVIRONMENT]
-            // fills, the 36-40× CHECK abort loop dies.
+            // 6-Z377 (rn331 decode): the entries are **BARE INSTANCE NAMES**
+            // ("default", "internal/0", …) — NOT "fq/instance" compounds. The
+            // rn331 artifact pinned it end-to-end: with 6-Z376's full-key
+            // entries the enumerate callback finally RAN (the wall moved!)
+            // and the client passed each entry VERBATIM as the getService
+            // INSTANCE arg — 33× "getTransport(@4.0::IKeymasterDevice/@4.0::
+            // IKeymasterDevice/default) → EMPTY" + 33× the CHECK(device)
+            // abort 'Failed to get service for "android.hardware.keymaster@
+            // 4.0::IKeymasterDevice" with interface name "…@4.0::…/default"'
+            // — the verbatim AOSP keystore_main try_get_device CHECK, whose
+            // `if (n == "default") has_default = true` also only makes sense
+            // for bare instance names. The client re-attaches ITS OWN
+            // queried descriptor, so the resolution path is:
+            // getService("@4.0::IKeymasterDevice", "default") →
+            // getTransport(4.0/default) → HWBINDER (the 6-Z373 manifest
+            // range expansion) → get(4.0/default) → the 6-Z351 chain-alias
+            // HIT → the keymaster device resolves → halVersion →
+            // kmDevices[TRUSTED_ENVIRONMENT] fills → the CHECK abort loop
+            // dies (0 kmDevices aborts in rn331 already; the 33 CHECK(device)
+            // aborts were the LAST shim in the chain).
             let names: Vec<String> = {
                 let b = bus.lock().expect("binder bus poisoned");
                 b.services
                     .keys()
-                    .filter(|k| k.split_once('/').map(|(f, _)| f == fq).unwrap_or(false))
+                    .filter_map(|k| {
+                        let (f, i) = k.split_once('/')?;
+                        (f == fq && !i.is_empty()).then(|| i.to_string())
+                    })
                     .take(128)
-                    .cloned()
                     .collect()
             };
             let count = names.len();
@@ -13827,29 +13828,24 @@ mod tests {
         let TransactionResult::Reply { data, offsets, sg } = result else {
             panic!("listManifestByInterface must Reply");
         };
-        // 6-Z376: the reply is vec<hidl_string> of the FULL "fq/instance"
-        // names (the rn330 verdict "Buffer length 32 does not match expected
-        // size 16" pinned the old vec<Instance> shape as unconsumable).
+        // 6-Z377: the reply is vec<hidl_string> of the BARE INSTANCE NAMES
+        // (rn331: the client passes each entry verbatim as the getService
+        // INSTANCE arg — the CHECK(device) abort showed the full-key shape
+        // producing "…/default"-suffixed lookups that answer EMPTY).
         // status(4) + vec-struct PTR(40) + array PTR(40) + chars PTR(40)
-        // = 124 (one "fq/instance" string element).
+        // = 124 (one bare-instance string element).
         assert_eq!(data.len(), 124);
         // offsets: 3 objects, u64 each.
         assert_eq!(offsets.len(), 24);
-        // SG: [vec struct 16, array 16 (1 string × 16), chars 62+1].
+        // SG: [vec struct 16, array 16 (1 string × 16), chars 8+1].
         let lens: Vec<usize> = sg.iter().map(|b| b.data.len()).collect();
-        assert_eq!(lens, vec![16, 16, 63]);
+        assert_eq!(lens, vec![16, 16, 9]);
         // vec struct: {ptr=0, size=1}.
         assert_eq!(u64::from_ne_bytes(sg[0].data[8..16].try_into().unwrap()), 1);
-        // array element: {ptr=0 (patched loader-side), size=62}.
-        assert_eq!(
-            u64::from_ne_bytes(sg[1].data[8..16].try_into().unwrap()),
-            62
-        );
-        // chars = the FULL registry key + NUL.
-        assert_eq!(
-            &sg[2].data,
-            b"android.hardware.camera.provider@2.6::ICameraProvider/legacy/0\0"
-        );
+        // array element: {ptr=0 (patched loader-side), size=8}.
+        assert_eq!(u64::from_ne_bytes(sg[1].data[8..16].try_into().unwrap()), 8);
+        // chars = the BARE instance name + NUL.
+        assert_eq!(&sg[2].data, b"legacy/0\0");
         // The vec-struct PTR object carries NO parent; the array PTR has
         // parent = the vec object's index, offset 0; the chars object's
         // parent = the ARRAY's index, offset 0 (the string header slot).
@@ -13878,7 +13874,7 @@ mod tests {
         assert_eq!(f2, BINDER_BUFFER_FLAG_HAS_PARENT);
         assert_eq!(par2, 1); // parent = the ARRAY (index 1)
         assert_eq!(po2, 0); // the string header at element offset 0
-        assert_eq!(l2, 63); // the chars: the full name + NUL
+        assert_eq!(l2, 9); // the chars: the bare instance name + NUL
     }
 
     /// Reproduction of the ladder-#129 code=12 wire dump (byte-exact from
