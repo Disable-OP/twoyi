@@ -6904,7 +6904,18 @@ fn scan_maps_range(line: &str) -> Option<(u64, u64)> {
 ///     i.e. the caller of libc's mmap wrapper by definition;
 /// (2) the live x29 — a leaf wrapper leaves the CALLER's frame record
 ///     mounted, so the same validated chain walk applies from it.
-fn bt_walk_6z364(pid: libc::pid_t, sp: u64, lr: u64, fp: u64) {
+///
+/// 6-Z370 (rn325 decode): the walk budget was 8 frames and rn325's 47.62 GiB
+/// chain ended EXACTLY at the budget: frame7 = insertAt (libutils+0x1738c),
+/// with the caller one frame out. Beyond the budget bump to 16, the walker
+/// now dumps the frame-SAVE regions (64 bytes at each of the first 4 frame
+/// records) on ≥8 GiB crossings: the callee-saved slots hold the caller's
+/// live registers verbatim (insertAt keeps numItems in x20; the function it
+/// calls saves THAT x20 in its own prologue slot), so the vector's real
+/// count/size fields land in the artifact without a second run. Up to 4
+/// heap-resident pointer words per frame get a 32-byte object probe.
+/// Read-only, bounded, zero semantics.
+fn bt_walk_6z364(pid: libc::pid_t, sp: u64, lr: u64, fp: u64, crossing_len: u64) {
     if sp == 0 {
         return;
     }
@@ -7004,7 +7015,9 @@ fn bt_walk_6z364(pid: libc::pid_t, sp: u64, lr: u64, fp: u64) {
     let Some(mut fp) = chain else {
         return;
     };
-    for depth in 0..8 {
+    // 6-Z370: collect the first frame records for the save-region dump.
+    let mut chain_fps: Vec<u64> = Vec::new();
+    for depth in 0..16 {
         let Some(rec) = read_child_bytes(pid, fp, 16) else {
             break;
         };
@@ -7012,6 +7025,9 @@ fn bt_walk_6z364(pid: libc::pid_t, sp: u64, lr: u64, fp: u64) {
         let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
         if ret == 0 {
             break;
+        }
+        if chain_fps.len() < 4 {
+            chain_fps.push(fp);
         }
         crate::trace_log_line(&format!(
             "6-Z364 BT: pid={} frame={} ret={:#x} {}",
@@ -7025,6 +7041,73 @@ fn bt_walk_6z364(pid: libc::pid_t, sp: u64, lr: u64, fp: u64) {
         }
         fp = next;
     }
+    // 6-Z370: on ≥8 GiB crossings dump the frame saves + candidate objects.
+    if crossing_len >= 0x2_0000_0000 && !chain_fps.is_empty() {
+        z370_dump_frame_saves(pid, &chain_fps, sp, &regions);
+    }
+}
+
+/// 6-Z370: dump the callee-save regions of the first frame records and
+/// probe heap-resident pointer words as candidate objects. Pure diagnostics:
+/// the child is stopped, all reads through read_child_bytes, ZERO writes.
+/// Bounded: ≤4 frames × (1 dump + ≤4 object probes).
+fn z370_dump_frame_saves(
+    pid: libc::pid_t,
+    fps: &[u64],
+    sp: u64,
+    regions: &[(u64, u64, bool, String)],
+) {
+    for (i, fp) in fps.iter().take(4).enumerate() {
+        let Some(b) = read_child_bytes(pid, *fp, 64) else {
+            continue;
+        };
+        let hex: Vec<String> = b.iter().map(|x| format!("{:02x}", x)).collect();
+        crate::trace_log_line(&format!(
+            "6-Z370: pid={} frame{} fp={:#x} save-hex={}",
+            pid,
+            i,
+            fp,
+            hex.join("")
+        ));
+        let mut probed = 0usize;
+        for wi in 0..8 {
+            if probed >= 4 {
+                break;
+            }
+            let w = u64::from_ne_bytes(b[wi * 8..wi * 8 + 8].try_into().unwrap());
+            if w < 0x1000 || w & 7 != 0 || !z370_probe_candidate(w, sp, regions) {
+                continue;
+            }
+            let Some(ob) = read_child_bytes(pid, w, 32) else {
+                continue;
+            };
+            let ohex: Vec<String> = ob.iter().map(|x| format!("{:02x}", x)).collect();
+            crate::trace_log_line(&format!(
+                "6-Z370: pid={} frame{} obj@{:#x} ={}",
+                pid,
+                i,
+                w,
+                ohex.join("")
+            ));
+            probed += 1;
+        }
+    }
+}
+
+/// 6-Z370: is this word worth a 32-byte object probe? It must be a plausible
+/// heap/anon-resident pointer: non-null, 8-byte aligned, outside the current
+/// stack window (the frame saves already cover the stack), and inside an
+/// anonymous (non-file-backed) RW region.
+fn z370_probe_candidate(w: u64, sp: u64, regions: &[(u64, u64, bool, String)]) -> bool {
+    if w < 0x1000 || w & 7 != 0 {
+        return false;
+    }
+    if w >= sp && w < sp + 0x100000 {
+        return false; // stack — already dumped in save-hex
+    }
+    regions
+        .iter()
+        .any(|(lo, hi, x, line)| !*x && w >= *lo && w < *hi && !line.contains('/'))
 }
 
 #[cfg(test)]
@@ -7095,6 +7178,32 @@ mod z369_tests {
             let (lr, fp) = bt_lr_fp_of(&regs);
             assert_eq!((lr, fp), (0, 0));
         }
+    }
+
+    fn heapish_regions() -> Vec<(u64, u64, bool, String)> {
+        vec![
+            (0x1000, 0x2000, false, "[stack]".to_string()),
+            (0x50000, 0x60000, false, "".to_string()), // anonymous RW heap
+            (0x70000, 0x80000, false, "[anon:scudo:primary]".to_string()),
+            (0x8000, 0x9000, true, "/system/lib64/libc.so".to_string()),
+        ]
+    }
+
+    #[test]
+    fn z370_probe_rejects_stack_file_and_misaligned() {
+        let r = heapish_regions();
+        // inside the current stack window → already dumped in save-hex
+        assert!(!z370_probe_candidate(0x1800, 0x1000, &r));
+        // file-backed region → not a heap object
+        assert!(!z370_probe_candidate(0x8500, 0x300000, &r));
+        // misaligned → skip
+        assert!(!z370_probe_candidate(0x50001, 0x300000, &r));
+        // NULL/near-NULL → skip
+        assert!(!z370_probe_candidate(0x800, 0x300000, &r));
+        // anonymous RW heap (unnamed) → probe
+        assert!(z370_probe_candidate(0x50010, 0x300000, &r));
+        // named anon (scudo) RW → probe
+        assert!(z370_probe_candidate(0x70020, 0x300000, &r));
     }
 }
 
@@ -7458,7 +7567,7 @@ fn z366_plain_sigtrap(pid: libc::pid_t) -> Z366PlainTrap {
         // read-only, zero register writes — same heuristics as 6-Z365;
         // 6-Z369: the live LR/x29 fall back when the writer's own stack
         // window keeps no frame record).
-        bt_walk_6z364(pid, sp, lr, wfp);
+        bt_walk_6z364(pid, sp, lr, wfp, 0);
     }
     Z366PlainTrap::Hit
 }
@@ -29997,6 +30106,7 @@ pub fn run_ptrace_loop(
                                             get_syscall_arg(&regs, abi.reg_sp),
                                             z364_lr,
                                             z364_fp,
+                                            m_len,
                                         );
                                         // 6-Z363: arm the per-pid detail
                                         // budget — the NEXT 8 big mmaps of
@@ -39643,7 +39753,7 @@ pub fn run_ptrace_loop(
                                 // same fallback (fatal handlers hit the same
                                 // leaf-wrapper shape on aarch64).
                                 let (z365_lr, z365_fp) = bt_lr_fp_of(&crash_regs);
-                                bt_walk_6z364(pid, rsp, z365_lr, z365_fp);
+                                bt_walk_6z364(pid, rsp, z365_lr, z365_fp, 0);
                                 // ── 6-Z306u: faulting-object memory peek ──
                                 //
                                 // #234 decode: the vendor-gralloc crash loop
