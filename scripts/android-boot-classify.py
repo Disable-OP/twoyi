@@ -103,7 +103,7 @@ def main(art, out_path):
 
     kr = read(os.path.join(art, "kr64-app-stderr-dockerexec.log"))
     kr_kr = read(os.path.join(art, "kr64-dockerexec.log"))
-    # 6-Z365 (rn318 decode): the docker-exec push of the app stderr is a
+    # 6-Z367 (rn318 decode): the docker-exec push of the app stderr is a
     # `tail -n 20000` of a very chatty file — in rn318 it only covered
     # +60.6s..+111.6s, so the early-boot KLOG-TIMELINE lines
     # (servicemanager +2.4s, zygote +9.7s, surfaceflinger +24.7s) were
@@ -145,7 +145,7 @@ def main(art, out_path):
     if hit("PROPERTY_SERVICE", r"prop_msg|property.*set|__properties__|z111_apply_property_set", kr_all, "kr64") or \
        hit("PROPERTY_SERVICE", r"property_info +\d+|properties_serial +\d+", props, "property-area"):
         rung, stage = 3, "PROPERTY_SERVICE"
-    # 4..8 — GUEST SUBTREE ONLY, with 6-Z365 klog fallbacks.
+    # 4..8 — GUEST SUBTREE ONLY, with 6-Z367 klog fallbacks.
     # The ps subtree disappears whenever the BENCH dies after the guest
     # made progress (rn318: host runtime restart killed the app tree),
     # and the stderr tail may have truncated the early KLOG lines. The
@@ -174,7 +174,7 @@ def main(art, out_path):
     if hit("BOOT_COMPLETED", r"BOOT_COMPLETED sent to @", kr_all, "kr64"):
         rung, stage = 9, "BOOT_COMPLETED"
 
-    # 6-Z365: bench-death discriminator. rn318's final `ps -A` had NO
+    # 6-Z367: bench-death discriminator. rn318's final `ps -A` had NO
     # io.twoyi.debug at all (host runtime restart killed the app tree),
     # which made rungs 4-8 structurally invisible even though the guest
     # trace was alive to +111.6s. Distinguish "guest died" (init reboot /

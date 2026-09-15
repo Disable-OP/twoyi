@@ -409,7 +409,7 @@ jobs:
             done
           ) &
           WATCHER=$!
-          # ── 6-Z365: HOST-survival CPU policy ──────────────────────
+          # ── 6-Z367: HOST-survival CPU policy ──────────────────────
           # rn318 death chain: the guest fleet (app + libkr64 + the
           # ptrace'd guest init/zygote/SF fleet) were the TOP CPU
           # consumers of the whole system (the HOST AMS watchdog dump
@@ -466,7 +466,7 @@ jobs:
             grep -cE "lowmemorykiller: epoll_wait failed" /tmp/ui-e2e-artifacts/logcat-dockerexec.txt | sed 's/^/epoll-wait-failed-count=/';
             grep -E "Lost connection to lmkd|Connection with lmkd established" /tmp/ui-e2e-artifacts/logcat-dockerexec.txt | head -8;
           } > /tmp/ui-e2e-artifacts/host-lmkd-kills.txt 2>&1 || true
-          # ── 6-Z365: HOST watchdog/restart forensics ───────────────
+          # ── 6-Z367: HOST watchdog/restart forensics ───────────────
           # rn318's actual death chain was a HOST runtime restart
           # (Watchdog killed system_server after the guest fleet starved
           # it), invisible in every per-run artifact until hand-grepping
