@@ -266,44 +266,116 @@ fn expand_version_ranges(versions: &[String]) -> Vec<String> {
     out
 }
 
-/// Index one AIDL `<fqname>` declaration against its `<hal>` package.
+/// Index one manifest `<fqname>` declaration against its `<hal>` package.
 ///
-/// libvintf accepts two spellings inside `<hal format="aidl">`:
-/// - relative: `<fqname>ILights/default</fqname>` (IFace/instance,
-///   resolved against `<name>`),
-/// - fully-qualified: `<fqname>android.hardware.light.ILights/default
-///   </fqname>`.
-/// A version component (`IFace/1/instance`, the compatibility-matrix
-/// shape) is tolerated and dropped — manifest entries key unversioned.
-fn insert_aidl_fqname(fq: &str, package: &str, out: &mut VintfManifests) {
+/// The shipped manifests use `<fqname>` in BOTH formats (the 6-Z372
+/// zero-entry skeleton diagnostic made the real shapes visible in the
+/// rn328 decode):
+/// - AIDL relative:  `<fqname>ILights/default</fqname>` (resolved
+///   against `<name>`),
+/// - AIDL qualified: `<fqname>android.hardware.rebootescrow.
+///   IRebootEscrow/default</fqname>`,
+/// - AIDL matrix:    `<fqname>IPower/2/default</fqname>` (a lone
+///   numeric middle component is the matrix version — dropped),
+/// - HIDL short:     `<fqname>@2.1::IHealth/default</fqname>` (the
+///   health@2.1.xml / nn-sample / drm-clearkey spelling — the package
+///   is carried by `<name>`, version+interface+instance inline),
+/// - HIDL full:      `<fqname>pkg@M.m::IFace/instance</fqname>`.
+///
+/// Instance components may contain slashes (`ICameraProvider/internal/
+/// 0`) — the interface/instance split takes the FIRST '/', and only a
+/// lone numeric middle component is treated as a version (AIDL only).
+fn insert_fqname_entry(
+    fq: &str,
+    package: &str,
+    aidl: bool,
+    transport: u8,
+    out: &mut VintfManifests,
+) {
     let fq = fq.trim();
     if fq.is_empty() || package.is_empty() {
         return;
     }
-    let (head, instance) = match fq.rsplit_once('/') {
-        Some((l, r)) => (l, r.trim()),
-        None => return,
+    // HIDL fqnames carry `pkg@M.m::IFace/instance`; AIDL fqnames carry
+    // no `::`. Split on the first `::` and let the tail parse shared.
+    let (head, tail) = match fq.split_once("::") {
+        Some((h, t)) => (Some(h.trim()), t),
+        None => (None, fq),
+    };
+    let (pkg, ver): (String, Option<String>) = match head {
+        Some(h) => {
+            if let Some(at) = h.rfind('@') {
+                (
+                    h[..at].trim().to_string(),
+                    Some(h[at + 1..].trim().to_string()),
+                )
+            } else if h.chars().all(|c| c.is_ascii_digit() || c == '.') && !h.is_empty() {
+                // Version-only head ("2.1::…") — package from <name>.
+                (String::new(), Some(h.to_string()))
+            } else {
+                (h.to_string(), None)
+            }
+        }
+        None => (String::new(), None),
+    };
+    // HIDL keys need a version; without one the entry is malformed.
+    if !aidl && head.is_some() && ver.is_none() {
+        return;
+    }
+    // Interface/instance: instance components may contain '/' — split
+    // at the FIRST '/', and drop a lone numeric middle component (the
+    // AIDL matrix version spelling).
+    let mut parts = tail.split('/');
+    let iface = match parts.next() {
+        Some(i) if !i.trim().is_empty() => i.trim().to_string(),
+        _ => return,
+    };
+    let rest: Vec<&str> = parts.collect();
+    let instance = match rest.len() {
+        0 => return,
+        1 => rest[0].trim().to_string(),
+        2 if aidl
+            && !rest[0].trim().is_empty()
+            && rest[0].trim().chars().all(|c| c.is_ascii_digit()) =>
+        {
+            rest[1].trim().to_string()
+        }
+        _ => rest.join("/").trim().to_string(),
     };
     if instance.is_empty() {
         return;
     }
-    // Drop a trailing version component (matrix spelling).
-    let mut iface = head.to_string();
-    if let Some((l, _maybe_version)) = iface.rsplit_once('/') {
-        iface = l.to_string();
-    }
-    // Strip the package prefix on the fully-qualified spelling.
-    let prefixed = format!("{}.", package);
-    let iface = match iface.strip_prefix(&prefixed) {
-        Some(rest) if !rest.is_empty() => rest.to_string(),
-        _ => iface,
-    };
-    if iface.is_empty() || iface.contains('/') {
+    if aidl && head.is_none() {
+        // AIDL: strip the package prefix on the fully-qualified spelling.
+        let prefixed = format!("{}.", package);
+        let iface = match iface.strip_prefix(&prefixed) {
+            Some(rest) if !rest.is_empty() => rest.to_string(),
+            _ => iface,
+        };
+        if iface.is_empty() {
+            return;
+        }
+        out.insert(
+            format!("{}{}::{}/{}", AIDL_KEY_PREFIX, package, iface, instance),
+            transport,
+        );
         return;
     }
+    let pkg = if pkg.is_empty() {
+        package.to_string()
+    } else {
+        pkg
+    };
+    let ver = match ver {
+        Some(v) if !v.is_empty() => v,
+        // AIDL-with-head is not a real shape; HIDL without a version was
+        // gated above — index nothing rather than a key no client can
+        // query.
+        _ => return,
+    };
     out.insert(
-        format!("{}{}::{}/{}", AIDL_KEY_PREFIX, package, iface, instance),
-        TRANSPORT_HWBINDER,
+        format!("{}@{}::{}/{}", pkg, ver, iface, instance),
+        transport,
     );
 }
 
@@ -502,14 +574,14 @@ fn parse_hal_block(body: &str, aidl: bool, out: &mut VintfManifests) {
             }
         }
     }
-    // 6-Z372: the compact AIDL `<fqname>` shape (lights-default.xml,
-    // power-default.xml, rebootescrow-default.xml ship it) — an AIDL
-    // hal block may declare its instance WITHOUT an <interface> block
-    // at all, in which case the loop above produced nothing.
-    if aidl {
-        for fq in all_child_texts(body, "fqname") {
-            insert_aidl_fqname(&fq, &package, out);
-        }
+    // 6-Z372/6-Z373: the compact `<fqname>` shape. BOTH formats ship it:
+    // AIDL hal blocks declare the instance WITHOUT an <interface> block
+    // (lights/power/rebootescrow), and the vendored HIDL fragments
+    // (health@2.1.xml, the nn samples, drm clearkey/widevine) use the
+    // SHORT fqname spelling `@M.m::IFace/instance` with the package
+    // carried by <name> — rn328's skeleton lines are the ground truth.
+    for fq in all_child_texts(body, "fqname") {
+        insert_fqname_entry(&fq, &package, aidl, transport, out);
     }
 }
 
@@ -873,6 +945,82 @@ mod tests {
         assert!(sk.chars().count() <= 242, "skeleton must stay bounded");
         let cmt = "<manifest><!-- only a comment --></manifest>";
         assert_eq!(xml_skeleton(cmt), "<manifest></manifest>");
+    }
+
+    #[test]
+    fn hidl_short_fqname_from_rn328_skeletons() {
+        // The rn328 ground truth: the vendored HIDL fragments declare
+        // `<fqname>@2.1::IHealth/default</fqname>` — version inline,
+        // package carried by <name>. These EXACTLY reproduced the
+        // health/drm/nn restart-loops after 6-Z372 (the AIDL-only
+        // fqname arm skipped them).
+        let xml = r#"
+<manifest version="1.0" type="device">
+    <hal format="hidl">
+        <name>android.hardware.health</name>
+        <transport>hwbinder</transport>
+        <fqname>@2.1::IHealth/default</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.hardware.drm</name>
+        <transport>hwbinder</transport>
+        <fqname>@1.3::ICryptoFactory/clearkey</fqname>
+        <fqname>@1.3::IDrmFactory/clearkey</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.hardware.neuralnetworks</name>
+        <transport>hwbinder</transport>
+        <fqname>@1.3::IDevice/nnapi-sample_all</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.hardware.camera.provider</name>
+        <transport>hwbinder</transport>
+        <fqname>@2.6::ICameraProvider/internal/0</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.hardware.full</name>
+        <transport>hwbinder</transport>
+        <fqname>android.hardware.full@2.0::IFull/default</fqname>
+    </hal>
+</manifest>
+"#;
+        let m = parse_manifest(xml);
+        assert_eq!(
+            m.lookup("android.hardware.health@2.1::IHealth", "default"),
+            Some(TRANSPORT_HWBINDER),
+            "health@2.1 short fqname must register"
+        );
+        assert_eq!(
+            m.lookup("android.hardware.drm@1.3::IDrmFactory", "clearkey"),
+            Some(TRANSPORT_HWBINDER),
+            "drm clearkey short fqname must register"
+        );
+        assert_eq!(
+            m.lookup("android.hardware.drm@1.3::ICryptoFactory", "clearkey"),
+            Some(TRANSPORT_HWBINDER),
+            "both drm fqname entries must register"
+        );
+        assert_eq!(
+            m.lookup(
+                "android.hardware.neuralnetworks@1.3::IDevice",
+                "nnapi-sample_all"
+            ),
+            Some(TRANSPORT_HWBINDER),
+            "nn sample short fqname must register"
+        );
+        assert_eq!(
+            m.lookup(
+                "android.hardware.camera.provider@2.6::ICameraProvider",
+                "internal/0"
+            ),
+            Some(TRANSPORT_HWBINDER),
+            "slash-bearing HIDL instances keep the full instance text"
+        );
+        assert_eq!(
+            m.lookup("android.hardware.full@2.0::IFull", "default"),
+            Some(TRANSPORT_HWBINDER),
+            "fully-qualified HIDL fqname registers under its own package"
+        );
     }
 
     #[test]
