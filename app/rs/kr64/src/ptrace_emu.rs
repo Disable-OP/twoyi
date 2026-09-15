@@ -15974,6 +15974,81 @@ pub fn run_ptrace_loop(
                 }
             }
         }
+        // ── 6-Z358: loop-top resume REPAIR ────────────────────────────
+        //
+        // rn308 (run 34911883200) proved the freeze class is NOT
+        // single-path: 19 live guest threads sat in ptrace-stop at the
+        // artifact snapshot (guest init's worker, logd.writer,
+        // cameraserver, the _vendor_bin_hw_ HAL fleet INCLUDING the
+        // graphics allocator + its HwBinder thread, the composer's
+        // thread pool, the zygote) while the invariant checker logged
+        // only ONE of them (its 32-line cap consumed by a single tid's
+        // violation storm). Two producers are named by the decode:
+        // (a) the ESRCH branch's reap_child eats a live tracee's
+        // pending stop report out-of-band and the first-alive switch
+        // strands the stopped victim — closed at the source in that
+        // branch (the 6-Z358 stopped_owed priority); (b) any other
+        // consumed-not-resumed stop whose serving loop-top got stolen
+        // (the #69 freeze family). THIS repair closes (b) generically:
+        // a tracked tid whose entry names a SYSCALL stop (WSTOPSIG ==
+        // SIGTRAP|0x80 — NEVER an event stop, whose bookkeeping belongs
+        // to its own arm), whose /proc state is 't' (ptrace tracing
+        // stop), and whose entry aged >2 iterations while the loop
+        // serves someone else, is resumed RIGHT HERE with
+        // PTRACE_SYSCALL — the exact call the owed loop-top would have
+        // made. One repair per iteration (the loop iterates far faster
+        // than victims accrue); counted; first 32 logged per boot. With
+        // (a)+(b) closed the checker's violation log should go silent —
+        // its silence is the rn309 decode proof.
+        {
+            let mut repair_target: Option<libc::pid_t> = None;
+            for (&t, &(loop0, st0)) in pending_resume.iter() {
+                if t == current_pid || !tracked_pids.contains(&t) {
+                    continue;
+                }
+                if iter_count.saturating_sub(loop0) <= 2 {
+                    continue;
+                }
+                // syscall-stop only (PTRACE_O_TRACESYSGOOD): event stops
+                // (0x4057f/0x6057f/…) keep their own arms' bookkeeping
+                // and stay with the checker's violation log.
+                if libc::WSTOPSIG(st0 as libc::c_int) != libc::SIGTRAP | 0x80 {
+                    continue;
+                }
+                if proc_state_char(t) != Some('t') {
+                    continue;
+                }
+                match repair_target {
+                    Some(best) if best < t => {}
+                    _ => repair_target = Some(t),
+                }
+            }
+            if let Some(t) = repair_target {
+                let r = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, t, 0, 0) };
+                static Z358_REPAIR_LOGGED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = Z358_REPAIR_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 32 {
+                    match pending_resume.get(&t) {
+                        Some(&(loop0, st0)) => log(&format!(
+                            "6-Z358 REPAIR: tid {} owed a syscall-stop resume (status=0x{:08x} consumed at iter {}, {} iterations unserved, state 't') — PTRACE_SYSCALL issued at loop-top (ret={})",
+                            t,
+                            st0,
+                            loop0,
+                            iter_count.saturating_sub(loop0),
+                            r
+                        )),
+                        None => log(&format!(
+                            "6-Z358 REPAIR: tid {} PTRACE_SYSCALL issued (ret={})",
+                            t, r
+                        )),
+                    }
+                }
+                if r == 0 {
+                    pending_resume.remove(&t);
+                }
+            }
+        }
         let skip_was_set = skip_next_resume;
         // 6-Z122: `skip_next_resume` (set by the ESRCH branch when
         // current_pid is a RUNNING — not ptrace-stopped — tracee)
@@ -16325,6 +16400,15 @@ pub fn run_ptrace_loop(
                 // ESRCH was the "restart of a non-stopped tracee" kind,
                 // and that child must stay tracked (and get resumed).
                 let esrch_pid_dead = matches!(reaped, Reaped::Dead(_) | Reaped::Gone);
+                // 6-Z358: when the reap loop CONSUMED a live victim's
+                // pending stop report (AliveStopped — its waitpid WNOHANG
+                // window deliberately eats the tracee's next stop), that
+                // victim is ptrace-STOPPED right now and owes a resume.
+                // The switch below must prefer it over "first alive"
+                // (rn308: the first-alive pick stranded eaten-stop victims
+                // — 18 of the 19 frozen threads — with no pending_resume
+                // entry, invisible to the invariant checker).
+                let mut stopped_owed: Option<(libc::pid_t, libc::c_int)> = None;
                 match reaped {
                     Reaped::Dead(status) if libc::WIFEXITED(status) => {
                         let code = libc::WEXITSTATUS(status);
@@ -16352,10 +16436,11 @@ pub fn run_ptrace_loop(
                             4096,
                         ) {
                             log(&format!(
-                                "6-Z89: ESRCH pid {} is ALIVE — the reap loop consumed a pending ptrace stop (status {:#x}); keeping it tracked and resuming it via the scan below [occurrence #{}]",
+                                "6-Z89: ESRCH pid {} is ALIVE — the reap loop consumed a pending ptrace stop (status {:#x}); it is STOPPED and OWES its resume — the 6-Z358 switch below serves it [occurrence #{}]",
                                 esrch_pid, status, total
                             ));
                         }
+                        stopped_owed = Some((esrch_pid, status));
                     }
                     Reaped::Running => {
                         // 6-Z305t-71: bounded (ladder #131: 3066× on the
@@ -16392,7 +16477,15 @@ pub fn run_ptrace_loop(
                 // live one (fresh /proc probe over the WHOLE tracked
                 // set — the 6-Z67 recovery-only probe could validate a
                 // stale, pid-recycled entry forever).
-                if let Some(live_pid) = any_traced_child_alive(&tracked_pids) {
+                // 6-Z358: an eaten-stop victim (stopped_owed) takes
+                // PRIORITY over the first-alive scan — it is already
+                // ptrace-stopped, so the loop-top resume lands
+                // kernel-true instead of ESRCH-ing on a running tracee
+                // (each such miss re-arms another reap/eat window).
+                let switch_target = stopped_owed
+                    .map(|(p, s)| (p, Some(s)))
+                    .or_else(|| any_traced_child_alive(&tracked_pids).map(|p| (p, None)));
+                if let Some((live_pid, eaten_status)) = switch_target {
                     // (Task 6-Z67 semantics, generalised: even when the
                     // ESRCH'd pid was init, the loop keeps serving the
                     // surviving traced sibling — the 6-Z67 `init_dead`
@@ -16414,7 +16507,22 @@ pub fn run_ptrace_loop(
                             total
                         ));
                     }
+                    // 6-Z358: swap the per-child in_syscall shadow exactly
+                    // like the waitpid dispatch does, so the victim's next
+                    // stop is classified against ITS state (the old
+                    // current_pid's phase must not leak into it).
+                    if live_pid != current_pid {
+                        in_syscall_map.insert(current_pid, in_syscall);
+                        in_syscall = *in_syscall_map.get(&live_pid).unwrap_or(&false);
+                    }
                     current_pid = live_pid;
+                    if let Some(vs) = eaten_status {
+                        // 6-Z358: the reap loop consumed this stop report
+                        // out-of-band (never dispatched) — record the owed
+                        // resume so the invariant checker tracks it and
+                        // the loop-top close removes it.
+                        pending_resume.insert(live_pid, (iter_count, vs as u32));
+                    }
                     // 6-Z122 (run 32745030268 livelock): when the switch
                     // target IS the RUNNING ESRCH'd pid itself, do NOT
                     // re-resume it — PTRACE_SYSCALL requires a
