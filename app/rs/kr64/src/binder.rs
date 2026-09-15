@@ -2287,14 +2287,19 @@ pub struct BusState {
     /// waitForClientDestroyedLocked failed forever → createClient #2/#3
     /// wedged both binder threads inside the condvar → the SF restart
     /// cascade, rung 5 at rn309's snapshot).
-    /// handle → node (0x7F000001+ — disjoint from the dense service
-    /// handles; the two handle spaces never mix).
+    /// handle → node. 6-Z371: node handles allocate from the SAME dense
+    /// monotonic space as service handles (`next_handle`) — kernel-true
+    /// (the kernel's per-proc handle table has ONE dense handle space;
+    /// libbinder's ProcessState::lookupHandleLocked indexes a dense
+    /// vector by the handle value). The previous disjoint 0x7F000001+
+    /// node range was a fabricated handle space: rn326 decoded the
+    /// guest SF death as ceil(0x7F000001 * 1.5) * 16 = 47.62 GiB — the
+    /// SharedBuffer::alloc of a handle table grown to the first node
+    /// handle's value (MAP_FIXED → container OOM → app death).
     nodes: HashMap<u32, GuestNode>,
     /// (owner, ptr, cookie) → handle. Kernel-true handle identity: the
     /// same node handed out repeatedly gets the SAME handle.
     node_by_key: HashMap<(ConnId, u64, u64), u32>,
-    /// Monotonic node-handle allocator.
-    next_node_handle: u32,
     next_conn: u64,
     next_txn: u64,
 }
@@ -2326,10 +2331,6 @@ impl BusState {
             watchers: HashMap::new(),
             nodes: HashMap::new(),
             node_by_key: HashMap::new(),
-            // 6-Z359: node handles live in a disjoint high range so a
-            // node handle can NEVER collide with a service handle (the
-            // services registry stays dense from PROXY_HANDLE_BASE+1).
-            next_node_handle: 0x7F00_0001,
             next_conn: PROXY_CONN_ID + 1,
             next_txn: 1,
         };
@@ -2917,8 +2918,15 @@ impl BusState {
         let handle = match self.node_by_key.get(&(sender, ptr, cookie)) {
             Some(h) => *h,
             None => {
-                let h = self.next_node_handle;
-                self.next_node_handle += 1;
+                // 6-Z371: kernel-true DENSE handle — the SAME allocator
+                // as service handles (one handle space; every guest
+                // handle-table entry stays small and sequential).
+                // Collision-free: all allocations run serialized under
+                // the bus lock and the counter is monotonic, so a
+                // handle value names exactly one object (service or
+                // node) for the life of the bus.
+                let h = self.next_handle;
+                self.next_handle += 1;
                 self.node_by_key.insert((sender, ptr, cookie), h);
                 self.nodes.insert(
                     h,
@@ -10316,9 +10324,14 @@ mod tests {
             "6-Z359: the LOCAL flat crossed as a HANDLE (was a raw ptr-form flat)"
         );
         let node_handle = u64::from_ne_bytes(got[16..24].try_into().unwrap()) as u32;
+        // 6-Z371: the handle must be kernel-true DENSE — indistinguishable
+        // from a service handle. The fabricated 0x7F000001+ node range made
+        // guest libbinder sparse-grow its handle table to the handle value
+        // (rn326: ceil(0x7F000001*1.5)*16 = 47.62 GiB SharedBuffer::alloc →
+        // MAP_FIXED balloon → container death).
         assert!(
-            node_handle >= 0x7F00_0001,
-            "the node handle lives in the disjoint 6-Z359 range, got 0x{node_handle:08x}"
+            node_handle > 0 && node_handle <= 4096,
+            "the node handle must be kernel-true dense (1..=4096), got 0x{node_handle:08x}"
         );
         assert_eq!(
             u64::from_ne_bytes(got[24..32].try_into().unwrap()),
