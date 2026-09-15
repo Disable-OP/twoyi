@@ -30261,3 +30261,17 @@ Stage Summary:
 - The boot blocker moved from "debuggerd interop" to the REAL earliest wall: HAL registration refused client-side on a parser bug; debuggerd interop is demoted to a quality gap (tombstones) for now.
 - Dispatched rn328 (ui-e2e-android-arm64, ref f37b0276-era main) + recovery pr-tier. EXPECT: health/drm/nn/light/power/rebootescrow register (HIDL addWithChain lines for the previously-missing set), the vendor-HAL restart loop drains, the watchdog abort window clears, and the boot advances past the system_server era toward rungs 8/9. If the storm persists, the skeleton lines + fresh abort msgs name the next layer.
 - Debuggerd interop (Task 111 plan) stays NEXT after rn328's verdict: tracer hand-off or crash-fallback resignal, plus tombstoned's socket-from-init.
+
+---
+Task ID: 114 (rn328 decoded same-session: 6-Z372 verified for the AIDL class, skeleton diagnostic exposed the HIDL short-fqname shape, 6-Z373 lands it; rn329 dispatched)
+
+Work Log:
+- rn328 (34990898185, 76ba4c8d) completed SUCCESS; artifact cached /home/z/artifacts-rn328/. Verdict: rung 7 SURFACEFLINGER, unchanged addWithChain census — the health/drm/nn loop persisted (27x getTransport(health@2.1)→EMPTY, 27x registerAsService aborts, 139 fatal signals).
+- **6-Z372 PARTIALLY VERIFIED**: lights/power/rebootescrow/vibrator-default.xml now parse (1 entry each), manifest index 55 entries; the AIDL <fqname> arm works.
+- **The skeleton diagnostic named the residual shape in one shot**: the vendored HIDL fragments use <fqname> TOO, in the SHORT spelling `@2.1::IHealth/default` (package from <name>) — health@2.1.xml, all five nn samples, drm clearkey/widevine. No interface block; no @-package in the fqname.
+- **6-Z373**: insert_aidl_fqname → insert_fqname_entry — one unified parser: AIDL relative/qualified/matrix spellings + HIDL short/full spellings + slash-bearing instances kept whole; honest skips for malformed shapes; rn328-skeleton fixtures as tests. 908/908 (+1), fmt/clippy clean. Pushed with docs.
+
+Stage Summary:
+- The zero-entry diagnostic loop (skeleton → fix → next run) is now the fastest decode cycle in the project: shape named in a single CI round.
+- rn329 (ui-e2e-android-arm64, ref main) + no new recovery dispatch needed (recovery green on 76ba4c8d: 3/3 children SUCCESS).
+- EXPECT rn329: health@2.1/drm@1.3/nn register (addWithChain lines for the missing set), health-hal-2-1 stops looping, the +170-200s watchdog storm window clears, boot advances past system_server toward rungs 8/9. If a THIRD shape appears, the skeletons name it again.
