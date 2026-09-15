@@ -6947,6 +6947,414 @@ fn bt_walk_6z364(pid: libc::pid_t, sp: u64) {
     }
 }
 
+// ============================================================================
+// 6-Z366: HARDWARE-WATCHPOINT WRITER-TRACE — name the in-guest destroyer
+// of self-owned HIDL node objects (the composer createClient paradox).
+//
+// THE PARADOX THIS INSTRUMENTS (rn315→rn323 decode chain): the proxy
+// mirrors the kernel-true BR_ACQUIRE node-ref hold onto the owner's
+// reply queue (the 6-Z306ae node-ref mirror), the 6-Z306ae-f anchor
+// verifies the object ALIVE at that instant ([R+8]==W round-trip), yet
+// seconds later the object is FULLY DESTRUCTED in-guest (rn323: the
+// composer's slot-2 IComposerClient node — weakref counts 0/0, the
+// object's mRefs field zeroed — between the +11.17s hold mirror and
+// the +15.32s delivery) and the NEXT transaction delivered into the
+// corpse (the 6-Z354 owner-alive override) Scudo-aborts the whole
+// process on "invalid chunk state when deallocating" the weakref.
+// The destroyer is IN-GUEST and invisible to every wire-level
+// instrument (the Task 103 accounting paradox).
+//
+// THE INSTRUMENT: the aarch64 CPU's own debug registers. When a
+// BR_ACQUIRE node-ref mirror is delivered for a HIDL BnHw-shaped node
+// (R - cookie == 0x88 — the #206 decode's virtual-base Δ for the
+// multiply-inheriting wrapper class), the tracer arms DBGWVR0/DBGWCR0
+// on [R+8] — the object's mRefs FIELD — for EVERY thread of the owner
+// (existing threads at their next syscall stop, threads spawned later
+// at their first stop). The mRefs field of a live object is quiet
+// (incStrong/decStrong write the WEAKREF's counters, not the field), so
+// a hit names exactly the construction/destruction-class event: a late
+// writer zeroing mRefs vs an early re-user taking the chunk — the
+// rn321 sub-shape discriminator, with the writer's pc + a 6-Z364 frame
+// walk in the log.
+//
+// BOUNDS (6-Z305t-71 storm lesson; Ptrace Safety §19): ≤ 2 watched
+// node shells per boot; one-shot per thread — a hit DISARMS that
+// thread's watchpoint BEFORE the required PTRACE_SINGLESTEP over the
+// trapping access (a still-enabled watchpoint re-triggers on the
+// re-executed access forever); ≤ 8 LOGGED hits boot-wide while the
+// disarm+step machinery itself stays active for any further hits (a
+// disabled logger must never become a consume-resume storm). Zero
+// semantics: debug state only, zero guest register writes, the watched
+// address is never modified by the tracer.
+// ============================================================================
+
+/// NT_ARM_HW_WATCH — the ELF note type identifying the aarch64 hardware
+/// watchpoint debug regset (mirrors <elf.h>; the libc crate does not
+/// export it). Carried in PTRACE_GETREGSET/SETREGSET's `addr` argument.
+const Z366_NT_ARM_HW_WATCH: libc::c_long = 0x403;
+
+/// user_hwdebug_state: u32 dbg_info + u32 pad, then 16 × (u64 DBGWVR +
+/// u32 DBGWCR + u32 pad) = 8 + 16*16 = 264 bytes. The kernel rejects
+/// regset writes shorter than the header; the full struct is written.
+const Z366_HWDEBUG_STATE_LEN: usize = 8 + 16 * 16;
+
+/// DBGWCR0 word for an 8-byte load/store watchpoint:
+///   bit 0     ENABLE = 1
+///   bits 4:3  LSC    = 0b11  (trap loads AND stores)          = 0x0018
+///   bits 12:5 BAS    = 0xFF  (all 8 bytes of the watched word) = 0x1FE0
+/// PAC/SSC/HMC/LBN stay 0 (every privilege level, unlinked). Total
+/// 0x1FF9 — the shape GDB programs for a default aarch64 watchpoint.
+const Z366_DBGWCR_RW_8: u32 = 1 | (0b11 << 3) | (0xFFu32 << 5);
+
+/// The HIDL BnHw<HIDL> virtual-base Δ (the #206 decode): the paradox
+/// class this instrument targets. Wrappers with other Δ (0x20/0x38/
+/// 0x68/0x80 — AIDL/native classes) are skipped so the 2-shell budget
+/// lands on the class the rn315→rn323 chain actually died to.
+const Z366_BNHW_DELTA: u64 = 0x88;
+
+/// Watchpoint budget: node shells per boot (the Task 103 design bound).
+const Z366_NODE_BUDGET: usize = 2;
+
+/// Logged-hit budget: after this many logged hits the logging stops but
+/// the disarm+step machinery stays active — the instrument can never
+/// degrade into a consume-resume storm (the 6-Z305t-71 lesson).
+const Z366_HIT_LOG_BUDGET: usize = 8;
+
+/// 6-Z366 state. Locked from the tracer loop's stop path and from the
+/// binder proxy's mirror-delivery path (different threads; the mutex is
+/// uncontended in practice and every hot-path caller early-outs on the
+/// relaxed Z366_ANY flag before locking).
+#[derive(Default)]
+struct Z366State {
+    /// Cleared the first time the kernel rejects the regset shape
+    /// (EINVAL/ENODEV) — the instrument stands down honestly and the
+    /// 6-Z365 fatal-BT accumulation remains the fallback oracle.
+    supported: bool,
+    /// Watched node shells so far (budget Z366_NODE_BUDGET).
+    nodes: usize,
+    /// Hits LOGGED so far (budget Z366_HIT_LOG_BUDGET).
+    hits_logged: usize,
+    /// tgid → watch address (the object's mRefs field, R+8). Persistent
+    /// so threads spawned after the request arm at their first stop.
+    requests: std::collections::HashMap<i32, u64>,
+    /// tid → watch address for ARMED threads (one-shot: disarmed on hit).
+    armed: std::collections::HashMap<i32, u64>,
+    /// tid → tgid cache (one /proc/<tid>/status Tgid read per tid).
+    tgid_cache: std::collections::HashMap<i32, i32>,
+    /// tids awaiting their single-step completion stop (TRAP_TRACE).
+    step_pending: std::collections::HashSet<i32>,
+}
+
+static Z366_STATE: std::sync::Mutex<Option<Z366State>> = std::sync::Mutex::new(None);
+static Z366_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn z366_lock() -> std::sync::MutexGuard<'static, Option<Z366State>> {
+    let mut g = Z366_STATE.lock().expect("6-Z366 state poisoned");
+    if g.is_none() {
+        *g = Some(Z366State {
+            supported: true,
+            ..Default::default()
+        });
+    }
+    g
+}
+
+/// Pure shape check for the arm decision (unit-testable): the paradox
+/// class is the BnHw<HIDL> wrapper Δ.
+fn z366_is_bnhw_class(delta: u64) -> bool {
+    delta == Z366_BNHW_DELTA
+}
+
+/// Pure regset builder (unit-testable): slot 0 watches `addr` when
+/// `enable`, everything else zeroes. 264-byte user_hwdebug_state.
+fn z366_build_wp_regset(addr: u64, enable: bool) -> [u8; Z366_HWDEBUG_STATE_LEN] {
+    let mut buf = [0u8; Z366_HWDEBUG_STATE_LEN];
+    if enable {
+        buf[8..16].copy_from_slice(&addr.to_ne_bytes()); // dbg_regs[0].addr
+        buf[16..20].copy_from_slice(&Z366_DBGWCR_RW_8.to_ne_bytes()); // dbg_regs[0].ctrl
+    }
+    buf
+}
+
+/// Apply the regset to `pid` (must be ptrace-stopped). Returns the raw
+/// errno on failure so the caller can discriminate support vs transient.
+fn z366_set_wp(pid: libc::pid_t, addr: u64, enable: bool) -> Result<(), i32> {
+    let mut buf = z366_build_wp_regset(addr, enable);
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: Z366_HWDEBUG_STATE_LEN,
+    };
+    let ret = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETREGSET,
+            pid,
+            Z366_NT_ARM_HW_WATCH,
+            &mut iov as *mut libc::iovec as libc::c_long,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    }
+}
+
+/// One /proc/<tid>/status Tgid read (0 = unreadable / unknown).
+fn z366_read_tgid(pid: libc::pid_t) -> i32 {
+    std::fs::read_to_string(format!("/proc/{}/status", pid))
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("Tgid:")
+                    .map(|v| v.trim().parse::<i32>().unwrap_or(0))
+            })
+        })
+        .unwrap_or(0)
+}
+
+/// 6-Z366 (binder.rs hook): a kernel-true BR_ACQUIRE node-ref mirror
+/// was just delivered onto `owner_tgid`'s reply queue for the node
+/// shell (weakref W, cookie B). If the shell is the HIDL BnHw class
+/// and the boot budget allows, resolve R = [W+8] (weakref_impl.mBase —
+/// the anchor proved [R+8]==W moments earlier, so this read lands on a
+/// live weakref) and request the watch of the object's mRefs field at
+/// R+8 for every thread of the owner. Inert off-aarch64 (the watch
+/// targets aarch64 debug registers; the x86_64 emulator path and the
+/// host test builds never arm anything).
+pub(crate) fn z366_request_watch(owner_tgid: libc::pid_t, weakref_w: u64, cookie: u64) {
+    if !cfg!(target_arch = "aarch64") || owner_tgid <= 0 || weakref_w == 0 || cookie == 0 {
+        return;
+    }
+    let mut guard = z366_lock();
+    let st = guard.as_mut().unwrap();
+    if !st.supported || st.nodes >= Z366_NODE_BUDGET || st.requests.contains_key(&owner_tgid) {
+        return;
+    }
+    let Some(buf) = read_child_bytes(owner_tgid, weakref_w + 8, 8) else {
+        return;
+    };
+    if buf.len() != 8 {
+        return;
+    }
+    let r = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+    if r == 0 {
+        return;
+    }
+    let delta = r.wrapping_sub(cookie);
+    if !z366_is_bnhw_class(delta) {
+        crate::trace_log_line(&format!(
+            "6-Z366: skip watch W=0x{:x} cookie=0x{:x} delta=0x{:x} (not the BnHw class) pid={}",
+            weakref_w, cookie, delta, owner_tgid
+        ));
+        return;
+    }
+    let addr = r + 8; // the object's mRefs field
+    st.requests.insert(owner_tgid, addr);
+    st.nodes += 1;
+    Z366_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::trace_log_line(&format!(
+        "6-Z366: watch requested pid={} W=0x{:x} cookie=0x{:x} R=0x{:x} mRefs@0x{:x} (shell {}/{}) — every owner thread arms at its next stop",
+        owner_tgid, weakref_w, cookie, r, addr, st.nodes, Z366_NODE_BUDGET
+    ));
+}
+
+/// 6-Z366 (tracer stop path — called at EVERY syscall-stop): arm this
+/// tid's watchpoint if its process owes one. Zero cost when the
+/// instrument is idle: one relaxed atomic load. The tid is
+/// ptrace-stopped RIGHT HERE, so PTRACE_SETREGSET is legal.
+fn z366_try_arm_tid(pid: libc::pid_t) {
+    if !Z366_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if pid_is_arm32(pid) {
+        return; // compat children carry no aarch64 node objects
+    }
+    let mut guard = z366_lock();
+    let st = guard.as_mut().unwrap();
+    if !st.supported || st.requests.is_empty() || st.armed.contains_key(&pid) {
+        return;
+    }
+    let tgid = match st.tgid_cache.get(&pid) {
+        Some(t) => *t,
+        None => {
+            let t = z366_read_tgid(pid);
+            if st.tgid_cache.len() < 8192 {
+                st.tgid_cache.insert(pid, t);
+            }
+            t
+        }
+    };
+    let Some(&addr) = st.requests.get(&tgid) else {
+        return;
+    };
+    match z366_set_wp(pid, addr, true) {
+        Ok(()) => {
+            st.armed.insert(pid, addr);
+            if st.armed.len() <= 16 {
+                crate::trace_log_line(&format!(
+                    "6-Z366: armed tid={} tgid={} mRefs@0x{:x} ({}/{} threads armed)",
+                    pid,
+                    tgid,
+                    addr,
+                    st.armed.len(),
+                    Z366_NODE_BUDGET
+                ));
+            }
+        }
+        Err(errno) => {
+            // EINVAL/ENODEV/ENOTSUP: the kernel lacks the regset shape —
+            // stand down boot-wide (the 6-Z365 BT stays the fallback).
+            // ESRCH/EPERM/EPERM-class: a dying/odd tid — skip quietly.
+            if matches!(errno, libc::EINVAL | libc::ENODEV | libc::ENOTSUP) {
+                st.supported = false;
+                crate::trace_log_line(&format!(
+                    "6-Z366: NT_ARM_HW_WATCH regset rejected (errno={}) — instrument stands down; 6-Z365 BT accumulation remains the oracle",
+                    errno
+                ));
+            }
+        }
+    }
+}
+
+/// The plain-SIGTRAP dispatcher's verdict for one stop.
+enum Z366PlainTrap {
+    /// A watchpoint hit: already logged + DISARMED; the caller must
+    /// single-step this tid over the trapping access.
+    Hit,
+    /// The completion stop of a 6-Z366 single-step: fall through to the
+    /// normal dispatcher (the loop-top PTRACE_SYSCALL restores rhythm).
+    StepDone,
+    /// Not ours.
+    None,
+}
+
+/// 6-Z366 (plain-SIGTRAP dispatcher, event==0): classify the stop.
+/// step_pending membership is the single-step state machine (the
+/// completion stop is SIGTRAP/TRAP_TRACE; a coalesced signal-delivery
+/// stop clears the pending state too — the one instruction DID step).
+fn z366_plain_sigtrap(pid: libc::pid_t) -> Z366PlainTrap {
+    if !Z366_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return Z366PlainTrap::None;
+    }
+    let mut guard = z366_lock();
+    let st = guard.as_mut().unwrap();
+    if st.step_pending.remove(&pid) {
+        return Z366PlainTrap::StepDone;
+    }
+    if !st.supported || !st.armed.contains_key(&pid) {
+        return Z366PlainTrap::None;
+    }
+    // Distinguish OUR watchpoint hit from every other plain SIGTRAP
+    // (tracer-injected int3, guest breakpoints, forced traps): the
+    // kernel reports hardware watchpoint exceptions with
+    // si_code = TRAP_HWBKPT (4).
+    let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // PTRACE_GETSIGINFO == 0x4202 (the same raw request the 6-Z305t-71
+    // arm uses — the libc binding is union-opaque here).
+    let si_r = unsafe { libc::ptrace(0x4202, pid, 0, &mut si as *mut _ as libc::c_long) };
+    if si_r != 0 {
+        return Z366PlainTrap::None;
+    }
+    let si_code = unsafe { *(&si as *const libc::siginfo_t as *const u8).add(8) as i32 };
+    if si_code != 4 {
+        return Z366PlainTrap::None;
+    }
+    let Some(&addr) = st.armed.get(&pid) else {
+        return Z366PlainTrap::None;
+    };
+
+    // The writer's context — read BEFORE the disarm (the child is
+    // stopped; zero register writes). aarch64-only at runtime: hits
+    // require armed aarch64 watchpoints.
+    #[cfg(target_arch = "aarch64")]
+    let (pc, sp, lr) = {
+        let mut regs: Regs = unsafe { std::mem::zeroed() };
+        if ptrace_getregs(pid, &mut regs).is_ok() {
+            (regs.pc, regs.sp, regs.regs[30]) // pc, sp, x30=lr
+        } else {
+            (0u64, 0u64, 0u64)
+        }
+    };
+    #[cfg(target_arch = "x86_64")]
+    let (pc, sp, lr) = (0u64, 0u64, 0u64);
+
+    // 48 bytes around the watched field (bounded, read-only).
+    let mut around = String::from("unreadable");
+    if addr >= 16 {
+        if let Some(b) = read_child_bytes(pid, addr - 16, 48) {
+            let hex: Vec<String> = b.iter().map(|x| format!("{:02x}", x)).collect();
+            around = hex.join("");
+        }
+    }
+
+    // DISARM THIS THREAD FIRST (one-shot), then count the hit. A still-
+    // enabled watchpoint would re-trigger on the re-executed access
+    // after the single-step — the exact storm class the mission bans.
+    let _ = z366_set_wp(pid, addr, false);
+    st.armed.remove(&pid);
+    st.hits_logged += 1;
+    let hit_no = st.hits_logged;
+    let log_it = hit_no <= Z366_HIT_LOG_BUDGET;
+    drop(guard);
+
+    if log_it {
+        crate::trace_log_line(&format!(
+            "6-Z366: WATCHPOINT HIT pid={} mRefs@0x{:x} pc=0x{:x} lr=0x{:x} sp=0x{:x} (hit {}/{}) — the writer names itself; mem[addr-16..addr+32]={}",
+            pid, addr, pc, lr, sp, hit_no, Z366_HIT_LOG_BUDGET, around
+        ));
+        // Bounded frame walk of the WRITER (the child stays stopped;
+        // read-only, zero register writes — same heuristics as 6-Z365).
+        bt_walk_6z364(pid, sp);
+    }
+    Z366PlainTrap::Hit
+}
+
+#[cfg(test)]
+mod z366_tests {
+    use super::*;
+
+    #[test]
+    fn z366_dbgwcr_word_is_enable_lsc_bas() {
+        // ENABLE=1 | LSC=0b11<<3 | BAS=0xFF<<5 = 0x1FF9
+        assert_eq!(Z366_DBGWCR_RW_8, 0x1FF9);
+        assert_eq!(Z366_DBGWCR_RW_8 & 1, 1); // enabled
+        assert_eq!((Z366_DBGWCR_RW_8 >> 3) & 0b11, 0b11); // load+store
+        assert_eq!((Z366_DBGWCR_RW_8 >> 5) & 0xFF, 0xFF); // 8 bytes
+    }
+
+    #[test]
+    fn z366_regset_layout_slot0_only() {
+        let buf = z366_build_wp_regset(0xdead_beef_0000_1234, true);
+        assert_eq!(buf.len(), 264);
+        let mut addr_bytes = [0u8; 8];
+        addr_bytes.copy_from_slice(&buf[8..16]);
+        assert_eq!(u64::from_ne_bytes(addr_bytes), 0xdead_beef_0000_1234);
+        let mut ctrl_bytes = [0u8; 4];
+        ctrl_bytes.copy_from_slice(&buf[16..20]);
+        assert_eq!(u32::from_ne_bytes(ctrl_bytes), Z366_DBGWCR_RW_8);
+        // dbg_info header + every other slot stay zero.
+        assert!(buf[0..8].iter().all(|b| *b == 0));
+        assert!(buf[20..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn z366_regset_disable_clears_control() {
+        let buf = z366_build_wp_regset(0x1000, false);
+        assert!(buf.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn z366_bnhw_delta_filter() {
+        assert!(z366_is_bnhw_class(0x88));
+        assert!(!z366_is_bnhw_class(0x20));
+        assert!(!z366_is_bnhw_class(0x38));
+        assert!(!z366_is_bnhw_class(0x68));
+        assert!(!z366_is_bnhw_class(0x80));
+        assert!(!z366_is_bnhw_class(0));
+    }
+}
+
 fn maps_bracket_in(content: &str, addr: u64) -> String {
     let mut prev: Option<&str> = None;
     for line in content.lines() {
@@ -15978,6 +16386,12 @@ pub fn run_ptrace_loop(
     // PTRACE_SYSCALL resume (it ESRCHs on a non-stopped tracee) and go
     // straight to the blocking waitpid for that child's next stop.
     let mut skip_next_resume: bool = false;
+    // 6-Z366: the loop-top resume for the CURRENT iteration becomes a
+    // PTRACE_SINGLESTEP when a watchpoint hit was just serviced — the
+    // trapping access must complete WITHOUT re-triggering (the hit path
+    // already disarmed the watchpoint), then the TRAP_TRACE completion
+    // stop returns the tid to the normal syscall-stop rhythm.
+    let mut z366_singlestep_resume: bool = false;
 
     // 6-Z126: consecutive-ESRCH accounting per pid. Run 32773072503:
     // pid 7039 (ueventd) reached a state where PTRACE_SYSCALL ESRCHs
@@ -16258,7 +16672,16 @@ pub fn run_ptrace_loop(
         // tracee returns ESRCH, and re-issuing it every iteration
         // livelocks the loop away from the waitpid that would have
         // received the child's next stop.
-        let r = if skip_next_resume {
+        let r = if z366_singlestep_resume {
+            z366_singlestep_resume = false;
+            // 6-Z366: step over the trapping access exactly once. The
+            // watchpoint is already disarmed on this tid, so the stepped
+            // instruction cannot re-trigger; the next stop of this tid
+            // (TRAP_TRACE, or a coalesced signal-delivery stop) lands in
+            // the plain-SIGTRAP dispatcher as Z366PlainTrap::StepDone and
+            // the loop-top PTRACE_SYSCALL restores the normal rhythm.
+            unsafe { libc::ptrace(libc::PTRACE_SINGLESTEP, current_pid, 0, 0) }
+        } else if skip_next_resume {
             skip_next_resume = false;
             // 6-Z211e DIAG: log when skip_next_resume is set (the parent
             // is NOT being resumed — this is the suspected root cause of
@@ -19318,6 +19741,13 @@ pub fn run_ptrace_loop(
                 // snapshot instead of taking a second GETREGSET.
                 let regs_epoch_at_fetch = SETREGS_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
                 let syscall_num = get_syscall_num(&regs, &abi);
+
+                // ── 6-Z366: arm this tid's hardware watchpoint if its
+                // process owes one (the composer-node destroyer
+                // instrument). The tid is stopped RIGHT HERE so
+                // PTRACE_SETREGSET is legal; the call is a relaxed
+                // atomic load when no watch is pending.
+                z366_try_arm_tid(pid);
 
                 // 6-Z210 DIAG (broad): fires for EVERY syscall-stop (capped
                 // at 2000) to see the full sequence of syscalls being caught
@@ -37142,6 +37572,25 @@ pub fn run_ptrace_loop(
                     // render never reads nr.
                     nr: 0,
                 });
+                // ── 6-Z366: watchpoint hit / single-step completion ──
+                // BEFORE the generic plain-SIGTRAP handling: a hardware
+                // watchpoint hit (si_code TRAP_HWBKPT) on a thread this
+                // instrument armed is logged + DISARMED here and resumed
+                // with ONE single-step (the loop-top resume below turns
+                // into PTRACE_SINGLESTEP for this iteration); the step's
+                // completion stop falls through to the normal dispatcher.
+                match z366_plain_sigtrap(pid) {
+                    Z366PlainTrap::Hit => {
+                        z366_singlestep_resume = true;
+                        continue;
+                    }
+                    Z366PlainTrap::StepDone => {
+                        // Fall through — the loop-top PTRACE_SYSCALL
+                        // resume restores the normal rhythm.
+                    }
+                    Z366PlainTrap::None => {}
+                }
+
                 // Regular SIGTRAP (breakpoint, single-step without 0x80
                 // marker, etc.). We did NOT request delivery of any signal
                 // so falling through to the next PTRACE_SYSCALL (with a
