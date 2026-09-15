@@ -5460,6 +5460,32 @@ pub const GOLDFISH_ASPACE_CEILING: u64 = 512 * 1024 * 1024;
 /// can run for ~90 s at ~25 MB/s).
 pub const GOLDFISH_ASPACE_GROW_LOG_CAP: u64 = 32;
 
+/// 6-Z362 (rn315 decode): the size threshold below which an anonymous mmap
+/// is not accounted at all. A healthy boot's big anonymous mappings are
+/// the zygote's preload arenas and scudo's secondary regions — all well
+/// under 8 MiB per single call; the rn315 balloon's allocations were GBs
+/// total over ~10 s, so 8 MiB keeps the per-pid map tiny while catching
+/// every meaningful step of the leak. Constants mirroring the 6-Z361
+/// bounded-accounting shape (detail cap + periodic aggregate).
+pub const BIG_ANON_MMAP_MIN: u64 = 8 * 1024 * 1024;
+/// 6-Z362: how many per-event detail lines (pid, len, flags, ret) are
+/// logged boot-wide before only the milestones + periodic aggregate remain.
+pub const BIG_ANON_MMAP_DETAIL_CAP: u64 = 32;
+/// 6-Z362: after the detail cap, one aggregate line per this many ≥8 MiB
+/// events (boot-wide), echoing the 6-Z361 every-512th-grow sampler.
+pub const BIG_ANON_MMAP_AGG_EVERY: u64 = 512;
+/// 6-Z362: per-pid cumulative-total milestones (one line per pid per
+/// threshold, monotonic). 64 MiB–8 GiB brackets every interesting scale
+/// between "single big mapping" and "the rn315 14 GB balloon".
+pub const BIG_ANON_MMAP_MILESTONES: [u64; 6] = [
+    64 * 1024 * 1024,
+    256 * 1024 * 1024,
+    1024 * 1024 * 1024,
+    4 * 1024 * 1024 * 1024,
+    8 * 1024 * 1024 * 1024,
+    12 * 1024 * 1024 * 1024,
+];
+
 /// 6-Z338: the address-space arena. ONE backing regular file is shared by
 /// every opener (the stand-in node), so offsets are GLOBAL across guest
 /// processes and must never collide — exactly what the real goldfish
@@ -15013,6 +15039,30 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     let mut mmap2_file_cache_bytes: u64 = 0;
     let mut vm_writev_usable: Option<bool> = None;
+
+    // ── 6-Z362: big-anonymous-mmap accounting state (rn315 decode) ──
+    //
+    // The rn315 run died to a guest surfaceflinger ~14 GB RSS balloon in
+    // ~10s whose allocation path bypassed the audited goldfish_address_space
+    // stand-in (the 6-Z361 arena telemetry peaked at 9.2 MB, zero ceiling
+    // refusals) — and NO existing diagnostic could name the caller: the
+    // 6-Z268 ENTRY DIAG is capped at 40 and carries no length, the 6-Z62
+    // injection path is i386-only, and per-syscall logging is banned on the
+    // hot path. The accounting below closes that gap with two compares per
+    // mmap EXIT and log lines only at ≥8 MiB sizes.
+    //
+    // `pending_big_mmap`: (length, flags) stashed at ENTRY because aarch64
+    // clobbers x0-x3 before the EXIT stop (the 6-Z305t-62 lesson) — the
+    // length arg is UNRECOVERABLE at EXIT. Only ≥8 MiB entries are stored,
+    // so the map holds a handful of slots per boot (small allocations never
+    // touch it).
+    let mut pending_big_mmap: std::collections::HashMap<libc::pid_t, (u64, u64)> =
+        std::collections::HashMap::new();
+    // Per-pid counters: (events, total_bytes, max_single, milestone_mask).
+    // The mask's bits are cleared as each 6-Z362_MILESTONES threshold is
+    // first crossed, so each pid logs one milestone line per threshold.
+    let mut big_mmap_stats: std::collections::HashMap<libc::pid_t, (u64, u64, u64, u32)> =
+        std::collections::HashMap::new();
 
     // Runtime-detected syscall/register layout for the child. `None`
     // until the first successful ptrace_getregs — at that point we
@@ -27439,6 +27489,22 @@ pub fn run_ptrace_loop(
                         n if n == abi.mmap || n == abi.mmap2 => {
                             let flags = get_syscall_arg(&regs, abi.reg_arg4) as i32;
                             let fd = get_syscall_arg(&regs, abi.reg_arg5) as i32;
+                            // ── 6-Z362: big-anonymous-mmap ENTRY stash ──
+                            //
+                            // aarch64 clobbers x0-x3 before the EXIT stop
+                            // (the 6-Z305t-62 epoll_pwait lesson), so the
+                            // length/flags args are unrecoverable at EXIT —
+                            // stash them NOW for the EXIT-side accounting.
+                            // The 8 MiB gate keeps the map at a handful of
+                            // slots per boot (small mmaps never insert), and
+                            // the stash happens BEFORE any 6-Z62 rewrite can
+                            // modify the arg registers.
+                            {
+                                let m_len362 = get_syscall_arg(&regs, abi.reg_arg2);
+                                if m_len362 >= BIG_ANON_MMAP_MIN {
+                                    pending_big_mmap.insert(pid, (m_len362, flags as u64));
+                                }
+                            }
                             // ── 6-Z305t-42: binder-fd mmap probe (ENTRY) ──
                             //
                             // libbinder's ProcessState mmaps the binder fd
@@ -29042,6 +29108,80 @@ pub fn run_ptrace_loop(
                 } else {
                     // ── Syscall EXIT ──
                     in_syscall = false;
+
+                    // ── 6-Z362: big-anonymous-mmap accounting (EXIT) ──
+                    //
+                    // rn315's blocking wall: the guest surfaceflinger
+                    // ballooned ~14 GB RSS in ~10 s (host lmkd kill-wave at
+                    // +30 s) through a path that bypasses the audited
+                    // goldfish_address_space stand-in, and NO existing
+                    // diagnostic carries a size for a generic anonymous mmap
+                    // on the 64-bit ABIs. This block consumes the ENTRY
+                    // stash (length/flags are clobbered by aarch64 before
+                    // EXIT) and, on a SUCCESSFUL mapping, updates per-pid
+                    // counters. Logging is bounded like the 6-Z361 grow
+                    // sampler: first 32 events boot-wide carry details,
+                    // per-pid cumulative milestones (64 MiB → 12 GiB) fire
+                    // exactly once each, and a boot-wide aggregate line
+                    // every 512th ≥8 MiB event keeps long-leak visibility
+                    // after the detail cap. ZERO semantics: the return
+                    // value is never read-modified here — a failed mmap
+                    // only drops the stash entry (counters measure REAL
+                    // mappings, mirroring RSS).
+                    if syscall_num == abi.mmap || syscall_num == abi.mmap2 {
+                        if let Some((m_len, m_flags)) = pending_big_mmap.remove(&pid) {
+                            let m_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            if m_ret > 0 {
+                                static BIG_MMAP_DETAIL: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                static BIG_MMAP_EVENTS: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let ev = BIG_MMAP_EVENTS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                                let detail_n = BIG_MMAP_DETAIL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let st = big_mmap_stats
+                                    .entry(pid)
+                                    .or_insert((0u64, 0u64, 0u64, 0u32));
+                                st.0 = st.0.saturating_add(1);
+                                st.1 = st.1.saturating_add(m_len);
+                                st.2 = st.2.max(m_len);
+                                // Per-pid milestones: one line per threshold,
+                                // bit-cleared as each fires (bit i set = still
+                                // owed for BIG_ANON_MMAP_MILESTONES[i]).
+                                let mut owed = st.3;
+                                let mut ms_text = String::new();
+                                for (i, th) in BIG_ANON_MMAP_MILESTONES.iter().enumerate() {
+                                    if owed & (1u32 << i) != 0 && st.1 >= *th {
+                                        owed &= !(1u32 << i);
+                                        ms_text.push_str(&format!(
+                                            " {:.2}GiB",
+                                            *th as f64 / 1073741824.0
+                                        ));
+                                    }
+                                }
+                                st.3 = owed;
+                                if !ms_text.is_empty() {
+                                    log(&format!(
+                                        "6-Z362: big-anon-mmap MILESTONE pid={} crossed{} total={} count={} max={} — display-era leak class names itself here",
+                                        pid, ms_text, st.1, st.0, st.2
+                                    ));
+                                } else if detail_n < BIG_ANON_MMAP_DETAIL_CAP {
+                                    log(&format!(
+                                        "6-Z362: big-anon-mmap pid={} len={} flags={:#x} ret={:#x} (event #{}, detail {}/{})",
+                                        pid, m_len, m_flags, m_ret, ev, detail_n + 1,
+                                        BIG_ANON_MMAP_DETAIL_CAP
+                                    ));
+                                } else if ev % BIG_ANON_MMAP_AGG_EVERY == 0 {
+                                    log(&format!(
+                                        "6-Z362: big-anon-mmap AGGREGATE boot-wide events={} (post-detail-cap; per-pid milestones carry the attribution)",
+                                        ev
+                                    ));
+                                }
+                            }
+                        }
+                    }
 
                     // ── 6-Z306p: consume a pending PR_CAPBSET_DROP ──
                     //
