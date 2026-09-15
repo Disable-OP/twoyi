@@ -103,7 +103,16 @@ def main(art, out_path):
 
     kr = read(os.path.join(art, "kr64-app-stderr-dockerexec.log"))
     kr_kr = read(os.path.join(art, "kr64-dockerexec.log"))
-    kr_all = kr + "\n" + kr_kr
+    # 6-Z365 (rn318 decode): the docker-exec push of the app stderr is a
+    # `tail -n 20000` of a very chatty file — in rn318 it only covered
+    # +60.6s..+111.6s, so the early-boot KLOG-TIMELINE lines
+    # (servicemanager +2.4s, zygote +9.7s, surfaceflinger +24.7s) were
+    # truncated OUT of the classifier's input while the run actually
+    # reached rung 7 territory. The app's FileLogger copy of kr64.log is
+    # pulled via adb WITHOUT a tail bound — full-history, and
+    # guest-attributed by construction (it IS the tracer's own log).
+    kr_fl = read(os.path.join(art, "app-logs", "log", "kr64.log"))
+    kr_all = kr + "\n" + kr_kr + "\n" + kr_fl
     ps = read(os.path.join(art, "ps-dockerexec.txt"))
     props = read(os.path.join(art, "property-area-state.txt"))
 
@@ -136,14 +145,28 @@ def main(art, out_path):
     if hit("PROPERTY_SERVICE", r"prop_msg|property.*set|__properties__|z111_apply_property_set", kr_all, "kr64") or \
        hit("PROPERTY_SERVICE", r"property_info +\d+|properties_serial +\d+", props, "property-area"):
         rung, stage = 3, "PROPERTY_SERVICE"
-    # 4..8 — GUEST SUBTREE ONLY
-    if hit("CORE_DAEMONS", r"\bservicemanager\b|\bvold\b|\bkeystore2\b|\blogd\b", guest_names, "guest-ps"):
+    # 4..8 — GUEST SUBTREE ONLY, with 6-Z365 klog fallbacks.
+    # The ps subtree disappears whenever the BENCH dies after the guest
+    # made progress (rn318: host runtime restart killed the app tree),
+    # and the stderr tail may have truncated the early KLOG lines. The
+    # tracer's own "init: starting service 'X'" bridge lines are
+    # GUEST-attributed evidence (the HOST has no such init service
+    # messages inside the kr64 trace), so they are a legitimate fallback.
+    # VERIFIED-PATTERNS-ONLY policy: rn318 ground truth shows the exact
+    # lines for servicemanager (+2.4s), zygote (+9.7s), surfaceflinger
+    # (+24.7s). system_server is forked BY zygote, not spawned by init,
+    # so no klog pattern is asserted for rung 6 (ps-only until a run
+    # captures the real line — no speculative patterns).
+    if hit("CORE_DAEMONS", r"\bservicemanager\b|\bvold\b|\bkeystore2\b|\blogd\b", guest_names, "guest-ps") or \
+       hit("CORE_DAEMONS", r"starting service '(?:servicemanager|logd|vold|keystore2|hwservicemanager)'", kr_all, "kr64-klog"):
         rung, stage = 4, "CORE_DAEMONS"
-    if hit("ZYGOTE", r"zygote", guest_names, "guest-ps"):
+    if hit("ZYGOTE", r"zygote", guest_names, "guest-ps") or \
+       hit("ZYGOTE", r"starting service 'zygote'", kr_all, "kr64-klog"):
         rung, stage = 5, "ZYGOTE"
     if hit("SYSTEM_SERVER", r"system_server", guest_names, "guest-ps"):
         rung, stage = 6, "SYSTEM_SERVER"
-    if hit("SURFACEFLINGER", r"surfaceflinger", guest_names, "guest-ps"):
+    if hit("SURFACEFLINGER", r"surfaceflinger", guest_names, "guest-ps") or \
+       hit("SURFACEFLINGER", r"starting service 'surfaceflinger'", kr_all, "kr64-klog"):
         rung, stage = 7, "SURFACEFLINGER"
     if hit("SYSTEMUI_LAUNCHER", r"com\.android\.systemui|launcher", guest_names, "guest-ps"):
         rung, stage = 8, "SYSTEMUI_LAUNCHER"
@@ -151,7 +174,22 @@ def main(art, out_path):
     if hit("BOOT_COMPLETED", r"BOOT_COMPLETED sent to @", kr_all, "kr64"):
         rung, stage = 9, "BOOT_COMPLETED"
 
+    # 6-Z365: bench-death discriminator. rn318's final `ps -A` had NO
+    # io.twoyi.debug at all (host runtime restart killed the app tree),
+    # which made rungs 4-8 structurally invisible even though the guest
+    # trace was alive to +111.6s. Distinguish "guest died" (init reboot /
+    # zombie kr64) from "the bench around it died" (app subtree vanished
+    # while the trace still shows life). The annotation NEVER lowers the
+    # rung — the klog evidence stays real guest progress.
+    bench_death = app_pid is None and bool(kr_all.strip())
+
     post_mortem = ""
+    if bench_death and not guest_dead:
+        post_mortem = ("bench-death: io.twoyi.debug subtree absent from final "
+                       "host ps while the kr64 trace shows guest life — "
+                       "host-side restart/teardown class (see "
+                       "host-restart-forensics.txt); rung NOT lowered")
+        stage = f"{stage} [{post_mortem}]"
     if guest_dead and rung < 9:
         post_mortem = ("guest exited post-mortem: "
                        + ("init reboot path (Reboot ending, jumping to kernel)" if init_reboot else "")
