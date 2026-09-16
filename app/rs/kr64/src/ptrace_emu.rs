@@ -15388,10 +15388,26 @@ pub fn run_ptrace_loop(
     //   Excluded from the 6-Z190 coverage sweep (re-attaching one would
     //   STEAL it back mid-dump) and from every stop account (they
     //   produce no more kr64 stops by construction).
+    // z388_handed_off_to (6-Z396): handed-off tid -> the crash_dump pid
+    //   that owns the dump. rn353 decode: the ANR/Watchdog backtrace
+    //   path dumps ALIVE processes ("Collecting stacks for pid 4031" —
+    //   system_server itself). When crash_dump finishes (it DETACHes the
+    //   tids) or dies (tombstoned's intercept timeout kills it: "intercept
+    //   for pid 4031 ... terminated: due to timeout"), those tids run
+    //   UNTRACED forever — outside every kr64 syscall emulation. The
+    //   guest then corrupts silently: tombstoned read its crash socket
+    //   as a 0-byte short read, system_server's main thread hung past
+    //   package_native registration, and the boot stalled at rung 7
+    //   with ZERO service deaths (the racy-loop class was already gone).
+    //   The map lets the death branches (6-Z394 prune site) RELEASE the
+    //   dead dump-worker's tids back into sweep-eligible space, so the
+    //   6-Z190 coverage sweep re-attaches them and emulation resumes.
     let mut z388_crash_dump_pids: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     let mut z388_handed_off: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    let mut z388_handed_off_to: std::collections::HashMap<libc::pid_t, libc::pid_t> =
+        std::collections::HashMap::new();
     // 6-Z305t-75d: per-pid budget + global cap for the STDIO-CLOSER
     // TRACER (close(0/1/2) observation — see the entry arm).
     let mut close_diag_budget: std::collections::HashMap<libc::pid_t, u64> =
@@ -18567,6 +18583,41 @@ pub fn run_ptrace_loop(
             // decision (and so the rn352 42-generation loops cannot
             // exhaust the tag cap with long-dead pids).
             z388_crash_dump_pids.remove(&pid);
+            // 6-Z396: the dump WORKER is gone — crash_dump PTRACE_DETACHed
+            // everything it seized (normal exit) or was killed mid-dump
+            // (tombstoned's intercept timeout). Either way its handed-off
+            // tids are NOBODY's tracees now; releasing them back into
+            // sweep-eligible space lets the 6-Z190 coverage sweep
+            // re-attach them and kr64 emulation resumes. Without this the
+            // rn353 class fires: an ALIVE process dumped via the
+            // ANR/Watchdog path (system_server pid 4031) runs untraced
+            // forever — its socket/binder/property calls bypass every
+            // emulation and the guest corrupts silently (tombstoned
+            // crash-socket short reads, package_native wait hangs, boot
+            // stall with zero service deaths).
+            {
+                let released: Vec<libc::pid_t> = z388_handed_off_to
+                    .iter()
+                    .filter(|(_, &owner)| owner == pid)
+                    .map(|(&tid, _)| tid)
+                    .collect();
+                for tid in &released {
+                    z388_handed_off_to.remove(tid);
+                    z388_handed_off.remove(tid);
+                }
+                if !released.is_empty() {
+                    log(&format!(
+                        "6-Z396: dump worker pid={} died — {} handed-off tid(s) {} released for 6-Z190 re-acquisition",
+                        pid,
+                        released.len(),
+                        released
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                }
+            }
             // 6-Z83: drop any pending-fake flag armed by THIS pid so a
             // later pid-reuse can never inherit a stale fake.
             // 6-Z87: the poll fake is now a per-pid map entry — same
@@ -18866,6 +18917,31 @@ pub fn run_ptrace_loop(
             // decision (and so the rn352 42-generation loops cannot
             // exhaust the tag cap with long-dead pids).
             z388_crash_dump_pids.remove(&pid);
+            // 6-Z396: release this dead dump worker's handed-off tids for
+            // 6-Z190 re-acquisition (see the WIFEXITED twin above).
+            {
+                let released: Vec<libc::pid_t> = z388_handed_off_to
+                    .iter()
+                    .filter(|(_, &owner)| owner == pid)
+                    .map(|(&tid, _)| tid)
+                    .collect();
+                for tid in &released {
+                    z388_handed_off_to.remove(tid);
+                    z388_handed_off.remove(tid);
+                }
+                if !released.is_empty() {
+                    log(&format!(
+                        "6-Z396: dump worker pid={} died — {} handed-off tid(s) {} released for 6-Z190 re-acquisition",
+                        pid,
+                        released.len(),
+                        released
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                }
+            }
             // 6-Z384: record the death for the loop-exit verdict ring.
             push_death_ring(format!(
                 "pid {} killed by signal {} at +{}ms",
@@ -21926,6 +22002,7 @@ pub fn run_ptrace_loop(
                                             last_stop_at.remove(&z388_target);
                                             z306k_last_natural.remove(&z388_target);
                                             z388_handed_off.insert(z388_target);
+                                            z388_handed_off_to.insert(z388_target, pid);
                                         }
                                         break;
                                     }
@@ -21950,6 +22027,7 @@ pub fn run_ptrace_loop(
                                 last_stop_at.remove(&z388_target);
                                 z306k_last_natural.remove(&z388_target);
                                 z388_handed_off.insert(z388_target);
+                                z388_handed_off_to.insert(z388_target, pid);
                                 if z388_n < 64 {
                                     log(&format!(
                                         "6-Z388: tid={} HANDED OFF to crash_dump pid={} ({} tracked, {} handed off)",
