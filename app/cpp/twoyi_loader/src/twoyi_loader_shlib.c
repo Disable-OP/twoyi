@@ -1121,15 +1121,16 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
             {
                 if (g_diag_br_tx > 0) {
                     g_diag_br_tx--;
-                    uint32_t t_code, t_target;
+                    uint32_t t_code, t_target, t_flags;
                     memcpy(&t_code, stream + pos + 4 + 16, 4);
                     memcpy(&t_target, stream + pos + 4, 4);
-                    char m[160];
+                    memcpy(&t_flags, stream + pos + 4 + 20, 4);
+                    char m[192];
                     snprintf(m, sizeof(m),
                              "[twoyi_loader] *** 6-Z272k %s to client: target=%u code=0x%x "
-                             "(pid=%d)\n",
+                             "flags=0x%x (pid=%d)\n",
                              (cmd == BP_BR_TRANSACTION) ? "BR-TX" : "BR-RPY",
-                             t_target, t_code, g_real_pid);
+                             t_target, t_code, t_flags, g_real_pid);
                     write_str(2, m);
                 }
             }
@@ -1257,6 +1258,55 @@ static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
                     off += snprintf(dump + off, sizeof(dump) - off, "%02x", p[dlen + q]);
                 snprintf(dump + off, sizeof(dump) - off, "\n");
                 write_str(2, dump);
+            }
+            // 6-Z380: bounded BR-TX parcel dump — the composer-callback
+            // wire-truth instrument's receiver half. rn336 decode: the
+            // composer's onHotplug (code=0x1 on SF's IComposerCallback
+            // node) was delivered to SF's HwBinder pool thread but the
+            // HIDL dispatch never completed client-side — SF's main
+            // thread waited 8.1 s for the registerCallback reply, found
+            // zero pending hotplug events and aborted "Missing internal
+            // display" (the SF crash loop restarted zygote 12× via
+            // onrestart). This names the EXACT bytes the receiving
+            // guest's HwBinder skeleton would parse: parcel head (the
+            // interface token — "android.hardware.graphics.composer@
+            // 2.1::IComposerCallback" must be here), the offsets array,
+            // and every SG region head (the embedded params buffer —
+            // display/connected). Filter: code==0x1 with a nonzero
+            // target (SM deliveries have target 0; method-code-1 calls
+            // to a LOCAL node are the callback class), budget 8 per
+            // process.
+            {
+                static uint32_t z380_br_tx_left = 8;
+                uint32_t z380_code, z380_target;
+                memcpy(&z380_code, stream + pos + 4 + 16, 4);
+                memcpy(&z380_target, stream + pos + 4, 4);
+                if (cmd == BP_BR_TRANSACTION && z380_code == 1 && z380_target != 0 &&
+                    z380_br_tx_left > 0) {
+                    z380_br_tx_left--;
+                    uint32_t z380_flags;
+                    memcpy(&z380_flags, stream + pos + 4 + 20, 4);
+                    char dump[768];
+                    int off = snprintf(dump, sizeof(dump),
+                        "[twoyi_loader] *** 6-Z380 BR-TX code=0x1 target=%u flags=0x%x "
+                        "dlen=%u olen=%u sg=%u data=",
+                        z380_target, z380_flags, dlen, olen, sg_seen);
+                    for (uint32_t q = 0; q < dlen && q < 64 && off < (int)sizeof(dump) - 4; q++)
+                        off += snprintf(dump + off, sizeof(dump) - off, "%02x", p[q]);
+                    off += snprintf(dump + off, sizeof(dump) - off, " offs=");
+                    for (uint32_t q = 0; q < olen && off < (int)sizeof(dump) - 4; q++)
+                        off += snprintf(dump + off, sizeof(dump) - off, "%02x", p[dlen + q]);
+                    for (uint32_t s = 0; s < sg_seen && off < (int)sizeof(dump) - 4; s++) {
+                        uint32_t shown = sg_len[s] < 16 ? sg_len[s] : 16;
+                        off += snprintf(dump + off, sizeof(dump) - off, " sg%u[%u]=",
+                                        s, sg_len[s]);
+                        for (uint32_t q = 0; q < shown && off < (int)sizeof(dump) - 4; q++)
+                            off += snprintf(dump + off, sizeof(dump) - off, "%02x",
+                                            p[sg_src[s] + q]);
+                    }
+                    snprintf(dump + off, sizeof(dump) - off, "\n");
+                    write_str(2, dump);
+                }
             }
             // [data][offsets][sg region] in one allocation; offsets_ptr =
             // base + dlen; every BINDER_TYPE_PTR object's `buffer` field is
@@ -2625,12 +2675,14 @@ static uint32_t bp_scan_tx_blobs(const uint8_t *stream, uint64_t len,
                     memcpy(&t_target, btd, 4);
                     memcpy(&t_code, btd + 16, 4);
                     memcpy(&t_ds, btd + 32, 8);
-                    char m[160];
+                    char m[192];
+                    uint32_t t_flags;
+                    memcpy(&t_flags, btd + 20, 4);
                     snprintf(m, sizeof(m),
                              "[twoyi_loader] *** 6-Z272k BC to proxy: cmd=%s target=%u "
-                             "code=0x%x dsize=%llu (pid=%d)\n",
+                             "code=0x%x flags=0x%x dsize=%llu (pid=%d)\n",
                              (cmd == BP_BC_REPLY || cmd == BP_BC_REPLY_SG) ? "REPLY" : "TX",
-                             t_target, t_code, (unsigned long long)t_ds, g_real_pid);
+                             t_target, t_code, t_flags, (unsigned long long)t_ds, g_real_pid);
                     write_str(2, m);
                 }
             }
