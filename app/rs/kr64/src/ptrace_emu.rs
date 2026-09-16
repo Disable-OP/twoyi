@@ -15742,6 +15742,8 @@ pub fn run_ptrace_loop(
     // 6-Z381: the seccomp(2) rewrite stash (see ChildAbi.seccomp).
     let mut seccomp_rewritten_ops: std::collections::HashMap<libc::pid_t, u64> =
         std::collections::HashMap::new();
+    // 6-Z382: the prctl-22/seccomp wire-truth probe budget (per boot).
+    static Z382_PRCTL22_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(12);
 
     // ── Task 6-V diagnostic state ────────────────────────────────────
     //
@@ -24273,6 +24275,23 @@ pub fn run_ptrace_loop(
                         if syscall_num == abi.prctl {
                             let prctl_option = get_syscall_arg(&regs, abi.reg_arg1);
                             let prctl_arg2 = get_syscall_arg(&regs, abi.reg_arg2);
+                            // 6-Z382: budgeted wire-truth probe — rn339
+                            // decode: minijail's prctl(PR_SET_SECCOMP)
+                            // still returned EPERM with the 6-Z381 fake
+                            // landed, while PR_SET_VMA prctls from the
+                            // SAME processes prove the ENTRY arm fires.
+                            // This probe names whether option-22 ENTRY
+                            // stops are ever seen, at which tid, and
+                            // what the EXIT fake answers.
+                            if prctl_option == 22
+                                && Z382_PRCTL22_LOG.load(std::sync::atomic::Ordering::Relaxed) > 0
+                            {
+                                Z382_PRCTL22_LOG.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                log(&format!(
+                                    "6-Z382 prctl-22 ENTRY tid={} arg2={} (PR_SET_SECCOMP) — rewrite armed",
+                                    pid, prctl_arg2
+                                ));
+                            }
                             set_syscall_num(&mut regs, &abi, abi.getpid);
                             prctl_rewritten_args.insert(pid, (prctl_option, prctl_arg2));
                             if ptrace_setregs(pid, &regs, iov_len).is_err() {
@@ -24299,6 +24318,13 @@ pub fn run_ptrace_loop(
                         // the system_server boot needs).
                         if abi.seccomp >= 0 && syscall_num == abi.seccomp {
                             let seccomp_op = get_syscall_arg(&regs, abi.reg_arg1);
+                            if Z382_PRCTL22_LOG.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                                Z382_PRCTL22_LOG.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                log(&format!(
+                                    "6-Z382 seccomp ENTRY tid={} op={} — rewrite armed",
+                                    pid, seccomp_op
+                                ));
+                            }
                             set_syscall_num(&mut regs, &abi, abi.getpid);
                             seccomp_rewritten_ops.insert(pid, seccomp_op);
                             if ptrace_setregs(pid, &regs, iov_len).is_err() {
@@ -34229,6 +34255,15 @@ pub fn run_ptrace_loop(
                     if past_first_execve {
                         if let Some((prctl_option, prctl_arg2)) = prctl_rewritten_args.remove(&pid)
                         {
+                            if prctl_option == 22
+                                && Z382_PRCTL22_LOG.load(std::sync::atomic::Ordering::Relaxed) > 0
+                            {
+                                Z382_PRCTL22_LOG.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                log(&format!(
+                                    "6-Z382 prctl-22 EXIT tid={} host_ret={} fake={} — the guest sees the fake",
+                                    pid, ret, emulated_prctl_ret(prctl_option, prctl_arg2)
+                                ));
+                            }
                             if ret >= 0 {
                                 let emulated = emulated_prctl_ret(prctl_option, prctl_arg2);
                                 let mut regs_pr: Regs = unsafe { std::mem::zeroed() };
