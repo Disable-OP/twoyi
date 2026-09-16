@@ -7651,6 +7651,24 @@ fn servicemanager_hidl(
 /// libbinder loops terminating until a v2-capable loader attaches
 /// (6-Z271 inlined request blobs for ALL real-libbinder clients).
 fn servicemanager_legacy(code: u32) -> TransactionResult {
+    // 6-Z401: the v1 legacy add is a SILENT fake-success — the registry
+    // cannot learn a name-less add, yet the client sees status-0 and
+    // carries on. rn355 pinned this shape as the reason SF's
+    // addService(SurfaceFlinger) never reached the registry (no bus
+    // receipt, DisplayManagerService polled forever) — every occurrence
+    // must be visible. Bounded: 16 per boot.
+    if code == SVC_MGR_ADD_SERVICE {
+        static Z401_LEGACY_ADD: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(16);
+        if Z401_LEGACY_ADD.load(Ordering::Relaxed) > 0 {
+            Z401_LEGACY_ADD.fetch_sub(1, Ordering::Relaxed);
+            warning!(
+                "[KR64][binder][svc] 6-Z401: legacy v1 addService (blob-less request) — replying fake status-0; the registry CANNOT learn this name (occurrence {}/{})",
+                16 - Z401_LEGACY_ADD.load(Ordering::Relaxed),
+                16
+            );
+        }
+    }
     let mut writer = ParcelWriter::new();
     writer.write_status_ok(); // EX_NONE
     match code {
