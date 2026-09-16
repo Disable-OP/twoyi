@@ -30319,19 +30319,33 @@ pub fn run_ptrace_loop(
                             // 6-Z391: final decision — drop-proof summary
                             // of what will actually execute for this call.
                             // (socket-family gate — see the ENTRY note.)
+                            // 6-Z400: also print the TRANSLATED PATH so the
+                            // loader-bind ({g_rootfs}/dev/socket/X) vs
+                            // tracer-translate ({rootfs}/dev/socket/X)
+                            // mismatch hypothesis is decidable from one
+                            // line — rn353's zygote socket fchmodat hit
+                            // ENOENT honest (6-Z305t-5 real mode) and the
+                            // boot's socket-mode normalization failed.
                             {
                                 let z391_gate = read_child_string(pid, path_addr)
                                     .map(|p| p.starts_with("/dev/socket"))
                                     .unwrap_or(false);
                                 if z391_gate {
+                                    let z391_translated = if translated_applied {
+                                        read_child_string(pid, path_addr)
+                                            .unwrap_or_else(|| "<unreadable>".to_string())
+                                    } else {
+                                        "<unchanged>".to_string()
+                                    };
                                     crate::z391_klog(
                                         rootfs,
                                         &format!(
-                                            "DECISION {} pid={} translated={} scratch={}",
+                                            "DECISION {} pid={} translated={} scratch={} translated_path={:?}",
                                             syscall_name(syscall_num, &abi),
                                             pid,
                                             translated_applied,
-                                            scratch_addr != 0
+                                            scratch_addr != 0,
+                                            z391_translated
                                         ),
                                     );
                                 }
@@ -36951,9 +36965,10 @@ pub fn run_ptrace_loop(
                                                 crate::z391_klog(
                                                     rootfs,
                                                     &format!(
-                                                        "EXIT-CATCH fchmodat ret={} path={:?} backing_exists={}",
+                                                        "EXIT-CATCH fchmodat ret={} path={:?} backing={:?} backing_exists={}",
                                                         fch_ret,
                                                         path,
+                                                        real_path,
                                                         backing.exists()
                                                     ),
                                                 );
