@@ -17950,6 +17950,91 @@ pub fn run_ptrace_loop(
                     tracked_pids.len()
                 ));
             }
+
+            // ── 6-Z392: the ptrace-stop freeze watchdog (rn349 decode) ──
+            //
+            // rn349's wall, at thread granularity: the guest's
+            // android.hardware.graphics.composer@2.3-service main +
+            // Binder threads sat in ptrace-stop state 't' at capture
+            // (+620s) while SF's HwBinder thread waited for the composer
+            // reply and system_server spun on getService(SurfaceFlinger)
+            // misses → rung 7 forever. The composer's last tracer-visible
+            // activity was a NORMAL RAW STOP/RESUME pair at +41.5s; no
+            // death, no 6-Z388 dance, no 6-Z305t-16 invariant violation,
+            // and no stderr trace of the freeze (762 lines then silence).
+            //
+            // This watchdog samples /proc every 30s for guest processes
+            // (ppid == init_pid, or the pid itself is init/tracked)
+            // whose process state is 't' (tracing stop) or 'T' (group
+            // stop) and reports them through the drop-proof 6-Z391
+            // channel. A single sample CAN legitimately catch a busy
+            // tracee mid-intercept (the tracer is single-threaded — every
+            // other tracee is stopped while we run), so one line is a
+            // CANDIDATE; the same pid recurring across samples 30s apart
+            // is a CONFIRMED freeze. Bounded: 64 log lines per boot.
+            {
+                static LAST_WATCH_MS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                static WATCH_LOGGED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if now_ms >= LAST_WATCH_MS.load(std::sync::atomic::Ordering::Relaxed) + 30000
+                    && LAST_WATCH_MS
+                        .compare_exchange(
+                            LAST_WATCH_MS.load(std::sync::atomic::Ordering::Relaxed),
+                            now_ms,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    if WATCH_LOGGED.load(std::sync::atomic::Ordering::Relaxed) < 64 {
+                        let mut hits: Vec<String> = Vec::new();
+                        if let Ok(rd) = std::fs::read_dir("/proc") {
+                            for ent in rd.flatten() {
+                                let p: i32 = match ent.file_name().to_string_lossy().parse() {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                };
+                                let stat =
+                                    match std::fs::read_to_string(format!("/proc/{}/stat", p)) {
+                                        Ok(s) => s,
+                                        Err(_) => continue,
+                                    };
+                                // state + ppid sit right after the comm's
+                                // closing ')' (comm may contain spaces).
+                                let Some(rp) = stat.rfind(')') else {
+                                    continue;
+                                };
+                                let fields: Vec<&str> = stat[rp + 2..].split_whitespace().collect();
+                                if fields.len() < 2 {
+                                    continue;
+                                }
+                                let state = fields[0];
+                                let ppid: i32 = fields[1].parse().unwrap_or(0);
+                                if (state == "t" || state == "T")
+                                    && (ppid == init_pid
+                                        || tracked_pids.contains(&p)
+                                        || p == init_pid)
+                                {
+                                    hits.push(format!(
+                                        "pid={} ppid={} state={} tracked={}",
+                                        p,
+                                        ppid,
+                                        state,
+                                        tracked_pids.contains(&p)
+                                    ));
+                                }
+                            }
+                        }
+                        if !hits.is_empty() {
+                            WATCH_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            for h in &hits {
+                                crate::z391_klog(rootfs, &format!("6-Z392 T-STOP {}", h));
+                            }
+                        }
+                    }
+                }
+            }
         }
         // ── 6-Z213 RAW STOP FORENSICS ──────────────────────────────────
         //
