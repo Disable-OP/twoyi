@@ -1517,6 +1517,26 @@ struct ChildAbi {
     //   x86_64: 317, i386: 354, aarch64 (asm-generic): 277,
     //   arm32: 383. -1 = not present on this architecture.
     seccomp: i64,
+    // ── 6-Z388: the guest-issued ptrace() syscall number, PER ABI ─────
+    //
+    // The debuggerd crash_dump interop (the tombstone path). A guest
+    // crash_dump64 (forked from the aborting process's pseudothread,
+    // auto-attached by the TRACEFORK machinery, exec'd through the
+    // 6-Z101 staging) reaches its PTRACE_SEIZE loop with EVERY target
+    // thread already traced by kr64 — the kernel returns EPERM
+    // ("failed to attach to thread %d, already traced by %d",
+    // crash_dump.cpp:474; rn344/346/347: 99 generations, ZERO
+    // tombstones, the SF abort reason unnameable). The 6-Z388 hand-off
+    // (the ENTRY arm after the 6-Z305u kill-trace) intercepts exactly
+    // this request, SIGSTOP-dances the target tid out of kr64's
+    // tracee set at a clean stop boundary, and lets the native SEIZE
+    // execute — from that point the whole dump is kernel-true.
+    //   x86_64: 101 (syscall_64.tbl), i386: 26 (syscall_32.tbl),
+    //   aarch64: 117 (asm-generic/unistd.h), arm32: 26
+    //   (arch/arm/tools/syscall.tbl).
+    // ptrace is NEVER multiplexed via socketcall on any ABI, so no
+    // socketcall_nr interplay. -1 = not present on this architecture.
+    ptrace_nr: i64,
 }
 
 // x86_64 user_regs_struct field order (as u64 array indices):
@@ -1829,6 +1849,8 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     prctl: 157,
     // 6-Z381: x86_64 seccomp=317 (syscall_64.tbl).
     seccomp: 317,
+    // 6-Z388: x86_64 ptrace=101 (syscall_64.tbl).
+    ptrace_nr: 101,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -2249,6 +2271,8 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     rt_sigqueueinfo_nr: 178,
     prctl: 172, // i386 prctl=172 — no getpid collision (i386 getpid=20)
     // 6-Z381: i386 seccomp=354 (syscall_32.tbl).
+    // 6-Z388: i386 ptrace=26 (syscall_32.tbl).
+    ptrace_nr: 26,
     seccomp: 354,
 };
 
@@ -2635,6 +2659,8 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     prctl: 167,
     // 6-Z381: aarch64 seccomp=277 (asm-generic unistd.h). NOT 278 —
     // 278 is getrandom.
+    // 6-Z388: aarch64 ptrace=117 (asm-generic/unistd.h).
+    ptrace_nr: 117,
     seccomp: 277,
 };
 //
@@ -2803,6 +2829,8 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     rt_sigqueueinfo_nr: 178,
     prctl: 172, // arm32 prctl=172 — no getpid collision (arm32 getpid=20)
     // 6-Z381: arm32 seccomp=383 (arch/arm/tools/syscall.tbl).
+    // 6-Z388: arm32 ptrace=26 (arch/arm/tools/syscall.tbl).
+    ptrace_nr: 26,
     seccomp: 383,
 };
 
@@ -12147,6 +12175,7 @@ fn sweep_untraced_guest_processes(
     tracked_pids: &mut Vec<libc::pid_t>,
     pid_starttimes: &mut std::collections::HashMap<libc::pid_t, u64>,
     in_syscall_map: &mut std::collections::HashMap<libc::pid_t, bool>,
+    z388_handed_off: &std::collections::HashSet<libc::pid_t>,
 ) -> usize {
     let self_pid = std::process::id() as libc::pid_t;
     let tracked: std::collections::HashSet<libc::pid_t> = tracked_pids.iter().copied().collect();
@@ -12166,6 +12195,13 @@ fn sweep_untraced_guest_processes(
             Err(_) => continue,
         };
         if pid == self_pid || tracked.contains(&pid) {
+            continue;
+        }
+        // 6-Z388: a handed-off tid is crash_dump's tracee for the duration
+        // of the debuggerd dump — re-attaching it here would STEAL it back
+        // mid-dump (PTRACE_ATTACH succeeds on the untraced tid, the kernel
+        // moves the tracee to the sweep) and kill the tombstone path.
+        if z388_sweep_must_skip(pid, z388_handed_off) {
             continue;
         }
         // STRICT descendant-of-guest-tree filter: the candidate's parent
@@ -13872,6 +13908,87 @@ fn read_real_tgid(pid: libc::pid_t) -> Option<libc::pid_t> {
     None
 }
 
+// ── 6-Z388: the debuggerd crash_dump ptrace hand-off (pure core) ────
+
+/// 6-Z388: PTRACE_SEIZE (0x4206) — the request crash_dump's attach loop
+/// issues for every thread of the aborting process (A11
+/// android-11.0.0_r1 crash_dump.cpp:89 `ptrace(PTRACE_SEIZE, tid, 0,
+/// flags)`) and for the pseudothread (crash_dump.cpp:510, with
+/// PTRACE_O_TRACECLONE).
+pub const Z388_PTRACE_SEIZE: i64 = 0x4206;
+/// 6-Z388: PTRACE_ATTACH (0x10) — the legacy attach flavor; tombstoned's
+/// intercept path and some debuggers use it. Carried so the hand-off is
+/// attach-flavor-agnostic.
+pub const Z388_PTRACE_ATTACH: i64 = 0x10;
+
+/// 6-Z388: is this ptrace request an attach flavor (SEIZE/ATTACH)?
+/// Every OTHER request (INTERRUPT/GETREGSET/GETSIGINFO/SETOPTIONS/
+/// CONT/DETACH/…) must pass through untouched — after a successful
+/// hand-off those are crash_dump's own kernel-true operations on its
+/// OWN tracees, and intercepting them would corrupt the dump.
+fn z388_attach_kind(request: i64) -> bool {
+    request == Z388_PTRACE_SEIZE || request == Z388_PTRACE_ATTACH
+}
+
+/// 6-Z388: the hand-off decision (pure; unit-tested truth table).
+///
+/// TRUE (hold-and-dance the target out of kr64's tracee set) only when
+/// ALL of the following hold:
+///   * the caller is a guest crash_dump (exec-tagged at its execve
+///     ENTRY — the tag reads the ORIGINAL guest path before the 6-Z101
+///     staging rewrite),
+///   * the request is SEIZE/ATTACH,
+///   * the target tid is currently a kr64 tracee and has not already
+///     been handed off (the caller must filter that — the decision
+///     takes it as `target_is_traced`).
+/// Every other combination is FALSE → the raw syscall executes with
+/// kernel-true semantics (EPERM against kr64's own trace, ESRCH for
+/// dead targets, success for targets outside the guest tree). This is
+/// the fail-safe direction: an unknown caller shape changes nothing.
+fn z388_handoff_decision(caller_is_crash_dump: bool, request: i64, target_is_traced: bool) -> bool {
+    caller_is_crash_dump && z388_attach_kind(request) && target_is_traced
+}
+
+/// 6-Z388: the signal argument for the detach that completes a
+/// hand-off. A SIGSTOP-caused group-stop SURVIVES PTRACE_DETACH with
+/// signal 0 (the tracee stays group-stopped → crash_dump's
+/// ptrace_interrupt/wait_for_stopped dance would see a frozen thread
+/// and the dump would stall), so a stop whose WSTOPSIG is SIGSTOP
+/// detaches with SIGCONT; every other stop detaches with 0 (no signal
+/// delivered — the stop's own signal is suppressed).
+fn z388_detach_signal(wstopsig: libc::c_int) -> libc::c_int {
+    if wstopsig == libc::SIGSTOP {
+        libc::SIGCONT
+    } else {
+        0
+    }
+}
+
+/// 6-Z388: the bounded SIGSTOP-dance budget. Polls of 2 ms × 150 =
+/// 300 ms worst case per detached tid, ONCE per SEIZE (crashes are
+/// rare); the aborting process's threads sit in interruptible sleeps
+/// so the stop normally arrives in microseconds. A timeout gives up
+/// and the raw SEIZE runs (today's EPERM — never worse, and the loop
+/// never blocks on a wedged guest beyond the budget).
+const Z388_DANCE_POLLS: usize = 150;
+const Z388_DANCE_POLL_SLEEP_MS: u64 = 2;
+
+/// 6-Z388: the crash_dump exec-tag set is bounded — a pathological boot
+/// that execs more than this many crash_dump images stops tagging
+/// (crash_dump generations per boot are single digits).
+const Z388_CRASH_DUMP_TAG_CAP: usize = 64;
+
+/// 6-Z388: the 6-Z190 coverage-sweep SKIP decision (pure). A
+/// handed-off tid is crash_dump's tracee for the duration of the dump;
+/// re-attaching it would STEAL it back mid-dump and kill the tombstone
+/// path, so the sweep must never touch it.
+fn z388_sweep_must_skip(
+    pid: libc::pid_t,
+    handed_off: &std::collections::HashSet<libc::pid_t>,
+) -> bool {
+    handed_off.contains(&pid)
+}
+
 /// 6-Z266: shape gate for the post-cap broad-DIAG sampler (kept as a
 /// named function so the policy is unit-testable).
 /// `shape_count` = how many stops of ONE (pid, nr, in_syscall) shape
@@ -15232,6 +15349,22 @@ pub fn run_ptrace_loop(
     // only advances on syscall stops — event-stop storms would undercount
     // ages and mask violations).
     let mut iter_count: u64 = 0;
+    // ── 6-Z388: the debuggerd crash_dump hand-off state ─────────────
+    //
+    // z388_crash_dump_pids: guest pids that exec'd a crash_dump binary
+    //   (tagged at the execve ENTRY where the ORIGINAL guest path is
+    //   readable — the 6-Z101 staging rewrites it to the staged copy
+    //   afterwards). The hand-off decision trusts ONLY this tag: no
+    //   other guest process's SEIZE is ever intercepted.
+    // z388_handed_off: tids detached out of kr64's tracee set for an
+    //   in-flight crash_dump dump (they are crash_dump's tracees now).
+    //   Excluded from the 6-Z190 coverage sweep (re-attaching one would
+    //   STEAL it back mid-dump) and from every stop account (they
+    //   produce no more kr64 stops by construction).
+    let mut z388_crash_dump_pids: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    let mut z388_handed_off: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     // 6-Z305t-75d: per-pid budget + global cap for the STDIO-CLOSER
     // TRACER (close(0/1/2) observation — see the entry arm).
     let mut close_diag_budget: std::collections::HashMap<libc::pid_t, u64> =
@@ -16991,6 +17124,7 @@ pub fn run_ptrace_loop(
                         &mut tracked_pids,
                         &mut pid_starttimes,
                         &mut in_syscall_map,
+                        &z388_handed_off,
                     );
                 }
             }
@@ -21432,6 +21566,212 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // ── 6-Z388: the debuggerd crash_dump ptrace hand-off ──
+                    //
+                    // ROOT CAUSE (rn344/rn346/rn347 + ladder #138): the
+                    // guest crash_dump64 execs fine, walks
+                    // /proc/<target>/task, then DIES at its first
+                    // PTRACE_SEIZE: every guest thread is already traced
+                    // by kr64, the kernel returns EPERM, crash_dump
+                    // LOG(FATAL)s "failed to attach to thread N, already
+                    // traced by M" (crash_dump.cpp:474), the handler logs
+                    // "crash_dump failed to dump process", and NO
+                    // tombstone is ever written. 76+ silent SF aborts per
+                    // run are the direct consequence — the abort reason
+                    // (a libbase CHECK text) is unnameable because the
+                    // dump that would carry it cannot exist.
+                    //
+                    // THE HAND-OFF (kernel-true, not an emulator): at the
+                    // SEIZE ENTRY, the tracer SIGSTOP-dances the target
+                    // tid out of its own tracee set at a clean stop
+                    // boundary and lets the native SEIZE execute against
+                    // the now-untraced tid. From the SEIZE onward the
+                    // ENTIRE dump is real-kernel work: crash_dump's own
+                    // INTERRUPT/GETREGSET/GETSIGINFO/mem reads, the
+                    // /dev/socket/tombstoned_crash connect (the 6-Z305p
+                    // translate reaches the REAL listener tombstoned
+                    // binds — rn347 kmsg: "tombstoned successfully
+                    // initialized" at +21.5s), the tombstone file, the
+                    // final detach + the handler's resignal. Guest init
+                    // reaps the corpse natively (the process is untraced
+                    // — SIGCHLD goes straight to it) and restarts the
+                    // service; the new generation auto-attaches as usual.
+                    //
+                    // SAFETY (each point is a proven blast radius):
+                    //   * ONLY crash_dump-tagged callers, ONLY
+                    //     SEIZE/ATTACH, ONLY kr64-traced targets — every
+                    //     other ptrace passes through untouched
+                    //     (z388_handoff_decision).
+                    //   * The dance is SYNCHRONOUS and BOUNDED (300 ms);
+                    //     on timeout the raw SEIZE runs (today's EPERM —
+                    //     never worse, no fleet stall: the loop never
+                    //     blocks on a wedged guest beyond the budget).
+                    //   * A target already at a consumed-not-resumed ENTRY
+                    //     gets its owed resume FIRST (the 6-Z358 REPAIR
+                    //     pattern — the same PTRACE_SYSCALL the loop-top
+                    //     would issue), otherwise the SIGSTOP could never
+                    //     deliver and the dance would always time out.
+                    //   * The detached tid is removed from every stop
+                    //     account (tracked_pids/pid_starttimes/
+                    //     in_syscall_map/pending_resume/esrch_streak/
+                    //     last_stop_at/z306k_last_natural) and recorded in
+                    //     z388_handed_off so the 6-Z190 sweep can never
+                    //     re-attach it mid-dump (re-attach = stealing the
+                    //     tracee back from crash_dump = the dump dies) and
+                    //     the 6-Z186 escape classifier never sees it (it
+                    //     fires on ESRCH streaks of RESUMED pids; a
+                    //     handed-off tid is resumed by nobody).
+                    if abi.ptrace_nr != -1 && syscall_num == abi.ptrace_nr {
+                        let z388_req = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                        let z388_target = get_syscall_arg(&regs, abi.reg_arg2) as libc::pid_t;
+                        let z388_target_tracked = tracked_pids.contains(&z388_target)
+                            && !z388_handed_off.contains(&z388_target);
+                        if z388_handoff_decision(
+                            z388_crash_dump_pids.contains(&pid),
+                            z388_req,
+                            z388_target_tracked,
+                        ) {
+                            static Z388_LOGGED: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let z388_n =
+                                Z388_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if z388_n < 64 {
+                                log(&format!(
+                                    "6-Z388: crash_dump pid={} {} tid={} — SIGSTOP dance starting ({} tracked)",
+                                    pid,
+                                    if z388_req == Z388_PTRACE_SEIZE { "SEIZE" } else { "ATTACH" },
+                                    z388_target,
+                                    tracked_pids.len()
+                                ));
+                            }
+                            // (1) If the target sits at a consumed-not-resumed
+                            // stop, issue its owed resume FIRST (the 6-Z358
+                            // REPAIR pattern) so the SIGSTOP can deliver.
+                            if pending_resume.contains_key(&z388_target) {
+                                let r = unsafe {
+                                    libc::ptrace(libc::PTRACE_SYSCALL, z388_target, 0, 0)
+                                };
+                                pending_resume.remove(&z388_target);
+                                if z388_n < 64 {
+                                    log(&format!(
+                                        "6-Z388: tid={} owed a resume — issued out-of-band PTRACE_SYSCALL (ret={})",
+                                        z388_target, r
+                                    ));
+                                }
+                            }
+                            // (2) SIGSTOP the tid (via its real tgid — a SEIZE
+                            // target is a TID; kill() would address the
+                            // process) — its next stop is the detach point.
+                            let z388_tgid = read_real_tgid(z388_target);
+                            if let Some(tgid) = z388_tgid {
+                                unsafe {
+                                    libc::syscall(
+                                        libc::SYS_tgkill,
+                                        tgid,
+                                        z388_target,
+                                        libc::SIGSTOP,
+                                    );
+                                }
+                            }
+                            // (3) Bounded WNOHANG poll for the stop.
+                            let mut z388_detached = false;
+                            if z388_tgid.is_some() {
+                                for _ in 0..Z388_DANCE_POLLS {
+                                    let mut st: libc::c_int = 0;
+                                    let w = unsafe {
+                                        libc::waitpid(
+                                            z388_target,
+                                            &mut st,
+                                            libc::__WALL | libc::WNOHANG,
+                                        )
+                                    };
+                                    if w == z388_target {
+                                        if libc::WIFSTOPPED(st) {
+                                            let sig = z388_detach_signal(libc::WSTOPSIG(st));
+                                            let dret = unsafe {
+                                                libc::ptrace(
+                                                    libc::PTRACE_DETACH,
+                                                    z388_target,
+                                                    0,
+                                                    sig as libc::c_long,
+                                                )
+                                            };
+                                            z388_detached = dret == 0;
+                                            if z388_n < 64 {
+                                                log(&format!(
+                                                    "6-Z388: tid={} stop status=0x{:x} — PTRACE_DETACH(sig={}) ret={} {}",
+                                                    z388_target,
+                                                    st,
+                                                    sig,
+                                                    dret,
+                                                    if z388_detached {
+                                                        "→ handed off"
+                                                    } else {
+                                                        "→ giving up (raw SEIZE will run)"
+                                                    }
+                                                ));
+                                            }
+                                        } else {
+                                            // The target DIED inside the dance
+                                            // window (its death report is ours —
+                                            // the /proc probes + the conservative
+                                            // liveness handle the absence).
+                                            if z388_n < 64 {
+                                                log(&format!(
+                                                    "6-Z388: tid={} died inside the dance window (status=0x{:x}) — hand-off moot",
+                                                    z388_target, st
+                                                ));
+                                            }
+                                            tracked_pids.retain(|&p| p != z388_target);
+                                            pid_starttimes.remove(&z388_target);
+                                            in_syscall_map.remove(&z388_target);
+                                            pending_resume.remove(&z388_target);
+                                            esrch_streak.remove(&z388_target);
+                                            last_stop_at.remove(&z388_target);
+                                            z306k_last_natural.remove(&z388_target);
+                                            z388_handed_off.insert(z388_target);
+                                        }
+                                        break;
+                                    }
+                                    if w == -1 {
+                                        // ECHILD: died between the SIGSTOP and
+                                        // the poll — nothing to hand off.
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        Z388_DANCE_POLL_SLEEP_MS,
+                                    ));
+                                }
+                            }
+                            if z388_detached {
+                                // (4) Complete the hand-off bookkeeping: the
+                                // tid is crash_dump's tracee now.
+                                tracked_pids.retain(|&p| p != z388_target);
+                                pid_starttimes.remove(&z388_target);
+                                in_syscall_map.remove(&z388_target);
+                                pending_resume.remove(&z388_target);
+                                esrch_streak.remove(&z388_target);
+                                last_stop_at.remove(&z388_target);
+                                z306k_last_natural.remove(&z388_target);
+                                z388_handed_off.insert(z388_target);
+                                if z388_n < 64 {
+                                    log(&format!(
+                                        "6-Z388: tid={} HANDED OFF to crash_dump pid={} ({} tracked, {} handed off)",
+                                        z388_target,
+                                        pid,
+                                        tracked_pids.len(),
+                                        z388_handed_off.len()
+                                    ));
+                                }
+                            }
+                            // Either way the ENTRY falls through: the loop-top
+                            // resumes the caller and its SEIZE executes
+                            // natively against the (now hopefully untraced)
+                            // target — kernel-true success, or today's EPERM
+                            // on a give-up.
+                        }
+                    }
+
                     // ── 6-Z199: ENTRY-side arg1 (fd) stash for
                     // EXIT-side consumers ──
                     //
@@ -21726,6 +22066,22 @@ pub fn run_ptrace_loop(
                             let path_addr_env = get_syscall_arg(&regs, abi.reg_arg1);
                             let exec_path = read_child_string(pid, path_addr_env)
                                 .unwrap_or_else(|| "<unreadable>".to_string());
+                            // 6-Z388: tag crash_dump execs for the debuggerd
+                            // hand-off decision. The ORIGINAL guest path is
+                            // only readable here (before the 6-Z101 staging
+                            // rewrite points argv[0]'s buffer at the staged
+                            // copy); the tag set is capped (Z388_CRASH_DUMP_TAG_CAP).
+                            if exec_path.contains("crash_dump")
+                                && z388_crash_dump_pids.len() < Z388_CRASH_DUMP_TAG_CAP
+                            {
+                                z388_crash_dump_pids.insert(pid);
+                                log(&format!(
+                                    "6-Z388: pid={} execve \"{}\" — tagged as debuggerd crash_dump (tagged={})",
+                                    pid,
+                                    exec_path,
+                                    z388_crash_dump_pids.len()
+                                ));
+                            }
                             let envp_addr = get_syscall_arg(&regs, abi.reg_arg3);
                             if envp_addr != 0 && exec_env_diag_count <= 24 && exec_env_scans <= 24 {
                                 exec_env_scans += 1;
@@ -49522,5 +49878,136 @@ mod z384_loop_exit_safety_tests {
             tail.last().map(|s| s.as_str()),
             Some("z384test death #0029")
         );
+    }
+}
+
+#[cfg(test)]
+mod z388_handoff_tests {
+    #[cfg(target_arch = "aarch64")]
+    use super::ABI_AARCH64;
+    use super::{
+        z388_attach_kind, z388_detach_signal, z388_handoff_decision, z388_sweep_must_skip,
+        ABI_ARM32, Z388_CRASH_DUMP_TAG_CAP, Z388_DANCE_POLLS, Z388_DANCE_POLL_SLEEP_MS,
+        Z388_PTRACE_ATTACH, Z388_PTRACE_SEIZE,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use super::{ABI_X86_32, ABI_X86_64};
+
+    /// ABI truth: the guest-issued ptrace syscall number per ABI (a
+    /// wrong number would classify the wrong syscall as a SEIZE). Only
+    /// the host-relevant ABIs exist at compile time (each const is
+    /// #[cfg(target_arch)]-gated; ABI_ARM32 is the all-hosts exception).
+    #[test]
+    fn z388_ptrace_nr_per_abi() {
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(ABI_AARCH64.ptrace_nr, 117, "aarch64 ptrace=117");
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(ABI_X86_64.ptrace_nr, 101, "x86_64 ptrace=101");
+            assert_eq!(ABI_X86_32.ptrace_nr, 26, "i386 ptrace=26");
+        }
+        assert_eq!(ABI_ARM32.ptrace_nr, 26, "arm32 ptrace=26");
+    }
+
+    /// The attach-flavor classifier: SEIZE and ATTACH are the ONLY
+    /// requests the hand-off may intercept. GETREGSET (0x4204),
+    /// INTERRUPT (0x4207), CONT (7), SETOPTIONS (0x4200), DETACH (17),
+    /// TRACEME (0), KILL (8), and the peeks/pokes must ALL be rejected —
+    /// after a hand-off those are crash_dump's own kernel-true
+    /// operations on its own tracees.
+    #[test]
+    fn z388_attach_kind_truth_table() {
+        assert!(z388_attach_kind(Z388_PTRACE_SEIZE));
+        assert!(z388_attach_kind(Z388_PTRACE_ATTACH));
+        // Kernel UAPI request numbers (sys/ptrace.h).
+        const PTRACE_TRACEME: i64 = 0;
+        const PTRACE_PEEKDATA: i64 = 2;
+        const PTRACE_KILL: i64 = 8;
+        const PTRACE_CONT: i64 = 7;
+        const PTRACE_DETACH: i64 = 17;
+        const PTRACE_GETREGSET: i64 = 0x4204;
+        const PTRACE_SETOPTIONS: i64 = 0x4200;
+        const PTRACE_INTERRUPT: i64 = 0x4207;
+        const PTRACE_GETSIGINFO: i64 = 0x4202;
+        const PTRACE_LISTEN: i64 = 0x4208;
+        for req in [
+            PTRACE_TRACEME,
+            PTRACE_PEEKDATA,
+            PTRACE_KILL,
+            PTRACE_CONT,
+            PTRACE_DETACH,
+            PTRACE_GETREGSET,
+            PTRACE_SETOPTIONS,
+            PTRACE_INTERRUPT,
+            PTRACE_GETSIGINFO,
+            PTRACE_LISTEN,
+            -1,
+            0,
+        ] {
+            assert!(
+                !z388_attach_kind(req),
+                "request {req:#x} must NOT be an attach flavor"
+            );
+        }
+    }
+
+    /// The hand-off decision truth table: TRUE only for
+    /// (crash_dump caller, SEIZE/ATTACH, kr64-traced target). Every
+    /// other combination passes through — the fail-safe direction.
+    #[test]
+    fn z388_handoff_decision_truth_table() {
+        // The one TRUE shape (both attach flavors).
+        assert!(z388_handoff_decision(true, Z388_PTRACE_SEIZE, true));
+        assert!(z388_handoff_decision(true, Z388_PTRACE_ATTACH, true));
+        // Non-crash_dump caller (any guest ptrace user) → never intercept.
+        assert!(!z388_handoff_decision(false, Z388_PTRACE_SEIZE, true));
+        assert!(!z388_handoff_decision(false, Z388_PTRACE_ATTACH, true));
+        // Untracked target (dead, host-side, or already handed off) →
+        // the raw kernel decides (EPERM/ESRCH/success).
+        assert!(!z388_handoff_decision(true, Z388_PTRACE_SEIZE, false));
+        assert!(!z388_handoff_decision(true, Z388_PTRACE_ATTACH, false));
+        // Non-attach requests from a crash_dump caller (its own
+        // POST-hand-off INTERRUPT/CONT/DETACH on its own tracees) →
+        // never intercept.
+        assert!(!z388_handoff_decision(
+            true, 0x4207, /* INTERRUPT */
+            true
+        ));
+        assert!(!z388_handoff_decision(true, 7 /* CONT */, true));
+        assert!(!z388_handoff_decision(true, 17 /* DETACH */, true));
+    }
+
+    /// The detach-signal rule: a SIGSTOP-caused stop must detach with
+    /// SIGCONT (a group-stop otherwise survives the detach and the
+    /// dump would stall on a frozen thread); every other stop detaches
+    /// with 0.
+    #[test]
+    fn z388_detach_signal_rule() {
+        assert_eq!(z388_detach_signal(libc::SIGSTOP), libc::SIGCONT);
+        // Syscall-entry/exit stops arrive as SIGTRAP|0x80 = 0x87.
+        assert_eq!(z388_detach_signal(0x87), 0);
+        assert_eq!(z388_detach_signal(libc::SIGTRAP), 0);
+        assert_eq!(z388_detach_signal(libc::SIGCHLD), 0);
+        assert_eq!(z388_detach_signal(0), 0);
+    }
+
+    /// The dance budget is bounded: 150 × 2 ms = 300 ms worst case.
+    #[test]
+    fn z388_dance_budget_is_bounded() {
+        let worst_ms = Z388_DANCE_POLLS as u64 * Z388_DANCE_POLL_SLEEP_MS;
+        assert_eq!(worst_ms, 300, "worst-case dance per tid must be 300 ms");
+        assert!(
+            Z388_CRASH_DUMP_TAG_CAP >= 8,
+            "single-digit generations per boot"
+        );
+    }
+
+    /// The 6-Z190 sweep must skip handed-off tids (re-attach = steal-back).
+    #[test]
+    fn z388_sweep_skips_handed_off() {
+        let mut handed_off = std::collections::HashSet::new();
+        handed_off.insert(4242);
+        assert!(z388_sweep_must_skip(4242, &handed_off));
+        assert!(!z388_sweep_must_skip(4243, &handed_off));
     }
 }
