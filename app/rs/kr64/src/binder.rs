@@ -3495,6 +3495,75 @@ impl BinderProxy {
                     vm_id, MAX_PROXY_CONNECTIONS
                 );
 
+                // 6-Z402: the BUS-STATE HEARTBEAT — every 30 s, one bounded
+                // line per connection holding PENDING state (an unanswered
+                // sync call with its age, a queued reply, a queued incoming
+                // transaction, a non-empty transaction stack). The
+                // rn355/rn356 decode burned on not being able to see, at
+                // stall time, WHAT a parked looper was actually waiting
+                // for: SF main sat in the idle tick for 30+s while every
+                // reply path logged silent-on-success. The heartbeat is the
+                // stall-time oracle — a stuck requester's (conn, age)
+                // appears in every artifact from this wave on.
+                let bus_hb = Arc::clone(&bus);
+                let shutdown_hb = Arc::clone(&shutdown_for_thread);
+                let vm_id_hb = vm_id;
+                thread::Builder::new()
+                    .name(format!("kr64-binder-hb-{}", vm_id))
+                    .spawn(move || {
+                        let mut tick: u64 = 0;
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(30));
+                            if shutdown_hb.load(Ordering::Acquire) {
+                                break;
+                            }
+                            tick += 1;
+                            let Ok(b) = bus_hb.lock() else {
+                                continue;
+                            };
+                            let now = std::time::Instant::now();
+                            let mut lines: Vec<String> = Vec::new();
+                            for (cid, bx) in b.conns.iter() {
+                                let mut parts: Vec<String> = Vec::new();
+                                for (t, at) in bx.out_sync.iter() {
+                                    parts.push(format!(
+                                        "sync#{} age={}s",
+                                        t,
+                                        now.duration_since(*at).as_secs()
+                                    ));
+                                }
+                                if !bx.reply_queue.is_empty() {
+                                    parts.push(format!("replies={}", bx.reply_queue.len()));
+                                }
+                                if !bx.inbox.is_empty() {
+                                    parts.push(format!("inbox={}", bx.inbox.len()));
+                                }
+                                if !bx.txn_stack.is_empty() {
+                                    parts.push(format!("stack={:?}", bx.txn_stack));
+                                }
+                                if !parts.is_empty() {
+                                    lines.push(format!(
+                                        "conn={} pid={} dev={} {}",
+                                        cid,
+                                        bx.sender_pid,
+                                        bx.dev_code,
+                                        parts.join(" ")
+                                    ));
+                                }
+                            }
+                            if !lines.is_empty() {
+                                info!(
+                                    "[KR64][binder][vm{}] 6-Z402 bus-state tick #{}: {} conn(s) pending | {}",
+                                    vm_id_hb,
+                                    tick,
+                                    lines.len(),
+                                    lines.join(" || ")
+                                );
+                            }
+                        }
+                    })
+                    .expect("kr64-binder-hb spawn");
+
                 while !shutdown_for_thread.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _addr)) => {
