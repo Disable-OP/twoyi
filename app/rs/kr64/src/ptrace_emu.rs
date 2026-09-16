@@ -17929,8 +17929,7 @@ pub fn run_ptrace_loop(
         // can lose at most a single line to a stalled consumer — bulk
         // diags keep using the NB path).
         {
-            static LAST_HB_MS: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static LAST_HB_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let now_ms = crate::boot_elapsed_ms() as u64;
             let last = LAST_HB_MS.load(std::sync::atomic::Ordering::Relaxed);
             if now_ms >= last + 5000
