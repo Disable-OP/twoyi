@@ -29965,6 +29965,25 @@ pub fn run_ptrace_loop(
                             let dirfd = syscall_dirfd(get_syscall_arg(&regs, abi.reg_arg1));
                             let path_addr = get_syscall_arg(&regs, abi.reg_arg2);
                             let mut translated_applied = false;
+                            // 6-Z391: drop-proof decision trace (the rn348
+                            // tombstoned fchmodat asymmetry — the stderr
+                            // capture is lossy in this exact window, the
+                            // kmsg mirror is not). One line per arm hit.
+                            {
+                                let z391_path = read_child_string(pid, path_addr)
+                                    .unwrap_or_else(|| "<unreadable>".to_string());
+                                crate::z391_klog(
+                                    rootfs,
+                                    &format!(
+                                        "ENTRY {} pid={} nr={} dirfd={} path={:?}",
+                                        syscall_name(syscall_num, &abi),
+                                        pid,
+                                        syscall_num,
+                                        dirfd,
+                                        z391_path
+                                    ),
+                                );
+                            }
                             if dirfd == AT_FDCWD {
                                 if let Some(path) = read_child_string(pid, path_addr) {
                                     if path.starts_with('/') {
@@ -30055,6 +30074,18 @@ pub fn run_ptrace_loop(
                                     )),
                                 }
                             }
+                            // 6-Z391: final decision — drop-proof summary
+                            // of what will actually execute for this call.
+                            crate::z391_klog(
+                                rootfs,
+                                &format!(
+                                    "DECISION {} pid={} translated={} scratch={}",
+                                    syscall_name(syscall_num, &abi),
+                                    pid,
+                                    translated_applied,
+                                    scratch_addr != 0
+                                ),
+                            );
                         }
                         // ── Task 6-Z69: set_thread_area ENTRY → REAL TLS
                         // install via PTRACE_SET_THREAD_AREA ──
@@ -36662,6 +36693,18 @@ pub fn run_ptrace_loop(
                                             let real_path =
                                                 translate_path_via_sandbox(&sandbox, rootfs, &path);
                                             let backing = std::path::Path::new(&real_path);
+                                            // 6-Z391: drop-proof trace of the
+                                            // catch's gate state for every
+                                            // failed fchmodat EXIT.
+                                            crate::z391_klog(
+                                                rootfs,
+                                                &format!(
+                                                    "EXIT-CATCH fchmodat ret={} path={:?} backing_exists={}",
+                                                    fch_ret,
+                                                    path,
+                                                    backing.exists()
+                                                ),
+                                            );
                                             if backing.exists() {
                                                 let mode =
                                                     get_syscall_arg(&regs, abi.reg_arg3) as u32;
