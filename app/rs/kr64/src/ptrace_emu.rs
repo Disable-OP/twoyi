@@ -17910,6 +17910,48 @@ pub fn run_ptrace_loop(
             tracked_pids.len() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // ── 6-Z390: PERIODIC LIVE HEARTBEAT (rn348 decode) ─────────────
+        //
+        // The kr64-app-stderr capture went SILENT at +17.4s while the
+        // guest demonstrably kept booting for another ~90s (the app's
+        // renderer logcat carried the GL handshake at ~+110s, and the
+        // tracer's stop machinery must have been alive — tracee
+        // processes kept running). The 16 KiB buffered sink plus the
+        // 6-Z305t-15 NB-drop path make "no bytes in the file"
+        // ambiguous between: (a) the tracer stopped emitting diags,
+        // (b) the sink stopped flushing its buffer, (c) the file
+        // write path itself died. One bounded line per 5s THROUGH the
+        // critical (immediate-flush) path disambiguates all three in
+        // the next capture: a live HB line proves the whole chain
+        // works; a gap names the exact silent window.
+        // Cost: one relaxed load + compare per waitpid round-trip and
+        // one direct stderr write per 5s (blocking, but a 5s cadence
+        // can lose at most a single line to a stalled consumer — bulk
+        // diags keep using the NB path).
+        {
+            static LAST_HB_MS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let now_ms = crate::boot_elapsed_ms() as u64;
+            let last = LAST_HB_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if now_ms >= last + 5000
+                && LAST_HB_MS
+                    .compare_exchange(
+                        last,
+                        now_ms,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                crate::trace_log_line_critical(&format!(
+                    "6-Z390 HB +{}ms loop={} waited={} tracked={} — tracer live, stderr chain exercised",
+                    now_ms,
+                    loop_count,
+                    waited,
+                    tracked_pids.len()
+                ));
+            }
+        }
         // ── 6-Z213 RAW STOP FORENSICS ──────────────────────────────────
         //
         // r24 (run 33248496503, commit 2db54ec) established a HARD fact:
