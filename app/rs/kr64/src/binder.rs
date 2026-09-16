@@ -8638,6 +8638,26 @@ enum Liveness {
     Unknown,
 }
 
+/// 6-Z387: the 6-Z306d-b association scan window (bytes of the cookie
+/// chunk searched for the weakref VALUE W). W = mRefs lives at
+/// [R+8] with R = the RefBase vbase subobject = B+Δ; Δ spans the
+/// wrapper's inheritance depth (rn344 census: HIDL 0x20..0x88, extractor
+/// 0x40, player 0x110, MediaMetrics 0x378, AudioFlinger 0x648 — the old
+/// 640 window false-deaded every Δ>0x320 wrapper and starved the
+/// registry strong ref → the audioserver/mediametrics corpse storm).
+/// Page-sized: bounded peek cost, margin for deeper wrappers.
+const ASSOC_SCAN_WINDOW: usize = 4096;
+
+/// 6-Z387: the pure 6-Z306d-b association decision over the peeked
+/// cookie chunk — the VALUE W (the object's mRefs) must appear at an
+/// 8-aligned slot inside the scanned window. Pure so tests replay the
+/// rn344 Δ shapes (AudioFlinger 0x648, MediaMetrics 0x378) without a
+/// tracer.
+fn assoc_scan(buf: &[u8], w: u64) -> bool {
+    buf.chunks_exact(8)
+        .any(|c| u64::from_ne_bytes(c.try_into().unwrap()) == w)
+}
+
 fn mirror_ref_check(guest_pid: i32, ptr: u64, cookie: u64) -> Liveness {
     if guest_pid <= 0 || ptr == 0 || cookie == 0 {
         return Liveness::Dead;
@@ -8688,13 +8708,32 @@ fn mirror_ref_check(guest_pid: i32, ptr: u64, cookie: u64) -> Liveness {
                     // B, its reused-chunk vptr sent the vbase adjust to
                     // B+0xE0, mRefs=NULL → si_addr=0x4). A live object's
                     // allocation contains its own mRefs pointer: [R+8]==W
-                    // with R = B+Δ (Δ>0, observed 0x20..0x88) sits inside
-                    // B's chunk — scan [B..B+640) for the VALUE W.
-                    match crate::ptrace_emu::peek_guest_bytes(guest_pid, cookie, 640) {
-                        Some(buf) if buf.len() == 640 => {
-                            let associated = buf
-                                .chunks_exact(8)
-                                .any(|w| u64::from_ne_bytes(w.try_into().unwrap()) == ptr);
+                    // with R = B+Δ (Δ>0) sits inside B's chunk — scan
+                    // [B..B+ASSOC_WINDOW) for the VALUE W.
+                    //
+                    // 6-Z387 (rn344 decode): the window MUST cover the
+                    // RefBase VBASE offset of multiply-inheriting wrappers,
+                    // not just the HIDL Δ=0x20..0x88 class. The stock A11
+                    // flattenBinder (libbinder.so 0x5babc, disassembled)
+                    // writes W=local->getWeakRefs() (via the vbase-adjusted
+                    // RefBase subobject) and cookie=local — so W=mRefs lives
+                    // at [R+8] where R=mBase=[W+8] can sit DEEP in the
+                    // wrapper. rn344 capture probes: AudioFlinger Δ=0x648
+                    // (W@0x650), MediaMetrics Δ=0x378 (W@0x380) — both
+                    // BEYOND the old 640 window, both hit the false-Dead
+                    // skip ("association broken", 197x), and both owners
+                    // crashed ~90-290 ms later at RefBase::incStrong+0x0 /
+                    // decStrong+0x1c on the FREED cookie chunk (the register
+                    // temporary died with no registry strong ref → delete →
+                    // the self-lookup served the corpse). Δ<640 services
+                    // (extractor 0x40, player 0x110) never stormed. The
+                    // window is page-sized (4096): covers every observed
+                    // wrapper class with margin, one bounded process_vm_readv
+                    // per registration (the capture budget still applies).
+                    match crate::ptrace_emu::peek_guest_bytes(guest_pid, cookie, ASSOC_SCAN_WINDOW)
+                    {
+                        Some(buf) if buf.len() == ASSOC_SCAN_WINDOW => {
+                            let associated = assoc_scan(&buf, ptr);
                             if associated {
                                 Liveness::Alive
                             } else {
@@ -12602,6 +12641,55 @@ mod tests {
                 .watchers
                 .contains_key("android.system.suspend@1.0::ISystemSuspend/default"),
             "watcher removed"
+        );
+    }
+
+    /// 6-Z387: the 6-Z306d-b association scan must find the weakref
+    /// VALUE W at the TRUE vbase depth of multiply-inheriting wrappers.
+    /// rn344 decode: the old 640-byte window missed W at [R+8] for
+    /// AudioFlinger (Δ=0x648 → W@0x650) and MediaMetrics (Δ=0x378 →
+    /// W@0x380) — the false-Dead skipped the registry BR_ACQUIRE, the
+    /// register temporary died with no strong ref, the service object
+    /// was freed, and the self-lookup served the corpse (the
+    /// incStrong+0x0 / decStrong+0x1c restart storm, 197 skips/run).
+    /// The same scan must still reject the #237 chimera (W absent).
+    #[test]
+    fn z387_assoc_scan_covers_deep_vbase_wrappers() {
+        // AudioFlinger-shaped live chunk: vptr@0, W at [R+8] with
+        // R = cookie + 0x648 (the rn344 capture probe numbers).
+        let w = 0xEE94_EAE0_6BB0u64;
+        let mut chunk = vec![0u8; ASSOC_SCAN_WINDOW];
+        chunk[0..8].copy_from_slice(&0xEE97_5BF7_5518u64.to_ne_bytes()); // vptr
+        chunk[0x650..0x658].copy_from_slice(&w.to_ne_bytes());
+        assert!(assoc_scan(&chunk, w), "AudioFlinger Δ=0x648 associated");
+        // The OLD window missed exactly this slot — the regression.
+        assert!(
+            !assoc_scan(&chunk[..640], w),
+            "the 640 window must miss W@0x650 (the bug shape)"
+        );
+
+        // MediaMetrics-shaped live chunk: R = cookie + 0x378.
+        let wm = 0xF252_9920_36D0u64;
+        let mut chunk_m = vec![0u8; ASSOC_SCAN_WINDOW];
+        chunk_m[0x380..0x388].copy_from_slice(&wm.to_ne_bytes());
+        assert!(assoc_scan(&chunk_m, wm), "MediaMetrics Δ=0x378 associated");
+
+        // In-window classes stay positive (extractor Δ=0x40, player 0x110).
+        let we = 0xE053_2DE0_5940u64;
+        let mut chunk_e = vec![0u8; ASSOC_SCAN_WINDOW];
+        chunk_e[0x48..0x50].copy_from_slice(&we.to_ne_bytes());
+        assert!(assoc_scan(&chunk_e, we), "extractor Δ=0x40 associated");
+
+        // #237 chimera: a dead/reused cookie chunk does not reference W
+        // anywhere in the window — still rejected (False→Dead is correct).
+        let mut dead = vec![0u8; ASSOC_SCAN_WINDOW];
+        dead[0..8].copy_from_slice(&0x1234_5678_9ABC_DEF0u64.to_ne_bytes());
+        assert!(!assoc_scan(&dead, w), "chimera chunk stays rejected");
+
+        // Window sanity: covers the deepest observed W slot.
+        assert!(
+            ASSOC_SCAN_WINDOW >= 0x650 + 8,
+            "window must cover AudioFlinger W@0x650"
         );
     }
 
