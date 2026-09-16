@@ -30555,3 +30555,17 @@ Work Log:
 Stage Summary:
 - EXPECT rn351: (a) 6-Z391 ENTRY/DECISION lines for /dev/socket/* around +8s INCLUDING the tombstoned fchmodat (the missing evidence for the one-line fix), (b) 6-Z392 T-STOP lines naming every frozen HAL (composer + neuralnetworks + ...) with tracked-truth at 30s cadence.
 - The composer/neuralnetworks multi-HAL ptrace-stop freeze is now the primary frontier; the tombstoned fchmodat asymmetry is one budget-clean run away from its decode.
+
+---
+Task ID: 133 (rn351 decoded — THE FREEZE ENGINE NAMED: 6-Z393 closes the pid-blind skip_next_resume resume-theft class)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn351 (#351, edc8d77d) decoded (/home/z/artifacts-rn350/rn351): budget fix VERIFIED — the socket-family 6-Z391 trace now lands (property_service/logd/logdr/logdw/lmkd/tombstoned_*/statsdw/dnsproxyd: EVERY socket shows fchownat translated=true, ZERO fchmodat ENTRYs — the fchmodat routing mystery is now bounded to one question with full visibility), and the 6-Z392 watchdog delivered the freeze inventory: +30s = 3 frozen pids → +60s = 10 frozen pids (composer 3055 + neuralnetworks + 8 more), ALL tracked=true, GROWING — a systemic resume-loss.
+- THE CAUSAL CHAIN (evidence-paired): the 6-Z211e DIAG names the skip CONSUMPTION victim per pid — victims 3055 (composer, skips #167/#168/#186), 3127 (skips #197/#198 → T-STOP at +30s AND +60s), 3128, 2802 — the EXACT frozen set. skip_next_resume was a LOOP-GLOBAL BOOL applied to whatever pid's stop the next loop-top consumed; the 6-Z305t-16 fix had already patched the failed-parent-resume SLICE ("the per-thread resume-loss class that froze logd's threads at ladder #69") — this closes the class at the root.
+- 6-Z393 landed (this commit): skip_next_resume: bool → Option<pid_t>. Set sites now name their target (6-Z186/6-Z122 ESRCH sites: Some(esrch_pid); 6-Z211h+i fork arm: Some(parent_pid)); the loop-top consumes the skip ONLY when the consumed stop's pid IS the skip's target; a cross-pid stop now gets its NORMAL resume (the safe failure direction — a resume is issued where the old code stole one). All three set sites' first loop-top has current_pid == the target, so intended consumption is unchanged.
+- Local gates: rustfmt clean, clippy -D warnings clean, 921/921 tests.
+
+Stage Summary:
+- Session commit chain (pushed + CI green): 32b6226c (6-Z389 run-ender race) → eb76017f (6-Z390 HB) → a208787f (6-Z391 kmsg channel) → 4f9961e9 (6-Z392 watchdog) → edc8d77d (budget fix) → THIS (6-Z393 pid-scoped skip).
+- EXPECT rn352: the 6-Z392 T-STOP inventory SHRINKS dramatically (ideally empty) — frozen HALs get their resumes; SF reaches the composer; the boot advances past rung 7. Residual decode queued: the socket fchmodat ENTRY routing asymmetry (full visibility now in place).

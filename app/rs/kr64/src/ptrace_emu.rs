@@ -17043,7 +17043,19 @@ pub fn run_ptrace_loop(
     // RUNNING ESRCH'd pid itself — the next iteration must SKIP the
     // PTRACE_SYSCALL resume (it ESRCHs on a non-stopped tracee) and go
     // straight to the blocking waitpid for that child's next stop.
-    let mut skip_next_resume: bool = false;
+    // 6-Z393 (rn349/rn350/rn351 decode): the skip is now PID-SCOPED.
+    // The loop-global bool applied the skip to WHATEVER pid's stop the
+    // next loop-top consumed — when a fork-storm stop for another tid
+    // landed between the set site and the intended loop-top, the skip
+    // STOLE that tid's resume and froze it in ptrace-stop 't' forever
+    // (the 6-Z392 watchdog inventory: composer 3055, neuralnetworks,
+    // logd-class threads — the same per-thread resume-loss class the
+    // 6-Z305t-16 fix patched for the failed-parent-resume slice; this
+    // closes the class for every set site). A pending skip for a pid
+    // that is not the consumed stop's pid now LINGERS (its own next
+    // stop consumes it) — the safe failure direction: a resume is
+    // issued where the old code stole one.
+    let mut skip_next_resume: Option<libc::pid_t> = None;
     // 6-Z366: the loop-top resume for the CURRENT iteration becomes a
     // PTRACE_SINGLESTEP when a watchpoint hit was just serviced — the
     // trapping access must complete WITHOUT re-triggering (the hit path
@@ -17324,7 +17336,7 @@ pub fn run_ptrace_loop(
                 }
             }
         }
-        let skip_was_set = skip_next_resume;
+        let skip_was_set = skip_next_resume == Some(current_pid);
         // 6-Z122: `skip_next_resume` (set by the ESRCH branch when
         // current_pid is a RUNNING — not ptrace-stopped — tracee)
         // skips this resume entirely: PTRACE_SYSCALL on a running
@@ -17340,8 +17352,8 @@ pub fn run_ptrace_loop(
             // the plain-SIGTRAP dispatcher as Z366PlainTrap::StepDone and
             // the loop-top PTRACE_SYSCALL restores the normal rhythm.
             unsafe { libc::ptrace(libc::PTRACE_SINGLESTEP, current_pid, 0, 0) }
-        } else if skip_next_resume {
-            skip_next_resume = false;
+        } else if skip_next_resume == Some(current_pid) {
+            skip_next_resume = None;
             // 6-Z211e DIAG: log when skip_next_resume is set (the parent
             // is NOT being resumed — this is the suspected root cause of
             // the mount() syscall-stop not being delivered).
@@ -17350,7 +17362,7 @@ pub fn run_ptrace_loop(
             let n = SKIP_RESUME_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 200 {
                 log(&format!(
-                    "6-Z211e DIAG: skip_next_resume=TRUE for pid={} loop_count={} — SKIPPING PTRACE_SYSCALL resume (the child is NOT being resumed) [skip #{}/200]",
+                    "6-Z393 DIAG: skip_next_resume consumed for pid={} loop_count={} — SKIPPING PTRACE_SYSCALL resume (pid-scoped: only the skip's own target is skipped) [skip #{}/200]",
                     current_pid,
                     loop_count,
                     n + 1,
@@ -17662,7 +17674,7 @@ pub fn run_ptrace_loop(
                                     // ping-pong ESRCH). Every other live
                                     // child gets its normal loop-top resume.
                                     if live_pid == esrch_pid {
-                                        skip_next_resume = true;
+                                        skip_next_resume = Some(esrch_pid);
                                     }
                                     continue;
                                 }
@@ -17826,7 +17838,7 @@ pub fn run_ptrace_loop(
                     // next iteration goes straight to the blocking
                     // waitpid and the child's next stop arrives there.
                     if live_pid == esrch_pid && matches!(reaped, Reaped::Running) {
-                        skip_next_resume = true;
+                        skip_next_resume = Some(esrch_pid);
                         // 6-Z305t-71: bounded (ladder #131: 1148×).
                         if let Some(total) = stop_log_allow(
                             &mut stop_log_budget,
@@ -19541,7 +19553,7 @@ pub fn run_ptrace_loop(
                         // normal resume and a dead parent ESRCHs into the
                         // 6-Z89 reap/switch flow, as intended.
                         if resume_r == 0 {
-                            skip_next_resume = true;
+                            skip_next_resume = Some(parent_pid);
                         }
                         // 6-Z268: capped at 8 — this fires per fork/clone
                         // EVENT and formatted the whole tracked_pids Vec
