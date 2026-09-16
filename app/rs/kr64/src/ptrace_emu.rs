@@ -10984,6 +10984,175 @@ pub(crate) fn traced_child_alive(pid: libc::pid_t) -> bool {
     }
 }
 
+/// 6-Z384: errno classification for the loop-exit liveness decision.
+/// Only a CONFIRMED-gone /proc entry (ENOENT) means dead. Any OTHER read
+/// failure (EIO/ENOMEM/EACCES — all seen transiently during the rn342
+/// collapse window) must count as ALIVE: the loop-exit decision is the
+/// one place where a false "dead" kills the ENTIRE guest via
+/// PTRACE_O_EXITKILL, so the conservative direction is inverted here.
+pub(crate) fn stat_read_err_means_gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
+/// 6-Z384: the state-char classifier shared by both probes (pure, for
+/// tests). 'Z' (zombie) and 'X' (exiting) are dead; everything else
+/// (R/S/T/t/D/I/P…) is alive. A missing state char is treated as DEAD —
+/// a truncated stat read mid-process-creation is not a safe liveness
+/// witness, and both callers handle the None case with their own
+/// conservative direction.
+fn stat_state_is_alive(state: Option<char>) -> bool {
+    match state {
+        Some('Z') | Some('X') => false,
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// 6-Z384: CONSERVATIVE liveness for the LOOP-EXIT decision only.
+///
+/// Differs from [`traced_child_alive`] (which stays the binder delivery
+/// gate — there a false ALIVE would lose transactions to dying pids, so
+/// false-DEAD is the correct direction):
+///   - a /proc/<pid>/stat read failure other than ENOENT → ALIVE
+///     (transient EIO/ENOMEM during a system-wide collapse must never
+///     let the loop conclude "ALL TRACED CHILDREN GONE" and exit — the
+///     PTRACE_O_EXITKILL teardown then SIGKILLs every tracee, the
+///     rn342-class mass death);
+///   - an unparseable stat (no ')' anchor) → ALIVE for the same reason.
+/// Only a state-char-confirmed Z/X or a confirmed-ENOENT counts as dead.
+pub(crate) fn traced_child_alive_conservative(pid: libc::pid_t) -> bool {
+    match std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
+        Ok(stat) => {
+            let state = stat
+                .rfind(')')
+                .and_then(|pos| stat.get(pos + 2..))
+                .and_then(|s| s.chars().next());
+            if state.is_none() {
+                static UNPARSEABLE_DIAG: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = UNPARSEABLE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 8 {
+                    crate::trace_log_line_critical(&format!(
+                        "6-Z384: /proc/{}/stat unparseable ({} bytes) — treated ALIVE for the loop-exit decision [occurrence #{}]",
+                        pid,
+                        stat.len(),
+                        n + 1
+                    ));
+                }
+            }
+            stat_state_is_alive(state)
+        }
+        Err(e) => {
+            let gone = stat_read_err_means_gone(&e);
+            if !gone {
+                static READ_ERR_DIAG: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = READ_ERR_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 8 {
+                    crate::trace_log_line_critical(&format!(
+                        "6-Z384: /proc/{}/stat read FAILED ({}) — treated ALIVE for the loop-exit decision [occurrence #{}]",
+                        pid,
+                        e,
+                        n + 1
+                    ));
+                }
+            }
+            !gone
+        }
+    }
+}
+
+/// 6-Z384: the conservative [`any_traced_child_alive`] — first tracked
+/// pid that is alive per the conservative probe, or None when every
+/// tracked child is CONFIRMED gone (Z/X state or missing /proc entry).
+pub(crate) fn any_traced_child_alive_conservative(
+    known_pids: &[libc::pid_t],
+) -> Option<libc::pid_t> {
+    for &p in known_pids {
+        if traced_child_alive_conservative(p) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+// ── 6-Z384: the death ring + the survivable loop-exit verdict ────────
+//
+// rn342 post-mortem: the loop's final ~100 ms of lines — the init reap
+// ("child 2793 killed by signal N"), the 6-Z97 verdict, the 6-Z89
+// "ALL TRACED CHILDREN GONE" decision — sat in the buffered sink / the
+// tee pipe when the process exited, and BOTH stderr sinks lost them.
+// The init killer has now gone unnamed across FOUR runs (rn257, rn259,
+// rn285, rn342). Two channels fix this:
+//   1. a bounded ring of recent child-death reports, replayed at every
+//      loop-exit verdict through the CRITICAL (flush-immediate) path;
+//   2. a MIRROR of the verdict + ring appended to the guest klog node
+//      ({rootfs}/dev/__kmsg__) — a REGULAR FILE on the rootfs that the
+//      harness always pulls (dev-__kmsg__ artifact), fully independent
+//      of the stderr pipe and the app-side tee.
+static DEATH_RING: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const DEATH_RING_CAP: usize = 24;
+
+/// 6-Z384: record one child-death report line in the ring (oldest
+/// dropped past the cap).
+fn push_death_ring(line: String) {
+    if let Ok(mut ring) = DEATH_RING.lock() {
+        if ring.len() >= DEATH_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(line);
+    }
+}
+
+/// 6-Z384: the death-ring snapshot (oldest → newest), for the verdict.
+fn death_ring_snapshot() -> Vec<String> {
+    DEATH_RING
+        .lock()
+        .map(|ring| ring.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// 6-Z384: append one loader-critical line to the guest klog node.
+/// Best-effort: the klog file is guest-owned (init appends its own
+/// lines); a failure here must never affect the loop. Line format
+/// mirrors the loader's existing klog markers (e.g. "logdw kmsg fd
+/// test") so klog tooling sees a familiar prefix.
+fn klog_critical(rootfs: &str, msg: &str) {
+    use std::io::Write;
+    let path = format!("{}/dev/__kmsg__", rootfs);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "<6>[twoyi_loader] 6-Z384: {}", msg);
+    }
+}
+
+/// 6-Z384: the loop-exit verdict — replay the death ring through the
+/// critical (flush-immediate) stderr path AND mirror verdict + ring to
+/// the guest klog file. Called at every "ending the ptrace loop" site.
+fn report_loop_exit_verdict(rootfs: &str, verdict: &str) {
+    crate::trace_log_line_critical(&format!("6-Z384 LOOP-EXIT VERDICT: {}", verdict));
+    klog_critical(rootfs, &format!("LOOP-EXIT VERDICT: {}", verdict));
+    let ring = death_ring_snapshot();
+    if ring.is_empty() {
+        crate::trace_log_line_critical("6-Z384 death ring: EMPTY (no child deaths recorded)");
+        klog_critical(rootfs, "death ring: EMPTY");
+    } else {
+        crate::trace_log_line_critical(&format!(
+            "6-Z384 death ring (last {} child deaths, oldest->newest):",
+            ring.len()
+        ));
+        klog_critical(rootfs, &format!("death ring (last {}):", ring.len()));
+        for line in &ring {
+            crate::trace_log_line_critical(&format!("6-Z384 ring: {}", line));
+            klog_critical(rootfs, &format!("ring: {}", line));
+        }
+    }
+}
+
 /// 6-Z186 SECURITY: read `TracerPid` from /proc/<pid>/status.
 ///
 /// Returns None when the /proc entry is gone (dead+reaped). A returned 0
@@ -17312,6 +17481,14 @@ pub fn run_ptrace_loop(
                                         esrch_pid,
                                         last_child_exit.unwrap_or(-1)
                                     ));
+                                    report_loop_exit_verdict(
+                                        rootfs,
+                                        &format!(
+                                            "6-Z186 ALL TRACED CHILDREN GONE after disposing of ESRCH pid {}; loop exit {}",
+                                            esrch_pid,
+                                            last_child_exit.unwrap_or(-1)
+                                        ),
+                                    );
                                     return last_child_exit.unwrap_or(-1);
                                 }
                             }
@@ -17488,6 +17665,14 @@ pub fn run_ptrace_loop(
                     tracked_pids.len(),
                     loop_exit
                 ));
+                report_loop_exit_verdict(
+                    rootfs,
+                    &format!(
+                        "6-Z89 ALL TRACED CHILDREN GONE (ESRCH branch): {} tracked, all confirmed dead; loop exit {}",
+                        tracked_pids.len(),
+                        loop_exit
+                    ),
+                );
                 return loop_exit;
             }
             log(&format!("PTRACE_SYSCALL failed: {}", e));
@@ -18011,6 +18196,13 @@ pub fn run_ptrace_loop(
                 "child {} exited with code {} (after {} iterations)",
                 pid, code, loop_count
             ));
+            // 6-Z384: record the death for the loop-exit verdict ring.
+            push_death_ring(format!(
+                "pid {} exited with code {} at +{}ms",
+                pid,
+                code,
+                crate::boot_elapsed_ms()
+            ));
             // Task 6-Z75 hygiene: drop the exited child's cached ABI so
             // a later fork can never inherit a stale entry via pid reuse.
             abi_map.remove(&pid);
@@ -18210,7 +18402,7 @@ pub fn run_ptrace_loop(
                 let alive: Vec<libc::pid_t> = tracked_pids
                     .iter()
                     .copied()
-                    .filter(|&p| traced_child_alive(p))
+                    .filter(|&p| traced_child_alive_conservative(p))
                     .collect();
                 if let Some(&new_init) = alive.first() {
                     log(&format!(
@@ -18239,6 +18431,13 @@ pub fn run_ptrace_loop(
                     "6-Z97: init_pid {} exited {} and no traced child is alive — genuine init exit, ending the ptrace loop (return {})",
                     pid, code, code
                 ));
+                report_loop_exit_verdict(
+                    rootfs,
+                    &format!(
+                        "6-Z97 genuine init exit: init_pid {} exited with code {}; waitpid-confirmed; no traced child alive",
+                        pid, code
+                    ),
+                );
                 return code;
             }
             // ── Task 6-Z89 FIX 1e: any-traced-child check (supersedes the
@@ -18254,7 +18453,7 @@ pub fn run_ptrace_loop(
             // 32634683464). When nothing is left, END the loop (this
             // also covers the old "init_dead → return" case: if init
             // were alive the scan would have found it).
-            if let Some(live_pid) = any_traced_child_alive(&tracked_pids) {
+            if let Some(live_pid) = any_traced_child_alive_conservative(&tracked_pids) {
                 // Task 6-Z67 semantics, generalised: init may be dead
                 // but a traced child (e.g. the recovery child — the
                 // whole point of the boot) is still alive. The
@@ -18270,10 +18469,29 @@ pub fn run_ptrace_loop(
                 current_pid = live_pid;
                 continue;
             }
-            log(&format!(
-                "6-Z89: ALL TRACED CHILDREN GONE ({} tracked, all dead) after child {} exited with code {} — ending the ptrace loop (return {})",
-                tracked_pids.len(), pid, code, code
-            ));
+            // 6-Z384: race guard — a dying child's /proc entry can
+            // vanish BETWEEN our reaps and the probe pass; a 2 ms
+            // second pass catches stragglers that were mid-exit during
+            // pass 1 before the loop decides the guest is gone (the
+            // EXITKILL teardown is irreversible).
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if let Some(live_pid) = any_traced_child_alive_conservative(&tracked_pids) {
+                log(&format!(
+                    "6-Z384: SECOND-PASS resurrection pid {} — a straggler surfaced after the first all-dead pass; keeping the ptrace loop running for it",
+                    live_pid
+                ));
+                current_pid = live_pid;
+                continue;
+            }
+            report_loop_exit_verdict(
+                rootfs,
+                &format!(
+                    "6-Z89 ALL TRACED CHILDREN GONE: {} tracked, all confirmed dead after child {} exited with code {} (two-pass conservative probe)",
+                    tracked_pids.len(),
+                    pid,
+                    code
+                ),
+            );
             return code;
         }
         if libc::WIFSIGNALED(status) {
@@ -18281,6 +18499,13 @@ pub fn run_ptrace_loop(
             log(&format!(
                 "child {} killed by signal {} (after {} iterations)",
                 pid, sig, loop_count
+            ));
+            // 6-Z384: record the death for the loop-exit verdict ring.
+            push_death_ring(format!(
+                "pid {} killed by signal {} at +{}ms",
+                pid,
+                sig,
+                crate::boot_elapsed_ms()
             ));
             // 6-Z306ao-c: the GROUP-DEATH class (#224, #240 gen-1: system_
             // server 5364 SIGSEGV at +175.2s with NO delivery stop and NO
@@ -18469,7 +18694,7 @@ pub fn run_ptrace_loop(
                 let alive: Vec<libc::pid_t> = tracked_pids
                     .iter()
                     .copied()
-                    .filter(|&p| traced_child_alive(p))
+                    .filter(|&p| traced_child_alive_conservative(p))
                     .collect();
                 if let Some(&new_init) = alive.first() {
                     log(&format!(
@@ -18489,13 +18714,16 @@ pub fn run_ptrace_loop(
                     }
                     continue;
                 }
-                log(&format!(
-                    "6-Z97: init_pid {} killed by signal {} and no traced child is alive — genuine init death, ending the ptrace loop (return {})",
-                    pid, sig, -sig
-                ));
+                report_loop_exit_verdict(
+                    rootfs,
+                    &format!(
+                        "6-Z97 GENUINE INIT DEATH: init_pid {} killed by signal {} (waitpid-confirmed WIFSIGNALED); no traced child alive — the signal NAMES the killer class (9=external kill, 6=abort, 11=crash)",
+                        pid, sig
+                    ),
+                );
                 return -sig;
             }
-            if let Some(live_pid) = any_traced_child_alive(&tracked_pids) {
+            if let Some(live_pid) = any_traced_child_alive_conservative(&tracked_pids) {
                 // Task 6-Z67 semantics, generalised (see the WIFEXITED
                 // branch for the full rationale).
                 log(&format!(
@@ -18505,10 +18733,26 @@ pub fn run_ptrace_loop(
                 current_pid = live_pid;
                 continue;
             }
-            log(&format!(
-                "6-Z89: ALL TRACED CHILDREN GONE ({} tracked, all dead) after child {} killed by signal {} — ending the ptrace loop (return {})",
-                tracked_pids.len(), pid, sig, -sig
-            ));
+            // 6-Z384: the same two-pass race guard as the WIFEXITED
+            // side — no EXITKILL teardown on a single all-dead pass.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if let Some(live_pid) = any_traced_child_alive_conservative(&tracked_pids) {
+                log(&format!(
+                    "6-Z384: SECOND-PASS resurrection pid {} — a straggler surfaced after the first all-dead pass; keeping the ptrace loop running for it",
+                    live_pid
+                ));
+                current_pid = live_pid;
+                continue;
+            }
+            report_loop_exit_verdict(
+                rootfs,
+                &format!(
+                    "6-Z89 ALL TRACED CHILDREN GONE: {} tracked, all confirmed dead after child {} killed by signal {} (two-pass conservative probe)",
+                    tracked_pids.len(),
+                    pid,
+                    sig
+                ),
+            );
             return -sig;
         }
 
@@ -49139,6 +49383,78 @@ mod z338_goldfish_aspace_tests {
                 last_off + GOLDFISH_ASPACE_PAGE,
                 block - GOLDFISH_ASPACE_PAGE
             ))
+        );
+    }
+}
+
+#[cfg(test)]
+mod z384_loop_exit_safety_tests {
+    use super::{
+        death_ring_snapshot, push_death_ring, stat_read_err_means_gone, stat_state_is_alive,
+    };
+
+    // The state-char classifier: Z/X dead, everything else alive, a
+    // missing char (truncated stat) dead-by-default.
+    #[test]
+    fn z384_state_char_classifier() {
+        assert!(!stat_state_is_alive(Some('Z')), "zombie must be dead");
+        assert!(!stat_state_is_alive(Some('X')), "exiting must be dead");
+        assert!(stat_state_is_alive(Some('R')), "running is alive");
+        assert!(stat_state_is_alive(Some('S')), "sleeping is alive");
+        assert!(stat_state_is_alive(Some('T')), "stopped is alive");
+        assert!(stat_state_is_alive(Some('D')), "disk-wait is alive");
+        assert!(stat_state_is_alive(Some('I')), "kernel-idle is alive");
+        assert!(
+            !stat_state_is_alive(None),
+            "missing state char is not a liveness witness"
+        );
+    }
+
+    // The errno classifier: only a confirmed ENOENT means gone; every
+    // other read failure must keep the loop-exit decision on the ALIVE
+    // side (the EXITKILL teardown is irreversible).
+    #[test]
+    fn z384_stat_read_err_classifier() {
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let transient = std::io::Error::from_raw_os_error(libc::EIO);
+        let mem = std::io::Error::from_raw_os_error(libc::ENOMEM);
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert!(stat_read_err_means_gone(&gone), "ENOENT = gone");
+        assert!(
+            !stat_read_err_means_gone(&transient),
+            "EIO must count ALIVE"
+        );
+        assert!(!stat_read_err_means_gone(&mem), "ENOMEM must count ALIVE");
+        assert!(
+            !stat_read_err_means_gone(&denied),
+            "EACCES must count ALIVE"
+        );
+    }
+
+    // The death ring: bounded at 24, oldest dropped, insertion order
+    // preserved. NOTE: the ring is a process-wide global and Rust test
+    // threads run in parallel, so this test only asserts properties of
+    // its OWN entries (never the absolute head/tail).
+    #[test]
+    fn z384_death_ring_is_bounded_and_ordered() {
+        for i in 0..30 {
+            push_death_ring(format!("z384test death #{:04}", i));
+        }
+        let ring = death_ring_snapshot();
+        // The ring can never exceed the cap.
+        assert!(ring.len() <= 24, "ring overflow: {}", ring.len());
+        // Our entries that survived appear in index order.
+        let tail: Vec<&String> = ring.iter().filter(|l| l.starts_with("z384test")).collect();
+        assert!(tail.len() >= 2, "ring dropped our entries: {}", tail.len());
+        for w in tail.windows(2) {
+            let a: u32 = w[0].rsplit('#').next().unwrap().parse().unwrap();
+            let b: u32 = w[1].rsplit('#').next().unwrap().parse().unwrap();
+            assert!(a < b, "ring order violated: {} then {}", a, b);
+        }
+        // The newest of ours is the final index.
+        assert_eq!(
+            tail.last().map(|s| s.as_str()),
+            Some("z384test death #0029")
         );
     }
 }

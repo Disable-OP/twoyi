@@ -304,6 +304,46 @@ pub(crate) fn trace_log_flush() {
     }
 }
 
+/// 6-Z384: emit a line that MUST survive the process exit — loop-exit
+/// verdicts, init-death reports, the all-children-gone decision. The
+/// 16 KiB buffered sink loses everything written after its last
+/// threshold flush when the process exits (rn342 post-mortem: the
+/// app-side tee died mid-meltdown and the buffered tail — including the
+/// 6-Z97 "genuine init death" verdict — never reached either log sink,
+/// hiding the init killer for the FOURTH time: rn257/rn259/rn285/rn342).
+/// A critical line is pushed through the same buffer and the buffer is
+/// drained IMMEDIATELY, so the line reaches the tee pipe in one write.
+pub(crate) fn trace_log_line_critical(msg: &str) {
+    trace_log_line(msg);
+    trace_log_flush();
+}
+
+// ── 6-Z384: atexit tail-drain ────────────────────────────────────────
+//
+// `std::process::exit` (main.rs) does NOT unwind: locals are not
+// dropped, so any tail still sitting in TRACE_LINE_BUF at exit time is
+// discarded. libc::atexit handlers DO run on exit() — drain the buffer
+// there (best-effort: if the Mutex is poisoned by a panicking writer,
+// skip; the critical-line path above already flushed what matters).
+extern "C" fn trace_atexit_hook() {
+    if let Ok(mut buf) = TRACE_LINE_BUF.lock() {
+        trace_line_flush_locked(&mut buf);
+    }
+}
+
+static TRACE_ATEXIT_REGISTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Register the atexit tail-drain exactly once. Called from `run()`
+/// before the ptrace branch; safe to call multiple times.
+pub(crate) fn register_trace_atexit_flush() {
+    if !TRACE_ATEXIT_REGISTERED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        unsafe {
+            libc::atexit(trace_atexit_hook);
+        }
+    }
+}
+
 /// RAII guard: flushes the trace-line buffer when dropped. Held for the
 /// lifetime of `run_ptrace_loop` so EVERY early return (waitpid
 /// failure, all-children-gone, teardown) drains the tail exactly once,
@@ -5646,6 +5686,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // 6-Z260: anchor the boot clock as the very first action so every
     // subsequent log line's [+Nms] prefix measures from daemon start.
     boot_clock_init();
+    // 6-Z384: drain the trace tail on std::process::exit — the buffered
+    // sink's RAII guard only covers run_ptrace_loop's scope; everything
+    // logged after its return (the "ptrace emulation loop ended" info!,
+    // the diagnostic-log copies) was discarded by exit() in rn342.
+    register_trace_atexit_flush();
     // ── 6-Z268: tracer scheduling priority ──────────────────────────
     // The tracer is a single thread emulating EVERY guest syscall; on a
     // phone it competes with the host app's render/GC threads and
