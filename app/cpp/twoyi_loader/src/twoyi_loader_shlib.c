@@ -2911,7 +2911,45 @@ static unsigned char *bp_build_v2_request_trailer(
     if (ws < 4) return NULL;
     struct bp_blob_desc descs[BP_BLOB_MAX_CMDS];
     uint32_t n = bp_scan_tx_blobs(stream, ws, descs);
-    if (n == 0) return NULL;
+    if (n == 0) {
+        // 6-Z401: the scan found NOTHING to inline. If the stream carries
+        // BC_TRANSACTION(s) at all, this ioctl goes out BLOB-LESS (v1) and
+        // the proxy's legacy SM path answers addService with a fake
+        // status-0 WITHOUT registering — the silent black hole the rn355
+        // decode pinned (SF's addService(SurfaceFlinger) produced no bus
+        // receipt, no registry entry, and a client-side success). Name the
+        // shape: log the first commands of the stream (bounded).
+        static int z401_v1_logged = 6;
+        uint32_t pos = 0;
+        int tx_found = 0;
+        uint32_t first_cmd = 0, first_code = 0, first_target = 0;
+        while (pos + 4 <= ws) {
+            uint32_t cmd;
+            memcpy(&cmd, stream + pos, 4);
+            uint32_t psize = (cmd >> 16) & 0x3fffu;
+            if (pos + 4 + psize > ws) break;
+            if (cmd == BP_BC_TRANSACTION || cmd == BP_BC_TRANSACTION_SG) {
+                tx_found = 1;
+                if (first_cmd == 0) {
+                    first_cmd = cmd;
+                    memcpy(&first_target, stream + pos + 4, 4);
+                    memcpy(&first_code, stream + pos + 4 + 16, 4);
+                }
+            }
+            pos += 4 + psize;
+        }
+        if (tx_found && z401_v1_logged > 0) {
+            z401_v1_logged--;
+            char m[192];
+            snprintf(m, sizeof(m),
+                     "[twoyi_loader] 6-Z401: v1 FALLBACK — BC_TRANSACTION in stream "
+                     "(first target=%u code=0x%x) got NO inline blob; the proxy's "
+                     "legacy path cannot learn addService names (pid=%d)\n",
+                     first_target, first_code, g_real_pid);
+            write_str(2, m);
+        }
+        return NULL;
+    }
 
     // 6-Z305t-68: per-blob BINDER_TYPE_PTR SG capture. The HIDL wire
     // carries hidl_string/hidl_vec contents OUT of the main parcel —
