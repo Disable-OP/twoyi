@@ -8894,6 +8894,10 @@ fn forget_dead_pid_state(
     // and the maps grew unboundedly across a long boot. Everything
     // keyed by pid is dropped here now.
     in_syscall_map.remove(&pid);
+    // 6-Z403: a dead tid's ENTRY fp/lr stash must never be inherited by a
+    // pid-recycled successor (a stale fp would send the 6-Z403 stall walk
+    // through the WRONG thread's frames).
+    z403_entry_stash_remove(pid);
     fake_netlink_fds.remove(&pid);
     netlink_fd_next.remove(&pid);
     fake_propserv_fds.remove(&pid);
@@ -11451,6 +11455,170 @@ fn stall_stack_arg_label(nr: i64, a0: u64) -> String {
     }
 }
 
+// ── 6-Z403: the futex-stall forensic upgrade (the rn357 SF-main wall) ──
+//
+// rn357 pinned SF main (pid 3181) to futex(uaddr=0xe7d8c7bccc14, op=0
+// FUTEX_WAIT, val=0xc91) with pc INSIDE linker64 — and every existing
+// stack oracle failed: the 6-Z314 word-scan found one vdso residue in
+// 512 bytes, and the 6-Z285 heuristic fp-candidate scan logged "no
+// frame record found in the first 512 bytes above sp". STRUCTURAL
+// CAUSE: bionic's syscall wrappers are leaf functions compiled without
+// frame records — x29 (fp) lives in a REGISTER across the wrapper, so
+// no (fp,ret) pair exists near sp to scan for. The chain is only
+// recoverable from x29 itself, which /proc/<pid>/syscall does NOT
+// export but which the tracer HOLDS at every syscall-ENTRY stop.
+//
+// Three instruments, all logging-only:
+//   * ENTRY-STASH: at every aarch64 syscall ENTRY stash (nr, x29, x30).
+//     At stall time walk the fp chain from the stashed x29 — the frames
+//     do not move while the thread is parked. When the blocking
+//     syscall's ENTRY was seen (the common case for a thread that
+//     parked), the walk names the waiting caller function outright.
+//   * WAKE-CENSUS: record every wake-family futex (WAKE/REQUEUE/
+//     CMP_REQUEUE/WAKE_OP/WAKE_BITSET, aarch64) by (tid, uaddr) with a
+//     saturating call count + last-seen instant. At a futex-WAIT stall,
+//     look up the stall uaddr: "woken N times, last +Xs ago" vs "NEVER
+//     woken" decides lost-wakeup vs never-started-signalizer in one
+//     line. WAKE-family ops are rare relative to the futex stop volume,
+//     so the hot path pays nothing.
+//   * STALL-HOLDER: when the stall's futex word is tid-shaped (bionic
+//     normal mutex words are 0/1/2 — a word like rn357's 0xc91=3217 is
+//     either a glibc-style tid-valued word, a PI/robust residue, or an
+//     arbitrary sequence counter; the probe treats tid-shaped values as
+//     CANDIDATE holders and names their live state at stall time).
+//
+// Word-shape note (drives the STALL-HOLDER trigger): bionic normal
+// mutex state words are 0/1/2; PI/robust words carry bit 30. A word
+// that is neither — small, nonzero, no bit 30 — is CANDIDATE-tid-shaped
+// (glibc-style owner tid or a tid recorded in some other primitive) or
+// just data (a condvar/sequence counter). The probe is bounded and
+// once-per-(pid,uaddr); it can never mislead worse than the current
+// "possibly tid=N holder" text it replaces.
+
+/// 6-Z403 wake-family classifier (op & 0x7f, PRIVATE/REALTIME flags
+/// masked). Authoritative linux/futex.h table:
+///   0 WAIT, 1 WAKE, 2 FD, 3 REQUEUE, 4 CMP_REQUEUE, 5 WAKE_OP,
+///   6 LOCK_PI, 7 UNLOCK_PI, 8 TRYLOCK_PI, 9 WAIT_BITSET,
+///   10 WAKE_BITSET, 11 WAIT_REQUEUE_PI, 12 CMP_REQUEUE_PI, 13 LOCK_PI2.
+/// Wake-family = {1, 3, 4, 5, 10}: every op that can move a waiter.
+/// (rn357's SF-adjacent dumpsys wait was op=137 → 137&0x7f = 9 =
+/// WAIT_BITSET — a waiter, correctly NOT recorded as a wake.)
+/// (allow(dead_code): called only from the aarch64 ENTRY hook — see
+/// z403_entry_stash_insert.)
+#[allow(dead_code)]
+fn z403_futex_op_is_wake_family(op: u64) -> bool {
+    matches!(op & 0x7f, 1 | 3 | 4 | 5 | 10)
+}
+
+/// 6-Z403: is a futex word a CANDIDATE holder tid? Nonzero, below the
+/// 6-Z306i candidate ceiling, no PI/robust bit (bit 30). Word 0/1/2 are
+/// the bionic normal-mutex states handled elsewhere (2 already gets the
+/// 6-Z306i owner probe).
+fn z403_word_is_candidate_tid(w: u32) -> bool {
+    w > 2 && w <= 0x100_0000 && (w & 0x4000_0000) == 0
+}
+
+/// 6-Z403: fp-chain record validity for the stash walk — a frame record
+/// is (next_fp, ret) where ret is a mapped-executable return and next is
+/// either 0 (chain end) or 8-aligned. The caller bounds `next` against
+/// the stack window separately (callers live at higher addresses).
+fn z403_frame_record_valid(next: u64, ret: u64, ret_exec: bool) -> bool {
+    ret != 0 && ret_exec && (next == 0 || next & 7 == 0)
+}
+
+/// 6-Z403 ENTRY-stash cap: the map is keyed by tid and over-written per
+/// stop; a fleet is a few hundred tids. If a pathological boot spawns
+/// more, the map self-cleans (oldest semantics are irrelevant — entries
+/// are refreshed on every ENTRY).
+/// (allow(dead_code): the INSERT path is aarch64-hot-only; the type +
+/// cap stay host-independent for the z403 test suite.)
+#[allow(dead_code)]
+const Z403_ENTRY_STASH_CAP: usize = 4096;
+
+type Z403EntryStash = std::collections::HashMap<libc::pid_t, (i64, u64, u64)>;
+static Z403_ENTRY_STASH: std::sync::OnceLock<std::sync::Mutex<Z403EntryStash>> =
+    std::sync::OnceLock::new();
+
+/// 6-Z403: record (nr, fp=x29, lr=x30) at a syscall-ENTRY stop.
+/// (allow(dead_code): called only from the aarch64 ENTRY hook — the
+/// x86_64 lib build never references it; kept host-independent so the
+/// z403 tests exercise the same code.)
+#[allow(dead_code)]
+fn z403_entry_stash_insert(tid: libc::pid_t, nr: i64, fp: u64, lr: u64) {
+    let m = Z403_ENTRY_STASH.get_or_init(|| std::sync::Mutex::new(Z403EntryStash::new()));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() >= Z403_ENTRY_STASH_CAP && !g.contains_key(&tid) {
+        g.clear();
+    }
+    g.insert(tid, (nr, fp, lr));
+}
+
+/// 6-Z403: fetch the last ENTRY-stashed (nr, fp, lr) for a tid.
+fn z403_entry_stash_get(tid: libc::pid_t) -> Option<(i64, u64, u64)> {
+    let m = Z403_ENTRY_STASH.get_or_init(|| std::sync::Mutex::new(Z403EntryStash::new()));
+    let g = m.lock().unwrap_or_else(|e| e.into_inner());
+    g.get(&tid).copied()
+}
+
+/// 6-Z403: drop a tid's stash (death bookkeeping — keeps the map tight).
+fn z403_entry_stash_remove(tid: libc::pid_t) {
+    if let Some(m) = Z403_ENTRY_STASH.get() {
+        m.lock().unwrap_or_else(|e| e.into_inner()).remove(&tid);
+    }
+}
+
+/// 6-Z403 wake-census record: (wake-calls, woken-total, last-wake).
+type Z403WakeCensus = std::collections::HashMap<(libc::pid_t, u64), (u64, u64, std::time::Instant)>;
+static Z403_WAKE_CENSUS: std::sync::OnceLock<std::sync::Mutex<Z403WakeCensus>> =
+    std::sync::OnceLock::new();
+const Z403_WAKE_CENSUS_CAP: usize = 128;
+
+/// 6-Z403: record one wake-family futex issue (tid, uaddr, nr_woken).
+/// (allow(dead_code): called only from the aarch64 ENTRY hook — see
+/// z403_entry_stash_insert.)
+#[allow(dead_code)]
+fn z403_wake_census_record(tid: libc::pid_t, uaddr: u64, woken: u32) {
+    let m = Z403_WAKE_CENSUS.get_or_init(|| std::sync::Mutex::new(Z403WakeCensus::new()));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let e = g
+        .entry((tid, uaddr))
+        .or_insert((0u64, 0u64, std::time::Instant::now()));
+    e.0 = e.0.saturating_add(1);
+    e.1 = e.1.saturating_add(woken as u64);
+    e.2 = std::time::Instant::now();
+    if g.len() > Z403_WAKE_CENSUS_CAP {
+        // Evict the OLDEST last-seen entry (bounded, rare path).
+        if let Some(oldest) = g.iter().min_by_key(|(_, v)| v.2).map(|(k, _)| *k) {
+            g.remove(&oldest);
+        }
+    }
+}
+
+/// 6-Z403: sum the census across ALL tids for one uaddr —
+/// (total wake-calls, total woken, age of the most recent wake).
+fn z403_wake_census_lookup(uaddr: u64) -> Option<(u64, u64, std::time::Duration)> {
+    let m = Z403_WAKE_CENSUS.get_or_init(|| std::sync::Mutex::new(Z403WakeCensus::new()));
+    let g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let mut calls = 0u64;
+    let mut woken = 0u64;
+    let mut last: Option<std::time::Instant> = None;
+    for ((_, ua), (c, w, t)) in g.iter() {
+        if *ua == uaddr {
+            calls = calls.saturating_add(*c);
+            woken = woken.saturating_add(*w);
+            last = Some(match last {
+                Some(prev) if prev > *t => prev,
+                _ => *t,
+            });
+        }
+    }
+    if calls == 0 {
+        None
+    } else {
+        Some((calls, woken, last.map(|t| t.elapsed()).unwrap_or_default()))
+    }
+}
+
 /// 6-Z271f: forensic dump for one blocked-in-syscall tracee.
 ///
 /// /proc/<pid>/syscall exposes the REAL syscall nr, its 6 argument
@@ -11543,7 +11711,19 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                 std::sync::atomic::AtomicU64::new(0);
             const STACK_WINDOW_CAP: u64 = 24;
             const STACK_FRAMES_CAP: usize = 12;
-            const STACK_WINDOW_BYTES: usize = 512; // 64 aarch64 words
+            // 6-Z403: futex stalls get a 4x-deeper word-scan window (2048 B
+            // = 256 words). rn357's SF-main scan found only a vdso residue
+            // in 512 B; deep wrappers (bionic cond/mutex -> linker ->
+            // caller) spill their records further up. The fd-shaped waits
+            // keep 512 B (their chains proved shallow). The fp-CHAIN walk
+            // below is the primary oracle now; this is the fallback.
+            const STACK_WINDOW_BYTES_FUTEX: usize = 2048;
+            const STACK_WINDOW_BYTES_DEFAULT: usize = 512; // 64 aarch64 words
+            let stack_window_bytes = if nr == 98 {
+                STACK_WINDOW_BYTES_FUTEX
+            } else {
+                STACK_WINDOW_BYTES_DEFAULT
+            };
 
             let fresh = {
                 let mut seen = STACK_SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -11556,29 +11736,104 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                 if !is_system_server_thread {
                     STACK_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                match peek_guest_bytes(pid, sp, STACK_WINDOW_BYTES) {
-                    Some(bytes) => {
-                        let words: Vec<u64> = bytes
-                            .chunks_exact(8)
-                            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
-                            .collect();
-                        let mut frames = 0usize;
-                        for (i, w) in words.iter().enumerate() {
-                            if frames >= STACK_FRAMES_CAP {
-                                break;
+
+                // ── 6-Z403: fp-chain walk from the ENTRY-stashed x29 ──
+                // The 6-Z285 heuristic scans the stack for a frame record,
+                // but bionic syscall wrappers are leaf functions compiled
+                // without frame records: x29 (fp) lives in a REGISTER
+                // across the wrapper, so no (fp,ret) pair exists near sp.
+                // The tracer HOLDS x29/x30 at every syscall-ENTRY stop —
+                // stash them (6-Z403 ENTRY hook) and walk the chain from
+                // the stash at stall time. Frames do not move while the
+                // thread is parked. When the blocking syscall's ENTRY was
+                // seen, this names the waiting caller function outright.
+                // A stale ENTRY (nr mismatch / missed entry under stop-
+                // storm load) degrades to the word-scan fallback below.
+                // ── 6-Z403: the word-scan skip flag (set by the fp-chain
+                // walk above when it names the callers).
+                let mut z403_word_scan_done = false;
+                {
+                    let mut z403_frames = 0usize;
+                    if let Some((stashed_nr, mut zfp, _zlr)) = z403_entry_stash_get(pid) {
+                        // Accept the stash only if its fp is a readable
+                        // frame record whose ret is executable. lr is NOT
+                        // used as frame0 — at ENTRY it is the wrapper's
+                        // own caller (already in the chain via [fp+8]).
+                        if let Some(rec) = read_child_bytes(pid, zfp, 16) {
+                            let next = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+                            let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+                            let ret_exec = maps_region_for_pc(pid, ret).contains(" r-xp ");
+                            if z403_frame_record_valid(next, ret, ret_exec) {
+                                let stale = if stashed_nr == nr {
+                                    String::new()
+                                } else {
+                                    format!(" (stale ENTRY nr={})", stashed_nr)
+                                };
+                                for depth in 0..STACK_FRAMES_CAP {
+                                    let Some(rec) = read_child_bytes(pid, zfp, 16) else {
+                                        break;
+                                    };
+                                    let next = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+                                    let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+                                    if ret == 0 {
+                                        break;
+                                    }
+                                    let r = maps_region_for_pc(pid, ret);
+                                    if r.is_empty() {
+                                        break;
+                                    }
+                                    z403_frames += 1;
+                                    crate::trace_log_line(&format!(
+                                        "6-Z403 BT: pid={} nr={} {} frame={} ret={:#x} {}{}",
+                                        pid,
+                                        nr,
+                                        arg_label,
+                                        depth,
+                                        ret,
+                                        r,
+                                        if depth == 0 { stale.as_str() } else { "" }
+                                    ));
+                                    if next <= zfp || next & 7 != 0 {
+                                        break;
+                                    }
+                                    zfp = next;
+                                }
                             }
-                            // A return address is a mapped code pointer; skip
-                            // stack/frame data (sp-region values are near sp,
-                            // small ints, and non-canonical noise).
-                            if *w < 0x1000_0000 || *w == sp {
-                                continue;
-                            }
-                            let r = maps_region_for_pc(pid, *w);
-                            if r.is_empty() || !r.contains(" r-xp ") {
-                                continue;
-                            }
-                            frames += 1;
-                            crate::trace_log_line(&format!(
+                        }
+                    }
+                    if z403_frames > 0 {
+                        // The chain names the callers; the raw word-scan
+                        // would only add vdso/plt residue noise (rn357).
+                        // Skip ONLY the word-scan — the futex-word and fd
+                        // forensics further down still run.
+                        z403_word_scan_done = true;
+                    }
+                }
+
+                if !z403_word_scan_done {
+                    match peek_guest_bytes(pid, sp, stack_window_bytes) {
+                        Some(bytes) => {
+                            let words: Vec<u64> = bytes
+                                .chunks_exact(8)
+                                .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
+                                .collect();
+                            let mut frames = 0usize;
+                            for (i, w) in words.iter().enumerate() {
+                                if frames >= STACK_FRAMES_CAP {
+                                    break;
+                                }
+                                // A return address is a mapped code pointer; skip
+                                // stack/frame data (sp-region values are near sp,
+                                // small ints, and non-canonical noise).
+                                if *w < 0x1000_0000 || *w == sp {
+                                    continue;
+                                }
+                                let r = maps_region_for_pc(pid, *w);
+                                if r.is_empty() || !r.contains(" r-xp ") {
+                                    continue;
+                                }
+                                frames += 1;
+                                crate::trace_log_line(&format!(
                                 "6-Z314 STALL-STACK: pid={} nr={} {} stack[+{:#04x}]=0x{:016x} -> {}",
                                 pid,
                                 nr,
@@ -11587,9 +11842,9 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                                 w,
                                 r
                             ));
-                        }
-                        if frames == 0 {
-                            crate::trace_log_line(&format!(
+                            }
+                            if frames == 0 {
+                                crate::trace_log_line(&format!(
                                 "6-Z314 STALL-STACK: pid={} nr={} {} — {} words read, none in r-xp mappings (stack window may be beyond the frames; raw first 8: {:02x?})",
                                 pid,
                                 nr,
@@ -11597,15 +11852,16 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                                 words.len(),
                                 &bytes[..bytes.len().min(64)]
                             ));
+                            }
                         }
-                    }
-                    None => {
-                        crate::trace_log_line(&format!(
+                        None => {
+                            crate::trace_log_line(&format!(
                             "6-Z314 STALL-STACK: pid={} nr={} {} — stack window at sp={:#x} UNREADABLE",
                             pid, nr, arg_label, sp
                         ));
+                        }
                     }
-                }
+                } // if !z403_word_scan_done
             }
         }
     }
@@ -12020,7 +12276,38 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                         }
                     }
                 } else if w != 0 {
-                    format!("nonzero word {:#x} (possibly tid={} holder)", w, w)
+                    // 6-Z403: a word that is neither a bionic normal-mutex
+                    // state (0/1/2) nor PI/robust is CANDIDATE-tid-shaped
+                    // (glibc-style owner word, or plain data — a condvar/
+                    // sequence counter like rn357's 0xc91=3217). Probe the
+                    // candidate's live state; the probe distinguishes
+                    // "tid 3217 is a real parked/running thread" from
+                    // "0xc91 is just a counter".
+                    if z403_word_is_candidate_tid(w) {
+                        let task_dir = format!("/proc/{}/task/{}", pid, w);
+                        if std::path::Path::new(&task_dir).exists() {
+                            let comm = std::fs::read_to_string(format!("{}/comm", task_dir))
+                                .map(|c| c.trim().to_string())
+                                .unwrap_or_default();
+                            let wch = std::fs::read_to_string(format!("{}/wchan", task_dir))
+                                .map(|c| c.trim().to_string())
+                                .unwrap_or_default();
+                            let hsys = std::fs::read_to_string(format!("{}/syscall", task_dir))
+                                .map(|c| c.split_whitespace().next().unwrap_or("?").to_string())
+                                .unwrap_or_default();
+                            format!(
+                                "word {:#x} (candidate holder tid={} ALIVE comm={:?} wchan={:?} syscall_nr={} — 6-Z403)",
+                                w, w, comm, wch, hsys
+                            )
+                        } else {
+                            format!(
+                                "word {:#x} (candidate holder tid={} DEAD/gone — abandoned word or counter — 6-Z403)",
+                                w, w
+                            )
+                        }
+                    } else {
+                        format!("nonzero word {:#x} (possibly tid={} holder)", w, w)
+                    }
                 } else {
                     "zero (uncontended or not a mutex word)".to_string()
                 };
@@ -12028,6 +12315,36 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                     "6-Z271f STALL-DUMP: pid={} futex uaddr={:#x} op={} word={:#x} — {}",
                     pid, a0, a1, w, desc
                 ));
+                // 6-Z403: the WAKE-CENSUS line — did ANY thread ever issue
+                // a wake-family futex on this uaddr? "woken N times, last
+                // +Xs ago" vs "NEVER woken" decides lost-wakeup vs
+                // never-started-signalizer. Once per (pid, uaddr) episode.
+                {
+                    use std::collections::HashSet;
+                    use std::sync::Mutex as Z403Mutex;
+                    static WAKE_CENSUS_SEEN: Z403Mutex<Option<HashSet<(libc::pid_t, u64)>>> =
+                        Z403Mutex::new(None);
+                    let fresh = {
+                        let mut seen = WAKE_CENSUS_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                        seen.get_or_insert_with(HashSet::new).insert((pid, a0))
+                    };
+                    if fresh {
+                        match z403_wake_census_lookup(a0) {
+                            Some((calls, woken, ago)) => crate::trace_log_line(&format!(
+                                "6-Z403 WAKE-CENSUS: pid={} uaddr={:#x} wake-calls={} woken-total={} last-wake={:.1}s ago",
+                                pid,
+                                a0,
+                                calls,
+                                woken,
+                                ago.as_secs_f32()
+                            )),
+                            None => crate::trace_log_line(&format!(
+                                "6-Z403 WAKE-CENSUS: pid={} uaddr={:#x} wakes=NEVER (no wake-family futex ever issued on this address)",
+                                pid, a0
+                            )),
+                        }
+                    }
+                }
             }
             None => crate::trace_log_line(&format!(
                 "6-Z271f STALL-DUMP: pid={} futex uaddr={:#x} UNREADABLE (pvm+peek both failed)",
@@ -21048,6 +21365,39 @@ pub fn run_ptrace_loop(
                     },
                     nr: syscall_num,
                 });
+
+                // ── 6-Z403: ENTRY-side fp/lr stash + FUTEX_WAKE census ──
+                // At every AArch64 syscall ENTRY the tracer HOLDS x29 (fp)
+                // and x30 (lr) in `regs` — stash them so the stall-time
+                // 6-Z403 fp-chain walk can name a parked thread's caller
+                // (bionic syscall wrappers keep no frame records on the
+                // stack; x29 lives in a register across the wrapper — see
+                // the 6-Z403 block at stall_forensic_dump). PLUS: record
+                // every wake-family futex (uaddr-keyed census) so a
+                // futex-WAIT stall can be classified lost-wakeup vs
+                // never-signaled in one line. Both cost nothing on the
+                // hot path (a map overwrite + a rare-op check).
+                #[cfg(target_arch = "aarch64")]
+                if is_entry && !pid_is_arm32(pid) {
+                    // AArch64 user_pt_regs: x29 = index 29, x30 = index 30
+                    // (same flat-index view the abi uses: reg_sp = 31).
+                    let z403_fp = get_syscall_arg(&regs, 29);
+                    let z403_lr = get_syscall_arg(&regs, 30);
+                    z403_entry_stash_insert(pid, syscall_num, z403_fp, z403_lr);
+                    if syscall_num == 98 {
+                        let z403_op = get_syscall_arg(&regs, abi.reg_arg2);
+                        if z403_futex_op_is_wake_family(z403_op) {
+                            let z403_uaddr = get_syscall_arg(&regs, abi.reg_arg1);
+                            // arg3 (x2) = nr_woken / val for the wake family.
+                            let z403_val = get_syscall_arg(&regs, abi.reg_arg3);
+                            z403_wake_census_record(
+                                pid,
+                                z403_uaddr,
+                                (z403_val & 0xFFFF_FFFF) as u32,
+                            );
+                        }
+                    }
+                }
 
                 // ── 6-Z305c: death-window full-fidelity trace ──
                 // 6-Z305h: same-page mprotect flips are excluded from the
@@ -50429,5 +50779,120 @@ mod z394_inherit_tests {
             false,
             Z388_CRASH_DUMP_TAG_CAP + 1
         ));
+    }
+}
+
+#[cfg(test)]
+mod z403_stall_forensics_tests {
+    use super::{
+        z403_frame_record_valid, z403_futex_op_is_wake_family, z403_wake_census_lookup,
+        z403_wake_census_record, z403_word_is_candidate_tid, Z403_WAKE_CENSUS_CAP,
+    };
+
+    /// The wake-family truth table (linux/futex.h): WAKE(1), REQUEUE(3),
+    /// CMP_REQUEUE(4), WAKE_OP(5), WAKE_BITSET(10) move waiters; every
+    /// other op — including rn357's op=137 (WAIT_BITSET|PRIVATE) — does
+    /// NOT. A misclassification would poison the census (a WAIT counted
+    /// as a wake would fabricate "woken N times" evidence).
+    #[test]
+    fn z403_wake_family_truth_table() {
+        // Wake family — with and without the PRIVATE flag (128) and
+        // CLOCK_REALTIME (256).
+        for op in [1u64, 3, 4, 5, 10] {
+            assert!(z403_futex_op_is_wake_family(op), "op {} is wake", op);
+            assert!(
+                z403_futex_op_is_wake_family(op | 128),
+                "op {}|PRIVATE is wake",
+                op
+            );
+            assert!(
+                z403_futex_op_is_wake_family(op | 256),
+                "op {}|REALTIME is wake",
+                op
+            );
+        }
+        // Wait family / PI family / the rn357 observed op.
+        for op in [0u64, 2, 6, 7, 8, 9, 11, 12, 13, 137, 137 | 128] {
+            assert!(!z403_futex_op_is_wake_family(op), "op {} is NOT wake", op);
+        }
+    }
+
+    /// Candidate-tid shape: >2 (bionic 0/1/2 states), <= 0x100_0000 (the
+    /// 6-Z306i candidate ceiling), no PI/robust bit 30. 3217 (rn357's
+    /// word) IS a candidate; 0x4000_0021 (PI) and huge words are NOT.
+    #[test]
+    fn z403_word_shape_truth_table() {
+        assert!(z403_word_is_candidate_tid(3217), "0xc91 = rn357 word");
+        assert!(z403_word_is_candidate_tid(100));
+        assert!(!z403_word_is_candidate_tid(0), "unlocked");
+        assert!(!z403_word_is_candidate_tid(1), "bionic locked");
+        assert!(!z403_word_is_candidate_tid(2), "bionic locked+waiters");
+        assert!(
+            !z403_word_is_candidate_tid(0x4000_0021),
+            "PI/robust bit set"
+        );
+        assert!(
+            !z403_word_is_candidate_tid(0x200_0000),
+            "above the candidate ceiling"
+        );
+    }
+
+    /// Frame-record validity: ret nonzero + ret executable; next is a
+    /// chain end (0) or 8-aligned. Unaligned next or zero ret rejects.
+    #[test]
+    fn z403_frame_record_truth_table() {
+        assert!(z403_frame_record_valid(0x1000, 0x2000, true));
+        assert!(z403_frame_record_valid(0, 0x2000, true), "chain end");
+        assert!(
+            !z403_frame_record_valid(0x1000, 0x2000, false),
+            "ret not executable"
+        );
+        assert!(!z403_frame_record_valid(0x1000, 0, true), "ret == 0");
+        assert!(
+            !z403_frame_record_valid(0x1003, 0x2000, true),
+            "unaligned next"
+        );
+    }
+
+    /// Census record + lookup: two tids waking the SAME uaddr sum in the
+    /// lookup; a different uaddr stays invisible; per-test isolation via
+    /// unique address ranges (the census is a process-wide global and
+    /// Rust tests run in parallel).
+    #[test]
+    fn z403_census_record_and_lookup() {
+        let base: u64 = 0x0000_5A03_0000_0000; // unique per-test range
+        z403_wake_census_record(4100, base + 0x100, 3);
+        z403_wake_census_record(4100, base + 0x100, 1);
+        z403_wake_census_record(4101, base + 0x100, 2);
+        let (calls, woken, _ago) =
+            z403_wake_census_lookup(base + 0x100).expect("census must see the uaddr");
+        assert!(calls >= 3, "wake-calls summed across tids: {}", calls);
+        assert!(woken >= 6, "woken-total summed: {}", woken);
+        assert!(
+            z403_wake_census_lookup(base + 0x2FF).is_none(),
+            "an address never woken must report NONE"
+        );
+    }
+
+    /// The census is bounded: inserting CAP + 50 distinct addrs keeps the
+    /// map at <= CAP (oldest-evicted) and every entry is still findable
+    /// by uaddr (the eviction drops whole keys, never silently truncates
+    /// counts).
+    #[test]
+    fn z403_census_is_bounded() {
+        let base: u64 = 0x0000_5A04_0000_0000; // unique per-test range
+        for i in 0..(Z403_WAKE_CENSUS_CAP + 50) {
+            z403_wake_census_record(4200 + (i as libc::pid_t % 7), base + (i as u64) * 8, 1);
+        }
+        // The first-recorded address of THIS test may have been evicted,
+        // but any address still present must report consistent shape.
+        let mut found = 0;
+        for i in 0..(Z403_WAKE_CENSUS_CAP + 50) {
+            if z403_wake_census_lookup(base + (i as u64) * 8).is_some() {
+                found += 1;
+            }
+        }
+        assert!(found >= 1, "recent entries must survive");
+        assert!(found <= Z403_WAKE_CENSUS_CAP, "cap holds: {}", found);
     }
 }
