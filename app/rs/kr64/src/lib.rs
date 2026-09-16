@@ -318,6 +318,44 @@ pub(crate) fn trace_log_line_critical(msg: &str) {
     trace_log_flush();
 }
 
+// ── 6-Z391: the drop-proof socket-bootstrap diag channel ─────────────
+//
+// rn348 left a decode-blocking asymmetry: init's tombstoned socket
+// bootstrap failed RAW at fchmodat (kmsg: "Failed to fchmodat socket
+// '/dev/socket/tombstoned_crash': No such file or directory", 3 sockets
+// × 2+ service starts, deterministic) while the 6-Z258 ENTRY
+// translation demonstrably fired for the sibling fchownat of the SAME
+// socket — and neither the 6-Z258 fchmodat line NOR the 6-Z305t-52
+// EXIT-catch line appeared in the (lossy) stderr capture. The tracer's
+// stderr sink is NB-drop-lossy exactly under the diagnostic pressure
+// this window generates, so absence-of-line is NOT evidence there.
+// The {rootfs}/dev/__kmsg__ mirror, by contrast, reached the artifacts
+// complete (every init PLOG line survived).
+//
+// z391_klog writes a bounded diagnostic DIRECTLY to that mirror
+// (host-side append; the file is a regular file inside the rootfs the
+// tracer owns). Lines use the guest klog shape the ladder already
+// collects ("<6>[kr64] ..."), so rn350 carries the socket family's
+// full decision trace REGARDLESS of stderr pressure.
+//
+// Bounded: 96 lines per boot (a socket bootstrap emits ≤3 per socket;
+// a normal boot sees ~5 sockets). Cost: one open/append/close per
+// line, only on the socket-bootstrap path.
+pub(crate) fn z391_klog(rootfs: &str, msg: &str) {
+    static Z391_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = Z391_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 96 {
+        return;
+    }
+    let path = format!("{}/dev/__kmsg__", rootfs);
+    let line = format!("<6>[kr64] 6-Z391 +{}ms {}\n", boot_elapsed_ms(), msg);
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
 // ── 6-Z384: atexit tail-drain ────────────────────────────────────────
 //
 // `std::process::exit` (main.rs) does NOT unwind: locals are not

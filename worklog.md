@@ -30502,3 +30502,20 @@ Stage Summary:
 - NEW HIGH-WATER MARK: guest guest-GL handshake (context+surface+current) completed on stock A11 — the previous "frozen composer" wall is not the frontier anymore.
 - EXPECT rn349 (on this commit): no "destroyed mutex" abort for the app lifetime; the boot proceeds past the first GL handshake churn; if the stderr stall recurs it is now isolated from the run-ender and decodable with live renderer logcat.
 - Next decode order: (1) rn349 -> if new wall, name it; (2) the stderr-stall observability fix so boot-timeline forensics stop going blind at +17s; (3) guest tombstoned "failed to get socket from init: Permission denied" class (init-created socket perms) — tombstones are still required for the debuggerd interop story.
+
+---
+Task ID: 130 (rn348 residual decode queued: the tombstoned socket fchmodat asymmetry + the lossy-stderr observability fix, 6-Z390 + 6-Z391 landed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn348 guest-kmsg decode: init's tombstoned socket bootstrap fails DETERMINISTICALLY at fchmodat ("Could not create socket 'tombstoned_crash'/'tombstoned_intercept'/'tombstoned_java_trace': Failed to fchmodat socket '/dev/socket/…': No such file or directory") → tombstoned "failed to get socket from init: Permission denied" → fatal 6 → crash-loop → NO guest tombstones ever. Task 128's "self-heals on the 3rd start" is DISPROVEN by rn348 (every captured start fails the same way).
+- Asymmetry named: the 6-Z258 ENTRY translation fired for the sibling fchownat of the SAME socket (stderr: "6-Z258: fchownat(\"/dev/socket/tombstoned_crash\") path translated") while the fchmodat left NO trace — no 6-Z258 line, no 6-Z257 getpid fallback line, no 6-Z305t-52 EXIT-catch line. All in-arm decline branches DO log via log(); the tracer's stderr sink is NB-drop-lossy exactly under this window's diagnostic pressure, so absence-of-line is NOT evidence.
+- Investigated and RULED OUT: seccomp trapping (SYS_fchmodat is in the ALLOW bucket, seccomp.rs), a first-match-wins nr collision (aarch64 chmod=53 vs fchmodat=53 — no earlier arm tests abi.chmod in the ENTRY dispatch), scratch-unreserved silence (scratch==0 → getpid rewrite, logged).
+- 6-Z390 (eb76017f, pushed): periodic 5s live heartbeat through trace_log_line_critical — disambiguates "no emission / no flush / no write" for the rn348 stderr-silent-window class. CI #1916 green.
+- 6-Z391 (this commit): z391_klog — a drop-proof diagnostic channel written DIRECTLY to the {rootfs}/dev/__kmsg__ mirror (host-side append, <6>[kr64] line shape, bounded 96 lines/boot). Wired at: (a) the 6-Z258 fchmodat/fchownat ENTRY arm top (nr, pid, dirfd, path — every arm hit), (b) the arm's final decision (translated / getpid-rewritten / left-real), (c) the 6-Z305t-52 EXIT catch gate state (raw return, path, backing-exists). rn350 will carry the complete socket-family decision trace regardless of stderr pressure.
+- Local gates: rustfmt clean, clippy -D warnings clean, 921/921 tests pass.
+
+Stage Summary:
+- The tombstoned socket fix is now ONE decode away: rn350's kmsg mirror will show whether fchmodat's ENTRY ever reaches the 6-Z258 arm (routing miss) or reaches it and declines (translator/scratch) — each outcome names a different one-line fix.
+- EXPECT rn350: "6-Z391 ENTRY fchmodat/fchownat ..." + "DECISION ..." lines in dev-__kmsg__ around every init socket bootstrap; 6-Z390 HB lines every ~5s in the stderr capture; no destroyed-mutex abort (6-Z389 riding along).
+- rn349 (6-Z389 only) still in flight — its verdict gates the renderer fix independently.
