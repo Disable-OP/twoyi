@@ -30537,3 +30537,21 @@ Work Log:
 Stage Summary:
 - Mission chain this session: rn348 (run-ender decoded → 6-Z389) → rn349 (fix verified; wall thread-pinned → 6-Z390/6-Z391/6-Z392 instrumentation). The composer freeze's Mechanism (which code path leaves consumed ENTRYs unresumed / drops pids from tracked_pids) is the next decode; rn350's kmsg mirror will carry ENTRY+DECISION (6-Z391) and T-STOP recurrences (6-Z392) for it.
 - rn350 to dispatch on this commit (6-Z389+390+391+392).
+
+---
+Task ID: 132 (rn350 decoded — the 6-Z390/6-Z391 channels VERIFIED live; my own z391 budget ate the +30s evidence; budget-discipline fix landed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn350 (#350, 4f9961e9) decoded (/home/z/artifacts-rn350). Verdict rung 7. Channel results:
+  * 6-Z390 HB: 123 lines, last at +615334ms — the stderr chain SURVIVED the whole 10-minute run (the rn348 +17.4s silent-window class is ELIMINATED).
+  * 6-Z389: still no destroyed-mutex aborts.
+  * 6-Z391: 92 lines landed — but the shared 96-line budget was exhausted at +1.46s by init's early chmod/fchownat storms (/proc/self/fd/*, cgroup dirs — 46 calls in the first 900ms). The tombstoned window (+8.4s) and every later line were buried by MY OWN cap.
+  * 6-Z392: zero lines — same root cause (the watchdog's +30s writes hit the exhausted budget).
+  * The COMPOSER FREEZE REPRODUCED (composer 3055 main+Binder+tids in 't' again, PLUS neuralnetworks@1.3-service-sample-all main thread 't' — a MULTIPLE-HAL freeze class) — confirmed NOT a one-run fluke, and confirmed real despite the watchdog's silence.
+- Budget-discipline fix landed (this commit): 6-Z391 ENTRY/DECISION/EXIT-CATCH lines now gated to /dev/socket paths only (the actual decode target; init's cgroup/fd chmod storms no longer consume the budget); the 6-Z392 watchdog gets its OWN 64-line budget (z392_klog, same channel).
+- Local gates: fmt clean, clippy -D warnings clean, 921/921 tests.
+
+Stage Summary:
+- EXPECT rn351: (a) 6-Z391 ENTRY/DECISION lines for /dev/socket/* around +8s INCLUDING the tombstoned fchmodat (the missing evidence for the one-line fix), (b) 6-Z392 T-STOP lines naming every frozen HAL (composer + neuralnetworks + ...) with tracked-truth at 30s cadence.
+- The composer/neuralnetworks multi-HAL ptrace-stop freeze is now the primary frontier; the tombstoned fchmodat asymmetry is one budget-clean run away from its decode.

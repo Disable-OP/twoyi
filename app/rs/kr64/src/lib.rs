@@ -356,6 +356,25 @@ pub(crate) fn z391_klog(rootfs: &str, msg: &str) {
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
+/// 6-Z392's own budget (rn350 decode: the shared 96-line z391 budget was
+/// exhausted at +1.46s by init's early chmod/fchownat storms — the
+/// +30s watchdog lines silently hit the cap and never reached the
+/// mirror). Same channel, independent counter.
+pub(crate) fn z392_klog(rootfs: &str, msg: &str) {
+    static Z392_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = Z392_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 64 {
+        return;
+    }
+    let path = format!("{}/dev/__kmsg__", rootfs);
+    let line = format!("<6>[kr64] 6-Z392 +{}ms {}\n", boot_elapsed_ms(), msg);
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
 // ── 6-Z384: atexit tail-drain ────────────────────────────────────────
 //
 // `std::process::exit` (main.rs) does NOT unwind: locals are not
