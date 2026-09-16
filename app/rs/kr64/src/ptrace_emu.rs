@@ -14749,6 +14749,31 @@ fn stop_ring_drain(reason: &str, tracked: &[libc::pid_t]) -> Vec<String> {
         "6-Z260 STOP-RING DUMP (reason={}, lines={}): ── last {} resume/stop pairs before this anomaly ──",
         reason, n, n
     ));
+    // 6-Z385: the HOT-SPIN census. rn342's wall-shape: SurfaceFlinger's
+    // main thread churned millions of syscall-stops (+51.7s sample,
+    // 6-Z213 RAW STOP #5063328) WITHOUT ever completing init()'s
+    // addService — the ring dump showed the churn but named neither the
+    // syscall nor the code. A spinning pid dominates the ring window;
+    // /proc/<pid>/syscall exposes its REAL current nr + args + sp + pc
+    // without a ptrace stop, and the maps resolve the pc's library.
+    // One bounded census line per dump (top spinner only, >=25% share
+    // and >=48 stops) names the spin in one run.
+    {
+        let mut counts: std::collections::HashMap<libc::pid_t, usize> =
+            std::collections::HashMap::new();
+        for ev in &drained {
+            if let StopRingEvent::RawStop { pid, .. } = ev {
+                *counts.entry(*pid).or_insert(0) += 1;
+            }
+        }
+        let mut ranked: Vec<(libc::pid_t, usize)> = counts.into_iter().collect();
+        ranked.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        if let Some(&(top_pid, top_count)) = ranked.first() {
+            if top_count >= 48 && top_count * 4 >= n {
+                out.extend(hot_spin_probe(top_pid, top_count, n));
+            }
+        }
+    }
     out.extend(
         drained
             .into_iter()
@@ -14757,6 +14782,38 @@ fn stop_ring_drain(reason: &str, tracked: &[libc::pid_t]) -> Vec<String> {
     out.push(format!(
         "6-Z260 STOP-RING DUMP (reason={}): ── end ──",
         reason
+    ));
+    out
+}
+
+/// 6-Z385: the hot-spin procfs probe — the real syscall (nr + 6 args +
+/// sp + pc) from the task's saved register state, plus wchan/comm and
+/// the maps[pc] module resolution. Best-effort: every read failure is
+/// reported, never fatal.
+fn hot_spin_probe(pid: libc::pid_t, top_count: usize, total: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .map(|c| c.trim().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    let syscall = std::fs::read_to_string(format!("/proc/{}/syscall", pid))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|e| format!("read failed: {}", e));
+    let wchan = std::fs::read_to_string(format!("/proc/{}/wchan", pid))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    // The pc is the 9th field of /proc/<pid>/syscall ("nr a0..a5 sp pc").
+    let pc = syscall
+        .split_whitespace()
+        .nth(8)
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+    let pc_resolved = pc.and_then(|pc_val| {
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
+        let rows = z306af_parse_exec_maps(&maps);
+        z306af_resolve_pc(&rows, pc_val)
+    });
+    out.push(format!(
+        "6-Z385 HOT-SPIN: pid={} comm={:?} stops={}/{} of the dump window — syscall={:?} wchan={:?} pc={:?} maps[pc]={:?}",
+        pid, comm, top_count, total, syscall, wchan, pc, pc_resolved
     ));
     out
 }
@@ -41059,8 +41116,17 @@ mod tests {
         // header first, footer last
         assert!(out[0].starts_with("6-Z260 STOP-RING DUMP (reason=z260-cap-test,"));
         assert!(out[out.len() - 1].starts_with("6-Z260 STOP-RING DUMP (reason=z260-cap-test)"));
+        // 6-Z385: pid 4242 owns 100% of this window (>=48 stops, >=25%
+        // share), so the HOT-SPIN census line MUST follow the header —
+        // it probes a fake pid, so every procfs read reports its
+        // failure but the line itself always renders.
+        assert!(
+            out[1].starts_with("6-Z385 HOT-SPIN: pid=4242 comm=\"?\" stops=1200/1200"),
+            "hot-spin census line missing or wrong shape: {}",
+            out[1]
+        );
         // payload bounded by the cap, and it holds the NEWEST lines
-        let payload = out.len() - 2;
+        let payload = out.len() - 3;
         assert_eq!(payload, STOP_RING_CAP);
         // 6-Z267: records render at dump time — the oldest survivor is
         // the event pushed at i=100 (seq=101) and the newest at
@@ -41078,7 +41144,7 @@ mod tests {
             },
             &[],
         );
-        assert_eq!(out[1], expect_first); // oldest survivor
+        assert_eq!(out[2], expect_first); // oldest survivor
         let expect_last = stop_ring_event_render(
             StopRingEvent::RawStop {
                 seq: (STOP_RING_CAP + 100) as u64,
