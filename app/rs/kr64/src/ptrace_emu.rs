@@ -34264,7 +34264,24 @@ pub fn run_ptrace_loop(
                                     pid, ret, emulated_prctl_ret(prctl_option, prctl_arg2)
                                 ));
                             }
-                            if ret >= 0 {
+                            // 6-Z382 FIX: the fake is UNCONDITIONAL now.
+                            // The stash guarantees the 6-Z147 ENTRY arm
+                            // saw THIS syscall — the guest must see the
+                            // emulated return WHATEVER the host answered.
+                            // rn340 probe evidence: minijail's
+                            // prctl(PR_SET_SECCOMP, 2, prog) came back
+                            // host_ret=-14/EFAULT then -13/EACCES (the
+                            // REAL prctl executed host-side — the prog
+                            // pointer is a guest address the host cannot
+                            // read, and the tracee has no real NNP), and
+                            // the old `if ret >= 0` gate SKIPPED the fake
+                            // on those negatives — the guest saw the raw
+                            // EACCES and pdie'd. The gate made sense only
+                            // while the nr rewrite always stuck (the
+                            // getpid proxy is >= 0); it betrays every
+                            // call where the host answered the real
+                            // syscall.
+                            {
                                 let emulated = emulated_prctl_ret(prctl_option, prctl_arg2);
                                 let mut regs_pr: Regs = unsafe { std::mem::zeroed() };
                                 if ptrace_getregs_wide(pid, &mut regs_pr).is_ok() {
