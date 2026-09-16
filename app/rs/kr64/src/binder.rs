@@ -4989,7 +4989,96 @@ fn handle_write_read(
                     // guest poll loop can't pin the tracer (see the 6-Z268
                     // analysis in the original comment history).
                     std::thread::sleep(IDLE_POLL_TICK);
-                    push_br_noop(&mut read_buf);
+                    // 6-Z383: RE-CHECK the conn's OWN inbox after the idle
+                    // tick — a transaction may have been queued DURING the
+                    // sleep, and the kernel delivers proc-todo work to a
+                    // waiting looper thread instead of answering BR_NOOP.
+                    // rn341 decode (the SF display race): SF's main thread
+                    // parked in a read waiting for the registerCallback
+                    // reply; the composer's onHotplug arrived mid-sleep;
+                    // the parked read answered BR_NOOP and the 6-Z271g
+                    // steal diverted the transaction to a POOL thread,
+                    // whose HWC2 dispatch blocks on SF's mStateLock (held
+                    // by main inside init()) — the hotplug event then
+                    // enqueued AFTER main's processDisplayHotplugEvents-
+                    // Locked() ran empty -> LOG_ALWAYS_FATAL "Missing
+                    // internal display" -> the SF/zygote onrestart loop
+                    // (37 cycles in rn341). Kernel truth: the waiting
+                    // looper thread takes the async work ITSELF (libhwb-
+                    // inder's waitForResponse handles an inline BR_TRANS-
+                    // ACTION; SF's onHotplugReceived then runs on MAIN
+                    // where the ConditionalLock is skipped and the event
+                    // is processed immediately — the rn337/338 direct-
+                    // delivery boots all crossed the display gate).
+                    let rechecked = {
+                        let mut b = bus.lock().expect("binder bus poisoned");
+                        match b.conns.get_mut(&conn_id) {
+                            Some(bx) => match bx.inbox.pop_front() {
+                                Some(InboxItem::Tx(tx)) => {
+                                    if tx.txn_id != 0 {
+                                        bx.txn_stack.push(tx.txn_id);
+                                        z306ag_note_stack_depth(bx.txn_stack.len());
+                                        bx.pending_in.retain(|id| *id != tx.txn_id);
+                                    }
+                                    Some(tx)
+                                }
+                                _ => None,
+                            },
+                            None => None,
+                        }
+                    };
+                    if let Some(tx) = rechecked {
+                        // The reader IS the owner process (alive by
+                        // definition — it is executing this read), so the
+                        // 6-Z354 owner-liveness gate cannot reject here.
+                        let (ds, os) = match &tx.blob {
+                            Some(bl) => (bl.data.len() as u64, bl.offsets.len() as u64),
+                            None => (0, 0),
+                        };
+                        if tx.cookie != 0 {
+                            let dpid = {
+                                let b = bus.lock().expect("binder bus poisoned");
+                                b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                            };
+                            probe_flat_mem(
+                                "delivery",
+                                &PROBE_DELIVERY_BUDGET,
+                                dpid,
+                                &format!("code={:#x}", tx.code),
+                                tx.ptr,
+                                tx.cookie,
+                            );
+                        }
+                        push_br_transaction(
+                            &mut read_buf,
+                            tx.code,
+                            tx.flags,
+                            tx.sender_pid,
+                            tx.sender_euid,
+                            tx.ptr,
+                            tx.cookie,
+                            ds,
+                            os,
+                        );
+                        if let Some(blob) = tx.blob {
+                            resp_blobs.push(blob);
+                        }
+                        {
+                            let served = {
+                                let b = bus.lock().expect("binder bus poisoned");
+                                b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                            };
+                            if served > 0 {
+                                note_served_pid(served);
+                            }
+                        }
+                        info!(
+                            "[KR64][binder][vm{}] 6-Z383 idle recheck delivered transaction conn={} <- conn={} code={} oneway={} flags=0x{:x} (tx #{})",
+                            vm_id, conn_id, tx.requester, tx.code, tx.one_way, tx.flags, tx.txn_id
+                        );
+                    } else {
+                        push_br_noop(&mut read_buf);
+                    }
                 }
             }
         }
