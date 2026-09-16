@@ -5400,6 +5400,49 @@ fn handle_transaction(
         return TransactionResult::Failed;
     };
 
+    // 6-Z380: bounded route-time parcel dump — the composer-callback
+    // wire-truth instrument (rn336 decode: the composer's onHotplug
+    // BC_TRANSACTION_SG arrived at the bus with flags LACKING
+    // TF_ONE_WAY — the only composer-origin transaction in the run,
+    // while 50 other oneway transactions carried the bit — and the
+    // HIDL callback dispatch never completed client-side; SF's main
+    // thread then waited 8.1 s for the registerCallback reply (the
+    // REPLY_TIMEOUT release), found zero pending hotplug events and
+    // LOG_ALWAYS_FATAL "Missing internal display"; the SF crash loop
+    // restarted zygote 12× via onrestart). This dump names, in one
+    // run, the SENDER-side parcel head (interface token + flat
+    // objects) and the raw flags — discriminating "the guest wrote a
+    // sync call" from "the wire lost the bit" before the bus rewrites
+    // anything.
+    static Z380_ROUTE_DUMP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(16);
+    if Z380_ROUTE_DUMP.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        Z380_ROUTE_DUMP.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let head: String = blob
+            .data
+            .iter()
+            .take(48)
+            .map(|x| format!("{:02x}", x))
+            .collect();
+        let offs: String = blob
+            .offsets
+            .iter()
+            .take(16)
+            .map(|x| format!("{:02x}", x))
+            .collect();
+        info!(
+            "[KR64][binder][svc] 6-Z380 route parcel conn={} handle=0x{:08x} code={:#x} flags=0x{:x} one_way={} dsize={} osize={} data=[{}] offs=[{}]",
+            conn_id,
+            target_handle,
+            code,
+            flags,
+            one_way,
+            blob.data.len(),
+            blob.offsets.len(),
+            head,
+            offs
+        );
+    }
+
     // 6-Z271i: SELF-TRANSACTIONS ARE LEGAL (kernel semantics). Real binder
     // queues the request on the target node's process todo list even when
     // that process is the caller's own: the requesting ioctl completes
@@ -5492,13 +5535,14 @@ fn handle_transaction(
         };
         if seen <= 16 || seen % 500 == 0 {
             info!(
-                "[KR64][binder][vm{}] routed transaction conn={} -> conn={} handle=0x{:08x} code={} oneway={} self={} [tx #{}{}]",
+                "[KR64][binder][vm{}] routed transaction conn={} -> conn={} handle=0x{:08x} code={} oneway={} flags=0x{:x} self={} [tx #{}{}]",
                 vm_id,
                 conn_id,
                 owner,
                 target_handle,
                 code,
                 one_way,
+                flags,
                 owner == conn_id,
                 seen,
                 if seen <= 16 { "" } else { " sampled" }
