@@ -648,7 +648,7 @@ jobs:
              for p in /proc/[0-9]*; do \
                n=\$(tr '\0' ' ' < \$p/cmdline 2>/dev/null); \
                case \"\$n\" in \
-                 *surfaceflinger*|*audioserver*|*mediametrics*|*mediaserver*|*zygote*|*system_server*|*vendor.ril-daemon*) \
+                 *surfaceflinger*|*audioserver*|*mediametrics*|*mediaserver*|*zygote*|*system_server*|*vendor.ril-daemon*|*graphics.composer*) \
                    f=dummy/svc-\${p#/proc/}.log; [ -f \${f#dummy/} ] && { echo \"== RAW-FULL \${f#dummy/} (\$(stat -c%s \${f#dummy/}) bytes, cmdline \$n) ==\"; cat \${f#dummy/}; } ;; \
                esac; \
              done" \
