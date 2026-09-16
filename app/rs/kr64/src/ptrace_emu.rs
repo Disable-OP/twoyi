@@ -1499,6 +1499,24 @@ struct ChildAbi {
     // the rewrite arm ABI-exact via this field:
     //   x86_64: prctl=157, aarch64: prctl=167, i386/arm32: prctl=172.
     prctl: i64,
+    // 6-Z381: the `seccomp(2)` syscall number — the OTHER filter-install
+    // entry point (libminijail ≥ 2017 prefers it over prctl(PR_SET_
+    // SECCOMP); the emulator already faked the prctl form via the
+    // 6-Z147 rewrite, but the seccomp(2) form PASSED THROUGH to the
+    // host kernel, whose unprivileged answer — no real
+    // PR_SET_NO_NEW_PRIVS is installed on the tracee, the loader's
+    // prctl fake never touched the host — is -EACCES "Permission
+    // denied". The guest's minijail then aborts the service
+    // ("prctl(seccomp_filter) failed: Permission denied") and init
+    // restarts it forever: rn338's 600 s watch measured mediaextractor
+    // 89× + vendor.media.omx 88× + media.swcodec 79× SIGABRT cycles
+    // (~7 s per cycle — ~256 restarts ≈ the entire Watchdog budget the
+    // system_server boot needs). The emulator is the kernel here: the
+    // filter is enforced virtually (the tracer's own interception
+    // layer), so the install answers SUCCESS (0) per op.
+    //   x86_64: 317, i386: 354, aarch64 (asm-generic): 277,
+    //   arm32: 383. -1 = not present on this architecture.
+    seccomp: i64,
 }
 
 // x86_64 user_regs_struct field order (as u64 array indices):
@@ -1809,6 +1827,8 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     tkill_nr: 200,
     rt_sigqueueinfo_nr: 129,
     prctl: 157,
+    // 6-Z381: x86_64 seccomp=317 (syscall_64.tbl).
+    seccomp: 317,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -2228,6 +2248,8 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     tkill_nr: 238,
     rt_sigqueueinfo_nr: 178,
     prctl: 172, // i386 prctl=172 — no getpid collision (i386 getpid=20)
+    // 6-Z381: i386 seccomp=354 (syscall_32.tbl).
+    seccomp: 354,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -2611,6 +2633,9 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // getpid; the old cross-ABI literal union poisoned every arm64
     // getpid with emulated_prctl_ret(0,0)==0 (the zygote wall).
     prctl: 167,
+    // 6-Z381: aarch64 seccomp=277 (asm-generic unistd.h). NOT 278 —
+    // 278 is getrandom.
+    seccomp: 277,
 };
 //
 // AArch32 compat mode (CONFIG_COMPAT): the kernel exposes the 72-byte
@@ -2777,6 +2802,8 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     tkill_nr: 238,
     rt_sigqueueinfo_nr: 178,
     prctl: 172, // arm32 prctl=172 — no getpid collision (arm32 getpid=20)
+    // 6-Z381: arm32 seccomp=383 (arch/arm/tools/syscall.tbl).
+    seccomp: 383,
 };
 
 /// Detect whether the traced child is a 32-bit (i386) or 64-bit (x86_64)
@@ -8804,6 +8831,10 @@ fn forget_dead_pid_state(
     netlink_fd_next: &mut std::collections::HashMap<libc::pid_t, i32>,
     fake_propserv_fds: &mut std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
     prctl_rewritten_args: &mut std::collections::HashMap<libc::pid_t, (u64, u64)>,
+    // 6-Z381: the seccomp(2) rewrite's ENTRY stash — (pid → op) with
+    // the same lifetime contract as prctl_rewritten_args (ENTRY inserts
+    // before the nr rewrite; EXIT consumes and fakes the return).
+    seccomp_rewritten_ops: &mut std::collections::HashMap<libc::pid_t, u64>,
     pending_epoll_readback: &mut std::collections::HashMap<libc::pid_t, (i64, u64, usize)>,
     pending_mount_enodev: &mut std::collections::HashSet<libc::pid_t>,
     pending_open_translated_path: &mut std::collections::HashMap<libc::pid_t, String>,
@@ -8839,6 +8870,7 @@ fn forget_dead_pid_state(
     netlink_fd_next.remove(&pid);
     fake_propserv_fds.remove(&pid);
     prctl_rewritten_args.remove(&pid);
+    seccomp_rewritten_ops.remove(&pid);
     pending_epoll_readback.remove(&pid);
     pending_mount_enodev.remove(&pid);
     pending_open_translated_path.remove(&pid);
@@ -15707,6 +15739,9 @@ pub fn run_ptrace_loop(
     // could start).
     let mut prctl_rewritten_args: std::collections::HashMap<libc::pid_t, (u64, u64)> =
         std::collections::HashMap::new();
+    // 6-Z381: the seccomp(2) rewrite stash (see ChildAbi.seccomp).
+    let mut seccomp_rewritten_ops: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
 
     // ── Task 6-V diagnostic state ────────────────────────────────────
     //
@@ -18013,6 +18048,7 @@ pub fn run_ptrace_loop(
                 &mut netlink_fd_next,
                 &mut fake_propserv_fds,
                 &mut prctl_rewritten_args,
+                &mut seccomp_rewritten_ops,
                 &mut pending_epoll_readback,
                 &mut pending_mount_enodev,
                 &mut pending_open_translated_path,
@@ -18333,6 +18369,7 @@ pub fn run_ptrace_loop(
                 &mut netlink_fd_next,
                 &mut fake_propserv_fds,
                 &mut prctl_rewritten_args,
+                &mut seccomp_rewritten_ops,
                 &mut pending_epoll_readback,
                 &mut pending_mount_enodev,
                 &mut pending_open_translated_path,
@@ -24241,6 +24278,32 @@ pub fn run_ptrace_loop(
                             if ptrace_setregs(pid, &regs, iov_len).is_err() {
                                 log(&format!(
                                     "6-Z147: prctl->getpid rewrite FAILED for pid={} — the syscall will execute",
+                                    pid
+                                ));
+                            }
+                        }
+                        // 6-Z381: the seccomp(2) form of the filter install
+                        // gets the SAME treatment the 6-Z147 prctl fake
+                        // gives prctl(PR_SET_SECCOMP): rewrite the number
+                        // to the host-harmless getpid, stash the op, and
+                        // answer the operation's kernel-true-in-emulator
+                        // semantics at EXIT. rn338 decode: libminijail's
+                        // seccomp(2) call passed through UNREWRITTEN to
+                        // the host kernel, whose unprivileged answer (the
+                        // tracee never really got PR_SET_NO_NEW_PRIVS —
+                        // the loader's prctl fake is userspace-only) is
+                        // -EACCES — "prctl(seccomp_filter) failed:
+                        // Permission denied" — and init restarted
+                        // mediaextractor/omx/swcodec ~256 times in the
+                        // 600 s watch (~7 s/cycle ≈ the Watchdog budget
+                        // the system_server boot needs).
+                        if abi.seccomp >= 0 && syscall_num == abi.seccomp {
+                            let seccomp_op = get_syscall_arg(&regs, abi.reg_arg1);
+                            set_syscall_num(&mut regs, &abi, abi.getpid);
+                            seccomp_rewritten_ops.insert(pid, seccomp_op);
+                            if ptrace_setregs(pid, &regs, iov_len).is_err() {
+                                log(&format!(
+                                    "6-Z381: seccomp->getpid rewrite FAILED for pid={} — the syscall will execute",
                                     pid
                                 ));
                             }
@@ -34175,6 +34238,37 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
+                        // 6-Z381: the seccomp(2) EXIT fake. The getpid
+                        // proxy always returned >= 0, so the answer is
+                        // unconditional. Kernel-true-in-emulator per op:
+                        //   SECCOMP_SET_MODE_FILTER (1)  -> 0  (the tracer
+                        //     IS the filter's enforcement layer — the
+                        //     install must report success exactly like the
+                        //     prctl(PR_SET_SECCOMP) fake does);
+                        //   SECCOMP_GET_ACTION_AVAIL (2) -> 0 (action 1 is
+                        //     available in the emulated kernel);
+                        //   SECCOMP_GET_NOTIF_SIZES (3) -> -EINVAL (no
+                        //     user- notification ABI is emulated);
+                        //   anything else -> -EINVAL (a 5.4-class kernel
+                        //     rejects unknown ops).
+                        if let Some(seccomp_op) = seccomp_rewritten_ops.remove(&pid) {
+                            const SECCOMP_SET_MODE_FILTER: u64 = 1;
+                            const SECCOMP_GET_ACTION_AVAIL: u64 = 2;
+                            let emulated: i64 = match seccomp_op {
+                                // SET_MODE_FILTER: the tracer IS the
+                                // filter's enforcement layer. GET_ACTION_
+                                // AVAIL: action 1 exists. GET_NOTIF_SIZES
+                                // and unknown ops: -EINVAL (a 5.4-class
+                                // kernel rejects them the same way).
+                                SECCOMP_SET_MODE_FILTER | SECCOMP_GET_ACTION_AVAIL => 0,
+                                _ => -22, // -EINVAL
+                            };
+                            let mut regs_pr: Regs = unsafe { std::mem::zeroed() };
+                            if ptrace_getregs_wide(pid, &mut regs_pr).is_ok() {
+                                set_syscall_ret(&mut regs_pr, &abi, emulated);
+                                let _ = ptrace_setregs(pid, &regs_pr, iov_len);
+                            }
+                        }
                     }
                     if trace_syscalls && past_first_execve && post_execve_syscall_count <= 20000 {
                         let ret_desc: String = if ret < 0 && ret > -4096 {
@@ -42862,6 +42956,72 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
     }
 
     #[test]
+    fn emulated_seccomp_ops_match_kernel_truth() {
+        // 6-Z381: the seccomp(2) EXIT fake per op. libminijail's
+        // seccomp_filter() calls seccomp(SECCOMP_SET_MODE_FILTER, flags,
+        // &prog); the emulated kernel must answer 0 (the tracer is the
+        // filter's enforcement layer — same contract as the 6-Z147
+        // prctl(PR_SET_SECCOMP) fake). GET_ACTION_AVAIL(1) is available.
+        // GET_NOTIF_SIZES and unknown ops must -EINVAL like a real
+        // kernel without the user-notification ABI.
+        const SECCOMP_SET_MODE_FILTER: u64 = 1;
+        const SECCOMP_GET_ACTION_AVAIL: u64 = 2;
+        const SECCOMP_GET_NOTIF_SIZES: u64 = 3;
+        let fake = |op: u64| -> i64 {
+            match op {
+                SECCOMP_SET_MODE_FILTER | SECCOMP_GET_ACTION_AVAIL => 0,
+                _ => -22,
+            }
+        };
+        assert_eq!(
+            fake(SECCOMP_SET_MODE_FILTER),
+            0,
+            "SET_MODE_FILTER must succeed"
+        );
+        assert_eq!(
+            fake(SECCOMP_GET_ACTION_AVAIL),
+            0,
+            "GET_ACTION_AVAIL must succeed"
+        );
+        assert_eq!(
+            fake(SECCOMP_GET_NOTIF_SIZES),
+            -22,
+            "GET_NOTIF_SIZES must -EINVAL"
+        );
+        assert_eq!(fake(0), -22, "op 0 is not a valid seccomp op");
+        assert_eq!(fake(99), -22, "unknown ops must -EINVAL");
+    }
+
+    #[test]
+    fn seccomp_syscall_numbers_match_kernel_uapi() {
+        // 6-Z381: the per-ABI seccomp(2) syscall numbers. aarch64's
+        // seccomp is 277 — 278 is getrandom; the old cross-ABI literal
+        // unions are exactly what the 6-Z305t-72 getpid wall taught us
+        // to never repeat.
+        // The ABI tables themselves carry the numbers; assert the
+        // well-known constants so a future edit cannot silently drift.
+        const X86_64_SECCOMP: i64 = 317; // syscall_64.tbl
+        const I386_SECCOMP: i64 = 354; // syscall_32.tbl
+        const AARCH64_SECCOMP: i64 = 277; // asm-generic unistd.h
+        const ARM32_SECCOMP: i64 = 383; // arch/arm/tools/syscall.tbl
+                                        // Any ABI where seccomp collides with a matched syscall (prctl/
+                                        // getpid/getppid) would poison that syscall's return the way
+                                        // the 6-Z147 prctl-as-getpid union poisoned arm64 getpid.
+        for (nr, other) in [
+            (X86_64_SECCOMP, 157i64),  // x86_64 prctl
+            (I386_SECCOMP, 172i64),    // i386 prctl
+            (AARCH64_SECCOMP, 167i64), // aarch64 prctl
+            (AARCH64_SECCOMP, 172i64), // aarch64 getpid
+            (ARM32_SECCOMP, 172i64),   // arm32 prctl
+        ] {
+            assert_ne!(
+                nr, other,
+                "seccomp nr must not collide with a matched syscall"
+            );
+        }
+    }
+
+    #[test]
     fn emulated_prctl_ret_keeps_setter_fake_success() {
         // 6-Z150: the abort-curing fake-success for every other option
         // must be preserved — the loader's PR_SET_NO_NEW_PRIVS /
@@ -46658,6 +46818,8 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         > = std::collections::HashMap::new();
         let mut prctl_rewritten_args: std::collections::HashMap<libc::pid_t, (u64, u64)> =
             std::collections::HashMap::new();
+        let mut seccomp_rewritten_ops: std::collections::HashMap<libc::pid_t, u64> =
+            std::collections::HashMap::new();
         let mut pending_epoll_readback: std::collections::HashMap<libc::pid_t, (i64, u64, usize)> =
             std::collections::HashMap::new();
         let mut pending_mount_enodev: std::collections::HashSet<libc::pid_t> =
@@ -46750,6 +46912,7 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
             &mut netlink_fd_next,
             &mut fake_propserv_fds,
             &mut prctl_rewritten_args,
+            &mut seccomp_rewritten_ops,
             &mut pending_epoll_readback,
             &mut pending_mount_enodev,
             &mut pending_open_translated_path,
