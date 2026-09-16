@@ -13974,9 +13974,13 @@ const Z388_DANCE_POLLS: usize = 150;
 const Z388_DANCE_POLL_SLEEP_MS: u64 = 2;
 
 /// 6-Z388: the crash_dump exec-tag set is bounded — a pathological boot
-/// that execs more than this many crash_dump images stops tagging
-/// (crash_dump generations per boot are single digits).
-const Z388_CRASH_DUMP_TAG_CAP: usize = 64;
+/// that execs more than this many crash_dump images stops tagging.
+/// 6-Z394 note: the set now holds BOTH the exec parent and its fork
+/// worker per dump (2 entries per generation) and is PRUNED at every
+/// traced death, so the steady-state size stays small even across the
+/// rn352-style 42-generation crash loops; the raised cap is the
+/// belt-and-braces bound, not the steady state.
+const Z388_CRASH_DUMP_TAG_CAP: usize = 256;
 
 /// 6-Z388: the 6-Z190 coverage-sweep SKIP decision (pure). A
 /// handed-off tid is crash_dump's tracee for the duration of the dump;
@@ -13987,6 +13991,29 @@ fn z388_sweep_must_skip(
     handed_off: &std::collections::HashSet<libc::pid_t>,
 ) -> bool {
     handed_off.contains(&pid)
+}
+
+/// 6-Z394: the crash_dump tag INHERITANCE decision at a fork event
+/// (pure). The A11 debuggerd dump WORKER — the process that actually
+/// issues PTRACE_SEIZE on the crashed target's threads — is a FORK of
+/// the exec-tagged crash_dump pid (rn352 +14.8s: pid 3312 exec'd
+/// /system/bin/crash_dump64 and was tagged; its fork 3313 made
+/// crash_dump.cpp:474's "failed to attach to thread 3308, already
+/// traced by 2749" FATAL — 2749 IS kr64). The exec-site tag never
+/// covered the worker, every hand-off decision returned false, and 42
+/// abort generations produced ZERO tombstones. The worker must inherit
+/// the tag: insert only when the fork parent is tagged, the child pid
+/// is fresh (positive, not already tagged), and the cap allows it.
+fn z394_inherit_decision(
+    parent_is_crash_dump: bool,
+    child_pid: libc::pid_t,
+    child_already_tagged: bool,
+    set_len: usize,
+) -> bool {
+    parent_is_crash_dump
+        && child_pid > 0
+        && !child_already_tagged
+        && set_len < Z388_CRASH_DUMP_TAG_CAP
 }
 
 /// 6-Z266: shape gate for the post-cap broad-DIAG sampler (kept as a
@@ -18535,6 +18562,11 @@ pub fn run_ptrace_loop(
             // Task 6-Z75 hygiene: drop the exited child's cached ABI so
             // a later fork can never inherit a stale entry via pid reuse.
             abi_map.remove(&pid);
+            // 6-Z394 hygiene: drop the dead pid's crash_dump tag so a
+            // pid-RECYCLED successor can never inherit a stale hand-off
+            // decision (and so the rn352 42-generation loops cannot
+            // exhaust the tag cap with long-dead pids).
+            z388_crash_dump_pids.remove(&pid);
             // 6-Z83: drop any pending-fake flag armed by THIS pid so a
             // later pid-reuse can never inherit a stale fake.
             // 6-Z87: the poll fake is now a per-pid map entry — same
@@ -18829,6 +18861,11 @@ pub fn run_ptrace_loop(
                 "child {} killed by signal {} (after {} iterations)",
                 pid, sig, loop_count
             ));
+            // 6-Z394 hygiene: drop the dead pid's crash_dump tag so a
+            // pid-RECYCLED successor can never inherit a stale hand-off
+            // decision (and so the rn352 42-generation loops cannot
+            // exhaust the tag cap with long-dead pids).
+            z388_crash_dump_pids.remove(&pid);
             // 6-Z384: record the death for the loop-exit verdict ring.
             push_death_ring(format!(
                 "pid {} killed by signal {} at +{}ms",
@@ -19390,6 +19427,27 @@ pub fn run_ptrace_loop(
                                 log(&format!(
                                     "6-Z97: PTRACE_EVENT_{} — new child PID {} registered in the tracked set ({} tracked) before its first waitpid stop",
                                     event_name, new_child_pid, tracked_pids.len()
+                                ));
+                            }
+                            // ── 6-Z394: crash_dump tag INHERITANCE at fork ──
+                            //
+                            // The dump WORKER (the fork child that issues
+                            // the actual PTRACE_SEIZE) must inherit the
+                            // debuggerd tag — see z394_inherit_decision for
+                            // the rn352 root-cause decode. Cap-checked;
+                            // pruned at death (6-Z394 hygiene).
+                            if z394_inherit_decision(
+                                z388_crash_dump_pids.contains(&pid),
+                                new_child_pid,
+                                z388_crash_dump_pids.contains(&new_child_pid),
+                                z388_crash_dump_pids.len(),
+                            ) {
+                                z388_crash_dump_pids.insert(new_child_pid);
+                                log(&format!(
+                                    "6-Z394: crash_dump dump-worker pid={} inherited the debuggerd tag from fork parent {} (tagged={})",
+                                    new_child_pid,
+                                    pid,
+                                    z388_crash_dump_pids.len()
                                 ));
                             }
                             // ── 6-Z277: focused-diag INHERITANCE at
@@ -50197,9 +50255,12 @@ mod z388_handoff_tests {
     fn z388_dance_budget_is_bounded() {
         let worst_ms = Z388_DANCE_POLLS as u64 * Z388_DANCE_POLL_SLEEP_MS;
         assert_eq!(worst_ms, 300, "worst-case dance per tid must be 300 ms");
+        // 6-Z394: the raised cap plus the per-death prune keep the tag
+        // set small in steady state even across 42-generation crash
+        // loops (2 entries per generation before pruning).
         assert!(
-            Z388_CRASH_DUMP_TAG_CAP >= 8,
-            "single-digit generations per boot"
+            Z388_CRASH_DUMP_TAG_CAP >= 256,
+            "cap must absorb multi-generation crash loops without pruning"
         );
     }
 
@@ -50210,5 +50271,70 @@ mod z388_handoff_tests {
         handed_off.insert(4242);
         assert!(z388_sweep_must_skip(4242, &handed_off));
         assert!(!z388_sweep_must_skip(4243, &handed_off));
+    }
+}
+
+#[cfg(test)]
+mod z394_inherit_tests {
+    use super::{z394_inherit_decision, Z388_CRASH_DUMP_TAG_CAP};
+
+    /// The rn352 shape: tagged crash_dump exec parent (3312) forks the
+    /// dump worker (3313) — the worker MUST inherit the tag, because it
+    /// is the process that issues PTRACE_SEIZE on the crashed target's
+    /// threads. Before 6-Z394 this decision was false for every
+    /// generation and the native kernel EPERM'd every SEIZE (42 abort
+    /// generations, zero tombstones).
+    #[test]
+    fn z394_worker_child_inherits_from_tagged_parent() {
+        assert!(z394_inherit_decision(true, 3313, false, 1));
+    }
+
+    /// A fork from an UNTAGGED parent never tags the child — the
+    /// fail-safe direction (only debuggerd's fork-helper lineage is
+    /// ever allowed to reach the hand-off decision).
+    #[test]
+    fn z394_untagged_parent_never_propagates() {
+        assert!(!z394_inherit_decision(false, 3313, false, 1));
+        assert!(!z394_inherit_decision(false, 3313, true, 1));
+    }
+
+    /// A child that is already tagged (double-registered fork event,
+    /// or the worker forking its own helper) must not be re-inserted —
+    /// the set is a set, and the log would double-count.
+    #[test]
+    fn z394_already_tagged_child_is_noop() {
+        assert!(!z394_inherit_decision(true, 3313, true, 1));
+    }
+
+    /// Degenerate child pids are rejected (GETEVENTMSG failure shapes).
+    #[test]
+    fn z394_degenerate_child_pid_rejected() {
+        assert!(!z394_inherit_decision(true, 0, false, 1));
+        assert!(!z394_inherit_decision(true, -1, false, 1));
+    }
+
+    /// The cap boundary: the insert is allowed while set_len < CAP and
+    /// rejected once the set is full. With the per-death prune the
+    /// steady state is small; the cap is the runaway bound.
+    #[test]
+    fn z394_cap_boundary() {
+        assert!(z394_inherit_decision(
+            true,
+            4000,
+            false,
+            Z388_CRASH_DUMP_TAG_CAP - 1
+        ));
+        assert!(!z394_inherit_decision(
+            true,
+            4000,
+            false,
+            Z388_CRASH_DUMP_TAG_CAP
+        ));
+        assert!(!z394_inherit_decision(
+            true,
+            4000,
+            false,
+            Z388_CRASH_DUMP_TAG_CAP + 1
+        ));
     }
 }
