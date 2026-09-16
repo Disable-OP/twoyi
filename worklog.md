@@ -30519,3 +30519,21 @@ Stage Summary:
 - The tombstoned socket fix is now ONE decode away: rn350's kmsg mirror will show whether fchmodat's ENTRY ever reaches the 6-Z258 arm (routing miss) or reaches it and declines (translator/scratch) — each outcome names a different one-line fix.
 - EXPECT rn350: "6-Z391 ENTRY fchmodat/fchownat ..." + "DECISION ..." lines in dev-__kmsg__ around every init socket bootstrap; 6-Z390 HB lines every ~5s in the stderr capture; no destroyed-mutex abort (6-Z389 riding along).
 - rn349 (6-Z389 only) still in flight — its verdict gates the renderer fix independently.
+
+---
+Task ID: 131 (rn349 decoded — 6-Z389 VERIFIED: the destroyed-mutex run-ender is gone; the wall is now thread-pinned: composer HAL threads frozen in ptrace-stop 't'; 6-Z392 freeze watchdog landed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn349 (#349, 32b6226c = 6-Z389) decoded (artifacts → /home/z/artifacts-rn349). Verdict: rung 7 SURFACEFLINGER, but a DIFFERENT, much deeper run than rn348:
+  * 6-Z389 VERIFIED: ZERO "destroyed mutex" aborts in 620s of app lifetime (rn348 died at +111s). The app, tracer, and guest lived the whole watch.
+  * The guest's crash_dump64 tagging works (6-Z388 lines present: 6 execve tags in the first 31s) — but ZERO dance/SEIZE executions (no qualifying seize-target pair ran).
+  * NEW WALL (thread-granularity, from the new guest-threads.txt artifact): the guest composer HAL (/vendor/bin/hw/android.hardware.graphics.composer@2.3-service, pid 3055) has its MAIN thread + Binder:3055_1 + tid 3095 ALL in ptrace_stop.part.0 state 't' at capture; SF (3181, full thread fleet incl. DispSync/app/sf) waits on HwBinder:3181_1; system_server spins getService(SurfaceFlinger) misses → SF never registers → rung 7.
+  * 3055's tracer history: normal exec at +8.2s, 6-Z211e skip_next_resume skips at +8.6s, binder deliveries at +16-17s, ONE normal RAW STOP/RESUME pair at +41.5s, then SILENCE to +620s. No invariant VIOLATION lines at all.
+  * Ruled out for the freeze: 6-Z388 dance (zero SEIZE lines), death/crash (no exit lines), seccomp routing (fchmodat is ALLOW-bucket).
+- 6-Z392 landed (this commit): a 30s ptrace-stop freeze watchdog at the loop-top — samples /proc for guest processes (ppid==init_pid / init / tracked) sitting in state 't' or 'T', reported through the drop-proof 6-Z391 kmsg channel, bounded 64 lines. One sample is a CANDIDATE (single-threaded tracer — other tracees are legitimately stopped at sample time); recurrence across samples is a CONFIRMED freeze with pid/ppid/tracked truth.
+- Local gates: rustfmt clean, clippy -D warnings clean, 921/921 tests. CI green on a208787f (6-Z391) as #1917.
+
+Stage Summary:
+- Mission chain this session: rn348 (run-ender decoded → 6-Z389) → rn349 (fix verified; wall thread-pinned → 6-Z390/6-Z391/6-Z392 instrumentation). The composer freeze's Mechanism (which code path leaves consumed ENTRYs unresumed / drops pids from tracked_pids) is the next decode; rn350's kmsg mirror will carry ENTRY+DECISION (6-Z391) and T-STOP recurrences (6-Z392) for it.
+- rn350 to dispatch on this commit (6-Z389+390+391+392).
