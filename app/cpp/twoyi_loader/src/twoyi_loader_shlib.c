@@ -2660,6 +2660,7 @@ static uint32_t bp_scan_tx_blobs(const uint8_t *stream, uint64_t len,
         if (pos + psize > len) break;
         if (cmd == BP_BC_TRANSACTION || cmd == BP_BC_TRANSACTION_SG ||
             cmd == BP_BC_REPLY || cmd == BP_BC_REPLY_SG) {
+            const uint8_t *btd = stream + pos;
             // 6-Z272k: bounded outgoing-side DIAG — the keystore2 compat
             // chain needed the guest's REPLY bytes (the self-_NTF on
             // handle 4 was answered with a 4-byte void parcel — if the
@@ -2669,7 +2670,6 @@ static uint32_t bp_scan_tx_blobs(const uint8_t *stream, uint64_t len,
             {
                 if (g_diag_bc > 0) {
                     g_diag_bc--;
-                    const uint8_t *btd = stream + pos;
                     uint32_t t_code, t_target;
                     uint64_t t_ds;
                     memcpy(&t_target, btd, 4);
@@ -2685,10 +2685,54 @@ static uint32_t bp_scan_tx_blobs(const uint8_t *stream, uint64_t len,
                              t_target, t_code, t_flags, (unsigned long long)t_ds, g_real_pid);
                     write_str(2, m);
                 }
+                // 6-Z395: SHAPE-KEYED sender ground truth for the
+                // registerCallback spine (code 0x1 on a non-zero handle).
+                // The rn352 decode proved the composer receives SF's
+                // registerCallback as a 52-byte descriptor-only parcel
+                // (dlen=52 olen=0) — the IComposerCallback flat stripped
+                // somewhere between the sender's memory and the bus.
+                // This dump bypasses the 12-per-process 6-Z272k budget
+                // (which the early SM chatter consumes) and reads the
+                // SENDER's own parcel memory: dsize/osize/flags as the
+                // guest libhwbinder wrote them + the parcel head. If
+                // dsize here is 76 with osize 8, the flat left the
+                // sender intact (the bus/recipient dropped it); if it
+                // is 52/0 here, the guest's own parcel was already
+                // short (a guest-side flatten failure — the kernel-true
+                // tx would then honestly carry no callback).
+                static int g_diag_cb_tx = 4;
+                uint32_t z_code = 0, z_target = 0;
+                memcpy(&z_target, btd, 4);
+                memcpy(&z_code, btd + 16, 4);
+                if (g_diag_cb_tx > 0 && z_code == 0x1 && z_target != 0 &&
+                    (cmd == BP_BC_TRANSACTION || cmd == BP_BC_TRANSACTION_SG)) {
+                    g_diag_cb_tx--;
+                    uint32_t z_flags;
+                    uint64_t z_ds, z_os, z_dp;
+                    memcpy(&z_flags, btd + 20, 4);
+                    memcpy(&z_ds, btd + 32, 8);
+                    memcpy(&z_os, btd + 40, 8);
+                    memcpy(&z_dp, btd + 48, 8);
+                    char m[384];
+                    uint8_t head[8];
+                    memset(head, 0, sizeof(head));
+                    if (z_dp != 0 && z_ds >= sizeof(head)) {
+                        memcpy(head, (const void *)(uintptr_t)z_dp, sizeof(head));
+                    }
+                    snprintf(m, sizeof(m),
+                             "[twoyi_loader] *** 6-Z395 callback-TX target=%u "
+                             "code=0x%x flags=0x%x dsize=%llu osize=%llu dp=0x%llx "
+                             "head=[%02x%02x%02x%02x%02x%02x%02x%02x] (pid=%d)\n",
+                             z_target, z_code, z_flags,
+                             (unsigned long long)z_ds, (unsigned long long)z_os,
+                             (unsigned long long)z_dp,
+                             head[0], head[1], head[2], head[3],
+                             head[4], head[5], head[6], head[7], g_real_pid);
+                    write_str(2, m);
+                }
             }
             tx_cmds++;
             if (n >= BP_BLOB_MAX_CMDS) return 0;  // too many — v1 fallback
-            const uint8_t *btd = stream + pos;
             uint64_t data_size, offsets_size, data_ptr, offsets_ptr;
             memcpy(&data_size, btd + 32, 8);
             memcpy(&offsets_size, btd + 40, 8);

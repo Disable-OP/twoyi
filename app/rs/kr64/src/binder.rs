@@ -3042,6 +3042,38 @@ impl BusState {
                     None
                 }
             })() else {
+                // 6-Z395: an offsets entry that points past the captured
+                // data is a PARCEL-INTEGRITY violation — the offsets array
+                // names an object the data region no longer carries. The
+                // rn352 decode proved this shape is real: SF's
+                // registerCallback (code 0x1, IComposerCallback flat at
+                // offset 52 in a 76-byte parcel) arrived at the composer
+                // as a 52-byte descriptor-only blob with olen=0 — the
+                // IComposerCallback object never crossed, the composer
+                // registered a null callback, its onHotplug failed
+                // FAILED_TRANSACTION, and SF FATAL'd "Missing internal
+                // display" 42 generations in a row. This bounded warning
+                // names WHICH side truncated the parcel (if this fires
+                // at route time, the sender's blob was already short —
+                // the capture layer, not the bus, dropped the flat).
+                static Z395_TRUNC: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(8);
+                if Z395_TRUNC.load(Ordering::Relaxed) > 0 {
+                    Z395_TRUNC.fetch_sub(1, Ordering::Relaxed);
+                    let off = u64::from_ne_bytes(
+                        offsets[i * 8..i * 8 + 8].try_into().unwrap_or([0u8; 8]),
+                    );
+                    warning!(
+                        "[KR64][binder][vm{}] 6-Z395: object flat at offset {} beyond data.len() {} (offsets {}B) in {} conn={} -> conn={} — parcel TRUNCATED sender-side",
+                        vm_id,
+                        off,
+                        data.len(),
+                        offsets.len(),
+                        what,
+                        sender,
+                        recipient
+                    );
+                }
                 continue;
             };
             let typ = u32::from_ne_bytes(data[off_usize..off_usize + 4].try_into().unwrap());
@@ -5527,6 +5559,50 @@ fn handle_transaction(
             one_way,
             blob.data.len(),
             blob.offsets.len(),
+            head,
+            offs
+        );
+    }
+    // 6-Z395: SHAPE-KEYED route dump for the composer-callback spine.
+    // The 6-Z380 budget (16, global) is first-come-first-served and the
+    // early boot burns it on interfaceChain/INTERFACE_TRANSACTION probes
+    // before SF's registerCallback (code 0x1 on the composer handle,
+    // carrying the IComposerCallback flat) ever routes — rn352 never
+    // captured it. This dump keys to the registerCallback shape itself:
+    // code==0x1, target != 0, object-bearing offsets (osize >= 8). It
+    // prints the sender-side parcel ground truth AT THE BUS so the
+    // flat-strip layer is discriminated in one run: dsize=76 osize=8
+    // here + 52/0 at the composer = the bus→recipient path dropped it;
+    // dsize=52 osize=0 here = the sender's capture was already short
+    // (the 6-Z395 truncated-parcel warning fires for the same event).
+    static Z395_CB_ROUTE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
+    if code == 0x1
+        && target_handle != 0
+        && Z395_CB_ROUTE.load(std::sync::atomic::Ordering::Relaxed) > 0
+    {
+        Z395_CB_ROUTE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let head: String = blob
+            .data
+            .iter()
+            .take(96)
+            .map(|x| format!("{:02x}", x))
+            .collect();
+        let offs: String = blob
+            .offsets
+            .iter()
+            .take(16)
+            .map(|x| format!("{:02x}", x))
+            .collect();
+        info!(
+            "[KR64][binder][svc] 6-Z395 callback-route parcel conn={} handle=0x{:08x} code={:#x} flags=0x{:x} one_way={} dsize={} osize={} sg={} data=[{}] offs=[{}]",
+            conn_id,
+            target_handle,
+            code,
+            flags,
+            one_way,
+            blob.data.len(),
+            blob.offsets.len(),
+            blob.sg.len(),
             head,
             offs
         );
