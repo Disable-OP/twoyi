@@ -2210,6 +2210,21 @@ struct IncomingTx {
 #[derive(Default)]
 struct ConnBox {
     inbox: std::collections::VecDeque<InboxItem>,
+    /// 6-Z399: this connection's guest reader is CURRENTLY blocked inside
+    /// its BINDER_WRITE_READ ioctl (the proxy is servicing it — including
+    /// the 6-Z152 idle tick and the 6-Z383 re-check). Kernel-true
+    /// semantics: a waiting looper thread takes ITS OWN proc-todo work;
+    /// the pool-steal (6-Z271g) must therefore never lift a transaction
+    /// out of a waiting reader's inbox — rn354 decode: the composer's
+    /// onHotplug was queued on SF's MAIN conn while main waited in the
+    /// idle tick; SF's fresh pool thread connected 4 ms later and the
+    /// steal handed it to the POOL thread 250 ms before main's 6-Z383
+    /// re-check — the dispatch then blocked on SF's mStateLock (held by
+    /// main inside init()), the hotplug event landed after init()'s
+    /// "Missing internal display" check, and the boot FATALed. With this
+    /// flag the steal skips waiting readers; the owner's own re-check
+    /// (≤250 ms) delivers the work on the right thread.
+    reader_waiting: bool,
     /// Sync transactions queued in `inbox` but not yet delivered — used
     /// to resolve their waiters as `Dead` when the connection dies.
     pending_in: Vec<u64>,
@@ -4043,6 +4058,42 @@ fn handle_write_read(
         );
         return Resp::new(-(libc::EINVAL), Vec::new());
     }
+    // 6-Z399: mark this conn's reader as WAITING for the duration of the
+    // ioctl. The pool-steal (6-Z271g) skips waiting readers — a waiting
+    // looper takes its own work (kernel proc-todo semantics; see the
+    // ConnBox.reader_waiting doc). The guard clears the flag on every
+    // exit path.
+    struct ReaderWaitingGuard {
+        bus: std::sync::Arc<std::sync::Mutex<BusState>>,
+        conn_id: ConnId,
+        armed: bool,
+    }
+    impl Drop for ReaderWaitingGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if let Ok(mut b) = self.bus.lock() {
+                if let Some(bx) = b.conns.get_mut(&self.conn_id) {
+                    bx.reader_waiting = false;
+                }
+            }
+        }
+    }
+    let _reader_guard = {
+        let mut b = bus.lock().expect("binder bus poisoned");
+        let armed = if let Some(bx) = b.conns.get_mut(&conn_id) {
+            bx.reader_waiting = true;
+            true
+        } else {
+            false
+        };
+        ReaderWaitingGuard {
+            bus: std::sync::Arc::clone(bus),
+            conn_id,
+            armed,
+        }
+    };
     let write_buf = &payload[8..8 + write_size];
 
     // Parse the optional v2/v3 trailer (6-Z114 §4.4 + 6-Z305t-68):
@@ -4604,6 +4655,26 @@ fn handle_write_read(
                 if let Some(bx) = b.conns.get_mut(&conn_id) {
                     bx.reply_queue.push_back(DeferredReply::Failed);
                 }
+                // 6-Z399: the timed-out transaction may also sit on the
+                // RESPONDER's transaction stack (it was DELIVERED — the
+                // rn354 hotplug shape: a void-oneway method written
+                // sync-flagged by the guest's libhwbinder never answers).
+                // A stale stack entry would mis-correlate the responder's
+                // NEXT BC_REPLY to this dead waiter and silently drop the
+                // real requester's reply bytes. Kernel truth: the server
+                // side of a dead caller resolves its transaction context.
+                let stale: Vec<ConnId> = b
+                    .conns
+                    .iter()
+                    .filter(|(_, bx)| bx.txn_stack.contains(&t))
+                    .map(|(cid, _)| *cid)
+                    .collect();
+                for cid in stale {
+                    if let Some(bx) = b.conns.get_mut(&cid) {
+                        bx.txn_stack.retain(|id| *id != t);
+                        bx.pending_in.retain(|id| *id != t);
+                    }
+                }
             }
         }
         // Deliver a resolved reply (BR_REPLY) if one is waiting. This is
@@ -4781,11 +4852,24 @@ fn handle_write_read(
                     if my_pid == 0 {
                         None
                     } else {
+                        // 6-Z399: a sibling whose reader is CURRENTLY
+                        // blocked in its own ioctl (idle tick + 6-Z383
+                        // re-check) takes its own inbox work — kernel
+                        // proc-todo semantics: the waiting looper thread
+                        // gets the work, not a later-arriving pool thread.
+                        // rn354: the onHotplug queued on SF's main conn
+                        // was stolen by a pool conn 250 ms before main's
+                        // re-check; the pool-thread dispatch blocked on
+                        // mStateLock (main holds it inside init()) and
+                        // the event missed init()'s display check.
                         let mut sibs: Vec<ConnId> = b
                             .conns
                             .iter()
                             .filter(|(cid, bx)| {
-                                **cid != conn_id && bx.sender_pid == my_pid && bx.dev_code == my_dev
+                                **cid != conn_id
+                                    && bx.sender_pid == my_pid
+                                    && bx.dev_code == my_dev
+                                    && !bx.reader_waiting
                             })
                             .map(|(cid, _)| *cid)
                             .collect();
