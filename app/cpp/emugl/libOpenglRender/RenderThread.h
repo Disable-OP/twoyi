@@ -21,6 +21,8 @@
 #include "renderControl_dec.h"
 #include "osThread.h"
 
+#include <atomic>
+
 class RenderThread : public osUtils::Thread
 {
 public:
@@ -35,7 +37,11 @@ private:
 private:
     IOStream *m_stream;
     renderControl_decoder_context_t m_rcDec;
-    bool m_finished;
+    // 6-Z389: written by the render thread at the end of Main(), read by
+    // the RenderServer accept loop - must be atomic (the join added in
+    // RenderServer gives the happens-before for the DELETE, but the flag
+    // read itself was a plain unsynchronized cross-thread bool).
+    std::atomic<bool> m_finished;
 };
 
 #endif

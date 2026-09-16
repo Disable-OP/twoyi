@@ -146,6 +146,22 @@ int RenderServer::Main()
             // delete and erase the current iterator
             // if thread is no longer running
             if ((*t)->isFinished()) {
+                // 6-Z389 (rn348 decode): isFinished() (m_finished) is set
+                // inside RenderThread::Main() BEFORE osUtils::Thread's exit
+                // handshake (thread_main's pthread_mutex_lock(&m_lock) to
+                // publish m_isRunning=false) runs. Deleting the object in
+                // that window destroys m_lock while thread_main is about to
+                // lock it -> bionic FORTIFY "pthread_mutex_lock called on a
+                // destroyed mutex" -> SIGABRT kills the whole VMM process
+                // (and the guest with it). rn348 run-ender: tid 3100,
+                // 12:21:17.987, abort pc in osUtils::Thread::thread_main,
+                // 93s after the app's stderr went quiet, one render-stream
+                // churn cycle after a clean rcCreateContext/rcMakeCurrent
+                // sequence. Main() having returned means the thread is
+                // microseconds from exit - join it first (bounded, no hang
+                // risk) so the delete can never race the exit handshake.
+                int exitStatus;
+                (*t)->wait(&exitStatus);
                 delete (*t);
                 threads.erase(t);
             }
