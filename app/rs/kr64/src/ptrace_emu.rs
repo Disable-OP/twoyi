@@ -22977,6 +22977,53 @@ pub fn run_ptrace_loop(
                         let z388_target = get_syscall_arg(&regs, abi.reg_arg2) as libc::pid_t;
                         let z388_target_tracked = tracked_pids.contains(&z388_target)
                             && !z388_handed_off.contains(&z388_target);
+                        // ── 6-Z425: the crash_dump ptrace-choreography trace ──
+                        //
+                        // rn382/383 decode: the wait_for_clone FATAL persists
+                        // with zero 6-Z388 dance fires — the dance's decision
+                        // inputs are unverified at runtime. Log EVERY ptrace
+                        // call from a tagged crash_dump pid (request, target,
+                        // kr64's tracked/handed-off view of the target) so the
+                        // failing dump's choreography — which SEIZEs fire at
+                        // all, against which tids, seen as tracked or not —
+                        // becomes mechanical to read.
+                        if z388_crash_dump_pids.contains(&pid) {
+                            static Z425_LOGGED: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if Z425_LOGGED.load(std::sync::atomic::Ordering::Relaxed) < 96 {
+                                Z425_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let req_name = match z388_req {
+                                    0x4206 => "SEIZE",
+                                    0x10 => "ATTACH",
+                                    0x4207 => "INTERRUPT",
+                                    7 => "CONT",
+                                    17 => "DETACH",
+                                    1 => "PEEKTEXT",
+                                    2 => "PEEKDATA",
+                                    3 => "PEEKUSER",
+                                    4 => "POKETEXT",
+                                    5 => "POKEDATA",
+                                    6 => "POKEUSER",
+                                    12 => "GETREGS",
+                                    13 => "SETREGS",
+                                    0x4204 => "GETREGSET",
+                                    0x4205 => "SETREGSET",
+                                    0x4200 => "TRACEME",
+                                    15 => "GETSIGINFO",
+                                    0x4208 => "SETOPTIONS",
+                                    0x420e => "GETEVENTMSG",
+                                    _ => "?",
+                                };
+                                log(&format!(
+                                    "6-Z425: ptrace {} target={} from pid={} (tracked={} handed_off={})",
+                                    req_name,
+                                    z388_target,
+                                    pid,
+                                    tracked_pids.contains(&z388_target),
+                                    z388_handed_off.contains(&z388_target)
+                                ));
+                            }
+                        }
                         if z388_handoff_decision(
                             z388_crash_dump_pids.contains(&pid),
                             z388_req,
