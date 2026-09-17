@@ -32521,6 +32521,69 @@ pub fn run_ptrace_loop(
                             }
                         }
                     }
+                    // ── 6-Z439: reference-ril ipv6-monitor AF_PACKET socket
+                    // → REAL AF_UNIX DGRAM socket (ENTRY-side arg rewrite) ──
+                    //
+                    // rn398 decode (run 35280739087): after 6-Z438 let
+                    // reference-ril's RIL_Init succeed, its mainLoop thread
+                    // (inside libgoldfish-ril.so) crashes vendor.ril-daemon
+                    // with SIGSEGV/NULL-deref (19 generations per run; the
+                    // tombstone says 'Cause: null pointer dereference', fault
+                    // addr 0x0; 6-Z243 placed the pc in libgoldfish-ril.so
+                    // r-xp). Chain: Ipv6Monitor::init() (device/generic/
+                    // goldfish radio/ril/ipv6_monitor.cpp) opens
+                    // socket(AF_PACKET, SOCK_DGRAM|SOCK_CLOEXEC, ETH_P_IPV6);
+                    // the untrusted-app seccomp filter denies AF_PACKET → -1
+                    // EPERM (the svc capture's "Ipv6Monitor failed to open
+                    // socket: Operation not permitted") → init() returns
+                    // InitResult::Error → ipv6MonitorCreate() returns nullptr
+                    // → mainLoop's ipv6MonitorSetCallback(nullptr, …) derefs
+                    // the null this → SIGSEGV. (The InterfaceMonitor's
+                    // socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE) SUCCEEDS
+                    // in this container — its async thread spawned before the
+                    // crash; the 6-Z99 EXIT arm below now also fakes its
+                    // failures as a safety net.)
+                    //
+                    // THE FIX: rewrite the syscall's OWN arguments ENTRY-side
+                    // to a REAL AF_UNIX SOCK_DGRAM socket — the FD_SET-safe
+                    // trick proven by 6-Z202. The monitor's very next call on
+                    // this fd is ioctl(fd, SIOCGIFFLAGS, ifreq) and
+                    // SIOCGIFFLAGS is a SOCKET ioctl: on the real AF_UNIX fd
+                    // the kernel resolves it through sock_ioctl →
+                    // dev_get_by_name(<radio-interface>) → ENODEV (the
+                    // interface does not exist in this container) — which is
+                    // ipv6_monitor's OWN Deferred branch ("If interface
+                    // initialization fails we'll retry later",
+                    // mPollTimeout=1000ms): the monitor parks in its
+                    // poll-retry loop forever, exactly like an emulator with
+                    // no radio interface up. recv* on the unconnected dgram
+                    // socket natively -EAGAIN; the run loop's poll is never
+                    // readable. NO synthetic fd, NO fake follow-ups (the fd
+                    // is deliberately NOT registered into fake_netlink_fds —
+                    // the ioctl must stay REAL to get the kernel-true
+                    // ENODEV), kernel semantics all the way down.
+                    if abi.socket_nr != -1 && syscall_num == abi.socket_nr {
+                        const AF_PACKET_Z439: u64 = 17;
+                        const AF_UNIX_Z439: u64 = 1;
+                        const ETH_P_IPV6_Z439: u64 = 0x86dd;
+                        const SOCK_DGRAM_Z439: u64 = 2;
+                        let domain = get_syscall_arg(&regs, abi.reg_arg1);
+                        let sock_type = get_syscall_arg(&regs, abi.reg_arg2);
+                        let protocol = get_syscall_arg(&regs, abi.reg_arg3);
+                        if domain == AF_PACKET_Z439
+                            && protocol == ETH_P_IPV6_Z439
+                            && (sock_type & 0xff) == SOCK_DGRAM_Z439
+                        {
+                            set_syscall_arg(&mut regs, abi.reg_arg1, AF_UNIX_Z439);
+                            set_syscall_arg(&mut regs, abi.reg_arg3, 0);
+                            if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                log(&format!(
+                                    "6-Z439: socket(AF_PACKET, {:#x}, ETH_P_IPV6) rewritten to socket(AF_UNIX, {:#x}, 0) — reference-ril ipv6 monitor gets a real fd; SIOCGIFFLAGS → kernel-true ENODEV → its own Deferred retry-poll loop",
+                                    sock_type, sock_type
+                                ));
+                            }
+                        }
+                    }
                     // ── 6-Z203: tracer-level ashmem ioctl
                     // virtualization (ENTRY) ──
                     //
@@ -40232,8 +40295,31 @@ pub fn run_ptrace_loop(
                                 }
                                 const AF_NETLINK_Z99: i64 = 16;
                                 const NETLINK_KOBJECT_UEVENT_Z99: i64 = 15;
+                                // 6-Z439: NETLINK_ROUTE failures join the
+                                // fake-fd machinery. rn398 (run
+                                // 35280739087): reference-ril's
+                                // InterfaceMonitor (if_monitor.cpp)
+                                // socket(AF_NETLINK, SOCK_DGRAM,
+                                // NETLINK_ROUTE) succeeded in this
+                                // container on the measured generation, but
+                                // the goldfish monitor code NULL-derefs on
+                                // ANY create failure
+                                // (ipv6MonitorCreate did fail — its
+                                // AF_PACKET socket, handled ENTRY-side
+                                // above). If a future host seccomp / LSM
+                                // change makes the NETLINK_ROUTE socket fail
+                                // too, ifMonitorCreate() would return
+                                // nullptr and ifMonitorSetCallback would
+                                // SIGSEGV identically — so a failed
+                                // NETLINK_ROUTE socket gets the same fake-fd
+                                // replacement as the uevent socket
+                                // (bind→0, recv*→-EAGAIN, poll
+                                // never-readable): the monitor parks in its
+                                // receive loop, the process lives.
+                                const NETLINK_ROUTE_Z439: i64 = 0;
                                 if domain == AF_NETLINK_Z99
-                                    && protocol == NETLINK_KOBJECT_UEVENT_Z99
+                                    && (protocol == NETLINK_KOBJECT_UEVENT_Z99
+                                        || protocol == NETLINK_ROUTE_Z439)
                                     && ret < 0
                                     && ret > -4096
                                     && !boot_recovery
