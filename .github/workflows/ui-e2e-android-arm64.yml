@@ -697,7 +697,13 @@ jobs:
              echo '##### guest tombstones dir #####'; \
              ls -la /data/user/0/io.twoyi.debug/profiles/default/rootfs/data/tombstones 2>/dev/null || echo 'guest tombstones dir MISSING'; \
              echo '##### HOST (redroid) /data/tombstones #####'; \
-             ls -la /data/tombstones 2>/dev/null || echo 'host tombstones dir MISSING'" \
+             ls -la /data/tombstones 2>/dev/null || echo 'host tombstones dir MISSING'; \
+             for h in /data/tombstones/tombstone_[0-9]*; do \
+               [ -f \$h ] || continue; \
+               echo \"== HOST \$(basename \$h) head (whose crash the host tombstoned served) ==\"; \
+               head -c 1536 \$h; \
+               echo; \
+             done" \
             > /tmp/ui-e2e-artifacts/tombstone-harvest.txt 2>&1 || true
           # ── 6-Z306ao-e: the watchdog's OWN reports ──────────────────
           # #241 named the wall: the guest's OWN watchdog thread SIGKILLs
