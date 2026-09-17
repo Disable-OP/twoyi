@@ -30971,3 +30971,18 @@ Work Log:
 Stage Summary:
 - Commit chain: ... f80b5c49 (6-Z423) → b0dea575 (docs) → 7a2b3230 (6-Z424). rn383 in flight.
 - THE EVIDENCE CHAIN IS COMPLETE: rn377 named the wall (349/347 dumps dead) → 6-Z418/421/422 fixed the architecture layers → 6-Z423 made the failing dump write its own autopsy → the note named the sweep race → 6-Z424 closes it. rn383 is the verification run.
+
+---
+Task ID: 158 (rn383 decoded — the sweep guards landed but the FATAL persists (824 failure-notes; the cascade back at full cadence via the 6-Z421 CONTs) and the 6-Z388 dance fired ZERO times; 6-Z425 the ptrace-choreography trace landed; rn384 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn383 (7a2b3230) decoded: rung 7. The sweep guards (6-Z424) did NOT fix the dump: 824 6-Z423 failure-notes, ALL the same wait_for_clone PTRACE_O_TRACECLONE FATAL. The 70-generation cascade returned at full cadence (the 6-Z421 CONTs release the frozen targets quickly, so each crash cycle is fast again).
+- THE PUZZLE SHARPENED: the 6-Z388 dance fired ZERO times all run (while 2021 thread-clones were tracked) — the pseudothread SEIZE never triggered a dance. The failing dump (worker 3295: forked +13387ms, failure-note +13402ms — 15ms of life) shows NO visible clone/ptrace syscall records in its KR64 trace before death.
+- 6-Z425 LANDED (a74ef808, pushed + raw-verified): every ptrace syscall from a tagged crash_dump pid logs request-named + target + kr64's tracked/handed-off view (96/run) — the failing dump's choreography (which SEIZEs fire at all, against which tids, seen as tracked or not) becomes mechanical to read. Gates: fmt/clippy/937-937 green.
+- rn384 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on a74ef808. EXPECT: the 6-Z425 lines show the failing dump's actual ptrace sequence → the exact divergence point (a SEIZE that returns EPERM? a missing SEIZE? a wrong tracked-view?).
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: ... 7a2b3230 (6-Z424) → ac8265dd (docs) → a74ef808 (6-Z425). rn384 in flight.
+- THE INSTRUMENT LADDER IS COMPLETE: rn377 named the wall → 6-Z418/421/422 re-architected the domain layers → 6-Z423 made the dump write its autopsy → 6-Z424 guarded the sweep → 6-Z425 traces the choreography itself. rn384's decode is mechanical.
