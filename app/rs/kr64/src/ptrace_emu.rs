@@ -693,6 +693,15 @@ struct ChildAbi {
     chown: i64,
     fchmodat: i64,
     fchownat: i64,
+    // 6-Z416: fchmodat2 (the Linux 6.6+ syscall) — bionic (Android-14-era,
+    // the pure-stock AOSP arm64 images) implements fchmodat(2) ON TOP OF
+    // fchmodat2 when the kernel provides it (uniform nr 452 on every ABI).
+    // rn371/372 decoded the socket-publish fleet's ENOENT cascade to THIS:
+    // ~358 fchmodat-class calls per run issued as nr=452 matched NO arm,
+    // executed RAW against the HOST root, and ENOENT'd — while the sibling
+    // fchownat (no fchownat2 exists) was caught every time. -1 = the ABI's
+    // table predates the syscall (the sentinel convention above).
+    fchmodat2_nr: i64,
     // execve syscall number for this ABI. Used to detect when the child
     // replaces its image (kr64 → TWRP init, or TWRP init → recovery), so
     // we can reset the lazily-detected ABI and re-read /proc/<pid>/exe
@@ -1650,6 +1659,9 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     chown: 182,
     fchmodat: 268,
     fchownat: 260,
+    // 6-Z416: -1 — the x86_64 e2e guests are pre-fchmodat2 images; the
+    // arm64 redroid path is where Android-14-era bionic needs this.
+    fchmodat2_nr: -1,
     execve: 59, // SYS_execve (x86_64)
     mount: 165,
     chroot: 161,
@@ -1983,7 +1995,8 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     chown: 182,
     fchmodat: 306,
     fchownat: 298,
-    execve: 11, // SYS_execve (i386)
+    fchmodat2_nr: -1, // 6-Z416: not needed on the i386-compat path
+    execve: 11,       // SYS_execve (i386)
     mount: 21,
     chroot: 61,
     mkdir: 39,
@@ -2372,6 +2385,9 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     chown: -1,
     fchmodat: 53,
     fchownat: 54,
+    // 6-Z416: the redroid host kernel is 6.6+ and the guest's Android-14-era
+    // bionic routes fchmodat() through fchmodat2 — uniform nr 452.
+    fchmodat2_nr: 452,
     execve: 221, // SYS_execve (aarch64)
     // aarch64 mount = 40 (per /usr/include/asm-generic/unistd.h,
     // verified directly against the kernel's UAPI header in Task 5-T).
@@ -2725,7 +2741,8 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     chown: 212,  // chown32
     fchmodat: 333,
     fchownat: 325,
-    execve: 11, // SYS_execve (arm32)
+    fchmodat2_nr: -1, // 6-Z416: not needed on the arm32-compat path
+    execve: 11,       // SYS_execve (arm32)
     mknodat: 324,
     mount: 21,
     chroot: 61,
@@ -3825,6 +3842,7 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.chown
         || syscall_nr == abi.fchmodat
         || syscall_nr == abi.fchownat
+        || (abi.fchmodat2_nr != -1 && syscall_nr == abi.fchmodat2_nr)
         || syscall_nr == abi.capget
         // 6-Z224: capset — the write side. OrangeFox run 33279360223:
         // init's service child called capset() (SetCapsForExec for
@@ -4506,6 +4524,11 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         // socket-fchmodat decode chasing a plain-chmod ghost. On x86_64/
         // i386 the numbers differ so this ordering is a no-op there.
         "fchmodat"
+    } else if abi.fchmodat2_nr != -1 && nr == abi.fchmodat2_nr {
+        // 6-Z416: fchmodat2 — Linux 6.6+, uniform nr 452; Android-14-era
+        // bionic routes fchmodat(2) through it (the rn371/372 socket-publish
+        // ENOENT fleet).
+        "fchmodat2"
     } else if nr == abi.fchownat {
         "fchownat"
     } else if nr == abi.chmod {
@@ -30915,7 +30938,10 @@ pub fn run_ptrace_loop(
                         // attempt); the forced 0 at EXIT keeps the
                         // observable contract identical (success) for the
                         // EPERM/ENOENT cases.
-                        n if n == abi.fchmodat || n == abi.fchownat => {
+                        n if n == abi.fchmodat
+                            || n == abi.fchownat
+                            || (abi.fchmodat2_nr != -1 && n == abi.fchmodat2_nr) =>
+                        {
                             pending_chmod_fake_pid = Some(pid); // 6-Z83: per-pid
                                                                 // 6-Z258b: kernel-semantics dirfd (low 32 bits,
                                                                 // signed) — the raw i64 compare never matched
@@ -36745,14 +36771,18 @@ pub fn run_ptrace_loop(
                                 // decision line already named it).
                                 if z413_entry_translated_pid != Some(pid)
                                     && (exit_syscall_num == abi.fchmodat
-                                        || exit_syscall_num == abi.fchownat)
+                                        || exit_syscall_num == abi.fchownat
+                                        || (abi.fchmodat2_nr != -1
+                                            && exit_syscall_num == abi.fchmodat2_nr))
                                 {
                                     let z413m_path_addr = get_syscall_arg(&regs2, abi.reg_arg2);
                                     if let Some(z413m_path) =
                                         read_child_string(pid, z413m_path_addr)
                                     {
                                         if z413m_path.starts_with("/dev/socket/")
-                                            && exit_syscall_num == abi.fchmodat
+                                            && (exit_syscall_num == abi.fchmodat
+                                                || (abi.fchmodat2_nr != -1
+                                                    && exit_syscall_num == abi.fchmodat2_nr))
                                         {
                                             use std::os::unix::fs::PermissionsExt;
                                             let z413m_mode = (get_syscall_arg(&regs2, abi.reg_arg3)
@@ -36868,7 +36898,9 @@ pub fn run_ptrace_loop(
                     // calls are all AT_FDCWD, and the family contract
                     // covers every other shape.
                     if !z408b_entry_caught
-                        && (syscall_num == abi.fchmodat || syscall_num == abi.fchownat)
+                        && (syscall_num == abi.fchmodat
+                            || syscall_num == abi.fchownat
+                            || (abi.fchmodat2_nr != -1 && syscall_num == abi.fchmodat2_nr))
                     {
                         let mut z408b_regs: Regs = unsafe { std::mem::zeroed() };
                         match ptrace_getregs_wide(pid, &mut z408b_regs) {
@@ -36882,7 +36914,8 @@ pub fn run_ptrace_loop(
                                 // handled caught-side and chown to an arbitrary
                                 // uid would EPERM for the app-uid tracer).
                                 let mut z408b_real = "skipped".to_string();
-                                if syscall_num == abi.fchmodat
+                                if (syscall_num == abi.fchmodat
+                                    || (abi.fchmodat2_nr != -1 && syscall_num == abi.fchmodat2_nr))
                                     && z408b_path.starts_with("/dev/socket/")
                                 {
                                     use std::os::unix::fs::PermissionsExt;
@@ -43291,6 +43324,18 @@ mod tests {
         assert_eq!(
             compute_exit_return_value(ABI_AARCH64.fchmodat, &ABI_AARCH64),
             Some(0)
+        );
+        // 6-Z416: fchmodat2 (452) — the syscall Android-14-era bionic's
+        // fchmodat() actually issues on Linux 6.6+ hosts. The rn371/372
+        // socket-publish ENOENT fleet was THIS number matching no arm.
+        assert_eq!(ABI_AARCH64.fchmodat2_nr, 452);
+        assert_eq!(
+            compute_exit_return_value(ABI_AARCH64.fchmodat2_nr, &ABI_AARCH64),
+            Some(0)
+        );
+        assert_eq!(
+            syscall_name(ABI_AARCH64.fchmodat2_nr, &ABI_AARCH64),
+            "fchmodat2"
         );
         assert_eq!(
             compute_exit_return_value(ABI_AARCH64.fchownat, &ABI_AARCH64),
