@@ -30941,3 +30941,18 @@ Work Log:
 Stage Summary:
 - Commit chain: ... 18922042 (6-Z420) → 1400385d (6-Z422). rn381 in flight.
 - The architecture converged: eager hand-off (real-kernel per-thread attach) + traced crash_dump (real guest libs) + the freeze watchdog + the death logger — every layer rn-verified except the final tombstone write, which rn381 tests.
+
+---
+Task ID: 156 (rn381 decoded — 6-Z422 fired but workers still _exit(1); the exit path NAMED in the AOSP source (the SetAborter failure-note write carries the abort message); 6-Z423 the failure-note capture landed; rn382 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn381 (1400385d) decoded: rung 7, 78 procs. 6-Z422 fired correctly (crash_dump stays traced + the eager walk releases the dying parents). ZERO 6-Z420 markers — expected: the shlib banner never appears in the dump parents' svc logs, and crash_dump's death is an _exit(1) (not a signal) — the SIGABRT logger can't see it.
+- THE EXIT PATH NAMED (AOSP-11 crash_dump.cpp:213-232): the custom SetAborter — on ANY LOG(FATAL) inside crash_dump: if tombstoned isn't connected, try the connect (kDebuggerdAnyIntercept); write "crash_dump failed to dump process" + THE ABORT MESSAGE into the output fd; _exit(1). The rn379 DIAG write sample caught the first chunk (write(fd=33, ret=33) = the 33-char note); the abort message rides the SECOND dprintf chunk. THE NOTE IS THE DECODE — it names the exact LOG(FATAL) that kills every dump.
+- 6-Z423 LANDED (f80b5c49, pushed + raw-verified): at the write arm's 64B probe, a "crash_dump failed" marker hit re-reads the full 512B chunk verbatim + arms a 4-write follow window (the abort-message chunk); 48/run budget. Gates: fmt/clippy/937-937 green.
+- rn382 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on f80b5c49. EXPECT: "6-Z423: crash_dump failure-note" lines naming the abort (e.g. a waitpid/traced-process failure, a pseudothread dance failure, or a tombstoned-connect defect) → the targeted fix.
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: ... 1400385d (6-Z422) → 595fae42 (docs) → f80b5c49 (6-Z423). rn382 in flight.
+- The instrumentation is now surgical: the failing dump writes its own autopsy — rn382 reads it.
