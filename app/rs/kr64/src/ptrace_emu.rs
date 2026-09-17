@@ -36491,6 +36491,11 @@ pub fn run_ptrace_loop(
                     // returns the traced pid (positive) — without this
                     // consumption the guest would see a pid where it
                     // expects chmod/chown success.
+                    // 6-Z408b: snapshot the armed state BEFORE the
+                    // consumption below flips it — the missed-ENTRY
+                    // backstop that follows must know whether THIS exit
+                    // had a processed ENTRY.
+                    let z408b_entry_caught = pending_chmod_fake_pid == Some(pid);
                     if pending_chmod_fake_pid == Some(pid) {
                         pending_chmod_fake_pid = None;
                         let exit_syscall_num = syscall_num;
@@ -36515,6 +36520,117 @@ pub fn run_ptrace_loop(
                             Err(e) => {
                                 log(&format!(
                                     "6-Z257: fchmodat/fchownat EXIT: ptrace_getregs FAILED: {} — cannot fake return 0",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+
+                    // ── 6-Z408b: fchmodat/fchownat MISSED-ENTRY EXIT backstop ──
+                    //
+                    // rn360/361's 6-Z405 census + rn363's dev-__kmsg__ decoded
+                    // a live, boot-shaping defect: init's socket bootstrap
+                    // (AOSP-11 init/util.cpp CreateSocket) ends with
+                    //   fchmodat(AT_FDCWD, "/dev/socket/<name>", perm,
+                    //            AT_SYMLINK_NOFOLLOW)
+                    // and ANY failure aborts the socket publish
+                    // ("Could not create socket 'X'" — rn363 logged it 15×
+                    // for lmkd/tombstoned×3/zygote/dnsproxyd/fwmarkd/traced/
+                    // statsdw/mdns). The caught ENTRY path translates the
+                    // path into the sandbox (6-Z258) or getpid-rewrites it
+                    // (6-Z257) and the family fake returns 0 — but a call
+                    // whose ENTRY stop was MISSED (the documented 6-Z210
+                    // per-stop race) executes RAW against the HOST root,
+                    // where /dev/socket/<name> does not exist → honest
+                    // ENOENT → the service loses its published socket →
+                    // tombstoned dead (crash dumps unreadable), zygote/
+                    // lmkd/adbd sockets unpublished.
+                    //
+                    // The backstop (same philosophy as the 6-Z185 sandbox
+                    // enforcement: never trust that any ENTRY handler ran):
+                    // at the EXIT stop, syscall_num still names the RAW
+                    // syscall (a caught call was rewritten to getpid or
+                    // consumed by the 6-Z257 block above — both flagged via
+                    // z408b_entry_caught), so an un-flagged chmod-family
+                    // exit IS a missed entry. Recovery:
+                    //   1. the REAL fix — for /dev/socket/* paths, apply the
+                    //      mode host-side to the sandbox backing file
+                    //      ({rootfs}/dev/socket/<name>, created by the
+                    //      translated bind): the socket's connect
+                    //      permissions become REAL, not faked;
+                    //   2. the family contract — fake the return to 0
+                    //      (identical to the caught path's blanket-0), so
+                    //      init proceeds past the fchmodat and publishes.
+                    // The dirfd argument is unrecoverable at EXIT (x0 was
+                    // clobbered by the return value) but init's socket
+                    // calls are all AT_FDCWD, and the family contract
+                    // covers every other shape.
+                    if !z408b_entry_caught
+                        && (syscall_num == abi.fchmodat || syscall_num == abi.fchownat)
+                    {
+                        let mut z408b_regs: Regs = unsafe { std::mem::zeroed() };
+                        match ptrace_getregs_wide(pid, &mut z408b_regs) {
+                            Ok(z408b_len) => {
+                                let z408b_path_addr = get_syscall_arg(&z408b_regs, abi.reg_arg2);
+                                let z408b_mode = get_syscall_arg(&z408b_regs, abi.reg_arg3) & 0xfff;
+                                let z408b_path = read_child_string(pid, z408b_path_addr)
+                                    .unwrap_or_else(|| "<unreadable>".to_string());
+                                // 1. the REAL fix (socket paths, fchmodat only —
+                                // the fchownat uid/gid translation is already
+                                // handled caught-side and chown to an arbitrary
+                                // uid would EPERM for the app-uid tracer).
+                                let mut z408b_real = "skipped".to_string();
+                                if syscall_num == abi.fchmodat
+                                    && z408b_path.starts_with("/dev/socket/")
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let z408b_real_path = format!("{}{}", rootfs, z408b_path);
+                                    match std::fs::set_permissions(
+                                        &z408b_real_path,
+                                        std::fs::Permissions::from_mode(z408b_mode as u32),
+                                    ) {
+                                        Ok(()) => {
+                                            z408b_real =
+                                                format!("real-chmod ok {}", z408b_real_path)
+                                        }
+                                        Err(e) => {
+                                            z408b_real = format!(
+                                                "real-chmod {} failed: {}",
+                                                z408b_real_path, e
+                                            )
+                                        }
+                                    }
+                                }
+                                // 2. the family contract: the guest sees 0.
+                                set_syscall_ret(&mut z408b_regs, &abi, 0);
+                                let z408b_fake = match ptrace_setregs(pid, &z408b_regs, z408b_len) {
+                                    Ok(()) => "fake0 ok",
+                                    Err(e) => {
+                                        log(&format!(
+                                            "6-Z408b: EXIT fake FAILED: ptrace_setregs: {} — child sees the raw errno for the missed {}",
+                                            e,
+                                            syscall_name(syscall_num, &abi)
+                                        ));
+                                        "fake0 FAILED"
+                                    }
+                                };
+                                crate::z408_klog(
+                                    rootfs,
+                                    &format!(
+                                        "6-Z408b MISSED-ENTRY {} pid={} path={:?} mode={:#o} → {} + {}",
+                                        syscall_name(syscall_num, &abi),
+                                        pid,
+                                        z408b_path,
+                                        z408b_mode,
+                                        z408b_real,
+                                        z408b_fake
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                log(&format!(
+                                    "6-Z408b: MISSED-ENTRY {} EXIT: ptrace_getregs FAILED: {} — no recovery possible",
+                                    syscall_name(syscall_num, &abi),
                                     e
                                 ));
                             }
