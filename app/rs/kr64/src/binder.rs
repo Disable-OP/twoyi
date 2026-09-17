@@ -4519,7 +4519,12 @@ fn handle_write_read(
                 {
                     static Z407_REPLY_LOGGED: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
-                    if Z407_REPLY_LOGGED.load(Ordering::Relaxed) < 64 {
+                    // 512/run: rn362's 64-line global budget burned out at
+                    // +28.4s — EXACTLY the window where the wedged bottom
+                    // frame (txn#12) would have unwound. The self-bury
+                    // class again (rn350's lesson): a correlation trace
+                    // must outlive the boot's first minute.
+                    if Z407_REPLY_LOGGED.load(Ordering::Relaxed) < 512 {
                         Z407_REPLY_LOGGED.fetch_add(1, Ordering::Relaxed);
                         let stack_left = {
                             let b = bus.lock().expect("binder bus poisoned");
@@ -4760,7 +4765,7 @@ fn handle_write_read(
                 {
                     static Z407_TIMEOUT_LOGGED: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
-                    if Z407_TIMEOUT_LOGGED.load(Ordering::Relaxed) < 48 {
+                    if Z407_TIMEOUT_LOGGED.load(Ordering::Relaxed) < 128 {
                         Z407_TIMEOUT_LOGGED.fetch_add(1, Ordering::Relaxed);
                         let stale_now: Vec<ConnId> = b
                             .conns
