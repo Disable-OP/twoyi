@@ -30875,3 +30875,20 @@ Work Log:
 Stage Summary:
 - Commit chain: ... a3b4b76d (6-Z417b) → 65eb016f (6-Z417c). rn376 in flight.
 - THE DECODE STATE: early-window fchmodats arrive+handled (E17 by +2s); the abort-window fchmodats (+4.5s..+600s, the 519-ENOENT fleet) are BEYOND every census's horizon so far. rn376's full-boot census finally watches them: watched counters advancing through the abort windows = match/translate gap; counters frozen = the stops never arrive (crash_dump SEIZE = suspect #2).
+
+---
+Task ID: 152 (rn376 decoded — THE SOCKET-BOOTSTRAP WALL IS DOWN: every socket name now reaches "Created socket" (the 393 abort lines are retry history — 17 unique); the census proves all bind/fchmodat/fchownat stops arrive and are handled; the remaining wall is the SF/zygote/netd/audioserver SIGABRT cascade at rung 7)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn376 (65eb016f) decoded: rung 7, 79 procs, the FULL-boot census captured (512 lines, init=2787 covered to 72K+ stops).
+- THE CENSUS VERDICT (init=2787, late boot): 53:E92/X1 (92 fchmodats arrived + handled — 91 getpid-rewritten to success, 1 raw), 452:E0/X0 (fchmodat2 dead for this guest — plain 53 confirmed), 54:E370/X363, 200:E47/X47 (ALL binds arriving+processed). THE STOPS WERE NEVER VANISHED IN THE LATE WINDOW EITHER — the earlier "vanish" evidence was the old binary + budget-censored channels + the getpid-fake-success path being invisible in the kmsg.
+- THE SOCKET SCORECARD (rn376): zygote, usap_pool_primary, fwmarkd, dnsproxyd, mdns, pdx x3, tombstoned x3, traced_producer, logd x3, property_service — **ALL "Created socket"**. The 393 abort lines = 17 unique messages × the service-restart retry cascade BEFORE each success (zygote x61 retries, usap x58...). THE BOOT-SHAPING WALL (the top opener since Task 145) IS DOWN.
+- THE REMAINING WALL: rung 7 — 286 SIGABRTs + 136 SIGKILLs across zygote(309)/netd(136)/surfaceflinger(133)/audioserver(120) restart events. The crash buffer records ONLY the bluetooth sim-HAL 'Invalid address: 3C:5A:B4:01:02:03' aborts (x2) + the bt_stack DEAD_OBJECT cascade (x2) — SF's SIGABRT STILL leaves no crash-buffer record. BT restarted only once (not the cascade driver). system_server never spawned.
+- The 6-Z414 set*con fake fires throughout (fscreate writes EINVAL-faked); 6-Z415's procfs probe replaced the SIGSTOP probe (exonerated); 6-Z416's fchmodat2 arm is inert for this guest (correct — it uses plain 53).
+- Security: credentials untouched.
+
+Stage Summary:
+- SESSION TOTALS: 8 code commits (6-Z413, 6-Z413b, 6-Z414 — VERIFIED, 6-Z415 — probe exonerated+replaced, 6-Z416 — inert-but-correct, 6-Z417/417b/417c — the census), 3 worklog docs, 10 CI runs green, 7 e2e runs dispatched+decoded (rn370..376), disk pressure handled twice.
+- THE BOOT TRANSFORMATION: the socket-publish fleet is FIXED end-to-end (zygote publishes for the first time in the rn3xx era). The remaining rung-7 cascade now has working tombstones/logd/sockets — the evidence channels are fully live for the next decode.
+- NEXT OPENERS (priority order): (1) the SF/zygote/netd/audioserver cascade — with sockets fixed, re-decode the crash-buffer + tombstones for SF's abort reason (the 6-Z413 REAL-MODE + real socket modes may have changed its shape); (2) the bluetooth sim-HAL 'Invalid address' config abort (deterministic; rootfs/property-side fix); (3) verify the tombstones are now readable and mine them; (4) rild joinRpcThreadpool.
