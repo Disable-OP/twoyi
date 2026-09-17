@@ -3923,9 +3923,28 @@ fn connection_loop(
             } else {
                 (0, resp.payload.len())
             };
+            // 6-Z407b: the FIRST BR command of the read stream — rn363's
+            // final hole (did the composer's nested wait consume txn#13's
+            // BR_REPLY, or was the 68-byte read a NEW incoming txn?)
+            // decodes from this one datum: BR_REPLY=0x72072006,
+            // BR_TRANSACTION=0x72072002, BR_NOOP=0x7206f000 (the
+            // transaction-class commands carry the reply/txn identity).
+            let first_br = if rs >= 4 && resp.payload.len() >= 8 {
+                Some(u32::from_ne_bytes(resp.payload[4..8].try_into().unwrap()))
+            } else {
+                None
+            };
             info!(
-                "[KR64][binder][vm{}] conn={} -> ret={} read_size={} trailer={}B",
-                vm_id, conn_id, resp.ret, rs, blobs
+                "[KR64][binder][vm{}] conn={} -> ret={} read_size={} trailer={}B first_br={}",
+                vm_id,
+                conn_id,
+                resp.ret,
+                rs,
+                blobs,
+                match first_br {
+                    Some(v) => format!("{:#010x}", v),
+                    None => "none".to_string(),
+                }
             );
         }
         // 6-Z362: count the OUT side — the fds this response carries via
