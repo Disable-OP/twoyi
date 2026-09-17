@@ -21814,13 +21814,32 @@ pub fn run_ptrace_loop(
                             })
                             .collect::<Vec<_>>()
                             .join(",");
+                        // 6-Z417b: the WATCHED numbers are ALWAYS reported —
+                        // the top-10 display truncates exactly the low-count
+                        // shapes the socket investigation needs (a
+                        // once-per-CreateSocket fchmodat never reaches the
+                        // top-10 of a 512-stop snapshot). Explicit counters
+                        // for the chmod family (53/452/54), the bind family
+                        // (200 + 49-listen + 201), and their exits make every
+                        // snapshot self-sufficient.
+                        let watched = [53i64, 452, 54, 200, 49, 201];
+                        let watched_s = watched
+                            .iter()
+                            .map(|nr| {
+                                let e = census.get(&(true, *nr)).copied().unwrap_or(0);
+                                let x = census.get(&(false, *nr)).copied().unwrap_or(0);
+                                format!("{}:E{}/X{}", nr, e, x)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         crate::z413_klog(
                             rootfs,
                             &format!(
-                                "STOP-CENSUS pid={} total={} shapes={} top=[{}]",
+                                "STOP-CENSUS pid={} total={} shapes={} watched[53,452,54,200,49,201]={} top=[{}]",
                                 pid,
                                 total,
                                 census.len(),
+                                watched_s,
                                 top_s
                             ),
                         );
