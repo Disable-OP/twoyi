@@ -28145,7 +28145,33 @@ pub fn run_ptrace_loop(
                                     }
                                     None => {
                                         // sp unmapped (a stale/recycled stop) —
-                                        // treat as unsafe.
+                                        // treat as unsafe. 6-Z432b: name WHY —
+                                        // a maps READ failure vs a genuine
+                                        // not-found (the parse covered no
+                                        // mapping) — the rn391/392 runs logged
+                                        // 17-37 of these and the distinction
+                                        // decides whether the third corruption
+                                        // door (still unnamed — the scratch and
+                                        // the staging pokes are EXONERATED by
+                                        // their zero-cap runs) hides behind a
+                                        // broken maps read.
+                                        static Z432B_DIAG: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        let z432b_n = Z432B_DIAG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if z432b_n < 8 {
+                                            let probe = std::fs::read_to_string(format!(
+                                                "/proc/{}/maps",
+                                                pid
+                                            ));
+                                            log(&format!(
+                                                "6-Z432b: scratch-gate maps lookup FAILED pid={} sp={:#x} read_err={} lines={}",
+                                                pid,
+                                                sp,
+                                                probe.is_err(),
+                                                probe.map(|m| m.lines().count()).unwrap_or(0)
+                                            ));
+                                        }
                                         z431_stack_cache.insert(pid, (sp_block, u64::MAX, false));
                                         (u64::MAX, false)
                                     }
