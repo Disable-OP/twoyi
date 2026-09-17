@@ -30587,3 +30587,19 @@ Stage Summary:
 - Boot frontier: rung 7, crash loop dead, display gate crossed, system_server into StartDisplayManager, debuggerd dumps working (native + released loans). The wall is SF main's unsignaled guest-internal futex wait before addService("SurfaceFlinger").
 - EXPECT rn358 (dispatched on 6-Z403, boot_wait 600 / stall 120): the 6-Z403 BT lines name SF main's caller chain; the WAKE-CENSUS line classifies the wakeup loss; the candidate-holder probe names the 0xc91 word's truth. With the caller named, the fix targets the exact primitive (linker lock vs condvar vs mutex).
 - Queued decode: the fchmodat socket-ENOENT early-window evidence (6-Z400 backing-path lines), rild joinRpcThreadpool ordering (secondary), the Java backtrace intercept timeout (art attach).
+
+---
+Task ID: 135 (rn358 decoded — 6-Z403 verified end-to-end; the SF wait topology named; 6-Z404 makes the userspace-park class visible)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn358 (#358, 6fc4ec55) decoded: 6-Z403 VERIFIED END TO END — the ENTRY-stash fp-chain walk named every stall caller (ueventd ppoll chain, libsysutils, statsd futex chain, and the SF class); 36 WAKE-CENSUS lines, 34 = wakes=NEVER; the candidate-holder probe fired on tid-shaped words.
+- The SF wall, one layer deeper: the verdict stays rung 7 (SURFACEFLINGER); 77 addService receipts and NONE named SurfaceFlinger; SF's svc log ends EXACTLY after full RenderEngine init (ANGLE-on-SwiftShader GL fully live); the thread census shows the whole SF fleet parked — Binder/HwBinder pool on sockets (normal loopers), DispSync/sf/app EventThreads + unnamed threads on futexes, main with ZERO 6-Z271d STALL lines for the whole 615 s run.
+- Wait-site identities (offsets symbolized offline against the vendored pure-stock A11 libsurfaceflinger.so): one thread = libc cond-wait -> libc++ -> libsurfaceflinger+0x546c8 (a waiter helper: refcount-increment, mutex, cond wait) -> +0x5442c (a state-machine wait loop: states 1/2/3, INT64_MAX deadline, steady+system clocks, f128 ns<->ms math, completion callback via [[obj+0xd0]+0x30], spawned via std::thread); a second = the DispSync region (addEventListener / DispSync:IntendedPeriod / DispSync:PendingPeriod). EVERY wait shows wakes=NEVER — a fleet of condvars nobody ever signals.
+- THE INVISIBILITY CLASS: the 271d detector and the 305t-18 probe both gate on in_syscall==true. A thread parked on a futex in USERSPACE (pthread condvar — wchan STAYS futex_do_wait) whose blocking futex ENTRY stop was missed under stop-storm load stays in_syscall=false FOREVER — invisible to every oracle. SF main is exactly this (zero stall lines all run).
+- 6-Z404 (this commit): a second SIGSTOP probe pass for that class — candidates: tracked, last stop >=15 s, in_syscall==false, wchan==futex_do_wait; budget 2/pid + 30 s cooldown; while SIGSTOPped, procfs-syscall nr==-1 identifies the userspace park and the LIVE probed registers feed an 8-frame 6-Z404 PARK-BT fp-chain walk (x29) that names the park site outright; PTRACE_SYSCALL resumes userspace transparently. Tests z404: 932/932, fmt clean, clippy -D warnings clean; CI green.
+
+Stage Summary:
+- Session commit chain (all pushed + CI green): 6fc4ec55 (6-Z403) -> THIS (6-Z404).
+- EXPECT rn359 (dispatched, boot_wait 600 / stall 120): 6-Z404 PARK-PROBE/PARK-BT lines naming SF main's exact park site (the rn357 linker64 futex shape vs the rn358 condvar shapes — decidable from ONE probe). With the site named, the fix targets the never-signaled primitive directly.
+- Queued decode: the fchmodat socket-ENOENT early-window evidence (6-Z400 backing-path lines), rild joinRpcThreadpool ordering (secondary), the Java backtrace intercept timeout (art attach).
