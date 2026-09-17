@@ -16353,6 +16353,27 @@ pub fn run_ptrace_loop(
     // 6-Z430: the O_TMPFILE→named-file rewrite counter (the
     // tombstone_tmp_NN file names; wraps at 100).
     let mut z430_counter: u64 = 0;
+    // 6-Z431: the scratch-window safety state. THE CORRUPTION CLASS (the
+    // rn389 tombstone_00 decode): crash_dump's OWN Scudo aborted with
+    // "invalid chunk state" deallocating a pointer NOT in any mapping —
+    // a heap corrupted by an out-of-domain write. The 6-Z16 scratch
+    // reservation pokes [sp-4096, sp) at EVERY ENTRY under the
+    // MAP_GROWSDOWN assumption — true ONLY for the main thread's
+    // [stack] VMA. THREAD stacks are fixed anon VMAs with NO growdown:
+    // when a thread's sp sits within 4096 bytes of its stack VMA's low
+    // bound, the poke at sp-4096 lands in whatever mapping is placed
+    // adjacently below (scudo's [anon:scudo:*] regions ARE placed
+    // adjacently) and PTRACE_POKEDATA SUCCEEDS — silently corrupting the
+    // neighbor's metadata. The gate: validate [sp-4096, sp) against the
+    // mapping owning sp (parsed from the HOST /proc/pid/maps, cached per
+    // (pid, 64KB sp block)); for a non-[stack] mapping require
+    // sp >= start + 4096, else scratch_addr=0 for this ENTRY (the path
+    // translation skips; the raw syscall runs — the honest ENOENT beats
+    // silent heap corruption).
+    let mut z431_stack_cache: std::collections::HashMap<libc::pid_t, (u64, u64, bool)> =
+        std::collections::HashMap::new();
+    let mut z431_unsafe_logged: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     // 6-Z305t-59: the LAST rewritten bind's (guest_path, remove_file result)
     // per pid — consumed at the bind EXIT by the 6-Z101 forensics so every
     // -98 is attributed to its guest path and the remove_file outcome.
@@ -28019,13 +28040,61 @@ pub fn run_ptrace_loop(
                     // an unmapped boundary.
                     {
                         let sp = get_syscall_arg(&regs, abi.reg_sp);
-                        scratch_addr = (sp.wrapping_sub(4096)) & !7u64;
-                        scratch_offset = 0;
-                        if loop_count <= 30 {
-                            log(&format!(
-                                "scratch area at {:#x} (below stack pointer {:#x}, re-reserved this ENTRY)",
-                                scratch_addr, sp
-                            ));
+                        // ── 6-Z431: the scratch-window safety gate ──
+                        // Validate [sp-4096, sp) against the mapping that owns
+                        // sp (the rn389 tombstone_00 decode: the sp-4096 poke
+                        // below a thread stack's low bound lands in the
+                        // adjacently-placed scudo VMA and corrupts its chunk
+                        // metadata — the crash_dump self-abort Scudo class).
+                        // Cached per (pid, 64KB sp block); a maps read only on
+                        // a block change.
+                        let sp_block = sp >> 16;
+                        let z431_cached = z431_stack_cache.get(&pid).copied();
+                        let (mapping_low, is_main_stack) = match z431_cached {
+                            Some((blk, low, main)) if blk == sp_block => (low, main),
+                            _ => {
+                                let parsed = std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                    .ok()
+                                    .and_then(|maps| {
+                                        z296_maps_triples(&maps)
+                                            .iter()
+                                            .find(|(s, e, _)| sp >= *s && sp < *e)
+                                            .map(|(s, _, p)| (*s, p.to_string()))
+                                    });
+                                match parsed {
+                                    Some((low, p)) => {
+                                        let main = p == "[stack]";
+                                        z431_stack_cache.insert(pid, (sp_block, low, main));
+                                        (low, main)
+                                    }
+                                    None => {
+                                        // sp unmapped (a stale/recycled stop) —
+                                        // treat as unsafe.
+                                        z431_stack_cache.insert(pid, (sp_block, u64::MAX, false));
+                                        (u64::MAX, false)
+                                    }
+                                }
+                            }
+                        };
+                        let z431_safe = is_main_stack || sp >= mapping_low.saturating_add(4096);
+                        if z431_safe {
+                            scratch_addr = (sp.wrapping_sub(4096)) & !7u64;
+                            scratch_offset = 0;
+                            if loop_count <= 30 {
+                                log(&format!(
+                                    "scratch area at {:#x} (below stack pointer {:#x}, re-reserved this ENTRY)",
+                                    scratch_addr, sp
+                                ));
+                            }
+                        } else {
+                            scratch_addr = 0;
+                            scratch_offset = 0;
+                            if z431_unsafe_logged.insert(pid) {
+                                log(&format!(
+                                    "6-Z431: scratch window UNSAFE pid={} sp={:#x} (the mapping owning sp starts at {:#x} — sp-4096 would poke the adjacent VMA; the crash_dump Scudo class) — scratch DISABLED this ENTRY, the syscall runs untranslated",
+                                    pid, sp, mapping_low
+                                ));
+                            }
                         }
                     }
 
@@ -30101,17 +30170,31 @@ pub fn run_ptrace_loop(
                                             path, translated, scratch_addr, scratch_offset
                                         ));
                                         // Scratch area not yet allocated — fall
-                                        // back to the legacy in-place overwrite
-                                        // (will likely fail for longer strings
-                                        // but does not crash). In practice this
-                                        // branch is dead because we reserve the
-                                        // scratch area at the very first syscall
-                                        // ENTRY stop (before any path-bearing
-                                        // syscall can be intercepted), but the
-                                        // fallback is harmless and keeps the
-                                        // `write_translated_path` failure mode
-                                        // well-defined.
-                                        write_child_string(pid, path_addr, &translated);
+                                        // back to the legacy in-place overwrite.
+                                        // 6-Z431: the overwrite is SAFE only when
+                                        // the translated path FITS the original
+                                        // buffer (translated.len() <= path.len());
+                                        // a longer poke clobbers the bytes that
+                                        // follow the string — for a heap-allocated
+                                        // path buffer that is EXACTLY the scudo
+                                        // chunk-metadata corruption class (the
+                                        // crash_dump self-abort). Longer
+                                        // translations are SKIPPED: the raw
+                                        // syscall runs and fails honestly.
+                                        if translated.len() <= path.len() {
+                                            write_child_string(pid, path_addr, &translated);
+                                        } else {
+                                            static Z431_INPLACE_SKIP: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            let z431_n = Z431_INPLACE_SKIP
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if z431_n < 12 {
+                                                log(&format!(
+                                                    "6-Z431: in-place overwrite SKIPPED for {} -> {} (the translation is longer than the original buffer — the poke would clobber the adjacent heap/rodata)",
+                                                    path, translated
+                                                ));
+                                            }
+                                        }
                                     }
                                 } else if loop_count >= 500 && loop_count <= 700 {
                                     // ── 6-Z234: PASSTHROUGH-open DIAG (capricorn
@@ -52223,6 +52306,60 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         assert_eq!(super::z306an_parse_syscall_info_op(&[3]), Some(3));
         // No bytes written → no op (the query failed).
         assert_eq!(super::z306an_parse_syscall_info_op(&[]), None);
+    }
+
+    /// 6-Z431: PURE decision core — is the scratch window [sp-4096, sp)
+    /// safe for a PTRACE poke, given the mapping that owns sp? The MAIN
+    /// thread's [stack] VMA has MAP_GROWSDOWN (the kernel expands the VMA
+    /// on the poke — the 6-Z16 behavior the whole boot relies on). EVERY
+    /// other mapping (thread stacks are fixed anon VMAs, and scudo's
+    /// [anon:scudo:*] regions are placed ADJACENTLY below them) must
+    /// contain the whole window: sp >= start + 4096.
+    fn z431_scratch_window_decision(mapping_path: &str, mapping_start: u64, sp: u64) -> bool {
+        if mapping_path == "[stack]" {
+            return true;
+        }
+        sp >= mapping_start.saturating_add(4096)
+    }
+
+    #[test]
+    fn z431_scratch_window_decision_locks_the_safety_table() {
+        // The main [stack]: always safe (MAP_GROWSDOWN expands on demand),
+        // even when sp sits within one page of the VMA's low bound.
+        assert!(z431_scratch_window_decision(
+            "[stack]",
+            0x7fc0_0000_0000,
+            0x7fc0_0000_0100
+        ));
+        // A thread stack (anon, empty path) with sp 4096+ above its start:
+        // the whole window is inside the VMA — safe.
+        assert!(z431_scratch_window_decision(
+            "",
+            0x7f90_0000_0000,
+            0x7f90_0000_2000
+        ));
+        // sp within 4096 of the VMA's low bound: the poke at sp-4096 would
+        // land BELOW the mapping — in the adjacently-placed scudo VMA.
+        assert!(!z431_scratch_window_decision(
+            "",
+            0x7f90_0000_0000,
+            0x7f90_0000_0800
+        ));
+        // Exactly at the boundary (sp == start + 4096): the window
+        // [sp-4096, sp) starts exactly AT the mapping start — safe.
+        assert!(z431_scratch_window_decision(
+            "",
+            0x7f90_0000_0000,
+            0x7f90_0000_1000
+        ));
+        // One byte less: unsafe.
+        assert!(!z431_scratch_window_decision(
+            "",
+            0x7f90_0000_0000,
+            0x7f90_0000_0fff
+        ));
+        // sp unmapped (a stale/recycled stop): unsafe regardless.
+        assert!(!z431_scratch_window_decision("", u64::MAX, 0x1000));
     }
 
     #[test]
