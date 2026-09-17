@@ -5291,6 +5291,63 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     // connect to /dev/__kmsg__ instead: the fd accepts unbounded
     // non-blocking writes, the log lines land in the kmsg artifacts,
     // and liblog's write path returns immediately.
+    // 6-Z428: the tombstoned dump-socket response-timeout guarantee.
+    //
+    // rn386 decode (the 6-Z423/6-Z425 evidence chain): the guest's
+    // tombstoned performs EXACTLY ONE crash dump per boot and then its
+    // single-slot queue wedges FOREVER — 92 "received crash request",
+    // 91 "enqueueing crash request", ZERO completions, ZERO
+    // "crash_dump timed out" (the 10s libevent deadline never fires;
+    // the /proc probe shows tombstoned sleeping in epoll_pwait for
+    // 300+ s stretches — impossible with a 10s timer armed). Every
+    // later crash_dump blocks INSIDE tombstoned_connect()'s
+    // RecvFileDescriptors recvmsg FOREVER (rn386 capture: 4 stuck
+    // dump processes, all __skb_wait_for_more_packets), never reaches
+    // its engrave_tombstone, and ZERO tombstone files ever exist.
+    //
+    // THE FIX (client-side, zero tracer interaction — the 6-Z415
+    // lesson forbids out-of-band tracer pokes): bound the response
+    // wait with SO_RCVTIMEO. A HEALTHY tombstoned answers in <100 ms
+    // (the timeout can never fire); a WEDGED queue leaves the client
+    // blocked forever. With the timeout: recvmsg returns -1/EAGAIN
+    // (TEMP_FAILURE_RETRY does not retry EAGAIN), tombstoned_connect
+    // returns false, and AOSP-11 crash_dump's OWN not-connected
+    // fallback runs (open /dev/null O_RDWR → g_output_fd) — which the
+    // 6-Z305t-24 svclog redirect ALREADY sends to svc-<pid>.log.
+    // engrave_tombstone then writes the FULL tombstone into the svc
+    // log, where the CI tombstone-harvest (the rn387 workflow change)
+    // saves it verbatim. The tombstone pipeline completes WITHOUT
+    // touching tombstoned at all, and honest behavior is preserved:
+    // a real response always wins (it arrives long before 8 s).
+    if (addr && addr->sa_family == AF_UNIX && g_rootfs) {
+        struct sockaddr_un *un_6z428 = (struct sockaddr_un *)addr;
+        if (un_6z428->sun_path[0] == '/' &&
+            (strncmp(un_6z428->sun_path, "/dev/socket/tombstoned_crash", 28) == 0 ||
+             strncmp(un_6z428->sun_path, "/dev/socket/tombstoned_java_trace", 33) == 0)) {
+            // Real connect first (raw syscall — no hook recursion).
+            int rc_6z428 = (int)syscall(SYS_connect, sockfd, addr, addrlen);
+            if (rc_6z428 == 0) {
+                // SO_RCVTIMEO = 8 s. aarch64 and x86_64 agree:
+                // SOL_SOCKET=1, SO_RCVTIMEO=20; struct timeval is
+                // {8, 0} on both LP64 ABIs.
+                struct timeval tv_6z428 = { 8, 0 };
+                int so_rc = (int)syscall(SYS_setsockopt, sockfd, 1 /*SOL_SOCKET*/,
+                                         20 /*SO_RCVTIMEO*/, &tv_6z428,
+                                         sizeof(tv_6z428));
+                static unsigned char z428_diag = 2;
+                if (z428_diag > 0) {
+                    z428_diag--;
+                    char m_6z428[192];
+                    snprintf(m_6z428, sizeof(m_6z428),
+                             "[twoyi_loader] 6-Z428: tombstoned dump socket fd=%d "
+                             "SO_RCVTIMEO 8s rc=%d (wedge-breaker armed)\n",
+                             sockfd, so_rc);
+                    write_str(2, m_6z428);
+                }
+            }
+            return rc_6z428;
+        }
+    }
     if (addr && addr->sa_family == AF_UNIX && g_rootfs) {
         struct sockaddr_un *un = (struct sockaddr_un *)addr;
         if (un->sun_path[0] == '/' &&

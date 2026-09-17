@@ -16317,6 +16317,33 @@ pub fn run_ptrace_loop(
     // aarch64 clobbers x0-x3 at EXIT, so the ENTRY stop stashes them.
     let mut pending_epoll_pwait: std::collections::HashMap<libc::pid_t, (u64, u64)> =
         std::collections::HashMap::new();
+    // 6-Z428: the tombstoned-timer-famine evidence state. The rn386 decode
+    // named the wall: tombstoned performs ONE dump per boot, its single-slot
+    // queue wedges forever (92 "received crash request" / 91 "enqueueing" /
+    // 0 completions), and ZERO libevent timer events fire in 575 s (0x
+    // "crash_dump timed out" despite a 10s deadline armed; the /proc probe
+    // catches tombstoned sleeping in epoll_pwait for 300+ s stretches —
+    // impossible with ANY timer armed). Two bounded evidence arms (zero
+    // behavior change) settle the mechanism in one decode:
+    //   - z428_pwait_logged: per-pid budget for the epoll_pwait ENTRY arg
+    //     capture (epfd/maxevents/TIMEOUT). timeout==-1 proves the libevent
+    //     timer heap is EMPTY (the completion event_add never queued — the
+    //     upstream libevent state machine is the defect); timeout>0 proves
+    //     the deadline exists and the WAKE is broken (a kernel/tracer
+    //     interaction).
+    //   - z428_tombstoned_pids: the tombstoned generation tag (the execve
+    //     mirror of z388_crash_dump_pids) gating its openat capture — every
+    //     openat under /data/tombstones is the tombstone-file leg (the
+    //     startup dir_fd_ open + per-dump get_output()); the rn386 decode
+    //     found a FULL tombstone in a dump worker's svc log yet ZERO files
+    //     in {rootfs}/data/tombstones — this arm names where the tombstone
+    //     fd actually points.
+    let mut z428_pwait_logged: std::collections::HashMap<libc::pid_t, u8> =
+        std::collections::HashMap::new();
+    let mut z428_tombstoned_pids: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    let mut z428_tomb_open_logged: std::collections::HashMap<libc::pid_t, u8> =
+        std::collections::HashMap::new();
     // 6-Z305t-59: the LAST rewritten bind's (guest_path, remove_file result)
     // per pid — consumed at the bind EXIT by the 6-Z101 forensics so every
     // -98 is attributed to its guest path and the remove_file outcome.
@@ -23511,6 +23538,23 @@ pub fn run_ptrace_loop(
                                     z388_crash_dump_pids.len()
                                 ));
                             }
+                            // 6-Z428: tag tombstoned execs the same way — the
+                            // evidence arms below (the pwait args + the
+                            // tombstones-dir openat capture) are only meaningful
+                            // for a tombstoned generation. Capped: ≤16 gens/run
+                            // (the rn386 shape: 7 restarts).
+                            if exec_path.ends_with("/tombstoned")
+                                && z428_tombstoned_pids.len() < 16
+                                && !z428_tombstoned_pids.contains(&pid)
+                            {
+                                z428_tombstoned_pids.insert(pid);
+                                log(&format!(
+                                    "6-Z428: pid={} execve \"{}\" — tagged as tombstoned generation (tagged={})",
+                                    pid,
+                                    exec_path,
+                                    z428_tombstoned_pids.len()
+                                ));
+                            }
                             let envp_addr = get_syscall_arg(&regs, abi.reg_arg3);
                             if envp_addr != 0 && exec_env_diag_count <= 24 && exec_env_scans <= 24 {
                                 exec_env_scans += 1;
@@ -25272,6 +25316,34 @@ pub fn run_ptrace_loop(
                             let ev_buf = get_syscall_arg(&regs, abi.reg_arg2);
                             let maxev = get_syscall_arg(&regs, abi.reg_arg3);
                             pending_epoll_pwait.insert(pid, (ev_buf, maxev));
+                            // ── 6-Z428: the tombstoned-timer-famine evidence ──
+                            // Capture (epfd, maxevents, TIMEOUT) at the pwait
+                            // ENTRY, bounded first-4-per-pid. The rn386 wall:
+                            // tombstoned's libevent timers never fire (0x
+                            // "crash_dump timed out" in 575 s while the dump
+                            // queue wedges). timeout==-1 ⇒ the timer heap is
+                            // EMPTY (the completion event_add never queued —
+                            // the upstream libevent state machine is the
+                            // defect); timeout>0 ⇒ the deadline exists and the
+                            // WAKE is broken (kernel/tracer interaction).
+                            // Either verdict names the rn388 root fix.
+                            let z428_t = get_syscall_arg(&regs, abi.reg_arg4) as i64;
+                            let z428_n = z428_pwait_logged.entry(pid).or_insert(0);
+                            if *z428_n < 4 {
+                                *z428_n += 1;
+                                log(&format!(
+                                    "6-Z428: pwait ENTRY pid={} epfd={} maxev={} timeout={}{}",
+                                    pid,
+                                    get_syscall_arg(&regs, abi.reg_arg1),
+                                    maxev,
+                                    z428_t,
+                                    if z428_t == -1 {
+                                        " (INFINITE — the libevent timer heap is EMPTY)"
+                                    } else {
+                                        ""
+                                    }
+                                ));
+                            }
                         }
                         // ── 6-Z163: AF_UNIX bind() sun_path rewrite (TWRP
                         // mode, direct-bind ABIs only) — see the helpers'
@@ -28838,6 +28910,40 @@ pub fn run_ptrace_loop(
                                                 ));
                                             }
                                         }
+                                    }
+                                }
+                                // ── 6-Z428: the tombstoned get_output capture ──
+                                // Every openat from a tombstoned generation under
+                                // /data/tombstones is the tombstone-file leg: the
+                                // startup dir_fd_ open (O_DIRECTORY) and the
+                                // per-dump get_output() (the O_TMPFILE tmp file —
+                                // or its .temporaryN fallback). The rn386 decode
+                                // proved a FULL tombstone was engraved (it landed
+                                // in a dump worker's svc log) while ZERO files
+                                // exist in {rootfs}/data/tombstones — this arm
+                                // names where the tombstone fd actually points
+                                // (the resolved host path + the flags + the
+                                // open's fate is visible at EXIT forensics).
+                                // Bounded: first 8 opens per tombstoned pid.
+                                if !boot_recovery
+                                    && z428_tombstoned_pids.contains(&pid)
+                                    && (path == "/data/tombstones"
+                                        || path.starts_with("/data/tombstones/"))
+                                {
+                                    let z428_n = z428_tomb_open_logged.entry(pid).or_insert(0);
+                                    if *z428_n < 8 {
+                                        *z428_n += 1;
+                                        let z428_flags = if syscall_num == abi.open {
+                                            Some(get_syscall_arg(&regs, abi.reg_arg2) as u32)
+                                        } else if syscall_num == abi.openat {
+                                            Some(get_syscall_arg(&regs, abi.reg_arg3) as u32)
+                                        } else {
+                                            None
+                                        };
+                                        log(&format!(
+                                            "6-Z428: tombstoned openat pid={} nr={} guest_path={:?} flags={:?} resolved={:?} (the tombstone-file leg)",
+                                            pid, syscall_num, path, z428_flags, translated
+                                        ));
                                     }
                                 }
                                 // ── 6-Z305i: virtual /proc/sys backing-file
