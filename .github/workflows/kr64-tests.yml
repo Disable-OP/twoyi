@@ -48,6 +48,15 @@ jobs:
           toolchain: stable
           # Run on the host (linux/x86_64); no Android targets needed.
           cache: true
+          # 6-Z419: point the vendored Swatinem/rust-cache at the REAL
+          # workspace. A floating v1 bump (observed 2026-09-17: runs
+          # 35216637144/35216720179 turned red between two pushes with
+          # no workflow edit) made rust-cache probe `cargo metadata` at
+          # the repo ROOT — which has no Cargo.toml (the workspace lives
+          # at app/rs/kr64) — and the hard failure killed the job before
+          # fmt/clippy/test ran. Forwarding `cache-workspaces` pins the
+          # probe to the actual workspace directory.
+          cache-workspaces: app/rs/kr64
           # Make CI failures easier to read.
           args: --component rustfmt --component clippy
 
