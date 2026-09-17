@@ -30841,3 +30841,20 @@ Stage Summary:
 - Commit chain: ... 46ad462e (6-Z414) → 3d8385df (6-Z415) → 0ed3a714 (worklog 148) → 96570a3a (6-Z416). rn373 in flight.
 - EXPECT rn373: the "Could not create socket ... Failed to fchmodat" fleet collapses to ~0 (every fchmodat2 caught: translated with a real mode on the sandbox node, or fake-0 with the REAL-MODE pass); zygote publishes; system_server spawns; the boot ladder advances past rung 7 for the first time.
 - If the boot still stalls at a new rung, the remaining sockets/openers queue up behind the new wall.
+
+---
+Task ID: 150 (rn373 decoded: the fchmodat2 hypothesis FAILED the test — 532 ENOENTs persisted with zero fchmodat2 arm activity; 6-Z417 STOP-CENSUS landed to answer the stop-arrival question from kernel-side ground truth; rn374 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn373 (96570a3a) decoded APK-first (fchmodat2 strings present): setsockcreatecon still 0 (6-Z414 holds); the fchmodat ENOENT fleet GREW to 532 with ZERO fchmodat2 arm activity — **the fchmodat2 (452) hypothesis failed the test**. The nr-452 arm exists but nothing matches it (or the calls genuinely never arrive).
+- The +7497ms zygote window (rn373 stderr 18124-18165) gave the full per-attempt shape with the NEW code: 6-Z414 fscreate fakes fire (ret -22 → faked — the HOST kernel rejects the guest's SELinux contexts on /proc/thread-self/attr/fscreate), bind -98 NOT-rewritten (no stash), 6-Z101 faked 0, fchownat caught+translated (underlying -2), fchmodat — nothing — abort; 6-Z414's own lines prove write(2) stops ARE processed in the same window while bind/fchmodat are not.
+- 6-Z417 LANDED (d8015214, pushed + raw-verified): the per-(pid, is_entry, nr) stop census taken at the classified syscall-stop branch (no extra getregs), one drop-proof STOP-CENSUS line per 512 stops per pid with the top-10 shapes. This is the kernel-side ground truth about whether init's bind/fchmodat stops EVER arrive — the question every cheaper oracle censored or left ambiguous. Dead pids' censuses are dropped at the death-cleanup block.
+- Gates: fmt clean, clippy -D warnings clean, 933/933 tests.
+- rn374 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on d8015214.
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: ... 96570a3a (6-Z416) → 67cb4ec2 (worklog 149) → d8015214 (6-Z417). rn374 in flight.
+- THE FORK IN THE ROAD for rn374's census: (E53|E452) counters advancing for init while the arms stay silent = the gap is INSIDE the match (a wrong-nr/ABI-table class, trivially fixed); the counters never advancing for the socket windows = the stops never arrive (kernel-side) and the crash_dump SEIZE hand-off machinery is suspect #2 (its PTRACE_SEIZE/DETACH of a busy thread mid-CreateSocket would hide stops).
+- Everything else stands: 6-Z414 verified twice, the mirror healthy, the instrumentation complete end-to-end.
