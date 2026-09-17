@@ -496,6 +496,54 @@ static void bp_klog_write_raw(const char *s) {
     syscall(NR_close, fd);
 }
 
+// ── 6-Z420: the untraced crash_dump death logger ─────────────────
+//
+// With the 6-Z418 untraced-debuggerd domain, crash_dump's dumps die
+// MID-FLIGHT and the death is invisible to every kr64-side channel (no
+// tracer, an untraced wait-side, LOG output lost). The shlib inside the
+// dying dump is the only witness. This handler runs on the fatal
+// signal, writes ONE raw-syscall marker line to /dev/__kmsg__, and
+// re-raises via raw tgkill so the real termination status (signal-
+// killed) is preserved for the parent. Raw syscalls only (no printf,
+// no malloc, no PLT-hooked calls — getpid is interposed, use g_real_pid).
+// g_real_pid is declared below (6-Z139); forward-declare here.
+static int g_real_pid __attribute__((unused));  // 6-Z420 forward decl above
+static void z420_death_handler(int sig) {
+    char msg[128];
+    int n = 0;
+    const char *p = "[twoyi_loader] 6-Z420: crash_dump pid=";
+    while (*p && n < 100) msg[n++] = *p++;
+    int v = g_real_pid > 0 ? g_real_pid : 0;
+    char d[12];
+    int dn = 0;
+    if (v == 0) d[dn++] = '0';
+    while (v > 0 && dn < 11) {
+        d[dn++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (dn > 0 && n < 110) msg[n++] = d[--dn];
+    p = " died: sig=";
+    while (*p && n < 118) msg[n++] = *p++;
+    v = sig;
+    dn = 0;
+    if (v == 0) d[dn++] = '0';
+    while (v > 0 && dn < 11) {
+        d[dn++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (dn > 0 && n < 126) msg[n++] = d[--dn];
+    msg[n++] = '\n';
+    long fd = twoyi_sys_open("/dev/__kmsg__", O_WRONLY | O_APPEND, 0);
+    if (fd >= 0) {
+        syscall(NR_write, fd, msg, (unsigned long)n);
+        syscall(NR_close, fd);
+    }
+    // SA_RESETHAND already restored SIG_DFL; re-raise so the real
+    // termination happens (the parent sees the signal-death status).
+    syscall(SYS_tgkill, g_real_pid > 0 ? g_real_pid : (int)syscall(SYS_getpid),
+            (int)syscall(SYS_gettid), sig);
+}
+
 // 6-Z139: the REAL pid of this process (captured at loader init via a
 // raw syscall BEFORE any hooks install). bionic's abort() does
 // tgkill(getpid(), gettid(), SIGABRT) — with the getpid hook returning
@@ -9164,6 +9212,70 @@ static void twoyi_init(void) {
     // bionic's abort() actually delivers SIGABRT (see g_real_pid).
     if (g_real_pid < 0) {
         g_real_pid = (int)syscall(SYS_getpid);
+    }
+
+    // ── 6-Z420: the untraced crash_dump death logger ─────────────────
+    //
+    // rn378/rn379 decode: with the 6-Z418 untraced-debuggerd domain,
+    // crash_dump's dumps die MID-FLIGHT (the client logs "crash_dump
+    // failed to dump process", the target stays group-stopped until the
+    // 6-Z421 watchdog CONTs it, and ZERO tombstones are written) — and
+    // the death itself is INVISIBLE: kr64 no longer traces crash_dump
+    // (by design), the dying parent's wait is untraced too (its tids
+    // were eagerly handed off), and crash_dump's LOG(ERROR) output goes
+    // to logcat records that never reach the mirrors. The ONLY channel
+    // inside the dying dump is the LD_PRELOAD shlib itself.
+    //
+    // So: for crash_dump processes ONLY, install async-signal-safe
+    // fatal-signal loggers that write one marker line to /dev/__kmsg__
+    // and then re-raise with the default disposition (the real exit
+    // status — signal-killed — is preserved for the parent). Raw
+    // syscalls only inside the handler (no printf, no malloc). SIGKILL
+    // deaths (tombstoned's intercept timeout) are uncatchable by
+    // design — noted here so the absence of a marker is read as
+    // "SIGKILL or clean exit", never as "no failure".
+    {
+        // Read /proc/self/cmdline with raw syscalls to detect crash_dump.
+        long cfd = twoyi_sys_open("/proc/self/cmdline", O_RDONLY, 0);
+        int is_crash_dump = 0;
+        if (cfd >= 0) {
+            char cbuf[256];
+            long n = syscall(NR_read, cfd, cbuf, sizeof(cbuf) - 1);
+            syscall(NR_close, cfd);
+            if (n > 0) {
+                cbuf[n] = '\0';
+                // Match anywhere in the first argv element (crash_dump32/64).
+                for (long i = 0; i + 9 < n; i++) {
+                    if (cbuf[i] == 'c' && cbuf[i + 1] == 'r' && cbuf[i + 2] == 'a' &&
+                        cbuf[i + 3] == 's' && cbuf[i + 4] == 'h' && cbuf[i + 5] == '_' &&
+                        cbuf[i + 6] == 'd' && cbuf[i + 7] == 'u' && cbuf[i + 8] == 'm' &&
+                        cbuf[i + 9] == 'p') {
+                        is_crash_dump = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if (is_crash_dump) {
+            static const int z420_sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE,
+                                            SIGABRT, SIGTRAP};
+            for (unsigned si = 0; si < sizeof(z420_sigs) / sizeof(z420_sigs[0]); si++) {
+                struct sigaction sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.sa_handler = z420_death_handler;
+                sa.sa_flags = (int)(SA_NODEFER | SA_RESETHAND | SA_ONSTACK);
+                sigemptyset(&sa.sa_mask);
+                // libc sigaction() (NOT the raw NR_rt_sigaction — the
+                // kernel struct layout differs from glibc's). Constructor
+                // context: normal libc use is safe here.
+                sigaction(z420_sigs[si], &sa, NULL);
+            }
+            char msg[96];
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] 6-Z420: crash_dump death logger installed pid=%d\n",
+                     g_real_pid);
+            bp_klog_write_raw(msg);
+        }
     }
 
     // 6-Z306aa: fork-aware client-side binder diagnostics. Re-arm the
