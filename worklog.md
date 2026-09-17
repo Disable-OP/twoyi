@@ -30909,3 +30909,20 @@ Stage Summary:
 - Commit chain: 3c364077 (docs 152) → cad3cab7 (6-Z418). rn378 in flight.
 - THE DECODE STATE: the socket wall is down (Task 152); the debuggerd wall is now named and fixed at the architecture level (the dumps own their ptrace domain); rn378 is the first run where guest tombstones CAN exist — the entire crash-class inventory (the rung-7 cascade) becomes decodable from native evidence.
 - NEXT: decode rn378 → mine the tombstones (the Scudo free site + SF's backtrace) → the targeted fixes; then the queued openers (bluetooth 'Invalid address', rild).
+
+---
+Task ID: 154 (rn378 decoded — 6-Z418 VERIFIED (zero cpp:332 fatals, the crash loop dead, system_server SPAWNED, 77 guest procs); new wall = dumps die mid-flight and freeze their targets (system_server T-state); 6-Z421 freeze watchdog + the detach-failure fallback landed; rn379 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- CI INFRA FIX FIRST: kr64-tests.yml went red between two pushes with NO workflow edit (floating setup-rust-toolchain@v1 bump made its vendored rust-cache run `cargo metadata` at the repo ROOT — no Cargo.toml there). 6-Z419: cache-workspaces: app/rs/kr64 pins the probe to the real workspace. Lesson 2: `cargo fmt` from app/rs does NOT cover the standalone kr64 crate — the local gate must run inside app/rs/kr64 (six method-chain wrap diffs had CI-red the gate). Both fixed; manual CI run GREEN.
+- rn378 (cad3cab7) decoded: rung 7, but 6-Z418 VERIFIED — 9 dumps detached eagerly (e.g. "crash_dump pid=3290 DETACHED ... dying parent Some(3042): 8 tid(s), 0 skipped"), ZERO crash_dump.cpp:332 fatals. THE CRASH LOOP IS DEAD: zygote started ONCE (was 69), surfaceflinger ONCE (was 68), ZERO init-level "received signal" records. **system_server SPAWNED for the first time in the rn3xx era** — the run-end guest ps shows zygote64, system_server, surfaceflinger, tombstoned, adbd, installd, keystore, media.codec, 77 processes.
+- THE NEW WALL: the dumps complete (crash_dump zombies reaped) but produce ZERO tombstones and every dump target stays in do_signal_stop (state T) — SF 3194, cameraserver 3384, AND system_server 3991 (frozen by its own JDWP dump: "Requested dump for tid 3999", crash_dump 4193 detached with 34 tids). The 6-Z396/6-Z411 release cannot fire for an untraced worker (its death produces no kr64 stop) — the frozen class is back, invisible to init (the stall has NO init-level trail). One orphan: crash_dump 3564 PTRACE_DETACH ret=-1 then dropped + skip armed = state 't' forever.
+- 6-Z421 LANDED (ebcdc7c1, pushed + raw-verified): (a) the coverage sweep's loan handling probes each handed-off tid — dead/recycled = pruned; ALIVE but T/t-state past 60s = SIGCONT (kernel-true: the crash class dies from its queued SIGABRT, the live-dump class resumes) + the loan retired; (b) the detach fallback — signal-0 failure retries with SIGCONT, a second failure RESTORES the traced bookkeeping (no unresumable orphans); errno logged. +1 test (937/937), fmt/clippy clean (kr64-crate-local).
+- rn379 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on ebcdc7c1. EXPECT: frozen targets resume (system_server's 34 tids CONT'd at +60s), the boot advances past the frozen-system_server stall; if tombstones STILL fail to write, the next instrument = the tombstoned-side connect/accept trace (6-Z420).
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: 3c364077 → cad3cab7 (6-Z418) → d4d7d874 (docs) → 08b0fbfe (6-Z419 CI) → 4ccf19a2 (fmt) → ebcdc7c1 (6-Z421). rn379 in flight.
+- THE BOOT FRONTIER MOVED AGAINST THE RUNG METRIC: the rung-7 label now sits on a boot with a LIVE system_server and a dead crash loop — the label lags the reality because the ladder's rung 6 evidence (guest-ps) was recorded before the ps sample matured; the real remaining wall = the mid-flight dump failures (tombstone write path) + their frozen victims.
+- NEXT: decode rn379 → the 6-Z421 SIGCONTs should unfreeze system_server (the boot may reach rung 8/9); the tombstone-write failure needs the tombstoned-side connect trace if persists.
