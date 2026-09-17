@@ -30653,3 +30653,20 @@ Stage Summary:
 - Session commit chain (all pushed + CI green): 6fc4ec55 (6-Z403) -> 20e83b19 (6-Z404 v1) -> 07d15be5 (6-Z405) -> 8f41cb59 (6-Z404 v2) -> 7a394f6c (6-Z406) -> 208a19ae (6-Z407) -> THIS (budget fix).
 - THE WALL, FULLY SHAPED: SF main cycles in a composer hwbinder call (registerCallback-class, code=1) whose reply wedges at the BOTTOM of the composer's txn_stack; the composer's nested onHotplug unwind completes; the bottom frame never does. rn363's +28.4..31.1 s window decides between "the reply was sent but mis-delivered" and "the composer never sends it" — each with a one-line fix.
 - Queued decode: the 6-Z405 INIT-CHMODFAM lines (the fchmodat verdict), rild joinRpcThreadpool (secondary), the Java backtrace intercept timeout (art attach).
+
+---
+Task ID: 139 (rn363 decoded — the definitive ledger: the composer never replies to the wedged txn#12 even after its nested onHotplug unwinds; 6-Z407b (the first-BR datum) landed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn363 (#363, 0c6f931d) decoded: verdict rung 7 — and the correlation ledger is now DEFINITIVE:
+  * txn#12 (code=1, registerCallback-class) delivered to the composer (conn=30) at +22876 ms was NEVER replied to. The composer processed every LATER transaction normally (txn#14..24 popped within ~300 ms each, all logging stack-left=1 — txn#12 wedged at the stack BOTTOM).
+  * The composer's nested onHotplug (txn#13) unwound completely: main replied at +27473 ms (conn=66 pops txn#13), the reply routed back, the composer's read at +27580 returned 68 B (a real BR stream), it issued BC_INCREFS at +27584, returned to idle — WITHOUT ever popping txn#12.
+  * Main's waiter expired at +30949 ms ("6-Z407 TIMEOUT: conn=66 txn#12 expired — BR_FAILED_REPLY queued, stack purge from conns [30]"); main re-issued (the 250 ms retry loop); the run ends rung 7.
+- THE ONE REMAINING AMBIGUITY: the +27580 68-byte read — BR_REPLY (the nested wait consumed txn#13's reply and the registerCallback handler STILL did not complete — a guest-side HIDL semantics defect AFTER the callback consumption) vs BR_TRANSACTION (a new incoming transaction; the reply still queued unconsumed — a proxy-side delivery-order defect).
+- 6-Z407b (this commit): every WRITE_READ response line now carries the FIRST BR command of the read stream ("first_br=" — BR_REPLY=0x72072006 vs BR_TRANSACTION=0x72072002). Gates: fmt clean, clippy -D warnings clean, 932/932 tests; CI green.
+
+Stage Summary:
+- Session commit chain (all pushed + CI green): 6fc4ec55 (6-Z403) -> 20e83b19 (6-Z404 v1) -> 07d15be5 (6-Z405) -> 8f41cb59 (6-Z404 v2) -> 7a394f6c (6-Z406) -> 208a19ae (6-Z407) -> 0c6f931d (budget) -> THIS (6-Z407b).
+- EXPECT rn364: the +27.5 s conn=30 read stream names its first BR — the wedged-bottom-frame defect resolves to the guest side (the composer's post-reply behavior) or the proxy side (the reply-queue ordering), each with a targeted fix.
+- Queued decode: the 6-Z405 INIT-CHMODFAM lines (the fchmodat verdict), rild joinRpcThreadpool (secondary), the Java backtrace intercept timeout (art attach).
