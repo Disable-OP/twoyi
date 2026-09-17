@@ -30742,3 +30742,20 @@ Stage Summary:
 - Session commit chain: ... 88e4fba5 (6-Z410) -> afefbaf2 (worklog 142) -> THIS 957bb36d (6-Z411).
 - EXPECT rn368: the dumped services RESUME after their dumps (the "6-Z411: post-dump SIGCONT" lines); the crashed composer DIES from its queued SIGABRT (init reaps + RESTARTS it — the restart loop becomes visible, kernel-true); the boot should push past rung 7 (SF's getHashChain answered, the composer's client created, the display pipeline proceeds). If the composer's Scudo abort then loops the restart, the NEXT layer is the invalid-free itself (the buffer-accounting decode) — but now with VISIBLE service deaths instead of silent freezes.
 - Queued: the socket fchmodat pair-skip class (6-Z210), rild joinRpcThreadpool, the Java backtrace intercept timeout.
+
+---
+Task ID: 144 (rn368 decoded — 6-Z411 VERIFIED: the lifecycle is kernel-true, zero binder timeouts, the composer survives; the 68-generation SF cascade loops with its abort message lost to logcat rotation; 6-Z412 crash-buffer capture landed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn368 (#368, 957bb36d) decoded: verdict rung 7, INTERNALLY TRANSFORMED:
+  * 6-Z411 VERIFIED: 1967 post-dump SIGCONTs (kill rc=0 throughout); ZERO 6-Z407 binder timeouts (the wedge fleet GONE); txn counters 449+, pids 11K (thousands of service cycles vs the old stuck-at-30); the composer SURVIVES the whole run (0 fatal signals — 6-Z409's ack + 6-Z411's resume both hold).
+  * The boot loops a 68-generation surfaceflinger/zygote/netd/audioserver cascade ("init: Service 'surfaceflinger' (pid 3461) received signal 6" — SF aborts with its own SIGABRT, 68 times).
+  * SF's OWN abort message is lost to main-buffer rotation; the surviving evidence: 17 captured svc logs carry "Failed HIDL return status not checked ... Status(EX_TRANSACTION_FAILED): DEAD_OBJECT" aborts; the bluetooth fleet's own cascade backtraced (HciHalHidl::start_hidl got DEAD_OBJECT after the 'Invalid address: 3C:5A:B4:01:02:03' config abort — pids 1025/1565); one 60s 'Fail to create version map ... Is system_server down?' PMS wait.
+- 6-Z412 (this commit): the runner now dumps "logcat -d -b crash" alongside the main buffer — the crash buffer retains EVERY Fatal signal + Abort message for the WHOLE run (rotation-proof). rn369 DISPATCHED on THIS commit (HTTP 204).
+
+Stage Summary:
+- Session commit chain: ... 957bb36d (6-Z411) -> ba1a285c (worklog 143) -> THIS 3611a932 (6-Z412).
+- THE ARC THIS SESSION: registerCallback wedge (6-Z409 FIXED, verified 2x) -> frozen-after-dump class (6-Z411 FIXED, verified) -> the 68-generation SF SIGABRT cascade with the abort message rotation-lost (6-Z412 instruments; rn369 names SF's abort).
+- Next decode (rn369): logcat-crash.txt -> SF's abort message -> the targeted fix (likely a DEAD_OBJECT return on one of SF's HAL calls, or the Scudo invalid-free class resurfacing inside SF's own buffers).
+- Queued: the socket fchmodat pair-skip class (6-Z210), the bluetooth 'Invalid address' config abort, rild joinRpcThreadpool.
