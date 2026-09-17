@@ -32993,7 +32993,21 @@ pub fn run_ptrace_loop(
                         if hit && (req == SIOCGIFFLAGS_Z439 || req == SIOCSIFFLAGS_Z439) {
                             set_syscall_num(&mut regs, &abi, abi.getpid);
                             if ptrace_setregs(pid, &regs, iov_len).is_ok() {
-                                pending_sandbox_deny.insert(pid, -2); // raw -ENODEV
+                                // 6-Z439c: raw -ENODEV (19) — NOT -2! rn400
+                                // (run 35286126530) measured the -2 mistake:
+                                // -2 is -ENOENT ("No such file or
+                                // directory" — the svc capture has it
+                                // verbatim), and ipv6_monitor's retry-later
+                                // branch matches ONLY errno == ENODEV
+                                // ("If interface initialization fails
+                                // we'll retry later"); ENOENT fell through
+                                // to InitResult::Error → the nullptr → the
+                                // SAME SIGSEGV, with the fake visibly
+                                // firing 21×. ENODEV=19 drives the
+                                // Deferred branch: mPollTimeout=1000ms and
+                                // the monitor parks in its poll-retry loop
+                                // forever.
+                                pending_sandbox_deny.insert(pid, -(libc::ENODEV as i64));
                                 log(&format!(
                                     "6-Z439b: ioctl(fd={}, req={:#x}) on the packet-standin fd -> raw -ENODEV (the reference-ril monitor's own Deferred branch)",
                                     fd, req
