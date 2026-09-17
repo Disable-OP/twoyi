@@ -31001,3 +31001,18 @@ Work Log:
 Stage Summary:
 - Commit chain: ... a74ef808 (6-Z425) → c5124e16 (docs) → 9f4b7f88 (6-Z426). rn385 in flight.
 - The debuggerd chain is now complete end to end: eager hand-off (raw-kernel attach) + stays-traced (guest libs) + sweep guards + the freeze watchdog + the death logger + the queued-SIGSTOP fix. rn385 verifies the pipeline.
+
+---
+Task ID: 160 (rn385 decoded — THE DEBUGGERD PIPELINE COMPLETE END TO END (zero fatals, 10 tombstoned accepts, the full choreography ran) but the tombstone-creation linkat hit the 6-Z185 backstop (no translation arm); 6-Z427 linkat translation landed; rn386 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn385 (9f4b7f88) decoded: rung 7. **6-Z426 VERIFIED — ZERO failure-notes** (the wait_for_clone FATAL class is DEAD). The choreography ran COMPLETE: 25 SEIZE / 24 DETACH / 21 INTERRUPT / 17 GETREGSET / the pseudothread "?"-flag seize / 3 CONT; tombstoned ACCEPTED 10 crash connects. BUT zero tombstone files: "SANDBOX BACKSTOP: DENIED linkat(/data/tombstones/tombstone_00) — resolved outside the rootfs" (x2).
+- ROOT CAUSE: tombstoned creates the tombstone via linkat(tmpfd, "", AT_FDCWD, "/data/tombstones/tombstone_NN", AT_EMPTY_PATH) — the link/rename family's linkat leg had NO translation arm (the code comment admitted: "the backstop is their only guard") — the raw host path was correctly denied and the tombstone never landed in the guest rootfs.
+- 6-Z427 LANDED (c6c2e8ba, pushed + raw-verified): ChildAbi.linkat (37 aarch64 / 265 x86_64 / 303 i386 / 330 arm32) + the linkat ENTRY translation arm (mirrors the 6-Z306v renameat arm): oldpath skipped under AT_EMPTY_PATH; newpath ALWAYS translated → the tombstone link lands at {rootfs}/data/tombstones/tombstone_NN. +1 ABI test (938/938), fmt/clippy clean.
+- rn386 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on c6c2e8ba. EXPECT: "6-Z427: linkat ... newpath" lines; tombstone FILES in {rootfs}/data/tombstones; the Scudo/SF abort backtraces finally readable.
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: ... 9f4b7f88 (6-Z426) → 94f04ee0 (docs) → c6c2e8ba (6-Z427). rn386 in flight.
+- THE FULL CHAIN THIS SESSION: rn377 named the debuggerd wall → 6-Z418/421/422 re-architected the trace domain → 6-Z423 made the dump write its autopsy → 6-Z424 guarded the sweep → 6-Z425 traced the choreography → 6-Z426 fixed the queued-SIGSTOP leak → 6-Z427 fixed the tombstone-creation leg. rn386 is the first run where guest tombstones CAN exist.
