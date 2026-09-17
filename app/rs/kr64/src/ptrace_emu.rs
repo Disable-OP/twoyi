@@ -22975,8 +22975,10 @@ pub fn run_ptrace_loop(
                                             // 6-Z418: record the start time so the
                                             // periodic prune can retire this
                                             // entry when the tid dies/recycles.
-                                            z388_handed_off_at
-                                                .insert(z388_target, proc_starttime(z388_target).unwrap_or(0));
+                                            z388_handed_off_at.insert(
+                                                z388_target,
+                                                proc_starttime(z388_target).unwrap_or(0),
+                                            );
                                         }
                                         break;
                                     }
@@ -36807,23 +36809,25 @@ pub fn run_ptrace_loop(
                         ) {
                             static Z418_LOGGED: std::sync::atomic::AtomicU64 =
                                 std::sync::atomic::AtomicU64::new(0);
-                            let z418_n = Z418_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let z418_n =
+                                Z418_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let dying_parent = z418_parent_pid(exec_pid);
                             let mut released: usize = 0;
                             let mut walk_skipped: usize = 0;
                             let walk_t0 = std::time::Instant::now();
                             if let Some(parent) = dying_parent {
-                                let mut tid_list: Vec<libc::pid_t> = std::fs::read_dir(
-                                    format!("/proc/{}/task", parent),
-                                )
-                                .map(|rd| {
-                                    rd.filter_map(|e| e.ok())
-                                        .filter_map(|e| {
-                                            e.file_name().to_str().and_then(|s| s.parse::<libc::pid_t>().ok())
+                                let mut tid_list: Vec<libc::pid_t> =
+                                    std::fs::read_dir(format!("/proc/{}/task", parent))
+                                        .map(|rd| {
+                                            rd.filter_map(|e| e.ok())
+                                                .filter_map(|e| {
+                                                    e.file_name()
+                                                        .to_str()
+                                                        .and_then(|s| s.parse::<libc::pid_t>().ok())
+                                                })
+                                                .collect()
                                         })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                                        .unwrap_or_default();
                                 tid_list.sort_unstable();
                                 tid_list.truncate(Z418_WALK_MAX_TIDS);
                                 for tid in tid_list {
@@ -36878,8 +36882,7 @@ pub fn run_ptrace_loop(
                                             )
                                         };
                                         if w == tid {
-                                            let st_time =
-                                                proc_starttime(tid).unwrap_or(0);
+                                            let st_time = proc_starttime(tid).unwrap_or(0);
                                             tracked_pids.retain(|&p| p != tid);
                                             pid_starttimes.remove(&tid);
                                             in_syscall_map.remove(&tid);
@@ -36891,8 +36894,7 @@ pub fn run_ptrace_loop(
                                             z388_handed_off_to.insert(tid, exec_pid);
                                             z388_handed_off_at.insert(tid, st_time);
                                             if libc::WIFSTOPPED(st) {
-                                                let sig =
-                                                    z388_detach_signal(libc::WSTOPSIG(st));
+                                                let sig = z388_detach_signal(libc::WSTOPSIG(st));
                                                 let dret = unsafe {
                                                     libc::ptrace(
                                                         libc::PTRACE_DETACH,
