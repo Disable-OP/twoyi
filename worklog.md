@@ -30926,3 +30926,18 @@ Stage Summary:
 - Commit chain: 3c364077 → cad3cab7 (6-Z418) → d4d7d874 (docs) → 08b0fbfe (6-Z419 CI) → 4ccf19a2 (fmt) → ebcdc7c1 (6-Z421). rn379 in flight.
 - THE BOOT FRONTIER MOVED AGAINST THE RUNG METRIC: the rung-7 label now sits on a boot with a LIVE system_server and a dead crash loop — the label lags the reality because the ladder's rung 6 evidence (guest-ps) was recorded before the ps sample matured; the real remaining wall = the mid-flight dump failures (tombstone write path) + their frozen victims.
 - NEXT: decode rn379 → the 6-Z421 SIGCONTs should unfreeze system_server (the boot may reach rung 8/9); the tombstone-write failure needs the tombstoned-side connect trace if persists.
+
+---
+Task ID: 155 (rn380 decoded — the full-detach design KILLED: the untraced crash_dump's guest linker resolves guest libs against the HOST fs and dies pre-constructor (zero 6-Z420 markers); 6-Z422 = crash_dump stays traced + the eager hand-off is the keeper; rn381 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn380 (18922042) decoded: rung 7, 59 dumps detached, 73 6-Z421 fires — and ZERO 6-Z420 markers despite the logger shipping in the APK (verified by unzipping the artifact APK: the arm64 libtwoyi_loader_shlib.so carries the 6-Z420 code). The crash_dump shlib constructor NEVER RAN.
+- ROOT CAUSE: the untraced crash_dump's guest LINKER resolves everything RAW — LD_PRELOAD (/dev/lib*.so) and DT_NEEDED (/system/lib64) hit the HOST filesystem (Android-14 host bionic for an Android-11 guest binary) → the linker dies before any constructor. Every OTHER staged exec works because its linker's opens are TRANSLATED by kr64 (the process is traced).
+- 6-Z422 LANDED (1400385d, pushed + raw-verified): crash_dump STAYS TRACED (the loader/shlib/socket-connect translation + the guest linker path) while the 6-Z418 EAGER HAND-OFF stays (the dying parent's tids are released before crash_dump's first SEIZE → its per-thread attach runs raw-kernel with NO dance; the one remaining in-domain SEIZE — its own pseudothread — fires the rn353-verified 6-Z388 dance). The rn377 wait_for_clone SIGSTOP leakage came from the dying tids' per-tid dances racing the attach loop — the eager walk removed those dances entirely. 6-Z421 stays as the freeze backstop; 6-Z420 stays (it will finally run now that crash_dump's shlib loads). Gates: fmt/clippy/937-937 green.
+- rn381 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on 1400385d. EXPECT: the 6-Z420 "installed" markers appear (the shlib loads now); the dumps complete; tombstone files appear; the Scudo + SF-abort backtraces become decodable.
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: ... 18922042 (6-Z420) → 1400385d (6-Z422). rn381 in flight.
+- The architecture converged: eager hand-off (real-kernel per-thread attach) + traced crash_dump (real guest libs) + the freeze watchdog + the death logger — every layer rn-verified except the final tombstone write, which rn381 tests.
