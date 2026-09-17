@@ -30956,3 +30956,18 @@ Work Log:
 Stage Summary:
 - Commit chain: ... 1400385d (6-Z422) → 595fae42 (docs) → f80b5c49 (6-Z423). rn382 in flight.
 - The instrumentation is now surgical: the failing dump writes its own autopsy — rn382 reads it.
+
+---
+Task ID: 157 (rn382 decoded — THE 6-Z423 NOTE DELIVERED THE VERDICT VERBATIM: "process didn't stop due to PTRACE_O_TRACECLONE (status = 8393599)" on EVERY dump; the mechanism = the coverage sweep RACING crash_dump's pseudothread seize; 6-Z424 landed; rn383 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn382 (f80b5c49) decoded: rung 7. **THE 6-Z423 INSTRUMENT DELIVERED THE ANSWER**: "6-Z423: crash_dump failure-note (pid=4003): crash_dump failed to dump process 3726: process didn't stop due to PTRACE_O_TRACECLONE (status = 8393599)" — the same wait_for_clone auto-attach-shaped SIGSTOP on every dump, captured verbatim from the failing dump's own output fd.
+- THE MECHANISM NAMED: the failing window shows ZERO 6-Z388 dance fires (the pseudothread SEIZE matched no dance) while the pseudothread's parent (the dump worker) IS kr64-tracked — the 6-Z190 coverage sweep's parent-descendant filter QUALIFIED the pseudothread (tracked parent, untracked in the books) and its PTRACE_ATTACH RACED crash_dump's own PTRACE_SEIZE of the same tid; the loser of that race poisons the dump — the pseudothread's stops land in the wrong tracer's waitpid and wait_for_clone receives the auto-attach-shaped SIGSTOP (0x80137F) where its clone event belongs.
+- 6-Z424 LANDED (7a2b3230, pushed + raw-verified): (a) the sweep skips candidates whose PPID is a tagged crash_dump pid (the pseudothread/intermediate/vm_pid family); (b) the sweep skips ANY candidate whose /proc status shows a non-zero TracerPid — universal "never touch someone else's tracee". Gates: fmt/clippy/937-937 green.
+- rn383 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on 7a2b3230. EXPECT: zero PTRACE_O_TRACECLONE fatals; the dumps complete; tombstone files; the Scudo/SF backtraces.
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: ... f80b5c49 (6-Z423) → b0dea575 (docs) → 7a2b3230 (6-Z424). rn383 in flight.
+- THE EVIDENCE CHAIN IS COMPLETE: rn377 named the wall (349/347 dumps dead) → 6-Z418/421/422 fixed the architecture layers → 6-Z423 made the failing dump write its own autopsy → the note named the sweep race → 6-Z424 closes it. rn383 is the verification run.
