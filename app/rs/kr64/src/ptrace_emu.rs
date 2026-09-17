@@ -595,6 +595,11 @@ struct ChildAbi {
     // (same shape as openat's arg2).
     renameat: i64,
     renameat2: i64,
+    // 6-Z427: linkat (old dirfd, old PATH, new dirfd, new PATH, flags) —
+    // arg2 + arg4 are the paths (AT_EMPTY_PATH skips arg2's translation).
+    // tombstoned's tombstone-creation leg: linkat(tmpfd, "", AT_FDCWD,
+    // "/data/tombstones/tombstone_NN", AT_EMPTY_PATH).
+    linkat: i64,
     // Syscalls that TWRP init calls early in startup which return EPERM
     // as untrusted_app (capget — no capabilities; fchown/fchmod — can't
     // change ownership/permissions of fds; ioprio_get / ioprio_set —
@@ -1625,6 +1630,8 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // 6-Z306v: x86_64 renameat=264, renameat2=316 (unistd_64.h).
     renameat: 264,
     renameat2: 316,
+    // 6-Z427: x86_64 linkat=265 (unistd_64.h).
+    linkat: 265,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. Real fchown on x86_64 is 93 (NOT 91, which
     // is fchmod — the diagnostic log that motivated this fix reported
@@ -1965,6 +1972,8 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // below had i386/x86_64 renameat swapped until this fix).
     renameat: 302,
     renameat2: 353,
+    // 6-Z427: i386 linkat=303 (unistd_32.h).
+    linkat: 303,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. i386 fchown=95, fchmod=94, capget=184,
     // ioprio_get=290, ioprio_set=289 (per /usr/lib/linux/uapi/x86/
@@ -2352,6 +2361,8 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // 6-Z306v: aarch64 (asm-generic) renameat=38, renameat2=276.
     renameat: 38,
     renameat2: 276,
+    // 6-Z427: aarch64 (asm-generic) linkat=37.
+    linkat: 37,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
     // fchown=55, fchmod=52, capget=90, ioprio_get=31, ioprio_set=30
@@ -2730,6 +2741,8 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     // 6-Z306v: arm32 renameat=329, renameat2=382 (syscall.tbl).
     renameat: 329,
     renameat2: 382,
+    // 6-Z427: arm32 linkat=330 (syscall.tbl).
+    linkat: 330,
     fchown: 207, // fchown32 — bionic lp32 mapping
     fchmod: 94,
     capget: 184,
@@ -30843,6 +30856,79 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         }
+                        // ── 6-Z427: linkat ENTRY path translation — the
+                        // tombstone-creation leg ─────────────────────────
+                        //
+                        // rn385 decode: the debuggerd pipeline is COMPLETE
+                        // (the eager hand-off + stays-traced + sweep guards +
+                        // the queued-SIGSTOP fix — zero wait_for_clone
+                        // fatals, tombstoned ACCEPTED 10 crash connects) but
+                        // ZERO tombstone files exist: tombstoned creates the
+                        // file via linkat(tmpfd, "", AT_FDCWD,
+                        // "/data/tombstones/tombstone_NN", AT_EMPTY_PATH) and
+                        // the rename/link family's linkat leg had NO
+                        // translation arm — the raw host path
+                        // /data/tombstones/tombstone_00 hit the 6-Z185
+                        // backstop ("DENIED linkat ... resolved outside the
+                        // rootfs") and the tombstone never landed. This arm
+                        // translates BOTH path args (mirrors the 6-Z306v
+                        // renameat arm):
+                        //   oldpath = arg2 (dirfd arg1) — SKIPPED when
+                        //     AT_EMPTY_PATH (0x1000) is set: the string is
+                        //     empty by design (the fd IS the file);
+                        //   newpath = arg4 (dirfd arg3) — ALWAYS translated.
+                        // The guest linker's libc calls this on aarch64 as
+                        // nr 37 (i386 303 / x86_64 265 / arm32 330).
+                        n if (abi.linkat != -1 && n == abi.linkat) => {
+                            const AT_EMPTY_PATH: u64 = 0x1000;
+                            let flags = get_syscall_arg(&regs, abi.reg_arg5);
+                            if flags & AT_EMPTY_PATH == 0 {
+                                let old_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                if let Some(old_path) = read_child_string(pid, old_addr) {
+                                    if !old_path.is_empty() {
+                                        let old_trans =
+                                            translate_path_via_sandbox(&sandbox, rootfs, &old_path);
+                                        if old_trans != old_path {
+                                            write_translated_path(
+                                                pid,
+                                                &mut regs,
+                                                iov_len,
+                                                abi.reg_arg2,
+                                                scratch_addr,
+                                                &mut scratch_offset,
+                                                &old_trans,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            let new_addr = get_syscall_arg(&regs, abi.reg_arg4);
+                            if let Some(new_path) = read_child_string(pid, new_addr) {
+                                let new_trans =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &new_path);
+                                if new_trans != new_path {
+                                    static Z427_DIAG: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z427_DIAG.load(std::sync::atomic::Ordering::Relaxed) < 24 {
+                                        Z427_DIAG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        log(&format!(
+                                            "6-Z427: linkat pid={} newpath {:?} -> {:?} (the tombstone-creation leg lands in the rootfs)",
+                                            pid, new_path, new_trans
+                                        ));
+                                    }
+                                    write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        abi.reg_arg4,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &new_trans,
+                                    );
+                                }
+                            }
+                        }
                         // ── bootfix FIX 1: statfs (i386 nr=99) /
                         // statfs64 (i386 nr=268) ENTRY path translation ──
                         //
@@ -52319,6 +52405,20 @@ mod z388_handoff_tests {
         // fully traced — this is kr64's core emulation hook.
         assert!(!z418_detach_decision(false, false));
         assert!(!z418_detach_decision(false, true));
+    }
+
+    /// 6-Z427: the linkat numbers per ABI — the tombstone-creation leg's
+    /// translation arm keys on these; a wrong number would leave the arm
+    /// inert (the backstop denial returns) or hijack another syscall.
+    #[test]
+    fn z427_linkat_numbers_per_abi() {
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(ABI_AARCH64.linkat, 37, "aarch64 linkat=37 (asm-generic)");
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(ABI_X86_64.linkat, 265, "x86_64 linkat=265");
+            assert_eq!(ABI_X86_32.linkat, 303, "i386 linkat=303");
+        }
     }
 
     /// 6-Z418: the /proc/<pid>/status PPid parser — the dying parent is
