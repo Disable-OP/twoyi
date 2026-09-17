@@ -35201,8 +35201,91 @@ pub fn run_ptrace_loop(
                             static Z306AF_S2_ARMED: std::sync::Mutex<
                                 Option<(i32, u32, std::time::Instant)>,
                             > = std::sync::Mutex::new(None);
+                            // 6-Z423: the crash_dump failure-note follow
+                            // window — after the "crash_dump failed" marker
+                            // write, the abort message rides the next writes
+                            // from the same pid (the second dprintf chunk).
+                            static Z423_FOLLOW: std::sync::Mutex<Option<(i32, u32)>> =
+                                std::sync::Mutex::new(None);
                             let probe =
                                 read_child_bytes(pid, get_syscall_arg(&regs, abi.reg_arg2), 64);
+                            // 6-Z423: THE crash_dump failure-note capture.
+                            // The custom aborter (crash_dump.cpp:213-232)
+                            // writes "crash_dump failed to dump process"
+                            // AND the ABORT MESSAGE into the output fd, then
+                            // _exit(1) — rn381's workers exited 1, so the
+                            // note IS the decode: it names the exact
+                            // LOG(FATAL) that killed the dump. The 64B probe
+                            // already read the buffer start; the note's first
+                            // chunk begins with the marker, so a marker hit
+                            // here re-reads the FULL chunk (512B) and logs it
+                            // verbatim through the drop-proof z413 channel.
+                            if probe
+                                .as_ref()
+                                .map(|b| {
+                                    b.starts_with(b"crash_dump failed")
+                                        || b.windows(17).any(|w| w == b"crash_dump failed")
+                                })
+                                .unwrap_or(false)
+                            {
+                                static Z423_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z423_LOGGED.load(std::sync::atomic::Ordering::Relaxed) < 48 {
+                                    Z423_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let full = read_child_bytes(
+                                        pid,
+                                        get_syscall_arg(&regs, abi.reg_arg2),
+                                        512,
+                                    );
+                                    let text = full
+                                        .map(|b| String::from_utf8_lossy(&b).trim_end().to_string())
+                                        .unwrap_or_else(|| "<unreadable>".to_string());
+                                    log(&format!(
+                                        "6-Z423: crash_dump failure-note (pid={}): {}",
+                                        pid,
+                                        crate::cap_log_line(&text, 480)
+                                    ));
+                                }
+                                // The abort MESSAGE rides the SECOND dprintf
+                                // chunk (a separate write) — arm a follow
+                                // window for this pid (4 verbatim captures).
+                                if let Ok(mut w) = Z423_FOLLOW.lock() {
+                                    *w = Some((pid, 4));
+                                }
+                            }
+                            // 6-Z423 follow: drain the window — the next
+                            // writes from the failing crash_dump carry the
+                            // abort message (" <tid>: <msg>").
+                            {
+                                let mut take423 = false;
+                                if let Ok(mut w) = Z423_FOLLOW.lock() {
+                                    match w.as_ref() {
+                                        Some((apid, left)) if *apid == pid && *left > 0 => {
+                                            take423 = true;
+                                            let nl = *left - 1;
+                                            *w = if nl == 0 { None } else { Some((pid, nl)) };
+                                        }
+                                        Some((apid, _)) if *apid != pid => {}
+                                        _ => {}
+                                    }
+                                }
+                                if take423 {
+                                    let full = read_child_bytes(
+                                        pid,
+                                        get_syscall_arg(&regs, abi.reg_arg2),
+                                        512,
+                                    );
+                                    log(&format!(
+                                        "6-Z423: crash_dump failure-note cont (pid={}): {}",
+                                        pid,
+                                        full.map(|b| {
+                                            crate::cap_log_line(&String::from_utf8_lossy(&b), 480)
+                                                .into_owned()
+                                        })
+                                        .unwrap_or_else(|| "<unreadable>".to_string())
+                                    ));
+                                }
+                            }
                             // 6-Z301: glog classification FIRST (borrow);
                             // is_fatal_marker below consumes the probe.
                             is_glog = probe
