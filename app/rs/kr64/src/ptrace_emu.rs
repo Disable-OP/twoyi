@@ -37019,71 +37019,48 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             }
-                            // (3) detach the crash_dump itself. rn378 decode:
-                            // one dump's PTRACE_DETACH returned -1 while the
-                            // kernel-side tracer persisted — the pid was
-                            // dropped from every account + skip_next_resume
-                            // armed, so NOTHING ever resumed it (state 't'
-                            // forever, cameraserver frozen). The fallback:
-                            // retry the detach with SIGCONT (a group-stop
-                            // survives a signal-0 detach), and if the kernel
-                            // still refuses, RESTORE the traced bookkeeping
-                            // so the loop-top resumes it normally (the
-                            // in-domain path — today's behavior — instead of
-                            // an unresumable orphan).
-                            let mut dret = unsafe {
-                                libc::ptrace(libc::PTRACE_DETACH, exec_pid, 0, 0 as libc::c_long)
-                            };
-                            if dret != 0 {
-                                let err0 = std::io::Error::last_os_error();
-                                dret = unsafe {
-                                    libc::ptrace(
-                                        libc::PTRACE_DETACH,
-                                        exec_pid,
-                                        0,
-                                        libc::SIGCONT as libc::c_long,
-                                    )
-                                };
-                                if z418_n < 64 {
-                                    log(&format!(
-                                        "6-Z418: crash_dump pid={} signal-0 detach failed ({}), SIGCONT-retry ret={}",
-                                        exec_pid, err0, dret
-                                    ));
-                                }
-                            }
-                            if dret == 0 {
-                                tracked_pids.retain(|&p| p != exec_pid);
-                                pid_starttimes.remove(&exec_pid);
-                                in_syscall_map.remove(&exec_pid);
-                                pending_resume.remove(&exec_pid);
-                                esrch_streak.remove(&exec_pid);
-                                last_stop_at.remove(&exec_pid);
-                                z306k_last_natural.remove(&exec_pid);
-                                z388_crash_dump_pids.remove(&exec_pid);
-                                z418_untraced.insert(exec_pid);
-                                // (4) the loop-top must not resume an untraced pid.
-                                skip_next_resume = Some(exec_pid);
-                            } else {
-                                let err = std::io::Error::last_os_error();
-                                // RESTORE: the pid stays kr64-traced; the
-                                // loop-top's normal resume applies.
-                                if !tracked_pids.contains(&exec_pid) {
-                                    tracked_pids.push(exec_pid);
-                                }
-                                pid_starttimes
-                                    .insert(exec_pid, proc_starttime(exec_pid).unwrap_or(0));
-                                z388_handed_off_at.remove(&exec_pid);
-                                if z418_n < 64 {
-                                    log(&format!(
-                                        "6-Z418: crash_dump pid={} DETACH FAILED twice ({}) — restoring the traced path (skip_next_resume NOT armed)",
-                                        exec_pid, err
-                                    ));
-                                }
-                            }
-                            if z418_n < 64 {
+                            // (3) 6-Z422: crash_dump STAYS TRACED. rn380's
+                            // decode killed the full-detach design: an
+                            // untraced crash_dump's guest linker resolves
+                            // its LD_PRELOAD (/dev/lib*.so) and DT_NEEDED
+                            // (/system/lib64) RAW against the HOST
+                            // filesystem — Android-14 host libs for an
+                            // Android-11 guest binary — and the linker
+                            // dies before ANY constructor (zero 6-Z420
+                            // markers in rn380 despite the code shipping
+                            // in the APK; the traced loader path is HOW
+                            // every other staged exec gets its guest
+                            // libs). With crash_dump traced:
+                            //   * its file ops stay translated (the
+                            //     loader, the shlib, the socket connects);
+                            //   * its SEIZEs of the DYING tids hit the
+                            //     6-Z388 decision with target_tracked=FALSE
+                            //     (the eager walk above already released
+                            //     them) → NO dance → the raw kernel SEIZE
+                            //     succeeds natively — the dump's per-thread
+                            //     attach is real-kernel;
+                            //   * its SEIZE of its OWN pseudothread (the
+                            //     one remaining tracked target) fires the
+                            //     6-Z388 dance — the rn353-verified shape
+                            //     (detach-with-CONT, raw SEIZE lands, the
+                            //     fork events flow to crash_dump as the
+                            //     pseudothread's tracer);
+                            //   * the rn377 wait_for_clone SIGSTOP leakage
+                            //     came from the DYING tids' dances racing
+                            //     the attach loop — the eager walk
+                            //     eliminated those dances entirely.
+                            // The 6-Z421 watchdog stays as the backstop for
+                            // any dump that dies mid-flight (its targets
+                            // are untraced either way — the walk released
+                            // them — so the SIGCONT resume is unchanged).
+                            static Z422_LOGGED: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let z422_n =
+                                Z422_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if z422_n < 8 {
                                 log(&format!(
-                                    "6-Z418: crash_dump pid={} DETACHED (untraced-debuggerd; ret={}) — dying parent {:?}: {} tid(s) eagerly handed off, {} skipped; the dump now runs real-kernel ptrace end to end",
-                                    exec_pid, dret, dying_parent, released, walk_skipped
+                                    "6-Z422: crash_dump pid={} STAYS TRACED (the guest linker needs kr64's translation; eager hand-off already released the dying parent {:?}'s {} tid(s), {} skipped — its SEIZEs of them are raw-kernel)",
+                                    exec_pid, dying_parent, released, walk_skipped
                                 ));
                             }
                         }
