@@ -16344,6 +16344,12 @@ pub fn run_ptrace_loop(
         std::collections::HashSet::new();
     let mut z428_tomb_open_logged: std::collections::HashMap<libc::pid_t, u8> =
         std::collections::HashMap::new();
+    // 6-Z428d: the pwait-EXIT census (the wake/restart/timeout shape) —
+    // first 8 per tombstoned pid.
+    let mut z428_pwait_exit_logged: std::collections::HashMap<libc::pid_t, u8> =
+        std::collections::HashMap::new();
+    // 6-Z429: the raw-connect repair log budget (first 16 per run).
+    let mut z429_repair_logged: u64 = 0;
     // 6-Z305t-59: the LAST rewritten bind's (guest_path, remove_file result)
     // per pid — consumed at the bind EXIT by the 6-Z101 forensics so every
     // -98 is attributed to its guest path and the remove_file outcome.
@@ -28888,7 +28894,45 @@ pub fn run_ptrace_loop(
                                     } else {
                                         0
                                     };
-                                    if open_flags & (libc::O_WRONLY | libc::O_RDWR) != 0 {
+                                    // ── 6-Z428c: the fallback-tombstone landing ──
+                                    // AOSP-11 crash_dump's not-connected fallback
+                                    // opens /dev/null O_RDWR as its g_output_fd
+                                    // (crash_dump.cpp:557-564 — the ONLY /dev/null
+                                    // open in the binary). The rn387 harvest proved
+                                    // the fallback tombstones are FULL and land in
+                                    // the svc log (via the redirect below) — this
+                                    // arm instead lands them IN the guest's
+                                    // tombstones dir as real files: a tagged
+                                    // crash_dump's /dev/null write-open resolves to
+                                    // {rootfs}/data/tombstones/tombstone_fallback_<pid>
+                                    // (pre-created O_APPEND; the dir init created).
+                                    // The guest's own tooling can read them; the
+                                    // ladder evidence channel sees a non-empty
+                                    // tombstones dir; zero tombstoned involvement.
+                                    if z388_crash_dump_pids.contains(&pid)
+                                        && open_flags & (libc::O_WRONLY | libc::O_RDWR) != 0
+                                    {
+                                        let fb_dir = format!("{}/data/tombstones", rootfs);
+                                        if std::fs::metadata(&fb_dir).is_ok() {
+                                            let fb_path =
+                                                format!("{}/tombstone_fallback_{}", fb_dir, pid);
+                                            let _ = std::fs::OpenOptions::new()
+                                                .create(true)
+                                                .append(true)
+                                                .open(&fb_path);
+                                            translated = fb_path;
+                                            static FALLBACK_LAND_LOG: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            let fb_n = FALLBACK_LAND_LOG
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if fb_n < 12 {
+                                                log(&format!(
+                                                    "6-Z428c: crash_dump pid={} /dev/null write-open → {} (the fallback tombstone lands in the guest tombstones dir)",
+                                                    pid, translated
+                                                ));
+                                            }
+                                        }
+                                    } else if open_flags & (libc::O_WRONLY | libc::O_RDWR) != 0 {
                                         let svclog_dir = format!("{}/dev/twoyi-svclogs", rootfs);
                                         if std::fs::metadata(&svclog_dir).is_ok() {
                                             let host_log =
@@ -38830,9 +38874,107 @@ pub fn run_ptrace_loop(
                     //      spin lmkd's kill logic. Zero the EPOLLPRI entries
                     //      in the child's events array and shrink the return.
                     //   Recovery gated off (corpus rule).
+                    // ── 6-Z429: the raw-tombstoned-connect repair ──
+                    // rn387's harvest decoded the dump-fleet funnel: the
+                    // HOST (redroid) /data/tombstones grew 4 tombstones
+                    // (tombstone_00..03, .pb + text, 1.6 MB) DURING the
+                    // run window — the guest crash_dump's connects whose
+                    // ENTRY stops were never processed (the 6-Z210 vanish
+                    // class) ran RAW against the host root and the redroid
+                    // host's OWN tombstoned (pid 50, its tombstoned_crash
+                    // listener) SERVED them — the guest's dump content
+                    // landed in the HOST container, invisible to every
+                    // guest-side evidence channel. The 6-Z305q ENTRY
+                    // rewrite pokes the translated path INTO the caller's
+                    // sockaddr buffer — so at EXIT, a buffer that STILL
+                    // spells the guest path is the airtight proof the
+                    // rewrite never ran (the z413b stash-mismatch logic,
+                    // without the stash). Repair: fail the connect with
+                    // -ECONNREFUSED — crash_dump's tombstoned_connect
+                    // returns false, and AOSP-11's OWN not-connected
+                    // fallback runs (the 6-Z428c arm then lands the full
+                    // tombstone in {rootfs}/data/tombstones). aarch64:
+                    // x1-x7 survive at EXIT (the z413b-established fact),
+                    // so arg2 still points at the caller's sockaddr.
+                    if !boot_recovery
+                        && abi.execve == 221
+                        && syscall_num == abi.connect_nr
+                        && z388_crash_dump_pids.contains(&pid)
+                        && get_syscall_arg(&regs, abi.reg_ret) as i64 == 0
+                    {
+                        let z429_sa = get_syscall_arg(&regs, abi.reg_arg2);
+                        let z429_len = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                        if z429_sa != 0 && z429_len >= 3 && z429_len <= 128 {
+                            if let Some(z429_blob) = read_child_bytes(pid, z429_sa, 128) {
+                                if let Some(z429_gp) =
+                                    unix_fs_sun_path(&z429_blob).map(|gp| gp.to_string())
+                                {
+                                    if z429_gp == "/dev/socket/tombstoned_crash"
+                                        || z429_gp == "/dev/socket/tombstoned_java_trace"
+                                    {
+                                        let mut z429_regs: Regs = unsafe { std::mem::zeroed() };
+                                        if let Ok(z429_len2) =
+                                            ptrace_getregs_wide(pid, &mut z429_regs)
+                                        {
+                                            set_syscall_ret(
+                                                &mut z429_regs,
+                                                &abi,
+                                                -(libc::ECONNREFUSED as i64),
+                                            );
+                                            if ptrace_setregs(pid, &z429_regs, z429_len2).is_ok() {
+                                                if z429_repair_logged < 16 {
+                                                    z429_repair_logged += 1;
+                                                    log(&format!(
+                                                        "6-Z429: RAW-CONNECT repaired pid={} fd={} guest_path={} (the ENTRY rewrite never ran; the raw connect reached the HOST namespace) → ret=-ECONNREFUSED (the AOSP fallback + 6-Z428c land the tombstone)",
+                                                        pid,
+                                                        get_syscall_arg(
+                                                            &regs,
+                                                            abi.reg_arg1
+                                                        ),
+                                                        z429_gp
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if !boot_recovery && abi.execve == 221 {
                         let is_ctl = syscall_num == 21;
                         let is_pwait = syscall_num == 22;
+                        // ── 6-Z428d: the tombstoned pwait-EXIT census ──
+                        // rn387's ENTRY capture proved the deadlines ARE
+                        // armed (timeout=1000 accept / 10000 completion seen
+                        // at ENTRY) while ZERO timer callbacks ever run.
+                        // The EXIT ret names the wait's fate: ret>0 = fd
+                        // events, ret==0 = the TIMEOUT fired (and libevent
+                        // then must run the callback — contradiction with
+                        // rn386 ⇒ the callback path is broken downstream),
+                        // ret==-EINTR = a signal wake (the restart-cycle
+                        // shape: the kernel wakes every 10s, libevent's
+                        // deadline comparison never satisfies). Bounded
+                        // first 8 per tombstoned pid.
+                        if is_pwait && z428_tombstoned_pids.contains(&pid) {
+                            let z428_er = z428_pwait_exit_logged.entry(pid).or_insert(0);
+                            if *z428_er < 8 {
+                                *z428_er += 1;
+                                let z428_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                                log(&format!(
+                                    "6-Z428: pwait EXIT pid={} ret={}{}",
+                                    pid,
+                                    z428_ret,
+                                    if z428_ret == 0 {
+                                        " (timeout fired — events=0)"
+                                    } else if z428_ret == -(libc::EINTR as i64) {
+                                        " (EINTR — signal wake/restart)"
+                                    } else {
+                                        ""
+                                    }
+                                ));
+                            }
+                        }
                         if is_ctl || is_pwait {
                             let epi_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                             if is_ctl && epi_ret == -(libc::EPERM as i64) {
