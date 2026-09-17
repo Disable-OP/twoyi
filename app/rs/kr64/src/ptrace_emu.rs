@@ -23964,8 +23964,30 @@ pub fn run_ptrace_loop(
                                                                 .unwrap_or(false)
                                                     };
                                                     let sp_scr = get_syscall_arg(&regs, abi.reg_sp);
+                                                    // 6-Z432: the same adjacent-VMA slot cap as
+                                                    // the 6-Z101 staging (see that site).
+                                                    let z432_max_slot3 = std::fs::read_to_string(
+                                                        format!("/proc/{}/maps", pid),
+                                                    )
+                                                    .ok()
+                                                    .and_then(|maps| {
+                                                        z296_maps_triples(&maps)
+                                                            .iter()
+                                                            .find(|(s, e, _)| {
+                                                                sp_scr >= *s && sp_scr < *e
+                                                            })
+                                                            .map(|(s, _, p)| {
+                                                                if *p == "[stack]" {
+                                                                    4usize
+                                                                } else {
+                                                                    ((sp_scr - s) / 4096).min(4)
+                                                                        as usize
+                                                                }
+                                                            })
+                                                    })
+                                                    .unwrap_or(0);
                                                     let mut path_ok = false;
-                                                    for slot in 1..=4usize {
+                                                    for slot in 1..=z432_max_slot3 {
                                                         let scratch_local = sp_scr
                                                             .wrapping_sub(4096u64 * slot as u64)
                                                             & !7u64;
@@ -24153,8 +24175,45 @@ pub fn run_ptrace_loop(
                                                 .unwrap_or(false)
                                     };
                                     let sp_now = get_syscall_arg(&regs, abi.reg_sp);
+                                    // 6-Z432: the staging pokes reach 16KB below sp
+                                    // (slots 1..=4) — the same adjacent-VMA hazard as
+                                    // the 6-Z431 scratch gate (the rn389 tombstone_00
+                                    // crash_dump Scudo class). Cap the safe slots from
+                                    // the mapping owning sp: the main [stack]
+                                    // (MAP_GROWSDOWN) allows all 4; every other
+                                    // mapping caps at (sp - start)/4096; a maps-read
+                                    // failure caps at 0 (the rf-translate fallback
+                                    // handles the no-poke case).
+                                    let z432_max_slot =
+                                        std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                            .ok()
+                                            .and_then(|maps| {
+                                                z296_maps_triples(&maps)
+                                                    .iter()
+                                                    .find(|(s, e, _)| sp_now >= *s && sp_now < *e)
+                                                    .map(|(s, _, p)| {
+                                                        if *p == "[stack]" {
+                                                            4usize
+                                                        } else {
+                                                            ((sp_now - s) / 4096).min(4) as usize
+                                                        }
+                                                    })
+                                            })
+                                            .unwrap_or(0);
+                                    if z432_max_slot < 4 {
+                                        static Z432_CAP_LOG: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        let z432_n = Z432_CAP_LOG
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if z432_n < 12 {
+                                            log(&format!(
+                                                "6-Z432: execve staging slots capped pid={} sp={:#x} max_slot={} (the 6-Z431 adjacent-VMA hazard)",
+                                                pid, sp_now, z432_max_slot
+                                            ));
+                                        }
+                                    }
                                     let mut rewritten_ok = false;
-                                    for slot in 1..=4usize {
+                                    for slot in 1..=z432_max_slot {
                                         let scratch_local =
                                             sp_now.wrapping_sub(4096u64 * slot as u64) & !7u64;
                                         if !write_child_string_unchecked(pid, scratch_local, &c) {
@@ -24185,7 +24244,24 @@ pub fn run_ptrace_loop(
                                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
                                             if ptrace_getregs_wide(pid, &mut regs2).is_ok() {
                                                 let sp2 = get_syscall_arg(&regs2, abi.reg_sp);
-                                                for slot in 1..=4usize {
+                                                let z432_max_slot2 = std::fs::read_to_string(
+                                                    format!("/proc/{}/maps", pid),
+                                                )
+                                                .ok()
+                                                .and_then(|maps| {
+                                                    z296_maps_triples(&maps)
+                                                        .iter()
+                                                        .find(|(s, e, _)| sp2 >= *s && sp2 < *e)
+                                                        .map(|(s, _, p)| {
+                                                            if *p == "[stack]" {
+                                                                4usize
+                                                            } else {
+                                                                ((sp2 - s) / 4096).min(4) as usize
+                                                            }
+                                                        })
+                                                })
+                                                .unwrap_or(0);
+                                                for slot in 1..=z432_max_slot2 {
                                                     let scratch_local = sp2
                                                         .wrapping_sub(4096u64 * slot as u64)
                                                         & !7u64;
