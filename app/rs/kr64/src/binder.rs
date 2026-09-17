@@ -4510,6 +4510,36 @@ fn handle_write_read(
                     let mut b = bus.lock().expect("binder bus poisoned");
                     b.conns.get_mut(&conn_id).and_then(|bx| bx.txn_stack.pop())
                 };
+                // 6-Z407: the reply-correlation trace — rn361's SF wall
+                // (code=10 retries with no reply) needs the EXACT chain:
+                // which stack frame each BC_REPLY pops, which requester it
+                // resolves, and how many frames remain. LIFO/FIFO drift
+                // (the composer's nested deliveries vs main's out_sync
+                // FIFO) is decidable from these lines alone.
+                {
+                    static Z407_REPLY_LOGGED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    if Z407_REPLY_LOGGED.load(Ordering::Relaxed) < 64 {
+                        Z407_REPLY_LOGGED.fetch_add(1, Ordering::Relaxed);
+                        let stack_left = {
+                            let b = bus.lock().expect("binder bus poisoned");
+                            b.conns
+                                .get(&conn_id)
+                                .map(|bx| bx.txn_stack.len())
+                                .unwrap_or(0)
+                        };
+                        match &inflight {
+                            Some(txn_id) => info!(
+                                "[KR64][binder][vm{}] 6-Z407 REPLY: conn={} pops txn#{} stack-left={} blobs={}",
+                                vm_id, conn_id, txn_id, stack_left, reply_blob.is_some()
+                            ),
+                            None => info!(
+                                "[KR64][binder][vm{}] 6-Z407 REPLY: conn={} stack EMPTY (drift class) blobs={}",
+                                vm_id, conn_id, reply_blob.is_some()
+                            ),
+                        }
+                    }
+                }
                 match inflight {
                     Some(txn_id) => {
                         let (data, offsets, sg, reply_fds) = match reply_blob {
@@ -4723,6 +4753,26 @@ fn handle_write_read(
                 b.waiters.remove(&t);
                 if let Some(bx) = b.conns.get_mut(&conn_id) {
                     bx.reply_queue.push_back(DeferredReply::Failed);
+                }
+                // 6-Z407: the timeout trace — rn361's SF wall needs the
+                // expiry side of the correlation chain (which txn timed
+                // out on which conn and what the stack purge removed).
+                {
+                    static Z407_TIMEOUT_LOGGED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    if Z407_TIMEOUT_LOGGED.load(Ordering::Relaxed) < 48 {
+                        Z407_TIMEOUT_LOGGED.fetch_add(1, Ordering::Relaxed);
+                        let stale_now: Vec<ConnId> = b
+                            .conns
+                            .iter()
+                            .filter(|(_, bx)| bx.txn_stack.contains(&t))
+                            .map(|(cid, _)| *cid)
+                            .collect();
+                        info!(
+                            "[KR64][binder][vm{}] 6-Z407 TIMEOUT: conn={} txn#{} expired — BR_FAILED_REPLY queued, stack purge from conns {:?}",
+                            vm_id, conn_id, t, stale_now
+                        );
+                    }
                 }
                 // 6-Z399: the timed-out transaction may also sit on the
                 // RESPONDER's transaction stack (it was DELIVERED — the
@@ -5853,7 +5903,7 @@ fn handle_transaction(
         };
         if seen <= 16 || seen % 500 == 0 {
             info!(
-                "[KR64][binder][vm{}] routed transaction conn={} -> conn={} handle=0x{:08x} code={} oneway={} flags=0x{:x} self={} [tx #{}{}]",
+                "[KR64][binder][vm{}] routed transaction conn={} -> conn={} handle=0x{:08x} code={} oneway={} flags=0x{:x} self={} txn#{} [tx #{}{}]",
                 vm_id,
                 conn_id,
                 owner,
@@ -5862,6 +5912,7 @@ fn handle_transaction(
                 one_way,
                 flags,
                 owner == conn_id,
+                if one_way { 0 } else { txn_id },
                 seen,
                 if seen <= 16 { "" } else { " sampled" }
             );
