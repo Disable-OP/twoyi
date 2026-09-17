@@ -11319,6 +11319,62 @@ fn maps_region_for_pc(pid: libc::pid_t, pc: u64) -> String {
     "?".to_string()
 }
 
+/// 6-Z404: classify the FIRST token of /proc/<pid>/syscall. Some(-1) =
+/// userspace park (kernel prints "-1 0x..."), Some(nr) = blocked in
+/// syscall nr, None = "running"/garbage. Pure so the z404 test can lock
+/// the three shapes.
+fn z404_parse_syscall_nr(first: &str) -> Option<i64> {
+    if first == "running" {
+        return None;
+    }
+    first.parse::<i64>().ok()
+}
+
+/// 6-Z404: parse /proc/<pid>/syscall into the syscall nr. Returns
+/// Some(-1) for a USERSPACE-parked task (the kernel prints "-1 0x..."
+/// when the task is stopped/not in a syscall), the nr for an
+/// in-kernel-blocked task, None when unreadable/"running". Drives the
+/// 6-Z404 userspace-park branch of the stall probe.
+fn z404_procfs_syscall_nr(pid: libc::pid_t) -> Option<i64> {
+    let raw = std::fs::read_to_string(format!("/proc/{}/syscall", pid)).ok()?;
+    let first = raw.split_whitespace().next()?;
+    z404_parse_syscall_nr(first)
+}
+
+/// 6-Z404: bounded AArch64 fp-chain walk from a LIVE (probed) x29 —
+/// names a userspace-parked thread's call chain. Logging-only; the
+/// chain does not move while the thread stays parked. Returns the
+/// number of frames resolved.
+#[cfg(target_arch = "aarch64")]
+fn z404_walk_chain(pid: libc::pid_t, fp: u64, frames_cap: usize) -> usize {
+    let mut zfp = fp;
+    let mut frames = 0usize;
+    for depth in 0..frames_cap {
+        let Some(rec) = read_child_bytes(pid, zfp, 16) else {
+            break;
+        };
+        let next = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
+        let ret = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
+        if ret == 0 {
+            break;
+        }
+        let r = maps_region_for_pc(pid, ret);
+        if r.is_empty() {
+            break;
+        }
+        frames += 1;
+        crate::trace_log_line(&format!(
+            "6-Z404 PARK-BT: pid={} frame={} ret={:#x} {}",
+            pid, depth, ret, r
+        ));
+        if next <= zfp || next & 7 != 0 {
+            break;
+        }
+        zfp = next;
+    }
+    frames
+}
+
 /// 6-Z305t-18: SIGSTOP stall probe — the portable way to name a
 /// long-stalled tracee's TRUE blocked syscall on ATTACH-attached tracees.
 ///
@@ -11414,10 +11470,53 @@ fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
         "6-Z305t-18 STALL-PROBE: pid={} TRUE blocked nr={} a0={:#x} a1={:#x} a2={:#x} pc={:#x} maps[pc]={} (stop {:#x})",
         pid, nr, a0, a1, a2, pc, region, status as u32
     ));
+
+    // ── 6-Z404: the userspace-park branch ───────────────────────────────
+    // A thread parked on a condvar/mutex in USERSPACE (not blocked in a
+    // syscall) shows procfs-syscall nr == -1. This is the rn357/rn358
+    // invisible class: the stall detector and the probe PASS both gate on
+    // in_syscall_map == true, and a thread whose blocking futex ENTRY was
+    // never seen stays in_syscall=false forever — invisible to every
+    // existing oracle while its whole process waits on never-signaled
+    // futexes (rn358: SF main + 4 threads, wakes=NEVER, rung 7 forever).
+    // While SIGSTOPped we hold the LIVE registers: x29/x30 are the parked
+    // thread's fp/lr — the 6-Z403 fp-chain names the park site outright.
+    if z404_procfs_syscall_nr(pid) == Some(-1) {
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+            .map(|c| c.trim().to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        crate::trace_log_line(&format!(
+            "6-Z404 PARK-PROBE: pid={} comm={} parked in USERSPACE (procfs nr=-1) pc={:#x} {}",
+            pid, comm, pc, region
+        ));
+        #[cfg(target_arch = "aarch64")]
+        {
+            let z404_fp = get_syscall_arg(&regs, 29);
+            let _ = get_syscall_arg(&regs, 30); // lr: frame0 of the walk covers it
+            if z404_fp != 0 {
+                let walked = z404_walk_chain(pid, z404_fp, 8);
+                if walked == 0 {
+                    crate::trace_log_line(&format!(
+                        "6-Z404 PARK-PROBE: pid={} fp={:#x} — first frame record unreadable (leaf park or corrupt chain)",
+                        pid, z404_fp
+                    ));
+                }
+            } else {
+                crate::trace_log_line(&format!(
+                    "6-Z404 PARK-PROBE: pid={} fp=0 (no chain available)",
+                    pid
+                ));
+            }
+        }
+    }
+
     // 4. Resume: PTRACE_SYSCALL(signal 0) swallows the SIGSTOP group-stop
     //    and lets the ERESTARTSYS-rewound syscall re-execute. The tracee
     //    stays mid-syscall by the loop's bookkeeping (in_syscall_map
     //    unchanged), so the EXIT stop arrives exactly as the loop expects.
+    //    For the 6-Z404 userspace-park case PTRACE_SYSCALL simply resumes
+    //    userspace execution (no syscall was interrupted); the loop's
+    //    phase bookkeeping (in_syscall=false) stays correct.
     let r = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) };
     if r != 0 {
         crate::trace_log_line(&format!(
@@ -15582,6 +15681,16 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     let mut stall_probe_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
         std::collections::HashMap::new();
+    // 6-Z404: USERSPACE-PARK probe budgets — per-pid probe count (max 2:
+    // a parked thread's park site is stable, one probe suffices) and
+    // last-probe instant (30 s cooldown). These probe the class the
+    // in_syscall gate makes invisible: threads parked on futexes in
+    // userspace (condvar/mutex) whose blocking ENTRY stop was never seen
+    // (rn358: SF main + its whole thread fleet, wakes=NEVER, rung 7).
+    let mut z404_park_budget: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    let mut z404_park_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
+        std::collections::HashMap::new();
     // 6-Z306an: FORGOTTEN-RESUME watchdog — per-pid intervention budget
     // (max 4 forced PTRACE_SYSCALL resumes/boot) + last-attempt instant
     // (30 s cooldown). See the watchdog pass near the 6-Z305t-18 probe.
@@ -18637,6 +18746,73 @@ pub fn run_ptrace_loop(
                         // of the tracee's (post-setuid) uid.
                         stall_interrupt_probe(sp, &abi);
                     }
+                }
+            }
+        }
+
+        // ── 6-Z404: the USERSPACE-PARK probe pass (the invisible class) ──
+        //
+        // The 271d detector + the 305t-18 probe both gate on
+        // in_syscall_map == true. A thread parked on a futex in USERSPACE
+        // (pthread condvar/mutex) whose blocking futex ENTRY stop was
+        // never seen (missed under stop-storm load — the rn357 "nr at
+        // last ENTRY stop: -1" note) stays in_syscall=false FOREVER and
+        // is invisible to every existing oracle. rn358's SF fleet was
+        // exactly this: main + 4 threads parked on never-signaled
+        // futexes (34/36 WAKE-CENSUS lines = wakes=NEVER) while the
+        // verdict stayed rung 7 for 615 s.
+        //
+        // This pass probes that class: tracked pids whose LAST stop is
+        // >=15 s old, in_syscall == false, wchan == futex_do_wait (true
+        // futex parks; epoll/binder parks have their own wchans and are
+        // visible to the other tools). The probe SIGSTOPs the thread,
+        // GETREGSes the LIVE registers (procfs-syscall reads nr=-1 → the
+        // 6-Z404 branch walks the fp chain from x29 and names the park
+        // site), and resumes. Bounded: 2 probes/pid (a park site is
+        // stable), 30 s cooldown, and the same z306k probe-pending
+        // attribution the 305t-18 probe uses.
+        if stall_tick % 256 == 0 {
+            let now = std::time::Instant::now();
+            let mut park_candidates: Vec<(libc::pid_t, std::time::Duration)> = last_stop_at
+                .iter()
+                .filter(|(p, t)| {
+                    now.duration_since(**t) >= std::time::Duration::from_secs(15)
+                        && !in_syscall_map.get(*p).copied().unwrap_or(true)
+                        && z404_park_budget.get(*p).copied().unwrap_or(0) < 2
+                })
+                .map(|(p, t)| (*p, now.duration_since(*t)))
+                .collect();
+            park_candidates.sort_by_key(|(p, _)| *p);
+            for (sp, elapsed) in park_candidates {
+                if z306k_probe_pending.contains(&sp) {
+                    continue;
+                }
+                let wch = std::fs::read_to_string(format!("/proc/{}/wchan", sp))
+                    .map(|c| c.trim().to_string())
+                    .unwrap_or_default();
+                if wch != "futex_do_wait" {
+                    continue;
+                }
+                let cooldown_ok = match z404_park_last.get(&sp) {
+                    None => true,
+                    Some(t) => now.duration_since(*t) >= std::time::Duration::from_secs(30),
+                };
+                if !cooldown_ok {
+                    continue;
+                }
+                let budget = z404_park_budget.get(&sp).copied().unwrap_or(0);
+                z404_park_budget.insert(sp, budget + 1);
+                z404_park_last.insert(sp, now);
+                let comm = std::fs::read_to_string(format!("/proc/{}/comm", sp))
+                    .map(|c| c.trim().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                log(&format!(
+                    "6-Z404 PARK-STALL: pid={} comm={} wchan=futex_do_wait no-syscall-stop for {:.1}s (the ENTRY-missed invisible class) — probing",
+                    sp, comm, elapsed.as_secs_f32()
+                ));
+                if let Some(&abi) = abi_map.get(&sp) {
+                    z306k_probe_pending.insert(sp);
+                    stall_interrupt_probe(sp, &abi);
                 }
             }
         }
@@ -50894,5 +51070,29 @@ mod z403_stall_forensics_tests {
         }
         assert!(found >= 1, "recent entries must survive");
         assert!(found <= Z403_WAKE_CENSUS_CAP, "cap holds: {}", found);
+    }
+}
+
+#[cfg(test)]
+mod z404_park_probe_tests {
+    use super::z404_parse_syscall_nr;
+
+    /// The three procfs-syscall shapes the 6-Z404 park branch must
+    /// distinguish: "-1 0x..." (userspace park — the rn357/rn358
+    /// invisible class), a real nr (in-kernel block, the 271d class),
+    /// and "running" (on-CPU at read time — skip).
+    #[test]
+    fn z404_procfs_syscall_shapes() {
+        assert_eq!(z404_parse_syscall_nr("-1"), Some(-1), "userspace park");
+        assert_eq!(
+            z404_parse_syscall_nr("-1"),
+            Some(-1),
+            "parked task prints nr -1"
+        );
+        assert_eq!(z404_parse_syscall_nr("98"), Some(98), "futex block");
+        assert_eq!(z404_parse_syscall_nr("73"), Some(73), "ppoll block");
+        assert_eq!(z404_parse_syscall_nr("running"), None, "on-CPU: skip");
+        assert_eq!(z404_parse_syscall_nr("garbage"), None, "unparseable");
+        assert_eq!(z404_parse_syscall_nr(""), None, "empty token");
     }
 }
