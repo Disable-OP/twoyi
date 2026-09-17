@@ -30807,3 +30807,21 @@ Work Log:
 Stage Summary:
 - The rn371 decode decides the vanish-class mechanism in one run via the CHMODFAM/REAL-MODE/REVERT + FAIL-BIND corpus.
 - Queued openers: the setsockcreatecon stub class, the bluetooth sim-HAL 'Invalid address' abort (backtrace named: android.hardware.bluetooth@1.1-service.sim initialize_impl), rild joinRpcThreadpool.
+
+---
+Task ID: 148 (rn371 decoded: the 6-Z413/413b instrumentation verified IN-GUEST; the vanish class proven UPSTREAM of the arms — CHMODFAM=0 with the ENOENT fleet persisting; 6-Z415 disables the SIGSTOP stall probe (suspect #1) with a procfs-only fallback; rn372 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn371 (35195942032, 90a178a8) decoded: rung 7, 87 guest processes. APK-artifact probe FIRST this time (the Task 147 lesson): libkr64.so contains 6-Z413/REAL-MODE/NR-REWRITE/FAIL-BIND strings — the instrumentation WAS in the run.
+- THE VERDICT: 6-Z413 CHMODFAM = 0 lines (zero read-failures AND zero translate-noops across every CAUGHT chmod-family call — the rn365 read-failure hypothesis is DEAD); 6-Z413-R REVERT/READBACK = 0 (the stale-regs-revert hypothesis is DEAD); 6-Z413 FAIL-BIND = 0 (no failing /dev/socket bind hit the forensics path — every vanished bind left its stash stale/unconsumed at the PREVIOUS failing bind). Meanwhile the ENOENT fleet persisted: zygote x30, usap_pool_primary x31, fwmarkd x27, mdns x24, dnsproxyd x22, tombstoned x7 (+ the 108-line setsockcreatecon pdx class — 6-Z414's target, not in this build). The z391 channel stayed healthy (94 lines) — the mirror never dropped a line.
+- CONCLUSION (decisive): the vanished bind/fchmodat calls never reach ANY arm — their ENTRY+EXIT stops are consumed OUT-OF-BAND or never generated. The full +4562ms zygote window decode (stderr 7893-7940) shows the per-attempt shape: bind ENTRY vanished (stale lmkd stash at the forensics), raw bind → host EADDRINUSE → 6-Z101 faked 0, fchownat CAUGHT+translated in the SAME window, fchmodat vanished → raw ENOENT → abort → init's service-restart loop repeats forever.
+- The only machinery touching tracees outside the main loop's rhythm: the 6-Z305t-18 SIGSTOP stall probe — 901 firings/run, each kill(pid, SIGSTOP) + a 250ms out-of-band waitpid(pid, __WALL|WNOHANG) spin consuming ANY queued stop + a SIGSTOP left PENDING on timeout (rn365: "+813ms pid=2809 stop TIMEOUT — SIGSTOP left pending" — right before every socket window). Its group-stop interleaves with the tracee's syscall rhythm and the ERESTARTSYS syscall rewinds for the rest of the boot.
+- 6-Z415 LANDED (3d8385df, pushed, raw-content-verified): the SIGSTOP probe is DISABLED (const gate) and replaced by the read-only /proc/<pid>/syscall probe (6-Z415 PROCFS-PROBE lines) — zero tracee interaction. rn372 decides: healed → the probe was the culprit (permanent removal + redesign); not healed → the probe is exonerated and the crash_dump SEIZE dance is suspect #2.
+- Gates: fmt clean, clippy -D warnings clean, 933/933 tests.
+- rn372 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on 3d8385df — carries 6-Z414 (set*con family fake) + 6-Z415 (probe disabled).
+
+Stage Summary:
+- Commit chain: 0280f303 → 90a178a8 (6-Z413+413b) → 47ff7231 → 46ad462e (6-Z414) → 3d8385df (6-Z415). All pushes raw-content-verified.
+- The vanish-class suspects narrowed to two: the SIGSTOP stall probe (now disabled for rn372) and the crash_dump SEIZE dance (next if rn372 persists).
+- Queued: the bluetooth sim-HAL 'Invalid address' abort (backtrace named), rild joinRpcThreadpool.
