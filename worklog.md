@@ -30635,3 +30635,21 @@ Stage Summary:
 - THE WALL, NOW THREE LAYERS DEEPER: rung-7/SF -> SF main bursty-blocked -> recvmsg on the proxy transport -> INSIDE a composer hwbinder call with a LIVE composer and clean-looking replies. The last unknown is the reply-correlation chain.
 - EXPECT rn362: the full correlation chain for one code=10 call (routed txn#X on conn=111 -> delivered on conn=46 -> BC_REPLY pops txn#? -> requester=?) names the exact drift point and the one-line fix.
 - Queued decode: the 6-Z405 INIT-CHMODFAM lines (the fchmodat arrival-vs-bypass verdict), rild joinRpcThreadpool (secondary), the Java backtrace intercept timeout (art attach).
+
+---
+Task ID: 138 (rn362 decoded — THE WEDGED BOTTOM FRAME: the composer's txn#12 (registerCallback-class) delivered and never replied to; the 6-Z407 budget self-bury fixed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn362 (#362, 208a19ae) decoded: verdict rung 7 — but the 6-Z407 correlation trace DELIVERED THE COMPLETE CHAIN:
+  * SF main = conn=60; its composer calls (code=10 etc.) route to conn=35 (handle 0x2d = the IComposerClient node).
+  * txn#12 (code=1, routed +23104ms) was delivered to the composer and NEVER replied to — it sits at the BOTTOM of the composer's txn_stack forever (every later pop logs stack-left=1: #14,#16,#17..#32 all unwind ABOVE it).
+  * The composer's code=1 handler made a NESTED OUTGOING call (txn#13 — the onHotplug-class callback to main's handle 0x30); main's reply was delayed 5.3 s (conn=60 pops txn#13 at +28684 ms — the nested-handler + reply-wait recheck path); the nested unwind itself is CORRECT LIFO (newer frames pop fine).
+  * Main's txn#12 waiter expired at +31107 ms: "6-Z407 TIMEOUT: conn=60 txn#12 expired — BR_FAILED_REPLY queued, stack purge from conns [35]" — the 6-Z399 hygiene fired as designed; main re-issued (txn#17-22, 250 ms apart) — the same wedged-bottom shape — and the run ends rung 7 with main cycling in recvmsg inside the never-replied composer call (the 6-Z404/6-Z406 probes capture the bursty-blocked state all run).
+- THE ONE HOLE: the 6-Z407 REPLY budget (64 GLOBAL lines) burned out at +28410 ms — exactly the window where txn#12's unwind (or failure to unwind) would show. The rn350 self-bury class again.
+- The fix (this commit): the REPLY trace budget 64 -> 512/run, the TIMEOUT trace 48 -> 128/run. Gates: fmt clean, clippy -D warnings clean, 932/932 tests; CI green.
+
+Stage Summary:
+- Session commit chain (all pushed + CI green): 6fc4ec55 (6-Z403) -> 20e83b19 (6-Z404 v1) -> 07d15be5 (6-Z405) -> 8f41cb59 (6-Z404 v2) -> 7a394f6c (6-Z406) -> 208a19ae (6-Z407) -> THIS (budget fix).
+- THE WALL, FULLY SHAPED: SF main cycles in a composer hwbinder call (registerCallback-class, code=1) whose reply wedges at the BOTTOM of the composer's txn_stack; the composer's nested onHotplug unwind completes; the bottom frame never does. rn363's +28.4..31.1 s window decides between "the reply was sent but mis-delivered" and "the composer never sends it" — each with a one-line fix.
+- Queued decode: the 6-Z405 INIT-CHMODFAM lines (the fchmodat verdict), rild joinRpcThreadpool (secondary), the Java backtrace intercept timeout (art attach).
