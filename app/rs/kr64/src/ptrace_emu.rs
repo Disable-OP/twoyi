@@ -11471,23 +11471,29 @@ fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
         pid, nr, a0, a1, a2, pc, region, status as u32
     ));
 
-    // ── 6-Z404: the userspace-park branch ───────────────────────────────
-    // A thread parked on a condvar/mutex in USERSPACE (not blocked in a
-    // syscall) shows procfs-syscall nr == -1. This is the rn357/rn358
-    // invisible class: the stall detector and the probe PASS both gate on
-    // in_syscall_map == true, and a thread whose blocking futex ENTRY was
-    // never seen stays in_syscall=false forever — invisible to every
-    // existing oracle while its whole process waits on never-signaled
-    // futexes (rn358: SF main + 4 threads, wakes=NEVER, rung 7 forever).
-    // While SIGSTOPped we hold the LIVE registers: x29/x30 are the parked
-    // thread's fp/lr — the 6-Z403 fp-chain names the park site outright.
-    if z404_procfs_syscall_nr(pid) == Some(-1) {
-        let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+    // ── 6-Z404: the live fp-chain walk — EVERY probe, every class ───────
+    // v1 gated this on procfs nr == -1 (userspace park), but the equally
+    // invisible IN-SYSCALL class (rn359: SF main's missed-ENTRY recvfrom
+    // on a unix stream socket, wchan unix_stream_data_wait; the SF futex
+    // waiters blocked IN the futex syscall) needs the same oracle. While
+    // SIGSTOPped the registers are live in BOTH classes: x29 feeds the
+    // bounded 6-Z404 PARK-BT walk that names the parked caller outright.
+    // PROBE-STATE also reports wchan + the procfs nr — for the in-syscall
+    // class the wchan itself is the shape (futex_do_wait vs
+    // unix_stream_data_wait vs ep_poll).
+    {
+        let z404_wchan = std::fs::read_to_string(format!("/proc/{}/wchan", pid))
             .map(|c| c.trim().to_string())
             .unwrap_or_else(|_| "?".to_string());
+        let z404_comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+            .map(|c| c.trim().to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        let z404_procfs = z404_procfs_syscall_nr(pid)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
         crate::trace_log_line(&format!(
-            "6-Z404 PARK-PROBE: pid={} comm={} parked in USERSPACE (procfs nr=-1) pc={:#x} {}",
-            pid, comm, pc, region
+            "6-Z404 PROBE-STATE: pid={} comm={} wchan={} procfs_nr={} stop={:#x}",
+            pid, z404_comm, z404_wchan, z404_procfs, status as u32
         ));
         #[cfg(target_arch = "aarch64")]
         {
@@ -15681,12 +15687,13 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     let mut stall_probe_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
         std::collections::HashMap::new();
-    // 6-Z404: USERSPACE-PARK probe budgets — per-pid probe count (max 2:
-    // a parked thread's park site is stable, one probe suffices) and
-    // last-probe instant (30 s cooldown). These probe the class the
-    // in_syscall gate makes invisible: threads parked on futexes in
-    // userspace (condvar/mutex) whose blocking ENTRY stop was never seen
-    // (rn358: SF main + its whole thread fleet, wakes=NEVER, rung 7).
+    // 6-Z404: SILENT-tid probe budgets (v2) — per-pid probe count (max 3:
+    // a parked thread's site is stable, one probe suffices; 3 covers the
+    // probe-timeout path) and last-probe instant (30 s cooldown). These
+    // probe the class every in_syscall-gated oracle misses: tids whose
+    // blocking ENTRY stop was never seen — blocked in a syscall (SF
+    // main's missed-ENTRY unix-socket recvfrom, rn359), parked on a
+    // futex, or stopped in userspace (rn358: the SF fleet, wakes=NEVER).
     let mut z404_park_budget: std::collections::HashMap<libc::pid_t, u32> =
         std::collections::HashMap::new();
     let mut z404_park_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
@@ -18750,47 +18757,34 @@ pub fn run_ptrace_loop(
             }
         }
 
-        // ── 6-Z404: the USERSPACE-PARK probe pass (the invisible class) ──
+        // ── 6-Z404: the SILENT-tid probe pass (v2, rn359 decode) ────────
         //
-        // The 271d detector + the 305t-18 probe both gate on
-        // in_syscall_map == true. A thread parked on a futex in USERSPACE
-        // (pthread condvar/mutex) whose blocking futex ENTRY stop was
-        // never seen (missed under stop-storm load — the rn357 "nr at
-        // last ENTRY stop: -1" note) stays in_syscall=false FOREVER and
-        // is invisible to every existing oracle. rn358's SF fleet was
-        // exactly this: main + 4 threads parked on never-signaled
-        // futexes (34/36 WAKE-CENSUS lines = wakes=NEVER) while the
-        // verdict stayed rung 7 for 615 s.
-        //
-        // This pass probes that class: tracked pids whose LAST stop is
-        // >=15 s old, in_syscall == false, wchan == futex_do_wait (true
-        // futex parks; epoll/binder parks have their own wchans and are
-        // visible to the other tools). The probe SIGSTOPs the thread,
-        // GETREGSes the LIVE registers (procfs-syscall reads nr=-1 → the
-        // 6-Z404 branch walks the fp chain from x29 and names the park
-        // site), and resumes. Bounded: 2 probes/pid (a park site is
-        // stable), 30 s cooldown, and the same z306k probe-pending
-        // attribution the 305t-18 probe uses.
+        // v1 gated on (in_syscall==false, wchan==futex_do_wait) — rn359
+        // proved BOTH gates wrong for the actual fleet: the SF futex
+        // waiters block IN the futex syscall (in_syscall=true when the
+        // ENTRY was seen) and SF MAIN blocks on unix_stream_data_wait
+        // (a recvfrom, wchan != futex_do_wait) — every one invisible
+        // because its blocking ENTRY stop was missed under stop-storm
+        // load (in_syscall stays false forever). The class predicate is
+        // simply SILENCE: a tracked tid whose LAST tracer stop is >=15 s
+        // old is parked SOMEWHERE — in a syscall, on a futex, on a
+        // socket — and the SIGSTOP dance + live GETREGS names it in
+        // every case (the fp chain from x29 is live whenever the thread
+        // is parked). Bounded: 3 probes/pid, 30 s cooldown, z306k
+        // attribution skip.
         if stall_tick % 256 == 0 {
             let now = std::time::Instant::now();
             let mut park_candidates: Vec<(libc::pid_t, std::time::Duration)> = last_stop_at
                 .iter()
                 .filter(|(p, t)| {
                     now.duration_since(**t) >= std::time::Duration::from_secs(15)
-                        && !in_syscall_map.get(*p).copied().unwrap_or(true)
-                        && z404_park_budget.get(*p).copied().unwrap_or(0) < 2
+                        && z404_park_budget.get(*p).copied().unwrap_or(0) < 3
                 })
                 .map(|(p, t)| (*p, now.duration_since(*t)))
                 .collect();
             park_candidates.sort_by_key(|(p, _)| *p);
             for (sp, elapsed) in park_candidates {
                 if z306k_probe_pending.contains(&sp) {
-                    continue;
-                }
-                let wch = std::fs::read_to_string(format!("/proc/{}/wchan", sp))
-                    .map(|c| c.trim().to_string())
-                    .unwrap_or_default();
-                if wch != "futex_do_wait" {
                     continue;
                 }
                 let cooldown_ok = match z404_park_last.get(&sp) {
@@ -18806,9 +18800,12 @@ pub fn run_ptrace_loop(
                 let comm = std::fs::read_to_string(format!("/proc/{}/comm", sp))
                     .map(|c| c.trim().to_string())
                     .unwrap_or_else(|_| "?".to_string());
+                let wch = std::fs::read_to_string(format!("/proc/{}/wchan", sp))
+                    .map(|c| c.trim().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
                 log(&format!(
-                    "6-Z404 PARK-STALL: pid={} comm={} wchan=futex_do_wait no-syscall-stop for {:.1}s (the ENTRY-missed invisible class) — probing",
-                    sp, comm, elapsed.as_secs_f32()
+                    "6-Z404 SILENT: pid={} comm={} wchan={} no-stop for {:.1}s (the ENTRY-missed invisible class) — probing",
+                    sp, comm, wch, elapsed.as_secs_f32()
                 ));
                 if let Some(&abi) = abi_map.get(&sp) {
                     z306k_probe_pending.insert(sp);
