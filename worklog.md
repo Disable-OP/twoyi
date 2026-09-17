@@ -30794,3 +30794,16 @@ Stage Summary:
 - EXPECT rn370: zero "Could not create socket" failures (every caught fchmodat now fakes success with a real host-side mode, and any revert alarms loudly); zygote/tombstoned/lmkd sockets published; tombstones readable; the SF abort message finally landing in the crash buffer (the logd socket restored). If ENOENTs persist with clean readbacks, the true stop-vanish is proven and the next lever is the per-pid stop ledger.
 - Next decode (rn370): 6-Z413 CHMODFAM/REAL-MODE/REVERT lines + the socket scorecard + logcat-crash.txt.
 - Queued: the bind-rewrite stale-target corruption (6-Z305t-57: lmkd's bind forensics showed the logdw target, EADDRINUSE faked 0), the bluetooth 'Invalid address' config abort, rild joinRpcThreadpool.
+
+---
+Task ID: 147 (rn370 decoded: ran the OLD binary — the 0280f303 commit staged only the worklog (source never added); the code landed with 90a178a8 via git add -A; rn371 dispatched on the true code)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn370 (35193472676, 0280f303) decoded: rung 7, the guest fleet the richest yet (tombstoned/traced/adbd/installd/keystore/surfaceflinger present) — but ZERO 6-Z413 lines. APK-artifact probe (strings on libkr64.so): 6-Z408/6-Z411 present, 6-Z413/REAL-MODE ABSENT; raw.githubusercontent at 0280f303 confirms lib.rs lacks z413_klog. THE 0280f303 COMMIT STAGED ONLY worklog.md — the 6-Z413 source rode 90a178a8 (git add -A; +60/+379 lines, CI #1954 green). Lesson recorded: verify the pushed tree (raw-content check) BEFORE dispatching a verification run.
+- rn370's old-binary data still valuable: 208 fchmodat-ENOENT socket failures (zygote x52/usap x56/mdns x47/dnsproxyd x45/fwmarkd x44, multiplied by the 50+-generation zygote restart cascade) — the vanish class unchanged; PLUS a new separate class: 201 pdx + 2 adbd "setsockcreatecon(...) failed: Invalid argument" — the SELinux socket-label stub gap (queued as its own opener).
+- rn371 DISPATCHED (HTTP 204) on 90a178a8 — the first run carrying 6-Z413 + 6-Z413b.
+
+Stage Summary:
+- The rn371 decode decides the vanish-class mechanism in one run via the CHMODFAM/REAL-MODE/REVERT + FAIL-BIND corpus.
+- Queued openers: the setsockcreatecon stub class, the bluetooth sim-HAL 'Invalid address' abort (backtrace named: android.hardware.bluetooth@1.1-service.sim initialize_impl), rild joinRpcThreadpool.
