@@ -31016,3 +31016,18 @@ Work Log:
 Stage Summary:
 - Commit chain: ... 9f4b7f88 (6-Z426) → 94f04ee0 (docs) → c6c2e8ba (6-Z427). rn386 in flight.
 - THE FULL CHAIN THIS SESSION: rn377 named the debuggerd wall → 6-Z418/421/422 re-architected the trace domain → 6-Z423 made the dump write its autopsy → 6-Z424 guarded the sweep → 6-Z425 traced the choreography → 6-Z426 fixed the queued-SIGSTOP leak → 6-Z427 fixed the tombstone-creation leg. rn386 is the first run where guest tombstones CAN exist.
+
+---
+Task ID: 161 (rn386 decoded — THE PSEUDOTHREAD DANCE RUNS COMPLETE (the "?"-flag seize + CONT + DETACH — the 6-Z426 fix VERIFIED; zero failure-notes); the last gap = crash_dump's tombstoned-connect vs tombstoned's dead-windows; session closed with a full handoff)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn386 (c6c2e8ba) decoded: rung 7. **6-Z426 VERIFIED — the pseudothread dance runs COMPLETE**: the choreography now shows SEIZE(main tid) → the "?"-flag seize (PTRACE_SEIZE|PTRACE_O_TRACECLONE = crash_dump.cpp:510!) → CONT(intermediate — wait_for_clone's resume_child) → "?" + DETACH — the ENTIRE dance that never once completed since rn377. ZERO 6-Z423 failure-notes. ZERO 6-Z427 linkat fires (tombstoned never reached the file-creation stage) AND zero backstop denials.
+- THE LAST GAP: crash_dump's tombstoned-connect fails client-side ("failed to connect to tombstoned: No such file or directory" (ENOENT — the dead-window) / "Connection refused" (the file exists, no listener)) — tombstoned cycles through the 17-generation cascade (early generations = the known socket-fail exit-1 class; "tombstoned successfully initialized" appears and 171 accepts fired — but those are the DYING processes' intercept connects; crash_dump's dump-fd connects never landed in an alive-window). tombstoned NEVER opened a tombstone file.
+- NEXT SESSION OPENERS (priority order): (1) instrument crash_dump's connect (the shlib connect-hook DIAG for the tombstoned paths + tombstoned's accept-side census per-socket) → correlate crash_dump's connect attempts with tombstoned's alive-windows; (2) tombstoned's restart cascade: why its post-publish generations exit 1 (its svc log shows only the loader banner — instrument its exit reason); (3) once ONE dump completes: mine the tombstones for the Scudo free-site + SF's abort backtrace (the rung-7 abort classes become fixable); (4) the queued openers: the bluetooth 'Invalid address' abort, rild joinRpcThreadpool.
+- Security: credentials untouched.
+
+Stage Summary:
+- SESSION TOTALS: 13 code/docs commits (6-Z418 untraced-debuggerd → 6-Z419 CI fix → 6-Z421 freeze watchdog → 6-Z420 shlib death logger → 6-Z422 stays-traced → 6-Z423 failure-note capture → 6-Z424 sweep guards → 6-Z425 choreography trace → 6-Z426 queued-SIGSTOP fix → 6-Z427 linkat translation), 10 e2e runs dispatched+decoded (rn377..rn386), CI green on every push, all worklogs pushed (Tasks 153-161).
+- THE DEBUGGERD TRANSFORMATION: rn377 = 349/349 dumps dead, zero tombstones, the wall invisible → rn386 = the dance completes, zero fatals, the only remaining gap = the tombstoned-connect timing (a well-scoped, instrumented opener).
+- THE BOOT STATE: the crash cascade is down to 17 generations (from 68-69); system_server SPAWNED in rn378+; the socket fleet publishes; the evidence channels (logcat bridge, kmsg, svc logs, tombstones-when-they-land) are all live.
