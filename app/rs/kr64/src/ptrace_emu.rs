@@ -19205,6 +19205,27 @@ pub fn run_ptrace_loop(
                 for tid in &released {
                     z388_handed_off_to.remove(tid);
                     z388_handed_off.remove(tid);
+                    // 6-Z411: THE POST-DUMP RESUME — the crash_dump
+                    // SIGSTOP dance leaves the dumped process in a
+                    // GROUP-STOP (do_signal_stop, state T) that survives
+                    // crash_dump's own PTRACE_DETACH: the threads sit
+                    // frozen FOREVER, a queued fatal signal can never
+                    // deliver, the process never exits, init's restart
+                    // cascade never fires, and every binder conn of the
+                    // process goes silent (rn366: the composer's
+                    // getHashChain wedge — conn=18 inbox=2 for 5 minutes;
+                    // rn367: the identical shape, the thread dump shows
+                    // tids in state T). The real kernel delivers the
+                    // queued signal once the group-stop ends — so send
+                    // SIGCONT: the CRASH class resumes and dies from its
+                    // own pending SIGABRT (init reaps + restarts, the
+                    // kernel-true flow), the LIVE-dump class (ANR /
+                    // intercept) resumes and keeps running.
+                    let rc = unsafe { libc::kill(*tid, libc::SIGCONT) };
+                    log(&format!(
+                        "6-Z411: post-dump SIGCONT tid={} (kill rc={}) — the group-stop must end so pending work (or the queued fatal signal) delivers",
+                        tid, rc
+                    ));
                 }
                 if !released.is_empty() {
                     log(&format!(
@@ -19529,6 +19550,13 @@ pub fn run_ptrace_loop(
                 for tid in &released {
                     z388_handed_off_to.remove(tid);
                     z388_handed_off.remove(tid);
+                    // 6-Z411: post-dump SIGCONT (WIFSIGNALED twin — the
+                    // full rationale lives at the WIFEXITED site).
+                    let rc = unsafe { libc::kill(*tid, libc::SIGCONT) };
+                    log(&format!(
+                        "6-Z411: post-dump SIGCONT tid={} (kill rc={}) — the group-stop must end so pending work (or the queued fatal signal) delivers",
+                        tid, rc
+                    ));
                 }
                 if !released.is_empty() {
                     log(&format!(
