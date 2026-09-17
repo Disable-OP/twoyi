@@ -3244,9 +3244,24 @@ impl BusState {
 
 /// How long a sync transaction waits for the server's `BC_REPLY` before
 /// the proxy resolves it as `BR_FAILED_REPLY` (the kernel has no timeout,
-/// but a hung server would otherwise hang the requester forever; 8 s
-/// matches the class of client-side waits this wave is eliminating).
-pub const REPLY_TIMEOUT: Duration = Duration::from_secs(8);
+/// but a hung server would otherwise hang the requester forever).
+///
+/// 6-Z437 (rn394 decode): 8s was FAKING FAILURES. The run carried 60
+/// 6-Z407 expiries and the death fleet's tombstones carry exactly the
+/// surface shape: `Status(EX_TRANSACTION_FAILED): 'FAILED_TRANSACTION'`
+/// aborts in the composer (_vendor_bin_hw_), audioserver, camera and SF
+/// generations — every one an UNCHECKED-HIDL caller whose two-way
+/// transaction outlived the budget under the boot's CPU starvation (the
+/// host redroid + the guest share 4 cores; a legit composer/allocator
+/// reply can exceed 8s while the SF/composer restart storm saturates
+/// the bus). libhwbinder maps BR_FAILED_REPLY to FAILED_TRANSACTION and
+/// the unchecked-Return callers abort — each expiry KILLED a service.
+/// The kernel's own answer is WAIT FOREVER; 30s keeps the wedge-breaker
+/// (the permanent wedges — sync-flagged oneways that never reply, the
+/// 6-Z399 class — resolve at 30s instead of 8s; nothing wedges forever)
+/// while absorbing every legit boot-latency spike. The 6-Z407 trace now
+/// also names the RESPONDER conn so the decode sees who starved.
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ============================================================================
 // Service-manager handle table.
@@ -4846,6 +4861,7 @@ fn handle_write_read(
         {
             let mut b = bus.lock().expect("binder bus poisoned");
             let now = std::time::Instant::now();
+            let mut responders: Vec<ConnId> = Vec::new();
             let expired: Vec<u64> = match b.conns.get_mut(&conn_id) {
                 Some(bx) => {
                     let mut v = Vec::new();
@@ -4853,8 +4869,13 @@ fn handle_write_read(
                         if now.duration_since(*at) < REPLY_TIMEOUT {
                             break;
                         }
-                        let (t, _, _) = bx.out_sync.pop_front().expect("front checked");
+                        let (t, o, _) = bx.out_sync.pop_front().expect("front checked");
                         v.push(t);
+                        // 6-Z437: name the responder so the decode sees WHO
+                        // starved past the budget (the rn394 death fleet:
+                        // the composer's own allocator/mapper calls expired
+                        // at 8s under the boot's CPU starvation).
+                        responders.push(o);
                     }
                     v
                 }
@@ -4880,8 +4901,8 @@ fn handle_write_read(
                             .map(|(cid, _)| *cid)
                             .collect();
                         info!(
-                            "[KR64][binder][vm{}] 6-Z407 TIMEOUT: conn={} txn#{} expired — BR_FAILED_REPLY queued, stack purge from conns {:?}",
-                            vm_id, conn_id, t, stale_now
+                            "[KR64][binder][vm{}] 6-Z407 TIMEOUT: conn={} txn#{} expired (responder conn={:?}) — BR_FAILED_REPLY queued, stack purge from conns {:?}",
+                            vm_id, conn_id, t, responders, stale_now
                         );
                     }
                 }
