@@ -454,6 +454,27 @@ pub(crate) fn z413r_klog(rootfs: &str, msg: &str) {
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
+/// 6-Z417c: the census's OWN channel — rn375 self-buried it: the shared
+/// z413 budget (96 lines) was consumed 65 lines deep by the census itself
+/// (every-512-stops across 50 tracked pids), cutting the census off exactly
+/// at the +4.5s socket-failure horizon it was built to observe. The census
+/// gets 512 lines of its own and a slower cadence for non-init pids (set
+/// by the caller via its per-pid cadence constant).
+pub(crate) fn z417_klog(rootfs: &str, msg: &str) {
+    static Z417_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = Z417_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 512 {
+        return;
+    }
+    let path = format!("{}/dev/__kmsg__", rootfs);
+    let line = format!("<6>[kr64] 6-Z417 +{}ms {}\n", boot_elapsed_ms(), msg);
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
 // ── 6-Z384: atexit tail-drain ────────────────────────────────────────
 //
 // `std::process::exit` (main.rs) does NOT unwind: locals are not
