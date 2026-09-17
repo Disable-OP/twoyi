@@ -11516,6 +11516,34 @@ fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
         }
     }
 
+    // ── 6-Z406: probe-time fd-table dump ────────────────────────────────
+    // rn360: SF main's wall is a unix-stream recvfrom on the shlib binder
+    // PROXY transport — the fd TABLE names the actual socket inode the
+    // thread is parked on (proxy sockets carry distinguishable paths in
+    // their fd origins, and the table exposes every OTHER blocking fd —
+    // wake pipes, tombstoned sockets, the fb0 hook fd). Bounded: first
+    // 16 fds, one dump per probe.
+    {
+        let mut z406_fd_lines = 0usize;
+        for fd in 0..16i32 {
+            if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
+                z406_fd_lines += 1;
+                crate::trace_log_line(&format!(
+                    "6-Z406 PROBE-FD: pid={} fd {} -> {}",
+                    pid,
+                    fd,
+                    target.display()
+                ));
+            }
+        }
+        if z406_fd_lines > 0 {
+            crate::trace_log_line(&format!(
+                "6-Z406 PROBE-FD: pid={} ({} fds listed)",
+                pid, z406_fd_lines
+            ));
+        }
+    }
+
     // 4. Resume: PTRACE_SYSCALL(signal 0) swallows the SIGSTOP group-stop
     //    and lets the ERESTARTSYS-rewound syscall re-execute. The tracee
     //    stays mid-syscall by the loop's bookkeeping (in_syscall_map
@@ -15698,6 +15726,15 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     let mut z404_park_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
         std::collections::HashMap::new();
+    // 6-Z406: MAIN-TID probe budgets — per-pid probe count (max 6) and
+    // last-probe instant (60 s cooldown). Probes every parked MAIN thread
+    // of the fleet regardless of silence: bursty-blocked mains (SF main's
+    // proxy-socket recvfrom with periodic wakeups) never qualify for the
+    // 6-Z404 SILENCE predicate, yet their wchan IS the wall shape.
+    let mut z406_main_budget: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    let mut z406_main_last: std::collections::HashMap<libc::pid_t, std::time::Instant> =
+        std::collections::HashMap::new();
     // 6-Z306an: FORGOTTEN-RESUME watchdog — per-pid intervention budget
     // (max 4 forced PTRACE_SYSCALL resumes/boot) + last-attempt instant
     // (30 s cooldown). See the watchdog pass near the 6-Z305t-18 probe.
@@ -18810,6 +18847,80 @@ pub fn run_ptrace_loop(
                 if let Some(&abi) = abi_map.get(&sp) {
                     z306k_probe_pending.insert(sp);
                     stall_interrupt_probe(sp, &abi);
+                }
+            }
+        }
+
+        // ── 6-Z406: the MAIN-TID probe pass (rn360 decode) ──────────────
+        //
+        // The SILENCE predicate (6-Z404) misses bursty-blocked threads:
+        // SF main sits in unix_stream_data_wait (the shlib binder-proxy
+        // recvfrom) MOST of the time but wakes every <15 s, so its
+        // last_stop_at keeps refreshing and it is never "silent" — yet
+        // its census wchan (unix_stream_data_wait) IS its long-term
+        // state and it never registered the service. The predicate for
+        // THIS pass: the tid is the MAIN thread of its process (Tgid ==
+        // tid) and is NOT running — parked main threads are exactly the
+        // boot-wall suspects (SF main, system_server main, zygote main).
+        // Bounded: 6 probes/pid, 60 s cooldown, R/Z/running skipped.
+        // The probe delivers PROBE-STATE + PARK-BT + PROBE-FD for the
+        // main thread — the socket identity + the calling chain in one
+        // shot.
+        if stall_tick % 256 == 0 {
+            let now = std::time::Instant::now();
+            for &tid in tracked_pids.iter() {
+                if z406_main_budget.get(&tid).copied().unwrap_or(0) >= 6 {
+                    continue;
+                }
+                if z306k_probe_pending.contains(&tid) {
+                    continue;
+                }
+                let cooldown_ok = match z406_main_last.get(&tid) {
+                    None => true,
+                    Some(t) => now.duration_since(*t) >= std::time::Duration::from_secs(60),
+                };
+                if !cooldown_ok {
+                    continue;
+                }
+                // Main-thread check + state via /proc/<tid>/status.
+                let status_text = match std::fs::read_to_string(format!("/proc/{}/status", tid)) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let mut tgid: Option<libc::pid_t> = None;
+                let mut state = '?';
+                for line in status_text.lines() {
+                    if let Some(v) = line.strip_prefix("Tgid:") {
+                        tgid = v.trim().parse().ok();
+                    } else if let Some(v) = line.strip_prefix("State:") {
+                        state = v.chars().next().unwrap_or('?');
+                    }
+                }
+                if tgid != Some(tid) {
+                    continue; // not a main thread
+                }
+                if state == 'R' || state == 'Z' || state == 'X' {
+                    continue; // running or dead — nothing to probe
+                }
+                let wch = std::fs::read_to_string(format!("/proc/{}/wchan", tid))
+                    .map(|c| c.trim().to_string())
+                    .unwrap_or_default();
+                if wch.is_empty() || wch == "0" {
+                    continue;
+                }
+                let budget = z406_main_budget.get(&tid).copied().unwrap_or(0);
+                z406_main_budget.insert(tid, budget + 1);
+                z406_main_last.insert(tid, now);
+                let comm = std::fs::read_to_string(format!("/proc/{}/comm", tid))
+                    .map(|c| c.trim().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                log(&format!(
+                    "6-Z406 MAIN-PROBE: tid={} (tgid main) comm={} state={} wchan={} — probing",
+                    tid, comm, state, wch
+                ));
+                if let Some(&abi) = abi_map.get(&tid) {
+                    z306k_probe_pending.insert(tid);
+                    stall_interrupt_probe(tid, &abi);
                 }
             }
         }
