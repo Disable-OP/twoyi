@@ -35512,6 +35512,17 @@ pub fn run_ptrace_loop(
                     // the write failed (ret < 0), fake the return to the write
                     // count (success). init thinks setexeccon succeeded → forks
                     // the recovery service → TWRP renders.
+                    //
+                    // 6-Z414: the SAME mechanism covers the REST of the
+                    // set*con family — rn370 logged 201 "Could not create
+                    // socket 'pdx/...': setsockcreatecon(...) failed: Invalid
+                    // argument" lines (+2 adbd): setsockcreatecon writes the
+                    // context to /proc/self/attr/sockcreate and setfscreatecon
+                    // to /proc/self/attr/fscreate — the host kernel rejects a
+                    // GUEST policy context with the same EINVAL, and init's
+                    // CreateSocket aborts the publish exactly like the
+                    // fchmodat class. Any failing write to an attr node that
+                    // came from a tracked open now gets the same fake.
                     if past_first_execve && syscall_num == abi.write {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         if ret < 0 {
@@ -35537,7 +35548,11 @@ pub fn run_ptrace_loop(
                                 .get(&(pid, fd))
                                 .or_else(|| open_fd_paths.get(&fd));
                             match attr_exec_path {
-                                Some(path) if path.contains("attr/exec") => {
+                                Some(path)
+                                    if path.contains("attr/exec")
+                                        || path.contains("attr/sockcreate")
+                                        || path.contains("attr/fscreate") =>
+                                {
                                     let count = get_syscall_arg(&regs, abi.reg_arg3) as i64;
                                     let fake_ret = if count > 0 { count } else { 0 };
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
@@ -35546,8 +35561,8 @@ pub fn run_ptrace_loop(
                                             set_syscall_ret(&mut regs2, &abi, fake_ret);
                                             match ptrace_setregs(pid, &regs2, len) {
                                                 Ok(()) => log(&format!(
-                                                    "DIAG attr/exec: faked setexeccon write success (ret {}->{}) — init thinks context was set, will fork recovery service (Task 6-Z29)",
-                                                    ret, fake_ret
+                                                    "6-Z414: faked set*con write success (ret {}->{}; fd path {:?}) — the guest's setexeccon/setsockcreatecon/setfscreatecon context write is honored (Task 6-Z29 + 6-Z414 family)",
+                                                    ret, fake_ret, attr_exec_path
                                                 )),
                                                 Err(e) => log(&format!(
                                                     "DIAG attr/exec: ptrace_setregs FAILED: {} — setexeccon fails, service start aborts",
