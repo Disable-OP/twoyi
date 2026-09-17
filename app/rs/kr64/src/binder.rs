@@ -4688,8 +4688,40 @@ fn handle_write_read(
                             "[KR64][binder][vm{}] BC_REPLY with no delivered transaction (conn={}) — ignored",
                             vm_id, conn_id
                         );
+                        // 6-Z409: kernel-true ack discipline — the kernel
+                        // answers an unresolvable BC_REPLY with
+                        // BR_FAILED_REPLY. libbinder's sendReply
+                        // (waitForResponse(null, null)) exits on the first
+                        // COMPLETE-or-error; without ANY ack the inner loop
+                        // keeps reading and may swallow the NEXT BR_REPLY
+                        // (the null-reply case frees + discards it) — the
+                        // exact wedge rn364/rn365 decoded.
+                        push_br_failed_reply(&mut read_buf);
                     }
                 }
+                // 6-Z409: THE WEDGE FIX — kernel-true BC_REPLY ack. The
+                // real driver answers every accepted BC_REPLY with
+                // BR_TRANSACTION_COMPLETE in the SAME read stream
+                // (binder_thread_write → binder_transaction(reply=1) →
+                // brTRANSACTION_COMPLETE). libbinder's sendReply runs
+                // waitForResponse(nullptr, nullptr), whose ONLY exit
+                // conditions are that COMPLETE (line 851: "if (!reply &&
+                // !acquireResult) goto finish"), an error, or a BR_REPLY —
+                // and a BR_REPLY seen with reply==nullptr is FREED AND
+                // DISCARDED ("freeBuffer(...); continue;"). rn364/rn365
+                // decoded the consequence byte-for-byte: the composer's
+                // nested onHotplug reply (txn#13) was delivered in a read
+                // that belonged to sendReply's INNER ack loop (the
+                // response to the previous cascade BC_REPLY carried
+                // BR_SPAWN_LOOPER instead of the COMPLETE), the inner loop
+                // freed + discarded the reply (BC_FREE_BUFFER observed
+                // 9 ms later), spun on SPAWN_LOOPER reads forever, and the
+                // registerCallback handler never resumed — no BC_REPLY for
+                // txn#12, SF main's waiter expired, rung 7. With the
+                // COMPLETE ack the inner loop exits immediately, the outer
+                // waitForResponse consumes the nested reply with its
+                // non-null reply Parcel, and the handler completes.
+                push_br_transaction_complete(&mut read_buf);
             }
             BC_ACQUIRE | BC_RELEASE | BC_INCREFS | BC_DECREFS => {
                 // 6-Z359: strong/weak refcount changes on remote handles.
@@ -10766,10 +10798,14 @@ mod tests {
         let payload4 = make_v2_write_read_multi_payload(&bc4, &[(reply_data, &tx_off)], 0);
         let (ret_r, resp_r) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload4);
         assert_eq!(ret_r, 0);
+        // 6-Z409: kernel-true ack — the BC_REPLY ioctl's read stream now
+        // carries BR_TRANSACTION_COMPLETE (the real driver acks every
+        // accepted BC_REPLY in the same read; libbinder's sendReply
+        // waitForResponse(null,null) exits on it).
         assert_eq!(
-            u32::from_ne_bytes(resp_r[0..4].try_into().unwrap()),
-            0,
-            "BC_REPLY ioctl returns an empty read buffer"
+            u32::from_ne_bytes(resp_r[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE,
+            "BC_REPLY ioctl acks with BR_TRANSACTION_COMPLETE (6-Z409)"
         );
 
         // ---- Connection B: read-only ioctl → the deferred BR_REPLY ----
@@ -11460,16 +11496,38 @@ mod tests {
         let payload5 = make_v2_write_read_multi_payload(&bc5, &[(rep, &no_off)], 4096);
         let (ret5, resp5) = exchange(&mut stream, BINDER_WRITE_READ, &payload5);
         assert_eq!(ret5, 0);
+        // 6-Z409: kernel-true — the BC_REPLY ioctl acks with
+        // BR_TRANSACTION_COMPLETE; the resolved self-reply (the drained
+        // reply_queue entry) surfaces on the NEXT read-only ioctl (the
+        // read half's `read_buf.is_empty()` guard skips the drain once
+        // the write half produced the ack — libbinder's sendReply
+        // waitForResponse(null,null) exits at the COMPLETE and the next
+        // waitForResponse consumes the reply, exactly like the kernel's
+        // two-read flow).
         assert_eq!(
             u32::from_ne_bytes(resp5[4..8].try_into().unwrap()),
-            BR_REPLY,
-            "self BC_REPLY answered in the same ioctl (reply queue drained)"
+            BR_TRANSACTION_COMPLETE,
+            "self BC_REPLY acked with BR_TRANSACTION_COMPLETE (6-Z409)"
         );
         let rs5 = u32::from_ne_bytes(resp5[0..4].try_into().unwrap()) as usize;
-        let o5 = 4 + rs5 + 8;
-        let dl5 = u32::from_ne_bytes(resp5[o5..o5 + 4].try_into().unwrap()) as usize;
-        assert_eq!(dl5, rep.len());
-        assert_eq!(&resp5[o5 + 12..o5 + 12 + dl5], rep, "own reply bytes exact");
+        assert_eq!(rs5, 4, "ack-only read stream");
+
+        // ---- the next read-only ioctl drains the self-reply ----
+        let mut wr6 = Vec::new();
+        wr6.extend_from_slice(&0u32.to_ne_bytes());
+        wr6.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret6, resp6) = exchange(&mut stream, BINDER_WRITE_READ, &wr6);
+        assert_eq!(ret6, 0);
+        let rs6 = u32::from_ne_bytes(resp6[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            u32::from_ne_bytes(resp6[4..8].try_into().unwrap()),
+            BR_REPLY,
+            "self BC_REPLY resolved by the next read (reply queue drained)"
+        );
+        let o6 = 4 + rs6 + 8;
+        let dl6 = u32::from_ne_bytes(resp6[o6..o6 + 4].try_into().unwrap()) as usize;
+        assert_eq!(dl6, rep.len());
+        assert_eq!(&resp6[o6 + 12..o6 + 12 + dl6], rep, "own reply bytes exact");
 
         drop(stream);
         drop(_handle);
