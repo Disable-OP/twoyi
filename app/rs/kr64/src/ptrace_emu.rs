@@ -16908,6 +16908,26 @@ pub fn run_ptrace_loop(
     // for recv*).
     let mut pending_uevent_socket: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // 6-Z439b: pids whose in-flight socket() ENTRY was rewritten from
+    // (AF_PACKET, SOCK_DGRAM, ETH_P_IPV6) to (AF_UNIX, SOCK_DGRAM, 0) —
+    // the socket EXIT arm records the returned REAL fd into
+    // z439_packet_fds, and the ioctl ENTRY arm forces
+    // SIOCGIFFLAGS/SIOCSIFFLAGS on such fds to raw -ENODEV. rn399 (run
+    // 35283930753) measured why: on the REAL AF_UNIX fd the
+    // SIOCGIFFLAGS resolved against the HOST's interface table, where
+    // "eth0" IS the CI runner's NIC — the monitor stepped past ENODEV,
+    // attempted SIOCSIFFLAGS (set ALLMULTI) and hit EPERM
+    // ("Ipv6Monitor failed to set interface flags for eth0: Operation
+    // not permitted") → InitResult::Error → ipv6MonitorCreate nullptr →
+    // the SAME SIGSEGV. -ENODEV drives the monitor's OWN Deferred
+    // branch (mPollTimeout=1000ms) — it parks in its poll-retry loop
+    // forever. The guest has no radio interface; host interfaces must
+    // never leak into the guest's ioctl answers.
+    let mut pending_z439_socket: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    let mut z439_packet_fds:
+        std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>> =
+        std::collections::HashMap::new();
     // 6-Z203: (pid, fd) → last ASHMEM_SET_SIZE for fds opened on the
     // {rootfs}/dev/ashmem regular-file stand-in. The tracer-level ioctl
     // virtualization needs the size for GET_SIZE + ftruncate on SET_SIZE.
@@ -32577,8 +32597,9 @@ pub fn run_ptrace_loop(
                             set_syscall_arg(&mut regs, abi.reg_arg1, AF_UNIX_Z439);
                             set_syscall_arg(&mut regs, abi.reg_arg3, 0);
                             if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                pending_z439_socket.insert(pid);
                                 log(&format!(
-                                    "6-Z439: socket(AF_PACKET, {:#x}, ETH_P_IPV6) rewritten to socket(AF_UNIX, {:#x}, 0) — reference-ril ipv6 monitor gets a real fd; SIOCGIFFLAGS → kernel-true ENODEV → its own Deferred retry-poll loop",
+                                    "6-Z439: socket(AF_PACKET, {:#x}, ETH_P_IPV6) rewritten to socket(AF_UNIX, {:#x}, 0) — reference-ril ipv6 monitor gets a real fd; its interface ioctls are pinned to -ENODEV by 6-Z439b (the monitor's own Deferred retry-poll loop)",
                                     sock_type, sock_type
                                 ));
                             }
@@ -32938,6 +32959,44 @@ pub fn run_ptrace_loop(
                                 log(&format!(
                                     "6-Z338: untracked 'G'-family ioctl req={:#x} on the goldfish_address_space stand-in (pid {}, fd {}) — left REAL (expect ENOTTY)",
                                     req, pid, fd
+                                ));
+                            }
+                        }
+                    }
+
+                    // ── 6-Z439b: the reference-ril ipv6-monitor
+                    // packet-standin interface ioctls (ENTRY) ──
+                    //
+                    // SIOCGIFFLAGS (0x8913) / SIOCSIFFLAGS (0x8914) on a
+                    // 6-Z439-rewritten AF_PACKET stand-in fd → raw -ENODEV.
+                    // rn399 (run 35283930753) measured the failure this
+                    // prevents: on the REAL AF_UNIX fd the SIOCGIFFLAGS
+                    // resolved against the HOST's interface table where
+                    // "eth0" IS the CI runner's NIC — the monitor stepped
+                    // past ENODEV, attempted SIOCSIFFLAGS (set ALLMULTI) and
+                    // hit EPERM ("Ipv6Monitor failed to set interface flags
+                    // for eth0: Operation not permitted") → InitResult::Error
+                    // → ipv6MonitorCreate nullptr → the SAME SIGSEGV as
+                    // rn398. -ENODEV drives the monitor's OWN Deferred
+                    // branch (mPollTimeout=1000ms): it parks in its
+                    // poll-retry loop forever. The guest has no radio
+                    // interface; HOST interfaces must never leak into the
+                    // guest's ioctl answers.
+                    if abi.ioctl_nr != -1 && syscall_num == abi.ioctl_nr {
+                        const SIOCGIFFLAGS_Z439: u64 = 0x8913;
+                        const SIOCSIFFLAGS_Z439: u64 = 0x8914;
+                        let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                        let req = get_syscall_arg(&regs, abi.reg_arg2);
+                        let hit = z439_packet_fds
+                            .get(&pid)
+                            .is_some_and(|fds| fds.contains(&(fd as i64)));
+                        if hit && (req == SIOCGIFFLAGS_Z439 || req == SIOCSIFFLAGS_Z439) {
+                            set_syscall_num(&mut regs, &abi, abi.getpid);
+                            if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                pending_sandbox_deny.insert(pid, -2); // raw -ENODEV
+                                log(&format!(
+                                    "6-Z439b: ioctl(fd={}, req={:#x}) on the packet-standin fd -> raw -ENODEV (the reference-ril monitor's own Deferred branch)",
+                                    fd, req
                                 ));
                             }
                         }
@@ -40290,6 +40349,18 @@ pub fn run_ptrace_loop(
                                     fake_netlink_fds.entry(pid).or_default().insert(ret);
                                     log(&format!(
                                         "6-Z202: uevent socket() -> real fd {} registered as fake-uevent (bind/listen/setsockopt faked 0, recv* native -EAGAIN)",
+                                        ret
+                                    ));
+                                }
+                                // 6-Z439b: the AF_PACKET stand-in fd joins the
+                                // ioctl fake (below) instead of the bind/recv
+                                // fake set — its SIOCGIFFLAGS must return raw
+                                // -ENODEV so the monitor parks in its own
+                                // Deferred branch (see the state declaration).
+                                if pending_z439_socket.remove(&pid) && ret >= 0 {
+                                    z439_packet_fds.entry(pid).or_default().insert(ret);
+                                    log(&format!(
+                                        "6-Z439b: packet-standin fd {} registered — SIOCGIFFLAGS/SIOCSIFFLAGS on it will return raw -ENODEV",
                                         ret
                                     ));
                                 }
