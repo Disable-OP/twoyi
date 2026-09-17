@@ -394,6 +394,66 @@ pub(crate) fn z408_klog(rootfs: &str, msg: &str) {
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
+// ── 6-Z413: the chmod-family decision + rewrite-integrity channel ────
+//
+// rn365 decoded a three-way split in the guest's socket fchmodat class
+// (init's CreateSocket fchmodat(AT_FDCWD, /dev/socket/X, perm,
+// AT_SYMLINK_NOFOLLOW) — the call whose failure aborts the socket
+// publish and kills zygote/tombstoned/lmkd for the whole boot):
+//   (a) some entries are caught and getpid-rewritten (386 stderr lines
+//       — all mislabelled "chmod" by the syscall_name ordering bug) with
+//       the fake-0 EXIT — init sees success but the sandbox node NEVER
+//       gets its mode;
+//   (b) some entries produce the raw ENOENT abort ("Could not create
+//       socket") with NEITHER the z391 ENTRY/DECISION klogs NOR a z408b
+//       backstop fire — the drop-proof channels stayed silent, so the
+//       failing link (path read? translate no-op? rewrite reverted by a
+//       stale-regs writer?) is unnamed;
+//   (c) the bind-side corruption (6-Z305t-57: lmkd's bind forensics
+//       showed the STALE logdw target, EADDRINUSE faked to 0) is its
+//       own decode.
+// z413_klog gives the arm a drop-proof decision line that does NOT
+// depend on the guest path read succeeding (the z391 ENTRY/DECISION
+// gates both silently skip on a failed read — exactly the blind spot
+// rn365 hit). Own budget per the rn350 self-bury discipline.
+pub(crate) fn z413_klog(rootfs: &str, msg: &str) {
+    static Z413_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = Z413_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 96 {
+        return;
+    }
+    let path = format!("{}/dev/__kmsg__", rootfs);
+    let line = format!("<6>[kr64] 6-Z413 +{}ms {}\n", boot_elapsed_ms(), msg);
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
+/// 6-Z413-R: the rewrite-INTEGRITY alarm — a register rewrite (the
+/// getpid nr-rewrite at ENTRY, the fake-0 return at EXIT) whose READBACK
+/// does not match what was written. The stale-regs-writer class (the
+/// 6-Z305t-58 bind READBACK MISMATCH evidence: "a LATER ENTRY arm
+/// clobbered the rewrite") would produce EXACTLY the rn365 shape — the
+/// rewrite logs fire, the kernel still runs the RAW syscall, init sees
+/// the raw ENOENT. These lines are the loudest signal in the channel;
+/// own small budget so a storm cannot bury the decision trace.
+pub(crate) fn z413r_klog(rootfs: &str, msg: &str) {
+    static Z413R_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = Z413R_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 32 {
+        return;
+    }
+    let path = format!("{}/dev/__kmsg__", rootfs);
+    let line = format!("<6>[kr64] 6-Z413-R +{}ms {}\n", boot_elapsed_ms(), msg);
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
 // ── 6-Z384: atexit tail-drain ────────────────────────────────────────
 //
 // `std::process::exit` (main.rs) does NOT unwind: locals are not

@@ -4495,6 +4495,19 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         // nr=-1 SIGSYS-desync events labelled "[unknown]" (mirrors the
         // bootfix FIX 1 statfs labels).
         "mkdirat"
+    } else if nr == abi.fchmodat {
+        // 6-Z413: the *at variants MUST be checked before the plain
+        // chmod/lchown/chown slots. On aarch64 (asm-generic) there are NO
+        // plain chmod/lchown/chown syscalls and ABI_AARCH64.chmod == 53 ==
+        // fchmodat (the historical-collision note at the ABI table), so
+        // checking chmod first labelled EVERY guest fchmodat "chmod" in
+        // the traces — rn365's 386 "chmod ENTRY nr=53 → rewritten to
+        // getpid" lines are all fchmodat calls, and the mislabel sent the
+        // socket-fchmodat decode chasing a plain-chmod ghost. On x86_64/
+        // i386 the numbers differ so this ordering is a no-op there.
+        "fchmodat"
+    } else if nr == abi.fchownat {
+        "fchownat"
     } else if nr == abi.chmod {
         "chmod"
     } else if nr == abi.unshare {
@@ -4525,10 +4538,6 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "lchown"
     } else if nr == abi.chown {
         "chown"
-    } else if nr == abi.fchmodat {
-        "fchmodat"
-    } else if nr == abi.fchownat {
-        "fchownat"
     } else if nr == abi.capget {
         "capget"
     } else if nr == abi.capset {
@@ -15959,6 +15968,17 @@ pub fn run_ptrace_loop(
     // ENOENT reach init's create_socket → LOG(FATAL) → the
     // mprotect-sweep death (run 33323583991). Per-pid (6-Z83).
     let mut pending_chmod_fake_pid: Option<libc::pid_t> = None;
+    // 6-Z413: did the LAST chmod-family ENTRY apply the sandbox path
+    // translation (6-Z258)? Single slot, same discipline as
+    // pending_chmod_fake_pid: the EXIT consumer requires a pid match.
+    // When the ENTRY did NOT translate (the getpid-fake class — the
+    // rn365 386-call fleet), the EXIT-side REAL-MODE pass below may
+    // still apply the mode host-side: at EXIT the guest's arg2 (path)
+    // and arg3 (mode) registers often survive (x0 is the only register
+    // the syscall return clobbers on aarch64), so a /dev/socket/* path
+    // read at EXIT enables the REAL chmod the ENTRY read's failure
+    // denied — the rn353 "socket-mode normalization" mechanism.
+    let mut z413_entry_translated_pid: Option<libc::pid_t> = None;
     // Task 6-Z28: pending flag for poll() return fake. Set at the ENTRY
     // stop (when init calls poll), consumed at the EXIT stop (fake return 0).
     // 6-Z83: PER-PID (see the block comment above) + arming loop_count for
@@ -30860,6 +30880,18 @@ pub fn run_ptrace_loop(
                             let dirfd = syscall_dirfd(get_syscall_arg(&regs, abi.reg_arg1));
                             let path_addr = get_syscall_arg(&regs, abi.reg_arg2);
                             let mut translated_applied = false;
+                            // 6-Z413: decision-trace inputs for the drop-proof
+                            // channel. The z391 ENTRY/DECISION gates BOTH
+                            // silently skip when read_child_string fails —
+                            // rn365's socket-fchmodat blind spot (no klog line,
+                            // raw ENOENT at the guest, z408b silent). Track the
+                            // outcome of every link here and emit one line per
+                            // INTERESTING call (read failed OR translate
+                            // no-op'd) at the arm tail.
+                            let mut z413_read: Option<String> = None;
+                            let mut z413_translate_noop = false;
+                            let mut z413_rewrite_getpid = false;
+                            let mut z413_rewrite_rc: &str = "n/a";
                             // 6-Z405: the INIT chmod-family census — rn358's
                             // lmkd/tombstoned fchmodat ENOENTs come with ZERO
                             // tracer traces of those calls (no z391 ENTRY, no
@@ -30925,6 +30957,7 @@ pub fn run_ptrace_loop(
                             }
                             if dirfd == AT_FDCWD {
                                 if let Some(path) = read_child_string(pid, path_addr) {
+                                    z413_read = Some(path.clone());
                                     if path.starts_with('/') {
                                         // 6-Z258c: use the SANDBOX translator —
                                         // the standalone translate_path()
@@ -30947,6 +30980,12 @@ pub fn run_ptrace_loop(
                                         // own paths untouched.
                                         let translated =
                                             translate_path_via_sandbox(&sandbox, rootfs, &path);
+                                        if translated == path {
+                                            // 6-Z413: the translator returned the
+                                            // guest path UNCHANGED — the raw syscall
+                                            // would resolve against the HOST root.
+                                            z413_translate_noop = true;
+                                        }
                                         if translated != path && scratch_addr != 0 {
                                             translated_applied = write_translated_path(
                                                 pid,
@@ -30977,13 +31016,50 @@ pub fn run_ptrace_loop(
                                 // reaches here via scratch==0).
                                 if dirfd == AT_FDCWD {
                                     set_syscall_num(&mut regs, &abi, abi.getpid);
+                                    z413_rewrite_getpid = true;
                                     match ptrace_setregs(pid, &regs, iov_len) {
-                                        Ok(()) => log(&format!(
-                                            "6-Z257: {} ENTRY nr={} → rewritten to getpid nr={} (untranslatable path — kernel will execute getpid; EXIT will fake return 0)",
-                                            syscall_name(syscall_num, &abi),
-                                            syscall_num,
-                                            abi.getpid
-                                        )),
+                                        Ok(()) => {
+                                            z413_rewrite_rc = "ok";
+                                            // 6-Z413-R: verify the nr rewrite STUCK.
+                                            // The stale-regs-writer class (the
+                                            // 6-Z305t-58 bind READBACK MISMATCH
+                                            // evidence) would restore the raw nr
+                                            // and the kernel would run the RAW
+                                            // fchmodat → host-root ENOENT — the
+                                            // rn365 "Could not create socket" shape
+                                            // WITH the rewrite log present.
+                                            let mut z413_rb: Regs =
+                                                unsafe { std::mem::zeroed() };
+                                            match ptrace_getregs_wide(pid, &mut z413_rb) {
+                                                Ok(_)
+                                                    if get_syscall_num(&z413_rb, &abi)
+                                                        == abi.getpid => {}
+                                                Ok(_) => crate::z413r_klog(
+                                                    rootfs,
+                                                    &format!(
+                                                        "NR-REWRITE REVERTED {} pid={} nr={} — the getpid rewrite did not stick; the kernel will run the RAW syscall (host-root ENOENT class)",
+                                                        syscall_name(syscall_num, &abi),
+                                                        pid,
+                                                        syscall_num
+                                                    ),
+                                                ),
+                                                Err(e) => crate::z413r_klog(
+                                                    rootfs,
+                                                    &format!(
+                                                        "NR-REWRITE READBACK FAILED {} pid={}: {} (rewrite unverified)",
+                                                        syscall_name(syscall_num, &abi),
+                                                        pid,
+                                                        e
+                                                    ),
+                                                ),
+                                            }
+                                            log(&format!(
+                                                "6-Z257: {} ENTRY nr={} → rewritten to getpid nr={} (untranslatable path — kernel will execute getpid; EXIT will fake return 0)",
+                                                syscall_name(syscall_num, &abi),
+                                                syscall_num,
+                                                abi.getpid
+                                            ));
+                                        }
                                         Err(e) => log(&format!(
                                             "6-Z257: {} ENTRY REWRITE FAILED: ptrace_setregs: {} — kernel will execute the real syscall (EXIT-side family fake + 6-Z185 backstop remain)",
                                             syscall_name(syscall_num, &abi),
@@ -30999,13 +31075,44 @@ pub fn run_ptrace_loop(
                                 }
                             } else if !translated_applied && scratch_addr == 0 {
                                 set_syscall_num(&mut regs, &abi, abi.getpid);
+                                z413_rewrite_getpid = true;
                                 match ptrace_setregs(pid, &regs, iov_len) {
-                                    Ok(()) => log(&format!(
-                                        "6-Z257: {} ENTRY nr={} → rewritten to getpid nr={} (scratch not reserved — kernel will execute getpid; EXIT will fake return 0)",
-                                        syscall_name(syscall_num, &abi),
-                                        syscall_num,
-                                        abi.getpid
-                                    )),
+                                    Ok(()) => {
+                                        z413_rewrite_rc = "ok";
+                                        // 6-Z413-R: same integrity readback as the
+                                        // scratch!=0 fallback above.
+                                        let mut z413_rb: Regs =
+                                            unsafe { std::mem::zeroed() };
+                                        match ptrace_getregs_wide(pid, &mut z413_rb) {
+                                            Ok(_)
+                                                if get_syscall_num(&z413_rb, &abi)
+                                                    == abi.getpid => {}
+                                            Ok(_) => crate::z413r_klog(
+                                                rootfs,
+                                                &format!(
+                                                    "NR-REWRITE REVERTED (scratch==0) {} pid={} nr={} — the getpid rewrite did not stick; the kernel will run the RAW syscall",
+                                                    syscall_name(syscall_num, &abi),
+                                                    pid,
+                                                    syscall_num
+                                                ),
+                                            ),
+                                            Err(e) => crate::z413r_klog(
+                                                rootfs,
+                                                &format!(
+                                                    "NR-REWRITE READBACK FAILED (scratch==0) {} pid={}: {} (rewrite unverified)",
+                                                    syscall_name(syscall_num, &abi),
+                                                    pid,
+                                                    e
+                                                ),
+                                            ),
+                                        }
+                                        log(&format!(
+                                            "6-Z257: {} ENTRY nr={} → rewritten to getpid nr={} (scratch not reserved — kernel will execute getpid; EXIT will fake return 0)",
+                                            syscall_name(syscall_num, &abi),
+                                            syscall_num,
+                                            abi.getpid
+                                        ));
+                                    }
                                     Err(e) => log(&format!(
                                         "6-Z257: {} ENTRY REWRITE FAILED (scratch==0): ptrace_setregs: {} — kernel will execute the real syscall (EXIT-side family fake + 6-Z185 backstop remain)",
                                         syscall_name(syscall_num, &abi),
@@ -31046,6 +31153,36 @@ pub fn run_ptrace_loop(
                                         ),
                                     );
                                 }
+                            }
+                            // 6-Z413: record whether THIS ENTRY translated —
+                            // the EXIT-side REAL-MODE pass reads it (pid-matched).
+                            z413_entry_translated_pid =
+                                if translated_applied { Some(pid) } else { None };
+                            // 6-Z413: the read-independent decision line — one
+                            // drop-proof klog per INTERESTING call (the guest
+                            // path read failed, or the translator returned the
+                            // path unchanged). The z391 gates above are both
+                            // read-dependent: a failed read produces NO klog
+                            // line at all while the raw syscall runs — rn365's
+                            // exact blind spot. Normal translated calls already
+                            // carry the z391 ENTRY+DECISION pair and stay
+                            // silent here to preserve the budget.
+                            if z413_read.is_none() || z413_translate_noop {
+                                crate::z413_klog(
+                                    rootfs,
+                                    &format!(
+                                        "CHMODFAM {} pid={} nr={} dirfd={} read={} translate_noop={} scratch={} rewrite_getpid={} rewrite_rc={}",
+                                        syscall_name(syscall_num, &abi),
+                                        pid,
+                                        syscall_num,
+                                        dirfd,
+                                        z413_read.as_deref().unwrap_or("<FAILED>"),
+                                        z413_translate_noop,
+                                        scratch_addr != 0,
+                                        z413_rewrite_getpid,
+                                        z413_rewrite_rc
+                                    ),
+                                );
                             }
                         }
                         // ── Task 6-Z69: set_thread_area ENTRY → REAL TLS
@@ -36531,14 +36668,91 @@ pub fn run_ptrace_loop(
                         match ptrace_getregs_wide(pid, &mut regs2) {
                             Ok(len) => {
                                 let original_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                // 6-Z413: the REAL-MODE pass — when the ENTRY
+                                // did NOT translate (the getpid-fake class: the
+                                // path read failed / the translate no-op'd),
+                                // the guest syscall NEVER touched the sandbox
+                                // node, so the fake-0 return leaves init's
+                                // socket mode UNAPPLIED. At EXIT the arg
+                                // registers usually survive (x0 carries the
+                                // return; the kernel does not zero x1-x7 on
+                                // the aarch64 syscall return path), so try the
+                                // path+mode readback here and apply the chmod
+                                // HOST-side against the sandbox node — the
+                                // same real-effect mechanism the z408b
+                                // backstop uses for the missed-ENTRY class.
+                                // A failed read is silent here (the z413 ENTRY
+                                // decision line already named it).
+                                if z413_entry_translated_pid != Some(pid)
+                                    && (exit_syscall_num == abi.fchmodat
+                                        || exit_syscall_num == abi.fchownat)
+                                {
+                                    let z413m_path_addr = get_syscall_arg(&regs2, abi.reg_arg2);
+                                    if let Some(z413m_path) =
+                                        read_child_string(pid, z413m_path_addr)
+                                    {
+                                        if z413m_path.starts_with("/dev/socket/")
+                                            && exit_syscall_num == abi.fchmodat
+                                        {
+                                            use std::os::unix::fs::PermissionsExt;
+                                            let z413m_mode = (get_syscall_arg(&regs2, abi.reg_arg3)
+                                                & 0xfff)
+                                                as u32;
+                                            let z413m_real = format!("{}{}", rootfs, z413m_path);
+                                            let z413m_res = std::fs::set_permissions(
+                                                &z413m_real,
+                                                std::fs::Permissions::from_mode(z413m_mode),
+                                            );
+                                            crate::z413_klog(
+                                                rootfs,
+                                                &format!(
+                                                    "REAL-MODE fchmodat pid={} path={:?} mode={:#o} -> {} ({})",
+                                                    pid,
+                                                    z413m_path,
+                                                    z413m_mode,
+                                                    if z413m_res.is_ok() { "ok" } else { "failed" },
+                                                    z413m_real
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                                z413_entry_translated_pid = None;
                                 set_syscall_ret(&mut regs2, &abi, 0);
                                 match ptrace_setregs(pid, &regs2, len) {
-                                    Ok(()) => log(&format!(
-                                        "6-Z257: fchmodat/fchownat EXIT: faked return 0 (underlying return {}; exit-syscall_num={} [{}]) — child sees chmod/chown success (missed-stop-proof family fake)",
-                                        original_ret,
-                                        exit_syscall_num,
-                                        syscall_name(exit_syscall_num, &abi)
-                                    )),
+                                    Ok(()) => {
+                                        // 6-Z413-R: EXIT-fake integrity readback —
+                                        // if the ret=0 write is reverted by a
+                                        // stale-regs writer before the resume,
+                                        // the guest sees the RAW errno (rn365's
+                                        // ENOENT with the rewrite logs present)
+                                        // while every log line claims success.
+                                        let mut z413_rb: Regs = unsafe { std::mem::zeroed() };
+                                        match ptrace_getregs_wide(pid, &mut z413_rb) {
+                                            Ok(_)
+                                                if get_syscall_arg(&z413_rb, abi.reg_ret) == 0 => {}
+                                            Ok(_) => crate::z413r_klog(
+                                                rootfs,
+                                                &format!(
+                                                    "EXIT-FAKE REVERTED pid={} exit-syscall_num={} — the ret=0 write did not stick; the guest will see the RAW errno",
+                                                    pid, exit_syscall_num
+                                                ),
+                                            ),
+                                            Err(e) => crate::z413r_klog(
+                                                rootfs,
+                                                &format!(
+                                                    "EXIT-FAKE READBACK FAILED pid={}: {} (fake unverified)",
+                                                    pid, e
+                                                ),
+                                            ),
+                                        }
+                                        log(&format!(
+                                            "6-Z257: fchmodat/fchownat EXIT: faked return 0 (underlying return {}; exit-syscall_num={} [{}]) — child sees chmod/chown success (missed-stop-proof family fake)",
+                                            original_ret,
+                                            exit_syscall_num,
+                                            syscall_name(exit_syscall_num, &abi)
+                                        ));
+                                    }
                                     Err(e) => log(&format!(
                                         "6-Z257: fchmodat/fchownat EXIT FAKE FAILED: ptrace_setregs: {} — child will see {} (NOT 0)",
                                         e, original_ret
@@ -38707,6 +38921,76 @@ pub fn run_ptrace_loop(
                                                 .unwrap_or_else(|| {
                                                     "(no stash — this bind was NOT rewritten)".to_string()
                                                 });
+                                            // 6-Z413b: the EXIT-side guest-path read.
+                                            // The stash above is a per-pid SINGLE slot
+                                            // written only by the 6-Z163 ENTRY rewrite:
+                                            // a bind whose ENTRY was never processed
+                                            // (the 6-Z210 vanish class) leaves the
+                                            // PREVIOUS bind's stash in place, and the
+                                            // forensics misattributes it (rn365: lmkd's
+                                            // -98 carried logdw's stash). Read the
+                                            // sockaddr DIRECTLY from the EXIT registers
+                                            // (arg registers survive on aarch64) and
+                                            // name the REAL failing socket drop-proof:
+                                            // a stash/guest mismatch is the
+                                            // missed-ENTRY-rewrite proof, and a MISSING
+                                            // /dev/socket/* target in the sandbox after
+                                            // a -98 means the raw bind ran against the
+                                            // HOST root (EADDRINUSE if the host owns
+                                            // the name, ENOENT otherwise) — the guest
+                                            // socket never lands and the follow-up
+                                            // fchmodat ENOENT aborts the publish.
+                                            'z413b: {
+                                                let mut regs_z413b: Regs =
+                                                    unsafe { std::mem::zeroed() };
+                                                if ptrace_getregs_wide(pid, &mut regs_z413b)
+                                                    .is_err()
+                                                {
+                                                    break 'z413b;
+                                                }
+                                                let z413b_sa =
+                                                    get_syscall_arg(&regs_z413b, abi.reg_arg2);
+                                                let z413b_len =
+                                                    get_syscall_arg(&regs_z413b, abi.reg_arg3)
+                                                        as i64;
+                                                if z413b_sa == 0 || z413b_len < 3 || z413b_len > 128
+                                                {
+                                                    break 'z413b;
+                                                }
+                                                let Some(z413b_blob) =
+                                                    read_child_bytes(pid, z413b_sa, 128)
+                                                else {
+                                                    break 'z413b;
+                                                };
+                                                let Some(z413b_gp) = unix_fs_sun_path(&z413b_blob)
+                                                    .map(|gp| gp.to_string())
+                                                else {
+                                                    break 'z413b;
+                                                };
+                                                if !z413b_gp.starts_with("/dev/socket/") {
+                                                    break 'z413b;
+                                                }
+                                                let z413b_stash = pending_bind_path
+                                                    .get(&pid)
+                                                    .map(|(gp, _, _, _)| gp.clone());
+                                                let z413b_target_exists = std::path::Path::new(
+                                                    &translate_path(rootfs, &z413b_gp),
+                                                )
+                                                .exists();
+                                                crate::z413_klog(
+                                                    rootfs,
+                                                    &format!(
+                                                        "FAIL-BIND pid={} fd={} ret={} guest_path={} stash_path={:?} stash_match={} sandbox_target_exists={} (stash_match=false ⇒ the ENTRY rewrite never ran — the 6-Z210 vanish class; the raw bind hit the HOST /dev/socket)",
+                                                        pid,
+                                                        fd,
+                                                        ret,
+                                                        z413b_gp,
+                                                        z413b_stash,
+                                                        z413b_stash.as_deref() == Some(z413b_gp.as_str()),
+                                                        z413b_target_exists
+                                                    ),
+                                                );
+                                            }
                                             log(&format!(
                                                 "6-Z305t-57: bind forensics pid={} fd={} raw_ret={} (-errno {}): fd_link={:?} inode={:?} unix_path={} rootfs_dev_socket={} BIND={}",
                                                 pid, fd, ret, -ret,
@@ -45402,7 +45686,56 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         // aarch64 fchmodat = 53. asm-generic has no plain chmod/lchown/
         // chown — bionic issues fchmodat for chmod() callers.
         assert_eq!(compute_exit_return_value(53, &ABI_AARCH64), Some(0));
-        assert_eq!(syscall_name(53, &ABI_AARCH64), "chmod");
+        // 6-Z413: the *at variants take label precedence on the aarch64
+        // number collision (chmod == fchmodat == 53 in the ABI table).
+        // The old ordering labelled every guest fchmodat "chmod", which
+        // corrupted the rn365 socket-fchmodat decode (386 rewrite lines
+        // mislabelled). asm-generic has NO plain chmod, so "fchmodat" is
+        // also the kernel-true name of whatever the guest sent as nr=53.
+        assert_eq!(syscall_name(53, &ABI_AARCH64), "fchmodat");
+    }
+
+    #[test]
+    fn syscall_name_at_variant_label_precedence_6z413() {
+        // 6-Z413: whenever an ABI's plain-chmod slot COLLIDES with the
+        // fchmodat number (aarch64: both 53 — asm-generic dropped plain
+        // chmod), the label MUST resolve to the *at variant: the guest's
+        // nr=53 call IS an fchmodat (path at arg2), and the plain-chmod
+        // mislabel corrupted the socket-fchmodat decode evidence. On ABIs
+        // where the numbers differ (x86_64: chmod=90 vs fchmodat=268) the
+        // labels must stay distinct.
+        for (abi_name, abi) in [
+            ("x86_64", &ABI_X86_64),
+            ("i386", &ABI_X86_32),
+            // ("aarch64" — ABI_AARCH64 is target-gated; the aarch64
+            // collision case is asserted by
+            // compute_exit_return_value_aarch64_fchmodat_returns_zero.)
+            ("arm32", &ABI_ARM32),
+        ] {
+            if abi.fchmodat != -1 && abi.chmod == abi.fchmodat {
+                assert_eq!(
+                    syscall_name(abi.fchmodat, abi),
+                    "fchmodat",
+                    "{}: nr={} is fchmodat (chmod collides) — the *at label must win",
+                    abi_name,
+                    abi.fchmodat
+                );
+            }
+            if abi.fchownat != -1 && abi.chown == abi.fchownat && abi.chown != -1 {
+                assert_eq!(
+                    syscall_name(abi.fchownat, abi),
+                    "fchownat",
+                    "{}: nr={} is fchownat (chown collides) — the *at label must win",
+                    abi_name,
+                    abi.fchownat
+                );
+            }
+        }
+        // The distinct-number ABIs keep their plain labels.
+        assert_eq!(syscall_name(ABI_X86_64.chmod, &ABI_X86_64), "chmod");
+        assert_eq!(syscall_name(ABI_X86_64.fchmodat, &ABI_X86_64), "fchmodat");
+        assert_eq!(syscall_name(ABI_X86_32.chmod, &ABI_X86_32), "chmod");
+        assert_eq!(syscall_name(ABI_X86_32.fchmodat, &ABI_X86_32), "fchmodat");
     }
 
     #[cfg(target_arch = "aarch64")]
