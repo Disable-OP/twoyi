@@ -30603,3 +30603,19 @@ Stage Summary:
 - Session commit chain (all pushed + CI green): 6fc4ec55 (6-Z403) -> THIS (6-Z404).
 - EXPECT rn359 (dispatched, boot_wait 600 / stall 120): 6-Z404 PARK-PROBE/PARK-BT lines naming SF main's exact park site (the rn357 linker64 futex shape vs the rn358 condvar shapes — decidable from ONE probe). With the site named, the fix targets the never-signaled primitive directly.
 - Queued decode: the fchmodat socket-ENOENT early-window evidence (6-Z400 backing-path lines), rild joinRpcThreadpool ordering (secondary), the Java backtrace intercept timeout (art attach).
+
+---
+Task ID: 136 (rn359 decoded — SF main's wall is a unix-stream recvfrom, not a futex; 6-Z404 v2 (the SILENT-tid probe) + 6-Z405 (the INIT chmod-family census) landed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn359 (#359, 20e83b19) decoded: verdict rung 7 again. 6-Z404 v1 fired ZERO probes — both its gates were wrong for the real fleet: the SF futex waiters block IN the futex syscall (in_syscall=true when the ENTRY was seen; the old 305t-18 pass probed SF 3225 4x, each probe reading a0=ERESTARTSYS — the syscall-rewound return, not the uaddr), and SF MAIN (3201) is NOT futex-parked at all: its census wchan is unix_stream_data_wait — blocked in a recvfrom on a unix STREAM socket — rejected by v1's wchan gate. Both were invisible because their blocking ENTRY stop was missed under stop-storm load (in_syscall stays false forever).
+- THE NEW SHAPE: SF main's wall is a unix-stream-socket READ. Working hypothesis: the shlib's binder proxy transport (SF's own svc log: "binder proxy: /dev/hwbinder -> CONNECTED .../vm0/dev/binder (fd=6)") — a thread waiting on the proxy unix socket is a thread waiting inside a binder ioctl; main may be stuck in an hwbinder get through the vm0 proxy. rn360's fp-chain names the caller.
+- rn359 census (process 3201): main unix_stream_data_wait; Binder:3201_1 parked on the binder socket (normal); the 6-Z403-named state-machine waiter futex WAIT_BITSET wakes=NEVER; ImageManager/DispSync/sf/app + 2 unnamed threads futex-parked wakes=NEVER; HwBinder pool normal.
+- 6-Z404 v2 (this commit): the class predicate is SILENCE — a tracked tid whose LAST tracer stop is >=15s old is parked somewhere (in a syscall, on a futex, on a socket, or stopped in userspace), and the SIGSTOP dance + live GETREGS names it in every case. The pass drops the in_syscall + wchan gates (budget 3/pid, 30s cooldown); the probe gains 6-Z404 PROBE-STATE (wchan + procfs nr + stop status on EVERY probe) and the 6-Z404 PARK-BT fp-chain walk runs on every probe regardless of the procfs nr (x29 is live whenever the thread is parked).
+- 6-Z405 (previous commit, riding the same run): the INIT chmod-family census — every chmod-family ENTRY of the init anchor logged to the drop-proof kmsg channel with dirfd/mode/flags/paths. rn358 showed init's socket fchownat caught+translated while the fchmodat on the SAME path leaves ZERO tracer traces (no z391 ENTRY, no 6-Z257/6-Z258) and ENOENTs; 405 other nr=53 calls did reach the arm. The census decides arrival-vs-bypass in one run.
+
+Stage Summary:
+- Session commit chain (all pushed + CI green): 6fc4ec55 (6-Z403) -> 20e83b19 (6-Z404 v1) -> 07d15be5 (6-Z405) -> THIS (6-Z404 v2).
+- EXPECT rn360: SF main's PROBE-STATE names its wchan; the PARK-BT chain names the recvfrom caller — the unix stream socket main is stuck reading is IDENTIFIED and the fix targets that reader; 6-Z405 INIT-CHMODFAM lines decide the fchmodat class.
+- Queued decode: rild joinRpcThreadpool ordering (secondary), the Java backtrace intercept timeout (art attach).
