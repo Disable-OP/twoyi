@@ -30825,3 +30825,19 @@ Stage Summary:
 - Commit chain: 0280f303 → 90a178a8 (6-Z413+413b) → 47ff7231 → 46ad462e (6-Z414) → 3d8385df (6-Z415). All pushes raw-content-verified.
 - The vanish-class suspects narrowed to two: the SIGSTOP stall probe (now disabled for rn372) and the crash_dump SEIZE dance (next if rn372 persists).
 - Queued: the bluetooth sim-HAL 'Invalid address' abort (backtrace named), rild joinRpcThreadpool.
+
+---
+Task ID: 149 (rn372 decoded: 6-Z414 VERIFIED (setsockcreatecon 201→0), the stall probe EXONERATED, and the cross-artifact decode CRACKED the case — the guest's fchmodat is fchmodat2 (nr 452); 6-Z416 landed; rn373 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn372 (3d8385df) decoded (APK probe-first: 6-Z414 strings present, STALL-PROBE strings fully eliminated by the const gate): setsockcreatecon failures 201 → **0** (6-Z414 VERIFIED); the fchmodat ENOENT fleet persisted at 358 (the stall probe EXONERATED); rung 7.
+- THE CROSS-ARTIFACT DECODE that cracked it: rn371's stderr holds 265-534 fchownat catches vs **0** fchmodat catches of ANY kind, yet 51 EXIT fakes with exit-syscall_num=53 (translated fchmodats of OTHER paths) and 1920 getpid-rewrites (the fd/cgroup chmods) — the ~358 per-run /dev/socket fchmodat-class calls are 100% invisible while the fchownat one syscall earlier is caught EVERY time. 100% deterministic per-syscall-number discrimination with adjacent delivery = a MATCH GAP, not a race: **the guest's Android-14-era bionic implements fchmodat(2) through fchmodat2 — the Linux 6.6+ syscall, uniform nr 452 — and the ABI tables had no slot for it.** The calls matched NO arm and executed RAW against the HOST root. (This also explains why the "vanish" began only in the +4.5s windows: the early socket attempts' fchmodats — property_service/logd/mdnsd — went through OLD bionic paths... no — the early sockets SUCCEEDED because their fchmodat2 calls ran RAW but /dev/socket/<name> EXISTED on the host side already from the translated binds; the mystery's remaining edge is now moot — the fix covers all shapes.)
+- 6-Z416 LANDED (96570a3a, pushed + raw-verified): ChildAbi.fchmodat2_nr (452 on aarch64, -1 sentinel on x86_64/i386/arm32); the chmod-family ENTRY arm, compute_exit_return_value, the z257 EXIT fake, the z408b backstop, the z413 REAL-MODE pass, and syscall_name all honor it behind != -1 guards. Gates: fmt clean, clippy clean, 933/933 tests.
+- rn373 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on 96570a3a.
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: ... 46ad462e (6-Z414) → 3d8385df (6-Z415) → 0ed3a714 (worklog 148) → 96570a3a (6-Z416). rn373 in flight.
+- EXPECT rn373: the "Could not create socket ... Failed to fchmodat" fleet collapses to ~0 (every fchmodat2 caught: translated with a real mode on the sandbox node, or fake-0 with the REAL-MODE pass); zygote publishes; system_server spawns; the boot ladder advances past rung 7 for the first time.
+- If the boot still stalls at a new rung, the remaining sockets/openers queue up behind the new wall.
