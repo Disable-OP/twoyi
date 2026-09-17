@@ -453,6 +453,16 @@ jobs:
           # classifier needs the tail, not the whole history.
           timeout 60 sudo docker exec redroid /system/bin/logcat -d -t 20000 \
             > /tmp/ui-e2e-artifacts/logcat-dockerexec.txt 2>&1 || true
+          # 6-Z412 (rn368 decode): the CRASH BUFFER as a first-class
+          # artifact. The main buffer ROTATES under a restart storm (the
+          # rn368 68-generation SF/zygote cascade pushed SF's own abort
+          # message out of the visible logcat while 17 other service
+          # generations' "Failed HIDL return status not checked ...
+          # DEAD_OBJECT" aborts survived) — the dedicated crash buffer
+          # retains EVERY Fatal signal + Abort message for the WHOLE run,
+          # which is exactly the evidence the abort-reason decodes need.
+          timeout 60 sudo docker exec redroid /system/bin/logcat -d -b crash \
+            > /tmp/ui-e2e-artifacts/logcat-crash.txt 2>&1 || true
           # 6-Z362 (rn315 decode): the HOST redroid's lowmemorykiller kill
           # records as a FIRST-CLASS artifact. rn315's death chain
           # (guest SF 14 GB balloon → lmkd watermark breach → mass kill
