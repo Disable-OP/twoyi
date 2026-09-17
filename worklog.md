@@ -30986,3 +30986,18 @@ Work Log:
 Stage Summary:
 - Commit chain: ... 7a2b3230 (6-Z424) → ac8265dd (docs) → a74ef808 (6-Z425). rn384 in flight.
 - THE INSTRUMENT LADDER IS COMPLETE: rn377 named the wall → 6-Z418/421/422 re-architected the domain layers → 6-Z423 made the dump write its autopsy → 6-Z424 guarded the sweep → 6-Z425 traces the choreography itself. rn384's decode is mechanical.
+
+---
+Task ID: 159 (rn384 decoded — THE CHOREOGRAPHY TRACE NAILED IT: the attach loop ran perfectly raw-kernel; the FINAL seize = the handler's PSEUDOTHREAD (a dying-process thread!); the queued-SIGSTOP leak from the sig=0 detach = the last divergence; 6-Z426 landed; rn385 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn384 (a74ef808) decoded: rung 7. THE 6-Z425 CHOREOGRAPHY TRACE DELIVERED THE MECHANICAL DECODE: the failing dump's attach loop ran PERFECTLY (SEIZE+INTERRUPT+GETREGSET x7 dying tids, all tracked=false/handed_off=true — the eager hand-off + raw-kernel attach works); the FINAL seize = target=3292 — **the HANDLER'S PSEUDOTHREAD** (crash_dump's argv[2]: a thread of the DYING process created by the debuggerd signal handler — NOT a crash_dump thread; created pre-exec and CLONE_PTRACE-attached to whoever traces the dying process) — followed 6ms later by the FATAL note.
+- THE MECHANISM (fully mechanical): the eager walk consumed a SYSCALL-stop of the pseudothread and detached with sig=0 — leaving a QUEUED SIGSTOP pending; the tid resumed, the pending SIGSTOP delivered, the tid group-stopped untraced; crash_dump's own SEIZE of it surfaced that group-stop to wait_for_clone as SIGSTOP+EVENT_STOP (0x80137F) exactly where the clone event belonged.
+- 6-Z426 LANDED (9f4b7f88, pushed + raw-verified): the eager walk's PTRACE_DETACH always carries SIGCONT — the kernel DISCARDS pending stop signals when SIGCONT is sent — the tid arrives at crash_dump's SEIZE clean and running. Gates: fmt/clippy/937-937 green.
+- rn385 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on 9f4b7f88. EXPECT: zero PTRACE_O_TRACECLONE fatals; the pseudothread dance completes; tombstone files appear; the Scudo/SF backtraces become decodable.
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: ... a74ef808 (6-Z425) → c5124e16 (docs) → 9f4b7f88 (6-Z426). rn385 in flight.
+- The debuggerd chain is now complete end to end: eager hand-off (raw-kernel attach) + stays-traced (guest libs) + sweep guards + the freeze watchdog + the death logger + the queued-SIGSTOP fix. rn385 verifies the pipeline.
