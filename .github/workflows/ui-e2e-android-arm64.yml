@@ -663,6 +663,42 @@ jobs:
                esac; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs-raw-top20.txt 2>&1 || true
+          # ── 6-Z428: the TOMBSTONE HARVEST ───────────────────────────
+          # The rn386 decode proved the dump pipeline engraves FULL
+          # tombstones that never land in {rootfs}/data/tombstones:
+          # (a) a complete tombstone for pid 3514 was found INSIDE a
+          # dump worker's svc log, and (b) tombstoned's single-slot
+          # queue wedges forever (92 requests received, 91 enqueued,
+          # 0 completions — its libevent timers never fire), so every
+          # dump escapes through AOSP's not-connected fallback whose
+          # /dev/null g_output_fd the 6-Z305t-24 redirect sends to
+          # svc-<pid>.log. This pass scans EVERY svc log for the
+          # tombstone header ("pid: N, tid: M, name: ... >>> X <<<")
+          # and copies the FULL file verbatim into the bundle (the
+          # filtered sweep's grep+tail-24 destroys tombstone bodies).
+          # Bounded: 24 files × 128 KB. Also lists the guest tombstones
+          # dir (the 6-Z427 linkat leg's target) AND the redroid HOST's
+          # own /data/tombstones (settles the raw-connect-to-host
+          # leak theory in one line: files there = the host served a
+          # dump; empty + a guest-side tombstone = the fallback path).
+          timeout 120 sudo docker exec redroid sh -c \
+            "d=/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs; \
+             n=0; \
+             for f in \$d/svc-*.log; do \
+               [ -f \$f ] || continue; \
+               if grep -aq '^pid: [0-9][0-9]*, tid: [0-9][0-9]*, name: ' \$f 2>/dev/null; then \
+                 n=\$((n+1)); \
+                 [ \$n -gt 24 ] && break; \
+                 echo \"== TOMBSTONE-IN-SVC \$(basename \$f) (\$(stat -c%s \$f) bytes) ==\"; \
+                 head -c 131072 \$f; \
+                 echo; \
+               fi; \
+             done; \
+             echo '##### guest tombstones dir #####'; \
+             ls -la /data/user/0/io.twoyi.debug/profiles/default/rootfs/data/tombstones 2>/dev/null || echo 'guest tombstones dir MISSING'; \
+             echo '##### HOST (redroid) /data/tombstones #####'; \
+             ls -la /data/tombstones 2>/dev/null || echo 'host tombstones dir MISSING'" \
+            > /tmp/ui-e2e-artifacts/tombstone-harvest.txt 2>&1 || true
           # ── 6-Z306ao-e: the watchdog's OWN reports ──────────────────
           # #241 named the wall: the guest's OWN watchdog thread SIGKILLs
           # system_server at ~+32s of process life (two generations, both
