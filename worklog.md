@@ -30727,3 +30727,18 @@ Stage Summary:
 - THE WALL IS MOVING: rung-7/SF -> the composer wedged on registerCallback (FIXED, 6-Z409) -> the composer aborts on Scudo invalid-free after the getHashChain delivery (6-Z410 instruments). Each rung of the binder stack now yields to a source-named fix.
 - Next decode (rn367): the 6-Z410 lines for the getHashChain-class deliveries vs the working ones -> the trailer/btd mismatch -> the fix in the delivery blob assembly (or the shlib's reassembly).
 - Queued: the socket fchmodat pair-skip class (6-Z210), rild joinRpcThreadpool, the Java backtrace intercept timeout.
+
+---
+Task ID: 143 (rn367 decoded — the getHashChain "wedge" is a FREEZE: the composer's threads sit in do_signal_stop after the crash_dump SIGSTOP dance, never resumed; 6-Z411 post-dump SIGCONT landed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn367 (#367, 88e4fba5) decoded: verdict rung 7. The shape reproduced rn366 EXACTLY: registerCallback completes (txn#11 routed +26097, pops +26321 stack-left=0 — 6-Z409 verified TWICE); the getHashChain txn#12 delivered +26576; the composer's conn=26 silent for 8 s; TIMEOUT.
+- 6-Z410's trailer breakdown CLEARED the blob-mismatch hypothesis: the 52-byte trailer is the CORRECT encoding for [dl=32 ol=0 sg=0] (magic 4 + count 4 + header 12 + data 32), and the routed parcel matches the delivered blob byte-for-byte ("android.hidl.base@1.0::IBase", 32 B, offs=0).
+- THE THREAD DUMP NAMED THE FREEZE: the composer's tids 3090/3091/3438 sit in do_signal_stop (state T). The crash_dump SIGSTOP dance (SEIZE +27565, 3+ tids handed off) leaves the process GROUP-STOPPED; crash_dump's own PTRACE_DETACH does NOT end the group-stop; the queued fatal signal (the Scudo SIGABRT re-raise) can never deliver while group-stopped; the process NEVER exits; init's restart cascade never fires; every binder conn goes silent. rn366's "death" was the same freeze (conn=18 inbox=2 for 5 minutes — no exit event ever fired). The fleet-wide getHashChain stalls = every dumped service frozen mid-first-touch.
+- 6-Z411 (this commit): at BOTH 6-Z396 release sites (the dump worker's WIFEXITED + WIFSIGNALED death), send SIGCONT to every released tid. The CRASH class resumes and dies from its own queued SIGABRT (init reaps + restarts — kernel-true); the LIVE-dump class resumes and keeps running. Gates: fmt, clippy -D warnings, 932/932 — all green. rn368 DISPATCHED (HTTP 204) on THIS commit.
+
+Stage Summary:
+- Session commit chain: ... 88e4fba5 (6-Z410) -> afefbaf2 (worklog 142) -> THIS 957bb36d (6-Z411).
+- EXPECT rn368: the dumped services RESUME after their dumps (the "6-Z411: post-dump SIGCONT" lines); the crashed composer DIES from its queued SIGABRT (init reaps + RESTARTS it — the restart loop becomes visible, kernel-true); the boot should push past rung 7 (SF's getHashChain answered, the composer's client created, the display pipeline proceeds). If the composer's Scudo abort then loops the restart, the NEXT layer is the invalid-free itself (the buffer-accounting decode) — but now with VISIBLE service deaths instead of silent freezes.
+- Queued: the socket fchmodat pair-skip class (6-Z210), rild joinRpcThreadpool, the Java backtrace intercept timeout.
