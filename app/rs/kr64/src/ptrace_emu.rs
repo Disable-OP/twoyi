@@ -6838,6 +6838,8 @@ fn read_child_string_proc_mem(pid: libc::pid_t, addr: u64) -> Option<String> {
 /// Mirrors write_child_string_unchecked's write semantics; the final
 /// partial word is zero-padded. Returns the byte length written.
 fn write_child_u64s_unchecked(pid: libc::pid_t, addr: u64, words: &[u64]) -> bool {
+    // 6-Z433: the argv/envp pointer-array write arm.
+    z433_write_census("u64s", pid, addr, words.len() * 8);
     if addr == 0 {
         return false;
     }
@@ -10366,6 +10368,9 @@ fn poke_child_gs_selector(pid: libc::pid_t, selector: u16) -> std::io::Result<()
 ///
 /// Returns the number of pollfd entries zeroed (for logging).
 fn zero_pollfd_revents(pid: libc::pid_t, pollfd_ptr: u64, nfds: u64) -> usize {
+    // 6-Z433: the pollfd revents RMW arm (read-modify-write words at the
+    // caller's pollfd array).
+    z433_write_census("pollfd", pid, pollfd_ptr, (nfds.min(32) as usize) * 8);
     if pollfd_ptr == 0 || nfds == 0 {
         return 0;
     }
@@ -13304,6 +13309,12 @@ fn rewrite_mmap_flags_shared_to_anonymous(flags: i32) -> i32 {
 }
 
 fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
+    // 6-Z433: census BEFORE the length guard — an in-place overwrite is
+    // exactly the shape the corruption hunt needs to see even when it
+    // then gets REJECTED (the guard is itself the third-door suspect:
+    // a rejected longer translation falls back to caller-side
+    // overwrites elsewhere).
+    z433_write_census("string", pid, addr, s.len() + 1);
     if addr == 0 {
         return false;
     }
@@ -13629,6 +13640,10 @@ pub fn materialize_selinuxfs_class_node(class: &str, perm: Option<&str>, rootfs:
 /// (which typically means `addr` is not a valid mapped address in the
 /// child).
 fn write_child_string_unchecked(pid: libc::pid_t, addr: u64, s: &str) -> bool {
+    // 6-Z433: the census covers BOTH internal mechanisms (the pvm fast
+    // path below AND the POKEDATA fallback loop) — one line per logical
+    // write, the mechanism is visible in the 6-Z180 audit lines.
+    z433_write_census("string_unchecked", pid, addr, s.len() + 1);
     if addr == 0 {
         return false;
     }
@@ -13725,6 +13740,10 @@ fn write_child_blob(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> bool {
 /// fail-closed connect arm needs the underlying POKEDATA errno for its
 /// denial diagnostic (the bool return swallowed it).
 fn write_child_blob_errno(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> Result<(), i32> {
+    // 6-Z433: write_child_blob delegates here — census at this leaf so
+    // each logical blob write (the 6-Z305q sockaddr rewrites, the
+    // uevent deliveries, the fail-closed connect arms) counts once.
+    z433_write_census("blob", pid, addr, bytes.len());
     // 6-Z180: POKE AUDIT (see write_child_bytes_pokedata).
     poke_audit("blob", pid, addr, bytes);
     if addr == 0 || bytes.is_empty() {
@@ -14930,12 +14949,114 @@ fn poke_audit(kind: &str, pid: libc::pid_t, addr: u64, bytes: &[u8]) {
     });
 }
 
+// ── 6-Z433: THE CRASH_DUMP WRITE-CENSUS ─────────────────────────────
+//
+// THE QUESTION (worklog Task 47 opener #1): the crash_dump Scudo
+// self-aborts survived BOTH gated tracer-write doors — the 6-Z431
+// scratch-window gate and the 6-Z432 staging slot-cap (both EXONERATED
+// by their zero-cap runs; the rn391/392/393 pids never appear in either
+// gate's hit list) — so a THIRD tracer-side corruption channel reaches
+// crash_dump's heap. This census NAMES it.
+//
+// MECHANISM: every tracer-side guest-memory write FOR A TAGGED
+// crash_dump pid is logged with the write arm (which mechanism), the
+// target address and the byte size — bounded per arm (12 lines/run per
+// arm) so every channel's activity is visible without flooding the
+// klog. Zero behaviour change: pure logging, the raw write always
+// follows.
+//
+// CHANNEL INVENTORY (every guest-memory write site in this file):
+//   u64s (write_child_u64s_unchecked), pollfd (zero_pollfd_revents),
+//   string (write_child_string), string_unchecked
+//   (write_child_string_unchecked — both its pvm fast path and its
+//   POKEDATA loop), blob (write_child_blob_errno — write_child_blob
+//   delegates there), pokedata (write_child_bytes_pokedata), capget
+//   (poke_capget_data), vm_writev (write_child_bytes_process_vm),
+//   inplace-devnull (the 6-Z306f-d rewrite), inplace-infinite-loop
+//   (the i386 legacy park), set_thread_area (the 6-Z69 write-back).
+// The 6-Z305q sockaddr rewrite and the write_translated_path in-place
+// fallback route THROUGH write_child_blob_errno / write_child_string
+// and are censused there.
+//
+// THE TAG MIRROR: the write helpers are free fns without loop state,
+// but the loop-local z388_crash_dump_pids set decides who is a
+// crash_dump. The mirror below is maintained at exactly the same four
+// sites that maintain the loop-local set (the 6-Z388 exec tag, the
+// 6-Z394 fork inheritance, and the two 6-Z394 death-hygiene removals)
+// so the census sees the same membership.
+
+const Z433_LINES_PER_ARM: u32 = 12;
+
+fn z433_tags_mutex() -> &'static std::sync::Mutex<std::collections::HashSet<libc::pid_t>> {
+    static TAGS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<libc::pid_t>>> =
+        std::sync::OnceLock::new();
+    TAGS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Mirror-maintainer: called everywhere the loop-local
+/// `z388_crash_dump_pids` INSERTS (the exec tag + the fork inheritance).
+fn z433_tag_crash_dump(pid: libc::pid_t) {
+    if let Ok(mut set) = z433_tags_mutex().lock() {
+        set.insert(pid);
+    }
+}
+
+/// Mirror-maintainer: called everywhere the loop-local set REMOVES (the
+/// two 6-Z394 death-hygiene sites).
+fn z433_untag_crash_dump(pid: libc::pid_t) {
+    if let Ok(mut set) = z433_tags_mutex().lock() {
+        set.remove(&pid);
+    }
+}
+
+/// 6-Z433: the census decision — PURE so the unit test locks the table.
+/// A write is censused iff the pid is tagged AND the arm's per-run
+/// budget is not yet spent.
+fn z433_census_decision(tagged: bool, prev_count: u32) -> bool {
+    tagged && prev_count < Z433_LINES_PER_ARM
+}
+
+/// 6-Z433: log one tracer-side guest-memory write for a tagged
+/// crash_dump pid (arm + target + size), bounded per arm. Untagged
+/// pids and spent arms return immediately (a HashSet lookup per write;
+/// the lock is never contended on the single-threaded tracer loop).
+fn z433_write_census(arm: &'static str, pid: libc::pid_t, addr: u64, len: usize) {
+    use std::collections::HashMap;
+    static COUNTS: std::sync::OnceLock<std::sync::Mutex<HashMap<&'static str, u32>>> =
+        std::sync::OnceLock::new();
+    let tagged = z433_tags_mutex()
+        .lock()
+        .map(|s| s.contains(&pid))
+        .unwrap_or(false);
+    if !tagged {
+        return;
+    }
+    let counts = COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let Ok(mut counts) = counts.lock() else {
+        return;
+    };
+    let n = counts.entry(arm).or_insert(0);
+    *n += 1;
+    if z433_census_decision(true, *n - 1) {
+        crate::info!(
+            "6-Z433 WRITE[{}] #{}: pid={} addr={:#x} len={}",
+            arm,
+            n,
+            pid,
+            addr,
+            len
+        );
+    }
+}
+
 fn write_child_bytes_pokedata(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> usize {
     // 6-Z180: POKE AUDIT — every tracer write into child memory is
     // logged (rate-capped) so a poke that lands on a sigframe/pthread
     // struct/stack is identifiable from the next run's log. Pure
     // diagnostic; zero behaviour change.
     poke_audit("pokedata", pid, addr, bytes);
+    // 6-Z433: the write-census line for tagged crash_dump pids.
+    z433_write_census("pokedata", pid, addr, bytes.len());
     if addr == 0 || bytes.is_empty() {
         return 0;
     }
@@ -15075,6 +15196,11 @@ pub fn peek_guest_bytes(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u
 ///       restores rax = orig_rax = the syscall number, so a trapped call
 ///       shows up as a bogus positive "311 bytes written".
 fn write_child_bytes_process_vm(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> (usize, bool) {
+    // 6-Z433: the BULK pvm arm — previously the only write channel with
+    // ZERO audit on its fast path (the 6-Z180 audit covered only the
+    // POKEDATA fallback). A bulk injection gone astray is exactly a
+    // third-door shape.
+    z433_write_census("vm_writev", pid, addr, bytes.len());
     const CHUNK: usize = 1024 * 1024;
     let mut written = 0usize;
     let mut off = 0usize;
@@ -15356,6 +15482,10 @@ fn write_translated_path(
 /// based implementation) but is intentionally not invoked.
 #[allow(dead_code)]
 fn poke_capget_data(pid: libc::pid_t, addr: u64) -> bool {
+    // 6-Z433: census present even though the call site is currently
+    // removed (this fn's own stack-corruption history is exactly the
+    // class the census hunts — if it is ever re-wired, it is covered).
+    z433_write_census("capget", pid, addr, 12);
     if addr == 0 {
         return false;
     }
@@ -19597,18 +19727,19 @@ pub fn run_ptrace_loop(
             // decision (and so the rn352 42-generation loops cannot
             // exhaust the tag cap with long-dead pids).
             z388_crash_dump_pids.remove(&pid);
-            // 6-Z396: the dump WORKER is gone — crash_dump PTRACE_DETACHed
-            // everything it seized (normal exit) or was killed mid-dump
-            // (tombstoned's intercept timeout). Either way its handed-off
-            // tids are NOBODY's tracees now; releasing them back into
-            // sweep-eligible space lets the 6-Z190 coverage sweep
-            // re-attach them and kr64 emulation resumes. Without this the
-            // rn353 class fires: an ALIVE process dumped via the
-            // ANR/Watchdog path (system_server pid 4031) runs untraced
-            // forever — its socket/binder/property calls bypass every
-            // emulation and the guest corrupts silently (tombstoned
-            // crash-socket short reads, package_native wait hangs, boot
-            // stall with zero service deaths).
+            z433_untag_crash_dump(pid); // 6-Z433: keep the census mirror in step
+                                        // 6-Z396: the dump WORKER is gone — crash_dump PTRACE_DETACHed
+                                        // everything it seized (normal exit) or was killed mid-dump
+                                        // (tombstoned's intercept timeout). Either way its handed-off
+                                        // tids are NOBODY's tracees now; releasing them back into
+                                        // sweep-eligible space lets the 6-Z190 coverage sweep
+                                        // re-attach them and kr64 emulation resumes. Without this the
+                                        // rn353 class fires: an ALIVE process dumped via the
+                                        // ANR/Watchdog path (system_server pid 4031) runs untraced
+                                        // forever — its socket/binder/property calls bypass every
+                                        // emulation and the guest corrupts silently (tombstoned
+                                        // crash-socket short reads, package_native wait hangs, boot
+                                        // stall with zero service deaths).
             {
                 let released: Vec<libc::pid_t> = z388_handed_off_to
                     .iter()
@@ -19954,8 +20085,9 @@ pub fn run_ptrace_loop(
             // decision (and so the rn352 42-generation loops cannot
             // exhaust the tag cap with long-dead pids).
             z388_crash_dump_pids.remove(&pid);
-            // 6-Z396: release this dead dump worker's handed-off tids for
-            // 6-Z190 re-acquisition (see the WIFEXITED twin above).
+            z433_untag_crash_dump(pid); // 6-Z433: keep the census mirror in step
+                                        // 6-Z396: release this dead dump worker's handed-off tids for
+                                        // 6-Z190 re-acquisition (see the WIFEXITED twin above).
             {
                 let released: Vec<libc::pid_t> = z388_handed_off_to
                     .iter()
@@ -20563,6 +20695,7 @@ pub fn run_ptrace_loop(
                                 z388_crash_dump_pids.len(),
                             ) {
                                 z388_crash_dump_pids.insert(new_child_pid);
+                                z433_tag_crash_dump(new_child_pid); // 6-Z433: census mirror
                                 log(&format!(
                                     "6-Z394: crash_dump dump-worker pid={} inherited the debuggerd tag from fork parent {} (tagged={})",
                                     new_child_pid,
@@ -22543,6 +22676,13 @@ pub fn run_ptrace_loop(
                                     // NUL-terminated) string from the same
                                     // buffer.
                                     const DEV_NULL_C: [u8; 10] = *b"/dev/null\0";
+                                    // 6-Z433: the in-place path overwrite arm.
+                                    z433_write_census(
+                                        "inplace-devnull",
+                                        pid,
+                                        paddr,
+                                        DEV_NULL_C.len(),
+                                    );
                                     let mut rewrite_ok = true;
                                     for (wi, chunk) in DEV_NULL_C.chunks(8).enumerate() {
                                         let mut w = [0u8; 8];
@@ -23561,6 +23701,7 @@ pub fn run_ptrace_loop(
                                 && z388_crash_dump_pids.len() < Z388_CRASH_DUMP_TAG_CAP
                             {
                                 z388_crash_dump_pids.insert(pid);
+                                z433_tag_crash_dump(pid); // 6-Z433: census mirror
                                 log(&format!(
                                     "6-Z388: pid={} execve \"{}\" — tagged as debuggerd crash_dump (tagged={})",
                                     pid,
@@ -24982,6 +25123,8 @@ pub fn run_ptrace_loop(
                                 // (jmp -2 = 0xeb 0xfe) so init's waitpid blocks
                                 let code_addr: u64 = 0x08048c59;
                                 let infinite_loop: [u8; 2] = [0xeb, 0xfe];
+                                // 6-Z433: the legacy i386 park-poke arm.
+                                z433_write_census("inplace-infinite-loop", pid, code_addr, 2);
                                 let loop_word: libc::c_long =
                                     i16::from_ne_bytes(infinite_loop) as libc::c_long;
                                 unsafe {
@@ -32242,6 +32385,9 @@ pub fn run_ptrace_loop(
                                             // only the struct's own first 4
                                             // bytes change.
                                             let mut wrote_back = false;
+                                            // 6-Z433: the TLS entry_number
+                                            // write-back RMW arm.
+                                            z433_write_census("set_thread_area", pid, u_info_addr, 8);
                                             let word = unsafe {
                                                 libc::ptrace(
                                                     libc::PTRACE_PEEKDATA,
@@ -52462,6 +52608,46 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         ));
         // sp unmapped (a stale/recycled stop): unsafe regardless.
         assert!(!z431_scratch_window_decision("", u64::MAX, 0x1000));
+    }
+
+    #[test]
+    fn z433_census_decision_and_tag_mirror_lock_the_census_table() {
+        // The PURE decision core: a write is censused iff tagged AND the
+        // arm's per-run budget is not yet spent.
+        // Untagged pids are never censused (the zero-cost path — the
+        // overwhelmingly common case: writes to init/zygote/SF).
+        assert!(!super::z433_census_decision(false, 0));
+        assert!(!super::z433_census_decision(false, 999_999));
+        // Tagged + fresh arm → censused.
+        assert!(super::z433_census_decision(true, 0));
+        // One line BEFORE the cap (12th line, n=11 prev) → censused.
+        assert!(super::z433_census_decision(
+            true,
+            super::Z433_LINES_PER_ARM - 1
+        ));
+        // At the cap (13th line) → silent (bounded, the write still runs).
+        assert!(!super::z433_census_decision(
+            true,
+            super::Z433_LINES_PER_ARM
+        ));
+        assert!(!super::z433_census_decision(
+            true,
+            super::Z433_LINES_PER_ARM + 77
+        ));
+
+        // The tag mirror roundtrip: insert is visible, removal clears it,
+        // and an unknown pid is never reported tagged (the pid-recycled
+        // hygiene shape).
+        let probe: libc::pid_t = 433_433;
+        super::z433_untag_crash_dump(probe); // start clean
+        assert!(!super::z433_tags_mutex().lock().unwrap().contains(&probe));
+        super::z433_tag_crash_dump(probe);
+        assert!(super::z433_tags_mutex().lock().unwrap().contains(&probe));
+        super::z433_tag_crash_dump(probe); // idempotent
+        assert!(super::z433_tags_mutex().lock().unwrap().contains(&probe));
+        super::z433_untag_crash_dump(probe);
+        assert!(!super::z433_tags_mutex().lock().unwrap().contains(&probe));
+        super::z433_untag_crash_dump(probe); // removing an absent pid is a no-op
     }
 
     #[test]

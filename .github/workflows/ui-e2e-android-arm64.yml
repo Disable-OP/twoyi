@@ -544,6 +544,29 @@ jobs:
           timeout 30 sudo docker exec redroid sh -c \
             "tail -n 12000 /data/user/0/io.twoyi.debug/kr64.log 2>/dev/null" \
             > /tmp/ui-e2e-artifacts/kr64-dockerexec.log 2>&1 || true
+          # ── 6-Z433: the CRASH_DUMP WRITE-CENSUS artifact ─────────────
+          # The census arms log "6-Z433 WRITE[arm] #n: pid=… addr=… len=…"
+          # for every tracer-side guest-memory write to a tagged
+          # crash_dump pid. Extract ALL census lines (+ the tag mirrors
+          # and the two gate lines whose zero-hit classes the census
+          # cross-checks: 6-Z431 UNSAFE / 6-Z432 capped) from BOTH tracer
+          # channels into one bounded artifact — the decode reads the
+          # third-door channel directly, no hand-grep of a 20k-line log.
+          {
+            echo '── 6-Z433 census lines (kr64-app-stderr) ──'
+            grep -a '6-Z433 WRITE' /tmp/ui-e2e-artifacts/kr64-app-stderr-dockerexec.log | head -200 || true
+            echo '── 6-Z433 census lines (kr64.log) ──'
+            grep -a '6-Z433 WRITE' /tmp/ui-e2e-artifacts/kr64-dockerexec.log | head -200 || true
+            echo '── per-arm census totals ──'
+            grep -aho '6-Z433 WRITE\[[^]]*\]' /tmp/ui-e2e-artifacts/kr64-app-stderr-dockerexec.log /tmp/ui-e2e-artifacts/kr64-dockerexec.log 2>/dev/null \
+              | sort | uniq -c | sort -rn || true
+            echo '── crash_dump tag events (6-Z388 exec tag + 6-Z394 inheritance) ──'
+            grep -aE '6-Z388: pid=.* tagged as debuggerd crash_dump|6-Z394: crash_dump dump-worker pid=.* inherited' \
+              /tmp/ui-e2e-artifacts/kr64-app-stderr-dockerexec.log /tmp/ui-e2e-artifacts/kr64-dockerexec.log 2>/dev/null | head -60 || true
+            echo '── the two gated doors this census cross-checks ──'
+            grep -aE '6-Z431: scratch window UNSAFE|6-Z432: execve staging slots capped' \
+              /tmp/ui-e2e-artifacts/kr64-app-stderr-dockerexec.log /tmp/ui-e2e-artifacts/kr64-dockerexec.log 2>/dev/null | head -60 || true
+          } > /tmp/ui-e2e-artifacts/crash-dump-write-census.txt 2>&1 || true
           timeout 30 sudo docker exec redroid sh -c \
             "ls -la /data/user/0/io.twoyi.debug/rootfs/ 2>/dev/null | head -40; \
              ls -la /data/user/0/io.twoyi.debug/rootfs/system/framework/ 2>/dev/null | head -10; \
