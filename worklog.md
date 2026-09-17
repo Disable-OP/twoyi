@@ -30708,3 +30708,22 @@ Stage Summary:
 - Session commit chain: ... aca05303 (6-Z408 + 6-Z408b) -> 436315b2 (worklog 140) -> THIS 726d3c83 (6-Z409).
 - EXPECT rn366: the composer's sendReply ack loop exits at the COMPLETE; the nested txn#13 reply is consumed by the OUTER waitForResponse (first_br=BR_REPLY followed by NO orphan BC_FREE_BUFFER-from-null-loop); the registerCallback handler completes → BC_REPLY(txn#12) → "conn=36 pops txn#12 stack-left=0" → SF main unblocks → the boot should advance PAST rung 7 (SF registers → rung 8+). If the wall STILL holds, the next datum is whether a BC_FREE_BUFFER follows a first_br=BR_REPLY read again (the ack loop still swallowing) — which would point at the read-half order inside ONE ioctl.
 - Queued: (1) the socket fchmodat pair-skip class (6-Z210 stop mechanics — now with rn365's 24/0 ENTRY signature); (2) rild joinRpcThreadpool; (3) the Java backtrace intercept timeout.
+
+---
+Task ID: 142 (rn366 decoded — 6-Z409 VERIFIED: the registerCallback wall is GONE; the boot advanced dramatically; the NEW wall = the composer's Scudo invalid-free after a 52-byte-trailer getHashChain delivery; 6-Z410 trailer breakdown landed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn366 (#366, 726d3c83) decoded: verdict rung 7 — but INTERNALLY A GENERATION AHEAD:
+  * 6-Z409 VERIFIED: the registerCallback call (txn#11, code=1, conn=65->18) routed +23039, delivered +23289 (trailer=208B), REPLIED +23628 ("conn=18 pops txn#11 stack-left=0", 340 ms) — rn363/364/365 NEVER got this; the sendReply ack loop now exits, the nested onHotplug reply is consumed correctly, the handler completes.
+  * The boot advanced dramatically: logcat shows system_server ALIVE (CompatibilityChangeReporter activity, UID 10060/10061 app work) — framework activity no previous run reached.
+  * THE NEW WALL: the composer (pid 3044, conn=18) took Fatal signal 6 (SIGABRT) at guest 01:01:36.790, ~660 ms after reading the getHashChain BR_TRANSACTION (code=0x0F43484E, txn#12, delivered +23889 with trailer=52 B vs the WORKING registerCallback delivery's 208 B). The abort message scan names it: "Scudo ERROR: invalid chunk state when deallocating address 0xf83e13807550" — an INVALID FREE of a Parcel buffer. crash_dump SEIZEd the threads +24551 (6 tids, dump exit 0 +24570), the composer DIED, conn=18 sat with inbox=2 for the rest of the run (6-Z402 ticks to +570 s).
+  * The getHashChain stall is FLEET-WIDE (services die or wedge on their first-touch getHashChain: conn=23/10/24 wedged, SF's txn#12 waiter expired) — every service death re-triggers the init restart cascade → rung 7.
+- SHAPE HYPOTHESIS: the shlib reassembles the delivered parcel from the v3 trailer; a mismatch between the btd data/offsets sizes and the trailer's blob contents corrupts the guest Parcel and its freeBuffer frees a non-live chunk → Scudo abort.
+- 6-Z410 (this commit): every BR_TRANSACTION delivery now logs the trailer BREAKDOWN (blob count, per-blob dl/ol/sg, total trailer bytes; 48-line budget) — rn367 names the mismatch in one decode. Gates: fmt clean, clippy -D warnings clean, 932/932 tests. rn367 DISPATCHED on THIS commit (HTTP 204).
+
+Stage Summary:
+- Session commit chain: ... 726d3c83 (6-Z409, VERIFIED) -> cfd7404e (worklog 141) -> THIS 88e4fba5 (6-Z410).
+- THE WALL IS MOVING: rung-7/SF -> the composer wedged on registerCallback (FIXED, 6-Z409) -> the composer aborts on Scudo invalid-free after the getHashChain delivery (6-Z410 instruments). Each rung of the binder stack now yields to a source-named fix.
+- Next decode (rn367): the 6-Z410 lines for the getHashChain-class deliveries vs the working ones -> the trailer/btd mismatch -> the fix in the delivery blob assembly (or the shlib's reassembly).
+- Queued: the socket fchmodat pair-skip class (6-Z210), rild joinRpcThreadpool, the Java backtrace intercept timeout.
