@@ -16047,6 +16047,17 @@ pub fn run_ptrace_loop(
     // read at EXIT enables the REAL chmod the ENTRY read's failure
     // denied — the rn353 "socket-mode normalization" mechanism.
     let mut z413_entry_translated_pid: Option<libc::pid_t> = None;
+    // 6-Z417: per-pid syscall-nr stop census — (is_entry, nr) → count, taken
+    // at the classified syscall-stop branch. Every 512th stop per pid emits
+    // one drop-proof STOP-CENSUS line (the z413 channel). Answers, from the
+    // kernel-side ground truth, whether init's bind/fchmodat-class stops
+    // ever arrive — the question every cheaper rn371/372/373 oracle
+    // censored or left ambiguous. Dead pids' entries are dropped at the
+    // death-cleanup block (the pending_chmod_fake_pid site) to bound memory.
+    let mut z417_stop_census: std::collections::HashMap<
+        libc::pid_t,
+        std::collections::HashMap<(bool, i64), u64>,
+    > = std::collections::HashMap::new();
     // Task 6-Z28: pending flag for poll() return fake. Set at the ENTRY
     // stop (when init calls poll), consumed at the EXIT stop (fake return 0).
     // 6-Z83: PER-PID (see the block comment above) + arming loop_count for
@@ -19347,6 +19358,8 @@ pub fn run_ptrace_loop(
             if pending_chmod_fake_pid == Some(pid) {
                 pending_chmod_fake_pid = None;
             }
+            // 6-Z417 hygiene: the dead pid's census dies with it.
+            z417_stop_census.remove(&pid);
             // ── Task 6-Z110: per-pid fd-table cleanup ──
             //
             // Drop the dead pid's per-pid fd-table state so a
@@ -21765,6 +21778,54 @@ pub fn run_ptrace_loop(
                     },
                     nr: syscall_num,
                 });
+
+                // ── 6-Z417: the per-pid syscall-nr stop census ──────────
+                //
+                // rn371/372/373 left ONE question standing after every
+                // cheaper oracle was exhausted: do the /dev/socket bind/
+                // fchmodat-class ENTRY stops of init EVER arrive at this
+                // loop? Everything downstream of this point is proven
+                // innocent (the arms translate correctly, the kmsg mirror
+                // is healthy, the SIGSTOP probe is gone) — so the census
+                // is taken HERE, at the classified syscall-stop branch,
+                // with the nr already fetched: a per-(pid, nr, phase)
+                // counter. Every 512th stop OF EACH PID emits one
+                // drop-proof line naming the pid's top shapes — the
+                // kernel-side ground truth about which syscall numbers
+                // init really delivers, immune to budget censoring and
+                // stderr loss. If rn374's census shows (53|452, ENTRY)
+                // counters advancing while the arms stay silent, the gap
+                // is INSIDE the match; if the counters never advance,
+                // the stops never arrive and the gap is the kernel's.
+                {
+                    let census = z417_stop_census.entry(pid).or_default();
+                    let c = census.entry((is_entry, syscall_num)).or_insert(0u64);
+                    *c += 1;
+                    let total = census.values().sum::<u64>();
+                    if total % 512 == 0 {
+                        let mut top: Vec<((bool, i64), u64)> =
+                            census.iter().map(|(k, v)| (*k, *v)).collect();
+                        top.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+                        let top_s = top
+                            .iter()
+                            .take(10)
+                            .map(|((e, nr), v)| {
+                                format!("{}{}:{}", if *e { "E" } else { "X" }, nr, v)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        crate::z413_klog(
+                            rootfs,
+                            &format!(
+                                "STOP-CENSUS pid={} total={} shapes={} top=[{}]",
+                                pid,
+                                total,
+                                census.len(),
+                                top_s
+                            ),
+                        );
+                    }
+                }
 
                 // ── 6-Z403: ENTRY-side fp/lr stash + FUTEX_WAKE census ──
                 // At every AArch64 syscall ENTRY the tracer HOLDS x29 (fp)
