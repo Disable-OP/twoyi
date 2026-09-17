@@ -30724,6 +30724,41 @@ pub fn run_ptrace_loop(
                             let dirfd = syscall_dirfd(get_syscall_arg(&regs, abi.reg_arg1));
                             let path_addr = get_syscall_arg(&regs, abi.reg_arg2);
                             let mut translated_applied = false;
+                            // 6-Z405: the INIT chmod-family census — rn358's
+                            // lmkd/tombstoned fchmodat ENOENTs come with ZERO
+                            // tracer traces of those calls (no z391 ENTRY, no
+                            // 6-Z257/6-Z258 line) while their fchownat
+                            // neighbors are caught+translated — the calls
+                            // either never reach this arm (a bypass — the
+                            // shlib interposition?) or arrive with an
+                            // unexpected shape. This census logs EVERY
+                            // chmod-family ENTRY of the INIT anchor to the
+                            // drop-proof kmsg channel, ANY path, own budget
+                            // (48): it decides arrival-vs-bypass in one run
+                            // and names the exact shape either way.
+                            if pid == init_pid {
+                                static Z405_BUDGET: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if Z405_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < 48 {
+                                    Z405_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let z405_path = read_child_string(pid, path_addr)
+                                        .unwrap_or_else(|| "<unreadable>".to_string());
+                                    let z405_mode = get_syscall_arg(&regs, abi.reg_arg3);
+                                    let z405_flags = get_syscall_arg(&regs, abi.reg_arg4);
+                                    crate::z391_klog(
+                                        rootfs,
+                                        &format!(
+                                            "6-Z405 INIT-CHMODFAM pid={} nr={} dirfd={} mode={:#o} flags={:#x} path={:?}",
+                                            pid,
+                                            syscall_num,
+                                            dirfd,
+                                            z405_mode & 0xfff,
+                                            z405_flags,
+                                            z405_path
+                                        ),
+                                    );
+                                }
+                            }
                             // 6-Z391: drop-proof decision trace (the rn348
                             // tombstoned fchmodat asymmetry — the stderr
                             // capture is lossy in this exact window, the
