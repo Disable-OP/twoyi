@@ -5511,6 +5511,43 @@ fn handle_write_read(
                 resp_payload.extend_from_slice(&b.data);
             }
         }
+        // 6-Z410: the delivery-trailer BREAKDOWN trace — rn366 decoded the
+        // composer's post-registerCallback abort (Scudo invalid-chunk-state
+        // on a dealloc, ~660 ms after it read the getHashChain
+        // BR_TRANSACTION whose delivery trailer was 52 B — vs 208 B for
+        // the WORKING registerCallback delivery). The shlib reassembles
+        // the parcel from this trailer; a shape mismatch between the btd's
+        // data_size/offsets_size and the trailer's blob contents lands in
+        // the guest as a corrupted Parcel whose freeBuffer frees a
+        // non-live chunk. The breakdown names dl/ol/sg per blob so the
+        // next run decides the mismatch in one decode.
+        if read_buf.len() >= 4 {
+            let first_cmd = u32::from_ne_bytes(read_buf[0..4].try_into().unwrap());
+            let is_txn = first_cmd == BR_TRANSACTION || first_cmd == 0x80407202;
+            if is_txn && Z410_TRAILER_LOG.load(Ordering::Relaxed) > 0 {
+                Z410_TRAILER_LOG.fetch_sub(1, Ordering::Relaxed);
+                let breakdown: Vec<String> = resp_blobs
+                    .iter()
+                    .map(|b| {
+                        format!(
+                            "dl={} ol={} sg={}",
+                            b.data.len(),
+                            b.offsets.len(),
+                            b.sg.len()
+                        )
+                    })
+                    .collect();
+                info!(
+                    "[KR64][binder][vm{}] 6-Z410 delivery-trailer: conn={} read_size={} blobs={} [{}] trailer_bytes={}",
+                    vm_id,
+                    conn_id,
+                    read_buf.len(),
+                    resp_blobs.len(),
+                    breakdown.join(", "),
+                    resp_payload.len() - 4 - read_buf.len()
+                );
+            }
+        }
     }
 
     // 6-Z355: collect the response blobs' fds (blob order) and append the
@@ -9035,6 +9072,12 @@ fn z306ag_note_stack_depth(depth: usize) {
 static Z408_HOLD_LOG: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(u32, u64), u64>>,
 > = std::sync::OnceLock::new();
+
+/// 6-Z410: bounded budget for the delivery-trailer breakdown trace — the
+/// rn366 Scudo invalid-chunk-state decode (the composer died freeing a
+/// non-live Parcel buffer right after a 52-byte-trailer getHashChain
+/// delivery). 48 lines name the blob shape population per boot.
+static Z410_TRAILER_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(48);
 
 fn z408_note_hold(
     vm_id: u32,
