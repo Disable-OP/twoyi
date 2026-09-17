@@ -37142,7 +37142,30 @@ pub fn run_ptrace_loop(
                                             z388_handed_off_when
                                                 .insert(tid, crate::boot_elapsed_ms());
                                             if libc::WIFSTOPPED(st) {
-                                                let sig = z388_detach_signal(libc::WSTOPSIG(st));
+                                                // 6-Z426: detach with SIGCONT
+                                                // UNCONDITIONALLY. rn384's
+                                                // choreography trace nailed the
+                                                // last divergence: a detach with
+                                                // sig=0 (the syscall-stop shape)
+                                                // leaves a QUEUED SIGSTOP pending
+                                                // — the tid resumed, the pending
+                                                // SIGSTOP delivered, the tid
+                                                // group-stopped untraced, and
+                                                // crash_dump's own SEIZE of it (the
+                                                // handler's pseudothread!) then
+                                                // surfaced that group-stop to
+                                                // wait_for_clone as SIGSTOP+
+                                                // EVENT_STOP (0x80137F) where the
+                                                // clone event belonged — the FATAL
+                                                // on EVERY dump. The kernel
+                                                // DISCARDS pending stop signals
+                                                // when SIGCONT is sent (sigaction
+                                                // semantics), so a SIGCONT detach
+                                                // both resumes the tid AND clears
+                                                // any queued SIGSTOP — the tid
+                                                // arrives at crash_dump's SEIZE
+                                                // clean and running.
+                                                let sig = libc::SIGCONT;
                                                 let dret = unsafe {
                                                     libc::ptrace(
                                                         libc::PTRACE_DETACH,
