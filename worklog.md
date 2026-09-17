@@ -30858,3 +30858,20 @@ Stage Summary:
 - Commit chain: ... 96570a3a (6-Z416) → 67cb4ec2 (worklog 149) → d8015214 (6-Z417). rn374 in flight.
 - THE FORK IN THE ROAD for rn374's census: (E53|E452) counters advancing for init while the arms stay silent = the gap is INSIDE the match (a wrong-nr/ABI-table class, trivially fixed); the counters never advancing for the socket windows = the stops never arrive (kernel-side) and the crash_dump SEIZE hand-off machinery is suspect #2 (its PTRACE_SEIZE/DETACH of a busy thread mid-CreateSocket would hide stops).
 - Everything else stands: 6-Z414 verified twice, the mirror healthy, the instrumentation complete end-to-end.
+
+---
+Task ID: 151 (rn374+rn375 decoded: the census works — the early window shows fchmodats ARRIVING and being getpid-rewritten to success; the census self-buried via the shared budget — 6-Z417c gives it its own channel; rn376 dispatched)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn374 (d8015214) decoded: the census works (65 lines, init tracked 16.9K stops / 152 shapes) but the top-10 display truncated the low-count shapes — 6-Z417b added explicit watched-number counters (53/452/54/200/49/201).
+- rn375 (a3b4b76d) decoded APK-first: the watched counters ANSWERED THE EARLY WINDOW — init=2788 at census total=16896: **53:E17/X1 (seventeen fchmodat ENTRYs ARRIVED; sixteen getpid-rewritten to success, one raw), 54:E16/X16, 200:E3/X3, 452:E0/X0 (fchmodat2 definitively dead)**. The early socket attempts' fchmodats arrive AND are handled — the getpid-fake-success path is real.
+- THE INSTRUMENT SELF-BURIED: the census shared z413's 96-line budget and consumed 65 of it — dying exactly at the +4.5s socket-failure horizon (the abort windows live from +4.5s to +600s; the census's last line is init total=16896 ≈ +2s).
+- 6-Z417c LANDED (65eb016f, pushed + raw-verified): z417_klog (own 512-line budget) + per-pid cadence (init every 1024 stops, others 4096). Gates: fmt clean, clippy clean, 933/933 tests.
+- rn376 DISPATCHED (HTTP 204, boot_wait 600 / stall 120) on 65eb016f.
+- ALSO this session: disk hit 100% again (rn375 extraction failed mid-way) — cleaned artifacts-rn360..373 (kept 374/375) and re-downloaded. Disk at 57%.
+- Security: credentials untouched.
+
+Stage Summary:
+- Commit chain: ... a3b4b76d (6-Z417b) → 65eb016f (6-Z417c). rn376 in flight.
+- THE DECODE STATE: early-window fchmodats arrive+handled (E17 by +2s); the abort-window fchmodats (+4.5s..+600s, the 519-ENOENT fleet) are BEYOND every census's horizon so far. rn376's full-boot census finally watches them: watched counters advancing through the abort windows = match/translate gap; counters frozen = the stops never arrive (crash_dump SEIZE = suspect #2).
