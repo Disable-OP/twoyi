@@ -769,6 +769,18 @@ const BOOT_DEFAULTS_PROP_FILES: &[&str] = &[
 /// |                          |              | exits 1 and its `reboot_on_failure` reboots the guest    |
 /// |                          |              | ("reboot,bootloader,bootstrap-apexd-failed" — run        |
 /// |                          |              | 34036213818).                                            |
+/// | `ro.kernel.qemu`         | `1`          | 6-Z438: the emulator marker. The cmdline's `qemu=1`      |
+/// |                          |              | (6-Z378) trips init's for_emulator gate, but the export  |
+/// |                          |              | pass's InitPropertySet("ro.kernel.qemu", "1\0") is       |
+/// |                          |              | rejected (the 6-Z223 hybrid cmdline puts a trailing NUL  |
+/// |                          |              | inside the value; run 35276494440 klog: "Init cannot set |
+/// |                          |              | 'ro.kernel.qemu' to '1'"). Without the property,        |
+/// |                          |              | goldfish-ril's isInEmulator() is false → RIL_Init        |
+/// |                          |              | returns NULL → RIL_register(NULL) skips                  |
+/// |                          |              | configureRpcThreadpool → joinRpcThreadpool LOG(FATAL) →  |
+/// |                          |              | 18× SIGABRT restart cycle (the dominant abort class of   |
+/// |                          |              | the rn397 decode). The .prop load path lands `ro.*`      |
+/// |                          |              | values reliably, so the marker is injected HERE.         |
 ///
 /// `ro.apex.updatable=false` is appended to EVERY existing file in
 /// [`BOOT_DEFAULTS_PROP_FILES`] (not just `/system/build.prop`) because
@@ -829,9 +841,15 @@ pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
     // used to rely on DOES NOT EXIST anywhere in the tree — the path was
     // dead documentation.
     let needs_crypto_state = !existing.contains("ro.crypto.state=");
-    if !needs_apexd_status && !needs_apex_updatable && !needs_crypto_state {
+    // 6-Z438: the emulator marker property. NOTE the exact-line shape:
+    // "ro.kernel.qemu=1" is NOT a prefix of the avd_name sibling
+    // ("ro.kernel.qemu.avd_name=…" contains "qemu.", not "qemu="), so a
+    // plain contains() here cannot false-positive on it.
+    let needs_ro_kernel_qemu = !existing.contains("ro.kernel.qemu=1");
+    if !needs_apexd_status && !needs_apex_updatable && !needs_crypto_state && !needs_ro_kernel_qemu
+    {
         info!(
-            "[KR64][proc_emu] {} already contains both boot preset properties — skip append",
+            "[KR64][proc_emu] {} already contains all boot preset properties — skip append",
             build_prop_path
         );
         return Ok(());
@@ -879,6 +897,41 @@ pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
              # `on zygote-start && property:ro.crypto.state=…` sections,\n\
              # which are the only `start zygote` call sites (init.rc:824-840).\n\
              ro.crypto.state=unsupported\n",
+        );
+    }
+    if needs_ro_kernel_qemu {
+        append_block.push_str(
+            "# 6-Z438: the canonical emulator marker. This COMPLETES 6-Z378 at\n\
+             # the property layer: the cmdline carries qemu=1 (the 6-Z223\n\
+             # hybrid format appends a trailing NUL to every item), so init's\n\
+             # ProcessKernelCmdline export pass fires (for_emulator=true —\n\
+             # the ro.kernel.androidboot.* exports prove it live, run\n\
+             # 35276494440) — but its InitPropertySet(\"ro.kernel.qemu\",\n\
+             # \"1\\0\") is REJECTED (klog: \"Init cannot set 'ro.kernel.qemu'\n\
+             # to '1'\" — the log record itself is cut at the embedded NUL,\n\
+             # so the rejection reason is invisible). The build.prop load\n\
+             # path runs LATER (PropertyLoadBootDefaults after PropertyInit)\n\
+             # and demonstrably lands ro.* values in this guest (the live\n\
+             # ro.hardware write-once conflict proves the loader reaches\n\
+             # the set), so the value lands HERE.\n\
+             #\n\
+             # Consumer: goldfish-ril's isInEmulator() (device/generic/goldfish\n\
+             # radio/ril/misc.c) is a pure __system_property_get(\"ro.kernel.qemu\")\n\
+             # EXISTENCE probe. Without the property, reference-ril's RIL_Init\n\
+             # takes the `usage(); return NULL` gate (\"reference-ril requires:\n\
+             # -p <tcp port> or -d /dev/tty_device\"); libgoldfish-rild's main()\n\
+             # does not NULL-check funcs, RIL_register(NULL) early-returns\n\
+             # BEFORE radio::registerService's configureRpcThreadpool(1,true),\n\
+             # and main() then unconditionally calls rilc_thread_pool() =\n\
+             # joinRpcThreadpool() — libhidlbase's file-static\n\
+             # gThreadPoolConfigured is false → LOG(FATAL) \"HIDL\n\
+             # joinRpcThreadpool without calling configureRpcThreadPool.\" →\n\
+             # SIGABRT → init restart loop (18× in run 35276494440, one\n\
+             # crash_dump + tombstone per generation). With the property\n\
+             # set, RIL_Init spawns its mainLoop and returns s_callbacks; the\n\
+             # radio HIDL service registers and rild parks in\n\
+             # joinRpcThreadpool forever — no abort, no restart cycle.\n\
+             ro.kernel.qemu=1\n",
         );
     }
 
@@ -1265,6 +1318,10 @@ mod tests {
         assert!(c.contains("androidboot.bootdevice=virtual"));
         // 6-Z378: the qemu flag trips init's for_emulator gate (ro.kernel.*
         // export pass → ro.kernel.qemu=1 → goldfish-ril isInEmulator()).
+        // 6-Z438 UPDATE: the export pass itself is REJECTED for the exact key
+        // (the 6-Z223 hybrid format embeds a trailing NUL in the value;
+        // "Init cannot set 'ro.kernel.qemu' to '1'" — run 35276494440) — the
+        // property now lands via write_boot_preset_properties instead.
         assert!(c.contains("qemu=1"));
         let _ = std::fs::remove_dir_all(&rootfs);
     }
@@ -1453,6 +1510,13 @@ mod tests {
             "ro.apex.updatable=false (flattened-apex device declaration) should be appended: {}",
             content
         );
+        // 6-Z438: the emulator marker (the goldfish-ril joinRpcThreadpool
+        // abort-class fix — see the append block's comment for the full chain).
+        assert!(
+            content.contains("ro.kernel.qemu=1"),
+            "ro.kernel.qemu=1 (emulator marker, 6-Z438) should be appended: {}",
+            content
+        );
 
         let _ = std::fs::remove_dir_all(&rootfs);
     }
@@ -1542,6 +1606,59 @@ mod tests {
             count_updatable, 1,
             "ro.apex.updatable=false should appear exactly once (got {}): {}",
             count_updatable, content
+        );
+        // 6-Z438: exactly one occurrence of the emulator marker. The
+        // idempotency probe uses contains("ro.kernel.qemu=1") — the avd_name
+        // sibling (ro.kernel.qemu.avd_name=…) must NOT satisfy it.
+        let count_qemu = content.matches("ro.kernel.qemu=1").count();
+        assert_eq!(
+            count_qemu, 1,
+            "ro.kernel.qemu=1 should appear exactly once (got {}): {}",
+            count_qemu, content
+        );
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test (6-Z438, rn397 decode): the guest init's
+    /// ProcessKernelCmdline export pass REJECTS InitPropertySet("ro.kernel.qemu",
+    /// "1\0") (the 6-Z223 hybrid cmdline embeds a trailing NUL in the value;
+    /// klog "Init cannot set 'ro.kernel.qemu' to '1'" — run 35276494440), so
+    /// the ONLY layer that lands the property is the boot-defaults .prop load
+    /// (write_boot_preset_properties). goldfish-ril's isInEmulator() is a pure
+    /// existence probe on this property; without it reference-ril's RIL_Init
+    /// returns NULL and libgoldfish-rild's un-NULL-checked main() reaches
+    /// joinRpcThreadpool with libhidlbase's gThreadPoolConfigured still false
+    /// → LOG(FATAL) SIGABRT → init restart loop (18× per boot). A build.prop
+    /// carrying an image-shipped ro.kernel.qemu.avd_name must NOT satisfy the
+    /// idempotency probe ("qemu.avd_name" does not contain "qemu=").
+    #[test]
+    fn ro_kernel_qemu_preset_survives_avd_name_sibling() {
+        let rootfs = tmpdir();
+        let build_prop = format!("{}/system/build.prop", rootfs);
+        std::fs::create_dir_all(format!("{}/system", rootfs)).unwrap();
+        // The guest image only ever has the avd_name sibling (set via the
+        // cmdline export pass — that one SUCCEEDED for the prefix-keyed
+        // context); the exact key ro.kernel.qemu never lands.
+        std::fs::write(&build_prop, "ro.kernel.qemu.avd_name=twoyi_test\n").unwrap();
+
+        write_boot_preset_properties(&rootfs).expect("first call");
+
+        let content = std::fs::read_to_string(&build_prop).unwrap();
+        assert!(
+            content.contains("ro.kernel.qemu=1"),
+            "the emulator marker must be appended even when the avd_name sibling exists: {}",
+            content
+        );
+
+        // Second call: no duplicate.
+        write_boot_preset_properties(&rootfs).expect("second call");
+        let content = std::fs::read_to_string(&build_prop).unwrap();
+        assert_eq!(
+            content.matches("ro.kernel.qemu=1").count(),
+            1,
+            "emulator marker must appear exactly once after re-run: {}",
+            content
         );
 
         let _ = std::fs::remove_dir_all(&rootfs);
