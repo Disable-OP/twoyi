@@ -12703,6 +12703,7 @@ fn sweep_untraced_guest_processes(
     pid_starttimes: &mut std::collections::HashMap<libc::pid_t, u64>,
     in_syscall_map: &mut std::collections::HashMap<libc::pid_t, bool>,
     z388_handed_off: &std::collections::HashSet<libc::pid_t>,
+    z388_crash_dump_pids: &std::collections::HashSet<libc::pid_t>,
 ) -> usize {
     let self_pid = std::process::id() as libc::pid_t;
     let tracked: std::collections::HashSet<libc::pid_t> = tracked_pids.iter().copied().collect();
@@ -12730,6 +12731,42 @@ fn sweep_untraced_guest_processes(
         // moves the tracee to the sweep) and kill the tombstone path.
         if z388_sweep_must_skip(pid, z388_handed_off) {
             continue;
+        }
+        // ── 6-Z424: never steal a crash_dump's own ptrace domain ──
+        //
+        // rn382 decode (6-Z423 failure-note: "process didn't stop due to
+        // PTRACE_O_TRACECLONE (status = 8393599)" on EVERY dump): the
+        // pseudothread of a traced crash_dump has a TRACKED parent (the
+        // dump worker) and is itself untracked in kr64's books — this
+        // sweep's parent-descendant filter qualified it, and the attach
+        // RACED crash_dump's own PTRACE_SEIZE of the same tid. Whoever
+        // loses the race poisons the dump: the pseudothread's stops land
+        // in the wrong tracer's waitpid and wait_for_clone receives an
+        // auto-attach-shaped SIGSTOP (0x80137F) where its clone event
+        // belongs. TWO guards, both cheap:
+        //   (a) a candidate whose PARENT is a tagged crash_dump pid is
+        //       crash_dump's own fork/thread machinery (the pseudothread,
+        //       the intermediate, the vm_pid) — skip outright;
+        //   (b) a candidate whose /proc status shows ANY TracerPid is
+        //       already someone's tracee — the sweep must never touch it
+        //       (universal: protects future in-dump tracees too).
+        {
+            if z388_crash_dump_pids.contains(&proc_ppid(pid).unwrap_or(-1)) {
+                continue;
+            }
+            if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+                if let Some(tpline) = status.lines().find(|l| l.starts_with("TracerPid:")) {
+                    if let Ok(tp) = tpline
+                        .trim_start_matches("TracerPid:")
+                        .trim()
+                        .parse::<libc::pid_t>()
+                    {
+                        if tp != 0 {
+                            continue;
+                        }
+                    }
+                }
+            }
         }
         // STRICT descendant-of-guest-tree filter: the candidate's parent
         // must itself be tracked. Host processes (zygote children, other
@@ -17866,6 +17903,7 @@ pub fn run_ptrace_loop(
                         &mut pid_starttimes,
                         &mut in_syscall_map,
                         &z388_handed_off,
+                        &z388_crash_dump_pids,
                     );
                     // ── 6-Z418/6-Z421: handed-off loan sweep ──
                     //
