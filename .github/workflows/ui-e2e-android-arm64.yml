@@ -696,6 +696,14 @@ jobs:
              done; \
              echo '##### guest tombstones dir #####'; \
              ls -la /data/user/0/io.twoyi.debug/profiles/default/rootfs/data/tombstones 2>/dev/null || echo 'guest tombstones dir MISSING'; \
+             for g in /data/user/0/io.twoyi.debug/profiles/default/rootfs/data/tombstones/tombstone_*; do \
+               [ -f \$g ] || continue; \
+               s=\$(stat -c%s \$g); \
+               [ \$s -lt 64 ] && continue; \
+               echo \"== GUEST-TOMBSTONE \$(basename \$g) (\$s bytes) ==\"; \
+               head -c 131072 \$g; \
+               echo; \
+             done; \
              echo '##### HOST (redroid) /data/tombstones #####'; \
              ls -la /data/tombstones 2>/dev/null || echo 'host tombstones dir MISSING'; \
              for h in /data/tombstones/tombstone_[0-9]*; do \

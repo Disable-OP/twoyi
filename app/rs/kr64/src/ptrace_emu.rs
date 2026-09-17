@@ -16350,6 +16350,9 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     // 6-Z429: the raw-connect repair log budget (first 16 per run).
     let mut z429_repair_logged: u64 = 0;
+    // 6-Z430: the O_TMPFILE→named-file rewrite counter (the
+    // tombstone_tmp_NN file names; wraps at 100).
+    let mut z430_counter: u64 = 0;
     // 6-Z305t-59: the LAST rewritten bind's (guest_path, remove_file result)
     // per pid — consumed at the bind EXIT by the 6-Z101 forensics so every
     // -98 is attributed to its guest path and the remove_file outcome.
@@ -28952,6 +28955,100 @@ pub fn run_ptrace_loop(
                                                     "6-Z305t-24: open(/dev/null) write-side by pid={} → {} (service stdio capture)",
                                                     pid, translated
                                                 ));
+                                            }
+                                        }
+                                    }
+                                }
+                                // ── 6-Z430: the O_TMPFILE→named-file rewrite ──
+                                // THE TOMBSTONE-LOSS MECHANISM (the rn388
+                                // decode, source-verified against AOSP-11):
+                                // tombstoned's get_output() opens the dump
+                                // sink as an UNNAMED O_TMPFILE inode; the
+                                // content is published ONLY by
+                                // crash_completed_cb's linkat on the
+                                // kCompletedDump packet. The AOSP-11 timeout
+                                // path is SILENT (crash_completed_cb:
+                                // on_crash_completed() FIRST, then
+                                // `if ((ev & EV_READ) == 0) goto fail;` —
+                                // no log at all): every >10s engrave (the
+                                // frozen-target unwinds) times out, the fd
+                                // closes, and the unnamed inode — WITH THE
+                                // FULL TOMBSTONE — is freed. rn388's pwait
+                                // EXIT census proved the kernel DOES honor
+                                // the 10s deadline (ret=0 seen at +60.9s).
+                                // THE FIX: rewrite the get_output openat into
+                                // a REAL NAMED FILE —
+                                // {rootfs}/data/tombstones/tombstone_tmp_NN —
+                                // via the tracer scratch (the 6-Z163 bind
+                                // pattern: write the path blob, repoint arg2;
+                                // strip O_TMPFILE|O_DIRECTORY, add O_CREAT on
+                                // arg3). Every engrave now persists even when
+                                // tombstoned drops the fd, and the completion
+                                // linkat(/proc/self/fd/N → tombstone_NN,
+                                // 6-Z427) hardlinks the SAME inode — the
+                                // publish keeps working natively.
+                                if !boot_recovery
+                                    && abi.execve == 221
+                                    && syscall_num == abi.openat
+                                    && z428_tombstoned_pids.contains(&pid)
+                                    && path == "."
+                                {
+                                    let z430_flags = get_syscall_arg(&regs, abi.reg_arg3) as u32;
+                                    const __O_TMPFILE_A64: u32 = 0x0200_0000;
+                                    const O_DIRECTORY_A64: u32 = 0x0001_0000;
+                                    if z430_flags & __O_TMPFILE_A64 != 0 {
+                                        z430_counter += 1;
+                                        let fb = format!(
+                                            "{}/data/tombstones/tombstone_tmp_{:02}",
+                                            rootfs,
+                                            z430_counter % 100
+                                        );
+                                        let _ = std::fs::OpenOptions::new()
+                                            .create(true)
+                                            .append(true)
+                                            .open(&fb);
+                                        let new_path = fb.clone();
+                                        let new_flags = (z430_flags
+                                            & !(__O_TMPFILE_A64 | O_DIRECTORY_A64))
+                                            | 0x40; // O_CREAT
+                                        let path_bytes = new_path.as_bytes();
+                                        let aligned = (path_bytes.len() + 8) & !7;
+                                        let cursor = if scratch_offset + aligned > 4096 {
+                                            0
+                                        } else {
+                                            scratch_offset
+                                        };
+                                        let path_scratch = scratch_addr + cursor as u64;
+                                        if write_child_blob(pid, path_scratch, path_bytes)
+                                            && write_child_blob(
+                                                pid,
+                                                path_scratch + path_bytes.len() as u64,
+                                                &[0u8],
+                                            )
+                                        {
+                                            let mut z430_regs: Regs = unsafe { std::mem::zeroed() };
+                                            if let Ok(z430_len) =
+                                                ptrace_getregs_wide(pid, &mut z430_regs)
+                                            {
+                                                set_syscall_arg(
+                                                    &mut z430_regs,
+                                                    abi.reg_arg2,
+                                                    path_scratch,
+                                                );
+                                                set_syscall_arg(
+                                                    &mut z430_regs,
+                                                    abi.reg_arg3,
+                                                    new_flags as u64,
+                                                );
+                                                if ptrace_setregs(pid, &z430_regs, z430_len).is_ok()
+                                                {
+                                                    if z430_counter <= 12 {
+                                                        log(&format!(
+                                                            "6-Z430: tombstoned O_TMPFILE openat pid={} → {} (flags {:#x} → {:#x}) — the tombstone survives the 10s timeout",
+                                                            pid, fb, z430_flags, new_flags
+                                                        ));
+                                                    }
+                                                }
                                             }
                                         }
                                     }
