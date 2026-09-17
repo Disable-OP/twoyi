@@ -30619,3 +30619,19 @@ Stage Summary:
 - Session commit chain (all pushed + CI green): 6fc4ec55 (6-Z403) -> 20e83b19 (6-Z404 v1) -> 07d15be5 (6-Z405) -> THIS (6-Z404 v2).
 - EXPECT rn360: SF main's PROBE-STATE names its wchan; the PARK-BT chain names the recvfrom caller — the unix stream socket main is stuck reading is IDENTIFIED and the fix targets that reader; 6-Z405 INIT-CHMODFAM lines decide the fchmodat class.
 - Queued decode: rild joinRpcThreadpool ordering (secondary), the Java backtrace intercept timeout (art attach).
+
+---
+Task ID: 137 (rn361 decoded — THE WALL IS A COMPOSER HWBINDER CALL: the 6-Z406 MAIN-PROBE named SF main's parked chain; 6-Z407 (the reply-correlation trace) landed)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn361 (#361, 7a394f6c) decoded: verdict rung 7. THE 6-Z406 MAIN-TID PROBE DELIVERED THE DECISIVE ORACLE: 1265 probes; SF main (tid 3843) caught at +169s/+229s with PROBE-STATE wchan=unix_stream_data_wait procfs_nr=212 (recvmsg) and the 6-Z404 PARK-BT chain NAMING the parked caller: libsurfaceflinger -> android.hardware.graphics.composer@2.1 -> libhidlbase -> libtwrp_fb_hook (the ioctl wrapper) -> libtwoyi_loader_shlib (the proxy-transport recvmsg). PROBE-FD listed the 16-fd table (the proxy sockets among them). SF MAIN IS BLOCKED INSIDE A COMPOSER HWBINDER CALL WHOSE REPLY NEVER COMES — the recvmsg is the shlib binder-proxy transport wait, not a guest-code hang.
+- PROXY-SIDE RECONSTRUCTION (kr64 hosts the binder proxy at {rootfs}/vm0/dev/binder): conn=111 = SF main's hwbinder connection. Main routed SIX code=10 calls to the composer's node (handle 0x57) at 250 ms intervals (+113.2..114.4 s) — a RETRY LOOP. The composer (conn=46, pid 3197) is ALIVE and HEALTHY for other calls: the 6-Z383 idle-recheck delivered its incoming transactions (codes 1/36/16/11/2/4/7/48/47 — including ONE code=10, txn #95) and it sent 5 BC_REPLYs (+115.4..116.9 s) that resolved cleanly (zero correlation warnings) — yet conn=111's reads return only BR_NOOP cycles and main keeps re-issuing.
+- THE INVISIBILITY: the correlation chain (routed txn_id -> delivery txn_id -> BC_REPLY stack-pop -> requester resolution) was untraceable — the routed line printed a per-owner DIAG counter instead of the global txn_id, the BC_REPLY stack-pop was unlogged (LIFO stack vs the requester's FIFO out_sync drift under the composer's nested deliveries), and the 8s REPLY_TIMEOUT expiry (BR_FAILED_REPLY + the 6-Z399 stack purge) was unlogged.
+- 6-Z407 (this commit): the reply-correlation trace, all bounded — routed lines now carry the GLOBAL txn#; every BC_REPLY resolution logs "6-Z407 REPLY: conn=N pops txn#M stack-left=K" (+ the stack-EMPTY drift verdict, 64/run); every REPLY_TIMEOUT expiry logs "6-Z407 TIMEOUT: conn=N txn#M expired — BR_FAILED_REPLY queued, stack purge from conns [...]" (48/run). Gates: fmt clean, clippy -D warnings clean, 932/932 tests; CI green.
+
+Stage Summary:
+- Session commit chain (all pushed + CI green): 6fc4ec55 (6-Z403) -> 20e83b19 (6-Z404 v1) -> 07d15be5 (6-Z405) -> 8f41cb59 (6-Z404 v2) -> 7a394f6c (6-Z406) -> THIS (6-Z407).
+- THE WALL, NOW THREE LAYERS DEEPER: rung-7/SF -> SF main bursty-blocked -> recvmsg on the proxy transport -> INSIDE a composer hwbinder call with a LIVE composer and clean-looking replies. The last unknown is the reply-correlation chain.
+- EXPECT rn362: the full correlation chain for one code=10 call (routed txn#X on conn=111 -> delivered on conn=46 -> BC_REPLY pops txn#? -> requester=?) names the exact drift point and the one-line fix.
+- Queued decode: the 6-Z405 INIT-CHMODFAM lines (the fchmodat arrival-vs-bypass verdict), rild joinRpcThreadpool (secondary), the Java backtrace intercept timeout (art attach).
