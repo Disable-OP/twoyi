@@ -21802,7 +21802,12 @@ pub fn run_ptrace_loop(
                     let c = census.entry((is_entry, syscall_num)).or_insert(0u64);
                     *c += 1;
                     let total = census.values().sum::<u64>();
-                    if total % 512 == 0 {
+                    // 6-Z417c: per-pid cadence — init (the socket bootstrap
+                    // driver) reports every 1024 stops, everyone else every
+                    // 4096; the census's own budget no longer buries the
+                    // late-boot windows it exists to observe.
+                    let cadence = if pid == init_pid { 1024 } else { 4096 };
+                    if total % cadence == 0 {
                         let mut top: Vec<((bool, i64), u64)> =
                             census.iter().map(|(k, v)| (*k, *v)).collect();
                         top.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
@@ -21832,7 +21837,7 @@ pub fn run_ptrace_loop(
                             })
                             .collect::<Vec<_>>()
                             .join(" ");
-                        crate::z413_klog(
+                        crate::z417_klog(
                             rootfs,
                             &format!(
                                 "STOP-CENSUS pid={} total={} shapes={} watched[53,452,54,200,49,201]={} top=[{}]",
