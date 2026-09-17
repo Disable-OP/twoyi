@@ -14559,6 +14559,30 @@ fn z418_handed_off_stale(recorded: u64, current_starttime: Option<u64>) -> bool 
     current_starttime != Some(recorded)
 }
 
+/// 6-Z421 (pure): parse the process state char from a /proc/<pid>/stat
+/// body (the field right after the final ')' in the parenthesized comm).
+fn z421_parse_stat_state(stat_text: &str) -> Option<char> {
+    let rest = stat_text.rsplit_once(")")?.1;
+    let state = rest.split_whitespace().next()?;
+    state.chars().next()
+}
+
+/// 6-Z421: read a live process state char ('R','S','T','t','Z','D'...).
+fn z421_proc_state(pid: libc::pid_t) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    z421_parse_stat_state(&stat)
+}
+
+/// 6-Z421: the untraced-domain freeze watchdog threshold. A healthy
+/// dump (seize + read + tombstone write + resignal) finishes in
+/// seconds; the rn354 intercept path timed out at 8 s. A handed-off tid
+/// still in T-state after this long means the dump DIED mid-flight and
+/// its resignal never came — the queued SIGSTOP group-stop must be
+/// ended (SIGCONT) or the process freezes forever (rn378: ALL dump
+/// targets frozen, system_server included — the boot stalls with ZERO
+/// service deaths, a stall with no init-level trail at all).
+const Z421_FREEZE_MS: u64 = 60_000;
+
 /// 6-Z418: the eager hand-off walk budget. Per-tid worst case is the
 /// 6-Z388 dance budget (300 ms); the GLOBAL walk cap keeps the tracer
 /// loop responsive even for a many-threaded dying process (system_server
@@ -16037,6 +16061,11 @@ pub fn run_ptrace_loop(
     // or whose pid was recycled — the 6-Z396 worker-death release cannot
     // fire for an untraced (6-Z418) dump worker.
     let mut z388_handed_off_at: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
+    // 6-Z421: boot-elapsed-ms at hand-off, so the sweep's freeze watchdog
+    // can tell an in-flight dump (< Z421_FREEZE_MS) from a dead dump's
+    // frozen target (the resignal never came).
+    let mut z388_handed_off_when: std::collections::HashMap<libc::pid_t, u128> =
         std::collections::HashMap::new();
     // 6-Z418: pids released into the untraced-debuggerd domain (their
     // dumps run entirely outside kr64's ptrace). See the helper block
@@ -17838,18 +17867,29 @@ pub fn run_ptrace_loop(
                         &mut in_syscall_map,
                         &z388_handed_off,
                     );
-                    // ── 6-Z418: handed-off entry prune ──
+                    // ── 6-Z418/6-Z421: handed-off loan sweep ──
                     //
-                    // The 6-Z396 worker-death release cannot fire for an
-                    // untraced (6-Z418) dump worker — its death produces no
-                    // kr64 stop — so handed-off entries whose tid DIED (the
-                    // dump completed or crashed) or whose pid was RECYCLED
-                    // must be retired by this periodic sweep. Dropping a
-                    // dead entry returns nothing to the traced set (the tid
-                    // is gone); dropping a RECYCLED entry keeps the fresh
-                    // owner sweep-eligible instead of shadow-blocked by a
-                    // corpse's hand-off.
+                    // (a) prune: the 6-Z396 worker-death release cannot
+                    //     fire for an untraced (6-Z418) dump worker — its
+                    //     death produces no kr64 stop — so handed-off
+                    //     entries whose tid DIED (the dump completed or
+                    //     crashed) or whose pid was RECYCLED must be
+                    //     retired here.
+                    // (b) 6-Z421 freeze watchdog: an ALIVE handed-off tid
+                    //     still in T-state (do_signal_stop) after
+                    //     Z421_FREEZE_MS means the dump died mid-flight
+                    //     and its resignal/SIGCONT never came (rn378: ALL
+                    //     dump targets frozen, system_server included —
+                    //     the boot stalled with ZERO service deaths, a
+                    //     stall with no init-level trail at all). End the
+                    //     group-stop with SIGCONT — the kernel-true
+                    //     resume: the crash class dies from its own
+                    //     queued fatal signal (init reaps + restarts),
+                    //     the live-dump class resumes and keeps running —
+                    //     and retire the loan (the sweep may re-attach
+                    //     and resume emulation on it).
                     let mut pruned: usize = 0;
+                    let mut unfrozen: usize = 0;
                     let mut checked: usize = 0;
                     z388_handed_off.retain(|&tid| {
                         if checked >= 256 {
@@ -17867,14 +17907,46 @@ pub fn run_ptrace_loop(
                             pruned += 1;
                             z388_handed_off_to.remove(&tid);
                             z388_handed_off_at.remove(&tid);
+                            z388_handed_off_when.remove(&tid);
+                            return false;
                         }
-                        !stale
+                        // 6-Z421: alive — is it FROZEN past the budget?
+                        let when = z388_handed_off_when
+                            .get(&tid)
+                            .copied()
+                            .unwrap_or(0);
+                        if crate::boot_elapsed_ms().saturating_sub(when) > Z421_FREEZE_MS as u128 {
+                            if let Some(state) = z421_proc_state(tid) {
+                                if state == 'T' || state == 't' {
+                                    let rc = unsafe { libc::kill(tid, libc::SIGCONT) };
+                                    unfrozen += 1;
+                                    if unfrozen <= 32 {
+                                        log(&format!(
+                                            "6-Z421: handed-off tid={} state={} {}ms after hand-off — dump died mid-flight; SIGCONT (rc={}) ends the group-stop so the queued signal/work delivers",
+                                            tid,
+                                            state,
+                                            crate::boot_elapsed_ms().saturating_sub(when),
+                                            rc
+                                        ));
+                                    }
+                                }
+                            }
+                            // Either way the loan is over: the dump is
+                            // long gone (its worker would have released
+                            // it otherwise) and the tid is now either
+                            // frozen-but-CONT'd or running untraced.
+                            z388_handed_off_to.remove(&tid);
+                            z388_handed_off_at.remove(&tid);
+                            z388_handed_off_when.remove(&tid);
+                            return false;
+                        }
+                        true
                     });
-                    if pruned > 0 {
+                    if pruned > 0 || unfrozen > 0 {
                         log(&format!(
-                            "6-Z418: handed-off prune — {} stale entr{} retired ({} remain)",
+                            "6-Z418/6-Z421: loan sweep — {} pruned, {} frozen tids SIGCONTed ({} loans remain)",
                             pruned,
-                            if pruned == 1 { "y" } else { "ies" },
+                            unfrozen,
                             z388_handed_off.len()
                         ));
                     }
@@ -22979,6 +23051,10 @@ pub fn run_ptrace_loop(
                                                 z388_target,
                                                 proc_starttime(z388_target).unwrap_or(0),
                                             );
+                                            // 6-Z421: hand-off instant for the
+                                            // freeze watchdog.
+                                            z388_handed_off_when
+                                                .insert(z388_target, crate::boot_elapsed_ms());
                                         }
                                         break;
                                     }
@@ -23007,6 +23083,8 @@ pub fn run_ptrace_loop(
                                 // 6-Z418: start time for the periodic prune.
                                 z388_handed_off_at
                                     .insert(z388_target, proc_starttime(z388_target).unwrap_or(0));
+                                // 6-Z421: hand-off instant for the freeze watchdog.
+                                z388_handed_off_when.insert(z388_target, crate::boot_elapsed_ms());
                                 if z388_n < 64 {
                                     log(&format!(
                                         "6-Z388: tid={} HANDED OFF to crash_dump pid={} ({} tracked, {} handed off)",
@@ -36893,6 +36971,8 @@ pub fn run_ptrace_loop(
                                             z388_handed_off.insert(tid);
                                             z388_handed_off_to.insert(tid, exec_pid);
                                             z388_handed_off_at.insert(tid, st_time);
+                                            z388_handed_off_when
+                                                .insert(tid, crate::boot_elapsed_ms());
                                             if libc::WIFSTOPPED(st) {
                                                 let sig = z388_detach_signal(libc::WSTOPSIG(st));
                                                 let dret = unsafe {
@@ -36939,21 +37019,67 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             }
-                            // (3) detach the crash_dump itself.
-                            let dret = unsafe {
+                            // (3) detach the crash_dump itself. rn378 decode:
+                            // one dump's PTRACE_DETACH returned -1 while the
+                            // kernel-side tracer persisted — the pid was
+                            // dropped from every account + skip_next_resume
+                            // armed, so NOTHING ever resumed it (state 't'
+                            // forever, cameraserver frozen). The fallback:
+                            // retry the detach with SIGCONT (a group-stop
+                            // survives a signal-0 detach), and if the kernel
+                            // still refuses, RESTORE the traced bookkeeping
+                            // so the loop-top resumes it normally (the
+                            // in-domain path — today's behavior — instead of
+                            // an unresumable orphan).
+                            let mut dret = unsafe {
                                 libc::ptrace(libc::PTRACE_DETACH, exec_pid, 0, 0 as libc::c_long)
                             };
-                            tracked_pids.retain(|&p| p != exec_pid);
-                            pid_starttimes.remove(&exec_pid);
-                            in_syscall_map.remove(&exec_pid);
-                            pending_resume.remove(&exec_pid);
-                            esrch_streak.remove(&exec_pid);
-                            last_stop_at.remove(&exec_pid);
-                            z306k_last_natural.remove(&exec_pid);
-                            z388_crash_dump_pids.remove(&exec_pid);
-                            z418_untraced.insert(exec_pid);
-                            // (4) the loop-top must not resume an untraced pid.
-                            skip_next_resume = Some(exec_pid);
+                            if dret != 0 {
+                                let err0 = std::io::Error::last_os_error();
+                                dret = unsafe {
+                                    libc::ptrace(
+                                        libc::PTRACE_DETACH,
+                                        exec_pid,
+                                        0,
+                                        libc::SIGCONT as libc::c_long,
+                                    )
+                                };
+                                if z418_n < 64 {
+                                    log(&format!(
+                                        "6-Z418: crash_dump pid={} signal-0 detach failed ({}), SIGCONT-retry ret={}",
+                                        exec_pid, err0, dret
+                                    ));
+                                }
+                            }
+                            if dret == 0 {
+                                tracked_pids.retain(|&p| p != exec_pid);
+                                pid_starttimes.remove(&exec_pid);
+                                in_syscall_map.remove(&exec_pid);
+                                pending_resume.remove(&exec_pid);
+                                esrch_streak.remove(&exec_pid);
+                                last_stop_at.remove(&exec_pid);
+                                z306k_last_natural.remove(&exec_pid);
+                                z388_crash_dump_pids.remove(&exec_pid);
+                                z418_untraced.insert(exec_pid);
+                                // (4) the loop-top must not resume an untraced pid.
+                                skip_next_resume = Some(exec_pid);
+                            } else {
+                                let err = std::io::Error::last_os_error();
+                                // RESTORE: the pid stays kr64-traced; the
+                                // loop-top's normal resume applies.
+                                if !tracked_pids.contains(&exec_pid) {
+                                    tracked_pids.push(exec_pid);
+                                }
+                                pid_starttimes
+                                    .insert(exec_pid, proc_starttime(exec_pid).unwrap_or(0));
+                                z388_handed_off_at.remove(&exec_pid);
+                                if z418_n < 64 {
+                                    log(&format!(
+                                        "6-Z418: crash_dump pid={} DETACH FAILED twice ({}) — restoring the traced path (skip_next_resume NOT armed)",
+                                        exec_pid, err
+                                    ));
+                                }
+                            }
                             if z418_n < 64 {
                                 log(&format!(
                                     "6-Z418: crash_dump pid={} DETACHED (untraced-debuggerd; ret={}) — dying parent {:?}: {} tid(s) eagerly handed off, {} skipped; the dump now runs real-kernel ptrace end to end",
@@ -51907,9 +52033,9 @@ mod z388_handoff_tests {
     use super::ABI_AARCH64;
     use super::{
         z388_attach_kind, z388_detach_signal, z388_handoff_decision, z388_sweep_must_skip,
-        z418_detach_decision, z418_handed_off_stale, z418_parse_ppid, ABI_ARM32,
-        Z388_CRASH_DUMP_TAG_CAP, Z388_DANCE_POLLS, Z388_DANCE_POLL_SLEEP_MS, Z388_PTRACE_ATTACH,
-        Z388_PTRACE_SEIZE,
+        z418_detach_decision, z418_handed_off_stale, z418_parse_ppid, z421_parse_stat_state,
+        ABI_ARM32, Z388_CRASH_DUMP_TAG_CAP, Z388_DANCE_POLLS, Z388_DANCE_POLL_SLEEP_MS,
+        Z388_PTRACE_ATTACH, Z388_PTRACE_SEIZE,
     };
     #[cfg(target_arch = "x86_64")]
     use super::{ABI_X86_32, ABI_X86_64};
@@ -52062,6 +52188,33 @@ mod z388_handoff_tests {
         // probe-based) — the predicate itself stays total.
         assert!(z418_handed_off_stale(0, None));
         assert!(!z418_handed_off_stale(0, Some(0)));
+    }
+
+    /// 6-Z421: the /proc/<pid>/stat state parser — the freeze watchdog
+    /// reads the state char AFTER the parenthesized comm (the comm may
+    /// itself contain ')', so the parse must take the LAST ')').
+    #[test]
+    fn z421_parse_stat_state_fields() {
+        // Simple comm.
+        assert_eq!(
+            z421_parse_stat_state("123 (crash_dump64) S 1 1 1 0 -1 0 0 0"),
+            Some('S')
+        );
+        // Comm containing ') ' — rsplit_once takes the LAST ')'.
+        assert_eq!(
+            z421_parse_stat_state("99 (a)weird)comm) T 1 1 1 0 -1 0 0 0"),
+            Some('T')
+        );
+        // Tracer-stop 't' (the rn378 orphan shape).
+        assert_eq!(
+            z421_parse_stat_state("3564 (crash_dump64) t 3384 3563 1 0 -1 0 0 0"),
+            Some('t')
+        );
+        // Zombie.
+        assert_eq!(z421_parse_stat_state("7 (x) Z 1 1 1 0 -1 0 0 0"), Some('Z'));
+        // Garbage → None.
+        assert_eq!(z421_parse_stat_state("no parens here"), None);
+        assert_eq!(z421_parse_stat_state("1 (x) "), None);
     }
 
     /// The dance budget is bounded: 150 × 2 ms = 300 ms worst case.
