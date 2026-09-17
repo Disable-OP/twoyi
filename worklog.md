@@ -30759,3 +30759,17 @@ Stage Summary:
 - THE ARC THIS SESSION: registerCallback wedge (6-Z409 FIXED, verified 2x) -> frozen-after-dump class (6-Z411 FIXED, verified) -> the 68-generation SF SIGABRT cascade with the abort message rotation-lost (6-Z412 instruments; rn369 names SF's abort).
 - Next decode (rn369): logcat-crash.txt -> SF's abort message -> the targeted fix (likely a DEAD_OBJECT return on one of SF's HAL calls, or the Scudo invalid-free class resurfacing inside SF's own buffers).
 - Queued: the socket fchmodat pair-skip class (6-Z210), the bluetooth 'Invalid address' config abort, rild joinRpcThreadpool.
+
+---
+Task ID: 145 (rn369 decoded — the crash-buffer capture works: only the bluetooth fleet aborts are recorded; SF's signal-6 leaves NO crash-buffer record = an external SIGABRT or the logd-socket degradation eating the evidence — the socket pair-skip class (6-Z210) is now the top-priority opener)
+Agent: Z.ai Code (main implementation agent, Twoyi mission)
+
+Work Log:
+- rn369 (#369, 3611a932) decoded: verdict rung 7. The 6-Z412 crash-buffer capture WORKS (logcat-crash.txt, 27.6 KB): exactly 4 aborts recorded, ALL bluetooth ('Invalid address: 3C:5A:B4:01:02:03' — the BT HAL's dummy-MAC config abort — then the bt_stack DEAD_OBJECT cascade). NO surfaceflinger record despite 58 generations of "Service 'surfaceflinger' (pid N) received signal 6".
+- THE INFERENCE: an abort() always writes the crash buffer (the libc fatal handler runs before anything else) — an SF SIGABRT with NO crash-buffer record means either (a) the SIGABRT is EXTERNAL (tgkill from another guest process — but which, with system_server dead in the cascade?), or (b) **the crash-buffer WRITE ITSELF fails — logd's /dev/socket/logd is degraded by the SAME socket fchmodat pair-skip class that broke tombstoned (6-Z210)** — the abort-message write silently fails. The socket class now blocks ALL crash evidence (tombstones AND the crash buffer) and is the TOP-PRIORITY opener.
+- This run's cascade: 58 x surfaceflinger/zygote/netd/audioserver (same shape as rn368's 68); the zygote SIGKILLs visible; the binder bus healthy throughout (transient conns, age 0-1s, txn counters at 393+, thousands of service cycles).
+
+Stage Summary:
+- Session totals: 7 runs decoded (rn363..rn369), 5 fix/instrument commits landed (6-Z408 reentrancy gate, 6-Z408b socket EXIT backstop, 6-Z409 BC_REPLY ack — verified 2x, 6-Z411 post-dump SIGCONT — verified, 6-Z412 crash-buffer capture), all CI green.
+- THE BOOT IS TRANSFORMED vs rn363: the composer completes registerCallback and survives the whole run; thousands of service cycles instead of a stuck fleet; zero binder timeouts.
+- THE NEXT OPENERS (priority order): (1) the socket fchmodat pair-skip class (6-Z210 stop mechanics; unblocks tombstones + logd crash evidence); (2) SF's external-SIGABRT source (via the restored evidence); (3) the bluetooth 'Invalid address' config abort; (4) the Scudo invalid-free class if it resurfaces; (5) rild joinRpcThreadpool.
