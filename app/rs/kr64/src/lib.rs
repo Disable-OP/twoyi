@@ -375,6 +375,25 @@ pub(crate) fn z392_klog(rootfs: &str, msg: &str) {
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
+/// 6-Z408b's own budget (the rn350 self-bury discipline): the missed-ENTRY
+/// chmod backstop logs through the drop-proof kmsg mirror with an
+/// independent counter — a burst of missed entries must never bury the
+/// socket-bootstrapping evidence of another channel.
+pub(crate) fn z408_klog(rootfs: &str, msg: &str) {
+    static Z408_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = Z408_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 64 {
+        return;
+    }
+    let path = format!("{}/dev/__kmsg__", rootfs);
+    let line = format!("<6>[kr64] 6-Z408 +{}ms {}\n", boot_elapsed_ms(), msg);
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
 // ── 6-Z384: atexit tail-drain ────────────────────────────────────────
 //
 // `std::process::exit` (main.rs) does NOT unwind: locals are not

@@ -2233,9 +2233,12 @@ struct ConnBox {
     /// thread todo list — see [`DeferredReply`]).
     reply_queue: std::collections::VecDeque<DeferredReply>,
     /// Sync transactions this connection SENT and has not seen a reply
-    /// for: (txn id, queued-at). Used for the bounded reply timeout and
-    /// for waiter cleanup when the connection dies.
-    out_sync: std::collections::VecDeque<(u64, std::time::Instant)>,
+    /// for: (txn id, target owner conn, queued-at). Used for the bounded
+    /// reply timeout, for waiter cleanup when the connection dies, and
+    /// (6-Z408) for the kernel reentrancy gate — the target owner decides
+    /// WHICH new sync callers may ride this conn's stream while it is
+    /// parked on its own reply.
+    out_sync: std::collections::VecDeque<(u64, ConnId, std::time::Instant)>,
     /// 6-Z306ag: the connection's TRANSACTION STACK — the ids of every
     /// delivered, still-unanswered sync transaction, INNERMOST LAST.
     /// Kernel semantics (`binder_thread.transaction_stack`): a binder
@@ -2832,7 +2835,7 @@ impl BusState {
         }
         // The dying conn's own outstanding sync calls: nobody is left to
         // receive a resolution — just drop their waiters.
-        for (txn_id, _) in out_sync {
+        for (txn_id, _, _) in out_sync {
             self.waiters.remove(&txn_id);
         }
         let dead: Vec<(String, u32)> = self
@@ -2938,6 +2941,58 @@ impl BusState {
             self.z359_drop_conn_refs(conn);
         }
         self.remove_watchers_of_conn(conn);
+    }
+
+    /// 6-Z408: the KERNEL REENTRANCY GATE for sync delivery — true when
+    /// the queued sync transaction `tx` must NOT be delivered to `conn`
+    /// yet (hold it in the owner's inbox).
+    ///
+    /// Kernel rule (binder.c's target-thread selection for a sync call):
+    /// a thread parked waiting for the reply of its OWN outgoing call
+    /// receives new incoming work ONLY when the new caller is the process
+    /// the parked call is headed to (the reentrant case — the txn rides
+    /// on top of that thread's transaction stack). Work from ANY OTHER
+    /// process goes to an idle pool thread or the proc todo queue — never
+    /// to the parked thread.
+    ///
+    /// rn362/363/364 decoded the consequence of ignoring this: the
+    /// composer's main thread (conn=32) parked inside the nested
+    /// onHotplug call (out_sync → SF main's conn) received every OTHER
+    /// client's traffic (#14..#32) in its own waitForResponse stream,
+    /// replied to each, consumed the nested BR_REPLY (rn364 first_br
+    /// oracle: BR_REPLY at +32234) — and its libhwbinder then returned to
+    /// the pool loop WITHOUT ever sending the BC_REPLY for the
+    /// registerCallback txn#12 that started the handler. SF main's waiter
+    /// expired → BR_FAILED_REPLY → the 250 ms retry loop → rung 7
+    /// forever. On a real kernel the mid-park transactions would have
+    /// been served by the composer's pool threads, the parked thread's
+    /// stream would have carried ONLY its nested reply, and the handler
+    /// would have completed.
+    ///
+    /// One-way items are NEVER blocked here (the kernel queues async work
+    /// on the proc todo; the rn354/6-Z399 ordering rules already own that
+    /// path). A dead/unknown target conn (pid 0) never blocks — the
+    /// waiter's own REPLY_TIMEOUT resolves that case, and holding forever
+    /// behind a dead target would wedge the server.
+    fn z408_sync_delivery_blocked(&self, conn: ConnId, tx: &IncomingTx) -> bool {
+        if tx.one_way || tx.txn_id == 0 {
+            return false;
+        }
+        let Some(bx) = self.conns.get(&conn) else {
+            return false;
+        };
+        let Some(&(_tid, target_owner, _at)) = bx.out_sync.back() else {
+            return false;
+        };
+        let target_pid = self
+            .conns
+            .get(&target_owner)
+            .map(|tbx| tbx.sender_pid)
+            .unwrap_or(0);
+        if target_pid == 0 {
+            return false;
+        }
+        tx.sender_pid != target_pid
     }
 
     /// Route a transaction to its owner's mailbox. Returns false when the
@@ -3525,7 +3580,7 @@ impl BinderProxy {
                             let mut lines: Vec<String> = Vec::new();
                             for (cid, bx) in b.conns.iter() {
                                 let mut parts: Vec<String> = Vec::new();
-                                for (t, at) in bx.out_sync.iter() {
+                                for (t, _o, at) in bx.out_sync.iter() {
                                     parts.push(format!(
                                         "sync#{} age={}s",
                                         t,
@@ -4579,7 +4634,7 @@ fn handle_write_read(
                             let requester = b.waiters.remove(&txn_id);
                             if let Some(rc) = requester {
                                 if let Some(rbx) = b.conns.get_mut(&rc) {
-                                    rbx.out_sync.retain(|(t, _)| *t != txn_id);
+                                    rbx.out_sync.retain(|(t, _, _)| *t != txn_id);
                                 }
                             }
                             requester
@@ -4762,11 +4817,11 @@ fn handle_write_read(
             let expired: Vec<u64> = match b.conns.get_mut(&conn_id) {
                 Some(bx) => {
                     let mut v = Vec::new();
-                    while let Some((_t, at)) = bx.out_sync.front() {
+                    while let Some((_t, _o, at)) = bx.out_sync.front() {
                         if now.duration_since(*at) < REPLY_TIMEOUT {
                             break;
                         }
-                        let (t, _) = bx.out_sync.pop_front().expect("front checked");
+                        let (t, _, _) = bx.out_sync.pop_front().expect("front checked");
                         v.push(t);
                     }
                     v
@@ -4930,26 +4985,55 @@ fn handle_write_read(
             }
             let mut delivery = {
                 let mut b = bus.lock().expect("binder bus poisoned");
-                match b.conns.get_mut(&conn_id) {
-                    Some(bx) => match bx.inbox.pop_front() {
-                        Some(InboxItem::Tx(tx)) => {
-                            // Mark the delivered transaction as owing a reply
-                            // (sync only — one-way has txn_id 0 and expects
-                            // no reply). Remove it from pending_in: it's no
-                            // longer "queued". 6-Z306ag: PUSH onto the
-                            // transaction stack — never overwrite; outer
-                            // frames must survive nested processing.
-                            if tx.txn_id != 0 {
-                                bx.txn_stack.push(tx.txn_id);
-                                z306ag_note_stack_depth(bx.txn_stack.len());
-                                bx.pending_in.retain(|id| *id != tx.txn_id);
-                            }
-                            Delivery::Tx(tx)
+                // 6-Z408: PEEK before pop — the kernel reentrancy gate may
+                // HOLD this conn's front sync item (see
+                // z408_sync_delivery_blocked). A held item stays queued;
+                // this conn's polls answer BR_NOOP until its nested call
+                // unwinds (out_sync drains) and the gate opens — the pool
+                // threads' steal is already excluded by 6-Z399's
+                // reader_waiting filter, and the REPLY_TIMEOUT guarantees
+                // the gate opens even if the nested reply never comes.
+                let z408_held = match b.conns.get(&conn_id).and_then(|bx| bx.inbox.front()) {
+                    Some(InboxItem::Tx(tx)) => {
+                        let held = b.z408_sync_delivery_blocked(conn_id, tx);
+                        if held {
+                            z408_note_hold(
+                                vm_id,
+                                conn_id,
+                                tx.txn_id,
+                                tx.code,
+                                tx.requester,
+                                tx.sender_pid,
+                            );
                         }
-                        Some(InboxItem::Death(cookie)) => Delivery::Death(cookie),
+                        held
+                    }
+                    _ => false,
+                };
+                if z408_held {
+                    Delivery::None
+                } else {
+                    match b.conns.get_mut(&conn_id) {
+                        Some(bx) => match bx.inbox.pop_front() {
+                            Some(InboxItem::Tx(tx)) => {
+                                // Mark the delivered transaction as owing a reply
+                                // (sync only — one-way has txn_id 0 and expects
+                                // no reply). Remove it from pending_in: it's no
+                                // longer "queued". 6-Z306ag: PUSH onto the
+                                // transaction stack — never overwrite; outer
+                                // frames must survive nested processing.
+                                if tx.txn_id != 0 {
+                                    bx.txn_stack.push(tx.txn_id);
+                                    z306ag_note_stack_depth(bx.txn_stack.len());
+                                    bx.pending_in.retain(|id| *id != tx.txn_id);
+                                }
+                                Delivery::Tx(tx)
+                            }
+                            Some(InboxItem::Death(cookie)) => Delivery::Death(cookie),
+                            None => Delivery::None,
+                        },
                         None => Delivery::None,
-                    },
-                    None => Delivery::None,
+                    }
                 }
             };
             // 6-Z271g: PROCESS-POOL WORK STEALING — real binder queues incoming
@@ -5271,19 +5355,45 @@ fn handle_write_read(
                     // delivery boots all crossed the display gate).
                     let rechecked = {
                         let mut b = bus.lock().expect("binder bus poisoned");
-                        match b.conns.get_mut(&conn_id) {
-                            Some(bx) => match bx.inbox.pop_front() {
-                                Some(InboxItem::Tx(tx)) => {
-                                    if tx.txn_id != 0 {
-                                        bx.txn_stack.push(tx.txn_id);
-                                        z306ag_note_stack_depth(bx.txn_stack.len());
-                                        bx.pending_in.retain(|id| *id != tx.txn_id);
-                                    }
-                                    Some(tx)
+                        // 6-Z408: the recheck honors the SAME reentrancy
+                        // gate as the primary drain — otherwise every
+                        // post-sleep re-pop would bypass the hold on the
+                        // parked conn's front sync item.
+                        let z408_held = match b.conns.get(&conn_id).and_then(|bx| bx.inbox.front())
+                        {
+                            Some(InboxItem::Tx(tx)) => {
+                                let held = b.z408_sync_delivery_blocked(conn_id, tx);
+                                if held {
+                                    z408_note_hold(
+                                        vm_id,
+                                        conn_id,
+                                        tx.txn_id,
+                                        tx.code,
+                                        tx.requester,
+                                        tx.sender_pid,
+                                    );
                                 }
-                                _ => None,
-                            },
-                            None => None,
+                                held
+                            }
+                            _ => false,
+                        };
+                        if z408_held {
+                            None
+                        } else {
+                            match b.conns.get_mut(&conn_id) {
+                                Some(bx) => match bx.inbox.pop_front() {
+                                    Some(InboxItem::Tx(tx)) => {
+                                        if tx.txn_id != 0 {
+                                            bx.txn_stack.push(tx.txn_id);
+                                            z306ag_note_stack_depth(bx.txn_stack.len());
+                                            bx.pending_in.retain(|id| *id != tx.txn_id);
+                                        }
+                                        Some(tx)
+                                    }
+                                    _ => None,
+                                },
+                                None => None,
+                            }
                         }
                     };
                     if let Some(tx) = rechecked {
@@ -5906,9 +6016,13 @@ fn handle_transaction(
         }
         if !one_way {
             // Track the outstanding sync call on the requester's conn for
-            // the bounded reply timeout + teardown cleanup.
+            // the bounded reply timeout + teardown cleanup. 6-Z408: the
+            // TARGET OWNER conn rides the entry — the reentrancy gate
+            // compares the target's sender process against new sync
+            // callers while this conn is parked on the reply.
             if let Some(rbx) = b.conns.get_mut(&conn_id) {
-                rbx.out_sync.push_back((txn_id, std::time::Instant::now()));
+                rbx.out_sync
+                    .push_back((txn_id, owner, std::time::Instant::now()));
             }
         }
         // 6-Z271n: bounded routed-transaction DIAG — the queue side was
@@ -8878,6 +8992,47 @@ fn z306ag_note_stack_depth(depth: usize) {
         info!(
             "[KR64][binder] 6-Z306ag: nested/overlapping txn stack depth={} on one conn",
             depth
+        );
+    }
+}
+
+/// 6-Z408: bounded budget for the reentrancy-gate HOLD diagnostics — how
+/// many times the gate may log a held sync transaction per (vm, conn).
+/// The parked-conn window lasts ~250 ms per nested call, so the hold
+/// lines stay sparse; the budget still guards a pathological fleet.
+static Z408_HOLD_LOG: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(u32, u64), u64>>,
+> = std::sync::OnceLock::new();
+
+fn z408_note_hold(
+    vm_id: u32,
+    conn_id: u64,
+    txn_id: u64,
+    code: u32,
+    requester: u64,
+    sender_pid: i32,
+) {
+    let seen = match Z408_HOLD_LOG
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+    {
+        Ok(mut m) => *m
+            .entry((vm_id, conn_id))
+            .and_modify(|c| *c += 1)
+            .or_insert(1),
+        Err(_) => 0,
+    };
+    if seen <= 16 || seen % 500 == 0 {
+        info!(
+            "[KR64][binder][vm{}] 6-Z408 REENTRANCY-HOLD: sync tx #{} (code={}, sender pid={}) held on parked conn={} (outstanding call target conn={}) — kernel reentrancy rule; drains when the nested call unwinds [tx #{}{}]",
+            vm_id,
+            txn_id,
+            code,
+            sender_pid,
+            conn_id,
+            requester,
+            seen,
+            if seen <= 16 { "" } else { " sampled" }
         );
     }
 }
