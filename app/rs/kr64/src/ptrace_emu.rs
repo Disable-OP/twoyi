@@ -11406,6 +11406,51 @@ fn z404_walk_chain(pid: libc::pid_t, fp: u64, frames_cap: usize) -> usize {
 /// Returns true when the probe completed (stop consumed, state logged,
 /// tracee resumed). Any failure path resumes-or-logs honestly.
 fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
+    // ── 6-Z415: THE SIGSTOP PROBE IS SUSPECT #1 FOR THE 6-Z210 VANISH CLASS ──
+    //
+    // rn371's decoded verdict for the socket fchmodat/bind vanish class:
+    // the vanished syscalls (zygote x30, usap x31, fwmarkd x27, mdns x24,
+    // dnsproxyd x22 per run — 100% after ~+4.5s) NEVER reach any arm —
+    // the 6-Z413 CHMODFAM channel stayed at ZERO while the z391 channel
+    // stayed healthy (94 lines) — so the ENTRY+EXIT stops are consumed
+    // OUT-OF-BAND or never generated. The ONLY machinery in the process
+    // that touches tracees outside the main loop's waitpid/stop rhythm:
+    // THIS probe — 901 firings per run, each kill(pid, SIGSTOP) plus a
+    // 250 ms out-of-band waitpid(pid, __WALL|WNOHANG) spin that consumes
+    // ANY queued stop of that pid, plus a SIGSTOP left PENDING on the
+    // 250 ms timeout ("+813ms: pid=2809 stop TIMEOUT — SIGSTOP left
+    // pending") whose group-stop then interleaves with the tracee's
+    // syscall-stop rhythm and its ERESTARTSYS syscall rewinds for the
+    // rest of the boot. A pending-SIGSTOP + ERESTART-restart interleave
+    // at a bind/fchmodat pair is exactly the "vanish" shape — the
+    // restarted syscall's second ENTRY stop can carry the group-stop
+    // semantics and neither half surfaces as a plain 0x857f.
+    //
+    // THE TEST: disable the SIGSTOP dance entirely and answer the same
+    // stall question from /proc/<pid>/syscall (read-only, zero tracee
+    // interaction — the 6-Z404/z306an machinery already trusts it).
+    // If rn372 heals the socket class, the probe was the culprit and the
+    // procfs probe becomes permanent; if not, the probe is exonerated
+    // and the suspicion moves to the crash_dump SEIZE dance.
+    const Z415_SIGSTOP_PROBE_DISABLED: bool = true;
+    if Z415_SIGSTOP_PROBE_DISABLED {
+        match z404_procfs_syscall_nr(pid) {
+            Some(nr) if nr >= 0 => crate::trace_log_line(&format!(
+                "6-Z415 PROCFS-PROBE: pid={} blocked-in-kernel nr={} (no SIGSTOP issued, no stop consumed)",
+                pid, nr
+            )),
+            Some(_) => crate::trace_log_line(&format!(
+                "6-Z415 PROCFS-PROBE: pid={} userspace-parked (procfs -1) (no SIGSTOP issued)",
+                pid
+            )),
+            None => crate::trace_log_line(&format!(
+                "6-Z415 PROCFS-PROBE: pid={} running or unreadable (no SIGSTOP issued)",
+                pid
+            )),
+        }
+        let _ = abi;
+        return false;
+    }
     // 1. SIGSTOP — wakes an interruptible sleep and forces the stop.
     //    ESRCH → died; EPERM → the host refuses to let us signal a
     //    post-setuid tracee (logged honestly either way).
