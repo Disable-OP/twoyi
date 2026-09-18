@@ -7156,6 +7156,8 @@ fn bt_walk_6z364(pid: libc::pid_t, sp: u64, lr: u64, fp: u64, crossing_len: u64)
     };
     // 6-Z370: collect the first frame records for the save-region dump.
     let mut chain_fps: Vec<u64> = Vec::new();
+    let mut printed = 0usize;
+    let mut last_ret = 0u64;
     for depth in 0..16 {
         let Some(rec) = read_child_bytes(pid, fp, 16) else {
             break;
@@ -7175,15 +7177,120 @@ fn bt_walk_6z364(pid: libc::pid_t, sp: u64, lr: u64, fp: u64, crossing_len: u64)
             ret,
             name_of(ret)
         ));
+        printed += 1;
+        last_ret = ret;
         if next <= fp || next >= sp + 0x100000 {
             break;
         }
         fp = next;
     }
+    // 6-Z460 (rn427 decode): the ABORT-TRAMPOLINE shape — the walk cut
+    // early inside the libc abort path (the signal trampoline keeps no
+    // FP frame records; rn427: all 3 scudo aborts surfaced exactly 3
+    // libc frames, never the free()-caller chain). The callers sit as
+    // RAW code pointers on the stack above the last walked frame: scan
+    // a bounded window for executable-region words, EXCLUDING the
+    // trampoline's own region, and name them. Read-only, ≤8 lines,
+    // at most once per walk and only when the chain cut early.
+    if printed < 4 {
+        let skip = regions
+            .iter()
+            .find(|(lo, hi, ex, _)| *ex && last_ret >= *lo && last_ret < *hi)
+            .map(|(lo, hi, _, _)| (*lo, *hi));
+        z364_raw_ret_scan(pid, fp, sp, skip, &regions);
+    }
     // 6-Z370: on ≥8 GiB crossings dump the frame saves + candidate objects.
     if crossing_len >= 0x2_0000_0000 && !chain_fps.is_empty() {
         z370_dump_frame_saves(pid, &chain_fps, sp, &regions);
     }
+}
+
+/// 6-Z460: bounded RAW return-address scan for the cut-chain shapes.
+/// Reads [from, from+2KB) of the stopped child's stack and names up to 8
+/// aligned words that land in EXECUTABLE map regions outside `skip` (the
+/// abort trampoline's own region — the frames the FP chain already
+/// named). Consecutive candidates from the SAME region dedupe to one
+/// line (stack garbage repeats a library's plthooks); `cap` bounds the
+/// output. Pure diagnostics: no writes, no behavior change.
+fn z364_raw_ret_scan(
+    pid: libc::pid_t,
+    from: u64,
+    sp: u64,
+    skip: Option<(u64, u64)>,
+    regions: &[(u64, u64, bool, String)],
+) {
+    let Some(win) = read_child_bytes(pid, from, 2048) else {
+        return;
+    };
+    let cands = z364_raw_candidates(&win, from, skip, regions, 8);
+    if cands.is_empty() {
+        return;
+    }
+    let name_of = |pc: u64| -> String {
+        for (lo, hi, _, line) in regions {
+            if pc >= *lo && pc < *hi {
+                let path = line.split_whitespace().last().unwrap_or("?");
+                if path.starts_with('[') {
+                    return path.to_string();
+                }
+                let comps: Vec<&str> = path.rsplitn(3, '/').collect();
+                let short = if comps.len() >= 2 {
+                    format!("{}/{}", comps[1], comps[0])
+                } else {
+                    path.to_string()
+                };
+                return format!("{}+{:#x}", short, pc - lo);
+            }
+        }
+        "?".to_string()
+    };
+    for (off, v) in cands {
+        crate::trace_log_line(&format!(
+            "6-Z460 BT-RAW: pid={} sp={:#x} @+{:#x} ret={:#x} {} (raw stack code-pointer — the FP chain cut at the abort trampoline)",
+            pid,
+            sp,
+            off,
+            v,
+            name_of(v)
+        ));
+    }
+}
+
+/// 6-Z460 companion: extract ≤`cap` raw code-pointer candidates from a
+/// stack window. A word qualifies when 8-aligned and inside an
+/// EXECUTABLE region other than `skip` (the trampoline's own).
+/// Consecutive words from the same region collapse to one candidate
+/// (the walk reports first-occurrence offsets only). Pure function —
+/// unit-tested against synthetic region/window shapes.
+fn z364_raw_candidates(
+    win: &[u8],
+    win_base: u64,
+    skip: Option<(u64, u64)>,
+    regions: &[(u64, u64, bool, String)],
+    cap: usize,
+) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut last_region: Option<usize> = None;
+    for i in 0..win.len() / 8 {
+        let v = u64::from_ne_bytes(win[i * 8..i * 8 + 8].try_into().unwrap());
+        if v & 7 != 0 {
+            continue;
+        }
+        let Some(ri) = regions.iter().position(|(lo, hi, ex, _)| {
+            *ex && v >= *lo && v < *hi && !skip.map_or(false, |(slo, shi)| v >= slo && v < shi)
+        }) else {
+            continue;
+        };
+        if last_region == Some(ri) {
+            continue;
+        }
+        last_region = Some(ri);
+        out.push((win_base + (i * 8) as u64, v));
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out
 }
 
 /// 6-Z370: dump the callee-save regions of the first frame records and
@@ -47764,6 +47871,83 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         );
         assert!(z306af_resolve_pc(&rows, 0xaaaa2000).is_none());
         assert!(z306af_resolve_pc(&rows, 0xaaaa0fff).is_none());
+    }
+
+    /// 6-Z460: the raw ret-scan candidate extraction — synthetic
+    /// region/window shapes: exec-region membership, the skip region
+    /// (the abort trampoline's own) excluded, consecutive same-region
+    /// words deduped, the cap honored, non-exec and unaligned words
+    /// ignored.
+    #[test]
+    fn z364_raw_candidates_filters_and_caps() {
+        let regions = vec![
+            (
+                0x1000u64,
+                0x2000u64,
+                true,
+                "r-xp /system/lib64/libc.so".to_string(),
+            ),
+            (
+                0x5000u64,
+                0x6000u64,
+                true,
+                "r-xp /system/lib64/libutils.so".to_string(),
+            ),
+            (
+                0x7000u64,
+                0x8000u64,
+                true,
+                "r-xp /system/lib64/libhidlbase.so".to_string(),
+            ),
+            (0x9000u64, 0xA000u64, false, "rw-p /data/stack".to_string()),
+        ];
+        let mut win = vec![0u8; 64];
+        let mut put = |i: usize, v: u64| win[i * 8..i * 8 + 8].copy_from_slice(&v.to_ne_bytes());
+        // 0: unaligned word (ignored)
+        put(0, 0x1007);
+        // 1: libc (trampoline region — would be skipped via `skip`)
+        put(1, 0x1080);
+        // 2: libutils first candidate
+        put(2, 0x5100);
+        // 3: libutils again (consecutive dedupe)
+        put(3, 0x5200);
+        // 4: non-exec stack region (ignored)
+        put(4, 0x9080);
+        // 5: libhidlbase second candidate
+        put(5, 0x7040);
+        // 6: libc again but NOT skipped when skip=None
+        put(6, 0x1100);
+
+        // With skip = libc region: utils then hidlbase.
+        let got = z364_raw_candidates(&win, 0xF000, Some((0x1000, 0x2000)), &regions, 8);
+        assert_eq!(
+            got,
+            vec![(0xF000 + 0x10, 0x5100), (0xF000 + 0x28, 0x7040)],
+            "skip region excluded, consecutive same-region deduped, non-exec ignored"
+        );
+
+        // Without skip: libc leads, utils dedupes, stack word ignored,
+        // and the trailing libc word is a DIFFERENT region than the
+        // preceding hidlbase — it is named too (dedupe is consecutive-only).
+        let got2 = z364_raw_candidates(&win, 0xF000, None, &regions, 8);
+        assert_eq!(
+            got2,
+            vec![
+                (0xF000 + 0x08, 0x1080),
+                (0xF000 + 0x10, 0x5100),
+                (0xF000 + 0x28, 0x7040),
+                (0xF000 + 0x30, 0x1100)
+            ],
+            "no skip: every non-consecutive region named"
+        );
+
+        // The cap bounds the output.
+        let got3 = z364_raw_candidates(&win, 0xF000, None, &regions, 2);
+        assert_eq!(got3.len(), 2, "cap honored");
+
+        // All-garbage window: no candidates.
+        let empty = z364_raw_candidates(&[0u8; 32], 0xF000, None, &regions, 8);
+        assert!(empty.is_empty());
     }
 
     /// 6-Z453: the Scudo abort-message address parse — the exact rn419
