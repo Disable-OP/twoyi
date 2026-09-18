@@ -2202,7 +2202,19 @@ enum DeferredReply {
     /// 6-Z306ae machinery) — for the composer this is the
     /// onClientDestroyed path that finally lets createClient #2+
     /// proceed past waitForClientDestroyedLocked.
-    RefCmd359 { br: u32, ptr: u64, cookie: u64 },
+    ///
+    /// 6-Z459 (Task 196): the node's LIFETIME grant counters snapshot at
+    /// the era close. The node entry may already be REMOVED (kernel-true
+    /// node lifetime: the entry dies at the both-maps-empty close) by
+    /// the time this mirror is delivered, so the 6-Z457 decode join
+    /// reads the counters from HERE, not from the node map.
+    RefCmd359 {
+        br: u32,
+        ptr: u64,
+        cookie: u64,
+        strong_grants: u32,
+        weak_grants: u32,
+    },
 }
 
 /// An incoming transaction queued for delivery to a server connection.
@@ -2381,7 +2393,12 @@ pub struct BusState {
     /// handle's value (MAP_FIXED → container OOM → app death).
     nodes: HashMap<u32, GuestNode>,
     /// (owner, ptr, cookie) → handle. Kernel-true handle identity: the
-    /// same node handed out repeatedly gets the SAME handle.
+    /// same node handed out repeatedly gets the SAME handle — WITHIN the
+    /// node's lifetime. 6-Z459 (Task 196): the entry is removed at the
+    /// both-maps-empty node-death moment (the kernel destroys the node
+    /// with its refs), so a post-death re-export of the same key creates
+    /// a FRESH node with a fresh handle instead of re-granting onto the
+    /// corpse (the rn426 reply-borne era-2 class).
     node_by_key: HashMap<(ConnId, u64, u64), u32>,
     next_conn: u64,
     next_txn: u64,
@@ -2441,8 +2458,11 @@ struct GuestNode {
     /// (every strong flat crossing). The per-holder maps drop to empty at
     /// the last-ref release — exactly when the 6-Z457 mirror fires — so
     /// the pre-delivery "bus grant count" the decode joins against the
-    /// guest's live mStrong must be a lifetime counter on the node entry
-    /// (which survives the release; freed only at owner death).
+    /// guest's live mStrong must be a lifetime counter on the node entry.
+    /// 6-Z459 (Task 196): the entry itself is removed at the node-death
+    /// moment (both maps empty, no registry pin), so the counters
+    /// SNAPSHOT into the queued RefCmd359 mirror at the era close — the
+    /// delivery-time join reads them from the mirror, not from the map.
     strong_grants: u32,
     /// 6-Z457: LIFETIME weak grants (weak flats + the implied weak of
     /// every strong grant — kernel `binder_inc_ref_for_node`).
@@ -3415,7 +3435,7 @@ impl BusState {
     /// (PREMATURE — the rn425 bug signature, must never appear),
     /// `absent` (client-side last ref on an unpinned node).
     fn z359_unref_node(&mut self, vm_id: u32, handle: u32, holder: ConnId, strong: bool) {
-        let (mirror, reg_pin_present, pin_mirror) = {
+        let (mirror, node_dead, node_key, reg_pin_present, pin_mirror) = {
             let Some(n) = self.nodes.get_mut(&handle) else {
                 return;
             };
@@ -3441,14 +3461,46 @@ impl BusState {
                     } else {
                         n.weak_notified = false;
                     }
-                    Some((n.owner, n.ptr, n.cookie))
+                    // 6-Z459: the LIFETIME counters snapshot into the
+                    // mirror — the entry is about to be removed (below),
+                    // and the delivery-time join reads them from HERE.
+                    Some((n.owner, n.ptr, n.cookie, n.strong_grants, n.weak_grants))
                 } else {
                     None
                 }
             };
-            (mirror, reg_pin_present, pin_mirror)
+            // 6-Z459 (Task 196): the kernel-true NODE-DEATH moment —
+            // BOTH maps empty means the driver node has no refs of any
+            // kind left: the node is destroyed WITH its refs. A pinned
+            // node never reaches this while registered (the registry
+            // pin lives in both maps — the Task 195 construction), so
+            // this fires exactly on: the client-side last ref, the
+            // registry pin's own drop, and the silent pin drop. The
+            // removal below makes a post-death re-export of the same
+            // (owner, ptr, cookie) a FRESH node identity instead of a
+            // re-grant onto the corpse (the rn426 reply-borne era-2
+            // mirrors-onto-a-freed-chunk class).
+            let node_dead = n.strong.is_empty() && n.weak.is_empty();
+            let node_key = (n.owner, n.ptr, n.cookie);
+            (mirror, node_dead, node_key, reg_pin_present, pin_mirror)
         };
-        let Some((owner, ptr, cookie)) = mirror else {
+        // 6-Z459: the node-death removal runs BEFORE the owner
+        // notification (kernel order: binder_dec_node destroys the
+        // node; the release mirror is best-effort). Every death path
+        // is covered — including the silent registry-pin drop, whose
+        // mirror never crosses but whose corpse entry must still go.
+        if node_dead {
+            self.nodes.remove(&handle);
+            self.node_by_key.remove(&node_key);
+            if Self::z359_release_log().load(Ordering::Relaxed) > 0 {
+                Self::z359_release_log().fetch_sub(1, Ordering::Relaxed);
+                info!(
+                    "[KR64][binder][vm{}] 6-Z459: node 0x{:08x} dead (both ref maps empty, no registry pin) — entry removed; re-exports get fresh node identities (kernel-true node lifetime)",
+                    vm_id, handle
+                );
+            }
+        }
+        let Some((owner, ptr, cookie, strong_grants, weak_grants)) = mirror else {
             return;
         };
         let br = if strong { BR_RELEASE } else { BR_DECREFS };
@@ -3480,8 +3532,13 @@ impl BusState {
         // refcounts, not from a memory probe. Delivery-time liveness is
         // the owner process /proc probe, checked in the RefCmd359 arm.
         if let Some(box_) = self.conns.get_mut(&owner) {
-            box_.reply_queue
-                .push_back(DeferredReply::RefCmd359 { br, ptr, cookie });
+            box_.reply_queue.push_back(DeferredReply::RefCmd359 {
+                br,
+                ptr,
+                cookie,
+                strong_grants,
+                weak_grants,
+            });
             // 6-Z454: the era's release is queued (the owner conn exists)
             // — the ledger checks it against this node's emitted acquires
             // (V1: a release past the acquire count is the
@@ -3532,10 +3589,14 @@ impl BusState {
                 );
             }
         }
-        // The node entry STAYS (the key map must stay consistent — the
-        // owner may re-export the same node and the handle must be
-        // stable); the entry is a few dozen bytes and the boot creates
-        // O(100). Freed when the OWNER connection dies (unregister_conn).
+        // 6-Z459: the node entry is NOT kept anymore — the kernel-true
+        // node lifetime. The both-maps-empty death above already removed
+        // the entry (nodes + node_by_key), so the handle is stable only
+        // WITHIN the node's lifetime and a re-export of the same key
+        // creates a fresh identity (fresh handle, fresh notification
+        // eras, fresh counters — the join counters rode the queued
+        // mirror). No era-2 mirror can ever land on the chunk the
+        // era-1 release already freed (the rn426 corpse-regrant class).
     }
 
     /// 6-Z458 (Task 195): book the REGISTRY's own strong+weak pin on the
@@ -5457,7 +5518,13 @@ fn handle_write_read(
                         push_br_noop(&mut read_buf);
                     }
                 }
-                DeferredReply::RefCmd359 { br, ptr, cookie } => {
+                DeferredReply::RefCmd359 {
+                    br,
+                    ptr,
+                    cookie,
+                    strong_grants: node_strong_grants,
+                    weak_grants: node_weak_grants,
+                } => {
                     // 6-Z359: kernel-true node-ref mirror. The decision
                     // was made from the proxy's own refcounts at
                     // BC_RELEASE/death time — the ONLY delivery gate is
@@ -5465,22 +5532,22 @@ fn handle_write_read(
                     // the 6-Z354 oracle): a dead owner cannot run
                     // decStrong and the conn teardown is already
                     // dismantling its mailbox.
-                    let (dpid, node_strong_grants, node_weak_grants) = {
+                    let (dpid, node_entry_live) = {
                         let b = bus.lock().expect("binder bus poisoned");
                         let pid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
-                        // 6-Z457: the node's LIFETIME grant counts (the
-                        // per-holder maps are already empty at last-ref —
-                        // the lifetime counters on the surviving node
-                        // entry are the bus-side join for the guest read).
-                        let (sg, wg) = match b
+                        // 6-Z459: the lifetime counters RIDE the queued
+                        // mirror (the node entry is removed at the
+                        // both-maps-empty death — kernel-true node
+                        // lifetime — so the map can no longer be the
+                        // join's source). The map read now only names
+                        // the entry's liveness for the decode witness:
+                        // node=live | node-dead in the 6-Z457 line.
+                        let node_entry_live = b
                             .node_by_key
                             .get(&(conn_id, ptr, cookie))
                             .and_then(|h| b.nodes.get(h))
-                        {
-                            Some(n) => (n.strong_grants, n.weak_grants),
-                            None => (0, 0),
-                        };
-                        (pid, sg, wg)
+                            .is_some();
+                        (pid, node_entry_live)
                     };
                     let owner_alive = dpid > 0 && crate::ptrace_emu::traced_child_alive(dpid);
                     if owner_alive {
@@ -5513,7 +5580,7 @@ fn handle_write_read(
                                 Some(st) => {
                                     let (ae, re, ad, rd) = z454_counts(dpid, ptr, cookie);
                                     info!(
-                                        "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} br=0x{:08x} W=0x{:x} mStrong={} (count={}) mWeak={} mBase=0x{:x} (delta=0x{:x} vs cookie 0x{:x}) mFlags={} ledger[emit acq={} rel={} / del acq={} rel={}] node-grants[strong={} weak={}] class={}",
+                                        "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} br=0x{:08x} W=0x{:x} mStrong={} (count={}) mWeak={} mBase=0x{:x} (delta=0x{:x} vs cookie 0x{:x}) mFlags={} ledger[emit acq={} rel={} / del acq={} rel={}] node-grants[strong={} weak={}] node={} class={}",
                                         vm_id, dpid, br, ptr,
                                         st.strong_raw,
                                         crate::ptrace_emu::z457_strong_count(st.strong_raw),
@@ -5521,6 +5588,7 @@ fn handle_write_read(
                                         st.mbase.wrapping_sub(cookie), cookie,
                                         st.flags, ae, re, ad, rd,
                                         node_strong_grants, node_weak_grants,
+                                        if node_entry_live { "live" } else { "node-dead" },
                                         crate::ptrace_emu::z457_classify(st.strong_raw)
                                     );
                                 }
@@ -12338,11 +12406,19 @@ mod tests {
         assert!(!node.strong_notified, "strong era re-armed");
         assert!(node.weak_notified, "weak era still notified");
 
-        // Drop the weak ref too: BR_DECREFS + weak re-arm.
+        // Drop the weak ref too: BR_DECREFS + weak re-arm — and the
+        // 6-Z459 NODE-DEATH moment: BOTH maps empty means the kernel
+        // destroys the node with its refs; the entry is REMOVED (the
+        // pre-6-Z459 corpse-entry semantics are retired).
         bus.z359_unref_node(0, handle, recipient, false);
-        let node = bus.nodes.get(&handle).expect("node survives");
-        assert!(node.weak.is_empty());
-        assert!(!node.weak_notified, "weak era re-armed");
+        assert!(
+            !bus.nodes.contains_key(&handle),
+            "node-dead: the entry is removed at the both-maps-empty close"
+        );
+        assert!(
+            !bus.node_by_key.contains_key(&(owner, ptr, cookie)),
+            "the key map is consistent with the node death"
+        );
 
         // A fresh export of the same object re-notifies BOTH. (Rebuild
         // the flat: the first crossing rewrote it to HANDLE form.)
@@ -12354,11 +12430,14 @@ mod tests {
         offsets.extend_from_slice(&0u64.to_ne_bytes());
         let grants2 =
             bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
-        assert_eq!(grants2[0].handle, handle, "stable handle across eras");
+        assert_ne!(
+            grants2[0].handle, handle,
+            "a post-death re-export is a FRESH node identity (kernel-true node lifetime), not a re-grant onto the corpse"
+        );
         assert_eq!(
             grants2[0].mirrors,
             vec![(BR_INCREFS, ptr, cookie), (BR_ACQUIRE, ptr, cookie)],
-            "the new era re-notifies"
+            "the fresh node's eras re-notify BOTH"
         );
     }
 
@@ -12832,6 +12911,156 @@ mod tests {
             "a pin whose acquire never crossed drops silently"
         );
         assert_eq!(z458_owner_refcmd359_count(&bus, owner, BR_DECREFS), 0);
+    }
+
+    /// 6-Z459 companion: read the LIFETIME counters carried by the last
+    /// queued RefCmd359 mirror of `br` on `owner`'s reply_queue (the
+    /// delivery-time join's source now that the node entry dies at the
+    /// both-maps-empty close).
+    fn z459_last_refcmd359_counters(bus: &BusState, owner: ConnId, br: u32) -> (u32, u32) {
+        bus.conns
+            .get(&owner)
+            .map(|b| {
+                b.reply_queue
+                    .iter()
+                    .filter_map(|r| match r {
+                        DeferredReply::RefCmd359 {
+                            br: b2,
+                            strong_grants,
+                            weak_grants,
+                            ..
+                        } if *b2 == br => Some((*strong_grants, *weak_grants)),
+                        _ => None,
+                    })
+                    .next_back()
+                    .unwrap_or((0, 0))
+            })
+            .unwrap_or((0, 0))
+    }
+
+    #[test]
+    fn z459_reply_borne_regrant_gets_a_fresh_node_identity() {
+        // THE rn426 reply-borne corpse-regrant shape, fixed. Era 1's
+        // last ref closes BOTH maps → the node entry is REMOVED
+        // (kernel-true node lifetime: the driver node dies with its
+        // refs). The next reply's re-export of the same (ptr, cookie)
+        // creates a FRESH node identity with a fresh handle — era-2's
+        // mirrors open a NEW notification era and NO mirror lands on
+        // the freed chunk's old identity (the era-2-mirrors-onto-a-
+        // freed-chunk class that kept the suspend-service death storm
+        // alive through the 6-Z458 registry-pin fix).
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let client = bus.register_conn();
+        if let Some(bx) = bus.conns.get_mut(&owner) {
+            bx.sender_pid = z454_unique_pid();
+        }
+        let ptr = 0x8100_E000u64;
+        let cookie = 0x6100_F000u64;
+
+        // Era 1: the reply-borne flat crossing grants strong+implied
+        // weak and opens BOTH notification eras (no registry pin on
+        // this shape — a pure reply flat, the rn426 five-W shape).
+        let (h1, mirrors1) = bus.z359_grant_node(owner, client, ptr, cookie, true);
+        assert!(mirrors1.iter().any(|(br, _, _)| *br == BR_INCREFS));
+        assert!(mirrors1.iter().any(|(br, _, _)| *br == BR_ACQUIRE));
+        assert!(bus.nodes.contains_key(&h1), "era-1 node entry live");
+
+        // Era 1 closes: the last client's strong drop mirrors
+        // BR_RELEASE (weak still held — no death yet); the weak drop
+        // mirrors BR_DECREFS and BOTH maps empty → the entry is
+        // REMOVED (nodes + node_by_key).
+        bus.z359_unref_node(0, h1, client, true);
+        assert!(
+            bus.nodes.contains_key(&h1),
+            "strong-only close keeps the entry (the implied weak still holds)"
+        );
+        bus.z359_unref_node(0, h1, client, false);
+        assert_eq!(z458_owner_refcmd359_count(&bus, owner, BR_RELEASE), 1);
+        assert_eq!(z458_owner_refcmd359_count(&bus, owner, BR_DECREFS), 1);
+        assert!(
+            !bus.nodes.contains_key(&h1),
+            "node-dead: entry removed at the both-maps-empty era close"
+        );
+        assert!(
+            !bus.node_by_key.contains_key(&(owner, ptr, cookie)),
+            "key map consistent with the node death"
+        );
+
+        // The queued release mirror carried the era-1 lifetime
+        // counters — the delivery-time join survives the entry's
+        // removal (the (0,0) blind read is retired with the entry).
+        let (sg1, wg1) = z459_last_refcmd359_counters(&bus, owner, BR_RELEASE);
+        assert_eq!((sg1, wg1), (1, 1), "era-1 counters ride the mirror");
+
+        // Era 2: the same (owner, ptr, cookie) re-exported in the next
+        // reply — a FRESH node identity (new handle), a NEW
+        // notification era (INCREFS+ACQUIRE again — the pre-fix shape
+        // re-granted SILENTLY onto the corpse via the surviving
+        // entry), and the corpse's counters are NOT inherited.
+        let (h2, mirrors2) = bus.z359_grant_node(owner, client, ptr, cookie, true);
+        assert_ne!(h2, h1, "re-export after node death = fresh handle");
+        assert_eq!(
+            mirrors2,
+            vec![(BR_INCREFS, ptr, cookie), (BR_ACQUIRE, ptr, cookie)],
+            "a fresh node opens fresh eras"
+        );
+        let node2 = bus.nodes.get(&h2).expect("fresh node entry");
+        assert_eq!(
+            node2.strong_grants, 1,
+            "fresh identity: era-2's own grant only (the corpse's era-1 grants are gone)"
+        );
+
+        // Era 2 closes the same way: mirrors onto the LIVE era-2
+        // object, then the entry is buried again — no residue, no
+        // third-era corpse.
+        bus.z359_unref_node(0, h2, client, true);
+        bus.z359_unref_node(0, h2, client, false);
+        assert_eq!(z458_owner_refcmd359_count(&bus, owner, BR_RELEASE), 2);
+        assert_eq!(z458_owner_refcmd359_count(&bus, owner, BR_DECREFS), 2);
+        assert!(!bus.nodes.contains_key(&h2));
+        assert!(!bus.node_by_key.contains_key(&(owner, ptr, cookie)));
+        let (sg2, wg2) = z459_last_refcmd359_counters(&bus, owner, BR_RELEASE);
+        assert_eq!(
+            (sg2, wg2),
+            (1, 1),
+            "era-2's counters are the FRESH node's (not the accumulated 2)"
+        );
+    }
+
+    #[test]
+    fn z459_silent_pin_drop_also_buries_the_dead_node() {
+        // The silent registry-pin drop (the add arm's acquire never
+        // crossed — the rn425 suspend shape) empties BOTH maps too:
+        // the node-death removal covers THAT path as well — no wire
+        // release AND no corpse entry a re-export could re-grant.
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let next_gen = bus.register_conn();
+        let ptr = 0x8110_0000u64;
+        let cookie = 0x6110_1000u64;
+        bus.add_guest_service("x.y@1.0::IFoo/default", owner, ptr, cookie);
+        bus.z458_registry_pin_add(owner, ptr, cookie, false);
+        let h = *bus
+            .node_by_key
+            .get(&(owner, ptr, cookie))
+            .expect("pinned node entry");
+        bus.add_guest_service(
+            "x.y@1.0::IFoo/default",
+            next_gen,
+            ptr.wrapping_add(0x1000),
+            cookie.wrapping_add(0x1000),
+        );
+        assert_eq!(
+            z458_owner_refcmd359_count(&bus, owner, BR_RELEASE),
+            0,
+            "the silent drop never crosses the wire"
+        );
+        assert!(
+            !bus.nodes.contains_key(&h),
+            "dead node buried on the silent path too"
+        );
+        assert!(!bus.node_by_key.contains_key(&(owner, ptr, cookie)));
     }
 
     #[test]
