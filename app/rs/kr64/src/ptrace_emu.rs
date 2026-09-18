@@ -12539,6 +12539,199 @@ fn z451_boot_image_unmap_line(pid: libc::pid_t, addr: u64, len: u64, path: &str,
     ));
 }
 
+// ── 6-Z452: the BOOT-IMAGE WINDOW ground truth (rn418 decode) ───────────
+//
+// The rn418 re-decode of the artifacts AGAINST the real android-11 ART
+// sources (android11-d1-release, kImageVersion "085" — the guest's exact
+// image format) DISPROVED the Task 187 mechanism:
+//   * A11 `MemMap::MapFileAtAddress` FORBIDS MAP_FIXED for the primary
+//     boot image (`CHECK_EQ(0, flags & MAP_FIXED)` in the non-reuse,
+//     non-reservation branch) — the "emulator must pass MAP_FIXED
+//     through" fix premise was aimed at a call shape the guest never
+//     makes.
+//   * The observed 2 ms map→unmap pairs of the .art files are the A11
+//     COPY PATH's NORMAL temp-map release (`LoadImageFile` maps
+//     `sizeof(ImageHeader)+stored_size` of the COMPRESSED image at a
+//     kernel-chosen address, memcpy/LZ4-decompresses into the anonymous
+//     image reservation, releases the temp) — NOT a rejection.
+//   * The boot.oat/boot.vdex REAL mappings SURVIVED at
+//     [0x6ff5d000, 0x703e6000) — the low-4 GB window is USABLE in the
+//     guest and nothing rejected the chain.
+//   * The per-generation heap bases (0xe139c0014380 / 0xe87856007380 /
+//     0xfd2730414380 / 0xee85c5213380) vary in ASLR shape, which matches
+//     `relocate_ ? ART_BASE_ADDRESS + ChooseRelocationOffsetDelta()` —
+//     A11 loads the boot image into a RANDOMLY-PLACED reservation and
+//     RELOCATES it, so the image can work at ANY base and the heap
+//     follows it.
+// The decisive open question is now binary: does the zygote's boot
+// image LOAD (relocated, image-less conclusions wrong) or FAIL
+// (somewhere the fd-backed instruments cannot see)? Both the
+// reservation and the image copies are ANONYMOUS mappings — invisible
+// to 6-Z451. This instrument names them three ways:
+//   * WINDOW-ANON: every anonymous mmap ≥ 24 MiB ANYWHERE (the
+//     reservation shape: `ReserveBootImageMemory(base, ~35 MB + extra,
+//     PROT_NONE)`), plus window hits (result or request inside
+//     [0x60000000, 0x80000000)) ≥ 512 KiB — the logged RESULT vs the
+//     requested address and the 0x70000000 delta NAME the relocation
+//     base (or the failure) directly on the wire.
+//   * MAPS-SNAPSHOT: at the pid's FIRST and LAST boot-image unmap
+//     (bracketing the whole load), dump the rows of /proc/<pid>/maps
+//     that intersect [0x60000000, 0x80000000) — the reservation, the
+//     anonymous image copies, the zygote space and the oats as they
+//     ACTUALLY sit.
+//   * NAMED-ANON: the same snapshots also scan the FULL maps for named
+//     anonymous rows ([anon:...boot.art] etc. — A11 names its image
+//     MemMaps via PR_SET_VMA/PR_SET_VMA_ANON_NAME) — the copies
+//     announce their location wherever relocation put them.
+const Z452_WINDOW_LO: u64 = 0x6000_0000;
+const Z452_WINDOW_HI: u64 = 0x8000_0000;
+/// The reservation shape: PROT_NONE + ≥ 24 MiB (the rn418 chain spans
+/// ~35.2 MB; the zygote extra reservation rides on top).
+const Z452_RESERVATION_MIN_BYTES: u64 = 24 * 1024 * 1024;
+/// Window-hit floor: the per-component image copies are 0x1000..0xbd000.
+const Z452_WINDOW_ANON_MIN_BYTES: u64 = 0x8_0000;
+
+/// 6-Z452: does this anonymous mapping carry information about the boot
+/// image window? (length gate only — the address gates live at the call
+/// sites where the requested and returned addresses are both known).
+fn z452_anon_shape_relevant(len: u64, req: u64, ret: Option<u64>) -> bool {
+    if len >= Z452_RESERVATION_MIN_BYTES {
+        return true;
+    }
+    if len < Z452_WINDOW_ANON_MIN_BYTES {
+        return false;
+    }
+    let in_window = |a: u64| (Z452_WINDOW_LO..Z452_WINDOW_HI).contains(&a);
+    in_window(req) || ret.map(in_window).unwrap_or(false)
+}
+
+/// 6-Z452: the stashed ENTRY shape of a relevant anonymous mmap (the
+/// aarch64 EXIT stop cannot recover these — the 6-Z362 lesson).
+struct Z452AnonShape {
+    len: u64,
+    prot: u64,
+    flags: u64,
+    req: u64,
+}
+
+/// 6-Z452: human text for the mapping base relative to the classic
+/// compiled base 0x70000000 — the relocation delta reads itself.
+fn z452_delta_text(ret: u64) -> String {
+    if ret < 0x7000_0000 {
+        format!("-{:#x}", 0x7000_0000 - ret)
+    } else {
+        format!("+{:#x}", ret - 0x7000_0000)
+    }
+}
+
+/// 6-Z452: the /proc/<pid>/maps rows intersecting [lo, hi), capped.
+/// Rows keep their verbatim form (start-end perms offset ... name).
+fn z452_window_rows(maps: &str, lo: u64, hi: u64, cap: usize) -> Vec<&str> {
+    let mut rows = Vec::new();
+    for line in maps.lines() {
+        let range = match line.split_whitespace().next() {
+            Some(r) => r,
+            None => continue,
+        };
+        let mut it = range.splitn(2, '-');
+        let start = match it.next().and_then(|s| u64::from_str_radix(s, 16).ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let end = match it.next().and_then(|s| u64::from_str_radix(s, 16).ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        if end > lo && start < hi {
+            rows.push(line);
+            if rows.len() >= cap {
+                break;
+            }
+        }
+    }
+    rows
+}
+
+/// 6-Z452: the named-anonymous rows of a maps file — the A11 image
+/// copies announce themselves via PR_SET_VMA names wherever the
+/// relocation placed them. Kept verbatim, capped.
+///
+/// The name is extracted from the `[anon:` marker (not the last
+/// whitespace field) because PR_SET_VMA names contain spaces
+/// ("[anon:boot image reservation]") and the kernel writes them
+/// verbatim as the row's tail.
+fn z452_named_anon_rows(maps: &str, cap: usize) -> Vec<&str> {
+    const MARKER: &str = "[anon:";
+    let mut rows = Vec::new();
+    for line in maps.lines() {
+        if let Some(pos) = line.find(MARKER) {
+            let name = &line[pos + MARKER.len()..];
+            let name = name.strip_suffix(']').unwrap_or(name);
+            let lower = name.to_ascii_lowercase();
+            if ["boot", "image", "oat", "vdex", "dalvik", "zygote", "space"]
+                .iter()
+                .any(|k| lower.contains(k))
+            {
+                rows.push(line);
+                if rows.len() >= cap {
+                    break;
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// 6-Z452: the WINDOW-ANON verdict line (anonymous mmap of the
+/// reservation/copy shape — result names the relocation base).
+fn z452_window_anon_line(pid: libc::pid_t, shape: &Z452AnonShape, ret: i64, n: u64) {
+    if ret < 0 && ret > -4096 {
+        crate::trace_log_line(&format!(
+            "6-Z452 WINDOW-ANON: pid={} len={:#x} prot={:#x} flags={:#x} req={:#x} -> -errno {} (FAILED anon mmap) [#{}]",
+            pid, shape.len, shape.prot, shape.flags, shape.req, -ret, n
+        ));
+    } else {
+        let ret = ret as u64;
+        crate::trace_log_line(&format!(
+            "6-Z452 WINDOW-ANON: pid={} len={:#x} prot={:#x} flags={:#x} req={:#x} -> {:#x} (delta from 0x70000000: {}) [#{}]",
+            pid,
+            shape.len,
+            shape.prot,
+            shape.flags,
+            shape.req,
+            ret,
+            z452_delta_text(ret),
+            n
+        ));
+    }
+}
+
+/// 6-Z452: the /proc/<pid>/maps snapshot line(s) — window rows first,
+/// then the named-anon rows from the FULL file (both capped).
+fn z452_maps_snapshot(pid: libc::pid_t, phase: &str, maps: &str) {
+    for (i, row) in z452_window_rows(maps, Z452_WINDOW_LO, Z452_WINDOW_HI, 48)
+        .into_iter()
+        .enumerate()
+    {
+        crate::trace_log_line(&format!(
+            "6-Z452 MAPS-SNAPSHOT: pid={} phase={} win#{:02}: {}",
+            pid,
+            phase,
+            i + 1,
+            row
+        ));
+    }
+    for (i, row) in z452_named_anon_rows(maps, 16).into_iter().enumerate() {
+        crate::trace_log_line(&format!(
+            "6-Z452 MAPS-SNAPSHOT: pid={} phase={} named#{:02}: {}",
+            pid,
+            phase,
+            i + 1,
+            row
+        ));
+    }
+}
+
 /// 6-Z449 v3 (rn415 decode): resolve a mirror object's Java class NAME
 /// through the compressed-reference heap by SELF-LOCATING the base.
 ///
@@ -18254,8 +18447,23 @@ pub fn run_ptrace_loop(
     // recorded at every SUCCESSFUL boot-image mmap and consulted at the
     // munmap ENTRY (the requested addr matches the stash → the image is
     // being discarded: the survival question decides whether ART kept
-    // the image or silently rejected it after mapping).
+    // the image or silently rejected it).
     let mut live_boot_image_maps: std::collections::HashMap<libc::pid_t, Vec<(u64, u64, String)>> =
+        std::collections::HashMap::new();
+    // 6-Z452: per-pid stash for ANONYMOUS mmaps of the image-window /
+    // reservation shape — the full ENTRY shape (len, prot, flags, req)
+    // (aarch64 clobbers the args before EXIT — the 6-Z362 lesson).
+    // Consumed at the mmap EXIT to log the result: the RESULT of the
+    // ~35 MB PROT_NONE reservation IS the relocation base (or the
+    // failure the fd-backed instruments cannot see).
+    let mut pending_window_mmap: std::collections::HashMap<libc::pid_t, Z452AnonShape> =
+        std::collections::HashMap::new();
+    // 6-Z452: snapshot bookkeeping per pid — (first-unmap done, unmaps
+    // seen). Snapshots fire at the FIRST and LAST boot-image unmap per
+    // pid (they bracket the whole load): at the first, the reservation
+    // + the primary copy are live; at the last, the chain's final
+    // state. Two snapshots per pid, six pids, hard-capped.
+    let mut z452_snapshot_state: std::collections::HashMap<libc::pid_t, (bool, u32)> =
         std::collections::HashMap::new();
     // Per-pid counters: (events, total_bytes, max_single, milestone_mask).
     // The mask's bits are cleared as each 6-Z362_MILESTONES threshold is
@@ -32172,6 +32380,37 @@ pub fn run_ptrace_loop(
                                             z451u + 1,
                                         );
                                     }
+                                    // ── 6-Z452: window snapshot at the FIRST
+                                    // and LAST boot-image unmap ── the two
+                                    // moments bracket the whole load: at the
+                                    // first, the reservation + the primary
+                                    // copy are live; at the last, the chain's
+                                    // final state (loaded-and-kept vs
+                                    // rolled-back reads directly off the
+                                    // rows). The tracee is stopped at its
+                                    // syscall ENTRY — /proc/<pid>/maps is
+                                    // stable to read here.
+                                    {
+                                        let (first_done, snaps) =
+                                            z452_snapshot_state.entry(pid).or_insert((false, 0u32));
+                                        let now_last = v.is_empty();
+                                        if *snaps < 2 && (!*first_done || now_last) {
+                                            let phase = if *first_done { "last" } else { "first" };
+                                            *first_done = true;
+                                            *snaps += 1;
+                                            if let Ok(maps) = std::fs::read_to_string(format!(
+                                                "/proc/{}/maps",
+                                                pid
+                                            )) {
+                                                z452_maps_snapshot(pid, phase, &maps);
+                                            } else {
+                                                crate::trace_log_line(&format!(
+                                                    "6-Z452 MAPS-SNAPSHOT: pid={} phase={} UNREADABLE",
+                                                    pid, phase
+                                                ));
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -32227,6 +32466,36 @@ pub fn run_ptrace_loop(
                                                 .insert(pid, (fd, z451_len, p451));
                                         }
                                     }
+                                }
+                            }
+                            // ── 6-Z452: IMAGE-WINDOW anon mmap ENTRY stash ──
+                            // The rn418 re-decode: the A11 load runs the COPY
+                            // path — the reservation and the image copies are
+                            // ANONYMOUS (invisible to 6-Z451). Stash
+                            // (len, prot, flags, req) NOW for the shapes that
+                            // can name them: ≥ 24 MiB anywhere (the
+                            // `ReserveBootImageMemory` reservation shape) and
+                            // window hits ≥ 512 KiB (the copies / the zygote
+                            // space). The EXIT logs the result — the
+                            // relocation base reads itself.
+                            {
+                                let z452_len = get_syscall_arg(&regs, abi.reg_arg2);
+                                let z452_req = get_syscall_arg(&regs, abi.reg_arg1);
+                                let z452_anon = (flags & libc::MAP_ANONYMOUS) != 0;
+                                if z452_anon
+                                    && z452_len > 0
+                                    && z452_anon_shape_relevant(z452_len, z452_req, None)
+                                {
+                                    let z452_prot = get_syscall_arg(&regs, abi.reg_arg3);
+                                    pending_window_mmap.insert(
+                                        pid,
+                                        Z452AnonShape {
+                                            len: z452_len,
+                                            prot: z452_prot,
+                                            flags: flags as u64,
+                                            req: z452_req,
+                                        },
+                                    );
                                 }
                             }
                             // ── 6-Z305t-42: binder-fd mmap probe (ENTRY) ──
@@ -34398,6 +34667,30 @@ pub fn run_ptrace_loop(
                                 let v = live_boot_image_maps.entry(pid).or_default();
                                 if v.len() < 16 {
                                     v.push((b_ret as u64, b_len, b_path.clone()));
+                                }
+                            }
+                        }
+                        // ── 6-Z452: IMAGE-WINDOW anon verdict ──
+                        // The result of the reservation-shaped anonymous
+                        // mmap IS the boot image's relocation base (or the
+                        // failure the fd-backed instruments cannot see).
+                        if let Some(shape) = pending_window_mmap.remove(&pid) {
+                            let w_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            static Z452_ANON_EVENTS: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            static Z452_ANON_FAIL: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if w_ret < 0 && w_ret > -4096 {
+                                let f = Z452_ANON_FAIL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if f < 16 {
+                                    z452_window_anon_line(pid, &shape, w_ret, f + 1);
+                                }
+                            } else {
+                                let e = Z452_ANON_EVENTS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if e < 96 {
+                                    z452_window_anon_line(pid, &shape, w_ret, e + 1);
                                 }
                             }
                         }
@@ -55125,7 +55418,10 @@ mod z404_park_probe_tests {
 
 #[cfg(test)]
 mod z449_class_name_tests {
-    use super::{z449_decode_string_bytes, z449_encode_u32_at};
+    use super::{
+        z449_decode_string_bytes, z449_encode_u32_at, z452_anon_shape_relevant, z452_delta_text,
+        z452_named_anon_rows, z452_window_rows, Z452_WINDOW_HI, Z452_WINDOW_LO,
+    };
 
     /// An A11 compressed (u8) String mirror: count_ = (len << 1) | 1,
     /// chars INLINE at +16 — "java.lang.Thread" (17 chars, odd).
@@ -55214,5 +55510,132 @@ mod z449_class_name_tests {
         let mut head = [0u8; 48];
         head[28..32].copy_from_slice(&0x1234_5678u32.to_ne_bytes());
         assert_eq!(z449_encode_u32_at(&head, 28), 0x1234_5678);
+    }
+
+    // ── 6-Z452: the boot-image WINDOW ground truth (rn418 decode) ────────
+
+    /// The shape gate: the ~35 MB reservation is relevant ANYWHERE (the
+    /// relocation may place it high); the copies matter only in the
+    /// classic window; sub-512 KiB anon mmaps are noise (scudo etc.).
+    #[test]
+    fn z452_anon_shape_gate() {
+        // The reservation shape: ≥ 24 MiB, any address (incl. high ASLR bases).
+        assert!(z452_anon_shape_relevant(
+            35 * 1024 * 1024,
+            0x7000_0000,
+            Some(0xe139_0000_0000)
+        ));
+        assert!(z452_anon_shape_relevant(
+            24 * 1024 * 1024,
+            0,
+            Some(0xffff_8000_0000_0000)
+        ));
+        // Just under the reservation floor, in-window: the 2.7 MB image
+        // copy requested at the compiled base.
+        assert!(z452_anon_shape_relevant(
+            0x28f_000,
+            0x7000_0000,
+            Some(0x7000_0000 + 0x28f_000)
+        ));
+        // Just under the reservation floor, result in-window.
+        assert!(z452_anon_shape_relevant(0x10_0000, 0, Some(0x7230_0000)));
+        // Same size OUTSIDE the window on both ends: noise.
+        assert!(!z452_anon_shape_relevant(
+            0x10_0000,
+            0,
+            Some(0xe139_0000_0000)
+        ));
+        // Sub-512 KiB: never (the 0x1000/0x5000 probes are noise).
+        assert!(!z452_anon_shape_relevant(
+            0x5_000,
+            0x7000_0000,
+            Some(0x7000_0000)
+        ));
+        // Window boundary semantics: [lo, hi) half-open.
+        assert!(z452_anon_shape_relevant(
+            0x8_0000,
+            Z452_WINDOW_LO,
+            Some(Z452_WINDOW_LO)
+        ));
+        assert!(!z452_anon_shape_relevant(
+            0x8_0000,
+            Z452_WINDOW_HI,
+            Some(Z452_WINDOW_HI)
+        ));
+    }
+
+    /// The delta text names the relocation base relative to the classic
+    /// compiled base 0x70000000 in both directions.
+    #[test]
+    fn z452_delta_text_directions() {
+        assert_eq!(z452_delta_text(0x7000_0000), "+0x0");
+        assert_eq!(z452_delta_text(0x6ff5_d000), "-0xa3000");
+        assert_eq!(z452_delta_text(0xe139_0000_0000), "+0xe13890000000");
+    }
+
+    /// The window-row filter: intersecting rows in order, capped,
+    /// boundaries half-open, malformed lines skipped.
+    #[test]
+    fn z452_window_rows_filter() {
+        let maps = "\
+00400000-00401000 r-xp 00000000 fd:01 123        /system/bin/app_process64\n\
+6ff5d000-6ffdd000 rw-p 00000000 00:05 456        /apex/com.android.art/javalib/arm64/boot.oat\n\
+70000000-7028f000 rw-p 00000000 00:05 789        /apex/com.android.art/javalib/arm64/boot.art\n\
+7fffffff-80000000 ---p 00000000 00:00 0          [anon:guard]\n\
+80001000-80002000 rw-p 00000000 00:00 0          [stack]\n\
+not-a-maps-line\n\
+e139c0000000-e139c0144000 rw-p 00000000 00:00 0  [anon:relocated heap]\n";
+        let rows = z452_window_rows(maps, Z452_WINDOW_LO, Z452_WINDOW_HI, 48);
+        assert_eq!(
+            rows.len(),
+            3,
+            "oat + art + guard rows; out-of-window skipped"
+        );
+        assert!(rows[0].starts_with("6ff5d000-"));
+        assert!(rows[1].starts_with("70000000-"));
+        assert!(rows[2].starts_with("7fffffff-"));
+        // Half-open: a map ending exactly at lo is out; starting exactly
+        // at hi is out. A map ending AT lo start... end==lo → excluded.
+        let boundary = "\
+10000000-60000000 rw-p 00000000 00:00 0  [ends at lo]\n\
+60000000-60001000 rw-p 00000000 00:00 0  [starts at lo]\n\
+70000000-80000000 rw-p 00000000 00:00 0  [spans the window]\n";
+        let rows = z452_window_rows(boundary, Z452_WINDOW_LO, Z452_WINDOW_HI, 48);
+        assert_eq!(rows.len(), 2, "end==lo excluded, start==hi excluded");
+        assert!(rows[0].contains("starts at lo"));
+        assert!(rows[1].contains("spans the window"));
+        // The cap: first N wins.
+        let rows = z452_window_rows(maps, Z452_WINDOW_LO, Z452_WINDOW_HI, 1);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].starts_with("6ff5d000-"));
+    }
+
+    /// The named-anon scan: A11 names its image MemMaps via PR_SET_VMA;
+    /// the scan keeps the image-shaped rows wherever they land.
+    #[test]
+    fn z452_named_anon_scan() {
+        let maps = "\
+70000000-7028f000 rw-p 00000000 00:00 0              [anon:/apex/com.android.art/javalib/arm64/boot.art]\n\
+7028f000-72317000 ---p 00000000 00:00 0               [anon:boot image reservation]\n\
+72317000-72417000 rw-p 00000000 00:00 0               [anon:zygote space]\n\
+f87039800000-f8709bff2fff --- 0 627f3000              [anon:cfi shadow]\n\
+f870b980a000-f870b9849fff rw- 0 40000                 [anon:scudo:primary]\n\
+e139c0000000-e139c0144000 rw-p 00000000 00:00 0       [anon:dalvik-non moving space]\n\
+ee86e52a5000-ee86e5e62000 rw-p 00000000 00:05 1       (unnamed file map)\n";
+        let rows = z452_named_anon_rows(maps, 16);
+        assert_eq!(
+            rows.len(),
+            4,
+            "boot.art + reservation + zygote space + dalvik"
+        );
+        assert!(rows[0].contains("boot.art"));
+        assert!(rows[1].contains("boot image reservation"));
+        assert!(rows[2].contains("zygote space"));
+        assert!(rows[3].contains("dalvik-non moving space"));
+        // The cap.
+        assert_eq!(z452_named_anon_rows(maps, 2).len(), 2);
+        // Non-anon or image-named FILE rows never match.
+        let plain = "70000000-7028f000 rw-p 00000000 00:05 1 /data/rootfs/apex/.../boot.art\n";
+        assert!(z452_named_anon_rows(plain, 16).is_empty());
     }
 }
