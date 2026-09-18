@@ -12269,7 +12269,7 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
     );
     if let Some(h) = hit {
         if h >= 64 && h + 8 <= mons.len() {
-            // owner candidates under both adjacency interpretations.
+            // Owner candidates under both adjacency interpretations.
             let cand_a = u64::from_ne_bytes(mons[h - 24..h - 16].try_into().unwrap());
             let cand_b = u64::from_ne_bytes(mons[h - 32..h - 24].try_into().unwrap());
             line.push_str(&format!(
@@ -12292,6 +12292,64 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
         .collect();
     line.push_str(&format!(" head=[{}]", words.join(" ")));
     crate::trace_log_line(&line);
+    // ── 6-Z447 CALIBRATED LAYOUT (rn411+rn412 decode) ─────────────────
+    // The guest build's Monitor = {monitor_lock_ (S_m=40), num_waiters_
+    // @40, owner_ @48, lock_count_ @56, wait_set_ @64, wake_set_ @72,
+    // hash_code_ @80, obj_ @88, lock_owner_ @96, lock_owner_method_
+    // @104, lock_owner_dex_pc_ @112, lock_owner_sum_ @120,
+    // lock_owner_request_ @128, monitor_id_ @136} = 144 bytes — the
+    // POOL SPACING measures 144 (adjacent monitors 0x90 apart), the
+    // self-hit lands at @64 = wait_set_ (the waiter IS the head; the
+    // HIT-DEREF proved it is the waiter's own native Thread), wake_set_
+    // @72 = 0 (never notified), and obj_ sits at @88 (the r1-tag order
+    // obj_/wait_set_ is SWAPPED in this build). owner_ @48 = 0 in every
+    // decoded episode: NOBODY holds the monitor. wakes=NEVER is NORMAL
+    // for a TimedWait loop (ETIMEDOUT needs no wake syscall) — the
+    // frontier question shifts to "whose condition never clears": dump
+    // the MONITORED OBJECT and the futex TIMEOUT.
+    if mons.len() >= 96 {
+        let g = |o: usize| u64::from_ne_bytes(mons[o..o + 8].try_into().unwrap());
+        let num_waiters = g(40);
+        let owner = g(48);
+        let wait_set = g(64);
+        let wake_set = g(72);
+        let obj = g(88);
+        crate::trace_log_line(&format!(
+            "6-Z447 CALIBRATED: pid={} num_waiters@40={} owner@48={:#x} wait_set@64={:#x} (self={:#x}) wake_set@72={:#x} obj@88={:#x} lock_owner@96={:#x} checksum@120={:#x}",
+            pid, num_waiters, owner, wait_set, thread, wake_set, obj,
+            g(96),
+            g(120)
+        ));
+        if z447_plausible_ptr(obj) {
+            match z446_read_mem_window(pid, obj, 128) {
+                Some(ob) if ob.len() >= 64 => {
+                    let klass = u32::from_ne_bytes(ob[0..4].try_into().unwrap());
+                    let words: Vec<String> = (0..ob.len() / 8)
+                        .map(|i| {
+                            format!(
+                                "o{:02}={:016x}",
+                                i,
+                                u64::from_ne_bytes(ob[i * 8..i * 8 + 8].try_into().unwrap())
+                            )
+                        })
+                        .collect();
+                    crate::trace_log_line(&format!(
+                        "6-Z447 MONITORED-OBJECT: pid={} obj={:#x} klass_word={:#010x} [{}]",
+                        pid,
+                        obj,
+                        klass,
+                        words.join(" ")
+                    ));
+                }
+                _ => {
+                    crate::trace_log_line(&format!(
+                        "6-Z447 MONITORED-OBJECT: pid={} obj={:#x} UNREADABLE",
+                        pid, obj
+                    ));
+                }
+            }
+        }
+    }
     // ── 6-Z447 calibration follow-ups (rn411 decode) ──────────────────
     // The rn411 MONITOR dumps fit NO consistent Monitor layout: with the
     // definitive S_m=40 (BaseMutex vptr+name+level+bool = 24, then
@@ -12418,6 +12476,10 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
     let a0 = parse_hex(parts[1]);
     let a1 = parse_hex(parts[2]);
     let a2 = parts.get(3).map(|s| parse_hex(s)).unwrap_or(0);
+    // arg3 (futex WAIT: the TIMESPEC* for timed waits — NULL for an
+    // infinite wait; the rn412 decode showed wakes=NEVER is normal for a
+    // TimedWait loop, so the timeout pointer is the discriminating datum).
+    let a3 = parts.get(4).map(|s| parse_hex(s)).unwrap_or(0);
     // /proc/<pid>/syscall layout: nr, arg0..arg5, sp, pc → 9 tokens;
     // sp = index 7, pc = index 8 (the 6-arg form is fixed by the ABI).
     let sp = parts.get(7).map(|s| parse_hex(s)).unwrap_or(0);
@@ -12426,9 +12488,28 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
     // pc → maps attribution (bounded: stop at the first containing line).
     let region = maps_region_for_pc(pid, pc);
     crate::trace_log_line(&format!(
-        "6-Z271f STALL-DUMP: pid={} nr={} arg0={:#x} arg1={:#x} arg2={:#x} sp={:#x} pc={:#x} maps[pc]={}",
-        pid, nr, a0, a1, a2, sp, pc, region
+        "6-Z271f STALL-DUMP: pid={} nr={} arg0={:#x} arg1={:#x} arg2={:#x} arg3={:#x} sp={:#x} pc={:#x} maps[pc]={}",
+        pid, nr, a0, a1, a2, a3, sp, pc, region
     ));
+    // Futex WAIT timeout read: arg3 != 0 → a TIMED wait — read the
+    // timespec (tv_sec/tv_nsec, 16B) so the decode sees the exact wait
+    // budget (a small timeout = a re-check loop; NULL = an infinite wait).
+    if (nr == 98 || nr == 202 || nr == 240) && (a1 & 0x7f) == 0 && a3 != 0 {
+        match read_child_bytes(pid, a3, 16) {
+            Some(tb) if tb.len() == 16 => {
+                let tv_sec = i64::from_le_bytes(tb[0..8].try_into().unwrap());
+                let tv_nsec = i64::from_le_bytes(tb[8..16].try_into().unwrap());
+                crate::trace_log_line(&format!(
+                    "6-Z448 WAIT-TIMEOUT: pid={} uaddr={:#x} tv_sec={} tv_nsec={} (timed wait budget)",
+                    pid, a0, tv_sec, tv_nsec
+                ));
+            }
+            _ => crate::trace_log_line(&format!(
+                "6-Z448 WAIT-TIMEOUT: pid={} uaddr={:#x} arg3={:#x} UNREADABLE",
+                pid, a0, a3
+            )),
+        }
+    }
 
     // ── 6-Z314: stall STACK-WINDOW capture ──────────────────────────────
     // The rn262 decode nailed main's wedge SHAPE (a real-kernel read on a
