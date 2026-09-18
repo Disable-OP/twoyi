@@ -2367,6 +2367,20 @@ pub struct BusState {
     next_txn: u64,
 }
 
+/// 6-Z442: one flat crossing's grant record — the node ref granted plus
+/// the owner-side mirrors the kernel would queue for it.
+struct Z442FlatGrant {
+    /// The node handle granted for the flat (already rewritten into the
+    /// parcel data as BINDER_TYPE_HANDLE).
+    handle: u32,
+    /// Whether the granted ref was the strong one (a strong flat grants
+    /// strong + implied weak; a weak flat grants weak only).
+    strong: bool,
+    /// `[BR_INCREFS]`/`[BR_ACQUIRE]` `(br, ptr, cookie)` triples for the
+    /// OWNER conn's read stream, kernel queue order.
+    mirrors: Vec<(u32, u64, u64)>,
+}
+
 /// 6-Z359: one guest-owned node (see [`BusState::nodes`]).
 struct GuestNode {
     owner: ConnId,
@@ -2379,8 +2393,23 @@ struct GuestNode {
     /// BR_RELEASE to the owner (its IPCThreadState decStrongs the local
     /// BBinder — the composer's onClientDestroyed path).
     strong: HashMap<ConnId, u32>,
-    /// Per-recipient weak-ref counts (weak flats / BC_INCREFS era).
+    /// Per-recipient weak-ref counts (weak flats / BC_INCREFS era). A
+    /// strong delivery ALSO grants one weak count (kernel:
+    /// binder_inc_ref_for_node takes the weak ref implied by every
+    /// strong ref) so the owner's BR_INCREFS mirror balances against a
+    /// BR_DECREFS when the recipient's proxy dies.
     weak: HashMap<ConnId, u32>,
+    /// 6-Z442 (kernel `has_strong_ref`): the owner-side BR_ACQUIRE
+    /// mirror for this node is OUTSTANDING — the owner's IPCThreadState
+    /// was told (or is about to be told, same-ioctl) to incStrong the
+    /// local object. Kernel truth: the notification fires once per
+    /// notification era; it re-arms only when the node's strong refs
+    /// drop back to zero (BR_RELEASE).
+    strong_notified: bool,
+    /// 6-Z442 (kernel `has_weak_ref`): the owner-side BR_INCREFS mirror
+    /// is outstanding. Re-arms when the node's weak refs drop to zero
+    /// (BR_DECREFS).
+    weak_notified: bool,
 }
 
 impl BusState {
@@ -3040,9 +3069,28 @@ impl BusState {
         N.get_or_init(|| std::sync::atomic::AtomicU32::new(8))
     }
 
-    /// Look up (or allocate) the node handle for a sender-local node,
-    /// and grant `recipient` one strong/weak ref. Kernel-true identity:
-    /// the same (owner, ptr, cookie) key reuses the same handle.
+    /// 6-Z442: grant (or re-grant) a node ref for `recipient` on the
+    /// LOCAL flat `(ptr, cookie)` exported by `sender`. Returns the node
+    /// handle and the OWNER-SIDE ref mirrors the kernel would queue for
+    /// this grant: `[BR_INCREFS][ptr][cookie]` when the node's first
+    /// weak ref of the current era is taken, plus
+    /// `[BR_ACQUIRE][ptr][cookie]` when the first strong ref is (kernel
+    /// `binder_inc_ref_for_node` → `binder_inc_node`'s
+    /// `has_weak_ref`/`has_strong_ref` handshake). A strong delivery
+    /// takes BOTH (kernel: every strong ref implies a weak one). The
+    /// caller MUST deliver these to the owner's `IPCThreadState` —
+    /// same-ioctl (the 6-Z306ae-e no-race shape) — because a local
+    /// object whose only remote ref is the just-granted one otherwise
+    /// destructs at the sender's frame exit before the owner's next read
+    /// (rn406: the composer's createClient IComposerClient was dead
+    /// ~300 ms after grant; SF's first call landed in the corpse →
+    /// Scudo invalid-free on the node ptr).
+    ///
+    /// On a FAILED delivery the caller MUST call
+    /// [`BusState::z442_unwind_grant`] for the returned grant — a
+    /// counted ref whose flat never crossed would otherwise later
+    /// mirror a BR_RELEASE for an owner that never saw the BR_ACQUIRE
+    /// (decStrong-on-zero).
     fn z359_grant_node(
         &mut self,
         sender: ConnId,
@@ -3050,7 +3098,8 @@ impl BusState {
         ptr: u64,
         cookie: u64,
         strong: bool,
-    ) -> u32 {
+    ) -> (u32, Vec<(u32, u64, u64)>) {
+        let mut mirrors: Vec<(u32, u64, u64)> = Vec::new();
         let handle = match self.node_by_key.get(&(sender, ptr, cookie)) {
             Some(h) => *h,
             None => {
@@ -3072,16 +3121,74 @@ impl BusState {
                         cookie,
                         strong: HashMap::new(),
                         weak: HashMap::new(),
+                        strong_notified: false,
+                        weak_notified: false,
                     },
                 );
                 h
             }
         };
         if let Some(n) = self.nodes.get_mut(&handle) {
-            let refs = if strong { &mut n.strong } else { &mut n.weak };
-            *refs.entry(recipient).or_insert(0) += 1;
+            if strong {
+                *n.strong.entry(recipient).or_insert(0) += 1;
+                // Kernel: the strong ref carries the implied weak ref.
+                *n.weak.entry(recipient).or_insert(0) += 1;
+                if !n.weak_notified {
+                    n.weak_notified = true;
+                    mirrors.push((BR_INCREFS, n.ptr, n.cookie));
+                }
+                if !n.strong_notified {
+                    n.strong_notified = true;
+                    mirrors.push((BR_ACQUIRE, n.ptr, n.cookie));
+                }
+            } else {
+                *n.weak.entry(recipient).or_insert(0) += 1;
+                if !n.weak_notified {
+                    n.weak_notified = true;
+                    mirrors.push((BR_INCREFS, n.ptr, n.cookie));
+                }
+            }
         }
-        handle
+        (handle, mirrors)
+    }
+
+    /// 6-Z442: undo a just-made grant whose delivery FAILED (mailbox
+    /// full / owner gone). Drops the counts `z359_grant_node` added and
+    /// re-arms the notification flags the grant consumed — the node
+    /// returns to its pre-grant state with NO mirrors ever leaving (a
+    /// counted ref whose flat never crossed must not later mirror a
+    /// BR_RELEASE for an owner that never saw the BR_ACQUIRE).
+    fn z442_unwind_grant(&mut self, handle: u32, recipient: ConnId, strong: bool) {
+        let Some(n) = self.nodes.get_mut(&handle) else {
+            return;
+        };
+        if strong {
+            if let Some(c) = n.strong.get_mut(&recipient) {
+                *c -= 1;
+                if *c == 0 {
+                    n.strong.remove(&recipient);
+                }
+            }
+        }
+        if let Some(c) = n.weak.get_mut(&recipient) {
+            *c -= 1;
+            if *c == 0 {
+                n.weak.remove(&recipient);
+            }
+        }
+        if n.strong.is_empty() {
+            n.strong_notified = false;
+        }
+        if n.weak.is_empty() {
+            n.weak_notified = false;
+        }
+        if n.strong.is_empty() && n.weak.is_empty() {
+            // The node never crossed — drop the entry entirely so a
+            // future export of the same (sender, ptr, cookie) re-grades
+            // cleanly (the key map keeps no stale handle).
+            self.node_by_key.remove(&(n.owner, n.ptr, n.cookie));
+            self.nodes.remove(&handle);
+        }
     }
 
     /// Rewrite every LOCAL flat in `data`/`offsets` that crosses from
@@ -3090,6 +3197,13 @@ impl BusState {
     /// left verbatim — the owner's own unflattenBinder decodes its OWN
     /// local object (the 6-Z306ac owner-conn LOCAL-hit shape, and the
     /// keystore2 in-process chain depends on it).
+    ///
+    /// 6-Z442: returns the OWNER-SIDE ref mirrors the kernel would queue
+    /// for the grants made here ([`BusState::z359_grant_node`]) — the
+    /// caller must deliver them to the SENDER conn's own read stream
+    /// BEFORE the BR_TRANSACTION_COMPLETE (the 6-Z306ae-e same-ioctl
+    /// no-race shape). Empty when nothing crossed or nothing needed
+    /// notifying.
     fn z359_translate_flats(
         &mut self,
         vm_id: u32,
@@ -3098,9 +3212,10 @@ impl BusState {
         data: &mut [u8],
         offsets: &mut [u8],
         what: &str,
-    ) {
+    ) -> Vec<Z442FlatGrant> {
+        let mut grants: Vec<Z442FlatGrant> = Vec::new();
         if sender == recipient || offsets.is_empty() || data.is_empty() {
-            return;
+            return grants;
         }
         let count = offsets.len() / 8;
         for i in 0..count {
@@ -3161,7 +3276,13 @@ impl BusState {
                 // Explicit null-binder flat — leave verbatim.
                 continue;
             }
-            let handle = self.z359_grant_node(sender, recipient, ptr, cookie, is_strong_local);
+            let (handle, granted_mirrors) =
+                self.z359_grant_node(sender, recipient, ptr, cookie, is_strong_local);
+            grants.push(Z442FlatGrant {
+                handle,
+                strong: is_strong_local,
+                mirrors: granted_mirrors,
+            });
             // Rewrite in place: [type][flags][handle u64][cookie=0].
             data[off_usize..off_usize + 4].copy_from_slice(&handle_type.to_ne_bytes());
             data[off_usize + 8..off_usize + 16].copy_from_slice(&(handle as u64).to_ne_bytes());
@@ -3174,6 +3295,7 @@ impl BusState {
                 );
             }
         }
+        grants
     }
 
     /// Drop every node ref `conn` holds; mirror the last-release to the
@@ -3193,9 +3315,15 @@ impl BusState {
     }
 
     /// Decrement `holder`'s strong/weak ref on node `handle`; mirror
-    /// BR_RELEASE / BR_DECREFS to the owner when THAT holder's count
-    /// hits zero (kernel: the mirror is per-recipient-ref, not global).
-    /// `strong=false` handles the weak side.
+    /// BR_RELEASE / BR_DECREFS to the owner when the NODE's total for
+    /// that kind hits zero (6-Z442 kernel truth: `binder_dec_node` fires
+    /// the owner notification when the node's external refs are
+    /// exhausted — per-holder mirroring would double-release the owner's
+    /// object whenever two recipients held the same node; with the
+    /// 6-Z442 BR_ACQUIRE mirror feeding the owner's strong count, an
+    /// unbalanced release is a decStrong-on-zero abort class).
+    /// `strong=false` handles the weak side. The notification flags
+    /// re-arm exactly here (the next era's first ref re-mirrors).
     fn z359_unref_node(&mut self, vm_id: u32, handle: u32, holder: ConnId, strong: bool) {
         let mirror = {
             let Some(n) = self.nodes.get_mut(&handle) else {
@@ -3210,7 +3338,21 @@ impl BusState {
                 None
             } else {
                 refs.remove(&holder);
-                Some((n.owner, n.ptr, n.cookie))
+                if refs.is_empty() {
+                    // The node's LAST external ref of this kind dropped:
+                    // the owner may destroy the object; mirror the
+                    // release and re-arm the 6-Z442 notification for the
+                    // next era. With refs remaining the kernel stays
+                    // silent (the object is still externally held).
+                    if strong {
+                        n.strong_notified = false;
+                    } else {
+                        n.weak_notified = false;
+                    }
+                    Some((n.owner, n.ptr, n.cookie))
+                } else {
+                    None
+                }
             }
         };
         let Some((owner, ptr, cookie)) = mirror else {
@@ -4498,6 +4640,34 @@ fn handle_write_read(
                         // reply/failure surfaces on a later read.
                         push_br_transaction_complete(&mut read_buf);
                     }
+                    TransactionResult::CompleteMirrored { refs } => {
+                        // 6-Z442: this transaction's LOCAL flats granted a
+                        // node — the SENDER (owner) gets the kernel-true
+                        // [BR_INCREFS][BR_ACQUIRE] BEFORE the completion
+                        // (the 6-Z306ae-e same-ioctl no-race shape: the
+                        // owner's waitForResponse incs the local object
+                        // while the marshal temporary is still alive —
+                        // rn406's composer createClient corpse class).
+                        for (br, ptr, cookie) in &refs {
+                            read_buf.extend_from_slice(&br.to_ne_bytes());
+                            read_buf.extend_from_slice(&ptr.to_ne_bytes());
+                            read_buf.extend_from_slice(&cookie.to_ne_bytes());
+                        }
+                        if !refs.is_empty() {
+                            static Z442_LOGGED: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(64);
+                            if Z442_LOGGED.load(Ordering::Relaxed) > 0 {
+                                Z442_LOGGED.fetch_sub(1, Ordering::Relaxed);
+                                for (br, ptr, cookie) in &refs {
+                                    info!(
+                                        "[KR64][binder][vm{}] 6-Z442: node-ref ACQUIRE mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x} (owner-side inc for the flat crossing)",
+                                        vm_id, conn_id, br, ptr, cookie
+                                    );
+                                }
+                            }
+                        }
+                        push_br_transaction_complete(&mut read_buf);
+                    }
                     TransactionResult::Reply { data, offsets, sg } => {
                         // Kernel-true batch (6-Z114 §4.5): the client's
                         // `waitForResponse` consumes BR_TRANSACTION_COMPLETE
@@ -4663,7 +4833,7 @@ fn handle_write_read(
                                 // composer's IComposerClient crosses HERE.
                                 let mut data = data;
                                 let mut offsets = offsets;
-                                b.z359_translate_flats(
+                                let z442_grants = b.z359_translate_flats(
                                     vm_id,
                                     conn_id,
                                     rc,
@@ -4685,6 +4855,35 @@ fn handle_write_read(
                                             "[KR64][binder][vm{}] BC_REPLY for txn {} — requester conn {} gone",
                                             vm_id, txn_id, rc
                                         );
+                                    }
+                                }
+                                // 6-Z442: the reply's LOCAL flat crossings
+                                // granted nodes — the SENDER (owner) gets
+                                // the kernel-true [BR_INCREFS][BR_ACQUIRE]
+                                // in THIS ioctl's read stream, BEFORE the
+                                // completion (the 6-Z306ae-e same-ioctl
+                                // no-race shape: the owner's
+                                // waitForResponse incs the local object
+                                // while the createClient marshal temporary
+                                // is still alive — rn406's corpse class).
+                                for g in &z442_grants {
+                                    for (br, ptr, cookie) in &g.mirrors {
+                                        read_buf.extend_from_slice(&br.to_ne_bytes());
+                                        read_buf.extend_from_slice(&ptr.to_ne_bytes());
+                                        read_buf.extend_from_slice(&cookie.to_ne_bytes());
+                                    }
+                                    static Z442_REPLY_LOGGED: std::sync::atomic::AtomicU32 =
+                                        std::sync::atomic::AtomicU32::new(64);
+                                    if !g.mirrors.is_empty()
+                                        && Z442_REPLY_LOGGED.load(Ordering::Relaxed) > 0
+                                    {
+                                        Z442_REPLY_LOGGED.fetch_sub(1, Ordering::Relaxed);
+                                        for (br, ptr, cookie) in &g.mirrors {
+                                            info!(
+                                                "[KR64][binder][vm{}] 6-Z442: node-ref ACQUIRE mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x} (BC_REPLY owner-side inc)",
+                                                vm_id, conn_id, br, ptr, cookie
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -5687,6 +5886,13 @@ enum TransactionResult {
     /// sync call whose `BC_REPLY` resolves on the requester's LATER read
     /// (kernel semantics — 6-Z271i deferred resolution).
     CompleteOnly,
+    /// 6-Z442: `CompleteOnly` PLUS the OWNER-SIDE node-ref mirrors from
+    /// this transaction's LOCAL flats (the sender's read stream gains
+    /// `[BR_INCREFS][BR_ACQUIRE]` before the completion — the
+    /// 6-Z306ae-e same-ioctl no-race shape, generalized from the
+    /// registration arms to every routed flat crossing). `refs` holds
+    /// `(br, ptr, cookie)` triples in kernel queue order.
+    CompleteMirrored { refs: Vec<(u32, u64, u64)> },
 }
 
 /// Handle a `BC_TRANSACTION` (or `BC_TRANSACTION_SG`) command.
@@ -6058,6 +6264,10 @@ fn handle_transaction(
     };
 
     let txn_id;
+    // 6-Z442: the OWNER-side mirrors from this request's LOCAL flats —
+    // hoisted out of the txn block for the function's return (the
+    // same-ioctl read-stream payload for the sender).
+    let mut z442_mirrors: Vec<(u32, u64, u64)> = Vec::new();
     {
         let mut b = bus.lock().expect("binder bus poisoned");
         txn_id = b.next_txn;
@@ -6069,7 +6279,7 @@ fn handle_transaction(
         // (kernel semantics — a flat that crosses conns crosses as a
         // handle) and grant the refs. Callback objects ride THIS path.
         let mut blob = blob;
-        b.z359_translate_flats(
+        let z442_grants = b.z359_translate_flats(
             vm_id,
             conn_id,
             owner,
@@ -6096,6 +6306,12 @@ fn handle_transaction(
             if !one_way {
                 b.waiters.remove(&txn_id);
             }
+            // 6-Z442: the flat never crossed (no delivery) — unwind the
+            // grants so no release can later mirror for an owner that
+            // never saw the acquire, and emit NO mirrors.
+            for g in &z442_grants {
+                b.z442_unwind_grant(g.handle, owner, g.strong);
+            }
             drop(b);
             warning!(
                 "[KR64][binder][vm{}] transaction to handle 0x{:08x}: owner mailbox full or gone",
@@ -6103,6 +6319,11 @@ fn handle_transaction(
                 target_handle
             );
             return TransactionResult::Failed;
+        }
+        // Success: the flats crossed (or will cross on delivery) — the
+        // owner-side mirrors ride THIS ioctl's read stream.
+        for g in &z442_grants {
+            z442_mirrors.extend(g.mirrors.iter().copied());
         }
         if !one_way {
             // Track the outstanding sync call on the requester's conn for
@@ -6150,7 +6371,15 @@ fn handle_transaction(
     // Both one-way and (now) sync transactions return
     // BR_TRANSACTION_COMPLETE from THIS ioctl; the sync reply surfaces on
     // a later read (kernel semantics — no blocking inside the proxy).
-    TransactionResult::CompleteOnly
+    // 6-Z442: when the request's LOCAL flats granted nodes (SF's
+    // registerCallback callback object rides THIS path), the sender's
+    // read stream gains the kernel-true [BR_INCREFS][BR_ACQUIRE] BEFORE
+    // the completion (the 6-Z306ae-e same-ioctl no-race shape).
+    if !z442_mirrors.is_empty() {
+        TransactionResult::CompleteMirrored { refs: z442_mirrors }
+    } else {
+        TransactionResult::CompleteOnly
+    }
 }
 
 /// Intercept servicemanager transactions (target handle 0).
@@ -11052,6 +11281,436 @@ mod tests {
         let _ = fs::remove_dir_all(&rootfs);
     }
 
+    // ==== 6-Z442: the owner-side node-ref ACQUIRE mirror (kernel-true
+    // ==== binder_node lifecycle). rn406: the composer's createClient
+    // ==== IComposerClient destructed ~300 ms after the node grant (its
+    // ==== only userspace ref was the createClient marshal temporary —
+    // ==== the kernel's BR_INCREFS/BR_ACQUIRE owner notification never
+    // ==== crossed), SF's first client call was delivered into the
+    // ==== corpse (vtable=0 at the 6-Z306ad probe), and the composer
+    // ==== Scudo-aborted on the freed node ptr → "Missing internal
+    // ==== display" → the rung-7 restart cascade. The mirror rides the
+    // ==== SAME ioctl as the flat crossing (6-Z306ae-e no-race shape).
+
+    #[test]
+    fn z442_bc_reply_owner_read_carries_acquire_mirror_before_complete() {
+        // THE rn406 WIRE SHAPE, fixed end-to-end: conn A (the composer)
+        // BC_REPLYs a LOCAL flat (the IComposerClient) to conn B (SF) —
+        // A's SAME-ioctl read stream must carry
+        // [BR_INCREFS][ptr][cookie][BR_ACQUIRE][ptr][cookie] BEFORE the
+        // [BR_TRANSACTION_COMPLETE]: libbinder's sendReply
+        // waitForResponse(nullptr, nullptr) processes both (incWeak +
+        // incStrong on the real guest object) while the createClient
+        // marshal temporary is still alive — no free-then-acquire race
+        // (rn406: the object was a destructed corpse ~300 ms after the
+        // grant and the composer Scudo-aborted on it).
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let live_pid = std::process::id();
+        let ident_payload = |pid: u32| {
+            let mut p = Vec::with_capacity(12);
+            p.extend_from_slice(&pid.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p
+        };
+
+        // ---- Conn A (the composer stand-in): addService ----
+        let mut stream_a = UnixStream::connect(&path).expect("connect A");
+        let (ret_i, _r) = exchange(&mut stream_a, WIRE_CMD_IDENT, &ident_payload(live_pid));
+        assert_eq!(ret_i, 0);
+        let mut args = ParcelWriter::new();
+        args.write_string16("z442_svc");
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0x1234,
+            cookie: 0x5678,
+        });
+        args.write_i32(0);
+        args.write_i32(0);
+        let (ad, ao) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &ad, &ao, 4096);
+        let (ret, _resp) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0, "ADD_SERVICE ok");
+
+        // ---- Conn B (the SF stand-in): getService → handle ----
+        let mut stream_b = UnixStream::connect(&path).expect("connect B");
+        let (ret_i2, _r2) = exchange(&mut stream_b, WIRE_CMD_IDENT, &ident_payload(live_pid));
+        assert_eq!(ret_i2, 0);
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("z442_svc");
+        let (bd, bo) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload2 = make_v2_write_read_payload(&bc2, &bd, &bo, 4096);
+        let (ret2, resp2) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0);
+        let off2 = 4 + u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize + 8;
+        let dl2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        let blob2 = &resp2[off2 + 12..off2 + 12 + dl2];
+        let svc_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+
+        // ---- Conn B: transact(code=7) → A receives BR_TRANSACTION ----
+        let mut tx_b = [0u8; 64];
+        tx_b[0..4].copy_from_slice(&svc_handle.to_ne_bytes());
+        tx_b[16..20].copy_from_slice(&7u32.to_ne_bytes());
+        let tx_data: &[u8] = b"create-client";
+        let tx_off: Vec<u8> = Vec::new();
+        let mut bc3 = Vec::with_capacity(4 + 64);
+        bc3.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc3.extend_from_slice(&tx_b);
+        let payload3 = make_v2_write_read_multi_payload(&bc3, &[(tx_data, &tx_off)], 4096);
+        let (ret_t, _resp_t) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload3);
+        assert_eq!(ret_t, 0);
+        let mut wr_a = Vec::new();
+        wr_a.extend_from_slice(&0u32.to_ne_bytes());
+        wr_a.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_a, resp_a) = exchange(&mut stream_a, BINDER_WRITE_READ, &wr_a);
+        assert_eq!(ret_a, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp_a[4..8].try_into().unwrap()),
+            BR_TRANSACTION,
+            "A receives the transaction"
+        );
+
+        // ---- Conn A: BC_REPLY carrying a LOCAL flat (the IComposerClient) ----
+        let mut reply_data: Vec<u8> = Vec::new();
+        reply_data.extend_from_slice(&0i32.to_ne_bytes()); // status NONE
+        reply_data.extend_from_slice(&0i32.to_ne_bytes()); // pad
+        reply_data.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        reply_data.extend_from_slice(&0u32.to_ne_bytes()); // flags
+        reply_data.extend_from_slice(&0xaaaa_u64.to_ne_bytes()); // binder ptr
+        reply_data.extend_from_slice(&0xbeef_u64.to_ne_bytes()); // cookie
+        let mut reply_off: Vec<u8> = Vec::new();
+        reply_off.extend_from_slice(&8u64.to_ne_bytes());
+        let reply = [0u8; 64];
+        let mut bc4 = Vec::with_capacity(4 + 64);
+        bc4.extend_from_slice(&BC_REPLY.to_ne_bytes());
+        bc4.extend_from_slice(&reply);
+        let payload4 =
+            make_v2_write_read_multi_payload(&bc4, &[(reply_data.as_slice(), &reply_off)], 0);
+        let (ret_r, resp_r) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload4);
+        assert_eq!(ret_r, 0);
+
+        // ---- THE 6-Z442 ASSERT: A's read stream = [INCREFS][ACQUIRE][COMPLETE] ----
+        let read_r = u32::from_ne_bytes(resp_r[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            read_r,
+            4 + 16 + 4 + 16 + 4,
+            "BR_INCREFS+cookie, BR_ACQUIRE+cookie, BR_TRANSACTION_COMPLETE"
+        );
+        let mut cur = 4;
+        let br1 = u32::from_ne_bytes(resp_r[cur..cur + 4].try_into().unwrap());
+        assert_eq!(br1, BR_INCREFS, "first mirror: INCREFS (kernel order)");
+        let mptr = u64::from_ne_bytes(resp_r[cur + 4..cur + 12].try_into().unwrap());
+        let mcookie = u64::from_ne_bytes(resp_r[cur + 12..cur + 20].try_into().unwrap());
+        assert_eq!(mptr, 0xaaaa, "mirror carries the OWNER's ptr");
+        assert_eq!(mcookie, 0xbeef, "mirror carries the OWNER's cookie");
+        cur += 20;
+        let br2 = u32::from_ne_bytes(resp_r[cur..cur + 4].try_into().unwrap());
+        assert_eq!(br2, BR_ACQUIRE, "second mirror: ACQUIRE");
+        assert_eq!(
+            u64::from_ne_bytes(resp_r[cur + 4..cur + 12].try_into().unwrap()),
+            0xaaaa
+        );
+        assert_eq!(
+            u64::from_ne_bytes(resp_r[cur + 12..cur + 20].try_into().unwrap()),
+            0xbeef
+        );
+        cur += 20;
+        assert_eq!(
+            u32::from_ne_bytes(resp_r[cur..cur + 4].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE,
+            "the completion follows the mirrors — sendReply exits AFTER the incs"
+        );
+
+        // ---- Conn B: the reply's flat MUST arrive as BINDER_TYPE_HANDLE ----
+        let mut wr_b = Vec::new();
+        wr_b.extend_from_slice(&0u32.to_ne_bytes());
+        wr_b.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_b, resp_b) = exchange(&mut stream_b, BINDER_WRITE_READ, &wr_b);
+        assert_eq!(ret_b, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp_b[4..8].try_into().unwrap()),
+            BR_REPLY,
+            "B's deferred BR_REPLY"
+        );
+
+        // ---- A's BC_INCREFS_DONE/BC_ACQUIRE_DONE acks parse cleanly ----
+        // libbinder's BR_INCREFS/BR_ACQUIRE handling writes the DONE
+        // commands to mOut; they flush on A's next write — the proxy
+        // must consume them without error (the no-op arm).
+        let mut done_cmds = Vec::new();
+        done_cmds.extend_from_slice(&BC_INCREFS_DONE.to_ne_bytes());
+        done_cmds.extend_from_slice(&0xaaaa_u64.to_ne_bytes());
+        done_cmds.extend_from_slice(&0xbeef_u64.to_ne_bytes());
+        done_cmds.extend_from_slice(&BC_ACQUIRE_DONE.to_ne_bytes());
+        done_cmds.extend_from_slice(&0xaaaa_u64.to_ne_bytes());
+        done_cmds.extend_from_slice(&0xbeef_u64.to_ne_bytes());
+        let mut payload_done = Vec::with_capacity(8 + done_cmds.len());
+        payload_done.extend_from_slice(&(done_cmds.len() as u32).to_ne_bytes());
+        payload_done.extend_from_slice(&0u32.to_ne_bytes());
+        payload_done.extend_from_slice(&done_cmds);
+        let (ret_d, _resp_d) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload_done);
+        assert_eq!(ret_d, 0, "BC_INCREFS_DONE/BC_ACQUIRE_DONE accepted");
+
+        drop(stream_a);
+        drop(stream_b);
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z442_strong_grant_mirrors_increfs_then_acquire_once() {
+        // Kernel truth: the FIRST strong flat crossing takes the implied
+        // weak ref too and queues [BR_INCREFS][BR_ACQUIRE] to the owner;
+        // re-grants in the same era queue NOTHING (has_weak_ref /
+        // has_strong_ref hold).
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let recipient = bus.register_conn();
+        let ptr: u64 = 0xE597_1B40_F370;
+        let cookie: u64 = 0xE597_7B40_DA60;
+
+        // A strong LOCAL flat: [type=BINDER][flags][ptr][cookie].
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+
+        let grants = bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants.len(), 1, "one flat crossing");
+        let g = &grants[0];
+        assert!(g.strong);
+        assert_eq!(
+            g.mirrors,
+            vec![(BR_INCREFS, ptr, cookie), (BR_ACQUIRE, ptr, cookie)],
+            "owner mirror order: INCREFS then ACQUIRE (kernel queue order)"
+        );
+        // The flat was rewritten to HANDLE form with the granted handle.
+        let flat_handle = u32::from_ne_bytes(data[8..12].try_into().unwrap());
+        assert_eq!(flat_handle, g.handle);
+        assert_eq!(
+            u32::from_ne_bytes(data[0..4].try_into().unwrap()),
+            BINDER_TYPE_HANDLE
+        );
+        // Emulator bookkeeping: strong AND implied weak for the recipient.
+        let node = bus.nodes.get(&g.handle).expect("node exists");
+        assert_eq!(node.strong.get(&recipient), Some(&1));
+        assert_eq!(node.weak.get(&recipient), Some(&1));
+        assert!(node.strong_notified && node.weak_notified, "era notified");
+
+        // Re-grant the SAME node (the sender re-exports its local object)
+        // — no new mirrors: the notification already crossed this era.
+        // (Rebuild the flat: the first crossing rewrote it to HANDLE form.)
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        let grants2 =
+            bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants2.len(), 1);
+        assert!(
+            grants2[0].mirrors.is_empty(),
+            "kernel re-acquire is silent while refs are outstanding"
+        );
+        let node = bus.nodes.get(&grants2[0].handle).expect("node exists");
+        assert_eq!(node.strong.get(&recipient), Some(&2));
+        assert_eq!(node.weak.get(&recipient), Some(&2));
+    }
+
+    #[test]
+    fn z442_release_to_zero_resets_era_and_remirrors_on_regrant() {
+        // Kernel truth: BR_RELEASE/BR_DECREFS fire when the node's LAST
+        // external ref of the kind drops (not per-holder), and the
+        // notification era re-arms exactly there — a fresh export
+        // re-notifies with a fresh [BR_INCREFS][BR_ACQUIRE].
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let recipient = bus.register_conn();
+        let ptr: u64 = 0xAAAA;
+        let cookie: u64 = 0xBEEF;
+
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+
+        let grants = bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        let handle = grants[0].handle;
+        assert_eq!(grants[0].mirrors.len(), 2, "INCREFS + ACQUIRE");
+
+        // Drop the strong ref (BC_RELEASE equivalent): the strong era
+        // ends → BR_RELEASE mirror + strong flag re-arms; the weak era
+        // REMAINS (the implied weak ref is still held) → no BR_DECREFS.
+        bus.z359_unref_node(0, handle, recipient, true);
+        let node = bus.nodes.get(&handle).expect("node survives");
+        assert!(node.strong.is_empty(), "strong gone");
+        assert_eq!(node.weak.get(&recipient), Some(&1), "weak remains");
+        assert!(!node.strong_notified, "strong era re-armed");
+        assert!(node.weak_notified, "weak era still notified");
+
+        // Drop the weak ref too: BR_DECREFS + weak re-arm.
+        bus.z359_unref_node(0, handle, recipient, false);
+        let node = bus.nodes.get(&handle).expect("node survives");
+        assert!(node.weak.is_empty());
+        assert!(!node.weak_notified, "weak era re-armed");
+
+        // A fresh export of the same object re-notifies BOTH. (Rebuild
+        // the flat: the first crossing rewrote it to HANDLE form.)
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        let grants2 =
+            bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants2[0].handle, handle, "stable handle across eras");
+        assert_eq!(
+            grants2[0].mirrors,
+            vec![(BR_INCREFS, ptr, cookie), (BR_ACQUIRE, ptr, cookie)],
+            "the new era re-notifies"
+        );
+    }
+
+    #[test]
+    fn z442_two_recipients_single_release_notification() {
+        // Kernel truth: two recipients of the same node → ONE
+        // notification set; the first recipient's release mirrors
+        // NOTHING (the object is still externally held); only the last
+        // drop notifies. (The old per-holder release mirroring would
+        // have decStrongs the owner twice for one acquire.)
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let rec_a = bus.register_conn();
+        let rec_b = bus.register_conn();
+        let ptr: u64 = 0x1111;
+        let cookie: u64 = 0x2222;
+
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+
+        let grants_a = bus.z359_translate_flats(0, owner, rec_a, &mut data, &mut offsets, "TEST");
+        let handle = grants_a[0].handle;
+        // (Rebuild the flat: rec_a's crossing rewrote it to HANDLE form.)
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        let grants_b = bus.z359_translate_flats(0, owner, rec_b, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants_b[0].handle, handle, "same node, second recipient");
+        assert!(
+            grants_b[0].mirrors.is_empty(),
+            "one notification era across recipients"
+        );
+
+        // First recipient releases: node still held by rec_b → silent.
+        bus.z359_unref_node(0, handle, rec_a, true);
+        bus.z359_unref_node(0, handle, rec_a, false);
+        let node = bus.nodes.get(&handle).expect("node exists");
+        assert_eq!(node.strong.get(&rec_b), Some(&1));
+        assert_eq!(node.weak.get(&rec_b), Some(&1));
+        assert!(node.strong_notified, "era holds while refs remain");
+
+        // Last recipient releases: BR_RELEASE era ends.
+        bus.z359_unref_node(0, handle, rec_b, true);
+        let node = bus.nodes.get(&handle).expect("node exists");
+        assert!(!node.strong_notified, "strong era re-armed at last drop");
+    }
+
+    #[test]
+    fn z442_weak_flat_mirrors_increfs_only() {
+        // BINDER_TYPE_WEAK_BINDER crossings: only the weak era —
+        // [BR_INCREFS] to the owner, never BR_ACQUIRE.
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let recipient = bus.register_conn();
+        let ptr: u64 = 0x3333;
+        let cookie: u64 = 0x4444;
+
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_WEAK_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+
+        let grants = bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants.len(), 1);
+        assert!(!grants[0].strong);
+        assert_eq!(grants[0].mirrors, vec![(BR_INCREFS, ptr, cookie)]);
+        let node = bus.nodes.get(&grants[0].handle).expect("node exists");
+        assert!(node.strong.is_empty(), "no strong ref for a weak flat");
+        assert_eq!(node.weak.get(&recipient), Some(&1));
+    }
+
+    #[test]
+    fn z442_unwind_grant_restores_pre_grant_state() {
+        // A FAILED delivery (mailbox full) unwinds the grant: counts
+        // gone, notification eras re-armed, the never-crossed node entry
+        // removed so a fresh export re-grades cleanly.
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let recipient = bus.register_conn();
+        let ptr: u64 = 0x5555;
+        let cookie: u64 = 0x6666;
+
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+
+        let grants = bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        let handle = grants[0].handle;
+        bus.z442_unwind_grant(handle, recipient, true);
+        assert!(
+            !bus.nodes.contains_key(&handle),
+            "never-crossed node entry dropped"
+        );
+        assert!(
+            !bus.node_by_key.contains_key(&(owner, ptr, cookie)),
+            "key map consistent with the drop"
+        );
+
+        // A fresh export re-notifies (the unwound era never notified).
+        // (Rebuild the flat: the first crossing rewrote it to HANDLE form.)
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        let grants2 =
+            bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        assert_eq!(
+            grants2[0].mirrors,
+            vec![(BR_INCREFS, ptr, cookie), (BR_ACQUIRE, ptr, cookie)]
+        );
+    }
+
     #[test]
     fn z359_reply_local_flat_becomes_handle_and_release_mirrors_to_owner() {
         // rn309 decode: the composer's createClient reply carried the
@@ -12997,6 +13656,7 @@ mod tests {
                 match other {
                     TransactionResult::Failed => "Failed",
                     TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::CompleteMirrored { .. } => "CompleteMirrored",
                     TransactionResult::Reply { .. } => "Reply (no spawn-looper!)",
                     TransactionResult::ReplySpawnLooper { .. } => unreachable!(),
                     TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
@@ -13105,6 +13765,7 @@ mod tests {
                 match other {
                     TransactionResult::Failed => "Failed",
                     TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::CompleteMirrored { .. } => "CompleteMirrored",
                     TransactionResult::Reply { .. } => "Reply (no spawn-looper!)",
                     TransactionResult::ReplySpawnLooper { .. } => unreachable!(),
                     TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
@@ -13151,6 +13812,7 @@ mod tests {
         match t {
             TransactionResult::Failed => "Failed",
             TransactionResult::CompleteOnly => "CompleteOnly",
+            TransactionResult::CompleteMirrored { .. } => "CompleteMirrored",
             TransactionResult::Reply { .. } => "Reply",
             TransactionResult::ReplySpawnLooper { .. } => "ReplySpawnLooper",
             TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
@@ -14980,6 +15642,7 @@ mod tests {
                 match other {
                     TransactionResult::Failed => "Failed",
                     TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::CompleteMirrored { .. } => "CompleteMirrored",
                     TransactionResult::Reply { .. } => unreachable!(),
                     TransactionResult::ReplySpawnLooper { .. } => "ReplySpawnLooper",
                     TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
