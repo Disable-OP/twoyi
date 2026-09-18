@@ -937,6 +937,14 @@ jobs:
                done; \
                echo \"== \$base/apex/com.android.art/javalib (the boot classpath jars) ==\"; \
                ls -la \$base/apex/com.android.art/javalib/ 2>/dev/null | head -30 || echo MISSING; \
+               echo \"== \$base/apex/com.android.art/javalib/arm64 (the PRIMARY boot image — rn416: the guest OPENS these) ==\"; \
+               ls -la \$base/apex/com.android.art/javalib/arm64/ 2>/dev/null | head -40 || echo MISSING; \
+               for bf in \$base/apex/com.android.art/javalib/arm64/boot.art \$base/apex/com.android.art/javalib/arm64/boot.oat \$base/apex/com.android.art/javalib/arm64/boot-framework.art \$base/system/framework/arm64/boot-framework.art \$base/system/framework/arm64/boot-framework.oat; do \
+                 if [ -f \$bf ]; then \
+                   echo \"-- ART-FILE \$bf size=\$(stat -c%s \$bf) mtime=\$(stat -c%y \$bf) --\"; \
+                   head -c 48 \$bf | od -A x -t x1 2>/dev/null | head -4; \
+                 else echo \"-- ART-FILE \$bf MISSING\"; fi; \
+               done; \
              done" \
             > /tmp/ui-e2e-artifacts/dex2oat-cache.txt 2>&1 || true
           sleep 5
