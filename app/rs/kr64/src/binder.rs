@@ -11293,6 +11293,137 @@ mod tests {
     // ==== SAME ioctl as the flat crossing (6-Z306ae-e no-race shape).
 
     #[test]
+    fn z444_cross_conn_deferred_reply_surfaces_on_requester_poll() {
+        // THE rn408 gen-1 hang shape: system_server main (conn A) issues a
+        // SYNC call to installd (conn B); B replies on a LATER ioctl; A's
+        // idle polls (ws=0 rc=256) MUST surface the [BR_REPLY] — rn408
+        // showed conn=138 polling [BR_NOOP] every 250 ms for 23 s with
+        // the reply popped off B's txn stack and (per the code path)
+        // queued on A's reply_queue, until the watchdog killed the
+        // process. This test pins the requester-side drain end-to-end.
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let _handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let live_pid = std::process::id();
+        let ident_payload = |pid: u32| {
+            let mut p = Vec::with_capacity(12);
+            p.extend_from_slice(&pid.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p.extend_from_slice(&0u32.to_ne_bytes());
+            p
+        };
+
+        // ---- Conn B (installd stand-in): addService ----
+        let mut stream_b = UnixStream::connect(&path).expect("connect B");
+        let (ret_i, _r) = exchange(&mut stream_b, WIRE_CMD_IDENT, &ident_payload(live_pid));
+        assert_eq!(ret_i, 0);
+        let mut args_b = ParcelWriter::new();
+        args_b.write_string16("z444_svc");
+        args_b.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0x1234,
+            cookie: 0x5678,
+        });
+        args_b.write_i32(0);
+        args_b.write_i32(0);
+        let (db, ob) = make_servicemanager_request_parcel(&mut args_b);
+        let mut bc_b = Vec::with_capacity(4 + 64);
+        bc_b.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc_b.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let payload_b = make_v2_write_read_payload(&bc_b, &db, &ob, 4096);
+        let (ret_b, _resp_b) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload_b);
+        assert_eq!(ret_b, 0, "addService ok");
+
+        // ---- Conn A (system_server stand-in): getService → handle ----
+        let mut stream_a = UnixStream::connect(&path).expect("connect A");
+        let (ret_i2, _r2) = exchange(&mut stream_a, WIRE_CMD_IDENT, &ident_payload(live_pid));
+        assert_eq!(ret_i2, 0);
+        let mut args_a = ParcelWriter::new();
+        args_a.write_string16("z444_svc");
+        let (da, oa) = make_servicemanager_request_parcel(&mut args_a);
+        let mut bc_a = Vec::with_capacity(4 + 64);
+        bc_a.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc_a.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload_a = make_v2_write_read_payload(&bc_a, &da, &oa, 4096);
+        let (ret_a, resp_a) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload_a);
+        assert_eq!(ret_a, 0);
+        let rs_a = u32::from_ne_bytes(resp_a[0..4].try_into().unwrap()) as usize;
+        let off_a = 4 + rs_a + 8;
+        let dl_a = u32::from_ne_bytes(resp_a[off_a..off_a + 4].try_into().unwrap()) as usize;
+        let blob_a = &resp_a[off_a + 12..off_a + 12 + dl_a];
+        let svc_handle = u64::from_ne_bytes(blob_a[12..20].try_into().unwrap()) as u32;
+
+        // ---- Conn A: SYNC call (code=17) on that handle ----
+        let mut tx = [0u8; 64];
+        tx[0..4].copy_from_slice(&svc_handle.to_ne_bytes());
+        tx[16..20].copy_from_slice(&17u32.to_ne_bytes());
+        let req: &[u8] = b"a-request";
+        let no_off: Vec<u8> = Vec::new();
+        let mut bc_t = Vec::with_capacity(4 + 64);
+        bc_t.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc_t.extend_from_slice(&tx);
+        let payload_t = make_v2_write_read_multi_payload(&bc_t, &[(req, &no_off)], 4096);
+        let (ret_t, resp_t) = exchange(&mut stream_a, BINDER_WRITE_READ, &payload_t);
+        assert_eq!(ret_t, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp_t[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE,
+            "the sync call is accepted; the reply surfaces on a LATER read"
+        );
+
+        // ---- Conn B: read-only ioctl → the routed BR_TRANSACTION ----
+        let mut wr = Vec::new();
+        wr.extend_from_slice(&0u32.to_ne_bytes());
+        wr.extend_from_slice(&4096u32.to_ne_bytes());
+        let (ret_r1, resp_r1) = exchange(&mut stream_b, BINDER_WRITE_READ, &wr);
+        assert_eq!(ret_r1, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp_r1[4..8].try_into().unwrap()),
+            BR_TRANSACTION,
+            "B receives the request"
+        );
+
+        // ---- Conn B: BC_REPLY → acked with COMPLETE ----
+        let rep: &[u8] = b"installd-reply";
+        let reply = [0u8; 64];
+        let mut bc_p = Vec::with_capacity(4 + 64);
+        bc_p.extend_from_slice(&BC_REPLY.to_ne_bytes());
+        bc_p.extend_from_slice(&reply);
+        let payload_p = make_v2_write_read_multi_payload(&bc_p, &[(rep, &no_off)], 4096);
+        let (ret_p, resp_p) = exchange(&mut stream_b, BINDER_WRITE_READ, &payload_p);
+        assert_eq!(ret_p, 0);
+        assert_eq!(
+            u32::from_ne_bytes(resp_p[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE
+        );
+
+        // ---- THE 6-Z444 ASSERT: A's next read-only ioctl = [BR_REPLY] ----
+        let (ret_d, resp_d) = exchange(&mut stream_a, BINDER_WRITE_READ, &wr);
+        assert_eq!(ret_d, 0);
+        let br_first = u32::from_ne_bytes(resp_d[4..8].try_into().unwrap());
+        assert_eq!(
+            br_first, BR_REPLY,
+            "6-Z444: the deferred reply MUST surface on A's next poll (rn408: 23 s of [BR_NOOP] instead)"
+        );
+        let rs_d = u32::from_ne_bytes(resp_d[0..4].try_into().unwrap()) as usize;
+        let off_d = 4 + rs_d + 8;
+        let dl_d = u32::from_ne_bytes(resp_d[off_d..off_d + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            &resp_d[off_d + 12..off_d + 12 + dl_d],
+            rep,
+            "reply bytes exact"
+        );
+
+        drop(stream_a);
+        drop(stream_b);
+        drop(_handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
     fn z442_bc_reply_owner_read_carries_acquire_mirror_before_complete() {
         // THE rn406 WIRE SHAPE, fixed end-to-end: conn A (the composer)
         // BC_REPLYs a LOCAL flat (the IComposerClient) to conn B (SF) —
