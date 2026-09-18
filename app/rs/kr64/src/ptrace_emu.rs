@@ -12058,7 +12058,14 @@ fn z447_plausible_ptr(v: u64) -> bool {
 
 /// 6-Z447 pair test on a Thread*-candidate buffer: (guard_, cv) adjacent
 /// qwords + the kernel tid within the first 64 bytes. Returns the
-/// (wait_mutex_off, wait_cond_off, tid_off) anchors.
+/// (wait_mutex_off, wait_cond_off, tid_off) anchors. The candidate read
+/// must span the WHOLE Thread prefix: wait_mutex_/wait_cond_ sit after
+/// tls32_ (~92B) + tls64_ (RuntimeStats) + tlsPtr_ (~40 ptrs) + the
+/// interpreter cache — ~1.8-2.6KB into the struct on this build, so the
+/// caller reads 8KB (a 2KB read misses the pair entirely — the rn410
+/// THREAD-UNRESOLVED lesson). tlsPtr_.self is NOT an anchor: thread.cc
+/// never assigns it (only __get_tls()[TLS_SLOT_ART_THREAD_SELF] holds
+/// the Thread*).
 fn z447_validate_thread(
     bytes: &[u8],
     guard: u64,
@@ -12169,6 +12176,12 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
         return; // not an ART ConditionVariable — the 6-Z446 window
                 // already captured it; stay quiet.
     };
+    if waiters == 0 {
+        // A parked CV always has num_waiters_ >= 1 (ConditionVariable::
+        // WaitHoldingLocks increments before the futex and decrements
+        // after). waiters==0 is foreign/zeroed memory — not the class.
+        return;
+    }
     crate::trace_log_line(&format!(
         "6-Z447 CV: pid={} uaddr={:#x} name={:#x} guard={:#x} seq={:#x} cv_waiters={}",
         pid, uaddr, name, guard, seq, waiters
@@ -12176,9 +12189,12 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
     if sp == 0 {
         return;
     }
-    // Thread* discovery on the parked thread's stack window.
-    const SPAN: usize = 0x4000;
-    const MAX_CANDS: usize = 192;
+    // Thread* discovery on the parked thread's stack window. The native
+    // frames spill ART's self register (x20 = Thread* under the quick
+    // convention) within the first few hundred bytes above sp; 32KB
+    // covers deep managed frames too.
+    const SPAN: usize = 0x8000;
+    const MAX_CANDS: usize = 256;
     let Some(stack) = z446_read_mem_window(pid, sp, SPAN) else {
         return;
     };
@@ -12190,7 +12206,8 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
     let mut found: Option<(u64, usize, usize, usize)> = None;
     let mut pair_only: Option<(u64, usize, usize, usize)> = None;
     for c in &cands {
-        let Some(tb) = z446_read_mem_window(pid, *c, 2048) else {
+        // 8KB: the full Thread prefix (the pair lives ~2KB in).
+        let Some(tb) = z446_read_mem_window(pid, *c, 8192) else {
             continue;
         };
         if let Some((wm, wc, to)) = z447_validate_thread(&tb, guard, uaddr - 16, pid as u32) {
