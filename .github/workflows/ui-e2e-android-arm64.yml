@@ -686,6 +686,32 @@ jobs:
                esac; \
              done" \
             > /tmp/ui-e2e-artifacts/svclogs-raw-top20.txt 2>&1 || true
+          # ── 6-Z440: ABORT-MESSAGE svc-log sweep (opener #1's decode
+          # payload) ─────────────────────────────────────────────────
+          # rn404's decode proved the dying rild generation's UNSAFE-
+          # retrieve FATAL context is invisible in BOTH existing svc
+          # bundles: svclogs.txt carries only tail-3072 filtered output,
+          # and svclogs-raw-top20's CRITICAL-SERVICE section matches
+          # /proc cmdlines — which DEAD generations no longer have.
+          # Task 173 named the blocker: "needs the FULL svc-<rild-pid>
+          # .log capture — svclogs.txt embeds only 3072-byte tails".
+          # Fix: grep the svclogs DIRECTORY (filenames outlive the
+          # processes) for the abort signatures and raw-tail the hits.
+          # Bounded: ≤6 files × 64KB + ≤6 × 32KB per run.
+          timeout 60 sudo docker exec redroid sh -c \
+            "d=/data/user/0/io.twoyi.debug/rootfs/dev/twoyi-svclogs; \
+             cd \$d 2>/dev/null || exit 0; \
+             echo '##### 6-Z440 UNSAFE-RETRIEVE SVLOGS #####'; \
+             grep -al 'Attempted to retrieve value from failed HIDL call' svc-*.log 2>/dev/null | head -6 | while read f; do \
+               echo \"== 6-Z440 ABORT-RAW \$f (\$(stat -c%s \$f) bytes) ==\"; \
+               tail -c 65536 \$f | grep -av 'anon:'; \
+             done; \
+             echo '##### 6-Z440 FATAL-SIGNAL SVLOGS #####'; \
+             grep -alE 'Fatal signal [0-9]+' svc-*.log 2>/dev/null | head -6 | while read f; do \
+               echo \"== 6-Z440 FATAL-RAW \$f (\$(stat -c%s \$f) bytes) ==\"; \
+               tail -c 32768 \$f | grep -av 'anon:'; \
+             done" \
+            > /tmp/ui-e2e-artifacts/svclogs-aborts.txt 2>&1 || true
           # ── 6-Z428: the TOMBSTONE HARVEST ───────────────────────────
           # The rn386 decode proved the dump pipeline engraves FULL
           # tombstones that never land in {rootfs}/data/tombstones:
