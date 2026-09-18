@@ -894,6 +894,39 @@ jobs:
                ls -la \$base/system/etc/ld.config*.txt \$base/etc/ld.config*.txt 2>/dev/null || echo 'no static ld.config variants'; \
              done" \
             > /tmp/ui-e2e-artifacts/linkerconfig-forensics.txt 2>&1 || true
+          # ── 6-Z450: the boot-image pipeline's OUTPUT side ────────────
+          # Task 185: dex2oat64 execs 3-5×/generation, fdatasyncs real
+          # output and EXITS 0 — yet the next runtime falls back to
+          # "Using default boot image" (the guest tombstone maps contain
+          # ZERO boot.art/boot.oat mappings). The dalvik-cache listing
+          # decides load-path-broken (cache files EXIST — the runtime's
+          # mmap/file access through the emulator fails) vs output-path-
+          # broken (files ABSENT — odrefresh's validation/rename never
+          # lands). Mtimes settle freshness (fresh-per-run vs stale-from-
+          # image); the 64-byte hexdump validates the ART file magic
+          # ("art\n"/"oat\n"). Both candidate rootfs trees (the #96
+          # lesson: the live tree is profiles/default). Bounded: listing
+          # capped, ≤64 files hexdumped.
+          timeout 60 sudo docker exec redroid sh -c \
+            "for base in /data/user/0/io.twoyi.debug/profiles/default/rootfs /data/user/0/io.twoyi.debug/rootfs; do \
+               for d in \$base/data/misc/apexdata/com.android.art/dalvik-cache \
+                        \$base/data/dalvik-cache; do \
+                 echo \"== \$d ==\"; \
+                 if [ -d \$d ]; then \
+                   ls -laR \$d 2>/dev/null | head -150; \
+                   n=0; \
+                   for f in \$d/*.art \$d/*.oat \$d/*/*.art \$d/*/*.oat; do \
+                     [ -f \$f ] || continue; \
+                     n=\$((n+1)); [ \$n -gt 64 ] && break; \
+                     echo \"-- FILE \$f size=\$(stat -c%s \$f) mtime=\$(stat -c%y \$f) --\"; \
+                     head -c 64 \$f | od -A x -t x1 2>/dev/null | head -5; \
+                   done; \
+                 else echo MISSING; fi; \
+               done; \
+               echo \"== \$base/data/misc/apexdata tree (head) ==\"; \
+               ls -laR \$base/data/misc/apexdata 2>/dev/null | head -100 || echo MISSING; \
+             done" \
+            > /tmp/ui-e2e-artifacts/dex2oat-cache.txt 2>&1 || true
           sleep 5
           timeout 45 sudo docker exec redroid /system/bin/sh -c \
             "/system/bin/screencap -p /data/local/tmp/final-2.png 2>/dev/null && cat /data/local/tmp/final-2.png" \
