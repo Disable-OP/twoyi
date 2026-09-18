@@ -11861,6 +11861,57 @@ fn z403_wake_census_record(tid: libc::pid_t, uaddr: u64, woken: u32) {
 
 /// 6-Z403: sum the census across ALL tids for one uaddr —
 /// (total wake-calls, total woken, age of the most recent wake).
+/// 6-Z446: read `len` bytes of the tracee's memory at `addr` via
+/// /proc/<pid>/mem (pread — the tracer's own access path; the same
+/// rights class as read_child_string_proc_mem). Returns None when the
+/// window is unreadable (unmapped, proc entry gone).
+fn z446_read_mem_window(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    let mut f = std::fs::File::open(format!("/proc/{}/mem", pid)).ok()?;
+    f.seek(SeekFrom::Start(addr)).ok()?;
+    let mut buf = vec![0u8; len];
+    let n = f.read(&mut buf).ok()?;
+    if n == 0 {
+        None
+    } else {
+        buf.truncate(n);
+        Some(buf)
+    }
+}
+
+/// 6-Z446: hex-dump a memory window as 8-byte LE words (bounded, one
+/// line) — the ART Monitor-struct neighborhood around a monitor futex
+/// uaddr: the lock word's neighbors carry the OWNER field / the monitor
+/// id / the waiter list, so the dump names WHO the parked waiter's
+/// monitor belongs to when the WAKE-CENSUS says wakes=NEVER (rn408
+/// decode: system_server main parked in FUTEX_WAIT_PRIVATE(word=0x11)
+/// that no thread ever woke; the monitor struct's owner field names the
+/// never-notifying holder).
+fn z446_mem_window_line(pid: libc::pid_t, uaddr: u64) -> Option<String> {
+    const BEFORE: u64 = 32;
+    const AFTER: u64 = 32;
+    let start = uaddr.saturating_sub(BEFORE);
+    let bytes = z446_read_mem_window(pid, start, (BEFORE + AFTER) as usize)?;
+    let mut words: Vec<String> = Vec::new();
+    for (i, w) in bytes.chunks_exact(8).enumerate() {
+        let v = u64::from_ne_bytes(w.try_into().ok()?);
+        let tag = if start + (i as u64) * 8 == uaddr {
+            " <=uaddr"
+        } else {
+            ""
+        };
+        words.push(format!("+{:02}:{:016x}{}", i * 8, v, tag));
+    }
+    Some(format!(
+        "6-Z446 MONITOR-WINDOW: pid={} [uaddr={:#x} -32..+32] {}",
+        pid,
+        uaddr,
+        words.join(" ")
+    ))
+}
+
 fn z403_wake_census_lookup(uaddr: u64) -> Option<(u64, u64, std::time::Duration)> {
     let m = Z403_WAKE_CENSUS.get_or_init(|| std::sync::Mutex::new(Z403WakeCensus::new()));
     let g = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -12603,10 +12654,19 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                                 woken,
                                 ago.as_secs_f32()
                             )),
-                            None => crate::trace_log_line(&format!(
-                                "6-Z403 WAKE-CENSUS: pid={} uaddr={:#x} wakes=NEVER (no wake-family futex ever issued on this address)",
-                                pid, a0
-                            )),
+                            None => {
+                                crate::trace_log_line(&format!(
+                                    "6-Z403 WAKE-CENSUS: pid={} uaddr={:#x} wakes=NEVER (no wake-family futex ever issued on this address)",
+                                    pid, a0
+                                ));
+                                // 6-Z446: a NEVER-woken monitor wait is the
+                                // lost-notify class — dump the Monitor-struct
+                                // neighborhood once so the decode sees the
+                                // owner/id fields around the futex word.
+                                if let Some(line) = z446_mem_window_line(pid, a0) {
+                                    crate::trace_log_line(&line);
+                                }
+                            }
                         }
                     }
                 }

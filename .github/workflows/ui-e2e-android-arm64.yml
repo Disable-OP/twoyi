@@ -798,14 +798,18 @@ jobs:
           # previously never collected. Bounded: list the dir, then
           # the 5 NEWEST tombstones head-capped at 48 KiB each (A11
           # tombstones are text: the signal line, the aborting
-          # pid/tid, and the full backtrace are all in the head).
+          # pid/tid, and the full backtrace are in the head — and
+          # the rn408 decode lesson: the MAPS section lives in the
+          # TAIL and is what symbolizes a SEGV pc (tombstone_02's
+          # pc=0xeaae225c8384 <unknown>). 96 KiB covers a full
+          # 81 KB tombstone end to end.
           timeout 60 sudo docker exec redroid sh -c \
             "t=/data/user/0/io.twoyi.debug/profiles/default/rootfs/data/tombstones; \
              if [ -d \$t ]; then \
                echo \"== \$t ==\"; ls -la \$t 2>/dev/null | head -40; \
                ls -t \$t/tombstone_* 2>/dev/null | head -5 | while read f; do \
-                 echo \"-- TOMBSTONE \$f (\$(stat -c%s \$f) bytes) head 49152 --\"; \
-                 head -c 49152 \$f; echo; \
+                 echo \"-- TOMBSTONE \$f (\$(stat -c%s \$f) bytes) head 98304 --\"; \
+                 head -c 98304 \$f; echo; \
                done; \
              else echo \"NO TOMBSTONES DIR at \$t\"; fi" \
             > /tmp/ui-e2e-artifacts/tombstones.txt 2>&1 || true
