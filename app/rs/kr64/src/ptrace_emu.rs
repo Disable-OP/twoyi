@@ -12439,21 +12439,41 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
     }
 }
 
-/// 6-Z449: resolve a mirror object's Java class NAME via the boot image.
+/// 6-Z449 v2 (rn414 decode): resolve a mirror object's Java class NAME
+/// through the compressed-reference heap.
 ///
 /// The monitored object's identity is THE fix-site datum: every main-class
 /// generation waits on a monitor whose object has the SAME class word
-/// (0x005c0000), a null class_loader slot, and a field that grows ~700 per
-/// boot generation. Chain (all u32 COMPRESSED refs against the boot.art
-/// mapping start):
-///   klass_ref (u32 @ obj+0) → base + klass_ref = the class mirror;
-///   name_ref (u32 @ class+28, mirror::Class::name_ in the java-link
-///   field order) → base + name_ref = the String mirror;
-///   value_ref (u32 @ string+8) → base + value_ref = the value array;
-///   its u32 length @ +8 and inline data @ +12 decode the name.
-/// Every step is validated and the first (base, klass) pair that decodes
-/// to printable ASCII wins; a wrong base is visible in the log instead of
-/// silently wrong.
+/// (0x005c0000) and a field that tracks the guest pid counter. The OLD
+/// chain (boot.art mapping start + u32 ref) is dead two ways:
+///   (1) the guest runs image-less ("Using default boot image") — no
+///       boot.art mapping exists to key the base on; and
+///   (2) the empirical shape (rn414: klass_ref = 0x005c0000 CONSTANT
+///       across generations while the Monitor obj_ high-32 varies per
+///       generation: 0xe139/0xfc70/0xfd2d/0xe7e2/0xf138) proves the
+///       guest build's heap refs are 32-bit OFFSETS from a 4GB-aligned
+///       heap WINDOW, not low-truncated absolute pointers — an absolute
+///       read of 0x5c0000 can never host the class mirror of a process
+///       whose heap lives at 0xe139_c0014380.
+/// Chain (all refs = u32 offsets from the window base):
+///   window = obj (the Monitor's full 64-bit obj_ ptr) & 0xffff_ffff_0000_0000;
+///   klass_ref (u32 @ obj+0, mirror::Object::klass_) → class mirror at
+///   window | klass_ref;
+///   SELF-CHECK: the class mirror's own klass_ (u32 @ +0) is the
+///   java.lang.Class mirror (whose klass_ points at itself), and its
+///   name_ must decode to the literal "java.lang.Class" — that proves
+///   the window base AND the field layout end to end, per-run;
+///   name_ref (u32 @ class+28 = mirror::Class::name_ in the A11
+///   java-link field order class_loader_@8 / component_type_@12 /
+///   dex_cache_@16 / ext_data_@20 / iftable_@24 / name_@28) → the
+///   String mirror;
+///   count_ (i32 @ string+8: with string compression the LSB is the
+///   flag and length = count_ >> 1; A11 stores the chars INLINE at
+///   string+16 — u8 when compressed, u16 otherwise — NOT behind a
+///   value_ array reference as the old chain assumed) → the name.
+/// Every step is validated, the raw mirrors are logged either way for
+/// the offline decode, and an unresolvable chain is LOGGED as such —
+/// never silent, never guessed.
 fn z449_class_name_line(pid: libc::pid_t, obj: u64) {
     if obj < 8 {
         return;
@@ -12465,66 +12485,170 @@ fn z449_class_name_line(pid: libc::pid_t, obj: u64) {
         return;
     }
     let klass_ref = u32::from_ne_bytes(ob0[0..4].try_into().unwrap());
-    if klass_ref == 0 || klass_ref > 0x800_0000 {
+    if klass_ref == 0 {
         return;
     }
-    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).unwrap_or_default();
-    let mut bases: Vec<u64> = Vec::new();
-    for line in maps.lines() {
-        if line.contains("boot.art") {
-            if let Some(start) = line.split('-').next() {
-                if let Ok(b) = u64::from_str_radix(start, 16) {
-                    if !bases.contains(&b) {
-                        bases.push(b);
+    let window = obj & 0xffff_ffff_0000_0000;
+    let class_addr = window | klass_ref as u64;
+    let Some(cb) = z446_read_mem_window(pid, class_addr, 48) else {
+        crate::trace_log_line(&format!(
+            "6-Z449 CLASS-RAW: pid={} obj={:#x} klass_ref={:#x} window={:#x} class={:#x} UNREADABLE (window|ref miss — the window base or the ref semantics differ)",
+            pid, obj, klass_ref, window, class_addr
+        ));
+        return;
+    };
+    if cb.len() < 32 {
+        crate::trace_log_line(&format!(
+            "6-Z449 CLASS-RAW: pid={} obj={:#x} window={:#x} class={:#x} SHORT-READ {}B",
+            pid,
+            obj,
+            window,
+            class_addr,
+            cb.len()
+        ));
+        return;
+    }
+    let class_klass_ref = z449_encode_u32_at(&cb, 0);
+    let name_ref = z449_encode_u32_at(&cb, 28);
+    // SELF-CHECK hop 1 (pointer identity): the class mirror's klass_ must
+    // point at a mirror whose own klass_ is ITSELF (java.lang.Class is
+    // self-referential) — klass_ref2 == class_klass_ref.
+    let mut self_check = "FAILED";
+    if class_klass_ref != 0 {
+        let cc_addr = window | class_klass_ref as u64;
+        if let Some(cc0) = z446_read_mem_window(pid, cc_addr, 4) {
+            if cc0.len() == 4 {
+                let cc_klass = u32::from_ne_bytes(cc0[0..4].try_into().unwrap());
+                if cc_klass == class_klass_ref {
+                    self_check = "SELF";
+                }
+            }
+        }
+    }
+    // SELF-CHECK hop 2 (full layout proof): the java.lang.Class mirror's
+    // name_ (+28) must decode to the literal "java.lang.Class".
+    if self_check == "SELF" {
+        if let Some(ccb) = z446_read_mem_window(pid, window | class_klass_ref as u64, 32) {
+            if ccb.len() >= 32 {
+                let nref2 = z449_encode_u32_at(&ccb, 28);
+                if nref2 != 0 {
+                    if let Some((nm, _enc)) = z449_decode_string(pid, window | nref2 as u64) {
+                        if nm == "java.lang.Class" {
+                            self_check = "PROVEN";
+                        }
                     }
                 }
             }
         }
     }
-    for base in bases {
-        let class_addr = base + klass_ref as u64;
-        let Some(cb) = z446_read_mem_window(pid, class_addr, 40) else {
-            continue;
-        };
-        if cb.len() < 40 {
-            continue;
+    // Raw mirrors for the offline decode (bounded: 48B class head).
+    let cb_hex: String = cb.iter().map(|b| format!("{:02x}", b)).collect();
+    crate::trace_log_line(&format!(
+        "6-Z449 CLASS-RAW: pid={} obj={:#x} klass_ref={:#x} window={:#x} class={:#x} class_klass_ref={:#x} name_ref={:#x} head={}",
+        pid, obj, klass_ref, window, class_addr, class_klass_ref, name_ref, cb_hex
+    ));
+    let primary = if name_ref == 0 {
+        None
+    } else {
+        z449_decode_string(pid, window | name_ref as u64)
+    };
+    match primary {
+        Some((name, enc)) => {
+            crate::trace_log_line(&format!(
+                "6-Z449 CLASS-NAME: pid={} obj={:#x} window={:#x} name={:?} enc={} self-check={} (the monitored object's class)",
+                pid, obj, window, name, enc, self_check
+            ));
         }
-        let name_ref = u32::from_ne_bytes(cb[28..32].try_into().unwrap());
-        if name_ref == 0 || name_ref > 0x800_0000 {
-            continue;
+        None => {
+            crate::trace_log_line(&format!(
+                "6-Z449 CLASS-NAME: pid={} obj={:#x} window={:#x} UNRESOLVED (klass_ref={:#x} name_ref={:#x} self-check={}) — raw mirrors logged for the offline decode",
+                pid, obj, window, klass_ref, name_ref, self_check
+            ));
         }
-        let str_addr = base + name_ref as u64;
-        let Some(sb) = z446_read_mem_window(pid, str_addr, 16) else {
-            continue;
-        };
-        if sb.len() < 16 {
-            continue;
-        }
-        let value_ref = u32::from_ne_bytes(sb[8..12].try_into().unwrap());
-        let count_raw = i32::from_ne_bytes(sb[12..16].try_into().unwrap());
-        if value_ref == 0 || value_ref > 0x800_0000 {
-            continue;
-        }
-        let arr_addr = base + value_ref as u64;
-        let Some(ab) = z446_read_mem_window(pid, arr_addr, 12 + 256) else {
-            continue;
-        };
-        if ab.len() < 12 {
-            continue;
-        }
-        let arr_len = u32::from_ne_bytes(ab[8..12].try_into().unwrap());
-        let data = &ab[12..];
-        let take = (arr_len as usize).min(160).min(data.len());
-        if take == 0 || !data[..take].iter().all(|b| (0x20..0x7f).contains(b)) {
-            continue;
-        }
-        let name_str = String::from_utf8_lossy(&data[..take]).into_owned();
-        crate::trace_log_line(&format!(
-            "6-Z449 CLASS-NAME: pid={} obj={:#x} klass_ref={:#x} base={:#x} name={:?} count_raw={:#x} (boot-image class of the monitored object)",
-            pid, obj, klass_ref, base, name_str, count_raw
-        ));
-        return;
     }
+}
+
+/// 6-Z449: decode an A11 inline String mirror at `addr`.
+///
+/// Layout (AOSP android-11.0.0_r1 mirror::String, field order fixed by
+/// ValidateFieldOrderOfJavaCppUnionClasses): klass_ @0, monitor_ @4,
+/// count_ @8 (i32), hash_code_ @12, chars INLINE @16. With string
+/// compression enabled count_'s LSB is the flag and the length is
+/// count_ >> 1 (chars are u8 when flag=1, u16 when flag=0); with it
+/// disabled count_ IS the length (u16 chars). Both interpretations are
+/// validated against printable-ASCII; the first hit wins and its
+/// encoding is named so a wrong guess is visible, not silent.
+fn z449_decode_string(pid: libc::pid_t, addr: u64) -> Option<(String, &'static str)> {
+    let sb = z446_read_mem_window(pid, addr, 16 + 512)?;
+    z449_decode_string_bytes(&sb)
+}
+
+/// 6-Z449: read a little-endian u32 field at `off` from a mirror head
+/// (the chain reads klass_/name_ fields at fixed offsets; the helper
+/// keeps the slice-bounds shape in one place).
+fn z449_encode_u32_at(buf: &[u8], off: usize) -> u32 {
+    u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+/// Pure core of the A11 inline-String decode (testable without a
+/// tracee). Returns the decoded name and the interpretation label.
+fn z449_decode_string_bytes(sb: &[u8]) -> Option<(String, &'static str)> {
+    if sb.len() < 16 {
+        return None;
+    }
+    let count_raw = i32::from_ne_bytes(sb[8..12].try_into().unwrap());
+    if count_raw <= 0 || count_raw > 4096 {
+        return None;
+    }
+    let flag = count_raw & 1;
+    // (char count, compressed, label) candidates in preference order.
+    // flag semantics (AOSP string.h): flag=1 → compressed u8 chars,
+    // length = count_ >> 1. The (u16, count_) fallback covers a build
+    // with string compression DISABLED (count_ = raw length); for even
+    // counts the two interpretations genuinely differ from bytes alone
+    // — the label in the log + the CLASS-RAW dump make a wrong pick
+    // visible instead of silent.
+    let mut cands: Vec<(usize, bool, &'static str)> = Vec::new();
+    if flag == 1 {
+        cands.push(((count_raw >> 1) as usize, true, "u8-flag1(count>>1)"));
+        cands.push((count_raw as usize, false, "u16-flag1(count)"));
+    } else {
+        cands.push(((count_raw >> 1) as usize, false, "u16-flag0(count>>1)"));
+        cands.push((count_raw as usize, false, "u16-flag0(count)"));
+    }
+    for (len, compressed, label) in cands {
+        if len == 0 || len > 256 {
+            continue;
+        }
+        let take = if compressed { len } else { len * 2 };
+        if 16 + take > sb.len() {
+            continue;
+        }
+        if compressed {
+            let d = &sb[16..16 + len];
+            if !d.iter().all(|b| (0x20..0x7f).contains(b)) {
+                continue;
+            }
+            return Some((String::from_utf8_lossy(d).into_owned(), label));
+        } else {
+            let mut v = Vec::with_capacity(len);
+            let mut ok = true;
+            for i in 0..len {
+                let c = u16::from_ne_bytes(sb[16 + i * 2..18 + i * 2].try_into().unwrap());
+                if !(0x20..0x7f).contains(&c) {
+                    ok = false;
+                    break;
+                }
+                v.push(c as u8);
+            }
+            if ok {
+                if let Ok(s) = String::from_utf8(v) {
+                    return Some((s, label));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 6-Z271f: forensic dump for one blocked-in-syscall tracee.
@@ -24728,6 +24852,30 @@ pub fn run_ptrace_loop(
                             execve_rewrite_claim = None;
                             let path_addr_e = get_syscall_arg(&regs, abi.reg_arg1);
                             if let Some(orig) = read_child_string(pid, path_addr_e) {
+                                // ── 6-Z450: dex2oat/odrefresh ARGV capture ──
+                                // The boot-image frontier (Task 185): dex2oat
+                                // execs 3-5×/generation, fdatasyncs real
+                                // output and EXITS 0 — yet the next runtime
+                                // still falls back to "Using default boot
+                                // image". The ORIGINAL guest argv at execve
+                                // ENTRY names --boot-image,
+                                // --instruction-set, --compiler-filter and
+                                // the odrefresh output paths — deciding
+                                // load-path-broken vs output-path-broken vs
+                                // arg-shape-broken. Logging-only; the 6-Z101
+                                // rewrite below is untouched.
+                                if orig.contains("dex2oat") || orig.contains("odrefresh") {
+                                    let argv_addr_e = get_syscall_arg(&regs, abi.reg_arg2);
+                                    let stride_e: u64 = if abi.execve == 11 { 4 } else { 8 };
+                                    let argv_e =
+                                        z306_read_guest_argv(pid, argv_addr_e, stride_e, 64);
+                                    log(&format!(
+                                        "6-Z450 DEX2OAT-ARGV: pid={} path={} argv=[{}] (execve ENTRY, before the 6-Z101 rewrite)",
+                                        pid,
+                                        orig,
+                                        argv_e.join("][")
+                                    ));
+                                }
                                 // Lazy-load the staged map once.
                                 if staged_exes.is_none() {
                                     let (m, note) = load_staged_exes_map(rootfs, data_dir);
@@ -54647,5 +54795,99 @@ mod z404_park_probe_tests {
         assert_eq!(z404_parse_syscall_nr("running"), None, "on-CPU: skip");
         assert_eq!(z404_parse_syscall_nr("garbage"), None, "unparseable");
         assert_eq!(z404_parse_syscall_nr(""), None, "empty token");
+    }
+}
+
+#[cfg(test)]
+mod z449_class_name_tests {
+    use super::{z449_decode_string_bytes, z449_encode_u32_at};
+
+    /// An A11 compressed (u8) String mirror: count_ = (len << 1) | 1,
+    /// chars INLINE at +16 — "java.lang.Thread" (17 chars, odd).
+    #[test]
+    fn z449_string_decodes_compressed_u8() {
+        let name = b"java.lang.Thread";
+        let mut b = vec![0u8; 16 + name.len() + 8];
+        let count: i32 = ((name.len() as i32) << 1) | 1;
+        b[8..12].copy_from_slice(&count.to_ne_bytes());
+        b[16..16 + name.len()].copy_from_slice(name);
+        let (s, enc) = z449_decode_string_bytes(&b).expect("compressed string must decode");
+        assert_eq!(s, "java.lang.Thread");
+        assert_eq!(enc, "u8-flag1(count>>1)");
+    }
+
+    /// An A11 uncompressed (u16) String mirror with compression enabled:
+    /// count_ = len << 1 (flag=0), UTF-16LE chars INLINE at +16 —
+    /// "java.lang.Object" (16 chars, even).
+    #[test]
+    fn z449_string_decodes_u16_flag0() {
+        let name = "java.lang.Object";
+        let mut b = vec![0u8; 16 + name.len() * 2 + 8];
+        let count: i32 = (name.len() as i32) << 1;
+        b[8..12].copy_from_slice(&count.to_ne_bytes());
+        for (i, ch) in name.chars().enumerate() {
+            b[16 + i * 2..18 + i * 2].copy_from_slice(&(ch as u16).to_ne_bytes());
+        }
+        let (s, enc) = z449_decode_string_bytes(&b).expect("u16 string must decode");
+        assert_eq!(s, name);
+        assert_eq!(enc, "u16-flag0(count>>1)");
+    }
+
+    /// A build with string compression DISABLED: count_ IS the length
+    /// (no flag bit) — an odd length routes to the (u16, count_)
+    /// fallback after the (u8, count>>1) candidate fails on the NUL
+    /// bytes of UTF-16LE.
+    #[test]
+    fn z449_string_falls_back_to_raw_count_for_disabled_compression() {
+        let name = "java.lang.Class"; // 15 chars (odd)
+        let mut b = vec![0u8; 16 + name.len() * 2 + 8];
+        let count: i32 = name.len() as i32; // odd → flag reads 1
+        b[8..12].copy_from_slice(&count.to_ne_bytes());
+        for (i, ch) in name.chars().enumerate() {
+            b[16 + i * 2..18 + i * 2].copy_from_slice(&(ch as u16).to_ne_bytes());
+        }
+        let (s, enc) = z449_decode_string_bytes(&b).expect("raw-count string must decode");
+        assert_eq!(s, name);
+        assert_eq!(enc, "u16-flag1(count)");
+    }
+
+    /// Garbage must NOT decode: zero/negative counts, non-printable
+    /// bytes, and non-UTF16 all return None (logged UNRESOLVED upstream,
+    /// never guessed).
+    #[test]
+    fn z449_string_rejects_garbage() {
+        assert_eq!(z449_decode_string_bytes(&[0u8; 16]), None, "zeroed mirror");
+        let mut b = vec![0u8; 64];
+        b[8..12].copy_from_slice(&(-4i32).to_ne_bytes());
+        assert_eq!(z449_decode_string_bytes(&b), None, "negative count");
+        let mut c = vec![0u8; 64];
+        c[8..12].copy_from_slice(&((8i32 << 1) | 1).to_ne_bytes());
+        c[16..24].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert_eq!(z449_decode_string_bytes(&c), None, "non-printable u8 chars");
+        let mut d = vec![0u8; 64];
+        d[8..12].copy_from_slice(&((8i32) << 1).to_ne_bytes());
+        for i in 0..8usize {
+            d[16 + i * 2..18 + i * 2].copy_from_slice(&0x4e2du16.to_ne_bytes());
+            // '一'
+        }
+        assert_eq!(z449_decode_string_bytes(&d), None, "non-ASCII u16 chars");
+    }
+
+    /// The rn414 window arithmetic: the class mirror address is
+    /// window | klass_ref where window = obj & 0xffff_ffff_0000_0000 —
+    /// pinned with the empirical rn414 episode (obj=0xe139c0014380,
+    /// klass_ref=0x005c0000 → class at 0xe139005c0000).
+    #[test]
+    fn z449_window_arithmetic_matches_rn414_episode() {
+        let obj: u64 = 0x0000_e139_c001_4380;
+        let klass_ref: u32 = 0x005c_0000;
+        let window = obj & 0xffff_ffff_0000_0000;
+        let class_addr = window | klass_ref as u64;
+        assert_eq!(window, 0x0000_e139_0000_0000);
+        assert_eq!(class_addr, 0x0000_e139_005c_0000);
+        // And the u32-field accessor used by the chain.
+        let mut head = [0u8; 48];
+        head[28..32].copy_from_slice(&0x1234_5678u32.to_ne_bytes());
+        assert_eq!(z449_encode_u32_at(&head, 28), 0x1234_5678);
     }
 }
