@@ -12349,6 +12349,8 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
                 }
             }
         }
+        // ── 6-Z449 CLASS-NAME chain (rn413 decode) ────────────────────
+        z449_class_name_line(pid, obj);
     }
     // ── 6-Z447 calibration follow-ups (rn411 decode) ──────────────────
     // The rn411 MONITOR dumps fit NO consistent Monitor layout: with the
@@ -12434,6 +12436,94 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
                 }
             }
         }
+    }
+}
+
+/// 6-Z449: resolve a mirror object's Java class NAME via the boot image.
+///
+/// The monitored object's identity is THE fix-site datum: every main-class
+/// generation waits on a monitor whose object has the SAME class word
+/// (0x005c0000), a null class_loader slot, and a field that grows ~700 per
+/// boot generation. Chain (all u32 COMPRESSED refs against the boot.art
+/// mapping start):
+///   klass_ref (u32 @ obj+0) → base + klass_ref = the class mirror;
+///   name_ref (u32 @ class+28, mirror::Class::name_ in the java-link
+///   field order) → base + name_ref = the String mirror;
+///   value_ref (u32 @ string+8) → base + value_ref = the value array;
+///   its u32 length @ +8 and inline data @ +12 decode the name.
+/// Every step is validated and the first (base, klass) pair that decodes
+/// to printable ASCII wins; a wrong base is visible in the log instead of
+/// silently wrong.
+fn z449_class_name_line(pid: libc::pid_t, obj: u64) {
+    if obj < 8 {
+        return;
+    }
+    let Some(ob0) = z446_read_mem_window(pid, obj, 8) else {
+        return;
+    };
+    if ob0.len() < 8 {
+        return;
+    }
+    let klass_ref = u32::from_ne_bytes(ob0[0..4].try_into().unwrap());
+    if klass_ref == 0 || klass_ref > 0x800_0000 {
+        return;
+    }
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).unwrap_or_default();
+    let mut bases: Vec<u64> = Vec::new();
+    for line in maps.lines() {
+        if line.contains("boot.art") {
+            if let Some(start) = line.split('-').next() {
+                if let Ok(b) = u64::from_str_radix(start, 16) {
+                    if !bases.contains(&b) {
+                        bases.push(b);
+                    }
+                }
+            }
+        }
+    }
+    for base in bases {
+        let class_addr = base + klass_ref as u64;
+        let Some(cb) = z446_read_mem_window(pid, class_addr, 40) else {
+            continue;
+        };
+        if cb.len() < 40 {
+            continue;
+        }
+        let name_ref = u32::from_ne_bytes(cb[28..32].try_into().unwrap());
+        if name_ref == 0 || name_ref > 0x800_0000 {
+            continue;
+        }
+        let str_addr = base + name_ref as u64;
+        let Some(sb) = z446_read_mem_window(pid, str_addr, 16) else {
+            continue;
+        };
+        if sb.len() < 16 {
+            continue;
+        }
+        let value_ref = u32::from_ne_bytes(sb[8..12].try_into().unwrap());
+        let count_raw = i32::from_ne_bytes(sb[12..16].try_into().unwrap());
+        if value_ref == 0 || value_ref > 0x800_0000 {
+            continue;
+        }
+        let arr_addr = base + value_ref as u64;
+        let Some(ab) = z446_read_mem_window(pid, arr_addr, 12 + 256) else {
+            continue;
+        };
+        if ab.len() < 12 {
+            continue;
+        }
+        let arr_len = u32::from_ne_bytes(ab[8..12].try_into().unwrap());
+        let data = &ab[12..];
+        let take = (arr_len as usize).min(160).min(data.len());
+        if take == 0 || !data[..take].iter().all(|b| (0x20..0x7f).contains(b)) {
+            continue;
+        }
+        let name_str = String::from_utf8_lossy(&data[..take]).into_owned();
+        crate::trace_log_line(&format!(
+            "6-Z449 CLASS-NAME: pid={} obj={:#x} klass_ref={:#x} base={:#x} name={:?} count_raw={:#x} (boot-image class of the monitored object)",
+            pid, obj, klass_ref, base, name_str, count_raw
+        ));
+        return;
     }
 }
 
