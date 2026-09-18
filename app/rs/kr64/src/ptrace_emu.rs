@@ -11578,14 +11578,21 @@ fn z455_harvest_anr(rootfs: &str) -> Vec<String> {
 // state through the guest and the decode joins the two views:
 //
 //   W = ptr (the weakref_impl* the kernel-true mirror carries)
+//   [W+0]  = mStrong i32  (raw; RefBase::INITIAL_STRONG_VALUE = 1<<28)
+//   [W+4]  = mWeak   i32
 //   [W+8]  = mBase        (the RefBase* this weakref belongs to)
-//   [W+16] = mStrong i32  (raw; RefBase::INITIAL_STRONG_VALUE = 1<<28)
-//   [W+20] = mWeak   i32
+//   [W+16] = mFlags  i32
 //
-// Layout proof (Android 11 RefBase.h): weakref_impl : weakref_type — vptr
-// at 0, mBase at 8, mStrong at 16, mWeak at 20. The z366 chain already
-// proved [R+8]==W for the BnHw shell class (R = mBase = [W+8]); this read
-// lands on the SAME live weakref the mirror names, no pointers invented.
+// Layout proof (A11 system/core/libutils/RefBase.cpp,
+// android-11.0.0_r1): weakref_impl's FIRST members are mStrong, mWeak,
+// THEN mBase, mFlags — and weakref_type contributes no vptr (empty
+// base), so mStrong lands at offset 0 and mBase at offset 8. The
+// z366 chain already proved [W+8]==mBase and [mBase+8]==W (the BnHw
+// shell class delta 0x88 = Z366_BNHW_DELTA); rn423's first 12 reads
+// landed on [W+8..24) under a WRONG offset model (mStrong@16) and read
+// {mBase=ok, mFlags=0, padding=garbage} — the [W+16]=0 + stable-garbage
+// shape was the DISPROOF that moved the model to the source-true
+// offsets. THIS read starts at W+0.
 //
 // count = mStrong_raw - INITIAL: ≥1 = the owner's own sp is present (the
 // delivery's decStrong is legit); 0 = the own sp is ALREADY gone (the
@@ -11600,30 +11607,38 @@ fn z455_harvest_anr(rootfs: &str) -> Vec<String> {
 /// raw value encodes `INITIAL + N - M`; the live count is the delta below.
 pub(crate) const Z457_INITIAL_STRONG: i32 = 1 << 28;
 
-/// One owner-side RefBase snapshot (the 16 bytes at [W+8..W+24]).
+/// One owner-side RefBase snapshot (the 20 bytes at [W+0..W+20)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Z457State {
-    /// [W+8] — the RefBase* the weakref belongs to (mBase).
-    pub mbase: u64,
-    /// [W+16] — the RAW mStrong (subtract [`Z457_INITIAL_STRONG`]).
+    /// [W+0] — the RAW mStrong (subtract [`Z457_INITIAL_STRONG`]).
     pub strong_raw: i32,
-    /// [W+20] — mWeak (starts at 0).
+    /// [W+4] — mWeak (starts at 0).
     pub weak: i32,
+    /// [W+8] — the RefBase* the weakref belongs to (mBase) — the
+    /// z366-validated anchor (delta vs the cookie = the class id).
+    pub mbase: u64,
+    /// [W+16] — mFlags (0 in the plain build; non-zero = OBJECT_XXX
+    /// lifecycle flags — a corruption/teardown signature).
+    pub flags: i32,
 }
 
-/// Pure parse of the 16-byte read (mBase, mStrong, mWeak) — testable
-/// without a guest.
+/// Pure parse of the 20-byte read (mStrong, mWeak, mBase, mFlags) —
+/// testable without a guest. The A11 source order: mStrong, mWeak,
+/// mBase, mFlags — mStrong FIRST (rn423's 12 reads at [W+16] landed on
+/// mFlags=0 + padding — the disproof that moved the window to W+0).
 fn z457_parse(buf: &[u8]) -> Option<Z457State> {
-    if buf.len() < 16 {
+    if buf.len() < 20 {
         return None;
     }
-    let mbase = u64::from_ne_bytes(buf[0..8].try_into().ok()?);
-    let strong_raw = i32::from_ne_bytes(buf[8..12].try_into().ok()?);
-    let weak = i32::from_ne_bytes(buf[12..16].try_into().ok()?);
+    let strong_raw = i32::from_ne_bytes(buf[0..4].try_into().ok()?);
+    let weak = i32::from_ne_bytes(buf[4..8].try_into().ok()?);
+    let mbase = u64::from_ne_bytes(buf[8..16].try_into().ok()?);
+    let flags = i32::from_ne_bytes(buf[16..20].try_into().ok()?);
     Some(Z457State {
-        mbase,
         strong_raw,
         weak,
+        mbase,
+        flags,
     })
 }
 
@@ -11658,7 +11673,7 @@ pub(crate) fn z457_refcount_snapshot(owner_pid: libc::pid_t, weakref_w: u64) -> 
     if owner_pid <= 0 || weakref_w == 0 {
         return None;
     }
-    let buf = read_child_bytes(owner_pid, weakref_w + 8, 16)?;
+    let buf = read_child_bytes(owner_pid, weakref_w, 20)?;
     z457_parse(&buf)
 }
 
@@ -47877,30 +47892,38 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         let _ = std::fs::remove_dir_all(&bare);
     }
 
-    /// 6-Z457: the 16-byte weakref window parse — [W+8] mBase (u64),
-    /// [W+16] mStrong (i32), [W+20] mWeak (i32); short/garbage → None.
+    /// 6-Z457: the 20-byte weakref window parse — [W+0] mStrong (i32),
+    /// [W+4] mWeak (i32), [W+8] mBase (u64), [W+16] mFlags (i32);
+    /// short/garbage → None. The A11 source order (mStrong FIRST —
+    /// rn423's 12 [W+16]-window reads landed on mFlags=0 + padding).
     #[test]
     fn z457_parse_decodes_the_weakref_window() {
         let w: u64 = 0xefea_6480_2610;
         let mbase: u64 = 0xefea_6480_2000; // mBase = cookie + class delta
         let mut buf = Vec::new();
-        buf.extend_from_slice(&mbase.to_ne_bytes());
         buf.extend_from_slice(&(-3i32).to_ne_bytes()); // over-dec shape
         buf.extend_from_slice(&(2i32).to_ne_bytes());
-        let st = z457_parse(&buf).expect("16-byte window parses");
+        buf.extend_from_slice(&mbase.to_ne_bytes());
+        buf.extend_from_slice(&(0i32).to_ne_bytes()); // mFlags plain build
+        let st = z457_parse(&buf).expect("20-byte window parses");
         assert_eq!(
             st,
             Z457State {
-                mbase,
                 strong_raw: -3,
-                weak: 2
+                weak: 2,
+                mbase,
+                flags: 0
             }
         );
         assert!(st.mbase == w.wrapping_sub(0x610)); // arbitrary sanity join
 
         // Short buffers never parse.
-        assert!(z457_parse(&buf[..15]).is_none());
+        assert!(z457_parse(&buf[..19]).is_none());
         assert!(z457_parse(&[]).is_none());
+
+        // The rn423 disproof shape: a [W+8..24)-style read (mbase first)
+        // must NOT be accepted — the 16-byte prefix alone is too short.
+        assert!(z457_parse(&buf[..16]).is_none());
     }
 
     /// 6-Z457: the count classes — count = raw − INITIAL_STRONG_VALUE.
