@@ -12292,6 +12292,91 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
         .collect();
     line.push_str(&format!(" head=[{}]", words.join(" ")));
     crate::trace_log_line(&line);
+    // ── 6-Z447 calibration follow-ups (rn411 decode) ──────────────────
+    // The rn411 MONITOR dumps fit NO consistent Monitor layout: with the
+    // definitive S_m=40 (BaseMutex vptr+name+level+bool = 24, then
+    // state_and_contenders_@24, exclusive_owner_@28, recursion_count_@32,
+    // recursive_@36), num_waiters_@40=1 and owner_@48=null decode CLEANLY
+    // but obj_@64 reads the WAITER'S OWN Thread* and wait_set_@72 reads
+    // NULL — a state Monitor::Wait cannot produce (it appends self to
+    // wait_set_ before parking). Resolve empirically, in-run:
+    //   (a) the CV's name STRING — pins which ConditionVariable this is;
+    //   (b) the guard_ (wait_mutex_) dump — a KNOWN art::Mutex (thread.cc
+    //       constructs it right before the CV) calibrates S_m by showing
+    //       vptr@0/name@8/level@16/state@24/exclusive_owner_@28
+    //       (a TID)/recursion_count_@32/recursive_@36 in the SAME run;
+    //   (c) dereference the @64 value: a native Thread has tls32_.tid
+    //       == the parked tid at +16; a mirror Object starts with a
+    //       4-byte class word. Decides "obj_ points at the native
+    //       Thread" (an emulator-visible anomaly) vs "the hit is a
+    //       rotated wait_set_ head" (S_m=32 world, impossible per the
+    //       definitive Mutex layout) vs garbage.
+    if let Some(nm) = read_child_string_proc_mem(pid, name) {
+        crate::trace_log_line(&format!("6-Z447 CV-NAME: pid={} name_str={:?}", pid, nm));
+    }
+    if let Some(gb) = z446_read_mem_window(pid, guard, 64) {
+        let gw: Vec<String> = (0..gb.len() / 8)
+            .map(|i| {
+                format!(
+                    "g{:02}={:016x}",
+                    i,
+                    u64::from_ne_bytes(gb[i * 8..i * 8 + 8].try_into().unwrap())
+                )
+            })
+            .collect();
+        crate::trace_log_line(&format!(
+            "6-Z447 GUARD-MUTEX: pid={} guard={:#x} [{}] (KNOWN art::Mutex — calibrates S_m)",
+            pid,
+            guard,
+            gw.join(" ")
+        ));
+    }
+    if let Some(h) = hit {
+        if h + 8 <= mons.len() {
+            let v64 = u64::from_ne_bytes(mons[h..h + 8].try_into().unwrap());
+            if z447_plausible_ptr(v64) {
+                match z446_read_mem_window(pid, v64, 32) {
+                    Some(ob) if ob.len() == 32 => {
+                        let word0 = u32::from_ne_bytes(ob[0..4].try_into().unwrap());
+                        let word1 = u32::from_ne_bytes(ob[4..8].try_into().unwrap());
+                        let state_hi = (word0 >> 16) & 0xffff;
+                        let field_tid = u32::from_ne_bytes(ob[16..20].try_into().unwrap());
+                        // A native art::Thread starts with state_and_flags
+                        // (flags LOW16, ThreadState HIGH16 ∈ 1..=8) and
+                        // carries its kernel tid at tls32_.tid (+16 for
+                        // this build). A mirror Object starts with a
+                        // 4-byte class word instead. tid@16 is decisive;
+                        // the word0/state shape is the fallback hint.
+                        let shape = if field_tid == pid as u32 {
+                            "NATIVE-THREAD (tid@16 matches — hit points at the waiter's own Thread struct)"
+                        } else if state_hi >= 1 && state_hi <= 8 && (word1 >> 16) == 0 {
+                            "NATIVE-THREAD-SHAPED (state_and_flags shape, tid mismatch)"
+                        } else {
+                            "MIRROR/UNKNOWN (no native-Thread shape)"
+                        };
+                        crate::trace_log_line(&format!(
+                            "6-Z447 HIT-DEREF: pid={} hit_val={:#x} word0={:#010x} state_hi={} field_tid16={} first32={} — {}",
+                            pid,
+                            v64,
+                            word0,
+                            state_hi,
+                            field_tid,
+                            ob.iter()
+                                .map(|x| format!("{:02x}", x))
+                                .collect::<String>(),
+                            shape
+                        ));
+                    }
+                    _ => {
+                        crate::trace_log_line(&format!(
+                            "6-Z447 HIT-DEREF: pid={} hit_val={:#x} UNREADABLE",
+                            pid, v64
+                        ));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 6-Z271f: forensic dump for one blocked-in-syscall tracee.
