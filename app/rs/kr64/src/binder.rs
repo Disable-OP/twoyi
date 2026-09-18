@@ -3395,9 +3395,20 @@ impl BusState {
             }
             if Self::z359_release_log().load(Ordering::Relaxed) > 0 {
                 Self::z359_release_log().fetch_sub(1, Ordering::Relaxed);
+                // 6-Z456: the released node's REGISTRY NAME — rn421's
+                // decode could only guess ("nodes 0x4e/0x50") because the
+                // mirror lines log raw handles. One by_handle lookup
+                // attributes the release to a service, closing the
+                // ISystemSuspend acquisition trail (get-hit → probe →
+                // registerCallback → release) on the bus side.
+                let node_name = self
+                    .by_handle
+                    .get(&handle)
+                    .cloned()
+                    .unwrap_or_else(|| "?".to_string());
                 info!(
-                    "[KR64][binder][vm{}] 6-Z359: last ref from conn={} on node 0x{:08x} released → {} mirrored to owner conn={} (ptr=0x{:x} cookie=0x{:x})",
-                    vm_id, holder, handle, if strong { "BR_RELEASE" } else { "BR_DECREFS" }, owner, ptr, cookie
+                    "[KR64][binder][vm{}] 6-Z359: last ref from conn={} on node 0x{:08x} released → {} mirrored to owner conn={} (ptr=0x{:x} cookie=0x{:x}) node-name={}",
+                    vm_id, holder, handle, if strong { "BR_RELEASE" } else { "BR_DECREFS" }, owner, ptr, cookie, node_name
                 );
             }
         }
@@ -6296,6 +6307,39 @@ fn handle_transaction(
             head,
             offs
         );
+    }
+
+    // 6-Z456: the interfaceChain cast-probe ARRIVAL on a suspend node —
+    // the ISystemSuspend acquisition trail's missing middle. The rn421
+    // decode saw the SM get hits and the registerCallback deliveries but
+    // could not attribute the ~600 ms node releases because the
+    // canCastInterface probe (IBase::interfaceChain, 0xf43484e — the
+    // client's FIRST transaction on ANY returned HIDL object, the cast
+    // DECISION's input) was invisible. This arm names the probe reaching
+    // the real service node (name-keyed, ≤16/run — the probe is the
+    // acquisition gate, so a MISSING line while a get hit fired is itself
+    // the finding: the client never probed = acquisition died before the
+    // cast).
+    if code == HIDL_IBASE_INTERFACE_CHAIN {
+        static Z456_CHAIN_PROBE: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(16);
+        let is_suspend = {
+            let b = bus.lock().expect("binder bus poisoned");
+            b.by_handle
+                .get(&target_handle)
+                .map(|n| n.contains("system.suspend"))
+                .unwrap_or(false)
+        };
+        if is_suspend && Z456_CHAIN_PROBE.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            Z456_CHAIN_PROBE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            info!(
+                "[KR64][binder][svc] 6-Z456: interfaceChain cast-probe → suspend node 0x{:08x} conn={} one_way={} (probes left {})",
+                target_handle,
+                conn_id,
+                one_way,
+                Z456_CHAIN_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
     }
 
     // 6-Z271i: SELF-TRANSACTIONS ARE LEGAL (kernel semantics). Real binder

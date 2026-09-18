@@ -11427,6 +11427,146 @@ fn z306ao_thread_census(pid: libc::pid_t) -> String {
     out
 }
 
+// ── 6-Z455: the SIGKILL-arm — the blocked stacks the Watchdog never printed ──
+//
+// Task 191 (rn421 decode): the real boot-killer is the ~145.6 s zygote cycle —
+// seven generations in 990 s, each ending with system_server SIGKILLed by its
+// OWN watchdog thread (the A11 Watchdog signature `Process.killProcess
+// (Process.myPid())`). The 6-Z306ao census names each thread's {state, wchan}
+// at the kill ENTRY but NOT where the userspace stacks are parked — the
+// evidence the Watchdog never printed (its own dumpStackTraces never lands in
+// /data/anr). At the kill ENTRY the victim's threads are alive and parked in
+// their kernel syscalls, so HOST-side /proc/<tid>/syscall snapshots each
+// thread's (nr, sp, pc) without touching ptrace on non-stopped tasks, and the
+// proven 6-Z364 sp-window walk names the parked chain. Pure diagnostics —
+// ZERO register writes, NO behavior change, bounded budgets.
+
+/// 6-Z455: parse /proc/<tid>/syscall — in-kernel tasks print
+/// "nr arg0..arg5 sp pc" (all hex except the decimal nr), userspace-parked
+/// tasks print "-1 0x..." (no sp/pc), running tasks print "running".
+/// Returns (nr, sp, pc); sp/pc are 0 when the shape carries none; None for
+/// "running"/garbage (a transient race — the caller logs the miss and moves
+/// on).
+fn z455_proc_syscall_fields(raw: &str) -> Option<(i64, u64, u64)> {
+    let t: Vec<&str> = raw.split_whitespace().collect();
+    match t.first() {
+        Some(&"running") | None => None,
+        Some(first) => {
+            let nr: i64 = first.parse().ok()?;
+            // In-kernel shape: nr + 6 args + sp + pc = 9 tokens.
+            if t.len() >= 9 {
+                let sp = u64::from_str_radix(t[7].trim_start_matches("0x"), 16).ok()?;
+                let pc = u64::from_str_radix(t[8].trim_start_matches("0x"), 16).ok()?;
+                Some((nr, sp, pc))
+            } else {
+                // Userspace park ("-1 0x...") or truncated — nr is still
+                // honest; no stack fields.
+                Some((nr, 0, 0))
+            }
+        }
+    }
+}
+
+/// 6-Z455: walk priority for a victim thread. Lower walks first (the
+/// per-kill thread budget is spent on the threads the A11 Watchdog's 60 s
+/// monitors actually guard before the binder pool). 0 = main thread +
+/// the watchdog thread itself; 1 = the A11 Watchdog's monitored handler
+/// threads (Watchdog.java DEFAULT_CHECK threads + the power monitor);
+/// 2 = the binder pool; 3 = everything else.
+fn z455_thread_priority(comm: &str, tid: libc::pid_t, tgid: libc::pid_t) -> u8 {
+    if tid == tgid || comm == "watchdog" {
+        return 0;
+    }
+    match comm {
+        "ActivityManager" | "android.display" | "android.fg" | "android.bg" | "android.ui"
+        | "power" => 1,
+        c if c.starts_with("binder:") => 2,
+        _ => 3,
+    }
+}
+
+/// 6-Z455b: harvest the guest /data/anr + /data/system/dropbox trees from the
+/// HOST side. The guest rootfs is a host directory (the z408-klog mechanism
+/// already maps {rootfs}/dev/__kmsg__), so {rootfs}/data/anr is readable
+/// without any guest cooperation — and the rn421 runs show the A11
+/// Watchdog's dumpStackTraces NEVER landing there (the 6-Z306af-t open
+/// tracer watches the guest-side opens; this is the ground truth of what
+/// actually exists). At the SIGKILL group-death reap any dump the Watchdog
+/// wrote is final. Returns bounded log lines for the caller to emit.
+fn z455_harvest_anr(rootfs: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let dir_listing = |dir: &str, cap: usize| -> Option<String> {
+        let rd = std::fs::read_dir(dir).ok()?;
+        let mut items: Vec<(std::time::SystemTime, String, u64)> = rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    return None;
+                }
+                let md = e.metadata().ok()?;
+                let mtime = md.modified().ok()?;
+                Some((mtime, name, md.len()))
+            })
+            .collect();
+        if items.is_empty() {
+            return Some("EMPTY".to_string());
+        }
+        items.sort_by_key(|a| std::cmp::Reverse(a.0)); // newest first
+        let shown: Vec<String> = items
+            .iter()
+            .take(cap)
+            .map(|(_, n, sz)| format!("{}({})", n, sz))
+            .collect();
+        let more = items.len().saturating_sub(cap);
+        Some(if more > 0 {
+            format!("{} +{}more", shown.join(","), more)
+        } else {
+            shown.join(",")
+        })
+    };
+    let anr_dir = format!("{}/data/anr", rootfs);
+    let listing = dir_listing(&anr_dir, 8).unwrap_or_else(|| "UNREADABLE".to_string());
+    out.push(format!("6-Z455b: anr-harvest {} → [{}]", anr_dir, listing));
+    let dbx_dir = format!("{}/data/system/dropbox", rootfs);
+    let listing = dir_listing(&dbx_dir, 8).unwrap_or_else(|| "UNREADABLE".to_string());
+    out.push(format!(
+        "6-Z455b: dropbox-harvest {} → [{}]",
+        dbx_dir, listing
+    ));
+    // The NEWEST anr trace head — the ANR file header names the subject
+    // line + the main thread stack, i.e. the very blockage the Watchdog
+    // killed for. Bounded: ≤12 lines × 160 chars from the first 2 KiB.
+    if let Ok(rd) = std::fs::read_dir(&anr_dir) {
+        let newest = rd
+            .flatten()
+            .filter_map(|e| {
+                let md = e.metadata().ok()?;
+                if !md.is_file() {
+                    return None;
+                }
+                Some((md.modified().ok()?, e.path()))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0));
+        if let Some((_, path)) = newest {
+            if let Ok(bytes) = std::fs::read(&path) {
+                let text = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
+                for (n, line) in text.lines().enumerate() {
+                    if n >= 12 {
+                        out.push("6-Z455b: anr-head …(+more)".to_string());
+                        break;
+                    }
+                    let t: String = line.chars().take(160).collect();
+                    out.push(format!("6-Z455b: anr-head[{}]: {}", n, t));
+                }
+            } else {
+                out.push(format!("6-Z455b: anr-head {} UNREADABLE", path.display()));
+            }
+        }
+    }
+    out
+}
+
 // 6-Z305t-17: PTRACE_INTERRUPT was REMOVED — it is PTRACE_SEIZE-only and
 // returned ESRCH on every ATTACH-attached twoyi tracee (ladder #74, 84/84
 // probes ESRCH). The stall probe now uses SIGSTOP (see stall_interrupt_probe).
@@ -21491,6 +21631,34 @@ pub fn run_ptrace_loop(
                     }
                 }
             }
+            // 6-Z455b: the SIGKILL-class group-death reap — the Watchdog
+            // kill class the arm above skips (it gates SIGSEGV/ABRT/BUS/
+            // ILL; rn421's six generations died by SIGKILL). At reap time
+            // any dumpStackTraces output the Watchdog wrote under
+            // /data/anr is FINAL — harvest the guest trees host-side and
+            // name the ground truth (rn421: both trees stayed EMPTY all
+            // run — this arm is the proof-of-absence instrument).
+            // Lineage-gated, ≤4 harvests/run.
+            if sig == libc::SIGKILL {
+                let reap_is_lineage =
+                    z306_in_zygote_lineage(pid, &z306_zygote_lineage, &mut z306_lineage_tgid_cache);
+                if reap_is_lineage {
+                    static Z455B_HARVEST: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(4);
+                    if Z455B_HARVEST.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        Z455B_HARVEST.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        log(&format!(
+                            "6-Z455b: SIGKILL group-death reap pid={} sig={} — harvesting /data/anr + /data/system/dropbox (harvests left {})",
+                            pid,
+                            sig,
+                            Z455B_HARVEST.load(std::sync::atomic::Ordering::Relaxed)
+                        ));
+                        for line in z455_harvest_anr(rootfs) {
+                            log(&line);
+                        }
+                    }
+                }
+            }
             // Task 6-Z75 hygiene: same as the WIFEXITED branch above —
             // drop the killed child's cached ABI entry.
             abi_map.remove(&pid);
@@ -28841,6 +29009,132 @@ pub fn run_ptrace_loop(
                                             "6-Z306ao-fd: victim target={} open_fds={} max_open_files_soft={} (OpenFdMonitor trips ≈96% of soft limit)",
                                             j_target, fd_count, max_open
                                         ));
+                                        // ── 6-Z455: the SIGKILL-arm — the blocked
+                                        // stacks the Watchdog never printed
+                                        // (Task 191 agenda). The census above
+                                        // names {state,wchan}; THIS names where
+                                        // the threads are parked in userspace:
+                                        // /proc/<tid>/syscall snapshots (nr,
+                                        // sp, pc) host-side — no ptrace on
+                                        // non-stopped tasks — and the proven
+                                        // 6-Z364 sp-window walk names the
+                                        // parked chain. Fires only for the
+                                        // system_server victim (the Watchdog
+                                        // kill class), ≤6 kills/run, ≤12
+                                        // threads/kill, ≤24 walks/run.
+                                        let victim_comm = std::fs::read_to_string(format!(
+                                            "/proc/{}/comm",
+                                            j_target
+                                        ))
+                                        .unwrap_or_default();
+                                        if victim_comm.trim_end() == "system_server" {
+                                            static Z455_KILLS: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(6);
+                                            static Z455_WALKS: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(24);
+                                            if Z455_KILLS.load(std::sync::atomic::Ordering::Relaxed)
+                                                > 0
+                                            {
+                                                Z455_KILLS.fetch_sub(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                log(&format!(
+                                                    "6-Z455: SIGKILL-arm — dumping system_server {} blocked stacks (kills left {}, walks left {})",
+                                                    j_target,
+                                                    Z455_KILLS.load(std::sync::atomic::Ordering::Relaxed),
+                                                    Z455_WALKS.load(std::sync::atomic::Ordering::Relaxed)
+                                                ));
+                                                // Enumerate + prioritize the victim's
+                                                // threads (main/watchdog first, then
+                                                // the A11 Watchdog's monitored
+                                                // handlers, then the binder pool).
+                                                let mut threads: Vec<(libc::pid_t, String, u8)> =
+                                                    Vec::new();
+                                                if let Ok(rd) = std::fs::read_dir(format!(
+                                                    "/proc/{}/task",
+                                                    j_target
+                                                )) {
+                                                    for e in rd.flatten() {
+                                                        let tid: libc::pid_t = e
+                                                            .file_name()
+                                                            .to_string_lossy()
+                                                            .parse()
+                                                            .unwrap_or(0);
+                                                        if tid == 0 {
+                                                            continue;
+                                                        }
+                                                        let comm =
+                                                            std::fs::read_to_string(format!(
+                                                                "/proc/{}/task/{}/comm",
+                                                                j_target, tid
+                                                            ))
+                                                            .map(|c| c.trim_end().to_string())
+                                                            .unwrap_or_else(|_| "?".into());
+                                                        let prio = z455_thread_priority(
+                                                            &comm, tid, j_target,
+                                                        );
+                                                        threads.push((tid, comm, prio));
+                                                    }
+                                                }
+                                                threads.sort_by_key(|a| a.2);
+                                                for (tid, comm, prio) in
+                                                    threads.into_iter().take(12)
+                                                {
+                                                    if Z455_WALKS
+                                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                                        == 0
+                                                    {
+                                                        log(
+                                                            "6-Z455: walk budget exhausted — remaining threads skipped",
+                                                        );
+                                                        break;
+                                                    }
+                                                    Z455_WALKS.fetch_sub(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    let raw = std::fs::read_to_string(format!(
+                                                        "/proc/{}/task/{}/syscall",
+                                                        j_target, tid
+                                                    ))
+                                                    .unwrap_or_default();
+                                                    match z455_proc_syscall_fields(&raw) {
+                                                        None => log(&format!(
+                                                            "6-Z455: tid={} comm={:?} prio={} — running (no snapshot)",
+                                                            tid, comm, prio
+                                                        )),
+                                                        Some((-1, _, _)) => log(&format!(
+                                                            "6-Z455: tid={} comm={:?} prio={} — userspace park (no sp/pc)",
+                                                            tid, comm, prio
+                                                        )),
+                                                        Some((nr, sp, pc)) => {
+                                                            log(&format!(
+                                                                "6-Z455: tid={} comm={:?} prio={} nr={}({}) sp={:#x} pc={:#x} pc@{}",
+                                                                tid,
+                                                                comm,
+                                                                prio,
+                                                                nr,
+                                                                arm64_generic_syscall_name(nr),
+                                                                sp,
+                                                                pc,
+                                                                maps_region_for_pc(tid, pc)
+                                                            ));
+                                                            // The walk reads the stack
+                                                            // above sp (read_child_bytes
+                                                            // — pvm works on running
+                                                            // tasks); lr/fp are 0 (no
+                                                            // regs without a stop) so
+                                                            // only the sp-window arm
+                                                            // runs — the futex-parked
+                                                            // class keeps its frame
+                                                            // records mounted.
+                                                            bt_walk_6z364(tid, sp, 0, 0, 0);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 // 6-Z306af-m: the sig=33 raiser context
@@ -47252,6 +47546,130 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         assert_eq!(z453_scudo_abort_addr("deallocating address "), None);
         assert_eq!(z453_scudo_abort_addr("deallocating address zz"), None);
         assert_eq!(z453_scudo_abort_addr("deallocating address 0xzzz"), None);
+    }
+
+    /// 6-Z455: /proc/<tid>/syscall shapes — the in-kernel park carries
+    /// nr+6 args+sp+pc (9 tokens), the userspace park prints "-1 0x..."
+    /// (no stack fields), "running"/garbage answer None.
+    #[test]
+    fn z455_proc_syscall_fields_parses_all_shapes() {
+        // In-kernel: futex wait with sp/pc.
+        assert_eq!(
+            z455_proc_syscall_fields("98 0x1 0x0 0x0 0x0 0x0 0x0 0x7ffd12345678 0x5600abcdef00"),
+            Some((98, 0x7ffd12345678, 0x5600abcdef00))
+        );
+        // Userspace park ("-1 0x...") — nr honest, no stack fields.
+        assert_eq!(
+            z455_proc_syscall_fields("-1 0x7f0000000000 0x0"),
+            Some((-1, 0, 0))
+        );
+        // Bare "-1".
+        assert_eq!(z455_proc_syscall_fields("-1"), Some((-1, 0, 0)));
+        // "running" and garbage.
+        assert_eq!(z455_proc_syscall_fields("running"), None);
+        assert_eq!(z455_proc_syscall_fields(""), None);
+        assert_eq!(z455_proc_syscall_fields("garbage"), None);
+    }
+
+    /// 6-Z455: walk priority — main + watchdog first, the A11 Watchdog's
+    /// monitored handler threads next, then the binder pool, then the
+    /// rest.
+    #[test]
+    fn z455_thread_priority_orders_watchdog_class_first() {
+        assert_eq!(z455_thread_priority("main", 100, 100), 0); // tid==tgid
+        assert_eq!(z455_thread_priority("watchdog", 7311, 7256), 0);
+        for comm in [
+            "ActivityManager",
+            "android.display",
+            "android.fg",
+            "android.bg",
+            "android.ui",
+            "power",
+        ] {
+            assert_eq!(z455_thread_priority(comm, 42, 100), 1, "comm={}", comm);
+        }
+        assert_eq!(z455_thread_priority("binder:7256_2", 42, 100), 2);
+        assert_eq!(z455_thread_priority("FinalizerDaemon", 42, 100), 3);
+        assert_eq!(z455_thread_priority("RenderThread", 42, 100), 3);
+    }
+
+    /// 6-Z455b: the anr/dropbox harvest — listings name files with sizes
+    /// (newest first), the newest anr file's head is emitted line-bounded,
+    /// empty dirs report EMPTY, missing dirs report UNREADABLE.
+    #[test]
+    fn z455_harvest_anr_lists_trees_and_reads_head() {
+        let tmp = std::env::temp_dir().join(format!("twoyi-z455b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let anr = tmp.join("data/anr");
+        std::fs::create_dir_all(&anr).unwrap();
+        let dbx = tmp.join("data/system/dropbox");
+        std::fs::create_dir_all(&dbx).unwrap();
+        // Two anr traces; make the older one explicitly older via
+        // set_times so the newest-first pick is deterministic.
+        let old_path = anr.join("anr_2026-01-01-00-00-00-000");
+        std::fs::write(&old_path, "old trace\n").unwrap();
+        let new_path = anr.join("anr_2026-01-02-00-00-00-000");
+        std::fs::write(
+            &new_path,
+            "----- pid 4131 at 2026-01-02 -----\nCmd line: system_server\n\"main\" prio=5 tid=1 Blocked\n",
+        )
+        .unwrap();
+        let older = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        std::fs::File::options()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(older)
+                    .set_modified(older),
+            )
+            .unwrap();
+
+        let lines = z455_harvest_anr(&tmp.to_string_lossy());
+        let joined = lines.join("\n");
+        assert!(joined.contains("6-Z455b: anr-harvest"), "{:?}", lines);
+        // Newest first: the 01-02 trace precedes the 01-01 one.
+        let anr_line = lines
+            .iter()
+            .find(|l| l.contains("anr-harvest"))
+            .expect("anr listing");
+        assert!(anr_line.contains("anr_2026-01-02"), "{}", anr_line);
+        let old_pos = anr_line.find("anr_2026-01-01").unwrap_or(usize::MAX);
+        let new_pos = anr_line.find("anr_2026-01-02").unwrap_or(0);
+        assert!(new_pos < old_pos, "newest first: {}", anr_line);
+        // Dropbox exists but is empty → EMPTY.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("dropbox-harvest") && l.contains("EMPTY")),
+            "{:?}",
+            lines
+        );
+        // The newest trace's head lines carry the subject + thread name.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("anr-head[1]") && l.contains("Cmd line: system_server")),
+            "{:?}",
+            lines
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("anr-head[2]") && l.contains("tid=1 Blocked")),
+            "{:?}",
+            lines
+        );
+        // A root without the data tree → UNREADABLE listings, no panic.
+        let bare = std::env::temp_dir().join(format!("twoyi-z455b-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        let lines = z455_harvest_anr(&bare.to_string_lossy());
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| l.contains("UNREADABLE")));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 
     /// 6-Z306aj: the siginfo head reader must decode si_signo@0, si_code@8
