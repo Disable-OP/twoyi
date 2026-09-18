@@ -190,6 +190,17 @@ jobs:
     # package_native waitForService poll alive, zero era deaths) — the
     # 6-Z329-honest boot is dexopt-BOUND, not stuck; give it 55 minutes.
     timeout-minutes: 55
+    # 6-Z461 (rn428 evidence-gap): the agent-side API token rotates and the
+    # new one lacks the actions scope — the actions-artifact zip download
+    # 403s ("You must have the actions scope to download artifacts") even
+    # though the run itself is green. The decode agenda needs the bundle.
+    # Release assets on a public repo download WITHOUT any scope (signed
+    # object-store redirect), so the boot job ALSO publishes its bundle to
+    # a rolling `boot-ladder-logs` release. Same repo pattern as build.yml
+    # (`gh release upload --clobber`), least-privilege: contents:write on
+    # THIS job only, and the publish is best-effort (never fails the run).
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -992,6 +1003,32 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
           compression-level: 0
+
+      # 6-Z461: the same bundle as a RELEASE ASSET — the scope-free read
+      # surface for the agent decode loop. Per-run names accumulate (no
+      # clobber, full decode history); the rolling `latest` copy clobbers.
+      - name: Publish logs bundle to boot-ladder-logs release (6-Z461)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          B=/tmp/ui-e2e-logs.tar.xz
+          [ -f "$B" ] || { echo "no bundle to publish"; exit 0; }
+          TAG=boot-ladder-logs
+          RN="rn${{ github.run_number }}-ui-e2e-logs.tar.xz"
+          cp "$B" "/tmp/${RN}"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "/tmp/${RN}" --clobber
+            gh release upload "$TAG" "$B" --clobber
+          else
+            gh release create "$TAG" "/tmp/${RN}" "$B" \
+              --title "Android boot-ladder logs (rolling)" \
+              --notes "6-Z461 scope-free decode bundles: <rn#>-ui-e2e-logs.tar.xz per run + latest as ui-e2e-logs.tar.xz" \
+              --target "${{ github.sha }}" \
+              --latest=false
+          fi
+          echo "published: ${RN} + ui-e2e-logs.tar.xz on ${TAG}"
 
       - name: Stop redroid
         if: always()
