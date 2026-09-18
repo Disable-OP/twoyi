@@ -5359,12 +5359,13 @@ fn handle_write_read(
                                 Some(st) => {
                                     let (ae, re, ad, rd) = z454_counts(dpid, ptr, cookie);
                                     info!(
-                                        "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} br=0x{:08x} W=0x{:x} mBase=0x{:x} (delta=0x{:x} vs cookie 0x{:x}) mStrong={} (count={}) mWeak={} ledger[emit acq={} rel={} / del acq={} rel={}] node-grants[strong={} weak={}] class={}",
-                                        vm_id, dpid, br, ptr, st.mbase,
-                                        st.mbase.wrapping_sub(cookie), cookie,
+                                        "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} br=0x{:08x} W=0x{:x} mStrong={} (count={}) mWeak={} mBase=0x{:x} (delta=0x{:x} vs cookie 0x{:x}) mFlags={} ledger[emit acq={} rel={} / del acq={} rel={}] node-grants[strong={} weak={}] class={}",
+                                        vm_id, dpid, br, ptr,
                                         st.strong_raw,
                                         st.strong_raw.wrapping_sub(crate::ptrace_emu::Z457_INITIAL_STRONG),
-                                        st.weak, ae, re, ad, rd,
+                                        st.weak, st.mbase,
+                                        st.mbase.wrapping_sub(cookie), cookie,
+                                        st.flags, ae, re, ad, rd,
                                         node_strong_grants, node_weak_grants,
                                         crate::ptrace_emu::z457_classify(st.strong_raw)
                                     );
@@ -8235,8 +8236,8 @@ fn servicemanager_hidl(
                 key, alias_count
             );
             info!(
-                "[KR64][binder][svc] HIDL addWithChain({}) → handle 0x{:08x} (conn={}, chain={:?})",
-                key, handle, conn_id, chain
+                "[KR64][binder][svc] HIDL addWithChain({}) → handle 0x{:08x} (conn={}, ptr=0x{:x} cookie=0x{:x}, chain={:?}) — the ADD flat's (ptr,cookie) names the registry-pinned shell: reply-borne nodes whose 6-Z359 name reads \"?\" join against THIS line (rn423 decode: node 0x4d's (conn=8, ptr) had no registry match)",
+                key, handle, conn_id, ptr, cookie, chain
             );
         }
         // A11 `android.hidl.manager@1.0::IServiceManager
