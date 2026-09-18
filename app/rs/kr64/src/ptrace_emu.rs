@@ -12439,40 +12439,73 @@ fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
     }
 }
 
-/// 6-Z449 v2 (rn414 decode): resolve a mirror object's Java class NAME
-/// through the compressed-reference heap.
+/// 6-Z451: does this path name a BOOT-IMAGE file (the shipped A11 boot
+/// classpath artifacts the runtime must load or stays interpreter-only)?
+/// Matches boot.art / boot.oat / boot.vdex (incl. the per-ISA variants
+/// like arm64/boot.oat) anywhere in the path — the guest's opens of
+/// these are THE boot-image load-path probe (rn415 frontier).
+fn is_boot_image_path(p: &str) -> bool {
+    // Filename-level match: the boot-image artifacts share the
+    // "boot" stem with art/oat/vdex extensions and no other guest
+    // file collides with that shape.
+    let name = p.rsplit('/').next().unwrap_or(p);
+    name == "boot.art"
+        || name == "boot.oat"
+        || name == "boot.vdex"
+        || name.starts_with("boot-")
+            && (name.ends_with(".art") || name.ends_with(".oat") || name.ends_with(".vdex"))
+}
+
+/// 6-Z451: BOOT-IMAGE-LOAD trace (rn415 decode) — see the open
+/// ENTRY/EXIT call sites for the rationale.
+fn z451_boot_image_open_line(pid: libc::pid_t, orig: &str, translated: &str, ret: i64, n: u64) {
+    crate::trace_log_line(&format!(
+        "6-Z451 BOOT-IMAGE-OPEN: pid={} orig={:?} translated={:?} -> {} ({}) [#{}]",
+        pid,
+        orig,
+        translated,
+        ret,
+        if ret < 0 {
+            format!("-errno {}", -ret)
+        } else {
+            "fd".to_string()
+        },
+        n
+    ));
+}
+
+/// 6-Z449 v3 (rn415 decode): resolve a mirror object's Java class NAME
+/// through the compressed-reference heap by SELF-LOCATING the base.
 ///
 /// The monitored object's identity is THE fix-site datum: every main-class
 /// generation waits on a monitor whose object has the SAME class word
-/// (0x005c0000) and a field that tracks the guest pid counter. The OLD
-/// chain (boot.art mapping start + u32 ref) is dead two ways:
-///   (1) the guest runs image-less ("Using default boot image") — no
-///       boot.art mapping exists to key the base on; and
-///   (2) the empirical shape (rn414: klass_ref = 0x005c0000 CONSTANT
-///       across generations while the Monitor obj_ high-32 varies per
-///       generation: 0xe139/0xfc70/0xfd2d/0xe7e2/0xf138) proves the
-///       guest build's heap refs are 32-bit OFFSETS from a 4GB-aligned
-///       heap WINDOW, not low-truncated absolute pointers — an absolute
-///       read of 0x5c0000 can never host the class mirror of a process
-///       whose heap lives at 0xe139_c0014380.
-/// Chain (all refs = u32 offsets from the window base):
-///   window = obj (the Monitor's full 64-bit obj_ ptr) & 0xffff_ffff_0000_0000;
-///   klass_ref (u32 @ obj+0, mirror::Object::klass_) → class mirror at
-///   window | klass_ref;
-///   SELF-CHECK: the class mirror's own klass_ (u32 @ +0) is the
-///   java.lang.Class mirror (whose klass_ points at itself), and its
-///   name_ must decode to the literal "java.lang.Class" — that proves
-///   the window base AND the field layout end to end, per-run;
-///   name_ref (u32 @ class+28 = mirror::Class::name_ in the A11
-///   java-link field order class_loader_@8 / component_type_@12 /
-///   dex_cache_@16 / ext_data_@20 / iftable_@24 / name_@28) → the
-///   String mirror;
-///   count_ (i32 @ string+8: with string compression the LSB is the
-///   flag and length = count_ >> 1; A11 stores the chars INLINE at
-///   string+16 — u8 when compressed, u16 otherwise — NOT behind a
-///   value_ array reference as the old chain assumed) → the name.
-/// Every step is validated, the raw mirrors are logged either way for
-/// the offline decode, and an unresolvable chain is LOGGED as such —
+/// (0x005c0000) and a field that tracks the guest pid counter.
+///
+/// History of the base question:
+///   * v1 keyed the base on the boot.art mapping start — dead: the guest
+///     runs image-less ("Using default boot image"), no boot.art exists.
+///   * v2 derived a 4GB window from the Monitor obj_ high-32 — rn415
+///     proved window|0x5c0000 reads MAPPED-BUT-ZEROED memory in every
+///     generation: the class mirror is NOT at the plain window offset.
+///   * v3 (this) probes a CANDIDATE SET and lets the data decide:
+///     bases = {the obj window} ∪ {every /proc/pid/maps mapping start
+///     at-or-below the object within 8GB, size >= 256KB}; per base BOTH
+///     offset interpretations are probed: plain (ref) and poisoned
+///     (2^32 - ref — Compress stores low32(-ptr) when the userdebug ROM
+///     builds with ART heap poisoning). The class mirror's OWN klass_
+///     must self-reference (java.lang.Class points at itself) — an
+///     interpretation-independent fingerprint — and its name_ (+28)
+///     must decode to the literal "java.lang.Class" before the primary
+///     name is trusted.
+/// Field offsets (AOSP android-11.0.0_r1, java-link order):
+///   mirror::Object: klass_ @0 (HeapReference, 4B), monitor_ @4;
+///   mirror::Class: class_loader_ @8 / component_type_ @12 /
+///   dex_cache_ @16 / ext_data_ @20 / iftable_ @24 / name_ @28;
+///   mirror::String: count_ @8 (i32, compression flag in the LSB,
+///   length = count_ >> 1), chars INLINE @16 (u8/u16 — NOT a value_
+///   array reference as the pre-A11 layout assumed).
+/// Every step is validated, the winning (base, interp) is logged with
+/// the raw mirrors, and an unresolvable chain is LOGGED as such —
 /// never silent, never guessed.
 fn z449_class_name_line(pid: libc::pid_t, obj: u64) {
     if obj < 8 {
@@ -12488,84 +12521,139 @@ fn z449_class_name_line(pid: libc::pid_t, obj: u64) {
     if klass_ref == 0 {
         return;
     }
-    let window = obj & 0xffff_ffff_0000_0000;
-    let class_addr = window | klass_ref as u64;
-    let Some(cb) = z446_read_mem_window(pid, class_addr, 48) else {
-        crate::trace_log_line(&format!(
-            "6-Z449 CLASS-RAW: pid={} obj={:#x} klass_ref={:#x} window={:#x} class={:#x} UNREADABLE (window|ref miss — the window base or the ref semantics differ)",
-            pid, obj, klass_ref, window, class_addr
-        ));
-        return;
-    };
-    if cb.len() < 32 {
-        crate::trace_log_line(&format!(
-            "6-Z449 CLASS-RAW: pid={} obj={:#x} window={:#x} class={:#x} SHORT-READ {}B",
-            pid,
-            obj,
-            window,
-            class_addr,
-            cb.len()
-        ));
-        return;
-    }
-    let class_klass_ref = z449_encode_u32_at(&cb, 0);
-    let name_ref = z449_encode_u32_at(&cb, 28);
-    // SELF-CHECK hop 1 (pointer identity): the class mirror's klass_ must
-    // point at a mirror whose own klass_ is ITSELF (java.lang.Class is
-    // self-referential) — klass_ref2 == class_klass_ref.
-    let mut self_check = "FAILED";
-    if class_klass_ref != 0 {
-        let cc_addr = window | class_klass_ref as u64;
-        if let Some(cc0) = z446_read_mem_window(pid, cc_addr, 4) {
-            if cc0.len() == 4 {
-                let cc_klass = u32::from_ne_bytes(cc0[0..4].try_into().unwrap());
-                if cc_klass == class_klass_ref {
-                    self_check = "SELF";
-                }
-            }
+    // Candidate bases, in probe order:
+    //   (1) the object's own 4GB window (obj high-32) — rn415 proved the
+    //       PLAIN offset reads ZEROED memory there, so also probe the
+    //       POISONED offset (2^32 - ref: the userdebug ROM may compile
+    //       ART with heap poisoning — Compress stores low32(-ptr)); and
+    //   (2) every /proc/pid/maps mapping start at-or-below the object
+    //       within an 8GB reach (the compressed-ref base = the heap
+    //       reservation's first mapping start — page-aligned but not
+    //       necessarily 4GB-aligned), same two offset interpretations.
+    // The FINGERPRINT is interpretation-independent: the java.lang.Class
+    // mirror's klass_ points at ITSELF, so the u32 stored at the
+    // candidate class-mirror head must EQUAL the u32 stored at the
+    // mirror it references. Only after the fingerprint hits do we spend
+    // the String hop, and the name must be the literal "java.lang.Class"
+    // — the chain PROVES its base + interpretation per-run.
+    let ref_poison = 0u32.wrapping_sub(klass_ref);
+    let mut bases: Vec<u64> = vec![obj & 0xffff_ffff_0000_0000];
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).unwrap_or_default();
+    for line in maps.lines() {
+        let Some(dash) = line.find('-') else {
+            continue;
+        };
+        let Ok(start) = u64::from_str_radix(&line[..dash], 16) else {
+            continue;
+        };
+        if start > obj || obj - start > 0x2_0000_0000 {
+            continue;
+        }
+        // Size gate: skip file/labelled micro-mappings; the heap
+        // reservation's first mapping is MB-scale.
+        let size = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|end| u64::from_str_radix(end, 16).ok())
+            .map(|end| end.saturating_sub(start))
+            .unwrap_or(0);
+        if size < 0x40000 {
+            continue;
+        }
+        if !bases.contains(&start) {
+            bases.push(start);
+        }
+        if bases.len() >= 48 {
+            break;
         }
     }
-    // SELF-CHECK hop 2 (full layout proof): the java.lang.Class mirror's
-    // name_ (+28) must decode to the literal "java.lang.Class".
-    if self_check == "SELF" {
-        if let Some(ccb) = z446_read_mem_window(pid, window | class_klass_ref as u64, 32) {
-            if ccb.len() >= 32 {
-                let nref2 = z449_encode_u32_at(&ccb, 28);
-                if nref2 != 0 {
-                    if let Some((nm, _enc)) = z449_decode_string(pid, window | nref2 as u64) {
-                        if nm == "java.lang.Class" {
-                            self_check = "PROVEN";
+    for base in &bases {
+        for (off, interp) in [(klass_ref as u64, "plain"), (ref_poison as u64, "poisoned")] {
+            let class_addr = base + off;
+            let Some(cb) = z446_read_mem_window(pid, class_addr, 48) else {
+                continue;
+            };
+            if cb.len() < 32 {
+                continue;
+            }
+            let ck = z449_encode_u32_at(&cb, 0);
+            if ck == 0 {
+                continue;
+            }
+            // Decode the class mirror's own klass_ under THIS
+            // interpretation and require the self-referential hit.
+            let ck_ptr = match interp {
+                "plain" => base + ck as u64,
+                _ => base + ck.wrapping_neg() as u64,
+            };
+            let Some(cc0) = z446_read_mem_window(pid, ck_ptr, 4) else {
+                continue;
+            };
+            if cc0.len() != 4 || z449_encode_u32_at(&cc0, 0) != ck {
+                continue;
+            }
+            // Fingerprint hit: ck_ptr IS the java.lang.Class mirror.
+            // Prove the layout by decoding its name (+28) — must be the
+            // literal "java.lang.Class".
+            let name_ref = z449_encode_u32_at(&cb, 28);
+            let mut self_check = "SELF";
+            if name_ref != 0 {
+                if let Some(ccb) = z446_read_mem_window(pid, ck_ptr, 32) {
+                    if ccb.len() >= 32 {
+                        let nref2 = z449_encode_u32_at(&ccb, 28);
+                        if nref2 != 0 {
+                            let n2 = match interp {
+                                "plain" => base + nref2 as u64,
+                                _ => base + nref2.wrapping_neg() as u64,
+                            };
+                            if let Some((nm, _)) = z449_decode_string(pid, n2) {
+                                if nm == "java.lang.Class" {
+                                    self_check = "PROVEN";
+                                }
+                            }
                         }
                     }
                 }
             }
+            // Raw mirrors for the offline decode (bounded: 48B head).
+            let cb_hex: String = cb.iter().map(|b| format!("{:02x}", b)).collect();
+            crate::trace_log_line(&format!(
+                "6-Z449 CLASS-RAW: pid={} obj={:#x} klass_ref={:#x} base={:#x} interp={} class={:#x} class_klass_ref={:#x} name_ref={:#x} head={}",
+                pid, obj, klass_ref, base, interp, class_addr, ck, name_ref, cb_hex
+            ));
+            let primary = if name_ref == 0 {
+                None
+            } else {
+                let naddr = match interp {
+                    "plain" => base + name_ref as u64,
+                    _ => base + name_ref.wrapping_neg() as u64,
+                };
+                z449_decode_string(pid, naddr)
+            };
+            match primary {
+                Some((name, enc)) => {
+                    crate::trace_log_line(&format!(
+                        "6-Z449 CLASS-NAME: pid={} obj={:#x} base={:#x} interp={} name={:?} enc={} self-check={} (the monitored object's class)",
+                        pid, obj, base, interp, name, enc, self_check
+                    ));
+                }
+                None => {
+                    crate::trace_log_line(&format!(
+                        "6-Z449 CLASS-NAME: pid={} obj={:#x} base={:#x} interp={} UNRESOLVED (name_ref={:#x} self-check={}) — raw mirrors logged for the offline decode",
+                        pid, obj, base, interp, name_ref, self_check
+                    ));
+                }
+            }
+            return;
         }
     }
-    // Raw mirrors for the offline decode (bounded: 48B class head).
-    let cb_hex: String = cb.iter().map(|b| format!("{:02x}", b)).collect();
     crate::trace_log_line(&format!(
-        "6-Z449 CLASS-RAW: pid={} obj={:#x} klass_ref={:#x} window={:#x} class={:#x} class_klass_ref={:#x} name_ref={:#x} head={}",
-        pid, obj, klass_ref, window, class_addr, class_klass_ref, name_ref, cb_hex
+        "6-Z449 CLASS-NAME: pid={} obj={:#x} klass_ref={:#x} UNRESOLVED ({} candidate bases x plain/poisoned offsets, no self-referential class fingerprint hit) — the ref semantics or the base set differ; the probed heads are not individually logged at this budget",
+        pid,
+        obj,
+        klass_ref,
+        bases.len()
     ));
-    let primary = if name_ref == 0 {
-        None
-    } else {
-        z449_decode_string(pid, window | name_ref as u64)
-    };
-    match primary {
-        Some((name, enc)) => {
-            crate::trace_log_line(&format!(
-                "6-Z449 CLASS-NAME: pid={} obj={:#x} window={:#x} name={:?} enc={} self-check={} (the monitored object's class)",
-                pid, obj, window, name, enc, self_check
-            ));
-        }
-        None => {
-            crate::trace_log_line(&format!(
-                "6-Z449 CLASS-NAME: pid={} obj={:#x} window={:#x} UNRESOLVED (klass_ref={:#x} name_ref={:#x} self-check={}) — raw mirrors logged for the offline decode",
-                pid, obj, window, klass_ref, name_ref, self_check
-            ));
-        }
-    }
 }
 
 /// 6-Z449: decode an A11 inline String mirror at `addr`.
@@ -29949,6 +30037,27 @@ pub fn run_ptrace_loop(
                                 // path alone cannot prove whether translation
                                 // actually engaged for THIS open).
                                 pending_open_original_path.insert(pid, path.clone());
+                                // ── 6-Z451: BOOT-IMAGE-LOAD trace (rn415 decode) ──
+                                // The guest's own klog prints AndroidRuntime
+                                // "Using default boot image" (rn415 kmsg) and
+                                // its tombstone maps carry ZERO boot.art/
+                                // boot.oat mappings: the shipped A11 boot
+                                // image (/system/framework/boot.art + the
+                                // boot-oat tree) either never opens or loads
+                                // and is rejected. On A11 there is NO on-device
+                                // boot-image compile (rn415 6-Z450: dex2oat
+                                // only compiles 3 APEX jars) — the runtime
+                                // MUST load the shipped image or stays
+                                // interpreter-only (the boot-cost + watchdog
+                                // enabler). Log every guest open attempt of a
+                                // boot-image file at ENTRY (the EXIT side
+                                // reports the -errno/fd result, budgeted).
+                                if is_boot_image_path(&path) {
+                                    log(&format!(
+                                        "6-Z451 BOOT-IMAGE-OPEN: pid={} path={} (open ENTRY — result follows at EXIT)",
+                                        pid, path
+                                    ));
+                                }
                                 // ── VFS materialization ─────────────────
                                 //
                                 // BEFORE calling translate_path, ask the VFS
@@ -35171,6 +35280,23 @@ pub fn run_ptrace_loop(
                                     fd_note,
                                     kmsg_open_diag_exit_count
                                 ));
+                            }
+                        }
+                        // ── 6-Z451: BOOT-IMAGE-OPEN result (rn415 decode) ──
+                        // The rn415 frontier: the shipped boot image never
+                        // lands in the guest's maps. EVERY boot-image open's
+                        // result is logged (fd or -errno) at the TOP-LEVEL
+                        // open EXIT — failures are the boot-image load
+                        // path's first suspect (missing file vs EACCES vs
+                        // translation miss), successes move the question to
+                        // the mmap/validate legs.
+                        if is_boot_image_path(&orig) || is_boot_image_path(&p) {
+                            static Z451_OPEN_RESULT: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let z451n =
+                                Z451_OPEN_RESULT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if z451n < 96 {
+                                z451_boot_image_open_line(pid, &orig, &p, ret, z451n + 1);
                             }
                         }
                     }

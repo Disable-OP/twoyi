@@ -925,6 +925,18 @@ jobs:
                done; \
                echo \"== \$base/data/misc/apexdata tree (head) ==\"; \
                ls -laR \$base/data/misc/apexdata 2>/dev/null | head -100 || echo MISSING; \
+               echo \"== \$base/system/framework (the SHIPPED boot image lives here on A11 — no on-device boot-classpath compile exists) ==\"; \
+               ls -la \$base/system/framework/ 2>/dev/null | head -50; \
+               echo \"== \$base/system/framework/arm64 (boot.oat tree) ==\"; \
+               ls -la \$base/system/framework/arm64/ 2>/dev/null | head -30 || echo MISSING; \
+               for bf in \$base/system/framework/boot.art \$base/system/framework/arm64/boot.art \$base/system/framework/arm64/boot.oat \$base/system/framework/arm64/boot.vdex; do \
+                 if [ -f \$bf ]; then \
+                   echo \"-- BOOT-IMAGE-FILE \$bf size=\$(stat -c%s \$bf) mtime=\$(stat -c%y \$bf) --\"; \
+                   head -c 64 \$bf | od -A x -t x1 2>/dev/null | head -5; \
+                 else echo \"-- BOOT-IMAGE-FILE \$bf MISSING\"; fi; \
+               done; \
+               echo \"== \$base/apex/com.android.art/javalib (the boot classpath jars) ==\"; \
+               ls -la \$base/apex/com.android.art/javalib/ 2>/dev/null | head -30 || echo MISSING; \
              done" \
             > /tmp/ui-e2e-artifacts/dex2oat-cache.txt 2>&1 || true
           sleep 5
