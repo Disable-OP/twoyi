@@ -297,6 +297,33 @@ fn pid_is_arm32(pid: libc::pid_t) -> bool {
     ARM32_PIDS.with(|s| s.borrow().contains(&pid))
 }
 
+/// 6-Z439d: the TRACER-side tgid of a tracee thread. The kernel fd table is
+/// process-wide, but ptrace reports per-THREAD tids — and the reference-ril
+/// ipv6-monitor registers its stand-in socket fd from the thread that ran
+/// Ipv6Monitor::init() while the Deferred retry-poll loop (mPollTimeout=
+/// 1000ms) re-issues the SIOCGIFFLAGS/SIOCSIFFLAGS ioctls from the monitor's
+/// OWN thread — a different tid of the SAME process. Keying z439_packet_fds
+/// by tid therefore misses every retry and the ioctls run REAL against the
+/// HOST interface table (rn401 measured it: "Ipv6Monitor failed to set
+/// interface flags for eth0: Operation not permitted" at +518s/+580s on the
+/// surviving generation). Reads /proc/<tid>/status Tgid — the same direct
+/// /proc truth the tracer already uses for the 6-Z305t-14b fd-table
+/// forensics — and falls back to the tid itself when the read fails (a
+/// dead/unknown tracee keeps the old tid-keyed behavior instead of
+/// silently disabling the fake).
+fn tracee_tgid(pid: libc::pid_t) -> libc::pid_t {
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Tgid:") {
+                if let Ok(tgid) = rest.trim().parse::<libc::pid_t>() {
+                    return tgid;
+                }
+            }
+        }
+    }
+    pid
+}
+
 /// 6-Z254: ABI-aware register fetch for the EXIT-path decision reads.
 ///
 /// `ptrace_getregs` on an aarch64 host requests the 272-byte NT_PRSTATUS
@@ -16923,6 +16950,14 @@ pub fn run_ptrace_loop(
     // branch (mPollTimeout=1000ms) — it parks in its poll-retry loop
     // forever. The guest has no radio interface; host interfaces must
     // never leak into the guest's ioctl answers.
+    // 6-Z439d: pending_z439_socket stays tid-keyed (the in-flight ENTRY
+    // rewrite is per-thread state by construction), but z439_packet_fds
+    // is keyed by the TGID of the creating thread — the kernel fd table
+    // is process-wide and the Deferred retry-poll ioctls arrive from the
+    // monitor's OWN thread (a different tid of the same process); the
+    // rn401-measured tid-keyed misses leaked the retry SIOCSIFFLAGS to
+    // the HOST interface table (+518s/+580s). tracee_tgid() does the
+    // /proc/<tid>/status read at both the registration and the lookup.
     let mut pending_z439_socket: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     let mut z439_packet_fds: std::collections::HashMap<
@@ -32988,8 +33023,15 @@ pub fn run_ptrace_loop(
                         const SIOCSIFFLAGS_Z439: u64 = 0x8914;
                         let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
                         let req = get_syscall_arg(&regs, abi.reg_arg2);
+                        // 6-Z439d: look the stand-in fd up by the CALLING
+                        // thread's TGID, not its tid — the fd table is
+                        // process-wide and the Deferred retries arrive from
+                        // the monitor's own thread, a DIFFERENT tid than the
+                        // socket creator (rn401 measured the tid-keyed
+                        // misses: the retry SIOCSIFFLAGS leaked to the HOST
+                        // at +518s/+580s).
                         let hit = z439_packet_fds
-                            .get(&pid)
+                            .get(&tracee_tgid(pid))
                             .is_some_and(|fds| fds.contains(&(fd as i64)));
                         if hit && (req == SIOCGIFFLAGS_Z439 || req == SIOCSIFFLAGS_Z439) {
                             set_syscall_num(&mut regs, &abi, abi.getpid);
@@ -40373,10 +40415,26 @@ pub fn run_ptrace_loop(
                                 // -ENODEV so the monitor parks in its own
                                 // Deferred branch (see the state declaration).
                                 if pending_z439_socket.remove(&pid) && ret >= 0 {
-                                    z439_packet_fds.entry(pid).or_default().insert(ret);
+                                    // 6-Z439d: register under the creating
+                                    // thread's TGID (the fd table is
+                                    // process-wide): the monitor's Deferred
+                                    // retry loop re-issues the ioctls from its
+                                    // OWN thread, whose tid differs from the
+                                    // creator's — rn401 measured the tid-keyed
+                                    // misses leaking to the HOST. The tgid key
+                                    // also stays correct across rild
+                                    // generations (each generation is a fresh
+                                    // fork+exec → a fresh tgid; a stale entry
+                                    // can only collide after a full pid_max
+                                    // wrap, unreachable inside one CI boot).
+                                    z439_packet_fds
+                                        .entry(tracee_tgid(pid))
+                                        .or_default()
+                                        .insert(ret);
                                     log(&format!(
-                                        "6-Z439b: packet-standin fd {} registered — SIOCGIFFLAGS/SIOCSIFFLAGS on it will return raw -ENODEV",
-                                        ret
+                                        "6-Z439b: packet-standin fd {} registered under tgid {} — SIOCGIFFLAGS/SIOCSIFFLAGS on it return raw -ENODEV from ANY thread of the process (6-Z439d)",
+                                        ret,
+                                        tracee_tgid(pid)
                                     ));
                                 }
                                 const AF_NETLINK_Z99: i64 = 16;
