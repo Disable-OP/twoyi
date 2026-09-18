@@ -2410,6 +2410,16 @@ struct GuestNode {
     /// is outstanding. Re-arms when the node's weak refs drop to zero
     /// (BR_DECREFS).
     weak_notified: bool,
+    /// 6-Z457 (Task 192): LIFETIME strong grants this node handed out
+    /// (every strong flat crossing). The per-holder maps drop to empty at
+    /// the last-ref release — exactly when the 6-Z457 mirror fires — so
+    /// the pre-delivery "bus grant count" the decode joins against the
+    /// guest's live mStrong must be a lifetime counter on the node entry
+    /// (which survives the release; freed only at owner death).
+    strong_grants: u32,
+    /// 6-Z457: LIFETIME weak grants (weak flats + the implied weak of
+    /// every strong grant — kernel `binder_inc_ref_for_node`).
+    weak_grants: u32,
 }
 
 impl BusState {
@@ -3133,6 +3143,8 @@ impl BusState {
                         weak: HashMap::new(),
                         strong_notified: false,
                         weak_notified: false,
+                        strong_grants: 0,
+                        weak_grants: 0,
                     },
                 );
                 h
@@ -3143,6 +3155,10 @@ impl BusState {
                 *n.strong.entry(recipient).or_insert(0) += 1;
                 // Kernel: the strong ref carries the implied weak ref.
                 *n.weak.entry(recipient).or_insert(0) += 1;
+                // 6-Z457: lifetime grant bookkeeping (survives the
+                // last-ref release — the mirror reads it at delivery).
+                n.strong_grants = n.strong_grants.wrapping_add(1);
+                n.weak_grants = n.weak_grants.wrapping_add(1);
                 if !n.weak_notified {
                     n.weak_notified = true;
                     mirrors.push((BR_INCREFS, n.ptr, n.cookie));
@@ -3158,6 +3174,8 @@ impl BusState {
                 }
             } else {
                 *n.weak.entry(recipient).or_insert(0) += 1;
+                // 6-Z457: lifetime weak grant.
+                n.weak_grants = n.weak_grants.wrapping_add(1);
                 if !n.weak_notified {
                     n.weak_notified = true;
                     mirrors.push((BR_INCREFS, n.ptr, n.cookie));
@@ -3165,6 +3183,27 @@ impl BusState {
             }
         }
         (handle, mirrors)
+    }
+
+    /// 6-Z457 companion (Task 192 decode): the 6-Z359 node-name via the
+    /// OWNER-side reverse map. `by_handle` keys CLIENT registry handles
+    /// while the mirror line's `handle` is the OWNER-namespace node id —
+    /// two disjoint id spaces off the same dense counter — so the rn422
+    /// lines resolved "?" on all 8 releases. The owner's registered
+    /// services are the naming oracle: every (owner, ptr) match names
+    /// the node (aliases join with `|`).
+    fn z359_owner_node_names(&self, owner: ConnId, ptr: u64) -> Option<String> {
+        let names: Vec<&str> = self
+            .services
+            .iter()
+            .filter(|(_, e)| e.owner == owner && e.ptr == ptr)
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if names.is_empty() {
+            None
+        } else {
+            Some(names.join("|"))
+        }
     }
 
     /// 6-Z442: undo a just-made grant whose delivery FAILED (mailbox
@@ -3397,14 +3436,16 @@ impl BusState {
                 Self::z359_release_log().fetch_sub(1, Ordering::Relaxed);
                 // 6-Z456: the released node's REGISTRY NAME — rn421's
                 // decode could only guess ("nodes 0x4e/0x50") because the
-                // mirror lines log raw handles. One by_handle lookup
-                // attributes the release to a service, closing the
-                // ISystemSuspend acquisition trail (get-hit → probe →
-                // registerCallback → release) on the bus side.
+                // mirror lines log raw handles. 6-Z457 (Task 192): the
+                // OWNER-side reverse map names the node — by_handle keys
+                // CLIENT handles, disjoint from the owner-namespace node
+                // id (rn422: "?" on all 8 lines). Registry entries whose
+                // (owner, ptr) match name the release site; the legacy
+                // by_handle hit stays the fallback for registry-held
+                // nodes (the 6-Z306ae/6-Z325 pins never own a service).
                 let node_name = self
-                    .by_handle
-                    .get(&handle)
-                    .cloned()
+                    .z359_owner_node_names(owner, ptr)
+                    .or_else(|| self.by_handle.get(&handle).cloned())
                     .unwrap_or_else(|| "?".to_string());
                 info!(
                     "[KR64][binder][vm{}] 6-Z359: last ref from conn={} on node 0x{:08x} released → {} mirrored to owner conn={} (ptr=0x{:x} cookie=0x{:x}) node-name={}",
@@ -5270,9 +5311,22 @@ fn handle_write_read(
                     // the 6-Z354 oracle): a dead owner cannot run
                     // decStrong and the conn teardown is already
                     // dismantling its mailbox.
-                    let dpid = {
+                    let (dpid, node_strong_grants, node_weak_grants) = {
                         let b = bus.lock().expect("binder bus poisoned");
-                        b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                        let pid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                        // 6-Z457: the node's LIFETIME grant counts (the
+                        // per-holder maps are already empty at last-ref —
+                        // the lifetime counters on the surviving node
+                        // entry are the bus-side join for the guest read).
+                        let (sg, wg) = match b
+                            .node_by_key
+                            .get(&(conn_id, ptr, cookie))
+                            .and_then(|h| b.nodes.get(h))
+                        {
+                            Some(n) => (n.strong_grants, n.weak_grants),
+                            None => (0, 0),
+                        };
+                        (pid, sg, wg)
                     };
                     let owner_alive = dpid > 0 && crate::ptrace_emu::traced_child_alive(dpid);
                     if owner_alive {
@@ -5286,6 +5340,43 @@ fn handle_write_read(
                             "[KR64][binder][vm{}] 6-Z359: node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
                             vm_id, conn_id, br, ptr, cookie
                         );
+                        // 6-Z457: the owner-side REFCOUNT MIRROR (Task 192
+                        // agenda) — at the last-ref delivery read the
+                        // owner's LIVE RefBase state for this weakref
+                        // (ptr=W: mBase=[W+8], mStrong=i32@[W+16], mWeak=
+                        // i32@[W+20]) and log count-before-delivery vs the
+                        // ledger's emit/deliver totals and the node's
+                        // lifetime grants. rn422: a BALANCED 6-Z454 ledger
+                        // over a Scudo double-free — the missing half lives
+                        // in the owner's IN-PROCESS refcount, which this
+                        // read names (count already 0 = the delivery's
+                        // decStrong over-decs = the delete#2 precondition;
+                        // count ≥1 = the owner's own sp is present and the
+                        // double-free needs a second in-process drop).
+                        if z457_budget().load(Ordering::Relaxed) > 0 {
+                            z457_budget().fetch_sub(1, Ordering::Relaxed);
+                            match crate::ptrace_emu::z457_refcount_snapshot(dpid, ptr) {
+                                Some(st) => {
+                                    let (ae, re, ad, rd) = z454_counts(dpid, ptr, cookie);
+                                    info!(
+                                        "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} br=0x{:08x} W=0x{:x} mBase=0x{:x} (delta=0x{:x} vs cookie 0x{:x}) mStrong={} (count={}) mWeak={} ledger[emit acq={} rel={} / del acq={} rel={}] node-grants[strong={} weak={}] class={}",
+                                        vm_id, dpid, br, ptr, st.mbase,
+                                        st.mbase.wrapping_sub(cookie), cookie,
+                                        st.strong_raw,
+                                        st.strong_raw.wrapping_sub(crate::ptrace_emu::Z457_INITIAL_STRONG),
+                                        st.weak, ae, re, ad, rd,
+                                        node_strong_grants, node_weak_grants,
+                                        crate::ptrace_emu::z457_classify(st.strong_raw)
+                                    );
+                                }
+                                None => {
+                                    info!(
+                                        "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} W=0x{:x} — READ FAILED (object may already be gone — itself a count≤0 signature)",
+                                        vm_id, dpid, ptr
+                                    );
+                                }
+                            }
+                        }
                     } else {
                         info!(
                             "[KR64][binder][vm{}] 6-Z359: node-ref mirror skipped — owner conn={} pid={} gone/dead",
@@ -9888,6 +9979,37 @@ fn z454_deliver(pid: i32, ptr: u64, cookie: u64, br: u32) -> bool {
     false
 }
 
+/// 6-Z457 (Task 192): the ledger's emit/deliver totals for one object —
+/// the read-only join the refcount mirror logs beside the guest's live
+/// RefBase counts (a BALANCED ledger over an already-zero mStrong names
+/// the in-process double-count; an UNBALANCED ledger names the mirror
+/// bug — the two shapes are the missing half rn422 could not name).
+/// Zeroes for unknown keys (never probed = never emitted).
+fn z454_counts(pid: i32, ptr: u64, cookie: u64) -> (u32, u32, u32, u32) {
+    if pid <= 0 || ptr == 0 || cookie == 0 {
+        return (0, 0, 0, 0);
+    }
+    let led = z454_ledger().lock().expect("6-Z454 ledger poisoned");
+    match led.get(&(pid, ptr, cookie)) {
+        Some(e) => (
+            e.acq_emitted,
+            e.rel_emitted,
+            e.acq_delivered,
+            e.rel_delivered,
+        ),
+        None => (0, 0, 0, 0),
+    }
+}
+
+/// 6-Z457 (Task 192): the refcount-mirror read budget — ≤12 owner-side
+/// RefBase snapshots per boot, last-ref mirrors only (the RefCmd359 arm
+/// is last-ref by construction). A read consumes one; the decode names
+/// the missing-half mechanism from at most 12 joins per run.
+fn z457_budget() -> &'static AtomicU32 {
+    static N: std::sync::OnceLock<AtomicU32> = std::sync::OnceLock::new();
+    N.get_or_init(|| AtomicU32::new(12))
+}
+
 /// 6-Z354: the TRANSACTION-delivery decision, pure for tests. Reject the
 /// queued transaction iff the target node's OWNER process is provably
 /// dead (the kernel-true oracle: a fresh /proc probe). The heap anchor
@@ -12265,6 +12387,145 @@ mod tests {
         // Era drop via the recipient's BC_RELEASE: the LAST strong drop
         // mirrors BR_RELEASE — the ledger sees rel==acq, no violation.
         bus.z359_unref_node(0, grants[0].handle, recipient, true);
+    }
+
+    #[test]
+    fn z457_node_grants_are_lifetime_counters() {
+        // 6-Z457 (Task 192): the per-holder maps drop to empty at the
+        // last-ref release — exactly when the refcount mirror fires — so
+        // the bus-side join must be the LIFETIME counters on the node
+        // entry (which survives the release). Grant → 1/1; re-grant →
+        // 2/2; the last-ref unref does NOT reset them.
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let recipient = bus.register_conn();
+        let ptr = 0x7D00_1000u64;
+        let cookie = 0x5D00_2000u64;
+        let mkflat = || {
+            let mut data = vec![0u8; 32];
+            data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+            data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+            data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+            let mut offsets = Vec::new();
+            offsets.extend_from_slice(&0u64.to_ne_bytes());
+            (data, offsets)
+        };
+        let (mut data, mut offsets) = mkflat();
+        let grants = bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        let h = grants[0].handle;
+        let node = bus.nodes.get(&h).expect("node exists");
+        assert_eq!(node.strong_grants, 1);
+        assert_eq!(node.weak_grants, 1);
+
+        // Re-grant the same node (rebuild the flat: the first crossing
+        // rewrote it to HANDLE form).
+        let (mut data, mut offsets) = mkflat();
+        let grants2 =
+            bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants2[0].handle, h, "same node identity");
+        let node = bus.nodes.get(&h).expect("node exists");
+        assert_eq!(node.strong_grants, 2);
+        assert_eq!(node.weak_grants, 2);
+
+        // Drop the strong refs one per BC_RELEASE (kernel truth) — the
+        // LAST drop (count 1→0) is the mirror-firing release; the node
+        // entry (and its lifetime counters) SURVIVE it for the
+        // delivery-time mirror read.
+        bus.z359_unref_node(0, h, recipient, true);
+        let node = bus.nodes.get(&h).expect("node entry survives");
+        assert_eq!(
+            node.strong.get(&recipient),
+            Some(&1),
+            "one release left one count"
+        );
+        bus.z359_unref_node(0, h, recipient, true);
+        let node = bus.nodes.get(&h).expect("node entry survives the release");
+        assert!(node.strong.is_empty(), "last-ref release empties the map");
+        assert_eq!(node.strong_grants, 2, "lifetime strong grants persist");
+        assert_eq!(node.weak_grants, 2, "lifetime weak grants persist");
+
+        // A weak-only grant bumps ONLY the weak lifetime counter.
+        let (mut data, mut offsets) = mkflat();
+        data[0..4].copy_from_slice(&BINDER_TYPE_WEAK_BINDER.to_ne_bytes());
+        let grants3 =
+            bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants3.len(), 1, "weak flat crossing");
+        let node = bus.nodes.get(&grants3[0].handle).expect("node exists");
+        assert_eq!(node.strong_grants, 2, "weak grant does not touch strong");
+        assert_eq!(node.weak_grants, 3, "lifetime weak grants bumped");
+    }
+
+    #[test]
+    fn z359_owner_node_names_resolves_via_the_owner_side_reverse_map() {
+        // 6-Z457 companion (Task 192 decode): rn422's 6-Z359 mirror lines
+        // resolved node-name="?" on all 8 releases — `handle` in that
+        // line is the OWNER-namespace node id while `by_handle` keys
+        // CLIENT registry handles (disjoint id spaces). The owner's own
+        // registry entries (owner, ptr) name the node instead.
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let other = bus.register_conn();
+        let ptr = 0x7E00_1000u64;
+        let cookie = 0x5E00_2000u64;
+
+        assert_eq!(bus.z359_owner_node_names(owner, ptr), None, "unregistered");
+
+        let h = bus.add_guest_service(
+            "android.system.suspend@1.0::ISystemSuspend/default",
+            owner,
+            ptr,
+            cookie,
+        );
+        assert_eq!(
+            bus.z359_owner_node_names(owner, ptr).as_deref(),
+            Some("android.system.suspend@1.0::ISystemSuspend/default")
+        );
+
+        // The chain-alias shape: a second name over the SAME (owner,
+        // ptr) joins with '|' (BTreeMap = sorted order).
+        bus.add_guest_service_alias(
+            "android.hidl.base@1.0::IBase/default",
+            owner,
+            ptr,
+            cookie,
+            h,
+        );
+        assert_eq!(
+            bus.z359_owner_node_names(owner, ptr).as_deref(),
+            Some("android.hidl.base@1.0::IBase/default|android.system.suspend@1.0::ISystemSuspend/default")
+        );
+
+        // A DIFFERENT owner's registration at the same ptr does NOT
+        // pollute the lookup (ownership is part of the key).
+        bus.add_guest_service("other.svc", other, ptr, cookie);
+        assert!(bus
+            .z359_owner_node_names(other, ptr)
+            .expect("other's name")
+            .contains("other.svc"));
+        assert_eq!(
+            bus.z359_owner_node_names(owner, ptr).as_deref(),
+            Some("android.hidl.base@1.0::IBase/default|android.system.suspend@1.0::ISystemSuspend/default")
+        );
+    }
+
+    #[test]
+    fn z454_counts_reads_the_ledger_totals_for_the_z457_join() {
+        // 6-Z457: the refcount-mirror log joins the ledger's emit/deliver
+        // totals beside the guest's live counts. The reader reports the
+        // four counters; unknown/degenerate keys read (0,0,0,0).
+        let pid = z454_unique_pid();
+        let (ptr, cookie) = (0x7F00_1000u64, 0x5F00_2000u64);
+        assert_eq!(z454_counts(pid, ptr, cookie), (0, 0, 0, 0), "unknown key");
+        assert!(!z454_emit(pid, ptr, cookie, Z454Site::NodeAcq));
+        assert!(!z454_deliver(pid, ptr, cookie, BR_ACQUIRE));
+        assert!(!z454_emit(pid, ptr, cookie, Z454Site::NodeRel));
+        assert!(!z454_deliver(pid, ptr, cookie, BR_RELEASE));
+        assert_eq!(z454_counts(pid, ptr, cookie), (1, 1, 1, 1));
+
+        // Degenerate keys never touch the ledger.
+        assert_eq!(z454_counts(0, ptr, cookie), (0, 0, 0, 0));
+        assert_eq!(z454_counts(pid, 0, cookie), (0, 0, 0, 0));
+        assert_eq!(z454_counts(pid, ptr, 0), (0, 0, 0, 0));
     }
 
     #[test]

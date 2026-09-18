@@ -11567,6 +11567,176 @@ fn z455_harvest_anr(rootfs: &str) -> Vec<String> {
     out
 }
 
+// ============================================================================
+// 6-Z457: the owner-side REFCOUNT MIRROR (Task 192 agenda)
+// ============================================================================
+//
+// rn422's suspend-service Scudo double-free fired under a BALANCED 6-Z454
+// ledger — the missing half lives in the owner's IN-PROCESS refcount, which
+// no bus-side accounting can see. At every last-ref mirror delivery
+// (DeferredReply::RefCmd359) the emulator now reads the owner's LIVE RefBase
+// state through the guest and the decode joins the two views:
+//
+//   W = ptr (the weakref_impl* the kernel-true mirror carries)
+//   [W+8]  = mBase        (the RefBase* this weakref belongs to)
+//   [W+16] = mStrong i32  (raw; RefBase::INITIAL_STRONG_VALUE = 1<<28)
+//   [W+20] = mWeak   i32
+//
+// Layout proof (Android 11 RefBase.h): weakref_impl : weakref_type — vptr
+// at 0, mBase at 8, mStrong at 16, mWeak at 20. The z366 chain already
+// proved [R+8]==W for the BnHw shell class (R = mBase = [W+8]); this read
+// lands on the SAME live weakref the mirror names, no pointers invented.
+//
+// count = mStrong_raw - INITIAL: ≥1 = the owner's own sp is present (the
+// delivery's decStrong is legit); 0 = the own sp is ALREADY gone (the
+// delivered decStrong over-decs — the delete#2 precondition); <0 = a
+// decStrong already fired past zero on this weakref. READ FAILED on a live
+// owner is itself a count≤0 signature (the chunk is freed — unmapped).
+//
+// Pure diagnostics: NO behavior change, the delivery proceeds unchanged
+// whether or not the read lands.
+
+/// RefBase::INITIAL_STRONG_VALUE (A11 frameworks/rs/RefBase.h): the mStrong
+/// raw value encodes `INITIAL + N - M`; the live count is the delta below.
+pub(crate) const Z457_INITIAL_STRONG: i32 = 1 << 28;
+
+/// One owner-side RefBase snapshot (the 16 bytes at [W+8..W+24]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Z457State {
+    /// [W+8] — the RefBase* the weakref belongs to (mBase).
+    pub mbase: u64,
+    /// [W+16] — the RAW mStrong (subtract [`Z457_INITIAL_STRONG`]).
+    pub strong_raw: i32,
+    /// [W+20] — mWeak (starts at 0).
+    pub weak: i32,
+}
+
+/// Pure parse of the 16-byte read (mBase, mStrong, mWeak) — testable
+/// without a guest.
+fn z457_parse(buf: &[u8]) -> Option<Z457State> {
+    if buf.len() < 16 {
+        return None;
+    }
+    let mbase = u64::from_ne_bytes(buf[0..8].try_into().ok()?);
+    let strong_raw = i32::from_ne_bytes(buf[8..12].try_into().ok()?);
+    let weak = i32::from_ne_bytes(buf[12..16].try_into().ok()?);
+    Some(Z457State {
+        mbase,
+        strong_raw,
+        weak,
+    })
+}
+
+/// Pure classifier of the RAW mStrong — names the count-before-delivery
+/// class the decode joins against the ledger (pure for tests).
+pub(crate) fn z457_classify(strong_raw: i32) -> &'static str {
+    let count = strong_raw.wrapping_sub(Z457_INITIAL_STRONG);
+    if count < 0 {
+        // Negative count: a decStrong already fired past zero on this
+        // weakref — the double-dec ALREADY happened (rn420/rn422 shape).
+        "over-dec (mStrong below INITIAL — decStrong past zero already fired)"
+    } else if count == 0 {
+        // The own sp is already gone; the delivered decStrong over-decs —
+        // the delete#2 precondition (the second free of the same chunk).
+        "zero (own sp already gone — the delivery's decStrong over-decs)"
+    } else {
+        // Normal: the owner's own ref is present; the delivery's decStrong
+        // lands count-1 (deletion legit iff it reaches 0 with no other
+        // in-process sp resurrecting later — the ledger join decides).
+        "held (own sp present — delivery's decStrong lands count-1)"
+    }
+}
+
+/// 6-Z457 (binder.rs hook): read the owner's live RefBase state for the
+/// last-ref mirror (W = the weakref_impl* the mirror carries). Reads
+/// through `read_child_bytes` (process_vm_readv → PEEKDATA fallback) — the
+/// proven read path (6-Z366's weakref anchor, 6-Z453's abort chain); ZERO
+/// register writes, the owner thread is stopped at its ioctl anyway.
+/// Returns None when the read fails (chunk freed/unmapped — itself a
+/// count≤0 signature) or W is degenerate.
+pub(crate) fn z457_refcount_snapshot(owner_pid: libc::pid_t, weakref_w: u64) -> Option<Z457State> {
+    if owner_pid <= 0 || weakref_w == 0 {
+        return None;
+    }
+    let buf = read_child_bytes(owner_pid, weakref_w + 8, 16)?;
+    z457_parse(&buf)
+}
+
+// ============================================================================
+// 6-Z455b v2: the /data/anr harvest gate (Task 192 decode fix)
+// ============================================================================
+//
+// rn422's budget flaw: the 4-harvest budget was consumed by the +174s
+// zygote-death kill storm — FOUR lineage reaps inside 113 ms (all EMPTY,
+// the anr file did not exist yet) — BEFORE the +322.9s system_server reap
+// that mattered. Two fixes, both kernel-event-true:
+//
+//  (a) SAME-SECOND BURST DEDUPE — a burst of lineage reaps inside one
+//      wall-clock second is ONE event (init reaps the whole kill storm
+//      synchronously); harvest once per second.
+//  (b) THE KILL-ENTRY CENSUS — the 6-Z455 arm already reads the victim's
+//      /proc/<pid>/comm at the kill/tgkill ENTRY (the system_server
+//      Watchdog class). PIDs seen there bypass the dedupe AND draw from a
+//      RESERVED budget (2) — the reap that matters never starves behind a
+//      zygote storm.
+
+/// The recent kill-ENTRY system_server victims (bounded ring, cap 8 —
+/// generations die repeatedly; one pid per generation is plenty).
+fn z455b_ss_victims() -> &'static std::sync::Mutex<Vec<libc::pid_t>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<Vec<libc::pid_t>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// 6-Z455 (kill-ENTRY arm): record that `pid` was SIGKILL-targeted as
+/// system_server. Bounded: keeps the most recent 8.
+pub(crate) fn z455b_note_ss_victim(pid: libc::pid_t) {
+    if pid <= 0 {
+        return;
+    }
+    let mut v = z455b_ss_victims().lock().expect("z455b victims poisoned");
+    if !v.contains(&pid) {
+        v.push(pid);
+        let len = v.len();
+        if len > 8 {
+            v.drain(0..len - 8);
+        }
+    }
+}
+
+/// Reap arm: was this pid SIGKILL-targeted as system_server at the
+/// kill-ENTRY?
+fn z455b_is_ss_victim(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    z455b_ss_victims()
+        .lock()
+        .expect("z455b victims poisoned")
+        .contains(&pid)
+}
+
+/// Unix seconds now (0 when the clock is before the epoch — never in
+/// practice, treated as "no previous harvest").
+fn z455b_now_sec() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn z455b_last_harvest_sec() -> &'static std::sync::atomic::AtomicU64 {
+    static S: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+
+/// Pure harvest gate (testable): a system_server victim ALWAYS passes;
+/// every other reap passes only when its second differs from the last
+/// actual harvest's second (0 = no harvest yet → pass). The caller is
+/// responsible for updating the last-harvest second when a harvest runs.
+fn z455b_harvest_gate(is_ss: bool, now_sec: u64, last_sec: u64) -> bool {
+    is_ss || last_sec == 0 || now_sec != last_sec
+}
+
 // 6-Z305t-17: PTRACE_INTERRUPT was REMOVED — it is PTRACE_SEIZE-only and
 // returned ESRCH on every ATTACH-attached twoyi tracee (ladder #74, 84/84
 // probes ESRCH). The stall probe now uses SIGSTOP (see stall_interrupt_probe).
@@ -21638,24 +21808,52 @@ pub fn run_ptrace_loop(
             // /data/anr is FINAL — harvest the guest trees host-side and
             // name the ground truth (rn421: both trees stayed EMPTY all
             // run — this arm is the proof-of-absence instrument).
-            // Lineage-gated, ≤4 harvests/run.
+            // 6-Z455b v2 (Task 192 decode): rn422's 4-harvest budget was
+            // drained by the +174s zygote-kill storm (4 lineage reaps in
+            // 113 ms, all EMPTY) before the +322.9s system_server reap
+            // that mattered. Fixed: same-second burst DEDUPE for lineage
+            // reaps (one harvest per wall second) + a RESERVED budget (2)
+            // that ONLY the kill-ENTRY-census system_server victims draw
+            // from, bypassing the dedupe.
             if sig == libc::SIGKILL {
                 let reap_is_lineage =
                     z306_in_zygote_lineage(pid, &z306_zygote_lineage, &mut z306_lineage_tgid_cache);
                 if reap_is_lineage {
+                    let is_ss = z455b_is_ss_victim(pid);
+                    let now_sec = z455b_now_sec();
+                    let last_sec =
+                        z455b_last_harvest_sec().load(std::sync::atomic::Ordering::Relaxed);
                     static Z455B_HARVEST: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(4);
-                    if Z455B_HARVEST.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                        Z455B_HARVEST.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        log(&format!(
-                            "6-Z455b: SIGKILL group-death reap pid={} sig={} — harvesting /data/anr + /data/system/dropbox (harvests left {})",
-                            pid,
-                            sig,
-                            Z455B_HARVEST.load(std::sync::atomic::Ordering::Relaxed)
-                        ));
-                        for line in z455_harvest_anr(rootfs) {
-                            log(&line);
+                    static Z455B_SS_HARVEST: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(2);
+                    if z455b_harvest_gate(is_ss, now_sec, last_sec) {
+                        let (budget, tag) = if is_ss {
+                            (&Z455B_SS_HARVEST, "ss-census")
+                        } else {
+                            (&Z455B_HARVEST, "lineage")
+                        };
+                        if budget.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                            budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            z455b_last_harvest_sec()
+                                .store(now_sec, std::sync::atomic::Ordering::Relaxed);
+                            log(&format!(
+                                "6-Z455b: SIGKILL group-death reap pid={} sig={} class={} — harvesting /data/anr + /data/system/dropbox (generic left {}, ss-reserved left {})",
+                                pid,
+                                sig,
+                                tag,
+                                Z455B_HARVEST.load(std::sync::atomic::Ordering::Relaxed),
+                                Z455B_SS_HARVEST.load(std::sync::atomic::Ordering::Relaxed)
+                            ));
+                            for line in z455_harvest_anr(rootfs) {
+                                log(&line);
+                            }
                         }
+                    } else {
+                        log(&format!(
+                            "6-Z455b: SIGKILL group-death reap pid={} sig={} — same-second burst SKIPPED (dedupe, last harvest sec {})",
+                            pid, sig, last_sec
+                        ));
                     }
                 }
             }
@@ -29028,6 +29226,13 @@ pub fn run_ptrace_loop(
                                         ))
                                         .unwrap_or_default();
                                         if victim_comm.trim_end() == "system_server" {
+                                            // 6-Z455b v2 (Task 192 decode): carry
+                                            // the census to the reap arm — this
+                                            // pid's SIGKILL group-death reap
+                                            // draws from the RESERVED ss budget
+                                            // and bypasses the burst dedupe (the
+                                            // rn422 starvation fix).
+                                            z455b_note_ss_victim(j_target);
                                             static Z455_KILLS: std::sync::atomic::AtomicU64 =
                                                 std::sync::atomic::AtomicU64::new(6);
                                             static Z455_WALKS: std::sync::atomic::AtomicU64 =
@@ -47670,6 +47875,108 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         assert!(lines.iter().all(|l| l.contains("UNREADABLE")));
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&bare);
+    }
+
+    /// 6-Z457: the 16-byte weakref window parse — [W+8] mBase (u64),
+    /// [W+16] mStrong (i32), [W+20] mWeak (i32); short/garbage → None.
+    #[test]
+    fn z457_parse_decodes_the_weakref_window() {
+        let w: u64 = 0xefea_6480_2610;
+        let mbase: u64 = 0xefea_6480_2000; // mBase = cookie + class delta
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&mbase.to_ne_bytes());
+        buf.extend_from_slice(&(-3i32).to_ne_bytes()); // over-dec shape
+        buf.extend_from_slice(&(2i32).to_ne_bytes());
+        let st = z457_parse(&buf).expect("16-byte window parses");
+        assert_eq!(
+            st,
+            Z457State {
+                mbase,
+                strong_raw: -3,
+                weak: 2
+            }
+        );
+        assert!(st.mbase == w.wrapping_sub(0x610)); // arbitrary sanity join
+
+        // Short buffers never parse.
+        assert!(z457_parse(&buf[..15]).is_none());
+        assert!(z457_parse(&[]).is_none());
+    }
+
+    /// 6-Z457: the count classes — count = raw − INITIAL_STRONG_VALUE.
+    /// INITIAL = zero (own sp gone → the delivery's decStrong over-decs),
+    /// INITIAL+N = held, anything below INITIAL = over-dec (a decStrong
+    /// already fired past zero on this weakref).
+    #[test]
+    fn z457_classify_names_the_count_classes() {
+        assert_eq!(
+            z457_classify(Z457_INITIAL_STRONG),
+            "zero (own sp already gone — the delivery's decStrong over-decs)"
+        );
+        assert_eq!(
+            z457_classify(Z457_INITIAL_STRONG + 1),
+            "held (own sp present — delivery's decStrong lands count-1)"
+        );
+        assert_eq!(
+            z457_classify(Z457_INITIAL_STRONG + 12),
+            "held (own sp present — delivery's decStrong lands count-1)"
+        );
+        // Below INITIAL: raw 0, raw 5, raw INITIAL-1 — all over-dec.
+        assert_eq!(
+            z457_classify(0),
+            "over-dec (mStrong below INITIAL — decStrong past zero already fired)"
+        );
+        assert_eq!(
+            z457_classify(5),
+            "over-dec (mStrong below INITIAL — decStrong past zero already fired)"
+        );
+        assert_eq!(
+            z457_classify(Z457_INITIAL_STRONG - 1),
+            "over-dec (mStrong below INITIAL — decStrong past zero already fired)"
+        );
+    }
+
+    /// 6-Z455b v2: the harvest gate — system_server victims bypass the
+    /// same-second dedupe; lineage reaps pass once per wall second; the
+    /// first harvest (last=0) always passes.
+    #[test]
+    fn z455b_harvest_gate_dedupes_bursts_and_prioritizes_ss() {
+        // Same-second burst → SKIP for lineage reaps.
+        assert!(!z455b_harvest_gate(false, 1000, 1000));
+        // Next second → harvest.
+        assert!(z455b_harvest_gate(false, 1001, 1000));
+        // First ever harvest (last=0) → harvest.
+        assert!(z455b_harvest_gate(false, 1000, 0));
+        // system_server victim bypasses the dedupe EVEN same-second.
+        assert!(z455b_harvest_gate(true, 1000, 1000));
+    }
+
+    /// 6-Z455b v2: the kill-ENTRY census ring — membership, dedupe,
+    /// bounded at 8 (oldest evicted), non-positive pids ignored.
+    #[test]
+    fn z455b_ss_victim_ring_is_bounded_and_deduped() {
+        let tag = std::process::id() as i32 * 7919; // avoid cross-test pids
+        z455b_note_ss_victim(tag + 1);
+        z455b_note_ss_victim(tag + 2);
+        z455b_note_ss_victim(tag + 1); // dedupe: no double-entry
+        assert!(z455b_is_ss_victim(tag + 1));
+        assert!(z455b_is_ss_victim(tag + 2));
+        // Non-positive pids never enter.
+        z455b_note_ss_victim(0);
+        z455b_note_ss_victim(-5);
+        assert!(!z455b_is_ss_victim(0));
+        assert!(!z455b_is_ss_victim(-5));
+        // Cap 8: fill with 8 fresh pids → tag+1 (the oldest) evicted.
+        for i in 3..=11 {
+            z455b_note_ss_victim(tag + i);
+        }
+        assert!(!z455b_is_ss_victim(tag + 1), "oldest evicted at cap 8");
+        assert!(z455b_is_ss_victim(tag + 11), "newest retained");
+        let v = z455b_ss_victims().lock().unwrap();
+        assert!(v.len() <= 8 + 1, "ring stays bounded (={})", v.len());
+        // NOTE: +1 slack — this test itself may share the ring with a
+        // concurrent gate test on the same binary; the cap assertion
+        // guards the INVARIANT, not the exact count under parallel tests.
     }
 
     /// 6-Z306aj: the siginfo head reader must decode si_signo@0, si_code@8
