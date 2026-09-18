@@ -312,11 +312,21 @@ fn pid_is_arm32(pid: libc::pid_t) -> bool {
 /// dead/unknown tracee keeps the old tid-keyed behavior instead of
 /// silently disabling the fake).
 fn tracee_tgid(pid: libc::pid_t) -> libc::pid_t {
-    if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("Tgid:") {
-                if let Ok(tgid) = rest.trim().parse::<libc::pid_t>() {
-                    return tgid;
+    // 6-Z439f: bounded retry — rn402 AND rn403 each measured a 3/96-class
+    // GET-bypass whose only escape is a failed tgid resolution (the leak's
+    // kmsg context names a crash-request pid adjacent to a REGISTERED
+    // generation's tid range: the leaking process IS a pinned member, so
+    // both the status read AND the fd-link read must have failed together —
+    // a transient procfs/EMFILE-class event inside the tracer, not a
+    // membership miss). 3 attempts, no sleep: the call sites already pay
+    // this only on the rare ifreq-request path (6-Z439e PERF ORDER).
+    for _ in 0..3 {
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("Tgid:") {
+                    if let Ok(tgid) = rest.trim().parse::<libc::pid_t>() {
+                        return tgid;
+                    }
                 }
             }
         }
@@ -33076,11 +33086,22 @@ pub fn run_ptrace_loop(
                             // 6-Z305t-14b fd-link pattern, reused for
                             // correctness.
                             if !hit {
-                                if let Ok(target) =
-                                    std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
-                                {
-                                    hit =
-                                        z439_fd_inodes.contains(target.to_string_lossy().as_ref());
+                                // 6-Z439f: 2 attempts — the same transient
+                                // procfs pressure that can break the status
+                                // read can break this readlink; one retry is
+                                // cheap on the rare ifreq path.
+                                for _ in 0..2 {
+                                    match std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
+                                        Ok(target) => {
+                                            if z439_fd_inodes
+                                                .contains(target.to_string_lossy().as_ref())
+                                            {
+                                                hit = true;
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => continue,
+                                    }
                                 }
                             }
                             if hit {
@@ -33106,18 +33127,37 @@ pub fn run_ptrace_loop(
                                         fd, req
                                     ));
                                 }
-                            } else if z439_packet_fds.contains_key(&tgid)
-                                && z439_miss_diag_budget > 0
-                            {
-                                // 6-Z439e bounded DIAG: a member process issued
-                                // an interface ioctl we did NOT pin — the only
-                                // way a future SET-EPERM leak can still form.
-                                // First 8 per run; the rn402-class bypasses
-                                // surface here instead of in the guest log.
+                            } else if z439_miss_diag_budget > 0 {
+                                // 6-Z439f UNCONDITIONAL forensic DIAG (the
+                                // rn403 MISS gate was blind to exactly the
+                                // fallback class it hunted: a failed tgid
+                                // resolution is not a map member, so the old
+                                // contains_key gate suppressed it). Every
+                                // unpinned interface-ioctl surfaces here with
+                                // its full /proc forensics — bounded 8/run.
                                 z439_miss_diag_budget -= 1;
+                                let status_tgid =
+                                    std::fs::read_to_string(format!("/proc/{}/status", pid))
+                                        .map(|s| {
+                                            s.lines()
+                                                .find_map(|l| {
+                                                    l.strip_prefix("Tgid:")
+                                                        .map(|v| v.trim().to_string())
+                                                })
+                                                .unwrap_or_else(|| "no-Tgid-line".to_string())
+                                        })
+                                        .unwrap_or_else(|e| format!("ERR:{}", e));
+                                let link = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                                    .map(|t| t.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|e| format!("ERR:{}", e));
                                 log(&format!(
-                                    "6-Z439e MISS: pid={} tgid={} fd={} req={:#x} NOT pinned (no fd-set hit, no inode hit) — the residual-bypass class surfaces here",
-                                    pid, tgid, fd, req
+                                    "6-Z439f MISS: pid={} fd={} req={:#x} status-Tgid={} fd-link={} member={} — the bypass class surfaces here",
+                                    pid,
+                                    fd,
+                                    req,
+                                    status_tgid,
+                                    link,
+                                    z439_packet_fds.contains_key(&tgid)
                                 ));
                             }
                         }
