@@ -1947,6 +1947,26 @@ pub type ConnId = u64;
 /// The proxy's own connection id (virtual services are "owned" by it).
 pub const PROXY_CONN_ID: ConnId = 0;
 
+/// 6-Z458 (Task 195): the SERVICEMANAGER's own driver-side pin, modeled
+/// as a virtual holder in every registered node's strong/weak maps.
+/// Kernel truth: the real servicemanagers hold one strong ref per
+/// registered service (ServiceManager.cpp `mNameToService[name].binder`;
+/// hwservicemanager addImpl: one HidlService sp per chain key) — the
+/// node's external refs NEVER empty while a registration key points at
+/// the object, so `binder_dec_node` cannot fire the owner's BR_RELEASE
+/// until the registry itself drops. The emulator's pre-6-Z458 maps
+/// tracked only client grants, so the LAST CLIENT's drop emptied the
+/// map and mirrored a BR_RELEASE the kernel would NOT send — the owner's
+/// decStrong deleted a REGISTRY-PINNED LIVE object, the notification era
+/// re-armed, and the next client's re-grant operated on the corpse (the
+/// rn425 corpse-regrant cascade: double-frees → "registration lost" →
+/// NULL ISystemSuspend proxy → SuspendLockout SIGSEGV → the ~145 s
+/// Watchdog self-kill cycle). Never a real connection: `next_conn`
+/// allocates upward from `PROXY_CONN_ID + 1`, so `u64::MAX` cannot
+/// collide, and every existing map consumer treats it as one more
+/// holder with no special-casing.
+pub const REGISTRY_CONN: ConnId = ConnId::MAX;
+
 /// 6-Z271 wire extension: connection-identity frame command. NOT a real
 /// binder ioctl — a dedicated `'b'`-type number the loader sends right
 /// after connect with `[u32 pid][u32 uid][u32 gid]`, so routed
@@ -2410,6 +2430,13 @@ struct GuestNode {
     /// is outstanding. Re-arms when the node's weak refs drop to zero
     /// (BR_DECREFS).
     weak_notified: bool,
+    /// 6-Z458 (Task 195): whether the REGISTRY pin's era-0 BR_ACQUIRE
+    /// actually crossed to the owner (the add arm's 6-Z306ae liveness
+    /// verdict at the LAST add of this object). The pin's own drop rides
+    /// this verdict: a pin whose acquire never reached the owner drops
+    /// SILENTLY — no release may precede its acquire on the wire (the
+    /// release-without-acquire decStrong-on-zero class).
+    registry_pin_mirror: bool,
     /// 6-Z457 (Task 192): LIFETIME strong grants this node handed out
     /// (every strong flat crossing). The per-holder maps drop to empty at
     /// the last-ref release — exactly when the 6-Z457 mirror fires — so
@@ -2595,29 +2622,22 @@ impl BusState {
                 && old_ptr != 0
                 && overwrite_release_due(&self.services, name, old_owner, old_ptr, old_cookie)
             {
-                let old_pid = self
-                    .conns
-                    .get(&old_owner)
-                    .map(|c| c.sender_pid)
-                    .unwrap_or(0);
-                if mirror_ref_ok(old_pid, old_ptr, old_cookie) {
-                    if let Some(ob) = self.conns.get_mut(&old_owner) {
-                        ob.reply_queue.push_back(DeferredReply::RefCmd {
-                            br: BR_RELEASE,
-                            ptr: old_ptr,
-                            cookie: old_cookie,
-                        });
-                        // 6-Z454: the overwrite's registry release is
-                        // queued — the ledger checks it against the OLD
-                        // object's emitted acquires (V1). THE KILLER
-                        // CANDIDATE: the add-side acquire mirror is
-                        // liveness-gated at REGISTRATION time, this
-                        // release is gated at OVERWRITE time — two probe
-                        // moments, two verdicts; a release here with the
-                        // acquire skipped earlier is the rn420
-                        // decStrong-on-zero shape.
-                        z454_emit(old_pid, old_ptr, old_cookie, Z454Site::RegRel);
-                    }
+                // 6-Z458 (Task 195): the registry's pin on the OLD object
+                // drops here — routed through the node-ref unref
+                // (z359_unref_node) so the BR_RELEASE mirror fires
+                // EXACTLY when the kernel's would (binder_dec_node on
+                // the truly-last strong ref): while a CLIENT ref remains
+                // the release defers to that client's drop; the rn425
+                // corpse-regrant shape (a release deleting a
+                // REGISTRY-PINNED live object) is structurally
+                // impossible. The old immediate RefCmd{BR_RELEASE} + its
+                // own mirror_ref_ok gate are gone: delivery liveness is
+                // the RefCmd359 arm's fresh owner probe, and a pin whose
+                // add-time acquire never crossed drops silently (no
+                // release may precede its acquire on the wire).
+                if let Some(&h) = self.node_by_key.get(&(old_owner, old_ptr, old_cookie)) {
+                    self.z359_unref_node(0, h, REGISTRY_CONN, true);
+                    self.z359_unref_node(0, h, REGISTRY_CONN, false);
                 }
             }
             // The registry handle now holds a strong node ref on the NEW
@@ -3143,6 +3163,7 @@ impl BusState {
                         weak: HashMap::new(),
                         strong_notified: false,
                         weak_notified: false,
+                        registry_pin_mirror: false,
                         strong_grants: 0,
                         weak_grants: 0,
                     },
@@ -3378,17 +3399,34 @@ impl BusState {
     /// unbalanced release is a decStrong-on-zero abort class).
     /// `strong=false` handles the weak side. The notification flags
     /// re-arm exactly here (the next era's first ref re-mirrors).
+    ///
+    /// 6-Z458 (Task 195): the node's maps now include the REGISTRY's own
+    /// pin ([`REGISTRY_CONN`], booked at every registration arm), so the
+    /// emptiness decision is kernel-true: the LAST CLIENT's drop leaves
+    /// the registry pin and mirrors NOTHING (the rn425 corpse-regrant
+    /// shape — a BR_RELEASE deleting a REGISTRY-PINNED live object — is
+    /// structurally impossible). The pin's own drop (the 6-Z379
+    /// last-key-repoint) fires the release exactly when the kernel's
+    /// servicemanager drop would; a pin whose add-time acquire mirror
+    /// never crossed (the 6-Z306ae liveness probe skipped) drops
+    /// SILENTLY — no release may precede its acquire on the wire. The
+    /// decode witness `reg-pin=` rides the last-ref line: `dropped` (the
+    /// registry released — the kernel-true era close), `present`
+    /// (PREMATURE — the rn425 bug signature, must never appear),
+    /// `absent` (client-side last ref on an unpinned node).
     fn z359_unref_node(&mut self, vm_id: u32, handle: u32, holder: ConnId, strong: bool) {
-        let mirror = {
+        let (mirror, reg_pin_present, pin_mirror) = {
             let Some(n) = self.nodes.get_mut(&handle) else {
                 return;
             };
+            let reg_pin_present = n.strong.contains_key(&REGISTRY_CONN);
+            let pin_mirror = n.registry_pin_mirror;
             let refs = if strong { &mut n.strong } else { &mut n.weak };
             let Some(c) = refs.get_mut(&holder) else {
                 return;
             };
             *c -= 1;
-            if *c > 0 {
+            let mirror = if *c > 0 {
                 None
             } else {
                 refs.remove(&holder);
@@ -3407,12 +3445,33 @@ impl BusState {
                 } else {
                     None
                 }
-            }
+            };
+            (mirror, reg_pin_present, pin_mirror)
         };
         let Some((owner, ptr, cookie)) = mirror else {
             return;
         };
         let br = if strong { BR_RELEASE } else { BR_DECREFS };
+        let is_registry_drop = holder == REGISTRY_CONN;
+        // 6-Z458: the REGISTRY pin's drop rides its own delivery
+        // verdict. A pin whose acquire mirror never crossed (the add
+        // arm's 6-Z306ae probe skipped — the rn425 suspend-service
+        // shape: ledger RegAcq=0) must not produce a release the owner
+        // never earned (release-without-acquire = the decStrong-on-zero
+        // class) — its drop is silent bookkeeping.
+        if is_registry_drop && !pin_mirror {
+            if Self::z359_release_log().load(Ordering::Relaxed) > 0 {
+                Self::z359_release_log().fetch_sub(1, Ordering::Relaxed);
+                info!(
+                    "[KR64][binder][vm{}] 6-Z458: registry pin dropped SILENT on node 0x{:08x} ({}) ptr=0x{:x} cookie=0x{:x} — the add arm's acq-mirror never delivered, no wire release (release-without-acquire prevention)",
+                    vm_id,
+                    handle,
+                    if strong { "strong" } else { "weak" },
+                    ptr, cookie
+                );
+            }
+            return;
+        }
         // Kernel-true mirror: push the RefCmd onto the OWNER's
         // reply_queue — the owner's IPCThreadState runs
         // decStrong/decWeak on the local BBinder (the composer's
@@ -3427,10 +3486,18 @@ impl BusState {
             // — the ledger checks it against this node's emitted acquires
             // (V1: a release past the acquire count is the
             // decStrong-on-zero precursor; naming the unref site + owner
-            // here is the Task 190 audit's deliverable).
+            // here is the Task 190 audit's deliverable). 6-Z458: the
+            // REGISTRY pin's own drop names site=reg-rel (it IS the
+            // registry release); the witness flag verifies no premature
+            // release crossed while the pin still held (Task 194 item e).
             if strong {
                 let owner_pid = self.conns.get(&owner).map(|c| c.sender_pid).unwrap_or(0);
-                z454_emit(owner_pid, ptr, cookie, Z454Site::NodeRel);
+                let site = if is_registry_drop {
+                    Z454Site::RegRel
+                } else {
+                    Z454Site::NodeRel
+                };
+                z454_emit_rel(owner_pid, ptr, cookie, site, reg_pin_present);
             }
             if Self::z359_release_log().load(Ordering::Relaxed) > 0 {
                 Self::z359_release_log().fetch_sub(1, Ordering::Relaxed);
@@ -3447,9 +3514,21 @@ impl BusState {
                     .z359_owner_node_names(owner, ptr)
                     .or_else(|| self.by_handle.get(&handle).cloned())
                     .unwrap_or_else(|| "?".to_string());
+                // 6-Z458 decode witness: dropped = the registry's own
+                // release (kernel-true era close); present = a client
+                // release fired while the pin STILL held (the rn425 bug
+                // signature — regression if ever seen); absent = the
+                // pre-pin node shapes (pure flat-crossing exports).
+                let reg_pin_witness = if is_registry_drop {
+                    "dropped"
+                } else if reg_pin_present {
+                    "present"
+                } else {
+                    "absent"
+                };
                 info!(
-                    "[KR64][binder][vm{}] 6-Z359: last ref from conn={} on node 0x{:08x} released → {} mirrored to owner conn={} (ptr=0x{:x} cookie=0x{:x}) node-name={}",
-                    vm_id, holder, handle, if strong { "BR_RELEASE" } else { "BR_DECREFS" }, owner, ptr, cookie, node_name
+                    "[KR64][binder][vm{}] 6-Z359: last ref from conn={} on node 0x{:08x} released → {} mirrored to owner conn={} (ptr=0x{:x} cookie=0x{:x}) node-name={} reg-pin={}",
+                    vm_id, holder, handle, if strong { "BR_RELEASE" } else { "BR_DECREFS" }, owner, ptr, cookie, node_name, reg_pin_witness
                 );
             }
         }
@@ -3457,6 +3536,81 @@ impl BusState {
         // owner may re-export the same node and the handle must be
         // stable); the entry is a few dozen bytes and the boot creates
         // O(100). Freed when the OWNER connection dies (unregister_conn).
+    }
+
+    /// 6-Z458 (Task 195): book the REGISTRY's own strong+weak pin on the
+    /// (owner, ptr, cookie) node at registration time (AIDL addService /
+    /// HIDL add / addWithChain chain[0]). Find-or-create the node with
+    /// the SAME key the client-grant path ([`BusState::z359_grant_node`])
+    /// uses, so the pin and the grants share one entry and every
+    /// existing map consumer sees one more holder.
+    ///
+    /// Kernel-true bookkeeping, regardless of the add arm's liveness
+    /// verdict: the SM's sp<> exists the moment the add lands, probe or
+    /// no probe — only the OWNER-NOTIFICATION side is probe-gated (the
+    /// 6-Z306ae arm, unchanged). The pin's presence raises
+    /// `strong_notified`: the pin IS the node's 0→1 strong edge (the
+    /// kernel's `binder_ref` creation on a ref-less node), so the first
+    /// CLIENT grant must not re-mirror the era's BR_ACQUIRE — this
+    /// removes the pre-6-Z458 compensating over-acquire whose absence
+    /// (add-mirror skipped) let the wrongful last-client release kill
+    /// the object (the rn425 cascade). `weak_notified` is deliberately
+    /// untouched: the weak era's BR_INCREFS still opens at the first
+    /// grant (the pre-6-Z458 balanced weak arithmetic, preserved).
+    ///
+    /// BOOLEAN presence per object (one pin while ANY registry key
+    /// points at it): re-adds and chain aliases do not inflate the
+    /// count — `overwrite_release_due`'s last-key semantics drop it
+    /// exactly once. NOT counted in the 6-Z457 lifetime grant counters:
+    /// those join guest mStrong against flat-crossing grants; the pin's
+    /// acquire is the add arm's mirror, visible in the ledger surface.
+    fn z458_registry_pin_add(&mut self, owner: ConnId, ptr: u64, cookie: u64, acq_mirrored: bool) {
+        if ptr == 0 || cookie == 0 || owner == PROXY_CONN_ID {
+            return;
+        }
+        let handle = match self.node_by_key.get(&(owner, ptr, cookie)) {
+            Some(h) => *h,
+            None => {
+                let h = self.next_handle;
+                self.next_handle += 1;
+                self.node_by_key.insert((owner, ptr, cookie), h);
+                self.nodes.insert(
+                    h,
+                    GuestNode {
+                        owner,
+                        ptr,
+                        cookie,
+                        strong: HashMap::new(),
+                        weak: HashMap::new(),
+                        strong_notified: false,
+                        weak_notified: false,
+                        registry_pin_mirror: false,
+                        strong_grants: 0,
+                        weak_grants: 0,
+                    },
+                );
+                h
+            }
+        };
+        let Some(n) = self.nodes.get_mut(&handle) else {
+            return;
+        };
+        if !n.strong.contains_key(&REGISTRY_CONN) {
+            *n.strong.entry(REGISTRY_CONN).or_insert(0) += 1;
+            // Kernel: every strong ref implies a weak one (the node's
+            // weak map balances the pin's implied weak against the
+            // owner's BR_INCREFS-era arithmetic).
+            *n.weak.entry(REGISTRY_CONN).or_insert(0) += 1;
+            // The pin IS the strong era's 0→1 edge — the add arm's
+            // BR_ACQUIRE (same-ioctl, or the 6-Z306am arm-B re-route)
+            // is its owner notification; the grant path must not
+            // re-mirror it.
+            n.strong_notified = true;
+        }
+        // The LATEST add's mirror verdict governs the pin's drop (each
+        // add re-mirrors the acquire; the release pairs with the last
+        // one the owner actually saw).
+        n.registry_pin_mirror = acq_mirrored;
     }
 }
 
@@ -7088,7 +7242,15 @@ fn servicemanager_proxy(
             // RefCmd queue (see the gate's header comment).
             if ptr != 0 {
                 let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
-                if mirror_ref_ok(gpid, ptr, cookie) {
+                // 6-Z458 (Task 195): the REGISTRY's own pin books into
+                // the node map UNCONDITIONALLY — kernel-true: the SM's
+                // sp<> exists the moment the add lands, probe or no
+                // probe — while `acq_mirrored` records the add arm's
+                // mirror verdict so the pin's eventual drop knows
+                // whether the owner ever saw the era's BR_ACQUIRE.
+                let acq_mirrored = mirror_ref_ok(gpid, ptr, cookie);
+                b.z458_registry_pin_add(conn_id, ptr, cookie, acq_mirrored);
+                if acq_mirrored {
                     if z306am_skip_prefix(conn_id, conn_id) {
                         if let Some(bx) = b.conns.get_mut(&conn_id) {
                             bx.reply_queue.push_back(DeferredReply::RefCmd {
@@ -7932,7 +8094,13 @@ fn servicemanager_hidl(
                 // transactions and re-routes the acquire through the
                 // liveness-gated RefCmd queue (see the gate's header).
                 let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
-                if ptr != 0 && mirror_ref_ok(gpid, ptr, cookie) {
+                // 6-Z458 (Task 195): the registry's own pin books into the
+                // node map UNCONDITIONALLY (see the AIDL add arm).
+                let acq_mirrored = ptr != 0 && mirror_ref_ok(gpid, ptr, cookie);
+                if ptr != 0 {
+                    b.z458_registry_pin_add(conn_id, ptr, cookie, acq_mirrored);
+                }
+                if acq_mirrored {
                     if z306am_skip_prefix(conn_id, conn_id) {
                         if let Some(bx) = b.conns.get_mut(&conn_id) {
                             bx.reply_queue.push_back(DeferredReply::RefCmd {
@@ -8172,7 +8340,13 @@ fn servicemanager_hidl(
                 // transactions and re-routes the acquire through the
                 // liveness-gated RefCmd queue (see the gate's header).
                 let gpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
-                if ptr != 0 && mirror_ref_ok(gpid, ptr, cookie) {
+                // 6-Z458 (Task 195): the registry's own pin books into the
+                // node map UNCONDITIONALLY (see the AIDL add arm).
+                let acq_mirrored = ptr != 0 && mirror_ref_ok(gpid, ptr, cookie);
+                if ptr != 0 {
+                    b.z458_registry_pin_add(conn_id, ptr, cookie, acq_mirrored);
+                }
+                if acq_mirrored {
                     if z306am_skip_prefix(conn_id, conn_id) {
                         if let Some(bx) = b.conns.get_mut(&conn_id) {
                             bx.reply_queue.push_back(DeferredReply::RefCmd {
@@ -9945,6 +10119,45 @@ fn z454_emit(pid: i32, ptr: u64, cookie: u64, site: Z454Site) -> bool {
         }
     } else {
         e.acq_emitted += 1;
+    }
+    false
+}
+
+/// 6-Z458 (Task 195): the release-side emit carrying the REGISTRY-pin
+/// witness — the decode's "no premature BR_RELEASE crossed"
+/// verification surface (Task 194 agenda item e). A fired release while
+/// the registry pin still held is the rn425 corpse-regrant shape; the
+/// V1 line names it the moment it is created. Acquire sites and the
+/// watcher surfaces keep [`z454_emit`] (witness always false there).
+fn z454_emit_rel(
+    pid: i32,
+    ptr: u64,
+    cookie: u64,
+    site: Z454Site,
+    registry_pin_present: bool,
+) -> bool {
+    if pid <= 0 || ptr == 0 || cookie == 0 {
+        return false;
+    }
+    let mut led = z454_ledger().lock().expect("6-Z454 ledger poisoned");
+    z454_evict_if_over(&mut led, &(pid, ptr, cookie));
+    let e = led.entry((pid, ptr, cookie)).or_default();
+    e.rel_emitted += 1;
+    if e.rel_emitted > e.acq_emitted {
+        if z454_viol_log().load(Ordering::Relaxed) > 0 {
+            z454_viol_log().fetch_sub(1, Ordering::Relaxed);
+            info!(
+                "[KR64][binder] 6-Z454 V1 EMIT release-without-acquire site={} pid={} ptr=0x{:x} cookie=0x{:x} emitted acq={} rel={} reg-pin={} — a queued BR_RELEASE will decStrong the owner past zero (the rn420 double-free class)",
+                site.name(),
+                pid,
+                ptr,
+                cookie,
+                e.acq_emitted,
+                e.rel_emitted,
+                if registry_pin_present { "present" } else { "absent" }
+            );
+        }
+        return true;
     }
     false
 }
@@ -12388,6 +12601,290 @@ mod tests {
         // Era drop via the recipient's BC_RELEASE: the LAST strong drop
         // mirrors BR_RELEASE — the ledger sees rel==acq, no violation.
         bus.z359_unref_node(0, grants[0].handle, recipient, true);
+    }
+
+    // ── 6-Z458 (Task 195): the kernel-true REGISTRY pin ────────────────
+
+    /// Count RefCmd359 mirrors of one br command queued to `owner`.
+    fn z458_owner_refcmd359_count(bus: &BusState, owner: ConnId, br: u32) -> usize {
+        bus.conns
+            .get(&owner)
+            .map(|bx| {
+                bx.reply_queue
+                    .iter()
+                    .filter(|r| matches!(r, DeferredReply::RefCmd359 { br: b, .. } if *b == br))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn z458_registry_pin_books_into_the_node_maps() {
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let ptr = 0x8100_1000u64;
+        let cookie = 0x6100_2000u64;
+        bus.add_guest_service(
+            "android.system.suspend@1.0::ISystemSuspend/default",
+            owner,
+            ptr,
+            cookie,
+        );
+        bus.z458_registry_pin_add(owner, ptr, cookie, true);
+        let handle = *bus
+            .node_by_key
+            .get(&(owner, ptr, cookie))
+            .expect("pin created the node");
+        let node = bus.nodes.get(&handle).expect("node entry");
+        assert_eq!(node.strong.get(&REGISTRY_CONN), Some(&1), "one strong pin");
+        assert_eq!(
+            node.weak.get(&REGISTRY_CONN),
+            Some(&1),
+            "the implied weak pin"
+        );
+        assert!(node.strong_notified, "the pin IS the era's 0→1 edge");
+        assert!(
+            !node.weak_notified,
+            "the weak era still opens at the first grant (unchanged surface)"
+        );
+        assert_eq!(
+            node.strong_grants, 0,
+            "the pin is not a flat-crossing grant"
+        );
+        // BOOLEAN presence: a re-add must not inflate the pin.
+        bus.z458_registry_pin_add(owner, ptr, cookie, true);
+        let node = bus.nodes.get(&handle).expect("node entry");
+        assert_eq!(
+            node.strong.get(&REGISTRY_CONN),
+            Some(&1),
+            "re-add does not inflate"
+        );
+        // Degenerate flats book nothing.
+        bus.z458_registry_pin_add(owner, 0, cookie, true);
+        bus.z458_registry_pin_add(owner, ptr, 0, true);
+        bus.z458_registry_pin_add(PROXY_CONN_ID, ptr, cookie, true);
+        assert_eq!(
+            bus.node_by_key.len(),
+            1,
+            "only the real registration created a node"
+        );
+    }
+
+    #[test]
+    fn z458_registry_pin_survives_the_last_client_drop() {
+        // THE rn425 REGRESSION TEST (Task 194 agenda item f): era 1's
+        // last-client drop must NOT mirror BR_RELEASE — the registry
+        // still pins the object (the corpse-regrant shape: the guest's
+        // decStrong deleted a REGISTRY-PINNED LIVE object, the era
+        // re-armed, the next client's re-grant operated on the corpse).
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let client_a = bus.register_conn();
+        let client_b = bus.register_conn();
+        let ptr = 0x8100_3000u64;
+        let cookie = 0x6100_4000u64;
+        bus.add_guest_service(
+            "android.system.suspend@1.0::ISystemSuspend/default",
+            owner,
+            ptr,
+            cookie,
+        );
+        bus.z458_registry_pin_add(owner, ptr, cookie, true);
+
+        // Era 1: the first client grant. The strong era opened at the
+        // pin (the add arm's BR_ACQUIRE) — NO second BR_ACQUIRE; the
+        // weak era still opens (BR_INCREFS, unchanged surface).
+        let (h, mirrors) = bus.z359_grant_node(owner, client_a, ptr, cookie, true);
+        assert!(
+            mirrors.iter().all(|(br, _, _)| *br != BR_ACQUIRE),
+            "the pin's era is already open — no compensating second BR_ACQUIRE"
+        );
+        assert!(
+            mirrors.iter().any(|(br, _, _)| *br == BR_INCREFS),
+            "weak era opens at the first grant (pre-6-Z458 balance preserved)"
+        );
+
+        // Era 1's last-client drop: the REGISTRY still pins → NOTHING
+        // mirrors to the owner (the rn425 killer, now impossible).
+        bus.z359_unref_node(0, h, client_a, true);
+        bus.z359_unref_node(0, h, client_a, false);
+        assert_eq!(
+            z458_owner_refcmd359_count(&bus, owner, BR_RELEASE),
+            0,
+            "era-1 drop must not release a registry-pinned object"
+        );
+        assert_eq!(
+            z458_owner_refcmd359_count(&bus, owner, BR_DECREFS),
+            0,
+            "the pin's implied weak holds the weak map too"
+        );
+
+        // Era 2: re-grant to another client onto the SAME node — no
+        // BR_ACQUIRE (the era never closed; kernel has_strong_ref truth).
+        let (_, mirrors2) = bus.z359_grant_node(owner, client_b, ptr, cookie, true);
+        assert!(
+            mirrors2.iter().all(|(br, _, _)| *br != BR_ACQUIRE),
+            "era-2 grant rides the still-open era — no mirror onto a corpse"
+        );
+        // The node's object identity is intact: same entry, same grants.
+        let node = bus.nodes.get(&h).expect("node survives the eras");
+        assert_eq!(node.strong_grants, 2, "lifetime grant counters survive");
+
+        // The pin's drop (a cross-owner overwrite — 6-Z379 last-key
+        // semantics): the kernel-true release moment. client_b still
+        // holds, so the release DEFERS (kernel binder_dec_node truth —
+        // see the deferred-shape test); drop client_b first.
+        bus.z359_unref_node(0, h, client_b, true);
+        bus.z359_unref_node(0, h, client_b, false);
+        assert_eq!(z458_owner_refcmd359_count(&bus, owner, BR_RELEASE), 0);
+        bus.add_guest_service(
+            "android.system.suspend@1.0::ISystemSuspend/default",
+            client_b,
+            ptr.wrapping_add(0x1000),
+            cookie.wrapping_add(0x1000),
+        );
+        assert_eq!(
+            z458_owner_refcmd359_count(&bus, owner, BR_RELEASE),
+            1,
+            "the registry pin's own drop fires the release — the kernel-true era close"
+        );
+        assert_eq!(
+            z458_owner_refcmd359_count(&bus, owner, BR_DECREFS),
+            1,
+            "the pin's implied weak drops with it"
+        );
+    }
+
+    #[test]
+    fn z458_overwrite_with_live_clients_defers_the_release() {
+        // Kernel binder_dec_node truth: the SM's drop while a client
+        // still holds fires NOTHING; the release rides the LAST drop.
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let next_gen = bus.register_conn();
+        let client = bus.register_conn();
+        if let Some(bx) = bus.conns.get_mut(&owner) {
+            bx.sender_pid = z454_unique_pid();
+        }
+        let ptr = 0x8100_5000u64;
+        let cookie = 0x6100_6000u64;
+        bus.add_guest_service("some.hal.IFoo/default", owner, ptr, cookie);
+        bus.z458_registry_pin_add(owner, ptr, cookie, true);
+        let (h, _) = bus.z359_grant_node(owner, client, ptr, cookie, true);
+
+        // The overwrite lands while the client holds: the pin drops but
+        // the client's ref keeps the map non-empty → no release.
+        bus.add_guest_service(
+            "some.hal.IFoo/default",
+            next_gen,
+            ptr.wrapping_add(0x2000),
+            cookie.wrapping_add(0x2000),
+        );
+        assert_eq!(
+            z458_owner_refcmd359_count(&bus, owner, BR_RELEASE),
+            0,
+            "the pin's drop with a live client defers the release"
+        );
+
+        // The client's drop now empties the map → the release fires
+        // (holder = the client; reg-pin witness = absent — the pin is
+        // already gone, the release is the kernel-true era close).
+        bus.z359_unref_node(0, h, client, true);
+        assert_eq!(
+            z458_owner_refcmd359_count(&bus, owner, BR_RELEASE),
+            1,
+            "the deferred release fired at the truly-last strong ref"
+        );
+        bus.z359_unref_node(0, h, client, false);
+        assert_eq!(z458_owner_refcmd359_count(&bus, owner, BR_DECREFS), 1);
+    }
+
+    #[test]
+    fn z458_silent_pin_drop_when_the_acquire_mirror_skipped() {
+        // The rn425 suspend-service shape: the add arm's liveness probe
+        // skipped the era-0 BR_ACQUIRE (ledger RegAcq=0). The pin's drop
+        // must then be SILENT — no release may precede its acquire on
+        // the wire (the decStrong-on-zero class).
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let next_gen = bus.register_conn();
+        if let Some(bx) = bus.conns.get_mut(&owner) {
+            bx.sender_pid = z454_unique_pid();
+        }
+        let ptr = 0x8100_7000u64;
+        let cookie = 0x6100_8000u64;
+        bus.add_guest_service(
+            "android.system.suspend@1.0::ISystemSuspend/default",
+            owner,
+            ptr,
+            cookie,
+        );
+        bus.z458_registry_pin_add(owner, ptr, cookie, false);
+        bus.add_guest_service(
+            "android.system.suspend@1.0::ISystemSuspend/default",
+            next_gen,
+            ptr.wrapping_add(0x3000),
+            cookie.wrapping_add(0x3000),
+        );
+        assert_eq!(
+            z458_owner_refcmd359_count(&bus, owner, BR_RELEASE),
+            0,
+            "a pin whose acquire never crossed drops silently"
+        );
+        assert_eq!(z458_owner_refcmd359_count(&bus, owner, BR_DECREFS), 0);
+    }
+
+    #[test]
+    fn z458_unwind_keeps_the_pinned_node_and_the_open_era() {
+        // 6-Z442 interplay (Task 194 item d): a failed first grant
+        // unwinds WITHOUT deleting the pinned node (the registry still
+        // holds it) and without re-arming the era the pin opened.
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let recipient = bus.register_conn();
+        let ptr = 0x8100_9000u64;
+        let cookie = 0x6100_A000u64;
+        bus.add_guest_service("x.y@1.0::IFoo/default", owner, ptr, cookie);
+        bus.z458_registry_pin_add(owner, ptr, cookie, true);
+        let (h, _) = bus.z359_grant_node(owner, recipient, ptr, cookie, true);
+        bus.z442_unwind_grant(h, recipient, true);
+        assert!(
+            bus.node_by_key.contains_key(&(owner, ptr, cookie)),
+            "the pinned node survives the unwind"
+        );
+        let node = bus.nodes.get(&h).expect("node entry survives");
+        assert_eq!(node.strong.get(&REGISTRY_CONN), Some(&1));
+        assert!(
+            node.strong_notified,
+            "the era stays open while the pin holds"
+        );
+        // A post-unwind re-grant finds the SAME node (stable handle) and
+        // still fires no BR_ACQUIRE (era open).
+        let (h2, mirrors) = bus.z359_grant_node(owner, recipient, ptr, cookie, true);
+        assert_eq!(h, h2, "stable node handle across the unwind");
+        assert!(mirrors.iter().all(|(br, _, _)| *br != BR_ACQUIRE));
+    }
+
+    #[test]
+    fn z458_ledger_release_emits_carry_the_registry_pin_witness() {
+        // Task 194 item e: the release-side ledger emit names the
+        // registry-pin state — a fired release while the pin held is
+        // the rn425 signature (V1, reg-pin=present).
+        let pid = z454_unique_pid();
+        let (ptr, cookie) = (0x8100_B000u64, 0x6100_C000u64);
+        // A balanced surface: acquire then release, no violation.
+        assert!(!z454_emit(pid, ptr, cookie, Z454Site::RegAcq));
+        assert!(!z454_emit_rel(pid, ptr, cookie, Z454Site::NodeRel, false));
+        // The killer shape: release without acquire, pin present.
+        let (ptr2, cookie2) = (0x8100_C000u64, 0x6100_D000u64);
+        assert!(
+            z454_emit_rel(pid, ptr2, cookie2, Z454Site::NodeRel, true),
+            "premature release with the pin present = V1 violation"
+        );
+        // Degenerate keys never touch the ledger.
+        assert!(!z454_emit_rel(0, ptr, cookie, Z454Site::RegRel, true));
+        assert!(!z454_emit_rel(pid, 0, cookie, Z454Site::RegRel, true));
+        assert!(!z454_emit_rel(pid, ptr, 0, Z454Site::RegRel, true));
     }
 
     #[test]
