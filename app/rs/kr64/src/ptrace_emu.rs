@@ -12474,6 +12474,71 @@ fn z451_boot_image_open_line(pid: libc::pid_t, orig: &str, translated: &str, ret
     ));
 }
 
+/// 6-Z451 v2: BOOT-IMAGE-MMAP verdict capture. At the FIRST successful
+/// boot-image mmap per (pid, path), dump the mapped ImageHeader's
+/// decision fields (AOSP android-11.0.0_r1 runtime/image.h, all u32):
+///   @0 magic "art\\n" + @4 version "085\\0", @8 image_reservation_size_,
+///   @12 component_count_, @16 image_begin_ (THE REQUIRED BASE — the
+///   rn417 decode: the apex boot.art compiles image_begin_=0x70000000
+///   while the emulator's mmap lands the file at 0xff0d... — if ART
+///   requires the compiled base, the mismatch IS the silent rejection),
+///   @20 image_size_, @24 image_checksum_, @28 oat_checksum_,
+///   @32 oat_file_begin_, @36 oat_data_begin_, @40 oat_data_end_,
+///   @44 oat_file_end_. Also records whether the mapping SURVIVES: the
+///   successful (addr,len) is stashed per pid and the munmap ENTRY
+///   compares the requested address — an unmap names the discard time;
+///   a mapping that survives the process points to a LOADED image.
+fn z451_boot_image_mmap_line(
+    pid: libc::pid_t,
+    fd: i32,
+    path: &str,
+    len: u64,
+    ret: i64,
+    header: Option<&[u8]>,
+    n: u64,
+) {
+    let mut line = format!(
+        "6-Z451 BOOT-IMAGE-MMAP: pid={} fd={} path={:?} len={:#x} -> {:#x}",
+        pid, fd, path, len, ret
+    );
+    if let Some(h) = header {
+        if h.len() >= 48 {
+            let u32at = |o: usize| u32::from_ne_bytes(h[o..o + 4].try_into().unwrap());
+            let magic = &h[0..4];
+            let version = String::from_utf8_lossy(&h[4..8])
+                .trim_end_matches('\0')
+                .to_string();
+            line.push_str(&format!(
+                " magic={:?} ver={:?} resv={:#x} components={} image_begin={:#x} image_size={:#x} img_ck={:#x} oat_ck={:#x} oat_file_begin={:#x} oat_data_begin={:#x} oat_data_end={:#x} oat_file_end={:#x}",
+                magic,
+                version,
+                u32at(8),
+                u32at(12),
+                u32at(16),
+                u32at(20),
+                u32at(24),
+                u32at(28),
+                u32at(32),
+                u32at(36),
+                u32at(40),
+                u32at(44),
+            ));
+        }
+    } else {
+        line.push_str(" header=UNREADABLE");
+    }
+    line.push_str(&format!(" [#{}]", n));
+    crate::trace_log_line(&line);
+}
+
+/// 6-Z451 v2: the mapped-image SURVIVAL watch line.
+fn z451_boot_image_unmap_line(pid: libc::pid_t, addr: u64, len: u64, path: &str, n: u64) {
+    crate::trace_log_line(&format!(
+        "6-Z451 BOOT-IMAGE-UNMAP: pid={} munmap addr={:#x} len={:#x} path={:?} (the mapped image is being discarded — pin the validation leg) [#{}]",
+        pid, addr, len, path, n
+    ));
+}
+
 /// 6-Z449 v3 (rn415 decode): resolve a mirror object's Java class NAME
 /// through the compressed-reference heap by SELF-LOCATING the base.
 ///
@@ -18184,6 +18249,13 @@ pub fn run_ptrace_loop(
     // the runtime still falls back to image-less, so the mmap/validate
     // leg is the frontier.
     let mut pending_boot_image_mmap: std::collections::HashMap<libc::pid_t, (i32, u64, String)> =
+        std::collections::HashMap::new();
+    // 6-Z451 v2: LIVE boot-image mappings per pid — (addr, len, path)
+    // recorded at every SUCCESSFUL boot-image mmap and consulted at the
+    // munmap ENTRY (the requested addr matches the stash → the image is
+    // being discarded: the survival question decides whether ART kept
+    // the image or silently rejected it after mapping).
+    let mut live_boot_image_maps: std::collections::HashMap<libc::pid_t, Vec<(u64, u64, String)>> =
         std::collections::HashMap::new();
     // Per-pid counters: (events, total_bytes, max_single, milestone_mask).
     // The mask's bits are cleared as each 6-Z362_MILESTONES threshold is
@@ -32074,6 +32146,35 @@ pub fn run_ptrace_loop(
                         //     set (init hasn't opened /dev/__properties__
                         //     yet): no fd to match against, so we let the
                         //     kernel handle it normally.
+                        n if n == 215 || n == 91 => {
+                            // ── 6-Z451 v2: munmap ENTRY (aarch64 215 / x86_64 91) ──
+                            // The arg registers are LIVE at ENTRY (aarch64
+                            // clobbers x0 before EXIT), so compare the
+                            // requested address against the LIVE boot-image
+                            // mapping stash: a hit = the image is being
+                            // discarded (pins the validation-failure time);
+                            // silence across the boot = the mapping SURVIVED.
+                            let z451_maddr = get_syscall_arg(&regs, abi.reg_arg1);
+                            let z451_mlen = get_syscall_arg(&regs, abi.reg_arg2);
+                            if let Some(v) = live_boot_image_maps.get_mut(&pid) {
+                                if let Some(pos) = v.iter().position(|(a, _, _)| *a == z451_maddr) {
+                                    let (_, _, z451_upath) = v.remove(pos);
+                                    static Z451_UNMAP: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let z451u = Z451_UNMAP
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if z451u < 48 {
+                                        z451_boot_image_unmap_line(
+                                            pid,
+                                            z451_maddr,
+                                            z451_mlen,
+                                            &z451_upath,
+                                            z451u + 1,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         n if n == abi.mmap || n == abi.mmap2 => {
                             let flags = get_syscall_arg(&regs, abi.reg_arg4) as i32;
                             let fd = get_syscall_arg(&regs, abi.reg_arg5) as i32;
@@ -34253,28 +34354,51 @@ pub fn run_ptrace_loop(
                     // only drops the stash entry (counters measure REAL
                     // mappings, mirroring RSS).
                     if syscall_num == abi.mmap || syscall_num == abi.mmap2 {
-                        // ── 6-Z451: BOOT-IMAGE mmap result ──
+                        // ── 6-Z451 v2: BOOT-IMAGE mmap verdict ──
                         if let Some((b_fd, b_len, b_path)) = pending_boot_image_mmap.remove(&pid) {
                             let b_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                             static Z451_MMAP_RESULT: std::sync::atomic::AtomicU64 =
                                 std::sync::atomic::AtomicU64::new(0);
+                            static Z451_MMAP_FAIL: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
                             let z451m =
                                 Z451_MMAP_RESULT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if z451m < 96 {
-                                crate::trace_log_line(&format!(
-                                    "6-Z451 BOOT-IMAGE-MMAP: pid={} fd={} path={:?} len={:#x} -> {:#x} ({}) [#{}]",
+                            if b_ret < 0 && b_ret > -4096 {
+                                // FAILURES ALWAYS LOG — the rn416 budget cap
+                                // consumed 96 successes and could have hidden
+                                // the deciding failure.
+                                let f = Z451_MMAP_FAIL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if f < 48 {
+                                    crate::trace_log_line(&format!(
+                                        "6-Z451 BOOT-IMAGE-MMAP: pid={} fd={} path={:?} len={:#x} -> -errno {} (FAILED mmap) [#fail{}]",
+                                        pid, b_fd, b_path, b_len, -b_ret, f + 1
+                                    ));
+                                }
+                            } else if z451m < 48 {
+                                // The first successful maps carry the
+                                // ImageHeader verdict dump (rn417: the apex
+                                // boot.art compiles image_begin_=0x70000000
+                                // while the emulator's mmap lands 0xff0d...).
+                                let header = z446_read_mem_window(pid, b_ret as u64, 48);
+                                z451_boot_image_mmap_line(
                                     pid,
                                     b_fd,
-                                    b_path,
+                                    &b_path,
                                     b_len,
                                     b_ret,
-                                    if b_ret < 0 && b_ret > -4096 {
-                                        format!("-errno {}", -b_ret)
-                                    } else {
-                                        "mapped".to_string()
-                                    },
-                                    z451m + 1
-                                ));
+                                    header.as_deref(),
+                                    z451m + 1,
+                                );
+                            }
+                            // Survival watch: record EVERY successful mapping
+                            // (cap 16 per pid — the art+oat+vdex chain per
+                            // component fits) for the munmap comparison.
+                            if b_ret >= 0 {
+                                let v = live_boot_image_maps.entry(pid).or_default();
+                                if v.len() < 16 {
+                                    v.push((b_ret as u64, b_len, b_path.clone()));
+                                }
                             }
                         }
                         if let Some((m_len, m_flags, m_addr)) = pending_big_mmap.remove(&pid) {
@@ -35354,10 +35478,24 @@ pub fn run_ptrace_loop(
                         if is_boot_image_path(&orig) || is_boot_image_path(&p) {
                             static Z451_OPEN_RESULT: std::sync::atomic::AtomicU64 =
                                 std::sync::atomic::AtomicU64::new(0);
-                            let z451n =
-                                Z451_OPEN_RESULT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if z451n < 96 {
-                                z451_boot_image_open_line(pid, &orig, &p, ret, z451n + 1);
+                            static Z451_OPEN_FAIL: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if ret < 0 {
+                                // FAILURES ALWAYS LOG (own budget) — the
+                                // rn416/417 result cap filled with successes
+                                // in the first seconds and could have hidden
+                                // a late failing open.
+                                let f = Z451_OPEN_FAIL
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if f < 64 {
+                                    z451_boot_image_open_line(pid, &orig, &p, ret, f + 1);
+                                }
+                            } else {
+                                let z451n = Z451_OPEN_RESULT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if z451n < 96 {
+                                    z451_boot_image_open_line(pid, &orig, &p, ret, z451n + 1);
+                                }
                             }
                         }
                     }
