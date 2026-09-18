@@ -16958,6 +16958,15 @@ pub fn run_ptrace_loop(
     // rn401-measured tid-keyed misses leaked the retry SIOCSIFFLAGS to
     // the HOST interface table (+518s/+580s). tracee_tgid() does the
     // /proc/<tid>/status read at both the registration and the lookup.
+    // 6-Z439e: z439_fd_inodes holds the stand-in sockets' KERNEL identity
+    // (the /proc/<tid>/fd/<n> link target, "socket:[inode]") captured at
+    // registration — the ioctl-ENTRY arm falls back to an inode match
+    // when the tgid resolution is unavailable (rn402 measured the
+    // residual 3/96 bypass class from transient /proc status read
+    // failures); z439_miss_diag_budget bounds the unpinned-member DIAG
+    // to the first 8 hits per run.
+    let mut z439_fd_inodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut z439_miss_diag_budget: u32 = 8;
     let mut pending_z439_socket: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     let mut z439_packet_fds: std::collections::HashMap<
@@ -33021,39 +33030,94 @@ pub fn run_ptrace_loop(
                     if abi.ioctl_nr != -1 && syscall_num == abi.ioctl_nr {
                         const SIOCGIFFLAGS_Z439: u64 = 0x8913;
                         const SIOCSIFFLAGS_Z439: u64 = 0x8914;
+                        // 6-Z439e: SIOCGIFHWADDR joins the pin — with the
+                        // AOSP flow (android11-gsi radio/ril/ipv6_monitor.cpp
+                        // initInterfaces) it only runs AFTER a successful
+                        // GET+SET, but pinning it closes the whole
+                        // interface-ioctl class on the stand-in fd (its
+                        // kernel-true answer for a nonexistent interface is
+                        // the same ENODEV — generic semantics, not a ROM
+                        // hack).
+                        const SIOCGIFHWADDR_Z439: u64 = 0x8927;
                         let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
                         let req = get_syscall_arg(&regs, abi.reg_arg2);
-                        // 6-Z439d: look the stand-in fd up by the CALLING
-                        // thread's TGID, not its tid — the fd table is
-                        // process-wide and the Deferred retries arrive from
-                        // the monitor's own thread, a DIFFERENT tid than the
-                        // socket creator (rn401 measured the tid-keyed
-                        // misses: the retry SIOCSIFFLAGS leaked to the HOST
-                        // at +518s/+580s).
-                        let hit = z439_packet_fds
-                            .get(&tracee_tgid(pid))
-                            .is_some_and(|fds| fds.contains(&(fd as i64)));
-                        if hit && (req == SIOCGIFFLAGS_Z439 || req == SIOCSIFFLAGS_Z439) {
-                            set_syscall_num(&mut regs, &abi, abi.getpid);
-                            if ptrace_setregs(pid, &regs, iov_len).is_ok() {
-                                // 6-Z439c: raw -ENODEV (19) — NOT -2! rn400
-                                // (run 35286126530) measured the -2 mistake:
-                                // -2 is -ENOENT ("No such file or
-                                // directory" — the svc capture has it
-                                // verbatim), and ipv6_monitor's retry-later
-                                // branch matches ONLY errno == ENODEV
-                                // ("If interface initialization fails
-                                // we'll retry later"); ENOENT fell through
-                                // to InitResult::Error → the nullptr → the
-                                // SAME SIGSEGV, with the fake visibly
-                                // firing 21×. ENODEV=19 drives the
-                                // Deferred branch: mPollTimeout=1000ms and
-                                // the monitor parks in its poll-retry loop
-                                // forever.
-                                pending_sandbox_deny.insert(pid, -(libc::ENODEV as i64));
+                        // 6-Z439e PERF ORDER (revisits 6-Z439d): the req
+                        // filter comes FIRST — tracee_tgid() is a /proc read
+                        // and MUST NOT sit on the every-ioctl path (binder
+                        // fires thousands of ioctls per boot); only the
+                        // three rare ifreq requests pay the resolution cost.
+                        if req == SIOCGIFFLAGS_Z439
+                            || req == SIOCSIFFLAGS_Z439
+                            || req == SIOCGIFHWADDR_Z439
+                        {
+                            // 6-Z439d: look the stand-in fd up by the CALLING
+                            // thread's TGID — the fd table is process-wide
+                            // and the Deferred retries arrive from the
+                            // monitor's own thread, a DIFFERENT tid than the
+                            // socket creator (rn401 measured the tid-keyed
+                            // misses: the retry SIOCSIFFLAGS leaked to the
+                            // HOST at +518s/+580s).
+                            let tgid = tracee_tgid(pid);
+                            let mut hit = z439_packet_fds
+                                .get(&tgid)
+                                .is_some_and(|fds| fds.contains(&(fd as i64)));
+                            // 6-Z439e kernel-truth identity: rn402 measured
+                            // the residual bypass (3/96 GETs) — a transient
+                            // /proc/<tid>/status read failure falls back to
+                            // the tid, the tgid-keyed lookup misses, the GET
+                            // resolves the HOST's eth0, and the follow-up SET
+                            // EPERMs ("failed to set interface flags",
+                            // InitResult::Error, the monitor thread parks —
+                            // rn402's 3 leak lines). Resolve the fd's REAL
+                            // identity instead: the stand-in socket's
+                            // /proc/<tid>/fd/<n> link ("socket:[inode]") is
+                            // globally unique and stable; a match pins the
+                            // ioctl regardless of any tgid resolution. The
+                            // 6-Z305t-14b fd-link pattern, reused for
+                            // correctness.
+                            if !hit {
+                                if let Ok(target) =
+                                    std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                                {
+                                    hit =
+                                        z439_fd_inodes.contains(target.to_string_lossy().as_ref());
+                                }
+                            }
+                            if hit {
+                                set_syscall_num(&mut regs, &abi, abi.getpid);
+                                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                    // 6-Z439c: raw -ENODEV (19) — NOT -2! rn400
+                                    // (run 35286126530) measured the -2 mistake:
+                                    // -2 is -ENOENT ("No such file or
+                                    // directory" — the svc capture has it
+                                    // verbatim), and ipv6_monitor's retry-later
+                                    // branch matches ONLY errno == ENODEV
+                                    // ("If interface initialization fails
+                                    // we'll retry later"); ENOENT fell through
+                                    // to InitResult::Error → the nullptr → the
+                                    // SAME SIGSEGV, with the fake visibly
+                                    // firing 21×. ENODEV=19 drives the
+                                    // Deferred branch: mPollTimeout=1000ms and
+                                    // the monitor parks in its poll-retry loop
+                                    // forever.
+                                    pending_sandbox_deny.insert(pid, -(libc::ENODEV as i64));
+                                    log(&format!(
+                                        "6-Z439b: ioctl(fd={}, req={:#x}) on the packet-standin fd -> raw -ENODEV (the reference-ril monitor's own Deferred branch)",
+                                        fd, req
+                                    ));
+                                }
+                            } else if z439_packet_fds.contains_key(&tgid)
+                                && z439_miss_diag_budget > 0
+                            {
+                                // 6-Z439e bounded DIAG: a member process issued
+                                // an interface ioctl we did NOT pin — the only
+                                // way a future SET-EPERM leak can still form.
+                                // First 8 per run; the rn402-class bypasses
+                                // surface here instead of in the guest log.
+                                z439_miss_diag_budget -= 1;
                                 log(&format!(
-                                    "6-Z439b: ioctl(fd={}, req={:#x}) on the packet-standin fd -> raw -ENODEV (the reference-ril monitor's own Deferred branch)",
-                                    fd, req
+                                    "6-Z439e MISS: pid={} tgid={} fd={} req={:#x} NOT pinned (no fd-set hit, no inode hit) — the residual-bypass class surfaces here",
+                                    pid, tgid, fd, req
                                 ));
                             }
                         }
@@ -40431,10 +40495,26 @@ pub fn run_ptrace_loop(
                                         .entry(tracee_tgid(pid))
                                         .or_default()
                                         .insert(ret);
+                                    // 6-Z439e: also record the stand-in fd's
+                                    // KERNEL identity — the /proc/<tid>/fd/<n>
+                                    // link ("socket:[inode]") is globally
+                                    // unique and stable for the socket's
+                                    // lifetime; the ioctl-ENTRY arm matches it
+                                    // when the tgid resolution is unavailable.
+                                    // Bounded: ≤1 registration per rild
+                                    // generation (~4/run measured on rn402).
+                                    let mut inode_note = String::from("no-fd-link");
+                                    if let Ok(target) =
+                                        std::fs::read_link(format!("/proc/{}/fd/{}", pid, ret))
+                                    {
+                                        inode_note = target.to_string_lossy().into_owned();
+                                        z439_fd_inodes.insert(inode_note.clone());
+                                    }
                                     log(&format!(
-                                        "6-Z439b: packet-standin fd {} registered under tgid {} — SIOCGIFFLAGS/SIOCSIFFLAGS on it return raw -ENODEV from ANY thread of the process (6-Z439d)",
+                                        "6-Z439b: packet-standin fd {} registered under tgid {} ({}) — SIOCGIFFLAGS/SIOCSIFFLAGS/SIOCGIFHWADDR on it return raw -ENODEV from ANY thread of the process (6-Z439d+e)",
                                         ret,
-                                        tracee_tgid(pid)
+                                        tracee_tgid(pid),
+                                        inode_note
                                     ));
                                 }
                                 const AF_NETLINK_Z99: i64 = 16;
