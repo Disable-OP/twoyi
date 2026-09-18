@@ -187,6 +187,9 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
     if channel == "GLProcessPipe" {
         return serve_gl_process_pipe_channel(guest, sid, leftover);
     }
+    if channel == "qemud:gsm" {
+        return serve_qemud_gsm_blackhole(guest, sid, leftover);
+    }
 
     if !FORWARD_CHANNELS.contains(&channel.as_str()) {
         // Unknown channel — close. (Future: route "audio", "camera", etc.)
@@ -536,6 +539,66 @@ fn serve_refcount_channel(
         bytes / 4
     );
     Ok(())
+}
+
+/// 6-Z441 (rn405 decode): the qemud `gsm` (radio) channel gets a QUIET
+/// PARK instead of the honest close. The full kill chain is now
+/// measured end to end: the proxy's close EOFs the rild's AT reader →
+/// "AT channel closed" → setRadioState(1) → "Re-opening after close" →
+/// a NEW `qemud:gsm` session every ~1005ms (rn405 sessions 119-130+
+/// logged at exactly that cadence) → each reopen re-fires the
+/// framework's telephony request storm → 3× "Attempted to retrieve
+/// value from failed HIDL call: Status(EX_TRANSACTION_FAILED)" per
+/// generation (libhidlbase onUnsafeRetrieve → the LOG_ALWAYS_FATAL
+/// path — ALL 6 intercepted aborts resolve to liblog.so+0x12b4 r-xp
+/// via the 6-Z440 maps capture) → the generation SIGABRTs at ~32s.
+/// THE FIX is the honest emulator-without-modem semantic: a real
+/// emulator with no modem keeps the channel OPEN and SILENT — the AT
+/// reader parks in read() forever (no data, no EOF), the reopen churn
+/// never starts, and the framework request storm never fires. We
+/// NEVER write anything (a fake modem answer would be exactly the
+/// forbidden fake-success class — silence IS the no-modem semantic);
+/// guest writes are read+discarded so the socket buffer cannot fill
+/// and wedge the rild's main loop. One parked thread per session;
+/// with the churn dead that is 1-2 per boot (one per rild
+/// generation), and the session ends the moment the guest closes its
+/// end (generation death) or the read errors.
+fn serve_qemud_gsm_blackhole(
+    mut guest: UnixStream,
+    sid: u64,
+    leftover: Vec<u8>,
+) -> std::io::Result<()> {
+    info!(
+        "[KR64][qemu_pipe] 6-Z441 session {} 'qemud:gsm' parked: the no-modem quiet channel (read+discard, never write, never EOF)",
+        sid
+    );
+    if !leftover.is_empty() {
+        info!(
+            "[KR64][qemu_pipe] 6-Z441 session {} discarded {} handshake-tail bytes (no qemud control reply — the modem channel carries none after open)",
+            sid,
+            leftover.len()
+        );
+    }
+    let mut sink = [0u8; 4096];
+    loop {
+        match guest.read(&mut sink) {
+            Ok(0) => {
+                info!(
+                    "[KR64][qemu_pipe] 6-Z441 session {} 'qemud:gsm' guest end closed, session ends",
+                    sid
+                );
+                return Ok(());
+            }
+            Ok(_) => { /* discarded: no modem ever answers */ }
+            Err(e) => {
+                info!(
+                    "[KR64][qemu_pipe] 6-Z441 session {} 'qemud:gsm' read error ({}), session ends",
+                    sid, e
+                );
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// Serve the goldfish `GLProcessPipe` support channel.
