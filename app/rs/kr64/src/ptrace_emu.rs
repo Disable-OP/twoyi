@@ -11643,22 +11643,47 @@ fn z457_parse(buf: &[u8]) -> Option<Z457State> {
 }
 
 /// Pure classifier of the RAW mStrong — names the count-before-delivery
-/// class the decode joins against the ledger (pure for tests).
+/// class the decode joins against the ledger. SOURCE-TRUE semantics
+/// (A11 RefBase.cpp): incStrong CONSUMES the INITIAL bias on the first
+/// strong ref (`fetch_add(1)` then `fetch_sub(INITIAL_STRONG_VALUE)`),
+/// so a live object's raw mStrong is the PLAIN count once any incStrong
+/// ran; raw == INITIAL means "virgin, never incStronged"; negative means
+/// decStrong past zero already fired. (rn424's 12 reads: raw 1→0 pairs
+/// = healthy single-ref releases; the rn423 "over-dec" labels were the
+/// offset bug reading mFlags=0, not real counts.)
 pub(crate) fn z457_classify(strong_raw: i32) -> &'static str {
-    let count = strong_raw.wrapping_sub(Z457_INITIAL_STRONG);
-    if count < 0 {
+    if strong_raw < 0 {
         // Negative count: a decStrong already fired past zero on this
         // weakref — the double-dec ALREADY happened (rn420/rn422 shape).
-        "over-dec (mStrong below INITIAL — decStrong past zero already fired)"
-    } else if count == 0 {
+        "over-dec (mStrong negative — decStrong past zero already fired)"
+    } else if strong_raw == Z457_INITIAL_STRONG {
+        // The bias is intact: NO incStrong ever landed on this weakref.
+        // A last-ref release delivered onto a virgin weakref = the
+        // acquire mirror never reached this owner (the V2 missing half).
+        "virgin (INITIAL bias intact — no incStrong ever landed)"
+    } else if strong_raw == 0 {
         // The own sp is already gone; the delivered decStrong over-decs —
         // the delete#2 precondition (the second free of the same chunk).
-        "zero (own sp already gone — the delivery's decStrong over-decs)"
+        "zero (no strong refs — the delivery's decStrong over-decs)"
+    } else if strong_raw > Z457_INITIAL_STRONG {
+        // Bias still present AND counted — transient (mid-incStrong) or
+        // corrupted; the plain count is raw − INITIAL.
+        "biased (raw above INITIAL — count = raw − INITIAL)"
     } else {
-        // Normal: the owner's own ref is present; the delivery's decStrong
-        // lands count-1 (deletion legit iff it reaches 0 with no other
-        // in-process sp resurrecting later — the ledger join decides).
-        "held (own sp present — delivery's decStrong lands count-1)"
+        // 0 < raw < INITIAL: the plain count (bias consumed at the first
+        // incStrong). raw=1 = exactly one holder — the delivery's
+        // decStrong is legit and deletes the object (kernel-true era end).
+        "held (plain count post-bias — the delivery's decStrong lands count-1)"
+    }
+}
+
+/// The live strong count for the log line, per the source-true encoding:
+/// bias-intact states count from INITIAL, the plain region counts raw.
+pub(crate) fn z457_strong_count(strong_raw: i32) -> i32 {
+    if strong_raw >= Z457_INITIAL_STRONG {
+        strong_raw.wrapping_sub(Z457_INITIAL_STRONG)
+    } else {
+        strong_raw
     }
 }
 
@@ -47926,37 +47951,52 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         assert!(z457_parse(&buf[..16]).is_none());
     }
 
-    /// 6-Z457: the count classes — count = raw − INITIAL_STRONG_VALUE.
-    /// INITIAL = zero (own sp gone → the delivery's decStrong over-decs),
-    /// INITIAL+N = held, anything below INITIAL = over-dec (a decStrong
-    /// already fired past zero on this weakref).
+    /// 6-Z457: the count classes — SOURCE-TRUE semantics (A11 RefBase:
+    /// the INITIAL bias is CONSUMED at the first incStrong, so a live
+    /// object's raw is the PLAIN count; raw==INITIAL = virgin; negative =
+    /// over-dec). rn424's live reads: raw 1→0 pairs = healthy releases.
     #[test]
     fn z457_classify_names_the_count_classes() {
+        // Plain-count region (bias consumed): raw 1 = one holder — the
+        // healthy rn424 pre-delivery state.
         assert_eq!(
-            z457_classify(Z457_INITIAL_STRONG),
-            "zero (own sp already gone — the delivery's decStrong over-decs)"
+            z457_classify(1),
+            "held (plain count post-bias — the delivery's decStrong lands count-1)"
         );
         assert_eq!(
-            z457_classify(Z457_INITIAL_STRONG + 1),
-            "held (own sp present — delivery's decStrong lands count-1)"
+            z457_classify(12),
+            "held (plain count post-bias — the delivery's decStrong lands count-1)"
         );
-        assert_eq!(
-            z457_classify(Z457_INITIAL_STRONG + 12),
-            "held (own sp present — delivery's decStrong lands count-1)"
-        );
-        // Below INITIAL: raw 0, raw 5, raw INITIAL-1 — all over-dec.
+        // Zero: no strong refs — the delivery's decStrong over-decs.
         assert_eq!(
             z457_classify(0),
-            "over-dec (mStrong below INITIAL — decStrong past zero already fired)"
+            "zero (no strong refs — the delivery's decStrong over-decs)"
+        );
+        // Virgin: the bias intact — no incStrong ever landed.
+        assert_eq!(
+            z457_classify(Z457_INITIAL_STRONG),
+            "virgin (INITIAL bias intact — no incStrong ever landed)"
+        );
+        // Biased-and-counted: transient/corrupted.
+        assert_eq!(
+            z457_classify(Z457_INITIAL_STRONG + 3),
+            "biased (raw above INITIAL — count = raw − INITIAL)"
+        );
+        // Negative: over-dec already fired.
+        assert_eq!(
+            z457_classify(-3),
+            "over-dec (mStrong negative — decStrong past zero already fired)"
         );
         assert_eq!(
-            z457_classify(5),
-            "over-dec (mStrong below INITIAL — decStrong past zero already fired)"
+            z457_classify(-1),
+            "over-dec (mStrong negative — decStrong past zero already fired)"
         );
-        assert_eq!(
-            z457_classify(Z457_INITIAL_STRONG - 1),
-            "over-dec (mStrong below INITIAL — decStrong past zero already fired)"
-        );
+        // The count decoder mirrors the classifier's regions.
+        assert_eq!(z457_strong_count(1), 1);
+        assert_eq!(z457_strong_count(0), 0);
+        assert_eq!(z457_strong_count(-3), -3);
+        assert_eq!(z457_strong_count(Z457_INITIAL_STRONG), 0);
+        assert_eq!(z457_strong_count(Z457_INITIAL_STRONG + 3), 3);
     }
 
     /// 6-Z455b v2: the harvest gate — system_server victims bypass the

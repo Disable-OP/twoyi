@@ -5362,7 +5362,7 @@ fn handle_write_read(
                                         "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} br=0x{:08x} W=0x{:x} mStrong={} (count={}) mWeak={} mBase=0x{:x} (delta=0x{:x} vs cookie 0x{:x}) mFlags={} ledger[emit acq={} rel={} / del acq={} rel={}] node-grants[strong={} weak={}] class={}",
                                         vm_id, dpid, br, ptr,
                                         st.strong_raw,
-                                        st.strong_raw.wrapping_sub(crate::ptrace_emu::Z457_INITIAL_STRONG),
+                                        crate::ptrace_emu::z457_strong_count(st.strong_raw),
                                         st.weak, st.mbase,
                                         st.mbase.wrapping_sub(cookie), cookie,
                                         st.flags, ae, re, ad, rd,
