@@ -2597,6 +2597,16 @@ impl BusState {
                             ptr: old_ptr,
                             cookie: old_cookie,
                         });
+                        // 6-Z454: the overwrite's registry release is
+                        // queued — the ledger checks it against the OLD
+                        // object's emitted acquires (V1). THE KILLER
+                        // CANDIDATE: the add-side acquire mirror is
+                        // liveness-gated at REGISTRATION time, this
+                        // release is gated at OVERWRITE time — two probe
+                        // moments, two verdicts; a release here with the
+                        // acquire skipped earlier is the rn420
+                        // decStrong-on-zero shape.
+                        z454_emit(old_pid, old_ptr, old_cookie, Z454Site::RegRel);
                     }
                 }
             }
@@ -3140,6 +3150,11 @@ impl BusState {
                 if !n.strong_notified {
                     n.strong_notified = true;
                     mirrors.push((BR_ACQUIRE, n.ptr, n.cookie));
+                    // 6-Z454: the era's acquire is on the wire — the ledger
+                    // counts it so this node's future BR_RELEASE mirrors
+                    // (z359_unref_node) balance against a real acquire.
+                    let owner_pid = self.conns.get(&sender).map(|c| c.sender_pid).unwrap_or(0);
+                    z454_emit(owner_pid, n.ptr, n.cookie, Z454Site::NodeAcq);
                 }
             } else {
                 *n.weak.entry(recipient).or_insert(0) += 1;
@@ -3369,6 +3384,15 @@ impl BusState {
         if let Some(box_) = self.conns.get_mut(&owner) {
             box_.reply_queue
                 .push_back(DeferredReply::RefCmd359 { br, ptr, cookie });
+            // 6-Z454: the era's release is queued (the owner conn exists)
+            // — the ledger checks it against this node's emitted acquires
+            // (V1: a release past the acquire count is the
+            // decStrong-on-zero precursor; naming the unref site + owner
+            // here is the Task 190 audit's deliverable).
+            if strong {
+                let owner_pid = self.conns.get(&owner).map(|c| c.sender_pid).unwrap_or(0);
+                z454_emit(owner_pid, ptr, cookie, Z454Site::NodeRel);
+            }
             if Self::z359_release_log().load(Ordering::Relaxed) > 0 {
                 Self::z359_release_log().fetch_sub(1, Ordering::Relaxed);
                 info!(
@@ -4648,7 +4672,14 @@ fn handle_write_read(
                         // owner's waitForResponse incs the local object
                         // while the marshal temporary is still alive —
                         // rn406's composer createClient corpse class).
+                        // 6-Z454: same-ioctl delivery is unconditional — the
+                        // ledger counts the delivered acquires (V2 baseline).
+                        let z454_dpid = {
+                            let b = bus.lock().expect("binder bus poisoned");
+                            b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                        };
                         for (br, ptr, cookie) in &refs {
+                            z454_deliver(z454_dpid, *ptr, *cookie, *br);
                             read_buf.extend_from_slice(&br.to_ne_bytes());
                             read_buf.extend_from_slice(&ptr.to_ne_bytes());
                             read_buf.extend_from_slice(&cookie.to_ne_bytes());
@@ -4703,6 +4734,12 @@ fn handle_write_read(
                         // onRegistration is neutralized by the loader's
                         // liveness gate (the rn273 wall).
                         if let Some((br, ptr, cookie)) = mirror {
+                            // 6-Z454: same-ioctl unconditional delivery.
+                            let z454_dpid = {
+                                let b = bus.lock().expect("binder bus poisoned");
+                                b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                            };
+                            z454_deliver(z454_dpid, ptr, cookie, br);
                             read_buf.extend_from_slice(&br.to_ne_bytes());
                             read_buf.extend_from_slice(&ptr.to_ne_bytes());
                             read_buf.extend_from_slice(&cookie.to_ne_bytes());
@@ -4733,6 +4770,12 @@ fn handle_write_read(
                         // waitForResponse runs BR_ACQUIRE's incStrong
                         // while the registering thread is still inside
                         // transact (no free-then-acquire race).
+                        // 6-Z454: same-ioctl unconditional delivery.
+                        let z454_dpid = {
+                            let b = bus.lock().expect("binder bus poisoned");
+                            b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
+                        };
+                        z454_deliver(z454_dpid, ptr, cookie, br);
                         read_buf.extend_from_slice(&br.to_ne_bytes());
                         read_buf.extend_from_slice(&ptr.to_ne_bytes());
                         read_buf.extend_from_slice(&cookie.to_ne_bytes());
@@ -4866,8 +4909,15 @@ fn handle_write_read(
                                 // waitForResponse incs the local object
                                 // while the createClient marshal temporary
                                 // is still alive — rn406's corpse class).
+                                // 6-Z454: same-ioctl unconditional delivery —
+                                // the pid rides the ALREADY-HELD bus guard
+                                // (no re-lock: this scope owns `b`).
+                                let z454_rpid =
+                                    b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
                                 for g in &z442_grants {
                                     for (br, ptr, cookie) in &g.mirrors {
+                                        // 6-Z454: same-ioctl unconditional delivery.
+                                        z454_deliver(z454_rpid, *ptr, *cookie, *br);
                                         read_buf.extend_from_slice(&br.to_ne_bytes());
                                         read_buf.extend_from_slice(&ptr.to_ne_bytes());
                                         read_buf.extend_from_slice(&cookie.to_ne_bytes());
@@ -5175,6 +5225,10 @@ fn handle_write_read(
                         b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0)
                     };
                     if mirror_ref_ok(dpid2, ptr, cookie) {
+                        // 6-Z454: the gate PASSED this time — the ledger
+                        // counts the delivery (V2: a later release passing
+                        // a DIFFERENT moment's gate is the killer shape).
+                        z454_deliver(dpid2, ptr, cookie, br);
                         read_buf.extend_from_slice(&br.to_ne_bytes());
                         read_buf.extend_from_slice(&ptr.to_ne_bytes());
                         read_buf.extend_from_slice(&cookie.to_ne_bytes());
@@ -5211,6 +5265,9 @@ fn handle_write_read(
                     };
                     let owner_alive = dpid > 0 && crate::ptrace_emu::traced_child_alive(dpid);
                     if owner_alive {
+                        // 6-Z454: the owner-liveness gate PASSED — the ledger
+                        // counts the delivery (V2 baseline for this object).
+                        z454_deliver(dpid, ptr, cookie, br);
                         read_buf.extend_from_slice(&br.to_ne_bytes());
                         read_buf.extend_from_slice(&ptr.to_ne_bytes());
                         read_buf.extend_from_slice(&cookie.to_ne_bytes());
@@ -6914,6 +6971,12 @@ fn servicemanager_proxy(
                     } else {
                         mirror = Some((BR_ACQUIRE, ptr, cookie));
                     }
+                    // 6-Z454: the registry's strong ref is mirrored — the
+                    // ledger counts it so a later overwrite release (a
+                    // DIFFERENT probe moment) balances against a real
+                    // acquire. A skip here (probe Unknown/Dead) followed by
+                    // a delivered release is the V1/V2 killer shape.
+                    z454_emit(gpid, ptr, cookie, Z454Site::RegAcq);
                 }
             }
             // Reply body: void (header only) per 6-Z114 §3.3.
@@ -6967,6 +7030,11 @@ fn servicemanager_proxy(
                     // onRegistration can never execute (the rn273 wall).
                     if added {
                         mirror = Some((BR_ACQUIRE, f.binder, f.cookie));
+                        // 6-Z454: the watcher pin's acquire is mirrored —
+                        // counted so the unregister release (and any future
+                        // watcher-cleanup release) balances against it.
+                        let wpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                        z454_emit(wpid, f.binder, f.cookie, Z454Site::WatchAcq);
                     }
                     match b.services.get(&name).map(|e| e.handle) {
                         Some(h) => {
@@ -7015,6 +7083,11 @@ fn servicemanager_proxy(
                 // path keeps its own local sp<> alive for the call).
                 if b.remove_watcher(&name, conn_id, f.binder) {
                     mirror = Some((BR_RELEASE, f.binder, f.cookie));
+                    // 6-Z454: the watcher release is queued — checked
+                    // against the pin's emitted acquire (V1; the pin's
+                    // acquire is liveness-gated at a DIFFERENT moment).
+                    let wpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                    z454_emit(wpid, f.binder, f.cookie, Z454Site::WatchRel);
                 }
                 info!(
                     "[KR64][binder][svc] 6-Z276: unregisterForNotifications({}) conn={} — dropped",
@@ -7742,6 +7815,8 @@ fn servicemanager_hidl(
                     } else {
                         mirror = Some((BR_ACQUIRE, ptr, cookie));
                     }
+                    // 6-Z454: registry acquire emitted — see the AIDL add arm.
+                    z454_emit(gpid, ptr, cookie, Z454Site::RegAcq);
                 }
                 h
             };
@@ -7797,6 +7872,10 @@ fn servicemanager_hidl(
                 // reused at delivery time — mStrong=49/mBase=0xf).
                 if added {
                     mirror = Some((BR_ACQUIRE, f.binder, f.cookie));
+                    // 6-Z454: the watcher pin's acquire is mirrored —
+                    // see the AIDL twin.
+                    let wpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                    z454_emit(wpid, f.binder, f.cookie, Z454Site::WatchAcq);
                 }
                 match b.services.get(&key).map(|e| e.handle) {
                     Some(h) => {
@@ -7867,6 +7946,9 @@ fn servicemanager_hidl(
                 // BR_RELEASE to the owner).
                 if b.remove_watcher(&key, conn_id, f.binder) {
                     mirror = Some((BR_RELEASE, f.binder, f.cookie));
+                    // 6-Z454: the watcher release is queued — see the AIDL twin.
+                    let wpid = b.conns.get(&conn_id).map(|c| c.sender_pid).unwrap_or(0);
+                    z454_emit(wpid, f.binder, f.cookie, Z454Site::WatchRel);
                 }
                 info!(
                     "[KR64][binder][svc] 6-Z276: HIDL unregisterForNotifications({}) conn={} — dropped",
@@ -7973,6 +8055,8 @@ fn servicemanager_hidl(
                     } else {
                         mirror = Some((BR_ACQUIRE, ptr, cookie));
                     }
+                    // 6-Z454: registry acquire emitted — see the AIDL add arm.
+                    z454_emit(gpid, ptr, cookie, Z454Site::RegAcq);
                 }
                 h
             };
@@ -9579,6 +9663,185 @@ fn mirror_ref_check(guest_pid: i32, ptr: u64, cookie: u64) -> Liveness {
 /// false exactly as every unreadable case did before the tri-state.
 fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
     matches!(mirror_ref_check(guest_pid, ptr, cookie), Liveness::Alive)
+}
+
+// ============================================================================
+// 6-Z454: the REF-LEDGER — per-object strong-ref accounting for every
+// node-ref mirror the bus EMITS (queues) or DELIVERS (hands to the
+// guest's read stream). The rn420 decode named the suspend@1.0-service
+// abort CLASS: a libhidlbase sp<> release ran RefBase::decStrong's
+// delete-this tail on an ALREADY-FREED chunk — the owner's strong count
+// went past zero. On a real kernel that is impossible: every BR_RELEASE
+// a process receives is preceded by a BR_ACQUIRE for the same node in
+// the same notification era (binder_dec_node fires the owner
+// notification only on the has_strong_ref true→false edge). The bus's
+// mirrors, however, are gated by the 6-Z306ae-f liveness probe AT
+// DIFFERENT MOMENTS: an acquire skipped at add time (probe Unknown or
+// Dead) paired with a release delivered later (probe Alive) is a
+// decStrong-on-zero — the exact rn419/rn420 fingerprint. The ledger
+// counts both sides per (owner pid, ptr, cookie) and flags the two
+// violations the moment they are created:
+//   V1 EMIT    — a BR_RELEASE queued while rel_emitted would exceed
+//                acq_emitted: the bus itself is about to over-release.
+//   V2 DELIVER — a BR_RELEASE handed to the guest while rel_delivered
+//                would exceed acq_delivered: the acquire never reached
+//                this owner (liveness-gated away) but the release did.
+// Both name the surface that emitted (reg-acq / reg-rel / watch-* /
+// node-*), so the rn421 decode reads the killer off the artifact
+// instead of a hypothesis.
+// Pure accounting: the ledger NEVER blocks a mirror (no behavior
+// change) — rn420's evidence stays the ground truth; this names the
+// emitter. Weak mirrors (BR_INCREFS / BR_DECREFS) do not destroy
+// objects and do not participate.
+// ============================================================================
+
+/// One object's strong-ref ledger entry.
+#[derive(Default, Clone, Copy, Debug)]
+struct Z454Entry {
+    acq_emitted: u32,
+    rel_emitted: u32,
+    acq_delivered: u32,
+    rel_delivered: u32,
+}
+
+/// Which mirror surface emitted — names the killer in the decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Z454Site {
+    /// The registry's strong ref on a registered service (6-Z306ae add
+    /// arms: AIDL add / HIDL add / addWithChain, incl. the 6-Z306am arm-B
+    /// liveness-RefCmd re-route).
+    RegAcq,
+    /// The registry's strong ref on a registered watcher callback
+    /// (6-Z325 registerForNotifications pin).
+    WatchAcq,
+    /// The registry ref released by a same-name overwrite (6-Z306ae /
+    /// 6-Z379, gated on `overwrite_release_due`).
+    RegRel,
+    /// The registry ref released by an explicit unregisterForNotifications
+    /// (6-Z276/6-Z325).
+    WatchRel,
+    /// The in-driver node ref granted by a flat crossing (6-Z442
+    /// `z359_grant_node`'s BR_ACQUIRE mirror).
+    NodeAcq,
+    /// The node's last external strong ref dropped (6-Z359/6-Z442
+    /// `z359_unref_node`'s BR_RELEASE mirror).
+    NodeRel,
+}
+
+impl Z454Site {
+    fn name(self) -> &'static str {
+        match self {
+            Z454Site::RegAcq => "reg-acq",
+            Z454Site::WatchAcq => "watch-acq",
+            Z454Site::RegRel => "reg-rel",
+            Z454Site::WatchRel => "watch-rel",
+            Z454Site::NodeAcq => "node-acq",
+            Z454Site::NodeRel => "node-rel",
+        }
+    }
+    fn is_release(self) -> bool {
+        matches!(
+            self,
+            Z454Site::RegRel | Z454Site::WatchRel | Z454Site::NodeRel
+        )
+    }
+}
+
+/// (owner pid, ptr, cookie) → ledger entry.
+type Z454Map = std::collections::HashMap<(i32, u64, u64), Z454Entry>;
+
+/// (owner pid, ptr, cookie) → ledger. Bounded: the boot registers O(100)
+/// objects; the cap evicts single arbitrary entries (that entry's
+/// accounting resets — bounded decode noise, never a false violation:
+/// eviction lowers both sides' baseline, and a post-eviction release on
+/// an evicted key re-baselines from zero, which is exactly the V1
+/// suspect shape and will be LOGGED as such).
+fn z454_ledger() -> &'static std::sync::Mutex<Z454Map> {
+    static LEDGER: std::sync::OnceLock<std::sync::Mutex<Z454Map>> = std::sync::OnceLock::new();
+    LEDGER.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Bounded violation-log budget per boot (the ledger must not flood the
+/// artifact — 24 lines name the class and its first 24 emitters).
+fn z454_viol_log() -> &'static AtomicU32 {
+    static N: std::sync::OnceLock<AtomicU32> = std::sync::OnceLock::new();
+    N.get_or_init(|| AtomicU32::new(24))
+}
+
+const Z454_LEDGER_CAP: usize = 1024;
+
+/// Evict one arbitrary stale entry when the ledger is over cap and the
+/// incoming key is new. Pure so tests can drive it on a held-lock map.
+fn z454_evict_if_over(led: &mut Z454Map, key: &(i32, u64, u64)) {
+    if led.len() >= Z454_LEDGER_CAP && !led.contains_key(key) {
+        if let Some(stale) = led.keys().next().copied() {
+            led.remove(&stale);
+        }
+    }
+}
+
+/// Record one mirror EMIT (the bus queued it). Returns true when the
+/// emit created a V1 violation (a release past the emitted acquire
+/// count for this object).
+fn z454_emit(pid: i32, ptr: u64, cookie: u64, site: Z454Site) -> bool {
+    if pid <= 0 || ptr == 0 || cookie == 0 {
+        return false;
+    }
+    let mut led = z454_ledger().lock().expect("6-Z454 ledger poisoned");
+    z454_evict_if_over(&mut led, &(pid, ptr, cookie));
+    let e = led.entry((pid, ptr, cookie)).or_default();
+    if site.is_release() {
+        e.rel_emitted += 1;
+        if e.rel_emitted > e.acq_emitted {
+            if z454_viol_log().load(Ordering::Relaxed) > 0 {
+                z454_viol_log().fetch_sub(1, Ordering::Relaxed);
+                info!(
+                    "[KR64][binder] 6-Z454 V1 EMIT release-without-acquire site={} pid={} ptr=0x{:x} cookie=0x{:x} emitted acq={} rel={} — a queued BR_RELEASE will decStrong the owner past zero (the rn420 double-free class)",
+                    site.name(),
+                    pid,
+                    ptr,
+                    cookie,
+                    e.acq_emitted,
+                    e.rel_emitted
+                );
+            }
+            return true;
+        }
+    } else {
+        e.acq_emitted += 1;
+    }
+    false
+}
+
+/// Record one mirror DELIVER (handed to the guest's read stream; `br` is
+/// the wire command). Returns true when the delivery created a V2
+/// violation (a release delivered past the delivered acquire count —
+/// the acquire never reached this owner).
+fn z454_deliver(pid: i32, ptr: u64, cookie: u64, br: u32) -> bool {
+    if pid <= 0 || ptr == 0 || cookie == 0 {
+        return false;
+    }
+    if br != BR_ACQUIRE && br != BR_RELEASE {
+        return false; // weak mirrors (BR_INCREFS / BR_DECREFS) don't participate
+    }
+    let mut led = z454_ledger().lock().expect("6-Z454 ledger poisoned");
+    let e = led.entry((pid, ptr, cookie)).or_default();
+    if br == BR_RELEASE {
+        e.rel_delivered += 1;
+        if e.rel_delivered > e.acq_delivered {
+            if z454_viol_log().load(Ordering::Relaxed) > 0 {
+                z454_viol_log().fetch_sub(1, Ordering::Relaxed);
+                info!(
+                    "[KR64][binder] 6-Z454 V2 DELIVER release-without-acquire pid={} ptr=0x{:x} cookie=0x{:x} delivered acq={} rel={} — the owner just decStrongs past zero (rn420: libutils decStrong delete-this on the freed chunk)",
+                    pid, ptr, cookie, e.acq_delivered, e.rel_delivered
+                );
+            }
+            return true;
+        }
+    } else {
+        e.acq_delivered += 1;
+    }
+    false
 }
 
 /// 6-Z354: the TRANSACTION-delivery decision, pure for tests. Reject the
@@ -11840,6 +12103,124 @@ mod tests {
             grants2[0].mirrors,
             vec![(BR_INCREFS, ptr, cookie), (BR_ACQUIRE, ptr, cookie)]
         );
+    }
+
+    // -------- 6-Z454: the REF-LEDGER ------------------------------------
+    //
+    // Parallel tests share the static ledger — every test mints its own
+    // (pid, ptr, cookie) key so assertions never collide.
+
+    /// A per-test unique pid (the static starts well above the guest pids
+    /// the other tests use, and this process's own pids are irrelevant to
+    /// the ledger's keys).
+    fn z454_unique_pid() -> i32 {
+        static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(45001);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn z454_balanced_emit_never_flags() {
+        let pid = z454_unique_pid();
+        let (ptr, cookie) = (0x7000_1000u64, 0x5000_2000u64);
+        assert!(!z454_emit(pid, ptr, cookie, Z454Site::RegAcq));
+        assert!(!z454_emit(pid, ptr, cookie, Z454Site::NodeAcq));
+        assert!(!z454_emit(pid, ptr, cookie, Z454Site::RegRel));
+        assert!(!z454_emit(pid, ptr, cookie, Z454Site::NodeRel));
+    }
+
+    #[test]
+    fn z454_v1_release_without_acquire_flags_the_emit() {
+        let pid = z454_unique_pid();
+        let (ptr, cookie) = (0x7000_3000u64, 0x5000_4000u64);
+        // THE KILLER SHAPE: the add-side acquire was liveness-gated away
+        // (never emitted), the overwrite release passes its own moment's
+        // gate — V1 names the emitter the moment it queues.
+        assert!(z454_emit(pid, ptr, cookie, Z454Site::RegRel));
+    }
+
+    #[test]
+    fn z454_v2_delivered_release_without_delivered_acquire_flags() {
+        let pid = z454_unique_pid();
+        let (ptr, cookie) = (0x7000_5000u64, 0x5000_6000u64);
+        // Emit-side balanced (the acquire was queued) but the DELIVERY
+        // arm skipped the acquire (its moment's probe failed) while the
+        // release passed its own: the owner decStrongs past zero NOW.
+        assert!(!z454_emit(pid, ptr, cookie, Z454Site::RegAcq));
+        assert!(z454_deliver(pid, ptr, cookie, BR_RELEASE));
+    }
+
+    #[test]
+    fn z454_delivered_acquire_balances_release_delivery() {
+        let pid = z454_unique_pid();
+        let (ptr, cookie) = (0x7000_7000u64, 0x5000_8000u64);
+        assert!(!z454_emit(pid, ptr, cookie, Z454Site::RegAcq));
+        assert!(!z454_deliver(pid, ptr, cookie, BR_ACQUIRE));
+        assert!(!z454_deliver(pid, ptr, cookie, BR_RELEASE));
+        // Weak mirrors never participate (they cannot destroy objects):
+        assert!(!z454_deliver(pid, ptr, cookie, BR_INCREFS));
+        assert!(!z454_deliver(pid, ptr, cookie, BR_DECREFS));
+    }
+
+    #[test]
+    fn z454_skips_unkeyed_and_unowned_entries() {
+        // pid 0 (conn gone / lookup failed), ptr 0, cookie 0: no ledger
+        // entry, no violation, no panic.
+        assert!(!z454_emit(0, 0x1000, 0x2000, Z454Site::RegRel));
+        assert!(!z454_emit(1234, 0, 0x2000, Z454Site::RegAcq));
+        assert!(!z454_emit(1234, 0x1000, 0, Z454Site::RegAcq));
+        assert!(!z454_deliver(0, 0x1000, 0x2000, BR_RELEASE));
+        assert!(!z454_deliver(1234, 0, 0x2000, BR_RELEASE));
+    }
+
+    #[test]
+    fn z454_evict_if_over_enforces_the_cap_and_keeps_live_keys() {
+        let mut led = Z454Map::new();
+        let base_pid = 70000 + (std::process::id() as i32 % 1000);
+        for i in 0..Z454_LEDGER_CAP as i32 {
+            let key = (base_pid, 0x7A00_0000u64 + i as u64 * 0x1000, 0x5B00u64);
+            led.insert(key, Z454Entry::default());
+        }
+        assert_eq!(led.len(), Z454_LEDGER_CAP);
+        // A live key at cap: no eviction, entry stays.
+        let live = (base_pid, 0x7A00_0000u64, 0x5B00u64);
+        z454_evict_if_over(&mut led, &live);
+        assert_eq!(led.len(), Z454_LEDGER_CAP);
+        assert!(led.contains_key(&live));
+        // A NEW key at cap: exactly one eviction (the caller then
+        // inserts — the z454_emit flow), cap headroom restored.
+        let fresh = (base_pid, 0x7C00_0000u64, 0x5B00u64);
+        z454_evict_if_over(&mut led, &fresh);
+        assert_eq!(led.len(), Z454_LEDGER_CAP - 1);
+        led.insert(fresh, Z454Entry::default());
+        assert_eq!(led.len(), Z454_LEDGER_CAP);
+        assert!(led.contains_key(&fresh));
+    }
+
+    #[test]
+    fn z454_node_grant_and_unref_emits_balance_through_the_bus() {
+        // The full bus path: a strong flat crossing emits NodeAcq (the
+        // era's BR_ACQUIRE mirror), the BC_RELEASE drop emits NodeRel —
+        // balanced, no violation. Directly exercises the Task 190 audit
+        // surface (per-(pid,handle) grant/unref accounting).
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let recipient = bus.register_conn();
+        if let Some(bx) = bus.conns.get_mut(&owner) {
+            bx.sender_pid = z454_unique_pid();
+        }
+        let ptr = 0x7700_1000u64;
+        let cookie = 0x5500_2000u64;
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        let grants = bus.z359_translate_flats(0, owner, recipient, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants[0].mirrors.len(), 2, "strong flat: INCREFS+ACQUIRE");
+        // Era drop via the recipient's BC_RELEASE: the LAST strong drop
+        // mirrors BR_RELEASE — the ledger sees rel==acq, no violation.
+        bus.z359_unref_node(0, grants[0].handle, recipient, true);
     }
 
     #[test]
