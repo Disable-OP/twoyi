@@ -7797,21 +7797,65 @@ fn maps_bracket_in(content: &str, addr: u64) -> String {
 /// classes: chunk state = freed (2) → the chunk was ALREADY freed (the
 /// aborting free is a DOUBLE-FREE); checksum/magic garbage → a buffer
 /// overflow or a stray write clobbered the header.
-fn z306af_scudo_chunk_header(pid: libc::pid_t, msg: &str) -> Option<String> {
+// ── 6-Z453: the SCUDO CORRUPTION ground truth (rn419 decode) ────────────
+//
+// rn419's boot-kill chain names the frontier: THREE guest HW services
+// (android.system.suspend@1.0-service pid 2873 @+34.0 s, plus 3629
+// @+51.8 s and 3750) aborted with `Scudo ERROR: invalid chunk state when
+// deallocating` — a repeating heap-corruption class whose chunk-header
+// bytes are THE discriminator (freed-state header → double-free; garbage
+// checksum/magic → overflow/stray-write; intact-allocated header → the
+// abort raced a concurrent free). The existing 6-Z306ah probe read the
+// chunk with `peek_guest_bytes` (process_vm_readv ONLY) and failed
+// UNREADABLE on every single attempt in rn419 (3/3) while the abort-
+// message reader (`read_child_bytes`: process_vm_readv → PEEKDATA
+// fallback) succeeded at the very same stops — so the read path itself
+// was the defect. This wave:
+//   * fixes the message→address parse (the '0x' prefix: a naive hex
+//     scan collects "0" and stops at 'x' → address 0 → the addr<32
+//     guard → UNREADABLE forever; that parse bug, not a memory-read
+//     failure, is what 3/3 rn419 attempts actually hit),
+//   * hardens the chunk read to `read_child_bytes` (pvm + PEEKDATA
+//     fallback — the fallback the abort-message reader proves works at
+//     these stops),
+//   * extends the Scudo arm with the aborting tid's pc/sp/lr + a 6-Z364
+//     frame walk (budgeted) — the free() CALLER is on the stack at the
+//     tgkill entry and names the corrupting site's user.
+/// Parse the freed address out of a bionic Scudo abort message
+/// ("... deallocating address 0x<HEX>" — the message may trail with
+/// any non-hex byte, typically '\n'). Returns None for garbage.
+///
+/// 6-Z453: the '0x' prefix MUST be skipped before the hex scan — 'x' is
+/// not a hex digit, so a naive take_while collects "0" and stops: the
+/// parsed address degenerates to 0, the `addr < 32` guard rejects it,
+/// and the probe reports UNREADABLE forever. That parse bug — not a
+/// memory-read failure — is why every 6-Z306ah attempt in rn419 came
+/// back UNREADABLE.
+fn z453_scudo_abort_addr(msg: &str) -> Option<u64> {
     const NEEDLE: &str = "deallocating address ";
     let pos = msg.find(NEEDLE)?;
-    let hex: String = msg[pos + NEEDLE.len()..]
-        .chars()
-        .take_while(|c| c.is_ascii_hexdigit())
-        .collect();
+    let rest = &msg[pos + NEEDLE.len()..];
+    let rest = rest
+        .strip_prefix("0x")
+        .or_else(|| rest.strip_prefix("0X"))
+        .unwrap_or(rest);
+    let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
     if hex.is_empty() {
         return None;
     }
-    let addr = u64::from_str_radix(&hex, 16).ok()?;
+    u64::from_str_radix(&hex, 16).ok()
+}
+
+fn z306af_scudo_chunk_header(pid: libc::pid_t, msg: &str) -> Option<String> {
+    let addr = z453_scudo_abort_addr(msg)?;
     if addr < 32 {
         return None;
     }
-    let bytes = peek_guest_bytes(pid, addr - 16, 32)?;
+    // 6-Z453: `read_child_bytes` — process_vm_readv first, PEEKDATA
+    // fallback. Strictly more robust than the previous pvm-only read:
+    // the abort-message reader (this same read_child_bytes) is proven
+    // to read guest memory at these exact stops.
+    let bytes = read_child_bytes(pid, addr - 16, 32)?;
     Some(
         bytes
             .iter()
@@ -45188,9 +45232,26 @@ pub fn run_ptrace_loop(
                                 // allocated header → the abort raced a
                                 // concurrent free. Bounded to 4 reads per
                                 // boot.
+                                //
+                                // 6-Z453 (rn419 decode): the rn419 run had
+                                // THREE Scudo aborts (suspend@1.0-service
+                                // 2873 @+34.0 s, 3629 @+51.8 s, 3750) and
+                                // the chunk header came back UNREADABLE on
+                                // every one — ROOT CAUSE: the address parse
+                                // never skipped the '0x' prefix, so the
+                                // parsed address was 0 and the addr<32
+                                // guard rejected every call (the parse
+                                // fix + its test tell the full story). The
+                                // budget is 12, and the aborting tid's
+                                // pc/sp/lr + a bounded 6-Z364 frame walk
+                                // ride along — the free() CALLER is on the
+                                // stack at the tgkill entry and names the
+                                // corrupting site's user (the rn419
+                                // suspects: the injected LD_PRELOAD shims
+                                // or the binder ioctls).
                                 if msg.contains("Scudo ERROR") {
                                     static Z306AH_BUDGET: std::sync::atomic::AtomicU32 =
-                                        std::sync::atomic::AtomicU32::new(4);
+                                        std::sync::atomic::AtomicU32::new(12);
                                     if Z306AH_BUDGET.load(std::sync::atomic::Ordering::Relaxed) > 0
                                     {
                                         Z306AH_BUDGET
@@ -45203,6 +45264,47 @@ pub fn run_ptrace_loop(
                                             None => log(
                                                 "6-Z306ah: scudo chunk header UNREADABLE at the tgkill entry",
                                             ),
+                                        }
+                                        // 6-Z453: the aborting tid's register
+                                        // head + the free()-caller frame walk.
+                                        // Read-only, self-contained (fresh
+                                        // GETREGS — the ENTRY arm's regs are
+                                        // the tgkill syscall args, and the
+                                        // walker needs sp/lr/fp).
+                                        #[cfg(target_arch = "aarch64")]
+                                        {
+                                            static Z453_WALK_BUDGET: std::sync::atomic::AtomicU32 =
+                                                std::sync::atomic::AtomicU32::new(6);
+                                            let mut sregs: Regs = unsafe { std::mem::zeroed() };
+                                            if ptrace_getregs(pid, &mut sregs).is_ok()
+                                                && Z453_WALK_BUDGET
+                                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                                    > 0
+                                            {
+                                                Z453_WALK_BUDGET.fetch_sub(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                // aarch64 user_pt_regs: x0..x30
+                                                // at indices 0..30, sp @31, pc
+                                                // @32 (the layout the SIGSEGV
+                                                // arm already relies on).
+                                                let rp = &sregs as *const Regs as *const u64;
+                                                let pc = unsafe { *rp.add(32) };
+                                                let sp = unsafe { *rp.add(31) };
+                                                let lr = unsafe { *rp.add(30) };
+                                                let fp = unsafe { *rp.add(29) };
+                                                log(&format!(
+                                                    "6-Z453 SCUDO-ABORT: pid={} pc={:#x} sp={:#x} lr={:#x} ({:#x} budget left)",
+                                                    pid,
+                                                    pc,
+                                                    sp,
+                                                    lr,
+                                                    Z453_WALK_BUDGET
+                                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                                ));
+                                                bt_walk_6z364(pid, sp, lr, fp, 0);
+                                            }
                                         }
                                     }
                                 }
@@ -47123,6 +47225,33 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         );
         assert!(z306af_resolve_pc(&rows, 0xaaaa2000).is_none());
         assert!(z306af_resolve_pc(&rows, 0xaaaa0fff).is_none());
+    }
+
+    /// 6-Z453: the Scudo abort-message address parse — the exact rn419
+    /// message shapes (raw\x00-prefixed VMA body, trailing '\n') must
+    /// resolve; garbage must not.
+    #[test]
+    fn z453_scudo_abort_addr_parses_rn419_shapes() {
+        // The verbatim rn419 suspend-service message (raw bytes before
+        // the text, '\n' after the address).
+        let msg = "\u{f0}\u{88}\u{c3}j\u{88}@\u{8e}\u{b1}\u{b5}\u{e0}\u{1d}Zu\u{ba}\u{df}\u{c6}c\0\0\0\0\0\0\0Scudo ERROR: invalid chunk state when deallocating address 0xec9f1cc0f9d0\n\0\0\0\0\0\0\0\0\0";
+        assert_eq!(z453_scudo_abort_addr(msg), Some(0xec9f1cc0f9d0));
+        // Plain shapes.
+        assert_eq!(
+            z453_scudo_abort_addr(
+                "Scudo ERROR: invalid chunk state when deallocating address 0xf0327c807610"
+            ),
+            Some(0xf0327c807610)
+        );
+        assert_eq!(
+            z453_scudo_abort_addr("... deallocating address 0x10 junk-after"),
+            Some(0x10)
+        );
+        // Garbage: no needle, no hex, non-hex immediately after, overflow.
+        assert_eq!(z453_scudo_abort_addr("nothing here"), None);
+        assert_eq!(z453_scudo_abort_addr("deallocating address "), None);
+        assert_eq!(z453_scudo_abort_addr("deallocating address zz"), None);
+        assert_eq!(z453_scudo_abort_addr("deallocating address 0xzzz"), None);
     }
 
     /// 6-Z306aj: the siginfo head reader must decode si_signo@0, si_code@8
