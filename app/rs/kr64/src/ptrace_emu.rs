@@ -16925,9 +16925,10 @@ pub fn run_ptrace_loop(
     // never leak into the guest's ioctl answers.
     let mut pending_z439_socket: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
-    let mut z439_packet_fds:
-        std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>> =
-        std::collections::HashMap::new();
+    let mut z439_packet_fds: std::collections::HashMap<
+        libc::pid_t,
+        std::collections::HashSet<i64>,
+    > = std::collections::HashMap::new();
     // 6-Z203: (pid, fd) → last ASHMEM_SET_SIZE for fds opened on the
     // {rootfs}/dev/ashmem regular-file stand-in. The tracer-level ioctl
     // virtualization needs the size for GET_SIZE + ftruncate on SET_SIZE.
