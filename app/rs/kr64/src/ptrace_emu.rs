@@ -12550,9 +12550,13 @@ fn z449_class_name_line(pid: libc::pid_t, obj: u64) {
             continue;
         }
         // Size gate: skip file/labelled micro-mappings; the heap
-        // reservation's first mapping is MB-scale.
-        let size = line
-            .split_whitespace()
+        // reservation's first mapping is MB-scale. The END address is
+        // the second half of the FIRST whitespace token ("start-end" —
+        // the rn416 bug: nth(1) is the PERMS field, so every candidate
+        // computed size=0 and the probe degenerated to the window only).
+        let first_token = line.split_whitespace().next().unwrap_or("");
+        let size = first_token
+            .split('-')
             .nth(1)
             .and_then(|end| u64::from_str_radix(end, 16).ok())
             .map(|end| end.saturating_sub(start))
@@ -18169,6 +18173,17 @@ pub fn run_ptrace_loop(
     // so the map holds a handful of slots per boot (small allocations never
     // touch it).
     let mut pending_big_mmap: std::collections::HashMap<libc::pid_t, (u64, u64, u64)> =
+        std::collections::HashMap::new();
+    // 6-Z451: per-pid stash for FILE-BACKED mmaps of BOOT-IMAGE files:
+    // (fd, length, path) captured at mmap ENTRY (aarch64 clobbers the
+    // arg registers before EXIT — the 6-Z362 lesson) when the fd's
+    // tracked path names a boot-image artifact. Consumed at the mmap
+    // EXIT to log the mapping result — the rn416 decode: the guest
+    // OPENS /apex/com.android.art/javalib/arm64/boot.art and the
+    // /system/framework/arm64 boot-framework images successfully, yet
+    // the runtime still falls back to image-less, so the mmap/validate
+    // leg is the frontier.
+    let mut pending_boot_image_mmap: std::collections::HashMap<libc::pid_t, (i32, u64, String)> =
         std::collections::HashMap::new();
     // Per-pid counters: (events, total_bytes, max_single, milestone_mask).
     // The mask's bits are cleared as each 6-Z362_MILESTONES threshold is
@@ -32091,6 +32106,28 @@ pub fn run_ptrace_loop(
                                     );
                                 }
                             }
+                            // ── 6-Z451: BOOT-IMAGE mmap ENTRY stash ──
+                            // The rn416 decode: the boot-image files OPEN
+                            // successfully yet the runtime stays image-less;
+                            // the file-backed mmap (or what follows it) is the
+                            // frontier. aarch64 clobbers the args before EXIT,
+                            // so stash (fd, length, path) NOW for the fds whose
+                            // tracked path names a boot-image artifact.
+                            {
+                                let z451_len = get_syscall_arg(&regs, abi.reg_arg2);
+                                if fd >= 0 {
+                                    let z451_path = open_fd_owner_paths
+                                        .get(&(pid, fd))
+                                        .or_else(|| open_fd_paths.get(&fd))
+                                        .cloned();
+                                    if let Some(p451) = z451_path {
+                                        if is_boot_image_path(&p451) {
+                                            pending_boot_image_mmap
+                                                .insert(pid, (fd, z451_len, p451));
+                                        }
+                                    }
+                                }
+                            }
                             // ── 6-Z305t-42: binder-fd mmap probe (ENTRY) ──
                             //
                             // libbinder's ProcessState mmaps the binder fd
@@ -34216,6 +34253,30 @@ pub fn run_ptrace_loop(
                     // only drops the stash entry (counters measure REAL
                     // mappings, mirroring RSS).
                     if syscall_num == abi.mmap || syscall_num == abi.mmap2 {
+                        // ── 6-Z451: BOOT-IMAGE mmap result ──
+                        if let Some((b_fd, b_len, b_path)) = pending_boot_image_mmap.remove(&pid) {
+                            let b_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            static Z451_MMAP_RESULT: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let z451m =
+                                Z451_MMAP_RESULT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if z451m < 96 {
+                                crate::trace_log_line(&format!(
+                                    "6-Z451 BOOT-IMAGE-MMAP: pid={} fd={} path={:?} len={:#x} -> {:#x} ({}) [#{}]",
+                                    pid,
+                                    b_fd,
+                                    b_path,
+                                    b_len,
+                                    b_ret,
+                                    if b_ret < 0 && b_ret > -4096 {
+                                        format!("-errno {}", -b_ret)
+                                    } else {
+                                        "mapped".to_string()
+                                    },
+                                    z451m + 1
+                                ));
+                            }
+                        }
                         if let Some((m_len, m_flags, m_addr)) = pending_big_mmap.remove(&pid) {
                             let m_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                             if m_ret > 0 {
