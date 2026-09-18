@@ -11935,6 +11935,348 @@ fn z403_wake_census_lookup(uaddr: u64) -> Option<(u64, u64, std::time::Duration)
     }
 }
 
+// ─── 6-Z447: WAIT-DECODE — name the never-notifying monitor holder ──
+//
+// The rn409 decode handoff (Task 183) asked for the ART Monitor struct
+// offsets so the wakes=NEVER wait of system_server main could name its
+// holder. The offline decode against the AOSP android-11.0.0_r1 ART
+// sources changed the target first: the never-woken futex is NOT inside
+// a Monitor at all. Monitor::Wait parks the waiter on a PER-THREAD
+// ConditionVariable (Thread::wait_cond_, guarded by Thread::wait_mutex_
+// — runtime/thread.h declares them adjacent), and ConditionVariable's
+// futex word is its sequence_ counter (base/mutex.h:
+// ConditionVariable = {const char* name_; Mutex& guard_; AtomicInteger
+// sequence_; int32_t num_waiters_;} — 24 bytes). The rn409 window of
+// system_server main (uaddr=0xee6067c2d4a0) decodes exactly under that
+// layout: name_=0xee60455fda5b (libart rodata literal), guard_=
+// 0xee6077c1c510 (the wait Mutex), sequence_=0x12 (== the FUTEX_WAIT
+// val), num_waiters_=1 (main itself) — which also retires the stall
+// dump's "candidate holder tid=18" misread: 0x12 is the CV sequence
+// counter, not a tid.
+//
+// What the CV window cannot show is the WAIT MONITOR and its OWNER —
+// the missing topology. Monitor::Wait's protocol (runtime/monitor.cc)
+// guarantees the parked waiter is a member of the monitor's wait_set_
+// (or wake_set_, if a Notify moved it but the unlocker never ran):
+//
+//   1. CV shape check: [uaddr-16..uaddr+8) must read {name_ ptr,
+//      guard_ ptr (16-aligned), seq u32, num_waiters u32}.
+//   2. Thread* discovery: the parked thread's /proc/<pid>/syscall sp
+//      frames hold `self` (ART Thread*) as a spilled callee-saved
+//      register. Scan [sp, sp+16KB) for 16-aligned plausible pointers
+//      and validate each candidate C with the PAIR TEST: C's memory
+//      contains (guard_, CV*) in ADJACENT qwords (wait_mutex_ /
+//      wait_cond_ adjacency), AND the u32 field == the kernel tid
+//      within C[0..64) (tls32_.tid; tls32_ is Thread's first member).
+//      A stack spill of the pair cannot fake the tid field, so a
+//      validated C IS the Thread struct. No hardcoded offsets beyond
+//      the CV identity itself.
+//   3. wait_monitor_ = the qword after wait_cond_. Dump the Monitor's
+//      qwords (bounded 512B), locate the waiter's own Thread* (the
+//      wait_set_/wake_set_ head), and emit owner_ candidates for both
+//      adjacency interpretations (owner_ sits at hit-24 if the hit is
+//      wait_set_, at hit-32 if it is wake_set_ — the other slot is
+//      num_waiters_/obj_, disambiguated offline).
+//   4. Owner liveness: for each pointer-shaped owner candidate, read
+//      its tid via the SAME validated tid offset and probe
+//      /proc/<tid>/comm + wchan: "ALIVE comm=..." names the never-
+//      notifying holder outright; "DEAD (dangling)" proves the holder
+//      died while holding the monitor.
+//   5. SEQ-TICK: repeat stall dumps of a registered CV re-read
+//      sequence_. An ADVANCING seq under a parked waiter whose census
+//      says wakes=NEVER is a lost-wake fingerprint (a Signal landed in
+//      guest memory but its futex wake was never traced — the emulator
+//      gap class); a frozen seq across the whole park excludes it.
+//
+// Logging ONLY — the tracee is already blocked; every read is
+// /proc/<pid>/mem pread or procfs (side-effect-free). One full decode
+// per (pid, uaddr) episode; ticks only on changed seq.
+
+/// 6-Z447 episode registry: (pid, uaddr) -> last observed CV sequence.
+fn z447_registry() -> &'static std::sync::Mutex<std::collections::HashMap<(libc::pid_t, u64), u32>>
+{
+    static R: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(libc::pid_t, u64), u32>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+const Z447_REGISTRY_CAP: usize = 256;
+
+fn z447_register(pid: libc::pid_t, uaddr: u64, seq: u32) {
+    let reg = z447_registry();
+    let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
+    if g.contains_key(&(pid, uaddr)) {
+        return;
+    }
+    if g.len() < Z447_REGISTRY_CAP {
+        g.insert((pid, uaddr), seq);
+    }
+}
+
+/// 6-Z447 SEQ-TICK: fire only when the registered CV's sequence word
+/// changed since the last observation of this episode.
+fn z447_seq_tick_maybe(pid: libc::pid_t, uaddr: u64, word: u32) {
+    let reg = z447_registry();
+    let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = g.get_mut(&(pid, uaddr)) {
+        if *last != word {
+            crate::trace_log_line(&format!(
+                "6-Z447 SEQ-TICK: pid={} uaddr={:#x} seq {:#x} -> {:#x} (signal landed in guest memory while waiter parked; no wake-family futex was recorded on this address — lost-wake fingerprint)",
+                pid, uaddr, *last, word
+            ));
+            *last = word;
+        }
+    }
+}
+
+/// 6-Z447 CV shape: parse [uaddr-16..uaddr+8) as ConditionVariable
+/// {name_, guard_, sequence_, num_waiters_}. Pointer-shaped name_, a
+/// 16-aligned guard_, and a small num_waiters_ are required; seq is
+/// informational (it equals the parked FUTEX_WAIT val by construction).
+fn z447_parse_cv(bytes: &[u8]) -> Option<(u64, u64, u32, u32)> {
+    if bytes.len() < 24 {
+        return None;
+    }
+    let name = u64::from_ne_bytes(bytes[0..8].try_into().ok()?);
+    let guard = u64::from_ne_bytes(bytes[8..16].try_into().ok()?);
+    let seq = u32::from_ne_bytes(bytes[16..20].try_into().ok()?);
+    let waiters = u32::from_ne_bytes(bytes[20..24].try_into().ok()?);
+    let name_ok = name != 0 && (name & 0xffff_0000_0000_0000) == 0;
+    let guard_ok = guard != 0 && (guard & 0xffff_0000_0000_0000) == 0 && (guard & 0xf) == 0;
+    if !name_ok || !guard_ok || waiters > 0x1000 {
+        return None;
+    }
+    Some((name, guard, seq, waiters))
+}
+
+/// 6-Z447 pointer plausibility for Thread*/Monitor* candidates: userspace,
+/// 16-aligned (both are `new`-allocated), nonzero.
+fn z447_plausible_ptr(v: u64) -> bool {
+    v > 0x1000 && (v & 0xffff_0000_0000_0000) == 0 && (v & 0xf) == 0
+}
+
+/// 6-Z447 pair test on a Thread*-candidate buffer: (guard_, cv) adjacent
+/// qwords + the kernel tid within the first 64 bytes. Returns the
+/// (wait_mutex_off, wait_cond_off, tid_off) anchors.
+fn z447_validate_thread(
+    bytes: &[u8],
+    guard: u64,
+    cv: u64,
+    tid: u32,
+) -> Option<(usize, usize, usize)> {
+    let nq = bytes.len() / 8;
+    if nq < 9 {
+        return None;
+    }
+    let q = |i: usize| -> Option<u64> {
+        if i * 8 + 8 <= bytes.len() {
+            Some(u64::from_ne_bytes(bytes[i * 8..i * 8 + 8].try_into().ok()?))
+        } else {
+            None
+        }
+    };
+    for j in 1..nq {
+        if q(j) == Some(cv) && q(j - 1) == Some(guard) {
+            for off in 0..=(64usize - 4) {
+                if u32::from_ne_bytes(bytes[off..off + 4].try_into().ok()?) == tid {
+                    return Some(((j - 1) * 8, j * 8, off));
+                }
+            }
+            // Pair without a tid anchor: still report with MAX as the
+            // "unvalidated" tid offset — the caller logs it honestly.
+            return Some(((j - 1) * 8, j * 8, usize::MAX));
+        }
+    }
+    None
+}
+
+/// 6-Z447 stack candidate collection: 16-aligned plausible pointers from
+/// the parked thread's stack window, excluding the known CV/guard values.
+fn z447_stack_candidates(bytes: &[u8], guard: u64, cv: u64, cap: usize) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    for w in bytes.chunks_exact(8) {
+        let v = u64::from_ne_bytes(w.try_into().unwrap());
+        if z447_plausible_ptr(v) && v != guard && v != cv && !out.contains(&v) {
+            out.push(v);
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 6-Z447 monitor-side decode: locate the waiter's own Thread* inside the
+/// Monitor dump (the wait_set_/wake_set_ head), then emit owner_ candidates
+/// for both adjacency interpretations with liveness probes. Pure: the
+/// caller supplies the dump bytes and does the /proc liveness reads via
+/// `z447_owner_desc`.
+fn z447_monitor_locate(bytes: &[u8], self_thread: u64) -> Option<usize> {
+    let nq = bytes.len() / 8;
+    for i in 0..nq {
+        if u64::from_ne_bytes(bytes[i * 8..i * 8 + 8].try_into().ok()?) == self_thread {
+            return Some(i * 8);
+        }
+    }
+    None
+}
+
+/// 6-Z447: format one owner-candidate slot (the offline decode picks the
+/// right interpretation; both are logged with liveness).
+fn z447_owner_slot_desc(pid: libc::pid_t, v: u64, tid_off: usize) -> String {
+    if v == 0 {
+        return "null".to_string();
+    }
+    if !z447_plausible_ptr(v) {
+        return format!("{:#x} (non-pointer-shape)", v);
+    }
+    let Some(bytes) = z446_read_mem_window(pid, v, 64) else {
+        return format!("{:#x} (unreadable)", v);
+    };
+    let tid = if tid_off != usize::MAX && tid_off + 4 <= bytes.len() {
+        u32::from_ne_bytes(bytes[tid_off..tid_off + 4].try_into().unwrap())
+    } else {
+        0
+    };
+    if tid == 0 {
+        return format!("{:#x} (tid unreadable)", v);
+    }
+    let task_dir = format!("/proc/{}/task/{}", pid, tid);
+    if std::path::Path::new(&task_dir).exists() {
+        let comm = std::fs::read_to_string(format!("{}/comm", task_dir))
+            .map(|c| c.trim().to_string())
+            .unwrap_or_default();
+        let wch = std::fs::read_to_string(format!("{}/wchan", task_dir))
+            .map(|c| c.trim().to_string())
+            .unwrap_or_default();
+        format!("{:#x} tid={} ALIVE comm={:?} wchan={:?}", v, tid, comm, wch)
+    } else {
+        format!("{:#x} tid={} DEAD (dangling holder)", v, tid)
+    }
+}
+
+/// 6-Z447 full decode + one log line per (pid, uaddr) episode.
+fn z447_wait_decode_and_log(pid: libc::pid_t, uaddr: u64, word: u32, sp: u64) {
+    z447_register(pid, uaddr, word);
+    if uaddr < 16 {
+        return;
+    }
+    let Some(cv_bytes) = z446_read_mem_window(pid, uaddr - 16, 24) else {
+        return;
+    };
+    let Some((name, guard, seq, waiters)) = z447_parse_cv(&cv_bytes) else {
+        return; // not an ART ConditionVariable — the 6-Z446 window
+                // already captured it; stay quiet.
+    };
+    crate::trace_log_line(&format!(
+        "6-Z447 CV: pid={} uaddr={:#x} name={:#x} guard={:#x} seq={:#x} cv_waiters={}",
+        pid, uaddr, name, guard, seq, waiters
+    ));
+    if sp == 0 {
+        return;
+    }
+    // Thread* discovery on the parked thread's stack window.
+    const SPAN: usize = 0x4000;
+    const MAX_CANDS: usize = 192;
+    let Some(stack) = z446_read_mem_window(pid, sp, SPAN) else {
+        return;
+    };
+    let cands = z447_stack_candidates(&stack, guard, uaddr - 16, MAX_CANDS);
+    // Two-pass discovery: prefer a candidate whose pair test ALSO
+    // anchors the kernel tid (a stack spill of (guard_, CV*) cannot
+    // fake the Thread's tls32_.tid); pair-only candidates are a
+    // fallback, logged with the honest MAX tid_off marker.
+    let mut found: Option<(u64, usize, usize, usize)> = None;
+    let mut pair_only: Option<(u64, usize, usize, usize)> = None;
+    for c in &cands {
+        let Some(tb) = z446_read_mem_window(pid, *c, 2048) else {
+            continue;
+        };
+        if let Some((wm, wc, to)) = z447_validate_thread(&tb, guard, uaddr - 16, pid as u32) {
+            if to != usize::MAX {
+                found = Some((*c, wm, wc, to));
+                break;
+            }
+            if pair_only.is_none() {
+                pair_only = Some((*c, wm, wc, to));
+            }
+        }
+    }
+    if found.is_none() {
+        found = pair_only;
+    }
+    let Some((thread, wm_off, wc_off, tid_off)) = found else {
+        crate::trace_log_line(&format!(
+            "6-Z447 THREAD-UNRESOLVED: pid={} uaddr={:#x} cands={} (CV facts above still valid)",
+            pid,
+            uaddr,
+            cands.len()
+        ));
+        return;
+    };
+    crate::trace_log_line(&format!(
+        "6-Z447 THREAD: pid={} thread={:#x} tid_off={} wait_mutex_off={} wait_cond_off={} (pair+tid validated)",
+        pid, thread, tid_off, wm_off, wc_off
+    ));
+    // wait_monitor_ = qword after wait_cond_.
+    let Some(tb) = z446_read_mem_window(pid, thread, wc_off + 16) else {
+        return;
+    };
+    if tb.len() < wc_off + 16 {
+        return;
+    }
+    let mon = u64::from_ne_bytes(tb[wc_off + 8..wc_off + 16].try_into().unwrap());
+    if !z447_plausible_ptr(mon) {
+        crate::trace_log_line(&format!(
+            "6-Z447 MONITOR-UNRESOLVED: pid={} wait_monitor={:#x}",
+            pid, mon
+        ));
+        return;
+    }
+    // 512B covers this build's Mutex-sized monitor_lock_ prefix plus the
+    // owner/wait-set fields for every A11 layout variant seen so far.
+    let Some(mons) = z446_read_mem_window(pid, mon, 512) else {
+        return;
+    };
+    let hit = z447_monitor_locate(&mons, thread);
+    let mut line = format!(
+        "6-Z447 MONITOR: pid={} monitor={:#x} wait_monitor_val={:#x} self_hit@{}",
+        pid,
+        mon,
+        mon,
+        match hit {
+            Some(h) => h.to_string(),
+            None => "none".to_string(),
+        }
+    );
+    if let Some(h) = hit {
+        if h >= 64 && h + 8 <= mons.len() {
+            // owner candidates under both adjacency interpretations.
+            let cand_a = u64::from_ne_bytes(mons[h - 24..h - 16].try_into().unwrap());
+            let cand_b = u64::from_ne_bytes(mons[h - 32..h - 24].try_into().unwrap());
+            line.push_str(&format!(
+                " owner_if_waitset@hit-24={} owner_if_wakeset@hit-32={}",
+                z447_owner_slot_desc(pid, cand_a, tid_off),
+                z447_owner_slot_desc(pid, cand_b, tid_off),
+            ));
+        }
+    }
+    // Raw head qwords for the offline layout decode (bounded).
+    let head_n = (mons.len() / 8).min(16);
+    let words: Vec<String> = (0..head_n)
+        .map(|i| {
+            format!(
+                "w{:02}={:016x}",
+                i,
+                u64::from_ne_bytes(mons[i * 8..i * 8 + 8].try_into().unwrap())
+            )
+        })
+        .collect();
+    line.push_str(&format!(" head=[{}]", words.join(" ")));
+    crate::trace_log_line(&line);
+}
+
 /// 6-Z271f: forensic dump for one blocked-in-syscall tracee.
 ///
 /// /proc/<pid>/syscall exposes the REAL syscall nr, its 6 argument
@@ -12497,6 +12839,11 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
         let word = read_child_u32(pid, a0);
         match word {
             Some(w) => {
+                // 6-Z447 SEQ-TICK: a registered CV uaddr re-reads its
+                // sequence word on every stall dump — an advancing seq
+                // under a parked waiter with a wakes=NEVER census is the
+                // lost-wake fingerprint (see the 6-Z447 block doc).
+                z447_seq_tick_maybe(pid, a0, w);
                 let desc = if w & 0x4000_0000 != 0 {
                     format!("PI/robust word — held by tid={}", w & !0x4000_0000)
                 } else if w == 2 || w == 1 {
@@ -12666,6 +13013,13 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                                 if let Some(line) = z446_mem_window_line(pid, a0) {
                                     crate::trace_log_line(&line);
                                 }
+                                // 6-Z447: full WAIT-DECODE — CV identity,
+                                // Thread* (pair+tid validated), the wait
+                                // monitor's wait_set_/wake_set_/owner_ slots
+                                // with holder liveness. Names the never-
+                                // notifying holder outright when the layout
+                                // anchors validate.
+                                z447_wait_decode_and_log(pid, a0, w, sp);
                             }
                         }
                     }
@@ -53866,6 +54220,136 @@ mod z403_stall_forensics_tests {
         }
         assert!(found >= 1, "recent entries must survive");
         assert!(found <= Z403_WAKE_CENSUS_CAP, "cap holds: {}", found);
+    }
+}
+
+#[cfg(test)]
+mod z447_wait_decode_tests {
+    use super::{
+        z447_monitor_locate, z447_parse_cv, z447_plausible_ptr, z447_stack_candidates,
+        z447_validate_thread,
+    };
+
+    const RN409_NAME: u64 = 0x0000_ee60_455f_da5b; // rodata literal ptr
+    const RN409_GUARD: u64 = 0x0000_ee60_77c1_c510; // wait Mutex (new'd)
+    const RN409_SEQ: u32 = 0x12; // == the FUTEX_WAIT val
+    const RN409_WAITERS: u32 = 1;
+
+    /// The rn409 system_server main window must parse as an A11
+    /// ConditionVariable {name_, guard_, sequence_, num_waiters_} — the
+    /// layout decode that retired the "candidate holder tid=18" misread.
+    #[test]
+    fn z447_cv_shape_accepts_rn409_window() {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&RN409_NAME.to_ne_bytes());
+        b[8..16].copy_from_slice(&RN409_GUARD.to_ne_bytes());
+        b[16..20].copy_from_slice(&RN409_SEQ.to_ne_bytes());
+        b[20..24].copy_from_slice(&RN409_WAITERS.to_ne_bytes());
+        let (name, guard, seq, waiters) = z447_parse_cv(&b).expect("rn409 CV must parse");
+        assert_eq!(name, RN409_NAME);
+        assert_eq!(guard, RN409_GUARD);
+        assert_eq!(seq, RN409_SEQ);
+        assert_eq!(waiters, RN409_WAITERS);
+    }
+
+    /// Shape rejects: unaligned guard_ (not a `new`-allocated Mutex),
+    /// absurd num_waiters_, zero name_, and a short buffer.
+    #[test]
+    fn z447_cv_shape_rejects_non_cv() {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&RN409_NAME.to_ne_bytes());
+        b[8..16].copy_from_slice(&(RN409_GUARD | 1).to_ne_bytes());
+        b[16..20].copy_from_slice(&RN409_SEQ.to_ne_bytes());
+        b[20..24].copy_from_slice(&RN409_WAITERS.to_ne_bytes());
+        assert!(z447_parse_cv(&b).is_none(), "unaligned guard_");
+        let mut b2 = b;
+        b2[8..16].copy_from_slice(&RN409_GUARD.to_ne_bytes());
+        b2[20..24].copy_from_slice(&0x2000u32.to_ne_bytes());
+        assert!(z447_parse_cv(&b2).is_none(), "absurd num_waiters_");
+        let mut b3 = b2;
+        b3[20..24].copy_from_slice(&RN409_WAITERS.to_ne_bytes());
+        b3[0..8].copy_from_slice(&0u64.to_ne_bytes());
+        assert!(z447_parse_cv(&b3).is_none(), "zero name_");
+        assert!(z447_parse_cv(&b3[..12]).is_none(), "short buffer");
+    }
+
+    /// Pointer plausibility: 16-aligned userspace only — Thread* and
+    /// Monitor* are `new`-allocated. Kernel-ish high bits, unaligned,
+    /// and tiny values are rejected.
+    #[test]
+    fn z447_ptr_plausibility_truth_table() {
+        assert!(z447_plausible_ptr(0x0000_ee60_455f_da60));
+        assert!(!z447_plausible_ptr(0xee60_455f_da60_0000), "high bits set");
+        assert!(!z447_plausible_ptr(0x0000_ee60_455f_da5b), "unaligned");
+        assert!(!z447_plausible_ptr(0x100), "too small");
+        assert!(!z447_plausible_ptr(0), "null");
+    }
+
+    /// The pair test on a synthetic Thread struct: tid at tls32_+16,
+    /// wait_mutex_/wait_cond_ adjacent mid-struct, wait_monitor_ after.
+    /// Returns the three anchors; a swapped pair or missing tid fails
+    /// the validated path (pair-only still returns with MAX tid_off).
+    #[test]
+    fn z447_thread_pair_test_anchors() {
+        const WM_OFF: usize = 400;
+        const WC_OFF: usize = 408;
+        let mut b = [0u8; 2048];
+        b[16..20].copy_from_slice(&4094u32.to_ne_bytes());
+        b[WM_OFF..WM_OFF + 8].copy_from_slice(&RN409_GUARD.to_ne_bytes());
+        b[WC_OFF..WC_OFF + 8].copy_from_slice(&(RN409_GUARD - 16).to_ne_bytes()); // cv = guard-16 (real shape)
+        let cv = RN409_GUARD - 16;
+        let (wm, wc, to) =
+            z447_validate_thread(&b, RN409_GUARD, cv, 4094).expect("validated thread");
+        assert_eq!((wm, wc, to), (WM_OFF, WC_OFF, 16));
+        // Pair present but tid absent → honest MAX marker, not a reject.
+        let (wm2, wc2, to2) = z447_validate_thread(&b, RN409_GUARD, cv, 7777).expect("pair-only");
+        assert_eq!((wm2, wc2, to2), (WM_OFF, WC_OFF, usize::MAX));
+        // Swapped adjacency (cv, guard) → reject outright.
+        let mut b2 = b;
+        b2[WM_OFF..WM_OFF + 8].copy_from_slice(&cv.to_ne_bytes());
+        b2[WC_OFF..WC_OFF + 8].copy_from_slice(&RN409_GUARD.to_ne_bytes());
+        assert!(z447_validate_thread(&b2, RN409_GUARD, cv, 4094).is_none());
+    }
+
+    /// Stack-candidate collection: keeps 16-aligned plausible pointers,
+    /// drops the known guard_/CV values, dedupes, respects the cap.
+    #[test]
+    fn z447_stack_candidates_filter_and_cap() {
+        let cv = RN409_GUARD - 16;
+        let mut b = [0u8; 64];
+        b[0..8].copy_from_slice(&RN409_GUARD.to_ne_bytes()); // excluded
+        b[8..16].copy_from_slice(&cv.to_ne_bytes()); // excluded
+        b[16..24].copy_from_slice(&0x0000_ee60_1111_2220u64.to_ne_bytes());
+        b[24..32].copy_from_slice(&0x0000_ee60_3333_4440u64.to_ne_bytes());
+        b[32..40].copy_from_slice(&0x0000_ee60_3333_4440u64.to_ne_bytes()); // dupe
+        b[40..48].copy_from_slice(&0x0000_ee60_5555_6661u64.to_ne_bytes()); // unaligned
+        b[48..56].copy_from_slice(&0xee60_5555_6660_0000u64.to_ne_bytes()); // high bits
+        let cands = z447_stack_candidates(&b, RN409_GUARD, cv, 8);
+        assert_eq!(
+            cands,
+            vec![0x0000_ee60_1111_2220, 0x0000_ee60_3333_4440],
+            "only the two plausible unique pointers survive"
+        );
+        // Cap: a buffer of 8 distinct pointers with cap 3 returns 3.
+        let mut b2 = [0u8; 64];
+        for i in 0..8usize {
+            b2[i * 8..i * 8 + 8]
+                .copy_from_slice(&(0x0000_ee60_0000_0100u64 + (i as u64) * 16).to_ne_bytes());
+        }
+        assert_eq!(z447_stack_candidates(&b2, 0, 0, 3).len(), 3);
+    }
+
+    /// Monitor self-hit location: the waiter's Thread* inside the
+    /// Monitor dump is found at its wait_set_/wake_set_ slot; absence
+    /// returns None (logged as self_hit@none, not an error).
+    #[test]
+    fn z447_monitor_locate_truth_table() {
+        const SELF: u64 = 0x0000_ee60_455f_da60;
+        let mut m = [0u8; 512];
+        let hit_off = 192usize; // a plausible S_m+32 landing zone
+        m[hit_off..hit_off + 8].copy_from_slice(&SELF.to_ne_bytes());
+        assert_eq!(z447_monitor_locate(&m, SELF), Some(hit_off));
+        assert_eq!(z447_monitor_locate(&m, SELF + 16), None);
     }
 }
 
