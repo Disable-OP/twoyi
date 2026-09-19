@@ -3470,6 +3470,10 @@ static Z307P_CONNECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static Z307P_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static Z307P_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// 6-Z481: bounded census for the real-wire prop_msg parses (the bridge
+// arm itself logs through spawn_boot_completed_sender's sender thread).
+static Z481_PARSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // 6-Z268: per-stop record of strings this tracer WROTE into the child
 // (`write_translated_path` + scratch rewrites). The sandbox backstop
 // previously re-read every rewritten path from the child with a full
@@ -18815,6 +18819,22 @@ pub fn run_ptrace_loop(
         std::collections::HashSet::new();
     let mut z307p_pending: std::collections::HashMap<libc::pid_t, (i64, u64, u64)> =
         std::collections::HashMap::new();
+    // 6-Z481: the REAL property-service wire bridge. rn452 proved the
+    // guest's property sets flow over a REAL socket (6-Z163 binds the
+    // rootfs path FOR REAL, 6-Z305q translates client connects in-place)
+    // — the 6-Z111 fake-connect path NEVER engages, so the 6-Z305
+    // sys.boot_completed bridge (armed ONLY inside the 6-Z111 SendTo
+    // fake) never fired and the app's boot gate honestly timed out at
+    // +367 s while the guest framework had ALREADY processed
+    // ACTION_BOOT_COMPLETED (logcat 20:36:12.607). Fix: parse the
+    // prop_msg payload at the tracked-wire ENTRY (write/sendto on a
+    // z307p fd — args are still valid there; the aarch64 EXIT clobbers
+    // x1-x5) and arm the EXISTING is_boot_completed_pred sender at EXIT
+    // when the send succeeded (ret > 0 — init has the request on the
+    // wire). The z481_parsed stash holds the ENTRY parse for the EXIT
+    // predicate check; dropped at close/process death like z307p fds.
+    let mut z481_parsed: std::collections::HashMap<libc::pid_t, (String, String)> =
+        std::collections::HashMap::new();
     // 6-Z305c: ENTRY-side readlink/readlinkat arg stash — (pid → (path_ptr,
     // buf_ptr)). bionic realpath (android-11) = open(O_PATH) + fstat(fd) +
     // readlink(/proc/self/fd/N) + stat(dst) with a dev/ino compare. At the
@@ -22165,6 +22185,8 @@ pub fn run_ptrace_loop(
             // process (a recycled pid must not inherit the tracking).
             z307p_prop_fds.retain(|(p, _)| *p != pid);
             z307p_pending.remove(&pid);
+            // 6-Z481: the wire-parse stash dies with the process.
+            z481_parsed.remove(&pid);
             z306k_last.remove(&pid);
             z306k_last_natural.remove(&pid);
             z306k_probe_pending.remove(&pid);
@@ -22613,6 +22635,8 @@ pub fn run_ptrace_loop(
             // process (a recycled pid must not inherit the tracking).
             z307p_prop_fds.retain(|(p, _)| *p != pid);
             z307p_pending.remove(&pid);
+            // 6-Z481: the wire-parse stash dies with the process.
+            z481_parsed.remove(&pid);
             z306k_last.remove(&pid);
             z306k_last_natural.remove(&pid);
             z306k_probe_pending.remove(&pid);
@@ -25874,6 +25898,44 @@ pub fn run_ptrace_loop(
                                     ));
                                 }
                                 z307p_pending.insert(pid, (z307p_fd, z307p_len, seq));
+                                // 6-Z481: parse the prop_msg payload HERE —
+                                // at the ENTRY stop the args are still live
+                                // (the aarch64 EXIT stop clobbers x1-x5, so
+                                // the buffer pointer cannot be re-fetched).
+                                // Covers write + sendto (the flat-frame
+                                // prop_msg client legs, same coverage as the
+                                // 6-Z111 fake path); writev stays deferred.
+                                if (abi.write != -1 && syscall_num == abi.write)
+                                    || (abi.sendto_nr != -1 && syscall_num == abi.sendto_nr)
+                                {
+                                    let buf_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                    let req_len = std::cmp::min(z307p_len as usize, 256);
+                                    // A legacy prop_msg frame is >= 128 bytes;
+                                    // the 4-5-byte early-wire noise (rn452
+                                    // census) never reaches the parser.
+                                    if buf_ptr != 0 && req_len >= 128 {
+                                        if let Some(payload) =
+                                            read_child_bytes(pid, buf_ptr, req_len)
+                                        {
+                                            if let Some((name, value)) = parse_prop_msg(&payload) {
+                                                let n = Z481_PARSE.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                if n < 4 {
+                                                    log(&format!(
+                                                        "6-Z481: wire payload parsed pid={} name='{}' value.len={} seq={}",
+                                                        pid,
+                                                        name,
+                                                        value.len(),
+                                                        seq
+                                                    ));
+                                                }
+                                                z481_parsed.insert(pid, (name, value));
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         // 6-Z305m: stash write(fd, buf, count) arguments at
@@ -37519,6 +37581,9 @@ pub fn run_ptrace_loop(
                             // tracking (the number may be recycled).
                             z307p_prop_fds.remove(&(pid, closed_fd as i64));
                             z307p_pending.remove(&pid);
+                            // 6-Z481: a parsed frame on a now-closed fd can
+                            // never reach its EXIT check — drop it.
+                            z481_parsed.remove(&pid);
                         }
                     }
                     // Task 6-V Part A2 — open()/openat()/openat2() EXIT:
@@ -39244,6 +39309,39 @@ pub fn run_ptrace_loop(
                                         "6-Z62: mmap2 content injection SKIPPED — ptrace_getregs FAILED: {} (fd={}, len={})",
                                         e, pending.fd, pending.length
                                     ));
+                                }
+                            }
+                        }
+                    }
+                    // 6-Z481: the REAL-wire BOOT_COMPLETED bridge — the
+                    // EXIT half. The ENTRY half parsed the prop_msg off a
+                    // tracked property-service fd (z481_parsed); here the
+                    // send actually went out (ret > 0 — init has the set
+                    // request on the wire), so arm the 6-Z305 sender.
+                    // Covers BOTH flat-frame legs (write and sendto —
+                    // rn452's census showed the real wire carries sendto
+                    // while the old DONE gate saw only write). A failed
+                    // send (ret <= 0) drops the parsed frame honestly —
+                    // no message on the wire, no bridge. The one-shot
+                    // guard in spawn_boot_completed_sender + the app's
+                    // CAS make a duplicate arm harmless.
+                    if past_first_execve
+                        && ((abi.write != -1 && syscall_num == abi.write)
+                            || (abi.sendto_nr != -1 && syscall_num == abi.sendto_nr))
+                    {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        let parsed = z481_parsed.remove(&pid);
+                        if ret > 0 {
+                            if let Some((name, value)) = parsed {
+                                if is_boot_completed_prop(&name, &value) {
+                                    log(&format!(
+                                        "6-Z481: REAL-WIRE bridge armed — pid={} sent sys.boot_completed=1 on the property-service socket (ret={})",
+                                        pid, ret
+                                    ));
+                                    spawn_boot_completed_sender(
+                                        pid,
+                                        "guest sent sys.boot_completed=1 on the REAL property-service wire (6-Z481)",
+                                    );
                                 }
                             }
                         }
@@ -56388,6 +56486,58 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         frame2[36..36 + value2.len()].copy_from_slice(value2);
         let (name2, value2) = parse_prop_msg(&frame2).expect("classic prop_msg must parse");
         assert!(!is_boot_completed_prop(&name2, &value2));
+    }
+
+    #[test]
+    fn z481_real_wire_frame_bridge_predicate() {
+        // 6-Z481: the REAL-wire bridge core — the exact composition the
+        // tracked-fd ENTRY arm runs: wire frame → parse_prop_msg →
+        // is_boot_completed_prop. The rn452 gap: the guest's property sets
+        // flow over the REAL socket (6-Z163 bind / 6-Z305q connect), so
+        // the 6-Z111 fake path never engages — this is the same parse the
+        // new wire arm performs, proven on BOTH frame layouts.
+        //
+        // WIDE frame (188 B, Android-11 bionic layout): name@4 (92 gate),
+        // value@96 (92 B). sys.boot_completed=1 must arm.
+        let mut wide = vec![0u8; 188];
+        wide[0..4].copy_from_slice(&1u32.to_le_bytes()); // PROP_MSG_SETPROP
+        let wname = b"sys.boot_completed";
+        wide[4..4 + wname.len()].copy_from_slice(wname);
+        wide[96..97].copy_from_slice(b"1");
+        let (wname, wvalue) = parse_prop_msg(&wide).expect("wide frame must parse");
+        assert_eq!(wname, "sys.boot_completed");
+        assert!(is_boot_completed_prop(&wname, &wvalue));
+
+        // value "0" on the right key never arms (honest semantics: the
+        // framework only ever sets "1", but the bridge must not invert).
+        let mut zero = wide.clone();
+        zero[96..97].copy_from_slice(b"0");
+        let (zname, zvalue) = parse_prop_msg(&zero).expect("zero frame must parse");
+        assert!(!is_boot_completed_prop(&zname, &zvalue));
+
+        // The classic frame stays covered (ROM variance) — already proven
+        // by z305_prop_msg_parsing_feeds_the_bridge; here the wide+classic
+        // NAME-OFFSET split is exercised: a classic-length frame with the
+        // name at @4 parses with the classic gate (31 B), not the wide one.
+        let mut classic = vec![0u8; 128];
+        classic[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let cname = b"sys.boot_completed";
+        classic[4..4 + cname.len()].copy_from_slice(cname);
+        classic[36..37].copy_from_slice(b"1");
+        let (cname, cvalue) = parse_prop_msg(&classic).expect("classic frame must parse");
+        assert!(is_boot_completed_prop(&cname, &cvalue));
+
+        // A different property on the wire (ctl.start) parses but never
+        // arms — the bridge stays silent for every non-boot frame.
+        let mut ctl = vec![0u8; 188];
+        ctl[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let ctlname = b"ctl.start";
+        ctl[4..4 + ctlname.len()].copy_from_slice(ctlname);
+        ctl[96..96 + 8].copy_from_slice(b"bootanim");
+        let (ctlname, ctlvalue) = parse_prop_msg(&ctl).expect("ctl frame must parse");
+        assert_eq!(ctlname, "ctl.start");
+        assert_eq!(ctlvalue, "bootanim");
+        assert!(!is_boot_completed_prop(&ctlname, &ctlvalue));
     }
 
     // ── 6-Z305j: virtual selinuxfs helpers ──────────────────────────
