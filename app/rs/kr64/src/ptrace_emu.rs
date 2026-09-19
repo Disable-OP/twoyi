@@ -16475,6 +16475,59 @@ pub(crate) const Z471_TIMER_ABSTIME: u64 = 1;
 /// 6-Z471: the cap for the extended watchdog deadline.
 pub(crate) const Z471_MAX_LENIENCY_SEC: u64 = 300;
 
+// ── 6-Z472: the era-true hand-off target snapshot (pure cores) ──────
+//
+// rn440 (Task 205) landed the 6-Z471 evidence layer (tombstones SERVED:
+// 7 real files, the leniency re-arm fired, ZERO SIGALRM deaths) — and
+// the served tombstones carry a NEW decode obstacle: their memory-map
+// sections DISAGREE with their registers. The system_server main-tid
+// section (pid 4091: SIGSEGV MAPERR 0x0, pc == lr == 0x0000fa45277cd384
+// landing INSIDE a rodata region whose memory-near dump reads the
+// framework const-string pool — "NetworkStatsService",
+// "PowerManager.SuspendLockout", "Excessive delay in setInteractive(%s)")
+// has a maps section that carries ONLY the staged crash_dump64 binary +
+// anon/scudo/cfi regions — no framework mapping covers the pc, so the
+// rn408-lesson offline symbolization has no anchor. The tombstone's
+// cmdline field ("name: system_server >>> crash_dump64 <<<") confirms
+// the split: the registers/threads were captured in the crashing
+// system_server's context, the maps were read in a DIFFERENT context
+// (the staged crash_dump child's view).
+//
+// The fix is not to repair crash_dump's file (guest-side) but to make
+// the tracer capture the era-true context at the ONE moment it is
+// guaranteed: the 6-Z418 eager hand-off — the target is held at its
+// crash point, maps intact, before the debuggerd child runs. At that
+// instant the tracer snapshots /proc/<target>/{maps,cmdline,stat} into
+// the stderr artifact (budgeted full-text; every line 6-Z472m-prefixed
+// so the decode greps it beside the tombstone). The pc → file-offset
+// → vendored-rootfs symbolization then works offline for every future
+// served dump.
+
+/// 6-Z472 (pure): the crash-relevant STATE letter from a
+/// /proc/<pid>/stat body (everything after the comm's closing ')').
+/// Returns the first whitespace-separated token (the state), or None
+/// when the body is malformed.
+fn z472_stat_state(stat_text: &str) -> Option<String> {
+    let close = stat_text.rfind(')')?;
+    stat_text[close + 1..]
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_string())
+}
+
+/// 6-Z472 (pure): sanitize a /proc/<pid>/cmdline body into a single
+/// log-safe string: NUL-separated argv joined with spaces, trimmed of
+/// trailing NULs, capped at 96 chars (the log line, not the data, is
+/// the bound here — maps carry the detail).
+fn z472_cmdline(raw: &str) -> String {
+    let joined = raw.trim_end_matches('\u{0}').replace('\u{0}', " ");
+    let mut joined = joined.trim().to_string();
+    if joined.len() > 96 {
+        joined.truncate(96);
+    }
+    joined
+}
+
 /// 6-Z471 (pure): the watchdog-arming decision for ONE it_value.
 ///
 /// `is_absolute` = TIMER_ABSTIME was set (timer_settime) — always false
@@ -40571,6 +40624,50 @@ pub fn run_ptrace_loop(
                             let mut walk_skipped: usize = 0;
                             let walk_t0 = std::time::Instant::now();
                             if let Some(parent) = dying_parent {
+                                // ── 6-Z472: the era-true hand-off target
+                                // snapshot (see the pure-core docs) — the
+                                // target is held at its crash point RIGHT
+                                // NOW; /proc/<parent>/maps read here is the
+                                // era-true map the tombstone's own maps
+                                // section lacks. Budgeted: 6 full-text
+                                // snapshots per boot (the rn440 crash-loop
+                                // fleet's 6 system_server generations fit);
+                                // every capture logs a header + the
+                                // 6-Z472m-prefixed map lines.
+                                {
+                                    static Z472_SNAPSHOTS: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let z472_n = Z472_SNAPSHOTS
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let z472_maps =
+                                        std::fs::read_to_string(format!("/proc/{}/maps", parent));
+                                    let z472_cmd = std::fs::read_to_string(format!(
+                                        "/proc/{}/cmdline",
+                                        parent
+                                    ))
+                                    .map(|c| z472_cmdline(&c))
+                                    .unwrap_or_else(|_| "?".to_string());
+                                    let z472_state =
+                                        std::fs::read_to_string(format!("/proc/{}/stat", parent))
+                                            .ok()
+                                            .and_then(|s| z472_stat_state(&s))
+                                            .unwrap_or_else(|| "?".to_string());
+                                    log(&format!(
+                                        "6-Z472: hand-off target snapshot pid={} cmdline={:?} state={} maps={} (dump {}/6 budget)",
+                                        parent,
+                                        z472_cmd,
+                                        z472_state,
+                                        if z472_maps.is_ok() { "captured" } else { "unreadable" },
+                                        z472_n + 1
+                                    ));
+                                    if z472_n < 6 {
+                                        if let Ok(maps) = z472_maps {
+                                            for ml in maps.lines().take(400) {
+                                                log(&format!("6-Z472m: {}", ml));
+                                            }
+                                        }
+                                    }
+                                }
                                 let mut tid_list: Vec<libc::pid_t> =
                                     std::fs::read_dir(format!("/proc/{}/task", parent))
                                         .map(|rd| {
@@ -57275,5 +57372,39 @@ mod z471_abi_tests {
         assert_eq!(ABI_AARCH64.timer_delete_nr, 111);
         assert_eq!(ABI_AARCH64.accept4_nr, 242);
         assert_eq!(ABI_AARCH64.alarm_nr, -1);
+    }
+}
+
+/// 6-Z472 pure cores (see the module docs above the fns).
+#[cfg(test)]
+mod z472_snapshot_tests {
+    use super::{z472_cmdline, z472_stat_state};
+
+    /// The stat STATE parse must survive a comm containing spaces and
+    /// parens (rsplit on the LAST ')') and must return the state letter.
+    #[test]
+    fn z472_stat_state_parse() {
+        let normal = "4091 (system_server) S 162 4091 0 0 -1 1077952832 0 0 0 0 0 0 0 0 20 0 36 0 12345 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0\n";
+        assert_eq!(z472_stat_state(normal).as_deref(), Some("S"));
+        let paren_comm = "77 (binder:4091_1) R 1 2 3 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 99 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0\n";
+        assert_eq!(z472_stat_state(paren_comm).as_deref(), Some("R"));
+        let tricky = "8 (sad)name (t) Z 1 2 3\n";
+        assert_eq!(z472_stat_state(tricky).as_deref(), Some("Z"));
+        assert_eq!(z472_stat_state("4091 (unterminated"), None);
+        assert_eq!(z472_stat_state(""), None);
+    }
+
+    /// The cmdline sanitizer: NUL-separated argv joins with spaces,
+    /// trailing NULs vanish, and the 96-char cap holds.
+    #[test]
+    fn z472_cmdline_sanitize() {
+        assert_eq!(
+            z472_cmdline("/system/bin/crash_dump64\x00--target\x004091\x00"),
+            "/system/bin/crash_dump64 --target 4091"
+        );
+        assert_eq!(z472_cmdline("system_server\0"), "system_server");
+        assert_eq!(z472_cmdline(""), "");
+        let long = "x".repeat(200);
+        assert_eq!(z472_cmdline(&long).len(), 96);
     }
 }
