@@ -8242,6 +8242,65 @@ fn hidl_sm_parse_fail_diag(stage: &str, code: u32, blob: &RequestBlob) {
     );
 }
 
+/// 6-Z480: kernel-true pool-recruitment gate for a service registration —
+/// does the registering process have NO thread already parked in an ioctl?
+///
+/// # Root cause (rn451 decode — the rung-8 BatteryService wall)
+///
+/// system_server reached startCoreServices and died at BatteryService.onStart
+/// three generations in a row: the health HAL (android.hardware.health@2.1-
+/// service, pid 2851) registered via addWithChain → handle 0x8 at +2.8 s and
+/// then NEVER READ its conn again — the ps/threads capture shows the process
+/// with EXACTLY ONE thread (the healthd mainloop, `ep_poll`), no
+/// `Binder:2851_1` pool thread. BatteryService's HIDL getService probes
+/// reached the service manager and were answered (get() hit → handle 0x8),
+/// the client's interfaceDescriptor cast probe (code 0x0F43440E) ROUTED to
+/// the health conn (conn=137 → conn=3, txn#1279) — and sat in its inbox
+/// forever: no parked reader existed to receive it. 6-Z407 expired the txn
+/// at the 8 s budget → BR_FAILED_REPLY → castFrom null →
+/// "getService: unable to call into hwbinder service" →
+/// "health: cannot register callback" → RuntimeException "Failed to start
+/// service com.android.server.BatteryService" → "Failure starting system
+/// services" → the era death.
+///
+/// On REAL hardware the healthd-style service (register + epoll mainloop,
+/// never joinRpcThreadpool) still gains a `Binder:pid_1` thread because the
+/// KERNEL recruits one: binder_thread_read appends BR_SPAWN_LOOPER to the
+/// read of a NON-looper thread when the proc has no thread waiting for proc
+/// todo work (`requested_threads == 0 && waiting_threads empty`). The
+/// registration read IS that read — the reply stream gains the recruitment
+/// command, libhwbinder's waitForResponse spawns a pooled thread, and that
+/// thread parks in the next ioctl forever after, serving every later client
+/// transaction.
+///
+/// The proxy never emitted the recruitment on the add arms (only the 6-Z324
+/// registerForNotifications arm did), so healthd-style HIDL services had no
+/// worker and the class above was structural. The fix arms the recruitment
+/// on the add/addWithChain SUCCESS replies, gated kernel-true: recruit only
+/// when NO OTHER conn of the same (guest pid, binder device) is inside an
+/// ioctl — the proxy's view of `waiting_threads` being empty. The
+/// registering conn's OWN ReaderWaitingGuard (true for the duration of this
+/// ioctl) is excluded. The spawned pool thread's BC_REGISTER_LOOPER + parked
+/// read land on the same conn; later adds in the same process then see the
+/// parked sibling and skip the recruitment — the kernel's own convergence.
+fn z480_needs_pool_recruitment(bus: &Arc<Mutex<BusState>>, conn_id: ConnId) -> bool {
+    let b = bus.lock().expect("binder bus poisoned");
+    let (pid, dev) = match b.conns.get(&conn_id) {
+        Some(c) => (c.sender_pid, c.dev_code),
+        None => return false,
+    };
+    if pid == 0 {
+        // Identity unknown (no SO_PEERCRED, no IDENT announcement): the
+        // registering conn is the only view of the process — recruit (the
+        // guest's own max-threads cap bounds the pool size, exactly like
+        // the kernel's BINDER_SET_MAX_THREADS).
+        return true;
+    }
+    !b.conns.iter().any(|(cid, c)| {
+        c.sender_pid == pid && c.dev_code == dev && *cid != conn_id && c.reader_waiting
+    })
+}
+
 fn servicemanager_hidl(
     code: u32,
     blob: &RequestBlob,
@@ -8491,8 +8550,19 @@ fn servicemanager_hidl(
                 h
             };
             // Reply: bool success = true.
-            writer.write_i32(1);
             let _ = handle;
+            writer.write_i32(1);
+            // 6-Z480: kernel pool recruitment on the successful add reply —
+            // a service proc with zero parked readers gains its first
+            // looper here (the healthd-style class: register + mainloop,
+            // never joinRpcThreadpool — rn451's health@2.1-service wall).
+            if z480_needs_pool_recruitment(bus, conn_id) {
+                spawn_looper = true;
+                info!(
+                    "[KR64][binder][svc] 6-Z480: pool recruitment armed on HIDL add '{}' reply (conn={}) — the kernel's BR_SPAWN_LOOPER for a service proc with zero parked loopers",
+                    name, conn_id
+                );
+            }
         }
         HIDL_SM_REGISTER_FOR_NOTIFICATIONS => {
             // 6-Z276: args = [hidl_string fqName][hidl_string name][flat
@@ -8737,29 +8807,46 @@ fn servicemanager_hidl(
                 h
             };
             writer.write_u8(1); // bool success = true
-                                // 6-Z351 (rn302 decode): the REAL hwservicemanager registers
-                                // the service under EVERY interfaceChain entry — AOSP
-                                // ServiceManager.cpp addImpl (android-11.0.0_r1): per chain
-                                // fqName, insertService/setService + a per-fq
-                                // sendPackageRegistrationNotification — ONE HidlService
-                                // object, many fq keys. rn302 proved the wall: the composer
-                                // registered @2.3::IComposer/default (chain[0] = [@2.3, @2.2,
-                                // @2.1, IBase], handle 0x28) and the 6-Z350b ancestor
-                                // getTransport answered SF's @2.1 transport probe — but the
-                                // SUBSEQUENT `sm->get(@2.1::IComposer/default)`
-                                // (getRawServiceInternal, after the transport hit) is an
-                                // EXACT map lookup that missed → "getService: Trying again
-                                // for android.hardware.graphics.composer@2.1::IComposer/
-                                // default" ×537 → SF never published → rung 7. With the
-                                // chain inserted, the real SM's exact-key get() hits — the
-                                // whole ancestor-get class (composer@2.1, keymaster@4.0,
-                                // soundtrigger@2.0/2.1, wifi@1.0-1.3, camera@2.4/2.5,
-                                // bluetooth@1.0, thermal@1.0 …) is served by registration
-                                // shape, not by a lookup hack. Aliases share the chain[0]
-                                // HANDLE (one node identity — the kernel hands the same
-                                // process the same handle for the same node) and fire their
-                                // own onRegistration callbacks (the real loop notifies per
-                                // chain entry); by_handle stays canonical on chain[0].
+                                // 6-Z480: kernel pool recruitment on the successful addWithChain
+                                // reply — THE rn451 wall: the health@2.1-service registered
+                                // (handle 0x8) and never read again (its one thread is the
+                                // healthd ep_poll mainloop), so BatteryService's
+                                // interfaceDescriptor probe sat in the conn's inbox until the
+                                // 6-Z407 8 s expiry → getService null → onStart threw →
+                                // "Failure starting system services". The real kernel recruits
+                                // the pool on THIS read (binder_thread_read, a non-looper
+                                // thread's read with waiting_threads empty) — so does the proxy
+                                // now, gated by z480_needs_pool_recruitment.
+            if z480_needs_pool_recruitment(bus, conn_id) {
+                spawn_looper = true;
+                info!(
+                    "[KR64][binder][svc] 6-Z480: pool recruitment armed on HIDL addWithChain '{}' reply (conn={}) — the kernel's BR_SPAWN_LOOPER for a service proc with zero parked loopers",
+                    key, conn_id
+                );
+            }
+            // 6-Z351 (rn302 decode): the REAL hwservicemanager registers
+            // the service under EVERY interfaceChain entry — AOSP
+            // ServiceManager.cpp addImpl (android-11.0.0_r1): per chain
+            // fqName, insertService/setService + a per-fq
+            // sendPackageRegistrationNotification — ONE HidlService
+            // object, many fq keys. rn302 proved the wall: the composer
+            // registered @2.3::IComposer/default (chain[0] = [@2.3, @2.2,
+            // @2.1, IBase], handle 0x28) and the 6-Z350b ancestor
+            // getTransport answered SF's @2.1 transport probe — but the
+            // SUBSEQUENT `sm->get(@2.1::IComposer/default)`
+            // (getRawServiceInternal, after the transport hit) is an
+            // EXACT map lookup that missed → "getService: Trying again
+            // for android.hardware.graphics.composer@2.1::IComposer/
+            // default" ×537 → SF never published → rung 7. With the
+            // chain inserted, the real SM's exact-key get() hits — the
+            // whole ancestor-get class (composer@2.1, keymaster@4.0,
+            // soundtrigger@2.0/2.1, wifi@1.0-1.3, camera@2.4/2.5,
+            // bluetooth@1.0, thermal@1.0 …) is served by registration
+            // shape, not by a lookup hack. Aliases share the chain[0]
+            // HANDLE (one node identity — the kernel hands the same
+            // process the same handle for the same node) and fire their
+            // own onRegistration callbacks (the real loop notifies per
+            // chain entry); by_handle stays canonical on chain[0].
             let mut alias_count = 0usize;
             for alias_fq in chain.iter().skip(1) {
                 let alias_key = format!("{}/{}", alias_fq, name);
@@ -15655,6 +15742,187 @@ mod tests {
                 );
             }
             _ => panic!("HIDL onRegistration not queued"),
+        }
+    }
+
+    /// 6-Z480: an HIDL add from a process with NO parked reader must arm
+    /// the kernel pool recruitment (ReplySpawnLooper) — the healthd-style
+    /// service class (register + own mainloop, never joinRpcThreadpool)
+    /// gains its first looper at the registration reply, exactly like the
+    /// real kernel's binder_thread_read BR_SPAWN_LOOPER recruitment. rn451:
+    /// the health@2.1-service registered handle 0x8 and never read again;
+    /// BatteryService's interfaceDescriptor probe expired (6-Z407) →
+    /// getService null → "Failure starting system services".
+    #[test]
+    fn z480_hidl_add_recruits_pool_for_readerless_registration() {
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        // Stamp the identity the SO_PEERCRED path stamps in production.
+        bus_state.conns.get_mut(&caller).unwrap().sender_pid = 2851;
+        bus_state.conns.get_mut(&caller).unwrap().dev_code = 2;
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+
+        // add(String name, IBase service): [string name][flat].
+        let req = hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|b| {
+            b.string_arg("android.hardware.health@2.1::IHealth");
+            b.binder_arg(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0x1000,
+                cookie: 0x2000,
+            });
+        });
+        match servicemanager_hidl(HIDL_SM_ADD, &req, &bus, caller) {
+            TransactionResult::ReplySpawnLooper { mirror, .. } => {
+                // Mirror may be None in the test env (the 6-Z306ae-f
+                // liveness probe peeks GUEST memory — unreadable here →
+                // Unknown → no mirror). The variant itself pins the
+                // recruitment: the read stream gains [BR_SPAWN_LOOPER].
+                let _ = mirror;
+            }
+            other => panic!(
+                "readerless add must ReplySpawnLooper, got: {}",
+                match other {
+                    TransactionResult::Failed => "Failed",
+                    TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::CompleteMirrored { .. } => "CompleteMirrored",
+                    TransactionResult::Reply { .. } => "Reply (no recruitment!)",
+                    TransactionResult::ReplySpawnLooper { .. } => unreachable!(),
+                    TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
+                }
+            ),
+        }
+    }
+
+    /// 6-Z480: addWithChain from a readerless process recruits the pool —
+    /// THE rn451 health-HAL wall, byte-for-byte: the addWithChain reply is
+    /// the read that the real kernel appends BR_SPAWN_LOOPER to.
+    #[test]
+    fn z480_add_with_chain_recruits_pool_for_readerless_registration() {
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        bus_state.conns.get_mut(&caller).unwrap().sender_pid = 2851;
+        bus_state.conns.get_mut(&caller).unwrap().dev_code = 2;
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+
+        // addWithChain(String name, IBase service, vec<string> chain):
+        // [string name][flat][vec chain].
+        let req = hidl_sm_request("android.hidl.manager@1.2::IServiceManager", &|b| {
+            b.string_arg("default");
+            b.binder_arg(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0x1000,
+                cookie: 0x2000,
+            });
+            b.vec_string_arg(&[
+                "android.hardware.health@2.1::IHealth",
+                "android.hardware.health@2.0::IHealth",
+                "android.hidl.base@1.0::IBase",
+            ]);
+        });
+        match servicemanager_hidl(HIDL_SM_ADD_WITH_CHAIN, &req, &bus, caller) {
+            TransactionResult::ReplySpawnLooper { .. } => {
+                // The variant itself pins the recruitment; the mirror is
+                // env-dependent (the liveness probe peeks guest memory).
+            }
+            other => panic!(
+                "readerless addWithChain must ReplySpawnLooper, got: {}",
+                match other {
+                    TransactionResult::Failed => "Failed",
+                    TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::CompleteMirrored { .. } => "CompleteMirrored",
+                    TransactionResult::Reply { .. } => "Reply (no recruitment!)",
+                    TransactionResult::ReplySpawnLooper { .. } => unreachable!(),
+                    TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
+                }
+            ),
+        }
+    }
+
+    /// 6-Z480: the gate must NOT recruit when a sibling conn of the same
+    /// (pid, device) is already parked in an ioctl — the kernel's
+    /// `waiting_threads` non-empty shape. The plain-Reply variant asserts
+    /// the negative (no flat → no mirror → Reply means no recruitment).
+    #[test]
+    fn z480_recruitment_skipped_when_sibling_parked_reader_exists() {
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        bus_state.conns.get_mut(&caller).unwrap().sender_pid = 2851;
+        bus_state.conns.get_mut(&caller).unwrap().dev_code = 2;
+        // A sibling of the SAME process on the SAME device, already parked.
+        let sibling = bus_state.register_conn();
+        bus_state.conns.get_mut(&sibling).unwrap().sender_pid = 2851;
+        bus_state.conns.get_mut(&sibling).unwrap().dev_code = 2;
+        bus_state.conns.get_mut(&sibling).unwrap().reader_waiting = true;
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+
+        // add without a flat: no mirror either — a plain Reply pins BOTH
+        // negatives (no acquire mirror, no pool recruitment).
+        let req = hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|b| {
+            b.string_arg("android.hardware.health@2.1::IHealth");
+        });
+        match servicemanager_hidl(HIDL_SM_ADD, &req, &bus, caller) {
+            TransactionResult::Reply { data, .. } => {
+                // [status ok][i32 1] — the add success shape.
+                assert_eq!(&data[0..8], &[0, 0, 0, 0, 1, 0, 0, 0]);
+            }
+            other => panic!(
+                "add with a parked sibling must stay plain Reply, got: {}",
+                match other {
+                    TransactionResult::Failed => "Failed",
+                    TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::CompleteMirrored { .. } => "CompleteMirrored",
+                    TransactionResult::Reply { .. } => unreachable!(),
+                    TransactionResult::ReplySpawnLooper { .. } => "ReplySpawnLooper (recruited!)",
+                    TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
+                }
+            ),
+        }
+    }
+
+    /// 6-Z480: the gate is (pid, device)-scoped — a parked reader on the
+    /// BINDER device must not suppress the recruitment of a HWBINDER
+    /// registration (system_server runs both contexts; kernel
+    /// waiting_threads are per-proc-device).
+    #[test]
+    fn z480_recruitment_scoped_to_same_pid_and_device() {
+        let mut bus_state = BusState::new();
+        let caller = bus_state.register_conn();
+        bus_state.conns.get_mut(&caller).unwrap().sender_pid = 2851;
+        bus_state.conns.get_mut(&caller).unwrap().dev_code = 2;
+        // Same pid, DIFFERENT device (dev=1 binder) parked — must NOT gate.
+        let sibling_binder = bus_state.register_conn();
+        bus_state.conns.get_mut(&sibling_binder).unwrap().sender_pid = 2851;
+        bus_state.conns.get_mut(&sibling_binder).unwrap().dev_code = 1;
+        bus_state
+            .conns
+            .get_mut(&sibling_binder)
+            .unwrap()
+            .reader_waiting = true;
+        // Different pid, same device parked — must NOT gate either.
+        let other_pid = bus_state.register_conn();
+        bus_state.conns.get_mut(&other_pid).unwrap().sender_pid = 9999;
+        bus_state.conns.get_mut(&other_pid).unwrap().dev_code = 2;
+        bus_state.conns.get_mut(&other_pid).unwrap().reader_waiting = true;
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(bus_state));
+
+        let req = hidl_sm_request("android.hidl.manager@1.0::IServiceManager", &|b| {
+            b.string_arg("android.hardware.health@2.1::IHealth");
+        });
+        match servicemanager_hidl(HIDL_SM_ADD, &req, &bus, caller) {
+            TransactionResult::ReplySpawnLooper { .. } => {}
+            other => panic!(
+                "cross-pid/cross-device parked readers must not gate the recruitment, got: {}",
+                match other {
+                    TransactionResult::Failed => "Failed",
+                    TransactionResult::CompleteOnly => "CompleteOnly",
+                    TransactionResult::CompleteMirrored { .. } => "CompleteMirrored",
+                    TransactionResult::Reply { .. } => "Reply (wrongly gated!)",
+                    TransactionResult::ReplySpawnLooper { .. } => unreachable!(),
+                    TransactionResult::ReplyMirrored { .. } => "ReplyMirrored",
+                }
+            ),
         }
     }
 
