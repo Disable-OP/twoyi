@@ -4,13 +4,13 @@
 # verdict markers, formatted for fast reading.
 #
 # Usage: fetch_z296.sh <run_id> [outdir]
-# Requires: GITHUB_TOKEN (or (private environment)/token)
+# Requires: GITHUB_TOKEN (exported from the caller's private environment;
+# authentication is never embedded in the repository).
 set -u
 RUN="${1:?usage: fetch_z296.sh <run_id> [outdir]}"
 OUT="${2:-/tmp/z296-${RUN}}"
 REPO="Disable-OP/twoyi"
 TOKEN="${GITHUB_TOKEN:-}"
-[ -n "$TOKEN" ] || TOKEN="$(cat (private environment)/token 2>/dev/null)"
 [ -n "$TOKEN" ] || { echo "no GITHUB_TOKEN"; exit 1; }
 
 mkdir -p "$OUT"
