@@ -40629,11 +40629,16 @@ pub fn run_ptrace_loop(
                                 // target is held at its crash point RIGHT
                                 // NOW; /proc/<parent>/maps read here is the
                                 // era-true map the tombstone's own maps
-                                // section lacks. Budgeted: 6 full-text
+                                // section lacks. Budgeted: 12 full-text
                                 // snapshots per boot (the rn440 crash-loop
-                                // fleet's 6 system_server generations fit);
-                                // every capture logs a header + the
-                                // 6-Z472m-prefixed map lines.
+                                // fleet's 6 system_server generations fit —
+                                // rn442's grew to 12 hand-offs: 9
+                                // system_server gens + bootanimation + 2
+                                // vendor HAL gens, and captures 7-12 still
+                                // fired — the rn442 decode needed era-true
+                                // maps from gens 5 and 7); every capture
+                                // logs a header + the 6-Z472m-prefixed map
+                                // lines.
                                 {
                                     static Z472_SNAPSHOTS: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
@@ -40653,16 +40658,30 @@ pub fn run_ptrace_loop(
                                             .and_then(|s| z472_stat_state(&s))
                                             .unwrap_or_else(|| "?".to_string());
                                     log(&format!(
-                                        "6-Z472: hand-off target snapshot pid={} cmdline={:?} state={} maps={} (dump {}/6 budget)",
+                                        "6-Z472: hand-off target snapshot pid={} cmdline={:?} state={} maps={} (dump {}/12 budget)",
                                         parent,
                                         z472_cmd,
                                         z472_state,
                                         if z472_maps.is_ok() { "captured" } else { "unreadable" },
                                         z472_n + 1
                                     ));
-                                    if z472_n < 6 {
+                                    // 6-Z474 (rn442 decode): the line budget
+                                    // 400→1600. The rn442 gen-5/gen-7
+                                    // SIGSEGV-0x0 pcs sat ~344KB above the
+                                    // 400-line cut (the libandroid_servers.so
+                                    // .text region) — the capture ended at
+                                    // 0xf71422961000 while pc=0xf714273d4384
+                                    // was era-unresolvable from the snapshot
+                                    // alone (the decode only recovered via
+                                    // boot-independent file-offset math
+                                    // against the crash registers). 1600
+                                    // lines ≈ the full crash-era system_server
+                                    // map (400 entries ≈ 25% of it) with a
+                                    // still-bounded ~192KB worst-case text
+                                    // cost per capture.
+                                    if z472_n < 12 {
                                         if let Ok(maps) = z472_maps {
-                                            for ml in maps.lines().take(400) {
+                                            for ml in maps.lines().take(1600) {
                                                 log(&format!("6-Z472m: {}", ml));
                                             }
                                         }
