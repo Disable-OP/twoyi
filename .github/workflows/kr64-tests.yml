@@ -59,7 +59,7 @@ jobs:
           echo "dispatch on behalf of head commit: ${GITHUB_SHA::7}"
           gh api "repos/${{ github.repository }}/actions/workflows/ui-e2e-android-arm64.yml/dispatches" \
             --input - <<'JSON'
-          {"ref": "main", "inputs": {"confirm_dispatch": "yes", "expect_rung": "0", "boot_wait_seconds": "180", "stall_seconds": "90", "import_wait_seconds": "300"}}
+          {"ref": "main", "inputs": {"confirm_dispatch": "yes", "expect_rung": "0", "boot_wait_seconds": "1800", "stall_seconds": "90", "import_wait_seconds": "300"}}
           JSON
           echo "boot ladder dispatched on main"
 
