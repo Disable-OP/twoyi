@@ -3433,6 +3433,23 @@ static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
     return 0;
 
 fail:
+    // 6-Z478: budgeted wire-failure evidence. The rn447 decode proved a
+    // proxy-wire hiccup here used to be INVISIBLE (the caller — e.g. the
+    // mmap hook's BINDER_VERSION probe — only saw a generic -1 and
+    // misclassified the fd as non-binder, killing the whole transport
+    // client-side). Name the request + the live errno, 8 shots per
+    // process (the same bounded-diag discipline as mmap_fail_log).
+    {
+        static unsigned proxy_ioctl_fail_log = 0;
+        if (proxy_ioctl_fail_log < 8) {
+            proxy_ioctl_fail_log++;
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] binder proxy ioctl FAIL fd=%d req=0x%x errno=%d\n",
+                     fd, req, errno);
+            write_str(2, msg);
+        }
+    }
     return -1;
 }
 
@@ -5085,10 +5102,29 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
             return MAP_FAILED;
         }
 
-        // mmap failed on a NON-fb fd — check if this might be a binder fd
-        // by trying BINDER_VERSION ioctl (pre-6-Z224 behavior, but now
-        // skipped for fb fds: probing an fb fd with binder ioctls is what
-        // produced the misleading ENOTTY).
+        // mmap failed on a NON-fb fd — binder-fd detection.
+        //
+        // 6-Z478: the shlib's OWN bookkeeping is authoritative for the fds
+        // IT created. A proxy/fallback fd registered by
+        // binder_open_fallback() is a binder fd BY CONSTRUCTION — the old
+        // BINDER_VERSION-probe-only detection was redundant for them and
+        // HARMFUL: the probe rides the proxy wire (the ioctl hook), and a
+        // wire hiccup misclassifies the fd as non-binder → MAP_FAILED →
+        // ProcessState::initWithDriver dies → the whole transport is dead
+        // CLIENT-SIDE for the process (rn447's byte-exact evidence: the
+        // gen-1-era ProcessState mmap — fd=6, len=1040384, prot=PROT_READ,
+        // MAP_PRIVATE — on a CONNECTED proxy socket failed ENODEV with NO
+        // anon fallback; the zero-SM-transaction ISystemSuspend NULL-proxy
+        // once-poison (libandroid_servers+0x86384 SIGSEGV, Task 207/208)
+        // and the IHealth 30 s BatteryService class are the visible
+        // faces). The probe remains for UNKNOWN fds (genuine binderfs
+        // opens that mapped weirdly); the sets answer first.
+        if (binder_fd_is_proxy(fd) || binder_fd_is_fallback(fd)) {
+            write_str(2,
+                      "[twoyi_loader] mmap on binder proxy/fallback fd -> using MAP_ANONYMOUS (6-Z478 set-verified)\n");
+            errno = 0;
+            return real_mmap(addr, length, prot, flags | MAP_ANONYMOUS, -1, 0);
+        }
         int vers = 0;
         if (ioctl(fd, 0xc0046209, &vers) == 0 || ioctl(fd, 0xc004620d, &vers) == 0) {
             // This is a binder fd — return anonymous mapping
