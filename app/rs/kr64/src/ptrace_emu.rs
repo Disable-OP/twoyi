@@ -1303,6 +1303,16 @@ struct ChildAbi {
     getsockopt_nr: i64,
     close_nr: i64,
     fcntl_nr: i64,
+    // 6-Z477: the STDIO-DISPLACEMENT net — the close-only floor missed the
+    // dup2 family (a dup2/dup3 onto a stdio slot DISPLACES the pinned
+    // object kernel-side with NO close() at all: the 6-Z475f ground truth
+    // showed fd 0's object changing across eras — the belt's /dev/null →
+    // a svclog file → a /system_ext directory fd — with ZERO close events,
+    // the dup2 signature). aarch64 has NO dup2 (bionic dup2() lowers to
+    // dup3 or fcntl) — dup2_nr stays -1 there and dup3_nr=24 carries the
+    // arm; x86_64 keeps both (33 / 292).
+    dup2_nr: i64,
+    dup3_nr: i64,
     // ── Task 6-Z110: property-service CLIENT emulation — the child
     // connect(@property_service) wall ──────────────────────────────
     //
@@ -1905,6 +1915,9 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     getsockopt_nr: 55,
     close_nr: 3,
     fcntl_nr: 72,
+    // 6-Z477: dup2=33, dup3=292 (asm/unistd_64.h).
+    dup2_nr: 33,
+    dup3_nr: 292,
     // 6-Z110: connect (x86_64 nr=42 per asm/unistd_64.h) + writev
     // (x86_64 nr=20 per asm/unistd_64.h). Both verified against the
     // kernel UAPI header in 6-Z110. The runtime AOSP guest is x86_64,
@@ -2321,6 +2334,9 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     getsockopt_nr: 365,
     close_nr: 6,
     fcntl_nr: 55,
+    // 6-Z477: i386 dup2=63, dup3=330 (syscall_32.tbl).
+    dup2_nr: 63,
+    dup3_nr: 330,
     // 6-Z305l: i386 connect = 362 (was 361 = bind). Same off-by-one
     // batch as the socket family above. writev = 146. The direct i386
     // connect number does NOT fire at runtime (bionic i386 normally
@@ -2715,6 +2731,10 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     getsockopt_nr: 209,
     close_nr: 57,
     fcntl_nr: 25,
+    // 6-Z477: aarch64 has NO dup2 (asm-generic) — bionic dup2() lowers
+    // to dup3(24) or fcntl; dup2_nr stays -1 and NEVER fires.
+    dup2_nr: -1,
+    dup3_nr: 24,
     // 6-Z110: aarch64 connect = 203 (per asm-generic/unistd.h:
     // __NR_connect 203) and writev = 66 (per asm-generic/unistd.h:
     // __NR_writev 66). The host is x86_64 running an i386 child, so
@@ -2929,6 +2949,9 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     getsockopt_nr: 295,
     close_nr: 6,
     fcntl_nr: 55,
+    // 6-Z477: arm32 dup2=63, dup3=358 (EABI table).
+    dup2_nr: 63,
+    dup3_nr: 358,
     connect_nr: 283,
     writev_nr: 146,
     // 6-Z305h sampler numbers (arch/arm/tools/syscall.tbl): mprotect=125.
@@ -16551,6 +16574,56 @@ fn z475_map_line_collapsible(line: &str) -> bool {
     }
 }
 
+/// 6-Z477b (pure): walk an AArch64 frame-pointer chain from `head` via the
+/// caller-supplied word reader. Each frame: [fp] = the next fp, [fp+8] =
+/// the return address. The walk stops on: the cap, a NULL/unaligned/fp<=
+/// previous fp (the chain only grows upward), or an unreadable slot.
+/// Returns the return-address pcs in walk order (frame #1 onward — the
+/// abort-site pc itself lives in the regs, not the chain).
+fn z477_walk_fp_chain<F>(head: u64, read: &mut F, cap: usize) -> Vec<u64>
+where
+    F: FnMut(u64) -> Option<u64>,
+{
+    let mut out: Vec<u64> = Vec::new();
+    let mut fp = head;
+    let mut prev: u64 = 0;
+    while out.len() < cap {
+        if fp == 0 || fp <= prev || fp % 8 != 0 {
+            break;
+        }
+        let lr = match read(fp + 8) {
+            Some(v) if v != 0 => v,
+            _ => break,
+        };
+        out.push(lr);
+        prev = fp;
+        match read(fp) {
+            Some(next) => fp = next,
+            None => break,
+        }
+    }
+    out
+}
+
+/// 6-Z477b (pure): resolve candidate pcs against the exec-region table
+/// `(start, end, name)`. A pc inside a region resolves to
+/// `name+0xOFFSET`; a pc outside every region resolves to `pc=<raw>` —
+/// BOTH are emitted (the raw form still anchors against the vendored
+/// rootfs offline, the rn442 lesson). The input order is preserved (the
+/// FP chain's order IS the call order).
+fn z477_resolve_stack_pcs(pcs: &[u64], regions: &[(u64, u64, &str)]) -> Vec<String> {
+    pcs.iter()
+        .map(
+            |pc| match regions.iter().find(|(s, e, _)| s <= pc && pc < e) {
+                Some((s, _e, name)) => {
+                    format!("{}+0x{:x}", name, pc - s)
+                }
+                None => format!("pc={:#x}", pc),
+            },
+        )
+        .collect()
+}
+
 /// 6-Z475 (pure): the head+tail line picker for the era-true map
 /// capture. rn443's decode proved a FLAT front-budget loses the crash
 /// era: system_server's map runs dalvik/anon first (the 1600-line cut
@@ -18808,6 +18881,19 @@ pub fn run_ptrace_loop(
     // own stdio wiring stays untouched.
     let mut z475_sserver_floor_pids: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // 6-Z477: the dup2-floor's in-flight rewrites — pid → the honest dup2
+    // return value (the target fd) forced at the EXIT stop (dup2's success
+    // contract: the caller expects the NEWFD back, not 0). Consumed and
+    // removed at the EXIT site next to the z305y zclose consumption.
+    let mut z477_dup2_ret_pending: std::collections::HashMap<libc::pid_t, i64> =
+        std::collections::HashMap::new();
+    // 6-Z477: per-pid readlink budget for the /dev/null-source check (the
+    // belt refills 0/1/2 = 3 dup2s per process era; 8 per pid covers the
+    // belt + slack). Past the budget the arm DENIES without the readlink
+    // (fail-closed: a post-budget displacement would silently break the
+    // floor; the belt always fits its own budget).
+    let mut z477_dup2_readlink_budget: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
     // ── 6-Z306: the ZYGOTE FORK-GATE FD SWEEP ────────────────────────
     //
     // Ladder #159 (e4e978a) decode: the zygote preloads FAST (12110
@@ -31221,6 +31307,109 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
+                        // ── 6-Z477: THE STDIO-DISPLACEMENT NET ──────────
+                        //
+                        // rn446's decode killed the last assumption of the
+                        // close-only floor: the fork-armed floor HELD (fd 0
+                        // = the zygote's inherited object at every death
+                        // era, hand-off AND dump — zero close() got past
+                        // the rewrite), yet the fdsan exchange abort
+                        // SURVIVED on the ADB-JDWP Connec tid with fd 0 =
+                        // a TAGGED /system_ext directory fd. The object
+                        // archaeology (the 6-Z475f tables across eras:
+                        // the belt's /dev/null → a svclog file → the
+                        // system_ext dir fd) shows fd 0's OBJECT changing
+                        // with ZERO close events — the dup2/dup3
+                        // signature: a dup2 onto an occupied stdio slot
+                        // DISPLACES the pinned object kernel-side without
+                        // any close() at all, while the floor mask (and
+                        // every close-rewrite) keeps believing the slot
+                        // is held. The displaced belt /dev/null left the
+                        // slot to whatever the churn dup2'd next; the
+                        // dir fd's zygote-era unique_fd adoption set the
+                        // bionic tag that the gens then INHERIT — the
+                        // JDWP thread's fresh `unique_fd::reset(0)`-class
+                        // adoption of the number 0 aborts on the foreign
+                        // tag (expected-unowned vs owned-by-0x7b0).
+                        //
+                        // THE FIX (the real-device semantic): the ONLY
+                        // legitimate mover of a floored stdio slot is a
+                        // /dev/null refill — what init does on a physical
+                        // device and what the loader's belt already does.
+                        // A dup2/dup3 whose TARGET is a floored stdio
+                        // slot and whose SOURCE is not /dev/null is the
+                        // anomaly class: rewritten to the getpid no-op
+                        // (the 6-Z147/6-Z305y/6-Z475 precedent) with the
+                        // honest dup2 return value (the target fd) forced
+                        // at EXIT. Fail-closed past the readlink budget.
+                        n if (abi.dup2_nr != -1 && n == abi.dup2_nr)
+                            || (abi.dup3_nr != -1 && n == abi.dup3_nr) =>
+                        {
+                            let src_fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            let dst_fd = get_syscall_arg(&regs, abi.reg_arg2) as i64;
+                            if dst_fd >= 0 && dst_fd <= 2 {
+                                let z477_floor_pid =
+                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid);
+                                if z305y_stdio_pin_pid == Some(pid)
+                                    || z475_sserver_floor_pids.contains(&z477_floor_pid)
+                                {
+                                    static Z477_DENY_LOGGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let budget_entry =
+                                        z477_dup2_readlink_budget.entry(pid).or_insert(0);
+                                    let budget_ok = *budget_entry < 8;
+                                    let src_is_devnull = if budget_ok {
+                                        *budget_entry += 1;
+                                        std::fs::read_link(format!("/proc/{}/fd/{}", pid, src_fd))
+                                            .map(|p| {
+                                                let t = p.to_string_lossy().into_owned();
+                                                t.ends_with("/dev/null")
+                                            })
+                                            .unwrap_or(false)
+                                    } else {
+                                        // fail-closed: past the per-pid budget
+                                        // the belt (3 refills) has long run;
+                                        // deny without the readlink.
+                                        false
+                                    };
+                                    if !src_is_devnull {
+                                        let z477_n = Z477_DENY_LOGGED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if z477_n < 24 {
+                                            // pc attribution (the 75d pattern):
+                                            // aarch64 regs[32] / x86_64[16]
+                                            #[cfg(target_arch = "aarch64")]
+                                            let z477_pc = unsafe {
+                                                *(&regs as *const Regs as *const u64).add(32)
+                                            };
+                                            #[cfg(target_arch = "x86_64")]
+                                            let z477_pc = unsafe {
+                                                *(&regs as *const Regs as *const u64).add(16)
+                                            };
+                                            #[cfg(not(any(
+                                                target_arch = "aarch64",
+                                                target_arch = "x86_64"
+                                            )))]
+                                            let z477_pc: u64 = 0;
+                                            let z477_region = maps_region_for_pc(pid, z477_pc);
+                                            log(&format!(
+                                                "6-Z477: dup-floor DENY pid={} dup({},{}) → getpid rewrite (non-/dev/null source displacing a floored stdio slot) pc={:#x} maps[pc]={}",
+                                                pid, src_fd, dst_fd, z477_pc, z477_region
+                                            ));
+                                        }
+                                        z477_dup2_ret_pending.insert(pid, dst_fd);
+                                        set_syscall_num(&mut regs, &abi, abi.getpid);
+                                        if ptrace_setregs(pid, &regs, iov_len).is_err() {
+                                            z477_dup2_ret_pending.remove(&pid);
+                                            log(&format!(
+                                                "6-Z477: dup-floor setregs FAILED pid={} — the dup2 will execute",
+                                                pid
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         436 => {
                             // close_range(first, last, flags) — if the
                             // range covers ANY standard descriptor, NAME
@@ -31469,6 +31658,114 @@ pub fn run_ptrace_loop(
                             } else {
                                 get_syscall_arg(&regs, abi.reg_arg2) as i64
                             };
+
+                            // ── 6-Z477b: THE EXCHANGE-CLASS STACK CAPTURE ──
+                            //
+                            // The fdsan exchange abort ends at
+                            // tgkill(tgid, tid, SIGABRT) — the aborting
+                            // thread's OWN syscall — and the tracer stops
+                            // that syscall with the aborting thread's
+                            // registers IN HAND (x29 = the frame-pointer
+                            // chain head, x31 = sp). The tombstone's EHABI
+                            // unwinder died at the libc abort frames
+                            // (rn446: exactly two `<unknown>` frames), so
+                            // THIS is the only caller evidence the abort
+                            // will ever volunteer. Walk the FP chain (cap
+                            // 24) and scan the sp window (256 words),
+                            // resolve every candidate pc against the
+                            // rename-era exec-maps cache (the
+                            // tgid-resolved lookup — the aborting thread
+                            // shares the gen's map), emit budgeted (3 per
+                            // run). Pure observation — the tgkill then
+                            // flows through the pre-existing rewrite arms
+                            // untouched.
+                            if is_tgkill && sig_arg == 6 && !z475_sserver_floor_pids.is_empty() {
+                                let z477b_tgid =
+                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid);
+                                if z475_sserver_floor_pids.contains(&z477b_tgid)
+                                    || z305y_stdio_pin_pid == Some(pid)
+                                {
+                                    static Z477B_STACK_LOGGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z477B_STACK_LOGGED.load(std::sync::atomic::Ordering::Relaxed)
+                                        < 3
+                                    {
+                                        Z477B_STACK_LOGGED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        // the aborting thread's register file
+                                        #[cfg(target_arch = "aarch64")]
+                                        let (z477b_fp, z477b_sp, z477b_pc) = unsafe {
+                                            (
+                                                *(&regs as *const Regs as *const u64).add(29),
+                                                *(&regs as *const Regs as *const u64).add(31),
+                                                *(&regs as *const Regs as *const u64).add(32),
+                                            )
+                                        };
+                                        #[cfg(not(target_arch = "aarch64"))]
+                                        let (z477b_fp, z477b_sp, z477b_pc): (u64, u64, u64) =
+                                            (0, 0, 0);
+                                        // the region table: the rename-era
+                                        // cache for the tgid, else a fresh
+                                        // bounded parse
+                                        let z477b_regions_owned: Vec<(u64, u64, String)> =
+                                            match z306af_maps_cache.get(&z477b_tgid) {
+                                                Some(rows) => rows.clone(),
+                                                None => std::fs::read_to_string(format!(
+                                                    "/proc/{}/maps",
+                                                    z477b_tgid
+                                                ))
+                                                .map(|m| z306af_parse_exec_maps(&m))
+                                                .unwrap_or_default(),
+                                            };
+                                        let z477b_regions: Vec<(u64, u64, &str)> =
+                                            z477b_regions_owned
+                                                .iter()
+                                                .map(|(s, e, n)| (*s, *e, n.as_str()))
+                                                .collect();
+                                        // the FP chain (the aborting thread
+                                        // reads its OWN memory — the tracer
+                                        // reads it via the same pid)
+                                        let mut z477b_reader =
+                                            |addr: u64| read_child_u64(pid, addr);
+                                        let z477b_frames =
+                                            z477_walk_fp_chain(z477b_fp, &mut z477b_reader, 24);
+                                        // the sp window scan (256 words)
+                                        let mut z477b_scan: Vec<u64> = Vec::new();
+                                        if z477b_sp != 0 {
+                                            for i in 0..256u64 {
+                                                if let Some(w) =
+                                                    read_child_u64(pid, z477b_sp + i * 8)
+                                                {
+                                                    z477b_scan.push(w);
+                                                }
+                                            }
+                                        }
+                                        let z477b_frames_resolved =
+                                            z477_resolve_stack_pcs(&z477b_frames, &z477b_regions);
+                                        let z477b_scan_resolved: Vec<String> = {
+                                            let mut out: Vec<String> = Vec::new();
+                                            let mut seen: std::collections::HashSet<String> =
+                                                std::collections::HashSet::new();
+                                            for r in
+                                                z477_resolve_stack_pcs(&z477b_scan, &z477b_regions)
+                                            {
+                                                if seen.insert(r.clone()) && out.len() < 12 {
+                                                    out.push(r);
+                                                }
+                                            }
+                                            out
+                                        };
+                                        log(&format!(
+                                            "6-Z477b: exchange-class stack pid={} t={} abort-pc={:#x} fp-chain={:?} scan-resolved={:?}",
+                                            z477b_tgid,
+                                            pid,
+                                            z477b_pc,
+                                            z477b_frames_resolved,
+                                            z477b_scan_resolved
+                                        ));
+                                    }
+                                }
+                            }
 
                             // 6-Z305t-23: the fake-self reference set grows —
                             // tgkill(tgid=0, …) is ALWAYS EINVAL in the
@@ -40341,6 +40638,18 @@ pub fn run_ptrace_loop(
                         let mut regs_u: Regs = unsafe { std::mem::zeroed() };
                         if ptrace_getregs_wide(pid, &mut regs_u).is_ok() {
                             set_syscall_ret(&mut regs_u, &abi, 0);
+                            let _ = ptrace_setregs(pid, &regs_u, iov_len);
+                        }
+                    }
+                    // 6-Z477: the dup-floor's rewrite returns the honest
+                    // dup2 contract value — the TARGET fd (dup2 returns the
+                    // newfd on success; the caller's state machine expects
+                    // it, and a wrong return would send bionic's dup2 into
+                    // its EBADF retry path).
+                    if let Some(z477_ret) = z477_dup2_ret_pending.remove(&pid) {
+                        let mut regs_u: Regs = unsafe { std::mem::zeroed() };
+                        if ptrace_getregs_wide(pid, &mut regs_u).is_ok() {
+                            set_syscall_ret(&mut regs_u, &abi, z477_ret);
                             let _ = ptrace_setregs(pid, &regs_u, iov_len);
                         }
                     }
@@ -57811,6 +58120,57 @@ mod z472_snapshot_tests {
             .count();
         assert_eq!(mass_lines, 0, "no mass line may survive the collapse");
         assert!(!picked.iter().any(|l| l == "...[6-Z475m SNIP]..."));
+    }
+
+    /// 6-Z477b: the FP-chain walker. A healthy chain walks upward
+    /// ([fp] = next fp, [fp+8] = the return address); the walk stops on
+    /// NULL, non-monotonic, unaligned, or unreadable slots (a garbage
+    /// chain must produce a bounded prefix, never a hang or a panic).
+    #[test]
+    fn z477_walk_fp_chain_walks_and_stops() {
+        use super::z477_walk_fp_chain;
+        // synthetic memory: fp0 → fp1 → fp2 → NULL
+        let mem: std::collections::HashMap<u64, u64> = [
+            (0x1000, 0x2000), // [fp0] = next fp
+            (0x1008, 0xAA00), // [fp0+8] = return addr 1
+            (0x2000, 0x3000), // [fp1] = next fp
+            (0x2008, 0xBB00), // [fp1+8] = return addr 2
+            (0x3000, 0),      // [fp2] = NULL — chain end
+            (0x3008, 0xCC00),
+        ]
+        .into_iter()
+        .collect();
+        let mut read = |a: u64| mem.get(&a).copied();
+        let chain = z477_walk_fp_chain(0x1000, &mut read, 24);
+        // the OUTER frame ([fp2] = NULL — the chain top) still carries its
+        // return address in [fp2+8] — the walker captures it BEFORE the
+        // NULL next-fp ends the walk
+        assert_eq!(chain, vec![0xAA00, 0xBB00, 0xCC00]);
+        // a CYCLIC chain must stop at the cap without hanging
+        let cyc: std::collections::HashMap<u64, u64> =
+            [(0x1000, 0x1000), (0x1008, 0xAA00)].into_iter().collect();
+        let mut read_cyc = |a: u64| cyc.get(&a).copied();
+        let chain_cyc = z477_walk_fp_chain(0x1000, &mut read_cyc, 24);
+        assert!(chain_cyc.len() <= 24, "cycle must be bounded by the cap");
+        // unreadable slots end the walk cleanly
+        let mut read_dead = |_a: u64| -> Option<u64> { None };
+        assert!(z477_walk_fp_chain(0x1000, &mut read_dead, 24).is_empty());
+    }
+
+    /// 6-Z477b: the pc resolver — in-region pcs resolve to name+offset,
+    /// out-of-region pcs keep the raw form (both anchor offline), and the
+    /// input order (the call order) is preserved.
+    #[test]
+    fn z477_resolve_stack_pcs_resolves_and_preserves_order() {
+        use super::z477_resolve_stack_pcs;
+        let regions: Vec<(u64, u64, &str)> =
+            vec![(0x1000, 0x2000, "libc.so"), (0x3000, 0x4000, "libart.so")];
+        let resolved = z477_resolve_stack_pcs(&[0x1010, 0x3500, 0x9999, 0x1000], &regions);
+        assert_eq!(resolved[0], "libc.so+0x10");
+        assert_eq!(resolved[1], "libart.so+0x500");
+        assert_eq!(resolved[2], "pc=0x9999");
+        assert_eq!(resolved[3], "libc.so+0x0");
+        assert_eq!(resolved.len(), 4);
     }
 
     /// 6-Z475: the fd-name sort key — decimal parse, garbage sorts last
