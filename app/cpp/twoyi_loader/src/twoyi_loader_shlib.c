@@ -6949,7 +6949,7 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     char ld_library_path[2048];
     snprintf(ld_library_path, sizeof(ld_library_path),
         "LD_LIBRARY_PATH=/dev:%s/system/lib64:%s/system/lib64/bootstrap:%s/apex/com.android.runtime/lib64:%s/apex/com.android.runtime/lib64/bionic:%s/apex/com.android.runtime/lib64/bootstrap:%s/apex/com.android.art/lib64:%s/apex/com.android.i18n/lib64:%s/vendor/lib64:%s/apex/com.android.os.statsd/lib64:%s/system_ext/lib64:%s/product/lib64",
-        g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
+        g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
 
         // 6-Z305s-j: +4th slot for the NO_PROPS carry (see below) when the
     // gate is on — without it the shlib's exec hook re-arms the property
