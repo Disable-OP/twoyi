@@ -3084,6 +3084,81 @@ impl BusState {
         tx.sender_pid != target_pid
     }
 
+    /// 6-Z469: PROC-TODO TAKE — the waiting-looper half of the kernel's
+    /// target-thread selection, which 6-Z408 implements only as a HOLD.
+    ///
+    /// Kernel rule (binder.c): a sync transaction whose target thread is
+    /// parked inside its own call (the 6-Z408 hold case) is NOT lost and
+    /// NOT pinned to the parked thread's fd — it sits on the target
+    /// PROC's todo list where ANY waiting looper thread of that proc
+    /// (empty transaction stack, blocked in its own read) takes it and
+    /// serves it. rn435's decode proved the missing half: system_server
+    /// main (conn=227, pid 10485) parked mid-bootstrap while its OWN
+    /// pool threads (conns 237-240, same pid) issued sync code=34
+    /// transactions at nodes owned by main's conn — the gate held every
+    /// one in main's inbox, no idle sibling could reach it (the 6-Z399
+    /// steal excludes reader_waiting sources), the senders' 30s
+    /// REPLY_TIMEOUT fired → BR_FAILED_REPLY → retry loop (16 holds in
+    /// 288ms, then silent) → the bootstrap wedge → the Watchdog ANR/kill
+    /// fleet (3 ANR traces at OMS registerReceiver / idmap2 verifyIdmap
+    /// / BatteryService health-cast, all byte-shaped as a parked main +
+    /// an idle binder worker). The take makes the shape kernel-true.
+    ///
+    /// Preconditions, all kernel-true:
+    /// - the TAKER must be a true idle looper: no outstanding sync call
+    ///   of its own (rn362: a thread parked in waitForResponse must
+    ///   never receive non-nested work mid-wait);
+    /// - the SOURCE must be a same-process (same sender_pid) sibling —
+    ///   the proc todo belongs to the target proc — on the SAME device
+    ///   (6-Z309f: binder/hwbinder/vndbinder never cross);
+    /// - the source's inbox FRONT must be a sync transaction the 6-Z408
+    ///   gate is currently holding (the narrow, decode-verified class —
+    ///   non-held fronts keep the rn354 under-steal ordering semantics);
+    /// - one-way items are never held by the gate → never taken here.
+    ///
+    /// The popped item follows the 6-Z271g steal bookkeeping exactly
+    /// (pending_in removed from the source; the txn_stack push happens
+    /// in the caller under the same lock, mirroring the steal).
+    fn z469_take_held_sync(&mut self, taker: ConnId) -> Option<IncomingTx> {
+        let (my_pid, my_dev, i_am_idle) = match self.conns.get(&taker) {
+            Some(bx) => (bx.sender_pid, bx.dev_code, bx.out_sync.is_empty()),
+            None => return None,
+        };
+        if my_pid == 0 || !i_am_idle {
+            return None;
+        }
+        let mut sibs: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter(|(cid, bx)| {
+                **cid != taker
+                    && bx.sender_pid == my_pid
+                    && bx.dev_code == my_dev
+                    && match bx.inbox.front() {
+                        Some(InboxItem::Tx(tx)) => {
+                            tx.txn_id != 0 && self.z408_sync_delivery_blocked(**cid, tx)
+                        }
+                        _ => false,
+                    }
+            })
+            .map(|(cid, _)| *cid)
+            .collect();
+        sibs.sort();
+        for sib in sibs {
+            let sbx = self.conns.get_mut(&sib)?;
+            match sbx.inbox.pop_front() {
+                Some(InboxItem::Tx(tx)) => {
+                    if tx.txn_id != 0 {
+                        sbx.pending_in.retain(|id| *id != tx.txn_id);
+                    }
+                    return Some(tx);
+                }
+                _ => continue,
+            }
+        }
+        None
+    }
+
     /// Route a transaction to its owner's mailbox. Returns false when the
     /// owner is gone or its mailbox is full.
     fn queue_transaction(&mut self, tx: IncomingTx, owner: ConnId) -> bool {
@@ -5976,6 +6051,42 @@ fn handle_write_read(
                     "[KR64][binder][vm{}] process-pool steal: conn={} takes tx #{} queued for a sibling (code={})",
                     vm_id, conn_id, tx.txn_id, tx.code
                 );
+                    delivery = Delivery::Tx(tx);
+                }
+            }
+            // 6-Z469: PROC-TODO TAKE — an idle looper of the same process
+            // serves a 6-Z408-held sync transaction from a parked sibling's
+            // inbox (kernel: proc-todo work goes to ANY waiting looper
+            // thread of the target proc; see z469_take_held_sync). Runs
+            // after the 6-Z271g steal so the rn354 running-source
+            // semantics keep priority; only gate-HELD fronts are taken.
+            if matches!(delivery, Delivery::None) {
+                let taken = {
+                    let mut b = bus.lock().expect("binder bus poisoned");
+                    let tx = b.z469_take_held_sync(conn_id);
+                    if let Some(tx) = &tx {
+                        if tx.txn_id != 0 {
+                            if let Some(bx) = b.conns.get_mut(&conn_id) {
+                                // 6-Z306ag: PUSH onto the taking conn's
+                                // transaction stack (LIFO reply
+                                // correlation; same as the 6-Z271g steal).
+                                bx.txn_stack.push(tx.txn_id);
+                                z306ag_note_stack_depth(bx.txn_stack.len());
+                            }
+                        }
+                    }
+                    tx
+                };
+                if let Some(tx) = taken {
+                    static Z469_TAKE_LOG: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    if Z469_TAKE_LOG.load(Ordering::Relaxed) < 128 {
+                        Z469_TAKE_LOG.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            "[KR64][binder][vm{}] 6-Z469 proc-todo take: idle looper conn={} serves 6-Z408-held tx #{} from parked sibling (code={})",
+                            vm_id, conn_id, tx.txn_id, tx.code
+                        );
+                    }
                     delivery = Delivery::Tx(tx);
                 }
             }
@@ -18090,5 +18201,266 @@ mod tests {
             libc::close(pr);
             libc::close(pw);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 6-Z469 — PROC-TODO TAKE (the waiting-looper half of the 6-Z408 gate)
+    // ------------------------------------------------------------------
+
+    /// Test helper: a sync transaction shaped like the rn435 wedge burst
+    /// (pool thread → a node owned by its own process's parked main).
+    fn z469_tx(requester: ConnId, txn: u64, sender_pid: i32) -> IncomingTx {
+        IncomingTx {
+            requester,
+            txn_id: txn,
+            code: 34,
+            flags: 0x10,
+            one_way: false,
+            sender_pid,
+            sender_euid: 0,
+            blob: None,
+            ptr: 0x1000,
+            cookie: 0x2000,
+        }
+    }
+
+    /// The rn435 wedge shape, byte-true: main (conn 227, pid 10485)
+    /// parked mid-call to a FOREIGN process (out_sync target conn 89,
+    /// pid 500) while its OWN pool thread (conn 238, same pid) has a
+    /// sync txn held in main's inbox by the 6-Z408 gate; an idle pool
+    /// looper (conn 239, same pid + dev, no out_sync) takes it — kernel
+    /// proc-todo semantics (the waiting looper thread serves the proc's
+    /// held work so the parked thread is never involved).
+    #[test]
+    fn z469_idle_looper_takes_gate_held_sync_from_parked_sibling() {
+        let mut b = BusState::new();
+        for c in [227u64, 238, 239, 89] {
+            b.conns.insert(c, ConnBox::default());
+        }
+        b.conns.get_mut(&227).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&227).unwrap().dev_code = 1;
+        // main parked on a sync call to conn 89 (a foreign pid → the
+        // gate holds same-proc senders' work):
+        b.conns
+            .get_mut(&227)
+            .unwrap()
+            .out_sync
+            .push_back((900, 89, std::time::Instant::now()));
+        b.conns.get_mut(&238).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&238).unwrap().dev_code = 1;
+        b.conns.get_mut(&239).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&239).unwrap().dev_code = 1;
+        b.conns.get_mut(&89).unwrap().sender_pid = 500;
+        let tx = z469_tx(238, 3318, 10485);
+        b.conns
+            .get_mut(&227)
+            .unwrap()
+            .inbox
+            .push_back(InboxItem::Tx(tx));
+        b.conns.get_mut(&227).unwrap().pending_in.push(3318);
+
+        let taken = b
+            .z469_take_held_sync(239)
+            .expect("an idle same-proc looper must take the held sync txn");
+        assert_eq!(taken.txn_id, 3318);
+        assert_eq!(taken.requester, 238);
+        // source bookkeeping: popped from the parked main's inbox and
+        // pending_in (mirrors the 6-Z271g steal).
+        assert!(b.conns[&227].inbox.is_empty());
+        assert!(!b.conns[&227].pending_in.contains(&3318));
+    }
+
+    /// A looper with its own outstanding sync call NEVER takes (rn362:
+    /// a thread parked in waitForResponse must never receive non-nested
+    /// work mid-wait); the item stays queued for the owner conn.
+    #[test]
+    fn z469_busy_looper_never_takes() {
+        let mut b = BusState::new();
+        for c in [227u64, 239, 89] {
+            b.conns.insert(c, ConnBox::default());
+        }
+        b.conns.get_mut(&227).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&227).unwrap().dev_code = 1;
+        b.conns
+            .get_mut(&227)
+            .unwrap()
+            .out_sync
+            .push_back((900, 89, std::time::Instant::now()));
+        b.conns.get_mut(&239).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&239).unwrap().dev_code = 1;
+        // the taker is BUSY: its own sync call is outstanding:
+        b.conns
+            .get_mut(&239)
+            .unwrap()
+            .out_sync
+            .push_back((777, 41, std::time::Instant::now()));
+        b.conns.get_mut(&89).unwrap().sender_pid = 500;
+        b.conns
+            .get_mut(&227)
+            .unwrap()
+            .inbox
+            .push_back(InboxItem::Tx(z469_tx(238, 3318, 10485)));
+        assert!(
+            b.z469_take_held_sync(239).is_none(),
+            "a parked looper must not take non-nested work"
+        );
+        assert_eq!(b.conns[&227].inbox.len(), 1, "the item stays queued");
+    }
+
+    /// The take fires ONLY for gate-HELD fronts:
+    /// (a) the reentrant case (main parked on a call to the SENDER's
+    ///     own process) — the gate opens and main itself serves it on
+    ///     its next poll (kernel transaction-stack ride); the take must
+    ///     not race it;
+    /// (b) cross-pid taker (the proc todo belongs to the target proc);
+    /// (c) cross-device taker (6-Z309f: binder/hwbinder never cross);
+    /// (d) one-way items (txn_id 0) — the gate never holds them.
+    #[test]
+    fn z469_never_takes_unheld_cross_pid_cross_dev_or_oneway() {
+        // (a) NOT held: the parked call targets the sender's own proc.
+        let mut b = BusState::new();
+        for c in [227u64, 239, 89] {
+            b.conns.insert(c, ConnBox::default());
+        }
+        b.conns.get_mut(&227).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&227).unwrap().dev_code = 1;
+        b.conns
+            .get_mut(&227)
+            .unwrap()
+            .out_sync
+            .push_back((900, 89, std::time::Instant::now()));
+        b.conns.get_mut(&239).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&239).unwrap().dev_code = 1;
+        b.conns.get_mut(&89).unwrap().sender_pid = 10485; // same proc!
+        b.conns
+            .get_mut(&227)
+            .unwrap()
+            .inbox
+            .push_back(InboxItem::Tx(z469_tx(238, 3318, 10485)));
+        assert!(
+            b.z469_take_held_sync(239).is_none(),
+            "a gate-open (reentrant) front is served by the parked conn itself"
+        );
+
+        // (b) cross-pid taker.
+        let mut b2 = BusState::new();
+        for c in [227u64, 239, 89] {
+            b2.conns.insert(c, ConnBox::default());
+        }
+        b2.conns.get_mut(&227).unwrap().sender_pid = 10485;
+        b2.conns.get_mut(&227).unwrap().dev_code = 1;
+        b2.conns
+            .get_mut(&227)
+            .unwrap()
+            .out_sync
+            .push_back((900, 89, std::time::Instant::now()));
+        b2.conns.get_mut(&239).unwrap().sender_pid = 777; // foreign proc
+        b2.conns.get_mut(&239).unwrap().dev_code = 1;
+        b2.conns.get_mut(&89).unwrap().sender_pid = 500;
+        b2.conns
+            .get_mut(&227)
+            .unwrap()
+            .inbox
+            .push_back(InboxItem::Tx(z469_tx(238, 3318, 10485)));
+        assert!(
+            b2.z469_take_held_sync(239).is_none(),
+            "another process's looper must not take this proc's held work"
+        );
+
+        // (c) cross-device taker.
+        let mut b3 = BusState::new();
+        for c in [227u64, 239, 89] {
+            b3.conns.insert(c, ConnBox::default());
+        }
+        b3.conns.get_mut(&227).unwrap().sender_pid = 10485;
+        b3.conns.get_mut(&227).unwrap().dev_code = 1;
+        b3.conns
+            .get_mut(&227)
+            .unwrap()
+            .out_sync
+            .push_back((900, 89, std::time::Instant::now()));
+        b3.conns.get_mut(&239).unwrap().sender_pid = 10485;
+        b3.conns.get_mut(&239).unwrap().dev_code = 2; // hwbinder vs binder
+        b3.conns.get_mut(&89).unwrap().sender_pid = 500;
+        b3.conns
+            .get_mut(&227)
+            .unwrap()
+            .inbox
+            .push_back(InboxItem::Tx(z469_tx(238, 3318, 10485)));
+        assert!(
+            b3.z469_take_held_sync(239).is_none(),
+            "6-Z309f: held work never crosses devices"
+        );
+
+        // (d) one-way front (txn_id 0): the gate never holds it.
+        let mut b4 = BusState::new();
+        for c in [227u64, 239, 89] {
+            b4.conns.insert(c, ConnBox::default());
+        }
+        b4.conns.get_mut(&227).unwrap().sender_pid = 10485;
+        b4.conns.get_mut(&227).unwrap().dev_code = 1;
+        b4.conns
+            .get_mut(&227)
+            .unwrap()
+            .out_sync
+            .push_back((900, 89, std::time::Instant::now()));
+        b4.conns.get_mut(&239).unwrap().sender_pid = 10485;
+        b4.conns.get_mut(&239).unwrap().dev_code = 1;
+        b4.conns.get_mut(&89).unwrap().sender_pid = 500;
+        let mut oneway = z469_tx(238, 0, 10485);
+        oneway.one_way = true;
+        b4.conns
+            .get_mut(&227)
+            .unwrap()
+            .inbox
+            .push_back(InboxItem::Tx(oneway));
+        assert!(
+            b4.z469_take_held_sync(239).is_none(),
+            "one-way items ride the owner's own queue (never 6-Z408-held)"
+        );
+    }
+
+    /// Deterministic source selection: two parked siblings both holding
+    /// gate-held sync work → the take pops the LOWEST conn id first.
+    #[test]
+    fn z469_take_is_lowest_sibling_first() {
+        let mut b = BusState::new();
+        for c in [100u64, 200, 239, 89, 91] {
+            b.conns.insert(c, ConnBox::default());
+        }
+        b.conns.get_mut(&100).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&100).unwrap().dev_code = 1;
+        b.conns
+            .get_mut(&100)
+            .unwrap()
+            .out_sync
+            .push_back((900, 89, std::time::Instant::now()));
+        b.conns.get_mut(&200).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&200).unwrap().dev_code = 1;
+        b.conns
+            .get_mut(&200)
+            .unwrap()
+            .out_sync
+            .push_back((901, 91, std::time::Instant::now()));
+        b.conns.get_mut(&239).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&239).unwrap().dev_code = 1;
+        b.conns.get_mut(&89).unwrap().sender_pid = 500;
+        b.conns.get_mut(&91).unwrap().sender_pid = 600;
+        b.conns
+            .get_mut(&100)
+            .unwrap()
+            .inbox
+            .push_back(InboxItem::Tx(z469_tx(238, 1, 10485)));
+        b.conns
+            .get_mut(&200)
+            .unwrap()
+            .inbox
+            .push_back(InboxItem::Tx(z469_tx(238, 2, 10485)));
+        let taken = b
+            .z469_take_held_sync(239)
+            .expect("two held sources → the lowest conn id pops first");
+        assert_eq!(taken.txn_id, 1, "conn 100 < conn 200 → its txn pops first");
+        assert_eq!(b.conns[&100].inbox.len(), 0);
+        assert_eq!(b.conns[&200].inbox.len(), 1);
     }
 }
