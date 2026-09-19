@@ -52,6 +52,7 @@ static int qemu_pipe_open_fallback(const char *path, int real_fd, int saved_errn
 #include <sys/statfs.h>  // 6-Z143: struct statfs (the selinuxfs magic hook)
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>      // 6-Z471: struct timespec for the bounded-connect retry sleep
 // 6-Z355: SCM_RIGHTS ancillary support — alloca for the cmsg buffer, and
 // MSG_CMSG_CLOEXEC when the libc headers predate it (the kernel value is
 // stable; raw-syscall use needs no glibc feature macros).
@@ -5324,8 +5325,63 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
         if (un_6z428->sun_path[0] == '/' &&
             (strncmp(un_6z428->sun_path, "/dev/socket/tombstoned_crash", 28) == 0 ||
              strncmp(un_6z428->sun_path, "/dev/socket/tombstoned_java_trace", 33) == 0)) {
-            // Real connect first (raw syscall — no hook recursion).
-            int rc_6z428 = (int)syscall(SYS_connect, sockfd, addr, addrlen);
+            // 6-Z471: bound the CONNECT itself. The 6-Z428 SO_RCVTIMEO
+            // leg bounds the RESPONSE wait but cannot fire before
+            // connect() returns. rn437 (run 35425759933, Task 204):
+            // the crash_dump dump-worker blocked 30.3 s INSIDE
+            // SYS_connect to /dev/socket/tombstoned_crash (init's
+            // listen(fd, 1) backlog full — tombstoned's accept loop was
+            // not servicing: the 6-Z392 T-STOP fleet again) and the
+            // worker's own 30 s SIGALRM watchdog killed it mid-connect
+            // (the 6-Z415 probe: "blocked-in-kernel nr=203"; the final
+            // DIAG shows the interrupted connect, the ERESTARTSYS
+            // remnant 0xfffffffffffffe00). The dump never engraved, the
+            // SIGABRT target died evidence-free (6-Z309c fatal-EXIT
+            // sig=6 served=false), and the gen-2 respawn ground to the
+            // watch cap at rung 7.
+            //
+            // Mechanics (client-side, zero tracer interaction — the
+            // 6-Z415 lesson stands): try the connect NON-blocking.
+            // AF_UNIX NEVER returns EINPROGRESS: when the backlog is
+            // full the kernel fails the connect EAGAIN immediately, so
+            // a bounded retry loop (100 ms ppoll-free nanosleep
+            // between attempts, 10 s total cap) is the correct shape.
+            // A healthy tombstoned answers on the FIRST attempt — the
+            // loop costs one fcntl + one connect. A wedged queue burns
+            // 10 s and returns -ETIMEDOUT → tombstoned_connect()
+            // returns false → the AOSP-11 not-connected fallback → the
+            // 6-Z305t-24 svclog engrave → the CI harvest (the proven
+            // 6-Z428c route). An ALREADY-non-blocking fd is passed
+            // through with a single honest attempt (the caller chose
+            // the semantics; EAGAIN must not be masked).
+            int rc_6z428;
+            {
+                int fl_6z471 = (int)syscall(SYS_fcntl, sockfd, 3 /*F_GETFL*/);
+                int was_blocking_6z471 = 0;
+                if (fl_6z471 >= 0) {
+                    was_blocking_6z471 = (fl_6z471 & O_NONBLOCK) == 0;
+                    if (was_blocking_6z471)
+                        syscall(SYS_fcntl, sockfd, 4 /*F_SETFL*/,
+                                fl_6z471 | O_NONBLOCK);
+                }
+                rc_6z428 = (int)syscall(SYS_connect, sockfd, addr, addrlen);
+                if (rc_6z428 < 0 && was_blocking_6z471 && errno == EAGAIN) {
+                    int retries_6z471 = 0;
+                    for (;;) {
+                        if (++retries_6z471 > 100) { // 100 * 100 ms = 10 s
+                            rc_6z428 = -1;
+                            errno = ETIMEDOUT;
+                            break;
+                        }
+                        struct timespec ts_6z471 = { 0, 100 * 1000 * 1000 };
+                        syscall(SYS_nanosleep, &ts_6z471, NULL);
+                        rc_6z428 = (int)syscall(SYS_connect, sockfd, addr, addrlen);
+                        if (rc_6z428 == 0 || errno != EAGAIN) break;
+                    }
+                }
+                if (fl_6z471 >= 0 && was_blocking_6z471)
+                    syscall(SYS_fcntl, sockfd, 4 /*F_SETFL*/, fl_6z471);
+            }
             if (rc_6z428 == 0) {
                 // SO_RCVTIMEO = 8 s. aarch64 and x86_64 agree:
                 // SOL_SOCKET=1, SO_RCVTIMEO=20; struct timeval is

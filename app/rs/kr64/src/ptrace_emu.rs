@@ -1406,6 +1406,57 @@ struct ChildAbi {
     getxattr_nr: i64,
     lgetxattr_nr: i64,
     fgetxattr_nr: i64,
+    // ── 6-Z471: the crash_dump dump-budget leniency ABI slots ───────
+    //
+    // rn437 (run 35425759933, Task 204) named the last no-tombstone
+    // class byte-exactly: the crash_dump dump-WORKER died by its own
+    // SIGALRM watchdog 30.3 s after dispatch while STILL blocked inside
+    // connect() to the tombstoned socket (the 6-Z415 probe:
+    // "blocked-in-kernel nr=203"; the worker's own last-50 buffer
+    // carries the timer_create(107)/timer_settime(110)/timer_delete(111)
+    // watchdog-arming shape). rn395 recorded the same death class
+    // ("killed by SIGALRM (14) 30s after fork — the dump budget and the
+    // tombstone engrave window interact"); rn437 pinned the blocking
+    // syscall as connect. The 6-Z471a intercept re-arms the worker's
+    // OWN watchdog ×10 (30 s → 300 s cap) by rewriting the itimerspec
+    // it_value IN THE CHILD'S BUFFER at timer_settime/setitimer ENTRY —
+    // the syscall then reads the extended deadline itself, so no
+    // register path, no EXIT fake, and a genuinely-finished dump is
+    // byte-identical (a healthy dump never arms past 60 s anyway).
+    //
+    // Labels: the crash-dump-observed numbers are ALSO added to
+    // arm64_generic_syscall_name so every future last-50 buffer
+    // self-annotates (rn437's "nr=107, nr=110, nr=242" tail cost the
+    // decode a table lookup per number).
+    //
+    // Verified against the local kernel UAPI headers (the repo's
+    // verification pattern — /usr/include/asm-generic/unistd.h,
+    // /usr/include/x86_64-linux-gnu/asm/unistd_{32,64}.h):
+    //   aarch64 (asm-generic): getitimer=102, setitimer=103,
+    //     timer_create=107, timer_settime=110, timer_delete=111,
+    //     accept4=242. asm-generic has NO alarm (bionic's alarm() is a
+    //     setitimer wrapper) → -1.
+    //   x86_64: getitimer=36, alarm=37, setitimer=38, timer_create=222,
+    //     timer_settime=223, timer_delete=226, accept4=288.
+    //   i386:   alarm=27, setitimer=104, getitimer=105, timer_create=259,
+    //     timer_settime=260, timer_delete=263, accept4=364.
+    //   arm32:  -1 SENTINELS — the arm EABI table is NOT verifiable
+    //     from this sandbox's headers, and a WRONG timer_settime_nr
+    //     here would rewrite a DIFFERENT syscall's argument buffer (a
+    //     memory-write arm, not a label). The ladder is arm64-only;
+    //     arm32 keeps the honest "unverified → inert" semantics.
+    //
+    // The 6-Z471a memory rewrite itself is additionally gated on
+    // detect_child_is_64bit (the LP64 itimerspec layout: timespec =
+    // {i64,i64}, it_value at byte offset 16) — the i386 numbers above
+    // are label-complete but the rewrite arm never fires there.
+    getitimer_nr: i64,
+    setitimer_nr: i64,
+    timer_create_nr: i64,
+    timer_settime_nr: i64,
+    timer_delete_nr: i64,
+    accept4_nr: i64,
+    alarm_nr: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -1876,6 +1927,14 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     getxattr_nr: 191,
     lgetxattr_nr: 192,
     fgetxattr_nr: 193,
+    // 6-Z471: verified against /usr/include/x86_64-linux-gnu/asm/unistd_64.h
+    getitimer_nr: 36,
+    setitimer_nr: 38,
+    timer_create_nr: 222,
+    timer_settime_nr: 223,
+    timer_delete_nr: 226,
+    accept4_nr: 288,
+    alarm_nr: 37,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -2297,6 +2356,19 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // land in the corresponding 64-bit slots: rbx ← ebx, rcx ← ecx,
     // rdx ← edx, rsi ← esi. orig_rax ← orig_eax and rax ← eax are the
     // same slots for both bitnesses.
+    // 6-Z471: verified against /usr/include/x86_64-linux-gnu/asm/unistd_32.h
+    // (alarm=27, setitimer=104, getitimer=105, timer_create=259,
+    // timer_settime=260, timer_delete=263, accept4=364). LABEL-ONLY: the
+    // 6-Z471a memory rewrite is gated on detect_child_is_64bit (the i386
+    // itimerspec is two 32-bit timespecs — a 32-byte LP64 parse would be
+    // wrong), so the rewrite arm never fires on the 32-bit child.
+    getitimer_nr: 105,
+    setitimer_nr: 104,
+    timer_create_nr: 259,
+    timer_settime_nr: 260,
+    timer_delete_nr: 263,
+    accept4_nr: 364,
+    alarm_nr: 27,
     reg_syscall: 15, // orig_rax (same as 64-bit)
     reg_ret: 10,     // rax (same)
     reg_arg1: 5,     // rbx (NOT rdi which is 14)
@@ -2688,6 +2760,16 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     getxattr_nr: 8,
     lgetxattr_nr: 9,
     fgetxattr_nr: 10,
+    // 6-Z471: verified against /usr/include/asm-generic/unistd.h.
+    // asm-generic has NO alarm syscall (bionic's alarm() is a setitimer
+    // wrapper) → -1 sentinel.
+    getitimer_nr: 102,
+    setitimer_nr: 103,
+    timer_create_nr: 107,
+    timer_settime_nr: 110,
+    timer_delete_nr: 111,
+    accept4_nr: 242,
+    alarm_nr: -1,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -2873,6 +2955,18 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     getxattr_nr: 385,
     lgetxattr_nr: 386,
     fgetxattr_nr: 387,
+    // 6-Z471: -1 SENTINELS — the arm EABI timer/accept4 numbers are NOT
+    // verifiable from this sandbox's headers, and a wrong timer_settime_nr
+    // would make the 6-Z471a memory-rewrite arm corrupt a DIFFERENT
+    // syscall's argument buffer. Inert until verified against
+    // arch/arm/tools/syscall.tbl (the ladder is arm64-only).
+    getitimer_nr: -1,
+    setitimer_nr: -1,
+    timer_create_nr: -1,
+    timer_settime_nr: -1,
+    timer_delete_nr: -1,
+    accept4_nr: -1,
+    alarm_nr: -1,
     reg_syscall: 7, // r7 (arm EABI syscall number register)
     reg_ret: 0,     // r0
     reg_arg1: 0,    // r0
@@ -4737,6 +4831,25 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "bind"
     } else if abi.listen_nr != -1 && nr == abi.listen_nr {
         "listen"
+    } else if abi.accept4_nr != -1 && nr == abi.accept4_nr {
+        // 6-Z471: the timer/watchdog + accept4 family — the crash-dump-
+        // observed numbers the rn437 decode had to look up by hand
+        // (labels only; the numbers are header-verified on the ChildAbi
+        // field docs; arm32 keeps -1 sentinels so no real syscall can
+        // ever match these branches there).
+        "accept4"
+    } else if abi.timer_create_nr != -1 && nr == abi.timer_create_nr {
+        "timer_create"
+    } else if abi.timer_settime_nr != -1 && nr == abi.timer_settime_nr {
+        "timer_settime"
+    } else if abi.timer_delete_nr != -1 && nr == abi.timer_delete_nr {
+        "timer_delete"
+    } else if abi.setitimer_nr != -1 && nr == abi.setitimer_nr {
+        "setitimer"
+    } else if abi.getitimer_nr != -1 && nr == abi.getitimer_nr {
+        "getitimer"
+    } else if abi.alarm_nr != -1 && nr == abi.alarm_nr {
+        "alarm"
     } else if abi.openat == 56 && abi.execve == 221 {
         // 6-Z180: arm64 generic-name fallback. The aarch64 ABI carries
         // dedicated fields only for the syscalls the tracer INTERCEPTS;
@@ -4811,6 +4924,17 @@ fn arm64_generic_syscall_name(nr: i64) -> &'static str {
         99 => "set_robust_list",
         100 => "get_robust_list",
         101 => "nanosleep",
+        // 6-Z471: the crash_dump watchdog-arming family — rn437's
+        // worker last-50 tail read "nr=107, nr=110, nr=242" raw; with
+        // these entries the buffer self-annotates (labels only, no
+        // intercept on this path).
+        102 => "getitimer",
+        103 => "setitimer",
+        107 => "timer_create",
+        108 => "timer_gettime",
+        109 => "timer_getoverrun",
+        110 => "timer_settime",
+        111 => "timer_delete",
         113 => "clock_gettime",
         114 => "clock_getres",
         115 => "clock_nanosleep",
@@ -4853,6 +4977,18 @@ fn arm64_generic_syscall_name(nr: i64) -> &'static str {
         148 => "getresuid",
         150 => "getresgid",
         199 => "socketpair",
+        // 6-Z471: the socket round-trip family crash_dump's worker uses
+        // against tombstoned (rn437: connect(203) was the 30 s block;
+        // the DIAG annotations previously printed these raw).
+        203 => "connect",
+        206 => "sendto",
+        207 => "recvfrom",
+        208 => "setsockopt",
+        209 => "getsockopt",
+        210 => "shutdown",
+        211 => "sendmsg",
+        212 => "recvmsg",
+        242 => "accept4",
         202 => "accept",
         204 => "getsockname",
         205 => "getpeername",
@@ -16302,6 +16438,68 @@ fn z418_detach_decision(exec_tagged: bool, already_untraced: bool) -> bool {
     exec_tagged && !already_untraced
 }
 
+// ── 6-Z471: the crash_dump dump-budget leniency (pure core) ─────────
+//
+// rn437 (run 35425759933, Task 204) named the no-tombstone class:
+// the dump-worker died by its OWN SIGALRM watchdog 30.3 s after
+// dispatch while STILL blocked inside connect() to the tombstoned
+// socket — so the SIGABRT target (gen-1 system_server, host pid 10860)
+// died evidence-free (6-Z309c served=false) and the boot's primary
+// crash record was lost again (rn436's variant: the harvest window;
+// rn437's variant: the watchdog vs the wedged tombstoned accept loop).
+// rn395 had already recorded the same death shape ("killed by SIGALRM
+// (14) 30s after fork") without the connect attribution.
+//
+// The intercept (at the timer_settime/setitimer ENTRY sites) re-arms
+// the watchdog ×10 by rewriting it_value IN THE CHILD'S BUFFER — the
+// syscall reads the extended deadline itself. This pure core is the
+// full decision: which arming calls qualify for the rewrite.
+//
+// Contract (locked by the z471 tests):
+//   * absolute deadlines (TIMER_ABSTIME) are NEVER rewritten (the
+//     wall-clock semantics cannot be extended by editing the value);
+//   * a zero value is a DISARM, not a watchdog — untouched;
+//   * anything above 60 s is not a crash-dump watchdog shape (AOSP
+//     arms 30 s; rn395/rn437 both died at 30.3 s) — untouched, so a
+//     legitimate long timer keeps its honest deadline;
+//   * a qualifying 1..=60 s relative arming is extended ×10, capped
+//     at 300 s (the run's watch budget is 1800 s; the worker's own
+//     timeout must never outlive the boot watch's usefulness);
+//   * a corrupt nsec field (>= 1e9) is untouched (garbage in, no
+//     write out).
+
+/// 6-Z471: TIMER_ABSTIME flag (linux/time.h) — the only timer_settime
+/// flag that changes the rewrite semantics.
+pub(crate) const Z471_TIMER_ABSTIME: u64 = 1;
+
+/// 6-Z471: the cap for the extended watchdog deadline.
+pub(crate) const Z471_MAX_LENIENCY_SEC: u64 = 300;
+
+/// 6-Z471 (pure): the watchdog-arming decision for ONE it_value.
+///
+/// `is_absolute` = TIMER_ABSTIME was set (timer_settime) — always false
+/// for setitimer (interval timers are relative by definition). Returns
+/// the replacement it_value.tv_sec, or None when the call must NOT be
+/// rewritten.
+fn z471_watchdog_extension(is_absolute: bool, cur_sec: u64, cur_nsec: u64) -> Option<u64> {
+    if is_absolute {
+        return None;
+    }
+    if cur_nsec > 999_999_999 {
+        return None;
+    }
+    if cur_sec == 0 && cur_nsec == 0 {
+        // A disarm (it_value = 0) — not a watchdog arming.
+        return None;
+    }
+    // Round UP to whole seconds: 0.5 s is a 1-second watchdog.
+    let eff = cur_sec + u64::from(cur_nsec > 0);
+    if eff > 60 {
+        return None;
+    }
+    Some((eff * 10).min(Z471_MAX_LENIENCY_SEC))
+}
+
 /// 6-Z418 (pure): parse the PPid line of a /proc/<pid>/status body.
 fn z418_parse_ppid(status_text: &str) -> Option<libc::pid_t> {
     for line in status_text.lines() {
@@ -17931,6 +18129,16 @@ pub fn run_ptrace_loop(
     //   6-Z190 coverage sweep re-attaches them and emulation resumes.
     let mut z388_crash_dump_pids: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
+    // 6-Z471c: tagged crash_dump connects in flight — pid → (since, fd,
+    // sockaddr path). Recorded at every connect ENTRY from a tagged
+    // crash_dump pid, pruned by the periodic CONNECT-STALL probe (in
+    // the 6-Z390 block) once /proc stops reporting connect, and at the
+    // death-hygiene sites. Small: a crash_dump connects once or twice
+    // per generation.
+    let mut z471_connect_since: std::collections::HashMap<
+        libc::pid_t,
+        (std::time::Instant, i32, String),
+    > = std::collections::HashMap::new();
     let mut z388_handed_off: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     let mut z388_handed_off_to: std::collections::HashMap<libc::pid_t, libc::pid_t> =
@@ -20873,6 +21081,73 @@ pub fn run_ptrace_loop(
                     }
                 }
             }
+            // ── 6-Z471c: the tombstoned-connect stall probe ────────────
+            //
+            // rn437 (Task 204): the dump-worker sat blocked-in-kernel in
+            // connect(203) to /dev/socket/tombstoned_crash for its FULL
+            // 30 s watchdog window and died by SIGALRM — with the only
+            // witnesses being two 6-Z415 PROCFS-PROBE samples that never
+            // named the socket. This probe repeats the observation every
+            // 5 s for every recorded tagged crash_dump connect that is
+            // STILL in connect per /proc/<pid>/syscall, naming the fd and
+            // the sockaddr path. Prunes itself: /proc reporting a
+            // different syscall (the connect returned — healthy or
+            // 6-Z471-timed-out) or an unreadable /proc (dead) drops the
+            // entry. Bounded: 40 stall lines per boot.
+            {
+                static LAST_Z471_MS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                static Z471_STALL_LOGGED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if now_ms >= LAST_Z471_MS.load(std::sync::atomic::Ordering::Relaxed) + 5000
+                    && LAST_Z471_MS
+                        .compare_exchange(
+                            LAST_Z471_MS.load(std::sync::atomic::Ordering::Relaxed),
+                            now_ms,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                {
+                    // Classify every entry: still-in-connect (any age —
+                    // the 10 s gate is LOG-ONLY, never a prune) vs done.
+                    let mut stalled: Vec<(libc::pid_t, f64, i32, String)> = Vec::new();
+                    let mut done: Vec<libc::pid_t> = Vec::new();
+                    for (p, (t, fd, path)) in z471_connect_since.iter() {
+                        let elapsed = t.elapsed().as_secs_f64();
+                        match z404_procfs_syscall_nr(*p) {
+                            Some(nr) => {
+                                let is_connect = abi_map
+                                    .get(p)
+                                    .map(|a| a.connect_nr != -1 && nr == a.connect_nr)
+                                    .unwrap_or(false);
+                                if is_connect {
+                                    if elapsed >= 10.0 {
+                                        stalled.push((*p, elapsed, *fd, path.clone()));
+                                    }
+                                } else {
+                                    done.push(*p);
+                                }
+                            }
+                            // Unreadable /proc → the pid is dead → done.
+                            None => done.push(*p),
+                        }
+                    }
+                    for p in done {
+                        z471_connect_since.remove(&p);
+                    }
+                    for (p, elapsed, fd, path) in stalled {
+                        let n = Z471_STALL_LOGGED.load(std::sync::atomic::Ordering::Relaxed);
+                        if n < 40 {
+                            Z471_STALL_LOGGED.store(n + 1, std::sync::atomic::Ordering::Relaxed);
+                            log(&format!(
+                                "6-Z471c CONNECT-STALL: pid={} fd={} path={} still inside connect for {:.0}s (the tombstoned accept loop is not servicing; the 6-Z471 shlib bound frees the dump at 10 s, the 6-Z471a leniency keeps its watchdog honest)",
+                                p, fd, path, elapsed
+                            ));
+                        }
+                    }
+                }
+            }
         }
         // ── 6-Z213 RAW STOP FORENSICS ──────────────────────────────────
         //
@@ -21497,6 +21772,7 @@ pub fn run_ptrace_loop(
             // decision (and so the rn352 42-generation loops cannot
             // exhaust the tag cap with long-dead pids).
             z388_crash_dump_pids.remove(&pid);
+            z471_connect_since.remove(&pid); // 6-Z471c: a dead dump pid cannot be mid-connect
             z433_untag_crash_dump(pid); // 6-Z433: keep the census mirror in step
                                         // 6-Z396: the dump WORKER is gone — crash_dump PTRACE_DETACHed
                                         // everything it seized (normal exit) or was killed mid-dump
@@ -21855,6 +22131,7 @@ pub fn run_ptrace_loop(
             // decision (and so the rn352 42-generation loops cannot
             // exhaust the tag cap with long-dead pids).
             z388_crash_dump_pids.remove(&pid);
+            z471_connect_since.remove(&pid); // 6-Z471c: a dead dump pid cannot be mid-connect
             z433_untag_crash_dump(pid); // 6-Z433: keep the census mirror in step
                                         // 6-Z396: release this dead dump worker's handed-off tids for
                                         // 6-Z190 re-acquisition (see the WIFEXITED twin above).
@@ -27918,6 +28195,148 @@ pub fn run_ptrace_loop(
                         // connect fails ENOENT/ECONNREFUSED and the EXISTING
                         // 6-Z110 ret<0 arm fakes the client side exactly as
                         // before — the fallback is untouched.
+                        //
+                        // ── 6-Z471a/6-Z471c: the crash_dump dump-budget
+                        // leniency + the tombstoned-connect stall record ──
+                        // rn437 (run 35425759933, Task 204): the dump-worker
+                        // blocked 30.3 s INSIDE connect() to
+                        // /dev/socket/tombstoned_crash (init's listen(fd,1)
+                        // backlog + a not-servicing tombstoned accept loop)
+                        // and its own 30 s SIGALRM watchdog killed it
+                        // mid-connect — no tombstone, the SIGABRT target
+                        // (gen-1 system_server 10860) died evidence-free.
+                        // (a) 6-Z471a: a tagged crash_dump's timer_settime/
+                        //     setitimer(ITIMER_REAL) arming of a 1..=60 s
+                        //     relative deadline is re-armed ×10 (cap 300 s)
+                        //     by rewriting it_value IN THE CHILD'S BUFFER —
+                        //     the syscall reads the extended deadline; a
+                        //     healthy dump never arms past 60 s so the
+                        //     rewrite only ever fires on the watchdog.
+                        // (b) 6-Z471c: every tagged crash_dump connect is
+                        //     recorded (z471_connect_since) for the
+                        //     periodic CONNECT-STALL probe in the 6-Z390
+                        //     block — the next wedged tombstoned accept
+                        //     loop is named every 5 s while it lasts.
+                        if !boot_recovery
+                            && past_first_execve
+                            && z388_crash_dump_pids.contains(&pid)
+                        {
+                            // 6-Z471c: record the connect attempt (any
+                            // socketcall-free ABI; the fd + the sockaddr
+                            // identity is all the probe needs).
+                            if abi.connect_nr != -1 && syscall_num == abi.connect_nr {
+                                let z471_fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                let mut z471_path = String::from("?");
+                                let z471_sa_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                if z471_sa_ptr != 0 {
+                                    if let Some(sa) = read_child_bytes(pid, z471_sa_ptr, 110) {
+                                        // sockaddr_un: sa_family u16 LE at 0,
+                                        // sun_path at 2. AF_UNIX = 1.
+                                        if sa.len() >= 3 && sa[0] == 1 && sa[1] == 0 {
+                                            let body = &sa[2..];
+                                            let end = body
+                                                .iter()
+                                                .position(|&b| b == 0)
+                                                .unwrap_or(body.len());
+                                            let s = String::from_utf8_lossy(&body[..end]);
+                                            let mut s = s.to_string();
+                                            if s.len() > 96 {
+                                                s.truncate(96);
+                                            }
+                                            z471_path = s;
+                                        }
+                                    }
+                                }
+                                z471_connect_since
+                                    .insert(pid, (std::time::Instant::now(), z471_fd, z471_path));
+                            }
+                            // 6-Z471a: the watchdog leniency. The LP64
+                            // gate is mandatory — the 32-byte itimerspec
+                            // parse below is WRONG for the i386 layout
+                            // (two 32-bit timespecs), and the arm32 ABI
+                            // keeps -1 sentinels (unverified numbers).
+                            if detect_child_is_64bit(pid) == Some(true) {
+                                // timer_settime(timerid, flags, new_value*, old_value*)
+                                if abi.timer_settime_nr != -1 && syscall_num == abi.timer_settime_nr
+                                {
+                                    let flags_471 = get_syscall_arg(&regs, abi.reg_arg2);
+                                    let nv_471 = get_syscall_arg(&regs, abi.reg_arg3);
+                                    if nv_471 != 0 && (flags_471 & Z471_TIMER_ABSTIME) == 0 {
+                                        if let Some(b) = read_child_bytes(pid, nv_471, 32) {
+                                            let cur_sec =
+                                                u64::from_le_bytes(b[16..24].try_into().unwrap());
+                                            let cur_nsec =
+                                                u64::from_le_bytes(b[24..32].try_into().unwrap());
+                                            if let Some(new_sec) =
+                                                z471_watchdog_extension(false, cur_sec, cur_nsec)
+                                            {
+                                                if write_child_u64s_unchecked(
+                                                    pid,
+                                                    nv_471 + 16,
+                                                    &[new_sec],
+                                                ) {
+                                                    static Z471_LEN_LOG:
+                                                        std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    let n = Z471_LEN_LOG
+                                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                                    if n < 32 {
+                                                        Z471_LEN_LOG.store(
+                                                            n + 1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                        log(&format!(
+                                                            "6-Z471a: pid={} timer_settime watchdog it_value {}s -> {}s (the dump-budget leniency; rn437's 30s-mid-connect class)",
+                                                            pid, cur_sec, new_sec
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if abi.setitimer_nr != -1 && syscall_num == abi.setitimer_nr
+                                {
+                                    // setitimer(which, new_value*, old_value*) —
+                                    // ITIMER_REAL (0) only: SIGALRM is the
+                                    // watchdog's delivery signal.
+                                    let which_471 = get_syscall_arg(&regs, abi.reg_arg1);
+                                    let nv_471 = get_syscall_arg(&regs, abi.reg_arg2);
+                                    if which_471 == 0 && nv_471 != 0 {
+                                        if let Some(b) = read_child_bytes(pid, nv_471, 32) {
+                                            let cur_sec =
+                                                u64::from_le_bytes(b[16..24].try_into().unwrap());
+                                            let cur_nsec =
+                                                u64::from_le_bytes(b[24..32].try_into().unwrap());
+                                            if let Some(new_sec) =
+                                                z471_watchdog_extension(false, cur_sec, cur_nsec)
+                                            {
+                                                if write_child_u64s_unchecked(
+                                                    pid,
+                                                    nv_471 + 16,
+                                                    &[new_sec],
+                                                ) {
+                                                    static Z471_ITIMER_LOG:
+                                                        std::sync::atomic::AtomicU64 =
+                                                        std::sync::atomic::AtomicU64::new(0);
+                                                    let n = Z471_ITIMER_LOG
+                                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                                    if n < 32 {
+                                                        Z471_ITIMER_LOG.store(
+                                                            n + 1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                        log(&format!(
+                                                            "6-Z471a: pid={} setitimer(ITIMER_REAL) watchdog it_value {}s -> {}s (the dump-budget leniency)",
+                                                            pid, cur_sec, new_sec
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if !boot_recovery
                             && past_first_execve
                             && abi.connect_nr != -1
@@ -56738,5 +57157,123 @@ ee86e52a5000-ee86e5e62000 rw-p 00000000 00:05 1       (unnamed file map)\n";
         // Non-anon or image-named FILE rows never match.
         let plain = "70000000-7028f000 rw-p 00000000 00:05 1 /data/rootfs/apex/.../boot.art\n";
         assert!(z452_named_anon_rows(plain, 16).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod z471_leniency_tests {
+    use super::{arm64_generic_syscall_name, z471_watchdog_extension, Z471_MAX_LENIENCY_SEC};
+
+    /// 6-Z471 (pure) truth table: the rn437 watchdog shape (30 s) is the
+    /// canonical case; every non-watchdog arming must stay untouched.
+    #[test]
+    fn z471_watchdog_extension_truth_table() {
+        // The rn437 shape: a 30 s relative arming extends to 300 s.
+        assert_eq!(z471_watchdog_extension(false, 30, 0), Some(300));
+        // Sub-watchdog armings extend ×10.
+        assert_eq!(z471_watchdog_extension(false, 5, 0), Some(50));
+        assert_eq!(z471_watchdog_extension(false, 1, 0), Some(10));
+        // Sub-second armings round UP to whole seconds first.
+        assert_eq!(z471_watchdog_extension(false, 0, 500_000_000), Some(10));
+        // The cap clamps: 31..=60 s armings all land on 300.
+        assert_eq!(
+            z471_watchdog_extension(false, 31, 0),
+            Some(Z471_MAX_LENIENCY_SEC)
+        );
+        assert_eq!(
+            z471_watchdog_extension(false, 60, 0),
+            Some(Z471_MAX_LENIENCY_SEC)
+        );
+        // A DISARM (it_value == 0) is never rewritten.
+        assert_eq!(z471_watchdog_extension(false, 0, 0), None);
+        // Absolute deadlines are never rewritten.
+        assert_eq!(z471_watchdog_extension(true, 30, 0), None);
+        // Corrupt nsec is untouched (garbage in, no write out).
+        assert_eq!(z471_watchdog_extension(false, 30, 1_000_000_000), None);
+        // Longer-than-watchdog armings keep their honest deadline.
+        assert_eq!(z471_watchdog_extension(false, 61, 0), None);
+        assert_eq!(z471_watchdog_extension(false, 3600, 0), None);
+    }
+
+    /// 6-Z471: the crash-dump-observed syscall numbers self-annotate in
+    /// the arm64 generic table (rn437's raw "nr=107, nr=110, nr=242"
+    /// tail cost the decode a header lookup per number).
+    #[test]
+    fn z471_arm64_generic_labels() {
+        assert_eq!(arm64_generic_syscall_name(102), "getitimer");
+        assert_eq!(arm64_generic_syscall_name(103), "setitimer");
+        assert_eq!(arm64_generic_syscall_name(107), "timer_create");
+        assert_eq!(arm64_generic_syscall_name(108), "timer_gettime");
+        assert_eq!(arm64_generic_syscall_name(109), "timer_getoverrun");
+        assert_eq!(arm64_generic_syscall_name(110), "timer_settime");
+        assert_eq!(arm64_generic_syscall_name(111), "timer_delete");
+        assert_eq!(arm64_generic_syscall_name(203), "connect");
+        assert_eq!(arm64_generic_syscall_name(206), "sendto");
+        assert_eq!(arm64_generic_syscall_name(207), "recvfrom");
+        assert_eq!(arm64_generic_syscall_name(208), "setsockopt");
+        assert_eq!(arm64_generic_syscall_name(209), "getsockopt");
+        assert_eq!(arm64_generic_syscall_name(210), "shutdown");
+        assert_eq!(arm64_generic_syscall_name(211), "sendmsg");
+        assert_eq!(arm64_generic_syscall_name(212), "recvmsg");
+        assert_eq!(arm64_generic_syscall_name(242), "accept4");
+        // The table stays a closed map: unknowns still fall through.
+        assert_eq!(arm64_generic_syscall_name(9999), "unknown");
+    }
+}
+
+/// The z471 tests live in `z471_leniency_tests` above; this module locks
+/// the per-ABI timer-family numbers (each const is #[cfg(target_arch)]-
+/// gated, so the asserts follow the existing ABI-test convention).
+#[cfg(test)]
+mod z471_abi_tests {
+    #[cfg(target_arch = "aarch64")]
+    use super::ABI_AARCH64;
+    use super::ABI_ARM32;
+    #[cfg(target_arch = "x86_64")]
+    use super::{ABI_X86_32, ABI_X86_64};
+
+    /// 6-Z471: header-verified timer-family numbers per ABI (see the
+    /// field docs on ChildAbi). arm32 is -1 by design (unverified →
+    /// inert), so the arm32 asserts double as the sentinel lock.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn z471_x86_64_timer_family_numbers() {
+        assert_eq!(ABI_X86_64.getitimer_nr, 36);
+        assert_eq!(ABI_X86_64.setitimer_nr, 38);
+        assert_eq!(ABI_X86_64.timer_create_nr, 222);
+        assert_eq!(ABI_X86_64.timer_settime_nr, 223);
+        assert_eq!(ABI_X86_64.timer_delete_nr, 226);
+        assert_eq!(ABI_X86_64.accept4_nr, 288);
+        assert_eq!(ABI_X86_64.alarm_nr, 37);
+        assert_eq!(ABI_X86_32.getitimer_nr, 105);
+        assert_eq!(ABI_X86_32.setitimer_nr, 104);
+        assert_eq!(ABI_X86_32.timer_create_nr, 259);
+        assert_eq!(ABI_X86_32.timer_settime_nr, 260);
+        assert_eq!(ABI_X86_32.timer_delete_nr, 263);
+        assert_eq!(ABI_X86_32.accept4_nr, 364);
+        assert_eq!(ABI_X86_32.alarm_nr, 27);
+    }
+
+    #[test]
+    fn z471_arm32_sentinels() {
+        assert_eq!(ABI_ARM32.getitimer_nr, -1);
+        assert_eq!(ABI_ARM32.setitimer_nr, -1);
+        assert_eq!(ABI_ARM32.timer_create_nr, -1);
+        assert_eq!(ABI_ARM32.timer_settime_nr, -1);
+        assert_eq!(ABI_ARM32.timer_delete_nr, -1);
+        assert_eq!(ABI_ARM32.accept4_nr, -1);
+        assert_eq!(ABI_ARM32.alarm_nr, -1);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn z471_aarch64_timer_family_numbers() {
+        assert_eq!(ABI_AARCH64.getitimer_nr, 102);
+        assert_eq!(ABI_AARCH64.setitimer_nr, 103);
+        assert_eq!(ABI_AARCH64.timer_create_nr, 107);
+        assert_eq!(ABI_AARCH64.timer_settime_nr, 110);
+        assert_eq!(ABI_AARCH64.timer_delete_nr, 111);
+        assert_eq!(ABI_AARCH64.accept4_nr, 242);
+        assert_eq!(ABI_AARCH64.alarm_nr, -1);
     }
 }
