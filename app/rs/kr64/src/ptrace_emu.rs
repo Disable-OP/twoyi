@@ -3474,6 +3474,29 @@ static Z307P_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 // arm itself logs through spawn_boot_completed_sender's sender thread).
 static Z481_PARSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// 6-Z483: the per-floored-pid fd-op ring — the displacement-vector
+// recorder. rn454: system_server (4203) stalled with fd 0 =
+// socket:[641976] (the 6-Z305t-14b STALL-FD readout) 69 s after the
+// 6-Z476 fork-arm armed its stdio floor, while EVERY dup2 the dup-net
+// denied logged (dup(3,0) → getpid) and NO connect syscall was ever
+// traced for the pid — the fd-0 slot was displaced by a vector the
+// existing logs cannot name (the candidates: a close class the floors
+// miss (close_range = 436 on every ABI?), an SCM_RIGHTS recvmsg
+// landing a received descriptor on a transiently-free fd 0, or an
+// fcntl(F_DUPFD) on a momentarily-free slot). The ring keeps the LAST
+// 48 fd-number-affecting syscall ENTRIES (args only — the EXIT stop's
+// aarch64 registers are clobbered) of every floored fork-child; the
+// STALL-FD capture flushes it verbatim and clears it. Statics because
+// the STALL-FD arm runs outside the loop's local-map scope.
+type Z483Ring = std::collections::VecDeque<(u64, &'static str, String)>;
+static Z483_FDOPS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<libc::pid_t, Z483Ring>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static Z483_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// close_range is nr 436 on aarch64 AND x86_64 (asm-generic + x86_64
+// unified) — not in ChildAbi; a raw match is exact.
+const Z483_CLOSE_RANGE: i64 = 436;
+
 // 6-Z268: per-stop record of strings this tracer WROTE into the child
 // (`write_translated_path` + scratch rewrites). The sandbox backstop
 // previously re-read every rewritten path from the child with a full
@@ -13960,6 +13983,27 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                 "6-Z305t-14b STALL-FD: pid={} ({} fds listed)",
                 pid, fd_lines
             ));
+        }
+        // 6-Z483: the fd-op ring flush — the LAST 48 fd-number-affecting
+        // syscall entries of this pid (a floored fork-child), oldest→
+        // newest, then the ring clears. rn454's unknown: fd 0 flipped to
+        // a socket with every dup denied and no connect traced — this
+        // flush names the vector (a close the floors miss, a
+        // close_range, an SCM_RIGHTS recvmsg, an F_DUPFD on a free slot)
+        // in exactly one more ladder cycle.
+        if let Ok(mut z483_map) = Z483_FDOPS.lock() {
+            if let Some(ring) = z483_map.remove(&pid) {
+                if !ring.is_empty() {
+                    crate::trace_log_line(&format!(
+                        "6-Z483: fd-op ring pid={} ({} entries, oldest->newest):",
+                        pid,
+                        ring.len()
+                    ));
+                    for (seq, name, desc) in ring.iter() {
+                        crate::trace_log_line(&format!("6-Z483:   #{:06} {} {}", seq, name, desc));
+                    }
+                }
+            }
         }
     }
 
@@ -25935,6 +25979,71 @@ pub fn run_ptrace_loop(
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                        // 6-Z483: the fd-op ring recording — floored
+                        // fork-children only (the 6-Z476 supervision set is
+                        // small; the 48-entry cap bounds it). ENTRY-side:
+                        // the args are live here (the EXIT stop's aarch64
+                        // registers are clobbered). The ring is the
+                        // displacement-vector evidence for the STALL-FD
+                        // flush — fd 0 turned into a socket in rn454 with
+                        // every dup denied and no connect traced.
+                        if z475_sserver_floor_pids.contains(&pid) {
+                            let z483_a1 = get_syscall_arg(&regs, abi.reg_arg1);
+                            let z483_a2 = get_syscall_arg(&regs, abi.reg_arg2);
+                            let z483_a3 = get_syscall_arg(&regs, abi.reg_arg3);
+                            let z483_rec: Option<(&'static str, String)> = if abi.socket_nr != -1
+                                && syscall_num == abi.socket_nr
+                            {
+                                Some((
+                                    "socket",
+                                    format!("domain={:#x} type={:#x}", z483_a1, z483_a2),
+                                ))
+                            } else if abi.connect_nr != -1 && syscall_num == abi.connect_nr {
+                                Some(("connect", format!("fd={} sa_len={}", z483_a1, z483_a3)))
+                            } else if abi.dup2_nr != -1 && syscall_num == abi.dup2_nr {
+                                Some(("dup2", format!("old={} new={}", z483_a1, z483_a2)))
+                            } else if abi.dup3_nr != -1 && syscall_num == abi.dup3_nr {
+                                Some((
+                                    "dup3",
+                                    format!("old={} new={} flags={:#x}", z483_a1, z483_a2, z483_a3),
+                                ))
+                            } else if abi.close_nr != -1 && syscall_num == abi.close_nr {
+                                Some(("close", format!("fd={}", z483_a1)))
+                            } else if syscall_num == Z483_CLOSE_RANGE {
+                                Some((
+                                    "close_range",
+                                    format!(
+                                        "first={} last={} flags={:#x}",
+                                        z483_a1, z483_a2, z483_a3
+                                    ),
+                                ))
+                            } else if abi.fcntl_nr != -1
+                                && syscall_num == abi.fcntl_nr
+                                && (z483_a2 == 0 || z483_a2 == 1030)
+                            {
+                                // F_DUPFD = 0, F_DUPFD_CLOEXEC = 1030 —
+                                // the fd-NUMBER-allocating fcntl cmds.
+                                Some((
+                                    "fcntl/F_DUPFD",
+                                    format!("fd={} cmd={} arg={}", z483_a1, z483_a2, z483_a3),
+                                ))
+                            } else if abi.recvmsg_nr != -1 && syscall_num == abi.recvmsg_nr {
+                                Some(("recvmsg", format!("fd={} (scm_rights candidate)", z483_a1)))
+                            } else {
+                                None
+                            };
+                            if let Some((name, desc)) = z483_rec {
+                                let seq =
+                                    Z483_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if let Ok(mut ring_map) = Z483_FDOPS.lock() {
+                                    let ring = ring_map.entry(pid).or_default();
+                                    if ring.len() >= 48 {
+                                        ring.pop_front();
+                                    }
+                                    ring.push_back((seq, name, desc));
                                 }
                             }
                         }
