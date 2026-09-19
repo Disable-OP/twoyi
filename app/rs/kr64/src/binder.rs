@@ -3120,13 +3120,19 @@ impl BusState {
     // init restart cascade → rung 5.
 
     /// Bounded 6-Z359 diag budgets (the registration storm must not flood).
+    /// 6-Z464 (rn427 decode): RAISED — the decode's era-map went BLIND at
+    /// ~+185s (the release budget exhausted after 8 lines, the grant-log
+    /// budgets after 64+64), so the abort-adjacent windows decoded with
+    /// invisible grants/burials (the (0xf280, 0x6c70) "close-without-grant"
+    /// lead was partly a LOGGING artifact). The structural lines are
+    /// O(100)/boot — the cap now covers a full run.
     fn z359_alloc_log() -> &'static std::sync::atomic::AtomicU32 {
         static N: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
-        N.get_or_init(|| std::sync::atomic::AtomicU32::new(12))
+        N.get_or_init(|| std::sync::atomic::AtomicU32::new(256))
     }
     fn z359_release_log() -> &'static std::sync::atomic::AtomicU32 {
         static N: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
-        N.get_or_init(|| std::sync::atomic::AtomicU32::new(8))
+        N.get_or_init(|| std::sync::atomic::AtomicU32::new(256))
     }
 
     /// 6-Z442: grant (or re-grant) a node ref for `recipient` on the
@@ -3527,10 +3533,14 @@ impl BusState {
         // Kernel-true mirror: push the RefCmd onto the OWNER's
         // reply_queue — the owner's IPCThreadState runs
         // decStrong/decWeak on the local BBinder (the composer's
-        // onClientDestroyed). The heap anchor NEVER gates this (the
-        // 6-Z354 lesson): the release decision came from OUR OWN
-        // refcounts, not from a memory probe. Delivery-time liveness is
-        // the owner process /proc probe, checked in the RefCmd359 arm.
+        // onClientDestroyed). The heap anchor does NOT gate the QUEUE
+        // decision (the 6-Z354 lesson: the release decision comes from
+        // OUR OWN refcounts, not from a memory probe) — the object-level
+        // anchor gates the DELIVERY instead (6-Z463: a close whose target
+        // chunk is POSITIVELY dead is the rn427 corruption write and
+        // drops to a silent close; Alive/Unknown deliver unchanged).
+        // Delivery-time process liveness is the owner /proc probe,
+        // checked in the RefCmd359 arm.
         if let Some(box_) = self.conns.get_mut(&owner) {
             box_.reply_queue.push_back(DeferredReply::RefCmd359 {
                 br,
@@ -4953,7 +4963,13 @@ fn handle_write_read(
                         }
                         if !refs.is_empty() {
                             static Z442_LOGGED: std::sync::atomic::AtomicU32 =
-                                std::sync::atomic::AtomicU32::new(64);
+                                std::sync::atomic::AtomicU32::new(1024);
+                            // 6-Z464 (rn427 decode): 64 → 1024 — the budget
+                            // died at ~+185s and the decode's era-map went
+                            // blind exactly where the Scudo aborts live (the
+                            // (0xf280, 0x6c70) "close-without-grant" lead was
+                            // partly a logging artifact). O(100)/boot lines:
+                            // the cap now covers a full 300s watch.
                             if Z442_LOGGED.load(Ordering::Relaxed) > 0 {
                                 Z442_LOGGED.fetch_sub(1, Ordering::Relaxed);
                                 for (br, ptr, cookie) in &refs {
@@ -5190,7 +5206,9 @@ fn handle_write_read(
                                         read_buf.extend_from_slice(&cookie.to_ne_bytes());
                                     }
                                     static Z442_REPLY_LOGGED: std::sync::atomic::AtomicU32 =
-                                        std::sync::atomic::AtomicU32::new(64);
+                                        std::sync::atomic::AtomicU32::new(1024);
+                                    // 6-Z464: 64 → 1024, same blindness fix as
+                                    // the transaction arm above.
                                     if !g.mirrors.is_empty()
                                         && Z442_REPLY_LOGGED.load(Ordering::Relaxed) > 0
                                     {
@@ -5551,54 +5569,105 @@ fn handle_write_read(
                     };
                     let owner_alive = dpid > 0 && crate::ptrace_emu::traced_child_alive(dpid);
                     if owner_alive {
-                        // 6-Z454: the owner-liveness gate PASSED — the ledger
-                        // counts the delivery (V2 baseline for this object).
-                        z454_deliver(dpid, ptr, cookie, br);
-                        read_buf.extend_from_slice(&br.to_ne_bytes());
-                        read_buf.extend_from_slice(&ptr.to_ne_bytes());
-                        read_buf.extend_from_slice(&cookie.to_ne_bytes());
-                        info!(
-                            "[KR64][binder][vm{}] 6-Z359: node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
-                            vm_id, conn_id, br, ptr, cookie
-                        );
-                        // 6-Z457: the owner-side REFCOUNT MIRROR (Task 192
-                        // agenda) — at the last-ref delivery read the
-                        // owner's LIVE RefBase state for this weakref
-                        // (ptr=W: mBase=[W+8], mStrong=i32@[W+16], mWeak=
-                        // i32@[W+20]) and log count-before-delivery vs the
-                        // ledger's emit/deliver totals and the node's
-                        // lifetime grants. rn422: a BALANCED 6-Z454 ledger
-                        // over a Scudo double-free — the missing half lives
-                        // in the owner's IN-PROCESS refcount, which this
-                        // read names (count already 0 = the delivery's
-                        // decStrong over-decs = the delete#2 precondition;
-                        // count ≥1 = the owner's own sp is present and the
-                        // double-free needs a second in-process drop).
-                        if z457_budget().load(Ordering::Relaxed) > 0 {
-                            z457_budget().fetch_sub(1, Ordering::Relaxed);
-                            match crate::ptrace_emu::z457_refcount_snapshot(dpid, ptr) {
-                                Some(st) => {
-                                    let (ae, re, ad, rd) = z454_counts(dpid, ptr, cookie);
-                                    info!(
-                                        "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} br=0x{:08x} W=0x{:x} mStrong={} (count={}) mWeak={} mBase=0x{:x} (delta=0x{:x} vs cookie 0x{:x}) mFlags={} ledger[emit acq={} rel={} / del acq={} rel={}] node-grants[strong={} weak={}] node={} class={}",
-                                        vm_id, dpid, br, ptr,
-                                        st.strong_raw,
-                                        crate::ptrace_emu::z457_strong_count(st.strong_raw),
-                                        st.weak, st.mbase,
-                                        st.mbase.wrapping_sub(cookie), cookie,
-                                        st.flags, ae, re, ad, rd,
-                                        node_strong_grants, node_weak_grants,
-                                        if node_entry_live { "live" } else { "node-dead" },
-                                        crate::ptrace_emu::z457_classify(st.strong_raw)
-                                    );
-                                }
-                                None => {
-                                    info!(
-                                        "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} W=0x{:x} — READ FAILED (object may already be gone — itself a count≤0 signature)",
-                                        vm_id, dpid, ptr
-                                    );
+                        // 6-Z463 (rn427 decode): the OBJECT-level close gate.
+                        // The rn427 +187083→+187101 chain named the Scudo
+                        // corruption WRITER: an era-close REL/DEC delivered
+                        // onto a weakref whose chunk was already freed and
+                        // reused — the owner's decStrong/decWeak wrote the
+                        // freed chunk (invalid-chunk-state abort 15 ms
+                        // later), and the grant-side anchor had POSITIVELY
+                        // identified the same chunk as dead one millisecond
+                        // earlier ([R+8]=0x0 round-trip broken). Kernel
+                        // truth: a BR_RELEASE reaches the owner only on the
+                        // has_strong_ref true→false edge OF A NODE WHOSE
+                        // REFS HOLD THE OBJECT ALIVE — the real driver can
+                        // never reach a dead-owner-object close; reaching
+                        // it here means the count is already lost and the
+                        // delivery is the corruption write. The 6-Z354
+                        // "deliver anyway" policy was the rn344 false-Dead
+                        // era; the 6-Z387 page-window round-trip anchor
+                        // ended that class (rn427: 3 ae-f Dead verdicts,
+                        // all correct), so the close arm now honors the
+                        // SAME anchor the grant arm honors — wire symmetry
+                        // both directions. The drop is the 6-Z458
+                        // silent-drop precedent generalized: nothing the
+                        // owner never earned may cross back. Alive and
+                        // Unknown deliver unchanged (the 6-Z306an rule:
+                        // only a positive Dead rejects).
+                        let anchored_dead = ptr != 0
+                            && cookie != 0
+                            && z463_close_rejected(mirror_ref_check(dpid, ptr, cookie));
+                        if anchored_dead {
+                            if z463_drop_log().load(Ordering::Relaxed) > 0 {
+                                z463_drop_log().fetch_sub(1, Ordering::Relaxed);
+                                info!(
+                                    "[KR64][binder][vm{}] 6-Z463: node-ref close DROPPED (silent close) conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x} owner-pid={} node-grants[strong={} weak={}] — the anchor positively identifies the owner object as dead/reused; delivering would write a freed chunk (the rn427 corruption-write chain) — the 6-Z458 silent-drop precedent generalized to node closes",
+                                    vm_id, conn_id, br, ptr, cookie, dpid,
+                                    node_strong_grants, node_weak_grants
+                                );
+                            }
+                            push_br_noop(&mut read_buf);
+                        } else if z457_budget().load(Ordering::Relaxed) > 0 {
+                            // 6-Z454: the gates PASSED — the ledger counts
+                            // the delivery (V2 baseline for this object).
+                            z454_deliver(dpid, ptr, cookie, br);
+                            read_buf.extend_from_slice(&br.to_ne_bytes());
+                            read_buf.extend_from_slice(&ptr.to_ne_bytes());
+                            read_buf.extend_from_slice(&cookie.to_ne_bytes());
+                            info!(
+                                "[KR64][binder][vm{}] 6-Z359: node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
+                                vm_id, conn_id, br, ptr, cookie
+                            );
+                            // 6-Z457: the owner-side REFCOUNT MIRROR (Task 192
+                            // agenda) — at the last-ref delivery read the
+                            // owner's LIVE RefBase state for this weakref
+                            // (ptr=W: mBase=[W+8], mStrong=i32@[W+16], mWeak=
+                            // i32@[W+20]) and log count-before-delivery vs the
+                            // ledger's emit/deliver totals and the node's
+                            // lifetime grants. rn422: a BALANCED 6-Z454 ledger
+                            // over a Scudo double-free — the missing half lives
+                            // in the owner's IN-PROCESS refcount, which this
+                            // read names (count already 0 = the delivery's
+                            // decStrong over-decs = the delete#2 precondition;
+                            // count ≥1 = the owner's own sp is present and the
+                            // double-free needs a second in-process drop).
+                            {
+                                z457_budget().fetch_sub(1, Ordering::Relaxed);
+                                match crate::ptrace_emu::z457_refcount_snapshot(dpid, ptr) {
+                                    Some(st) => {
+                                        let (ae, re, ad, rd) = z454_counts(dpid, ptr, cookie);
+                                        info!(
+                                            "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} br=0x{:08x} W=0x{:x} mStrong={} (count={}) mWeak={} mBase=0x{:x} (delta=0x{:x} vs cookie 0x{:x}) mFlags={} ledger[emit acq={} rel={} / del acq={} rel={}] node-grants[strong={} weak={}] node={} class={}",
+                                            vm_id, dpid, br, ptr,
+                                            st.strong_raw,
+                                            crate::ptrace_emu::z457_strong_count(st.strong_raw),
+                                            st.weak, st.mbase,
+                                            st.mbase.wrapping_sub(cookie), cookie,
+                                            st.flags, ae, re, ad, rd,
+                                            node_strong_grants, node_weak_grants,
+                                            if node_entry_live { "live" } else { "node-dead" },
+                                            crate::ptrace_emu::z457_classify(st.strong_raw)
+                                        );
+                                    }
+                                    None => {
+                                        info!(
+                                            "[KR64][binder][vm{}] 6-Z457: refcount mirror owner-pid={} W=0x{:x} — READ FAILED (object may already be gone — itself a count≤0 signature)",
+                                            vm_id, dpid, ptr
+                                        );
+                                    }
                                 }
                             }
+                        } else {
+                            // 6-Z457 budget exhausted — deliver without the
+                            // refcount snapshot (the mirror itself unchanged).
+                            z454_deliver(dpid, ptr, cookie, br);
+                            read_buf.extend_from_slice(&br.to_ne_bytes());
+                            read_buf.extend_from_slice(&ptr.to_ne_bytes());
+                            read_buf.extend_from_slice(&cookie.to_ne_bytes());
+                            info!(
+                                "[KR64][binder][vm{}] 6-Z359: node-ref mirror conn={} br=0x{:08x} ptr=0x{:x} cookie=0x{:x}",
+                                vm_id, conn_id, br, ptr, cookie
+                            );
                         }
                     } else {
                         info!(
@@ -10043,6 +10112,20 @@ fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
     matches!(mirror_ref_check(guest_pid, ptr, cookie), Liveness::Alive)
 }
 
+/// 6-Z463: the RefCmd359 CLOSE-delivery decision — the pure core of the
+/// object-level close gate. Only a POSITIVE `Dead` verdict (the 6-Z387
+/// round-trip anchor: mBase=0, round-trip severed, or association broken)
+/// rejects the close; `Alive` and `Unknown` deliver exactly as before
+/// (the 6-Z306an rule — an unreadable probe must never swallow a
+/// kernel-true wire command). Rejecting = the silent close (BR_NOOP +
+/// witness): the owner's object is provably dead/reused, so the
+/// decStrong/decWeak the guest would run IS the corruption write (the
+/// rn427 +187083→+187101 chain). Pure so tests pin the tri-state
+/// contract without a tracer.
+fn z463_close_rejected(probe: Liveness) -> bool {
+    matches!(probe, Liveness::Dead)
+}
+
 // ============================================================================
 // 6-Z454: the REF-LEDGER — per-object strong-ref accounting for every
 // node-ref mirror the bus EMITS (queues) or DELIVERS (hands to the
@@ -10290,6 +10373,13 @@ fn z454_counts(pid: i32, ptr: u64, cookie: u64) -> (u32, u32, u32, u32) {
 fn z457_budget() -> &'static AtomicU32 {
     static N: std::sync::OnceLock<AtomicU32> = std::sync::OnceLock::new();
     N.get_or_init(|| AtomicU32::new(12))
+}
+
+/// 6-Z463: bounded witness budget for the silent close (the drop is
+/// expected to be rare — rn427 showed 3 candidate windows per boot).
+fn z463_drop_log() -> &'static AtomicU32 {
+    static N: std::sync::OnceLock<AtomicU32> = std::sync::OnceLock::new();
+    N.get_or_init(|| AtomicU32::new(16))
 }
 
 /// 6-Z354: the TRANSACTION-delivery decision, pure for tests. Reject the
@@ -15495,6 +15585,30 @@ mod tests {
         assert!(
             ASSOC_SCAN_WINDOW >= 0x650 + 8,
             "window must cover AudioFlinger W@0x650"
+        );
+    }
+
+    /// 6-Z463: the RefCmd359 close gate's tri-state contract — only a
+    /// POSITIVE Dead (the 6-Z387 round-trip anchor's certain verdicts)
+    /// silently closes; Alive and Unknown deliver (the 6-Z306an rule:
+    /// an unreadable probe must never swallow a kernel-true wire
+    /// command; the rn344 false-Dead era must never return on the close
+    /// arm). The contract IS the fix: the rn427 +187083→+187101 chain
+    /// proved the close delivery onto a positively-dead chunk is the
+    /// Scudo corruption write.
+    #[test]
+    fn z463_close_gate_rejects_only_positive_dead() {
+        assert!(
+            z463_close_rejected(Liveness::Dead),
+            "a positive Dead verdict drops the close (the rn427 corruption-write guard)"
+        );
+        assert!(
+            !z463_close_rejected(Liveness::Alive),
+            "a live owner object receives its kernel-true release"
+        );
+        assert!(
+            !z463_close_rejected(Liveness::Unknown),
+            "an unreadable probe delivers (no ghost eras, no rn344 false-Dead starvation)"
         );
     }
 
