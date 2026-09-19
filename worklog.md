@@ -31511,3 +31511,60 @@ Stage Summary:
 - The boot's binding constraint has MOVED again: DMS display timeout (FIXED) → the gate-hold sync wedge (6-Z469, this session) → next: the grind-vs-Watchdog budget (6-Z468) and the bootanim SIGSEGV (a NEW non-binder crash class — bootanim pid 3551 died at +661.8s, 7.3s after BootAnimationStartTiming at +654.5s, in an <unknown> region whose rodata carries {fmt}-v6 snprintf_float strings, fault addr 0xed62cfe9 = a truncated 32-bit value used as a pointer; bootstrap continued past it — non-blocking for now, unowned).
 - Unresolved risks: run #436 in flight at session close (the next cron decodes it); the 6-Z469 take is NEW surface on the delivery path — the guards catch a mis-take (corpse-regrant, mirrors class=held, the 6-Z306ag stack depths); the REPLY_TIMEOUT-vs-kernel-no-timeout gap remains open (the rn362-class zombie risk is bounded by the existing late-reply drop); the traced_probes/perfetto and bootanim/{fmt} abort classes remain unowned (non-boot-blocking).
 - Recommended next step: decode run #436 (asset rn436): (1) 6-Z469 take witnesses fire and the ANR/Watchdog fleet shrinks (0 new /data/anr system_server traces = the wedge drained); (2) the grind quantification for 6-Z468; (3) rung 8/9 check (SystemUI/BOOT_COMPLETED); (4) if the wedge is gone, name the next class from the boot's furthest progress.
+
+---
+
+Iteration: 203
+Date/time: 2026-09-19 (session rn436-decode)
+
+Problem:
+Run #436 (rn436, workflow run 35422474668, HEAD 7e0ac02c, SUCCESS) awaited decode per the Task 202 agenda: (1) 6-Z469 take witnesses, (2) the ANR fleet drained?, (3) the grind quantification for 6-Z468, (4) rung 8/9 check, (5) the bootanim/{fmt} SIGSEGV class.
+
+Evidence:
+Bundle rn436-ui-e2e-logs.tar.xz (65.8 MB, scope-free via the 6-Z461 release pipeline). result.json: rung 7 SURFACEFLINGER, honest_note intact. Guest/host separation held per the Task 199 discipline: host redroid system_server = pid 242; guest system_server = host pid 4054 (gen-1) / 4927 (gen-2), the bridged fatal-signal line cross-checked against the ANR pid.
+
+Root cause:
+(1) WEDGE DRAINED: 0 of the rn435 5-trace ANR fleet — /data/anr holds only a 2345 B kernel wait-channel dump (main tid in unix_stream_data_wait, NOT the loader-ioctl park) + an empty file; dropbox empty; 0 REPLY_TIMEOUT; 0 BR_FAILED_REPLY; the 6-Z469 take never had occasion to fire (0 witnesses — the class it fixed did not reproduce; guard: nothing to guard this run).
+(2) THE NEW FRONTIER IS A REAL CRASH + A FORENSICS GAP: guest system_server gen-1 (spawned +138.2s as host pid 4054) main-tid SIGSEGV at +198.7s (SEGV_MAPERR, fault 0xffffffffffffffe8 = a −0x18 shape), 5.6 s after its own Watchdog wait-channel ANR dump landed (+193–198 s); debuggerd exec'd crash_dump64 (pid 4368, staged via 6-Z388/6-Z101 — the "failed to exec crash_dump helper: ENOENT" line is the FIRST attempt only, the retry succeeded); the dump ran (6-Z362: crash_dump crossed 8.86 GB anon mmap — the display-era leak marker), 6-Z411 SIGCONT'd the 37 group-stopped tids post-dump, 4054 was reaped +206.7 s, and tombstoned (pid 3524) linked TOMBSTONE_00 at +207.3 s (37 044 bytes, mode 0000). The tombstone EXISTS — but the harvest's `ls -t | head -5` window dropped it: tombstones.txt carried only the 5 newest files (the crash_dump64 self-abort trio tombstone_01/02/03 = pids 6087/7601/9060 at 05:09/05:15/05:22-28 + 2 empty fallbacks); tombstone_00 and 5 more fallbacks fell out of the window. The boot's primary crash evidence was harvested-out by its own bycatch.
+(3) GRIND QUANTIFIED: 0 completed dex2oats (data/dalvik-cache/arm64 EMPTY, apex dalvik-cache MISSING) — 6-Z468's grind remains the bootstrap's binding constraint.
+(4) RUNG 8/9 NOT REACHED: zygote respawned gen-2 system_server (4927, +330.1 s) which ground to the watch end in a sensor_privacy/package_native getService miss-loop ( getService(sensor_privacy) misses at ~20–50 Hz through +1817 s).
+(5) BOOTANIM CLASS CAUGHT with full 6-Z311 forensics: +30.835 s, tid 3589 "BootAnimation", si_addr 0x56666fe9 (MAPERR, the truncated-32-bit-pointer family), 5 threads alive, full registers + stack window captured. Non-blocking, unowned, still open.
+
+Change:
+6-Z470 (this session): the tombstone harvest window 5 → 30 in ui-e2e-android-arm64.yml (≤ ~3 MB worst case), with the rn436 lesson recorded in the workflow comment — the next run's bundle will carry the full guest tombstone set including any successor of tombstone_00.
+
+Build:
+Workflow-only change; YAML validated; no Rust surface touched (kr64-tests will pass on push).
+
+Tests:
+Harvest-shell semantics re-read against the rn436 listing (mode-0000 files ARE readable by the docker-exec root; selection was the only defect).
+
+Runtime:
+Not re-run this session; rn437 dispatch carries the fix.
+
+Guest evidence:
+system_server gen-1 SIGSEGV (fault 0xffffffffffffffe8) + tombstone_00 linked at +207.3 s; gen-2 alive at harvest (ps: u0_a87 4927 PPID 4448); BootAnimation SIGSEGV +30.8 s (6-Z311 forensics); anr wait-channel dump of 4054.
+
+Host evidence:
+Host redroid system_server pid 242 untouched by the guest crash; host tombstones (bluetooth sim-service) remain separate in tombstone-harvest.txt; crash_dump64 self-abort trio are GUEST-side dumpers dying mid-dump (the crash_dump Scudo class guards held — scratch DISABLED lines — but the dumpers still aborted; now the #4 agenda item).
+
+Boot timing:
+Guest init → rung 7 (SurfaceFlinger) as before; gen-1 system_server lifetime +138.2 s → +206.7 s (died of the SIGSEGV, not the Watchdog kill); gen-2 respawn +330.1 s → watch end; watch cap honored (screenshots to +1765 s). Boot did NOT complete; no honest sub-minute claim possible.
+
+Commit:
+6-Z470 = this session's ci(harvest) commit; Task 203 worklog entry recorded in the marker commit.
+
+CI:
+kr64-tests will run on push (push-triggered); the marker commit dispatches rn437 via the 6-Z462 shim.
+
+Result:
+The wedge class stayed dead on its first retest (good), the boot reached the same rung 7, and the decode converted an undiagnosable crash into a fully-instrumented one: the next run's tombstone harvest will capture the 0xffffffffffffffe8 backtrace end-to-end (MAPS tail included per the rn408 lesson).
+
+Next blocker:
+The gen-1 system_server SIGSEGV site (0xffffffffffffffe8) — decode its tombstone from rn437's bundle. Secondary, in priority order: the gen-2 sensor_privacy/package_native miss-loop (name the caller conn/pid), the grind (6-Z468: 0 completed dex2oats), the crash_dump64 self-abort cycle (tombstones 01/02/03 every ~6 min + the 8.8 GB 6-Z362 mmap), and the unowned bootanim/{fmt} class.
+
+Stage Summary:
+- The engineering loop advanced ONE verified decode (wedge class stays dead; the ANR fleet drained) + ONE structural instrumentation fix (6-Z470 harvest window) that unblocks the entire crash-forensics layer.
+- The boot's binding constraint has MOVED: gate-hold sync wedge (DRAINED) → the gen-1 system_server SIGSEGV + the crash-forensics gap (6-Z470 closes the gap; the SIGSEGV site decode follows from rn437's bundle) → then the grind-vs-Watchdog budget (6-Z468) and the rung-8 push through the gen-2 miss-loop.
+- Unresolved risks: the crash_dump64 self-abort cycle still destroys some dumps (tombstone_01/02/03) and one dump crossed 8.8 GB anon (6-Z362 marker) — a memory-pressure risk to the CI runner; the 6-Z469 take surface remains unexercised in vivo (its guards are untested live); the bootanim/{fmt} and traced_probes/perfetto classes remain unowned (non-boot-blocking).
+- Recommended next step: decode rn437 (asset rn437) with the agenda: (1) the 0xffffffffffffffe8 SIGSEGV tombstone (pc + MAPS symbolization), (2) 6-Z469 witnesses if the wedge re-reproduces, (3) the gen-2 miss-loop caller, (4) the crash_dump self-abort cycle, (5) rung 8/9 check.
