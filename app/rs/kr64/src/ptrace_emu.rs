@@ -16528,6 +16528,38 @@ fn z472_cmdline(raw: &str) -> String {
     joined
 }
 
+/// 6-Z475 (pure): the head+tail line picker for the era-true map
+/// capture. rn443's decode proved a FLAT front-budget loses the crash
+/// era: system_server's map runs dalvik/anon first (the 1600-line cut
+/// stopped at libbinder with ZERO libc entries) while the fdsan abort
+/// pcs sat in the libc/libart cluster near the map's tail. The capture
+/// emits the first `head` lines (the heap-baseline continuity) and the
+/// last `tail` lines (the system-lib cluster + stacks) with one snip
+/// marker between; when the map fits, it is returned whole.
+fn z475_pick_map_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    head: usize,
+    tail: usize,
+) -> Vec<&'a str> {
+    let all: Vec<&'a str> = lines.collect();
+    if all.len() <= head.saturating_add(tail) {
+        return all;
+    }
+    let mut out = Vec::with_capacity(head + tail + 1);
+    out.extend_from_slice(&all[..head]);
+    out.push("...[6-Z475m SNIP]...");
+    out.extend_from_slice(&all[all.len() - tail..]);
+    out
+}
+
+/// 6-Z475 (pure): the numeric sort key for a /proc/<pid>/fd directory
+/// entry name. Entries are decimal fd numbers; a non-numeric entry
+/// (never expected) sorts last via None — the caller treats None as
+/// i64::MAX.
+fn z475_fd_sort_key(entry: &str) -> Option<i64> {
+    entry.trim().parse::<i64>().ok()
+}
+
 /// 6-Z471 (pure): the watchdog-arming decision for ONE it_value.
 ///
 /// `is_absolute` = TIMER_ABSTIME was set (timer_settime) — always false
@@ -18698,6 +18730,24 @@ pub fn run_ptrace_loop(
     // onto 0/1/2) is legitimate and must keep working.
     let mut z305y_stdio_pin_pid: Option<libc::pid_t> = None;
     let mut z305y_zclose_pending: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    // 6-Z475: the SYSTEM_SERVER STDIO FLOOR. rn443's decode proved the
+    // fdsan fd-0 exchange abort ("fd 0 is owned by unique_fd ..., was
+    // expected to be unowned", the ADB-JDWP Connec tid — the run's
+    // DOMINANT killer: gens 2 and 4 of 6, and the likely second death
+    // inside the unserved dumps of gens 3/5/6): the forkSystemServer
+    // child FREES fd 0 (the tombstone fd lists show fd 0 gone while
+    // 1/2 = the zygote's svclog pipes survive), the JDWP SCM_RIGHTS
+    // receive lands on the freed stdio slot, and a second ownership
+    // exchange on fd 0 aborts. The floor (armed at the
+    // PR_SET_NAME("system_server") rename in the 6-Z306x arm, applied in
+    // the 6-Z305y close arm) rewrites close(0/1/2) to getpid for the
+    // system_server gen exactly like the zygote's own pin — a received
+    // fd can then never land on a stdio slot and the whole abort class
+    // dies. crash_dump children are NOT floored (only the rename-named
+    // system_server pid itself) — the 6-Z470/471/473 dump machinery's
+    // own stdio wiring stays untouched.
+    let mut z475_sserver_floor_pids: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     // ── 6-Z306: the ZYGOTE FORK-GATE FD SWEEP ────────────────────────
     //
@@ -29513,6 +29563,31 @@ pub fn run_ptrace_loop(
                                         .unwrap_or_else(|| "<unreadable>".into());
                                     log(&format!("6-Z306x: pid={} PR_SET_NAME -> {:?}", pid, name));
                                 }
+                                // 6-Z475: arm the SYSTEM_SERVER STDIO FLOOR
+                                // at the rename. Every lineage TGID names
+                                // itself exactly once at startup; the
+                                // "system_server" name is the reliable,
+                                // early, exec-free marker of the
+                                // forkSystemServer child (setArgV0 fires
+                                // long before the java-side stdin close).
+                                {
+                                    let name_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                    if let Some(nm) = read_child_string(pid, name_addr) {
+                                        if nm == "system_server" {
+                                            z475_sserver_floor_pids.insert(pid);
+                                            static Z475_ARM_LOGGED: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            let z475_arm_n = Z475_ARM_LOGGED
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if z475_arm_n < 16 {
+                                                log(&format!(
+                                                    "6-Z475: floor ARMED pid={} (the system_server rename — the fdsan fd-0 exchange class)",
+                                                    pid
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
                                 // 6-Z306af-d: snapshot the executable maps at
                                 // the rename — every lineage process names
                                 // itself exactly once at startup (zygote64 /
@@ -30966,14 +31041,16 @@ pub fn run_ptrace_loop(
                                 // precedent — and force ret=0 at EXIT so
                                 // bionic's close() sees success, identical
                                 // semantics to the libc-level floor.
-                                if z305y_stdio_pin_pid == Some(pid) {
+                                if z305y_stdio_pin_pid == Some(pid)
+                                    || z475_sserver_floor_pids.contains(&pid)
+                                {
                                     static Z305Y_PIN_LOGGED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
                                     let ln = Z305Y_PIN_LOGGED
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if ln < 24 {
                                         log(&format!(
-                                            "6-Z305y: pin close(fd={}) pid={} → getpid rewrite (stdio floor at the syscall layer) [#{}]",
+                                            "6-Z305y/6-Z475: floor close(fd={}) pid={} → getpid rewrite (stdio floor at the syscall layer) [#{}]",
                                             close_fd, pid, ln + 1
                                         ));
                                     }
@@ -40666,24 +40743,79 @@ pub fn run_ptrace_loop(
                                         z472_n + 1
                                     ));
                                     // 6-Z474 (rn442 decode): the line budget
-                                    // 400→1600. The rn442 gen-5/gen-7
+                                    // 400→1600 — the rn442 gen-5/gen-7
                                     // SIGSEGV-0x0 pcs sat ~344KB above the
-                                    // 400-line cut (the libandroid_servers.so
-                                    // .text region) — the capture ended at
-                                    // 0xf71422961000 while pc=0xf714273d4384
-                                    // was era-unresolvable from the snapshot
-                                    // alone (the decode only recovered via
-                                    // boot-independent file-offset math
-                                    // against the crash registers). 1600
-                                    // lines ≈ the full crash-era system_server
-                                    // map (400 entries ≈ 25% of it) with a
-                                    // still-bounded ~192KB worst-case text
-                                    // cost per capture.
+                                    // 400-line cut. SUPERSEDED by 6-Z475:
+                                    // rn443 proved even 1600 front lines
+                                    // stop at libbinder with ZERO libc
+                                    // entries (the fdsan abort era), so the
+                                    // capture is now head+tail (below).
                                     if z472_n < 12 {
                                         if let Ok(maps) = z472_maps {
-                                            for ml in maps.lines().take(1600) {
+                                            // 6-Z475 (rn443 decode): the flat
+                                            // 1600-line front budget ends at
+                                            // libbinder with ZERO libc entries
+                                            // — the fdsan abort pcs (the libc/
+                                            // libart cluster) sit near the map
+                                            // tail, era-unresolvable. Emit
+                                            // head+tail instead (the tail
+                                            // carries the crash-era system-lib
+                                            // cluster + stacks).
+                                            let z475_all: Vec<&str> = maps.lines().collect();
+                                            for ml in z475_pick_map_lines(
+                                                z475_all.iter().copied(),
+                                                400,
+                                                800,
+                                            ) {
                                                 log(&format!("6-Z472m: {}", ml));
                                             }
+                                        }
+                                        // 6-Z475 (rn443 decode): the fd-table
+                                        // GROUND TRUTH at the same era-true
+                                        // instant — the fdsan fd-0 exchange
+                                        // class is fd-table state that no
+                                        // tombstone maps section can show:
+                                        // who owns fd 0, whether the stdio
+                                        // slots are pipes or sockets, and
+                                        // what the JDWP hand-off collided
+                                        // with. Sorted numerically; 0-15 are
+                                        // always emitted before the 256 cap.
+                                        let mut z475_fds: Vec<(i64, String)> =
+                                            std::fs::read_dir(format!("/proc/{}/fd", parent))
+                                                .map(|rd| {
+                                                    rd.filter_map(|e| {
+                                                        let e = e.ok()?;
+                                                        let key = z475_fd_sort_key(
+                                                            &e.file_name().to_string_lossy(),
+                                                        )
+                                                        .unwrap_or(i64::MAX);
+                                                        let target = std::fs::read_link(e.path())
+                                                            .map(|p| {
+                                                                p.to_string_lossy().into_owned()
+                                                            })
+                                                            .unwrap_or_else(|_| {
+                                                                "<gone>".to_string()
+                                                            });
+                                                        Some((key, target))
+                                                    })
+                                                    .collect()
+                                                })
+                                                .unwrap_or_default();
+                                        z475_fds.sort_by_key(|(k, _)| *k);
+                                        let z475_fd_total = z475_fds.len();
+                                        for (z475_fd, z475_target) in z475_fds.iter().take(256) {
+                                            log(&format!(
+                                                "6-Z475f: pid={} fd={} -> {}",
+                                                parent, z475_fd, z475_target
+                                            ));
+                                        }
+                                        if z475_fd_total > 256 {
+                                            log(&format!(
+                                                "6-Z475f: pid={} ... {} more fds truncated (total {})",
+                                                parent,
+                                                z475_fd_total - 256,
+                                                z475_fd_total
+                                            ));
                                         }
                                     }
                                 }
@@ -57425,5 +57557,46 @@ mod z472_snapshot_tests {
         assert_eq!(z472_cmdline(""), "");
         let long = "x".repeat(200);
         assert_eq!(z472_cmdline(&long).len(), 96);
+    }
+
+    /// 6-Z475: the head+tail picker. A map that fits is returned whole;
+    /// an over-budget map is head + snip marker + tail, and the tail
+    /// MUST be the LAST lines (the rn443 lesson: the fdsan abort pcs sit
+    /// in the libc/libart cluster at the map tail — a front-budget loses
+    /// them entirely).
+    #[test]
+    fn z475_pick_map_lines_head_tail() {
+        use super::z475_pick_map_lines;
+        let small = ["a", "b", "c"];
+        assert_eq!(
+            z475_pick_map_lines(small.iter().copied(), 400, 800),
+            vec!["a", "b", "c"]
+        );
+        let big: Vec<String> = (0..1300).map(|i| format!("line-{}", i)).collect();
+        let refs: Vec<&str> = big.iter().map(|s| s.as_str()).collect();
+        let picked = z475_pick_map_lines(refs.into_iter(), 400, 800);
+        assert_eq!(picked.len(), 400 + 1 + 800);
+        assert_eq!(picked[0], "line-0");
+        assert_eq!(picked[399], "line-399");
+        assert_eq!(picked[400], "...[6-Z475m SNIP]...");
+        assert_eq!(picked[401], "line-500");
+        assert_eq!(picked[1200], "line-1299");
+    }
+
+    /// 6-Z475: the fd-name sort key — decimal parse, garbage sorts last
+    /// (the caller maps None → i64::MAX), and the fd listing stays
+    /// numerically ordered (a LEXICOGRAPHIC sort would put fd 10 before
+    /// fd 2).
+    #[test]
+    fn z475_fd_sort_key_numeric() {
+        use super::z475_fd_sort_key;
+        assert_eq!(z475_fd_sort_key("0"), Some(0));
+        assert_eq!(z475_fd_sort_key("12"), Some(12));
+        assert_eq!(z475_fd_sort_key("129"), Some(129));
+        assert_eq!(z475_fd_sort_key(""), None);
+        assert_eq!(z475_fd_sort_key("abc"), None);
+        let mut names = ["10", "2", "0", "129", "junk"];
+        names.sort_by_key(|n| z475_fd_sort_key(n).unwrap_or(i64::MAX));
+        assert_eq!(names, ["0", "2", "10", "129", "junk"]);
     }
 }
