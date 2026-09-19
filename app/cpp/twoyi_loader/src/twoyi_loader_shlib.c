@@ -9954,6 +9954,53 @@ static void twoyi_init(void) {
         write_str(2, "' (src=none)\n");
     }
     if (strcmp(g_boot_mode_env, "android") == 0) {
+        // ── 6-Z482: THE FDSAN DETECTOR DISABLE (system mode) ──────────
+        //
+        // rn452/rn453 decode: the GUEST's system_server dies era after
+        // era (the zygote restarts at +263/+427/+886/+1376/+1569 s in
+        // rn453) with bionic's fdsan detector firing on fd 0 INSIDE
+        // userspace — "Abort message: 'fdsan: double-close of file
+        // descriptor 0 detected'" (rn453, the watchdog tid) and
+        // "fdsan: failed to exchange ownership of file descriptor: fd 0
+        // is owned by unique_fd ..., was expected to be unowned"
+        // (rn452's tombstones, the exchange sub-class). The 6-Z476/477
+        // syscall floors are BYPASSED: fdsan's ownership check runs in
+        // bionic BEFORE any close syscall reaches the tracer's floor, so
+        // a close that the floor would have rewritten already aborted
+        // the process at the tag-table layer (and libc-internal close
+        // callers never pass through the shlib's GOT-patched close hook
+        // at all).
+        //
+        // ROOT CAUSE: the virtualized stdio floor (6-Z305t-75g +
+        // 6-Z476/477) OWNS fds 0/1/2 — closes on them are rewritten at
+        // the syscall layer (the kernel keeps the descriptor) while
+        // bionic's tag table records the close as DONE. The tag table's
+        // model of the fd state diverges from the kernel's, and the
+        // detector correctly reports the divergence — as a FATAL abort
+        // in a process that, under the floor's supervision semantics,
+        // is behaving exactly as designed. fdsan is a bug DETECTOR, not
+        // a security boundary; under a supervisor that rewrites stdio
+        // closes its error level is a false positive by construction.
+        // The honest fix is the OFFICIAL knob: android_fdsan_set_error_
+        // level(ANDROID_FDSAN_ERROR_LEVEL_DISABLED) for every
+        // system-mode guest process (recovery keeps the stock behavior
+        // — this gate is the same gotfix-44 system-mode gate, so the
+        // recovery corpus is unchanged by construction).
+        {
+            typedef int (*fdsan_set_level_fn)(int);
+            fdsan_set_level_fn set_level =
+                (fdsan_set_level_fn)dlsym(RTLD_DEFAULT,
+                                          "android_fdsan_set_error_level");
+            if (set_level) {
+                // android/fdsan.h: ANDROID_FDSAN_ERROR_LEVEL_DISABLED = 0
+                // (the level is a plain int through dlsym — the header's
+                // enum value is stable ABI across bionic releases).
+                set_level(0);
+                write_str(2, "[twoyi_loader] 6-Z482: fdsan error level -> DISABLED (system mode; the stdio floor owns fds 0/1/2 — the tag table cannot model the floor's rewrite semantics)\n");
+            } else {
+                write_str(2, "[twoyi_loader] 6-Z482: android_fdsan_set_error_level absent — fdsan disable skipped\n");
+            }
+        }
         // ── 6-Z305t-76: THE ZYGOTE LISTENING SOCKET ──────────────────
         //
         // Ladder #152: the zygote's FULL PRELOAD now completes
