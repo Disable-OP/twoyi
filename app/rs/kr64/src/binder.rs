@@ -3363,11 +3363,97 @@ impl BusState {
                 continue;
             };
             let typ = u32::from_ne_bytes(data[off_usize..off_usize + 4].try_into().unwrap());
+            if typ == BINDER_TYPE_HANDLE || typ == BINDER_TYPE_WEAK_HANDLE {
+                // 6-Z467: an already-HANDLE flat is a proxy the sender
+                // received earlier and now forwards. Kernel-true
+                // `binder_transaction()` rewrites the flat to the LOCAL
+                // form (BINDER_TYPE_BINDER/WEAK_BINDER carrying the
+                // owner's ptr/cookie) when the node's OWNER lives in the
+                // RECIPIENT's own guest process — libbinder's
+                // `unflatten_binder` then hands back the owner's LOCAL
+                // BBinder (cookie cast), no proxy, no BC refs. Before
+                // this fix the handle crossed VERBATIM: the recipient's
+                // libbinder materialized a FRESH BpBinder for the same
+                // global handle — a self-proxy whose pointer identity
+                // differs from the owner's local BBinder — and every
+                // map keyed by the local object missed. THE boot
+                // blocker: SF's getPhysicalDisplayToken reply exported
+                // the display-token node to system_server (6-Z359
+                // grant); DMS's getDisplayInfo(token) forwarded that
+                // handle back into SF (token owner conn=67, txn target
+                // conn=66 — the SAME guest pid 3224); SF materialized a
+                // self-proxy (the rn433 decode's BC_INCREFS/BC_ACQUIRE
+                // signature right before the error reply),
+                // getDisplayDeviceLocked's token lookup MISSED →
+                // NAME_NOT_FOUND → DisplayInfo null → "No valid info
+                // found" → DefaultDisplay=null → the DMS phase-100
+                // "Timeout waiting for default display" crash loop, five
+                // generations in a row. The identity that matters is the
+                // GUEST PROCESS (the IDENT-stamped `sender_pid`), NOT
+                // the conn: one process owns several binder conns, and
+                // the txn's target conn is frequently a different conn
+                // from the node-owner conn. Unstamped pids (0) and
+                // unknown handles keep the verbatim crossing (the
+                // pre-fix behavior) — the rewrite only fires on a
+                // POSITIVE same-process match.
+                let flat_handle =
+                    u32::from_ne_bytes(data[off_usize + 8..off_usize + 12].try_into().unwrap());
+                let local_identity = {
+                    let node = self.nodes.get(&flat_handle);
+                    let recipient_pid = self
+                        .conns
+                        .get(&recipient)
+                        .map(|c| c.sender_pid)
+                        .unwrap_or(0);
+                    let owner_pid = node
+                        .and_then(|n| self.conns.get(&n.owner))
+                        .map(|c| c.sender_pid)
+                        .unwrap_or(0);
+                    if recipient_pid != 0 && recipient_pid == owner_pid {
+                        node.map(|n| (n.owner, n.ptr, n.cookie))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((owner_conn, node_ptr, node_cookie)) = local_identity {
+                    let local_type = if typ == BINDER_TYPE_HANDLE {
+                        BINDER_TYPE_BINDER
+                    } else {
+                        BINDER_TYPE_WEAK_BINDER
+                    };
+                    data[off_usize..off_usize + 4].copy_from_slice(&local_type.to_ne_bytes());
+                    data[off_usize + 8..off_usize + 16].copy_from_slice(&node_ptr.to_ne_bytes());
+                    data[off_usize + 16..off_usize + 24]
+                        .copy_from_slice(&node_cookie.to_ne_bytes());
+                    static Z467_LOG: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(64);
+                    if Z467_LOG.load(Ordering::Relaxed) > 0 {
+                        Z467_LOG.fetch_sub(1, Ordering::Relaxed);
+                        info!(
+                            "[KR64][binder][vm{}] 6-Z467: local rewrite handle=0x{:08x} → local form (ptr=0x{:x} cookie=0x{:x}) — same guest process pid={} (owner conn={}, recipient conn={}) in {} conn={} -> conn={}",
+                            vm_id,
+                            flat_handle,
+                            node_ptr,
+                            node_cookie,
+                            self.conns.get(&recipient).map(|c| c.sender_pid).unwrap_or(0),
+                            owner_conn,
+                            recipient,
+                            what,
+                            sender,
+                            recipient
+                        );
+                    }
+                }
+                // No grant either way: a forwarded handle resolves on
+                // the recipient's own table; a local rewrite grants
+                // nothing (the owner already holds its object, and the
+                // sender's proxy refs are the sender's own).
+                continue;
+            }
             let (is_strong_local, handle_type) = match typ {
                 t if t == BINDER_TYPE_BINDER => (true, BINDER_TYPE_HANDLE),
                 t if t == BINDER_TYPE_WEAK_BINDER => (false, BINDER_TYPE_WEAK_HANDLE),
-                // Already handle-form (a proxy the sender received
-                // earlier and now forwards) or an fd/ptr entry: leave it.
+                // fd/ptr/other entries: leave verbatim.
                 _ => continue,
             };
             let ptr = u64::from_ne_bytes(data[off_usize + 8..off_usize + 16].try_into().unwrap());
@@ -12493,6 +12579,193 @@ mod tests {
         let node = bus.nodes.get(&grants2[0].handle).expect("node exists");
         assert_eq!(node.strong.get(&recipient), Some(&2));
         assert_eq!(node.weak.get(&recipient), Some(&2));
+    }
+
+    #[test]
+    fn z467_same_process_handle_flat_rewrites_to_local_form() {
+        // Kernel truth: a forwarded HANDLE flat whose node's OWNER lives
+        // in the RECIPIENT's own guest process is rewritten to the LOCAL
+        // form (the owner's ptr/cookie) — the recipient's
+        // unflatten_binder returns its OWN BBinder, no proxy, NO grant,
+        // NO owner-side mirrors. The rn433 decode's boot blocker: DMS's
+        // getDisplayInfo(token) forwarded SF's display-token handle back
+        // into SF (token owner conn=67, txn target conn=66, same guest
+        // pid) — the verbatim handle made SF materialize a self-proxy,
+        // the token lookup missed, and the DMS phase-100 display wait
+        // crash-looped every generation.
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let sender = bus.register_conn();
+        let recipient = bus.register_conn();
+        let shared_pid = z454_unique_pid();
+        bus.conns.get_mut(&owner).unwrap().sender_pid = shared_pid;
+        bus.conns.get_mut(&recipient).unwrap().sender_pid = shared_pid;
+        bus.conns.get_mut(&sender).unwrap().sender_pid = z454_unique_pid();
+
+        // Era 0: the owner exports its local object to `sender` — the
+        // ordinary local→handle grant (SF's token-reply arm).
+        let ptr: u64 = 0xE1E5_F280_7C30;
+        let cookie: u64 = 0xE1E6_0281_5510;
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        let grants = bus.z359_translate_flats(0, owner, sender, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants.len(), 1, "era-0 export grants the sender a handle");
+        let handle = grants[0].handle;
+
+        // The forward: `sender` sends the HANDLE flat back into the
+        // owner's process (the recipient shares the owner's pid).
+        let mut fwd = vec![0u8; 32];
+        fwd[0..4].copy_from_slice(&BINDER_TYPE_HANDLE.to_ne_bytes());
+        fwd[8..16].copy_from_slice(&(handle as u64).to_ne_bytes());
+        let mut fwd_off = Vec::new();
+        fwd_off.extend_from_slice(&0u64.to_ne_bytes());
+        let grants_fwd =
+            bus.z359_translate_flats(0, sender, recipient, &mut fwd, &mut fwd_off, "TEST");
+        assert!(grants_fwd.is_empty(), "a local rewrite grants nothing");
+        assert_eq!(
+            u32::from_ne_bytes(fwd[0..4].try_into().unwrap()),
+            BINDER_TYPE_BINDER,
+            "handle → local form"
+        );
+        assert_eq!(u64::from_ne_bytes(fwd[8..16].try_into().unwrap()), ptr);
+        assert_eq!(u64::from_ne_bytes(fwd[16..24].try_into().unwrap()), cookie);
+        // The recipient gained NO proxy refs — the node maps still name
+        // only the era-0 sender.
+        let node = bus.nodes.get(&handle).expect("node exists");
+        assert_eq!(node.strong.get(&recipient), None);
+        assert_eq!(node.weak.get(&recipient), None);
+    }
+
+    #[test]
+    fn z467_cross_process_handle_flat_stays_verbatim() {
+        // Different recipient pid: the handle stays a handle (kr64's
+        // global handle space makes the kernel's per-proc remap a no-op;
+        // the recipient's fresh proxy is kernel-true there).
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let sender = bus.register_conn();
+        let recipient = bus.register_conn();
+        bus.conns.get_mut(&owner).unwrap().sender_pid = z454_unique_pid();
+        bus.conns.get_mut(&sender).unwrap().sender_pid = z454_unique_pid();
+        bus.conns.get_mut(&recipient).unwrap().sender_pid = z454_unique_pid();
+
+        let ptr: u64 = 0x1000;
+        let cookie: u64 = 0x2000;
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        let grants = bus.z359_translate_flats(0, owner, sender, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants.len(), 1);
+        let handle = grants[0].handle;
+
+        let mut fwd = vec![0u8; 32];
+        fwd[0..4].copy_from_slice(&BINDER_TYPE_HANDLE.to_ne_bytes());
+        fwd[8..16].copy_from_slice(&(handle as u64).to_ne_bytes());
+        let mut fwd_off = Vec::new();
+        fwd_off.extend_from_slice(&0u64.to_ne_bytes());
+        let grants_fwd =
+            bus.z359_translate_flats(0, sender, recipient, &mut fwd, &mut fwd_off, "TEST");
+        assert!(grants_fwd.is_empty());
+        assert_eq!(
+            u32::from_ne_bytes(fwd[0..4].try_into().unwrap()),
+            BINDER_TYPE_HANDLE,
+            "cross-process forward stays handle-form"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(fwd[8..12].try_into().unwrap()),
+            handle,
+            "handle value unchanged"
+        );
+    }
+
+    #[test]
+    fn z467_unstamped_recipient_pid_keeps_handle_verbatim() {
+        // A recipient with no IDENT stamp (sender_pid == 0) keeps the
+        // pre-fix verbatim crossing — the rewrite fires only on a
+        // POSITIVE same-process match.
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let sender = bus.register_conn();
+        let recipient = bus.register_conn();
+        bus.conns.get_mut(&owner).unwrap().sender_pid = z454_unique_pid();
+        bus.conns.get_mut(&sender).unwrap().sender_pid = z454_unique_pid();
+        // recipient.sender_pid stays 0.
+
+        let ptr: u64 = 0x3000;
+        let cookie: u64 = 0x4000;
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        let grants = bus.z359_translate_flats(0, owner, sender, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants.len(), 1);
+        let handle = grants[0].handle;
+
+        let mut fwd = vec![0u8; 32];
+        fwd[0..4].copy_from_slice(&BINDER_TYPE_HANDLE.to_ne_bytes());
+        fwd[8..16].copy_from_slice(&(handle as u64).to_ne_bytes());
+        let mut fwd_off = Vec::new();
+        fwd_off.extend_from_slice(&0u64.to_ne_bytes());
+        let grants_fwd =
+            bus.z359_translate_flats(0, sender, recipient, &mut fwd, &mut fwd_off, "TEST");
+        assert!(grants_fwd.is_empty());
+        assert_eq!(
+            u32::from_ne_bytes(fwd[0..4].try_into().unwrap()),
+            BINDER_TYPE_HANDLE,
+            "unstamped pid: verbatim"
+        );
+    }
+
+    #[test]
+    fn z467_weak_handle_flat_rewrites_to_weak_binder() {
+        // The weak-handle forward into the owner's process rewrites to
+        // BINDER_TYPE_WEAK_BINDER with the same (ptr, cookie).
+        let mut bus = BusState::new();
+        let owner = bus.register_conn();
+        let sender = bus.register_conn();
+        let recipient = bus.register_conn();
+        let shared_pid = z454_unique_pid();
+        bus.conns.get_mut(&owner).unwrap().sender_pid = shared_pid;
+        bus.conns.get_mut(&recipient).unwrap().sender_pid = shared_pid;
+        bus.conns.get_mut(&sender).unwrap().sender_pid = z454_unique_pid();
+
+        let ptr: u64 = 0x5000;
+        let cookie: u64 = 0x6000;
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&BINDER_TYPE_WEAK_BINDER.to_ne_bytes());
+        data[8..16].copy_from_slice(&ptr.to_ne_bytes());
+        data[16..24].copy_from_slice(&cookie.to_ne_bytes());
+        let mut offsets = Vec::new();
+        offsets.extend_from_slice(&0u64.to_ne_bytes());
+        let grants = bus.z359_translate_flats(0, owner, sender, &mut data, &mut offsets, "TEST");
+        assert_eq!(grants.len(), 1, "weak export grants a weak handle");
+        assert!(!grants[0].strong);
+        let handle = grants[0].handle;
+
+        let mut fwd = vec![0u8; 32];
+        fwd[0..4].copy_from_slice(&BINDER_TYPE_WEAK_HANDLE.to_ne_bytes());
+        fwd[8..16].copy_from_slice(&(handle as u64).to_ne_bytes());
+        let mut fwd_off = Vec::new();
+        fwd_off.extend_from_slice(&0u64.to_ne_bytes());
+        let grants_fwd =
+            bus.z359_translate_flats(0, sender, recipient, &mut fwd, &mut fwd_off, "TEST");
+        assert!(grants_fwd.is_empty());
+        assert_eq!(
+            u32::from_ne_bytes(fwd[0..4].try_into().unwrap()),
+            BINDER_TYPE_WEAK_BINDER,
+            "weak handle → weak local form"
+        );
+        assert_eq!(u64::from_ne_bytes(fwd[8..16].try_into().unwrap()), ptr);
+        assert_eq!(u64::from_ne_bytes(fwd[16..24].try_into().unwrap()), cookie);
     }
 
     #[test]
