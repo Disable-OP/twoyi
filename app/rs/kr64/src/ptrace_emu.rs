@@ -26387,6 +26387,47 @@ pub fn run_ptrace_loop(
                                         orig,
                                         argv_e.join("][")
                                     ));
+                                    // 6-Z479a: the ENV capture. The rn449 decode
+                                    // named the PMS-grind dex2oat death: the
+                                    // STAGED exec's linker fails
+                                    // `CANNOT LINK EXECUTABLE ".../dex2oat64":
+                                    // library "libprofile.so" not found` — while
+                                    // libprofile.so EXISTS in the flattened APEX
+                                    // tree (the era-true maps carry its r-xp
+                                    // region at +227 s) AND the shlib's rebuilt
+                                    // guest LD_LIBRARY_PATH includes
+                                    // {rootfs}/apex/com.android.art/lib64. The
+                                    // unresolved question: WHAT env does THIS
+                                    // exec actually carry (the ART's dexopt
+                                    // invocation may pass a hand-crafted envp
+                                    // that DROPS/overrides LD_LIBRARY_PATH, or
+                                    // an unprefixed /apex form the host-context
+                                    // linker cannot serve). The envp = execve's
+                                    // arg3 — the same char** reader as the argv.
+                                    // 4 shots per run (the env is long).
+                                    {
+                                        static Z479A_ENV_LOGGED: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        if Z479A_ENV_LOGGED
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                            < 4
+                                        {
+                                            Z479A_ENV_LOGGED
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            let envp_addr_e = get_syscall_arg(&regs, abi.reg_arg3);
+                                            let env_e = z306_read_guest_argv(
+                                                pid,
+                                                envp_addr_e,
+                                                stride_e,
+                                                96,
+                                            );
+                                            log(&format!(
+                                                "6-Z479a DEX2OAT-ENV: pid={} env=[{}] (execve ENTRY)",
+                                                pid,
+                                                env_e.join("][")
+                                            ));
+                                        }
+                                    }
                                 }
                                 // Lazy-load the staged map once.
                                 if staged_exes.is_none() {
