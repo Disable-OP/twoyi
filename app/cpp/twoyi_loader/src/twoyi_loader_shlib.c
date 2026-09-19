@@ -4990,7 +4990,28 @@ int ioctl(int fd, unsigned long request, ...) {
     //    fix). Transport failures return -1 with errno (honest ioctl
     //    semantics; no silent degradation to the fakes above).
     if (binder_fd_is_proxy(fd)) {
-        return binder_proxy_ioctl(fd, req, argp);
+        int z478_ret = binder_proxy_ioctl(fd, req, argp);
+        // 6-Z478: uniform wire-failure evidence at the call site — the
+        // rn448 decode proved binder_proxy_write_read returns its OWN
+        // -errno (the rn448 -88 = -ENOTSOCK class, the health HAL's
+        // getAndExecuteCommand abort) WITHOUT passing through
+        // binder_proxy_ioctl's fail label, so the fail-label diag never
+        // saw it. Cover EVERY proxy ioctl failure here instead, 8 shots
+        // per process (the same bounded-diag discipline).
+        if (z478_ret != 0) {
+            static unsigned z478_proxy_fail_log = 0;
+            if (z478_proxy_fail_log < 8) {
+                z478_proxy_fail_log++;
+                int z478_e = errno;
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "[twoyi_loader] binder proxy ioctl FAIL fd=%d req=0x%x ret=%d errno=%d (%s)\n",
+                         fd, req, z478_ret, z478_e,
+                         z478_e > 0 ? strerror(z478_e) : "status");
+                write_str(2, msg);
+            }
+        }
+        return z478_ret;
     }
 
     // REAL binder fd (real binderfs device) — pass through to the real
