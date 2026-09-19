@@ -16528,6 +16528,29 @@ fn z472_cmdline(raw: &str) -> String {
     joined
 }
 
+/// 6-Z476 (pure): classify ONE /proc/<pid>/maps line as COLLAPSIBLE —
+/// decode-low-value mass that a symbolization-focused capture may
+/// compress: (a) a bare anonymous region (exactly the five leading
+/// fields — start-end, perms, offset, dev, inode — and nothing after),
+/// or (b) a bracket-anon region ([anon:...] — the stack_and_tls fleet,
+/// dalvik spaces, scudo arenas, .bss tails). JIT-code regions
+/// ([anon_shmem:...jit...] / [anon:...jit...]) and [stack] NEVER
+/// collapse (JIT pc resolution + the stack end anchor). A short or
+/// garbled line (< 5 fields) classifies as NOT collapsible — never
+/// compress what cannot be classified.
+fn z475_map_line_collapsible(line: &str) -> bool {
+    let mut it = line.split_whitespace();
+    for _ in 0..5 {
+        if it.next().is_none() {
+            return false;
+        }
+    }
+    match it.next() {
+        None => true,
+        Some(name_field) => name_field.starts_with("[anon:") && !name_field.contains("jit"),
+    }
+}
+
 /// 6-Z475 (pure): the head+tail line picker for the era-true map
 /// capture. rn443's decode proved a FLAT front-budget loses the crash
 /// era: system_server's map runs dalvik/anon first (the 1600-line cut
@@ -16536,19 +16559,55 @@ fn z472_cmdline(raw: &str) -> String {
 /// emits the first `head` lines (the heap-baseline continuity) and the
 /// last `tail` lines (the system-lib cluster + stacks) with one snip
 /// marker between; when the map fits, it is returned whole.
+///
+/// 6-Z476: head+tail alone failed its first live contact (rn444): the
+/// gen-5312 abort pc 0xeebcba2f92ec had NO region in the captured
+/// 1201 lines — the bare-anon mass sits BETWEEN the dalvik head and
+/// the linker tail, so the head/tail windows sliced around it and
+/// SNIPPED the file-backed library cluster the pcs live in. The picker
+/// now collapses runs of >= 3 consecutive UNNAMED-anon lines into one
+/// boundary + marker line BEFORE the budget applies: the file-backed
+/// (library) and named ([anon:...], [stack]) clusters survive whole
+/// and the head/tail budget applies to the REDUCED sequence. When the
+/// reduced map fits, it is returned whole; an over-budget reduced map
+/// is head + snip + tail of the reduced set. Markers are emitted as
+/// owned Strings (the anon-run marker is synthesized); every other
+/// line is the verbatim map text.
 fn z475_pick_map_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
     head: usize,
     tail: usize,
-) -> Vec<&'a str> {
+) -> Vec<String> {
     let all: Vec<&'a str> = lines.collect();
-    if all.len() <= head.saturating_add(tail) {
-        return all;
+    let mut reduced: Vec<String> = Vec::with_capacity(all.len());
+    let mut i = 0usize;
+    while i < all.len() {
+        if z475_map_line_collapsible(all[i]) {
+            let start = i;
+            while i < all.len() && z475_map_line_collapsible(all[i]) {
+                i += 1;
+            }
+            let run = i - start;
+            if run >= 3 {
+                reduced.push(all[start].to_string());
+                reduced.push(format!("...[6-Z475m ANON x{}]...", run));
+            } else {
+                for line in &all[start..i] {
+                    reduced.push((*line).to_string());
+                }
+            }
+        } else {
+            reduced.push(all[i].to_string());
+            i += 1;
+        }
+    }
+    if reduced.len() <= head.saturating_add(tail) {
+        return reduced;
     }
     let mut out = Vec::with_capacity(head + tail + 1);
-    out.extend_from_slice(&all[..head]);
-    out.push("...[6-Z475m SNIP]...");
-    out.extend_from_slice(&all[all.len() - tail..]);
+    out.extend_from_slice(&reduced[..head]);
+    out.push("...[6-Z475m SNIP]...".to_string());
+    out.extend_from_slice(&reduced[reduced.len() - tail..]);
     out
 }
 
@@ -22842,6 +22901,53 @@ pub fn run_ptrace_loop(
                                         z306_childgate.insert(new_child_id as libc::pid_t, 0u32);
                                         z306_zygote_fork_children
                                             .insert(new_child_id as libc::pid_t);
+                                        // 6-Z476: FORK-ARM the stdio floor for
+                                        // EVERY process child of the pinned
+                                        // zygote. rn444's decode DISPROVED the
+                                        // 6-Z475 arm point: the floor armed at
+                                        // the PR_SET_NAME("system_server")
+                                        // rename (+399.2s for gen-5312), but
+                                        // the forkSystemServer child's fd-0
+                                        // free (the DetachDescriptors stdin
+                                        // close) fires at the fork — BEFORE
+                                        // the rename — so the post-arm
+                                        // close(0)-rewrite was a NO-OP (zero
+                                        // floor rewrites for gens
+                                        // 5312/6304/7293/8015 vs 24 for the
+                                        // zygotes) and the still-free slot
+                                        // then caught the JDWP SCM_RIGHTS
+                                        // receive (fd 0 = a fresh socket at
+                                        // EVERY gen death per 6-Z475f;
+                                        // tombstone_00's "fd 0 is owned by
+                                        // unique_fd ..." abort on the
+                                        // watchdog tid). The fork event is
+                                        // the earliest visible child
+                                        // identity: arm HERE so the child's
+                                        // close(0) is rewritten to getpid
+                                        // from its FIRST syscall and a
+                                        // received descriptor can never land
+                                        // on a stdio slot. gen-4104 (rn444)
+                                        // never fired the rename arm at all
+                                        // (the 6-Z404 ENTRY-missed invisible
+                                        // class) — the fork arm covers that
+                                        // class too. Init's service children
+                                        // are NOT touched (they fork from
+                                        // init, not the zygote; their svclog
+                                        // dup2 wiring stays legitimate).
+                                        {
+                                            static Z476_FORK_ARM_LOGGED:
+                                                std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            let z476_n = Z476_FORK_ARM_LOGGED
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if z476_n < 16 {
+                                                log(&format!(
+                                                    "6-Z476: floor fork-ARMED pid={} (the pinned zygote's fork child — the fdsan fd-0 class armed before the rename)",
+                                                    new_child_id
+                                                ));
+                                            }
+                                        }
+                                        z475_sserver_floor_pids.insert(new_child_id as libc::pid_t);
                                     }
                                 }
                             }
@@ -31041,8 +31147,21 @@ pub fn run_ptrace_loop(
                                 // precedent — and force ret=0 at EXIT so
                                 // bionic's close() sees success, identical
                                 // semantics to the libc-level floor.
+                                // 6-Z476: resolve the checking pid to its
+                                // TGID first (the z306 lineage cache maps
+                                // thread-tid → tgid). The fork-armed floor
+                                // inserts the TGID; a close(0/1/2) arriving
+                                // from a THREAD of a floored gen must hit
+                                // the same floor (the fdsan abort class is
+                                // not thread-picky — rn443 caught it on the
+                                // ADB-JDWP Connec tid, rn444 on the
+                                // watchdog tid). The zygote pin keeps the
+                                // exact-pid check (the zygote's closes run
+                                // on its main thread, pid == tgid).
+                                let z476_floor_pid =
+                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid);
                                 if z305y_stdio_pin_pid == Some(pid)
-                                    || z475_sserver_floor_pids.contains(&pid)
+                                    || z475_sserver_floor_pids.contains(&z476_floor_pid)
                                 {
                                     static Z305Y_PIN_LOGGED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
@@ -40761,11 +40880,22 @@ pub fn run_ptrace_loop(
                                             // head+tail instead (the tail
                                             // carries the crash-era system-lib
                                             // cluster + stacks).
+                                            // 6-Z476 (rn444 decode): head+tail
+                                            // alone SNIPPED the cluster — the
+                                            // gen-5312 abort pc had NO region in
+                                            // the captured 1201 lines because the
+                                            // bare-anon + [anon:] mass sits
+                                            // BETWEEN the dalvik head and the
+                                            // linker tail. The picker collapses
+                                            // that mass first (6-Z476), and the
+                                            // tail budget rises 800 → 1200 so the
+                                            // reduced (library-cluster-whole) map
+                                            // fits the windows.
                                             let z475_all: Vec<&str> = maps.lines().collect();
                                             for ml in z475_pick_map_lines(
                                                 z475_all.iter().copied(),
                                                 400,
-                                                800,
+                                                1200,
                                             ) {
                                                 log(&format!("6-Z472m: {}", ml));
                                             }
@@ -57563,13 +57693,14 @@ mod z472_snapshot_tests {
     /// an over-budget map is head + snip marker + tail, and the tail
     /// MUST be the LAST lines (the rn443 lesson: the fdsan abort pcs sit
     /// in the libc/libart cluster at the map tail — a front-budget loses
-    /// them entirely).
+    /// them entirely). Lines that carry no name classify as garbage and
+    /// are never collapsed.
     #[test]
     fn z475_pick_map_lines_head_tail() {
         use super::z475_pick_map_lines;
         let small = ["a", "b", "c"];
         assert_eq!(
-            z475_pick_map_lines(small.iter().copied(), 400, 800),
+            z475_pick_map_lines(small.iter().copied(), 400, 1200),
             vec!["a", "b", "c"]
         );
         let big: Vec<String> = (0..1300).map(|i| format!("line-{}", i)).collect();
@@ -57581,6 +57712,105 @@ mod z472_snapshot_tests {
         assert_eq!(picked[400], "...[6-Z475m SNIP]...");
         assert_eq!(picked[401], "line-500");
         assert_eq!(picked[1200], "line-1299");
+    }
+
+    /// 6-Z476: the collapse classifier. A bare-anon line (exactly five
+    /// fields) and a [anon:...] label (the stack_and_tls / dalvik-space
+    /// fleet) are collapsible; file-backed paths, jit-code regions,
+    /// [stack], short/garbled lines, and socket:/pipe: named anons are
+    /// NOT.
+    #[test]
+    fn z475_map_line_collapsible_classifies() {
+        use super::z475_map_line_collapsible;
+        // exactly five fields = bare anon → collapsible
+        assert!(z475_map_line_collapsible(
+            "7f0000000-7f1000000 rw-p 00000000 00:00 0"
+        ));
+        // [anon:...] labels → collapsible (the fleet that drowned the
+        // rn444 tail window)
+        assert!(z475_map_line_collapsible(
+            "eeba16760000-eeba16761000 ---p 00000000 00:00 0   [anon:stack_and_tls:5353]"
+        ));
+        assert!(z475_map_line_collapsible(
+            "12c00000-2ac00000 rw-p 00000000 00:00 0    [anon:dalvik-main space (region space)]"
+        ));
+        // jit-code regions → NEVER collapsible (JIT pc resolution)
+        assert!(!z475_map_line_collapsible(
+            "3fa44000-41a44000 r--s 00000000 00:01 2199   /memfd:jit-zygote-cache (deleted)"
+        ));
+        assert!(!z475_map_line_collapsible(
+            "41a44000-43a44000 r-xs 02000000 00:01 2199   [anon_shmem:dalvik-zygote-jit-code-cache]"
+        ));
+        // file-backed + [stack] → never collapsible
+        assert!(!z475_map_line_collapsible(
+            "eebcba2f0000-eebcba3a0000 r-xp 000d8000 fd:01 1234  /apex/com.android.art/lib64/bionic/libc.so"
+        ));
+        assert!(!z475_map_line_collapsible(
+            "ffffdb0b0000-ffffdc0af000 rw-p 00000000 00:00 0   [stack]"
+        ));
+        // socket/pipe named anons → keep (fd-table corroboration)
+        assert!(!z475_map_line_collapsible(
+            "7f0000000-7f1000000 rw-s 00000000 00:00 0   socket:[123456]"
+        ));
+        // garbled short lines → never collapsible
+        assert!(!z475_map_line_collapsible("garbled"));
+        assert!(!z475_map_line_collapsible("a b c"));
+    }
+
+    /// 6-Z476: the collapse-then-budget picker. The rn444 failure shape:
+    /// a dalvik head, a HUGE anon+[anon:] mass, then the file-backed
+    /// library cluster (the abort-pc home) then [stack]. 6-Z475's plain
+    /// head+tail lost the cluster entirely; the collapse keeps every
+    /// file-backed line and the reduced map FITS the budget whole — the
+    /// libc.so line must appear in the capture.
+    #[test]
+    fn z475_pick_map_lines_anon_collapse_keeps_libraries() {
+        use super::z475_pick_map_lines;
+        let mut map: Vec<String> = Vec::new();
+        // dalvik-ish head: 10 named-anon lines (collapsible)
+        for i in 0..10 {
+            map.push(format!(
+                "12c00000-2ac00000 rw-p 00000000 00:00 0   [anon:dalvik-heap-{}]",
+                i
+            ));
+        }
+        // the bare-anon mass: 2000 lines (collapsible)
+        for i in 0..2000 {
+            map.push(format!("{:012x}-{:012x} rw-p 00000000 00:00 0", i, i + 1));
+        }
+        // the file-backed library cluster: 300 lines (NEVER collapsible)
+        for i in 0..300 {
+            map.push(format!(
+                "eebcba{:03x}-eebcbb{:03x} r-xp 000d8000 fd:01 1234  /apex/com.android.art/lib64/bionic/libc.so.{}",
+                i, i, i
+            ));
+        }
+        map.push("ffffdb0b0000-ffffdc0af000 rw-p 00000000 00:00 0   [stack]".to_string());
+        let refs: Vec<&str> = map.iter().map(|s| s.as_str()).collect();
+        // The dalvik head and the bare-anon mass are ADJACENT collapsible
+        // lines → ONE run of 2010 → 1 boundary + 1 marker; then the 300
+        // library lines + [stack]. The reduced map (303 lines) fits the
+        // 400/1200 budget WHOLE — no SNIP marker — and carries EVERY
+        // library line (the rn444 failure is structurally impossible).
+        let picked = z475_pick_map_lines(refs.into_iter(), 400, 1200);
+        assert_eq!(picked.len(), 2 + 300 + 1);
+        assert!(picked[0].contains("[anon:dalvik-heap-0]"));
+        assert_eq!(picked[1], "...[6-Z475m ANON x2010]...");
+        let libc_lines = picked.iter().filter(|l| l.contains("libc.so")).count();
+        assert_eq!(libc_lines, 300, "every library line must survive");
+        assert_eq!(
+            picked[picked.len() - 1],
+            "ffffdb0b0000-ffffdc0af000 rw-p 00000000 00:00 0   [stack]"
+        );
+        // the mass must not pass through line-by-line: the combined
+        // run's boundary is the RUN's first line (the dalvik head), so
+        // ZERO mass lines appear in the capture
+        let mass_lines = picked
+            .iter()
+            .filter(|l| l.starts_with("000000000000-"))
+            .count();
+        assert_eq!(mass_lines, 0, "no mass line may survive the collapse");
+        assert!(!picked.iter().any(|l| l == "...[6-Z475m SNIP]..."));
     }
 
     /// 6-Z475: the fd-name sort key — decimal parse, garbage sorts last
