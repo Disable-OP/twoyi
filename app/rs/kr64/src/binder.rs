@@ -5597,54 +5597,31 @@ fn handle_write_read(
                         let anchored_dead = ptr != 0
                             && cookie != 0
                             && z463_close_rejected(mirror_ref_check(dpid, ptr, cookie));
-                        // 6-Z465 (rn430 decode): the DEC-arm weakref-liveness
-                        // leg. The 6-Z463 silent close is exactly right for
-                        // the REL arm — a decStrong on a provably-dead object
-                        // is unconditionally the corruption write — but on
-                        // the DEC arm it also drops the CLEAN zero-class
-                        // shape: the object dead, the weakref chunk alive
-                        // owning the last weak ref. There the guest's decWeak
-                        // is the chunk-reclaiming write and the drop LEAKS
-                        // the weakref_impl (~48 B per dropped era, the rn430
-                        // bounded-leak note). This leg re-reads the
-                        // owner-side counters (z457's source-true 20-byte
-                        // read — mStrong@[W+0], mWeak@[W+4], mBase@[W+8],
-                        // mFlags@[W+16]; the old mStrong@16 model was
-                        // rn423's disproof) and delivers the DEC ONLY on a
-                        // plausible live-weakref snapshot; garbage / virgin
-                        // / lifecycle-flag / unreadable shapes keep the
-                        // silent close. The REL arm never rescues.
-                        let mut dec_rescued = false;
-                        if anchored_dead && br == BR_DECREFS {
-                            match crate::ptrace_emu::z457_refcount_snapshot(dpid, ptr) {
-                                Some(st) => {
-                                    if z465_weakref_live(st.strong_raw, st.weak, st.flags, st.mbase)
-                                    {
-                                        dec_rescued = true;
-                                        if z465_log().load(Ordering::Relaxed) > 0 {
-                                            z465_log().fetch_sub(1, Ordering::Relaxed);
-                                            info!(
-                                                "[KR64][binder][vm{}] 6-Z465: DEC delivered past a Dead anchor (weakref-live) conn={} W=0x{:x} cookie=0x{:x} owner-pid={} raw[strong={} weak={} flags={}] mBase=0x{:x} — the object is dead but the weakref chunk is alive and owns this DEC: the delivery is the chunk-reclaiming write; the silent close would leak the weakref_impl",
-                                                vm_id, conn_id, ptr, cookie, dpid,
-                                                st.strong_raw, st.weak, st.flags, st.mbase
-                                            );
-                                        }
-                                    } else if z465_log().load(Ordering::Relaxed) > 0 {
-                                        z465_log().fetch_sub(1, Ordering::Relaxed);
-                                        info!(
-                                            "[KR64][binder][vm{}] 6-Z465: DEC kept silent (counters garbage/virgin/lifecycle) conn={} W=0x{:x} cookie=0x{:x} owner-pid={} raw[strong={} weak={} flags={}] mBase=0x{:x} — the snapshot does not name a live weakref_impl; the 6-Z463 silent close stays",
-                                            vm_id, conn_id, ptr, cookie, dpid,
-                                            st.strong_raw, st.weak, st.flags, st.mbase
-                                        );
-                                    }
-                                }
-                                None => {
-                                    // W unreadable = the freed/unmapped
-                                    // signature — the silent close stays.
-                                }
-                            }
-                        }
-                        if anchored_dead && !dec_rescued {
+                        // 6-Z465 REVERTED (the rn432 decode verdict, Task
+                        // 200): the DEC-arm weakref-liveness rescue was
+                        // UNSOUND FOR ITS CLASS and ran exactly ONE boot.
+                        // rn430/rn431 (before the leg) had ZERO binder-Scudo
+                        // aborts; rn432 (with it) had THREE — and TWO abort
+                        // addresses join the rescue witnesses literally
+                        // (0xfe44b5c0c850 = the +28031ms rescue, pid 2862
+                        // aborted; 0xfd4f9ce0b580 = the +50921/+52237ms
+                        // rescues). The root cause is a PROBE-INVISIBLE
+                        // residue shape: the object-killed-with-pending-weak
+                        // chunk frees with residue strong=0, weak=1,
+                        // mBase intact, flags=0 — byte-identical to the
+                        // CLEAN live-weakref zero-class the 20-byte read
+                        // was supposed to select for. Freed-chunk residue
+                        // PASSES the probe, the DEC delivers onto a freed
+                        // chunk, and Scudo kills the owner (the very
+                        // corruption class 6-Z463 was built to stop). No
+                        // 20-byte read can separate a live weakref_impl
+                        // from its own freed residue — the rescue is
+                        // structurally unsound, not tunable. The ~48 B/era
+                        // weakref leak (bounded, zero corruption, zero
+                        // growth spiral) is the ACCEPTABLE cost; the
+                        // 6-Z463 silent close is restored UNCONDITIONALLY
+                        // for every anchor-Dead close, REL and DEC alike.
+                        if anchored_dead {
                             if z463_drop_log().load(Ordering::Relaxed) > 0 {
                                 z463_drop_log().fetch_sub(1, Ordering::Relaxed);
                                 info!(
@@ -5655,12 +5632,10 @@ fn handle_write_read(
                             }
                             push_br_noop(&mut read_buf);
                         }
-                        // 6-Z465: a rescued DEC rejoins the kernel-true
-                        // delivery path exactly as an anchor-Alive delivery
-                        // would — the 6-Z454 ledger does not count weak
-                        // mirrors (they destroy nothing), so no accounting
-                        // change.
-                        if !anchored_dead || dec_rescued {
+                        // 6-Z465 reverted — the delivery condition is back
+                        // to the 6-Z463 wire symmetry: anchor-Alive and
+                        // Unknown deliver, a positive Dead never does.
+                        if !anchored_dead {
                             if z457_budget().load(Ordering::Relaxed) > 0 {
                                 // 6-Z454: the gates PASSED — the ledger counts
                                 // the delivery (V2 baseline for this object).
@@ -10181,70 +10156,6 @@ fn mirror_ref_ok(guest_pid: i32, ptr: u64, cookie: u64) -> bool {
 /// contract without a tracer.
 fn z463_close_rejected(probe: Liveness) -> bool {
     matches!(probe, Liveness::Dead)
-}
-
-/// 6-Z465: the count cap separating a plausible live refcount from
-/// reused-chunk garbage. No boot-time object accumulates a million
-/// holders; anything above is a freed-chunk value.
-const Z465_COUNT_CAP: i32 = 1 << 20;
-
-/// 6-Z465 (rn430 decode): the DEC-arm weakref-liveness verdict — the
-/// pure decision core. The 6-Z463 silent close fixed the corruption
-/// write but DROPS the clean zero-class shape too: the object is dead
-/// (the round-trip anchor positively severed) while the WEAKREF CHUNK
-/// ITSELF is alive and owns the last weak ref — the DEC the guest
-/// would run is the chunk-reclaiming write, so dropping it leaks one
-/// weakref_impl per dropped era (~48 B, bounded, zero corruption — the
-/// rn430 note). This leg re-reads the owner-side counters AT the
-/// delivery and delivers the DEC only when the snapshot names a
-/// plausible live weakref_impl; everything else keeps the silent close.
-///
-/// Source-true layout (rn423's disproof model — weakref_impl's FIRST
-/// members are mStrong, mWeak, THEN mBase, mFlags; the old
-/// mStrong@16 model landed on mFlags=0 + padding and was disproven):
-///   [W+0]  mStrong i32 raw   — `strong_raw`
-///   [W+4]  mWeak   i32       — `weak`
-///   [W+8]  mBase   RefBase*  — `mbase`
-///   [W+16] mFlags i32        — `flags`
-///
-/// Contract (each clause kernel- or source-true):
-///   `mbase != 0`              — a live weakref_impl always carries its
-///                               object pointer (set in the ctor, never
-///                               zeroed); 0 = the freed-chunk signature
-///                               (the 6-Z306ae-f witness itself).
-///   `0 <= strong_raw <= CAP`  — the HAD-STRONG shape (the era's ACQ ran,
-///   `strong_raw != INITIAL`     the REL consumed the count — 0 expected).
-///                               VIRGIN (INITIAL bias intact) would drive
-///                               decWeak's delete-mBase object-kill path on
-///                               a provably-dead object — the double-free
-///                               class again. NEGATIVE = a decStrong already
-///                               fired past zero (the rn420/rn422 over-dec
-///                               shape) — the chunk's arithmetic is lost.
-///   `1 <= weak <= CAP`        — the chunk owns at least the ref this
-///                               DEC drops (mWeak counts refs; a live
-///                               chunk holding ours reads ≥ 1).
-///   `flags == 0`              — the plain OBJECT_LIFETIME_STRONG build;
-///                               any non-zero lifecycle flag reroutes
-///                               decWeak's tail (onLastWeakRef /
-///                               delete-mBase paths) — deliver only the
-///                               provably chunk-local shape. 0 is also
-///                               the live-shape signature rn423 proved.
-///
-/// Pure so tests pin the contract without a tracer.
-fn z465_weakref_live(strong_raw: i32, weak: i32, flags: i32, mbase: u64) -> bool {
-    mbase != 0
-        && (0..=Z465_COUNT_CAP).contains(&strong_raw)
-        && (1..=Z465_COUNT_CAP).contains(&weak)
-        && flags == 0
-}
-
-/// 6-Z465: bounded witness budget for the DEC-arm liveness leg (the leg
-/// fires at the reply-temporary era closes — rn430 saw 16 silent closes
-/// per boot; 64 covers the leak-shape count with the garbage-verdict
-/// lines sharing the pool).
-fn z465_log() -> &'static AtomicU32 {
-    static N: std::sync::OnceLock<AtomicU32> = std::sync::OnceLock::new();
-    N.get_or_init(|| AtomicU32::new(64))
 }
 
 // ============================================================================
@@ -15730,93 +15641,6 @@ mod tests {
         assert!(
             !z463_close_rejected(Liveness::Unknown),
             "an unreadable probe delivers (no ghost eras, no rn344 false-Dead starvation)"
-        );
-    }
-
-    /// 6-Z465: the DEC-arm weakref-liveness contract. The CLEAN
-    /// zero-class shape (object dead, weakref chunk alive owning the
-    /// last weak ref — the rn430 bounded-leak note) must DELIVER: the
-    /// DEC is the chunk-reclaiming write. Every shape that names a
-    /// dead/reused chunk, a virgin weakref (the decWeak delete-mBase
-    /// object-kill path), an over-dec'd chunk, a non-plain lifecycle,
-    /// or absurd magnitudes must keep the 6-Z463 silent close.
-    #[test]
-    fn z465_weakref_liveness_contract() {
-        let cap = Z465_COUNT_CAP;
-        let initial = crate::ptrace_emu::Z457_INITIAL_STRONG;
-
-        // THE leak shape: had-strong (REL consumed the count → raw 0),
-        // the last weak ref held, plain build, object pointer intact.
-        assert!(
-            z465_weakref_live(0, 1, 0, 0xf055bde02850),
-            "the clean zero-class shape (strong=0, weak=1) delivers — the DEC reclaims the chunk"
-        );
-        assert!(
-            z465_weakref_live(0, 3, 0, 0x1000),
-            "multiple weak holders: the DEC is chunk-safe (the impl survives on the rest)"
-        );
-        assert!(
-            z465_weakref_live(2, 5, 0, 0x1000),
-            "strong refs still held: decWeak is chunk-local (no object kill, no impl kill)"
-        );
-        assert!(
-            z465_weakref_live(0, cap, 0, 0x1000),
-            "the cap boundary is plausible"
-        );
-        assert!(
-            z465_weakref_live(cap, 1, 0, 0x1000),
-            "the strong cap boundary is plausible"
-        );
-
-        // mBase signatures: a live weakref_impl always carries its object.
-        assert!(
-            !z465_weakref_live(0, 1, 0, 0),
-            "mBase=0 is the freed-chunk signature — silent close stays"
-        );
-
-        // VIRGIN: the INITIAL bias intact would drive decWeak's
-        // delete-mBase object-kill path on a provably-dead object — the
-        // double-free class again.
-        assert!(
-            !z465_weakref_live(initial, 1, 0, 0x1000),
-            "virgin weakref (INITIAL bias intact) keeps the silent close"
-        );
-
-        // Over-dec: the chunk's strong arithmetic is already lost.
-        assert!(
-            !z465_weakref_live(-1, 1, 0, 0x1000),
-            "negative mStrong (decStrong past zero already fired) keeps the silent close"
-        );
-
-        // No weak ref left for this DEC to drop — not the delivery shape.
-        assert!(
-            !z465_weakref_live(0, 0, 0, 0x1000),
-            "mWeak=0 names a drained chunk — silent close stays"
-        );
-        assert!(
-            !z465_weakref_live(0, -7, 0, 0x1000),
-            "negative mWeak is reused-chunk garbage"
-        );
-
-        // Lifecycle flags reroute decWeak's tail — only the plain
-        // OBJECT_LIFETIME_STRONG shape delivers.
-        assert!(
-            !z465_weakref_live(0, 1, 1, 0x1000),
-            "non-zero mFlags (EXTEND/WEAK lifetime) keeps the silent close"
-        );
-
-        // Magnitude cap: no boot-time object holds a million holders.
-        assert!(
-            !z465_weakref_live(0, cap + 1, 0, 0x1000),
-            "mWeak over the cap is reused-chunk garbage"
-        );
-        assert!(
-            !z465_weakref_live(cap + 1, 1, 0, 0x1000),
-            "mStrong over the cap is reused-chunk garbage"
-        );
-        assert!(
-            !z465_weakref_live(initial + 3, 1, 0, 0x1000),
-            "biased-raw (above INITIAL) is the transient/corrupt class — silent close stays"
         );
     }
 
