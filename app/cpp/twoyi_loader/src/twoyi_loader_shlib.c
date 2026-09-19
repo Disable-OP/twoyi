@@ -5276,6 +5276,44 @@ int unlinkat(int dirfd, const char *path, int flags) {
     return syscall(SYS_unlinkat, dirfd, path, flags);
 }
 
+// ── 6-Z473: is THIS process a crash_dump? ────────────────────────────
+// The logdr bound (inside the connect hook, below) must scope to the
+// debuggerd dump processes only — the dispatcher ("/system/bin/crash_dump64
+// --target <pid> ...") and its forked worker (the fork copies the
+// cmdline image, so the inherited /proc/self/cmdline argv[0] still
+// names crash_dump). The verdict is process-invariant, so it is read
+// ONCE and cached in a plain static (no TLS — banned in this shlib;
+// the racy first-call double-compute is benign, both compute the same
+// answer). Raw syscalls only: going through the open-family hooks
+// would re-enter our own interposition mid-hook.
+static int z473_self_is_crash_dump(void) {
+    static signed char cached_6z473 = -1; // -1 unknown, 0 no, 1 yes
+    if (cached_6z473 >= 0) return cached_6z473;
+    int verdict_6z473 = 0;
+    char buf_6z473[128];
+    int fd_6z473 = (int)syscall(NR_openat, AT_FDCWD, "/proc/self/cmdline",
+                                0 /*O_RDONLY*/, 0);
+    if (fd_6z473 >= 0) {
+        long n_6z473 = syscall(SYS_read, fd_6z473, buf_6z473,
+                               (long)(sizeof(buf_6z473) - 1));
+        syscall(SYS_close, fd_6z473);
+        if (n_6z473 > 0) {
+            int n = (int)n_6z473;
+            buf_6z473[n] = '\0';
+            // argv[0] is the first NUL-terminated string in the buffer;
+            // take its basename.
+            const char *a0_6z473 = buf_6z473;
+            for (const char *p = buf_6z473; p < buf_6z473 + n && *p; p++)
+                if (*p == '/') a0_6z473 = p + 1;
+            if (strcmp(a0_6z473, "crash_dump64") == 0 ||
+                strcmp(a0_6z473, "crash_dump32") == 0)
+                verdict_6z473 = 1;
+        }
+    }
+    cached_6z473 = (signed char)verdict_6z473;
+    return verdict_6z473;
+}
+
 // Hook connect — redirect AF_UNIX socket paths to rootfs (matches bind)
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     static int (*real_connect)(int, const struct sockaddr *, socklen_t) = NULL;
@@ -5402,6 +5440,110 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
                 }
             }
             return rc_6z428;
+        }
+    }
+    // ── 6-Z473: bound the logdr (logd log-READER) socket for crash_dump
+    // processes ────────────────────────────────────────────────────────
+    // rn441 (run 35433227956, Task 206): every system_server generation's
+    // dump died evidence-free. The tombstoned leg (6-Z428 + 6-Z471) is
+    // HEALTHY — the workers obtained their output fds — but the dumps
+    // never completed: the worker blocks in-kernel in recvfrom (nr=207)
+    // on its logdr fd reading the target's log tail, and its own
+    // watchdog kills it at the 6-Z471a 300 s leniency cap (gen-1 worker
+    // 4157: armed +144.99 s, blocked-in-kernel nr=207 probed at +237.7 s,
+    // fatal-EXIT sig=14 served=false at +444.99 s — EXACTLY 300 s after
+    // the re-arm). Gen-7's worker (10440) was still alive at run end,
+    // wedged INSIDE connect(2) to /dev/socket/logdr (unix_wait_for_peer;
+    // the 6-Z471c CONNECT-STALL at +1595 s) — its SIGALRM restarted the
+    // interrupted connect forever (the rn437 ERESTARTSYS-remnant class).
+    // rn440 had the same recvfrom blocks (28 × nr=207) but logd serviced
+    // them and the dumps completed (7 served tombstones); rn441's grind
+    // churn (dex2oat zero completions under the crash loop) pushed
+    // logd's servicing latency past every budget and ZERO tombstones
+    // were served all run. The evidence layer must not depend on logd's
+    // liveness: bound the logdr socket so a wedged logd degrades the
+    // tombstone's log section instead of killing the dump. Client-side,
+    // zero tracer interaction (the 6-Z415 lesson stands); EAGAIN
+    // semantics per the 6-Z428 comment (TEMP_FAILURE_RETRY does not
+    // retry EAGAIN — the log-tail read fails once and the dump proceeds
+    // logless — the same property already banked for the tombstoned
+    // socket's recvmsg in this same dump path).
+    //
+    // Scope: ONLY crash_dump processes (z473_self_is_crash_dump, cached).
+    // Every other logdr client (logcat, dumpstate) passes through
+    // untouched. Mechanics = the proven 6-Z471 shape: non-blocking
+    // connect (AF_UNIX fails EAGAIN immediately when the peer's accept
+    // queue is full — never EINPROGRESS), 100 ms retry loop, 10 s cap →
+    // ETIMEDOUT (the rn441 10440 connect-wedge class); on success
+    // SO_RCVTIMEO/SO_SNDTIMEO = 10 s (SOL_SOCKET=1, SO_RCVTIMEO=20,
+    // SO_SNDTIMEO=21 on aarch64 and x86_64 alike; struct timeval {10,0}
+    // on both LP64 ABIs — the rn441 4157 recvfrom-wedge class).
+    if (addr && addr->sa_family == AF_UNIX && g_rootfs &&
+        z473_self_is_crash_dump()) {
+        struct sockaddr_un *un_6z473 = (struct sockaddr_un *)addr;
+        if (un_6z473->sun_path[0] == '/' &&
+            strncmp(un_6z473->sun_path, "/dev/socket/logdr", 17) == 0) {
+            int rc_6z473;
+            {
+                int fl_6z473 = (int)syscall(SYS_fcntl, sockfd, 3 /*F_GETFL*/);
+                int was_blocking_6z473 = 0;
+                if (fl_6z473 >= 0) {
+                    was_blocking_6z473 = (fl_6z473 & O_NONBLOCK) == 0;
+                    if (was_blocking_6z473)
+                        syscall(SYS_fcntl, sockfd, 4 /*F_SETFL*/,
+                                fl_6z473 | O_NONBLOCK);
+                }
+                rc_6z473 = (int)syscall(SYS_connect, sockfd, addr, addrlen);
+                if (rc_6z473 < 0 && was_blocking_6z473 && errno == EAGAIN) {
+                    int retries_6z473 = 0;
+                    for (;;) {
+                        if (++retries_6z473 > 100) { // 100 * 100 ms = 10 s
+                            rc_6z473 = -1;
+                            errno = ETIMEDOUT;
+                            break;
+                        }
+                        struct timespec ts_6z473 = { 0, 100 * 1000 * 1000 };
+                        syscall(SYS_nanosleep, &ts_6z473, NULL);
+                        rc_6z473 = (int)syscall(SYS_connect, sockfd, addr,
+                                                addrlen);
+                        if (rc_6z473 == 0 || errno != EAGAIN) break;
+                    }
+                }
+                if (fl_6z473 >= 0 && was_blocking_6z473)
+                    syscall(SYS_fcntl, sockfd, 4 /*F_SETFL*/, fl_6z473);
+            }
+            if (rc_6z473 == 0) {
+                struct timeval tv_6z473 = { 10, 0 };
+                int rcv_rc = (int)syscall(SYS_setsockopt, sockfd,
+                                          1 /*SOL_SOCKET*/, 20 /*SO_RCVTIMEO*/,
+                                          &tv_6z473, sizeof(tv_6z473));
+                int snd_rc = (int)syscall(SYS_setsockopt, sockfd,
+                                          1 /*SOL_SOCKET*/, 21 /*SO_SNDTIMEO*/,
+                                          &tv_6z473, sizeof(tv_6z473));
+                static unsigned char z473_diag = 2;
+                if (z473_diag > 0) {
+                    z473_diag--;
+                    char m_6z473[192];
+                    snprintf(m_6z473, sizeof(m_6z473),
+                             "[twoyi_loader] 6-Z473: logdr fd=%d bounded "
+                             "(RCVTIMEO 10s rc=%d, SNDTIMEO 10s rc=%d — "
+                             "the dump survives a wedged logd)\n",
+                             sockfd, rcv_rc, snd_rc);
+                    write_str(2, m_6z473);
+                }
+            } else {
+                static unsigned char z473_cap_diag = 2;
+                if (z473_cap_diag > 0) {
+                    z473_cap_diag--;
+                    char m_6z473c[192];
+                    snprintf(m_6z473c, sizeof(m_6z473c),
+                             "[twoyi_loader] 6-Z473: logdr connect bound "
+                             "fired (10 s cap, errno=%d) — dump proceeds "
+                             "logless\n", errno);
+                    write_str(2, m_6z473c);
+                }
+            }
+            return rc_6z473;
         }
     }
     if (addr && addr->sa_family == AF_UNIX && g_rootfs) {
