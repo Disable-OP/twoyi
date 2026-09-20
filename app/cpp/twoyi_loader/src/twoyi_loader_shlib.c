@@ -780,7 +780,17 @@ static void bp_fork_child_diag_rearm(void) {
     g_diag_reply_dump_done = 0;
     g_diag_tr_dump = 4;
     g_diag_vs_dump = 6;
-    g_diag_bc = 12;
+    // 6-Z485 (rn456): 12 → 64. The rn456 ANR captured the guest's
+    // system_server main thread BLOCKED in the FIRST IIdmap2 transaction
+    // (OverlayManagerService → idmap2d, SystemServer.startBootstrapServices:
+    // 917) while idmap2d had started, PINGed, registered its node and
+    // parked in idle WRITE_READs — the delivery story is UNNAMED because
+    // this 12-slot BC budget exhausted on the framework's early traffic
+    // long before the idmap call. 64 slots keeps the per-pid diag volume
+    // bounded (the svclog tail-caps at 3072 lines anyway) while spanning
+    // the whole bootstrap phase on both transaction ends (system_server's
+    // TX + idmap2d's receive side re-arm identically at their forks).
+    g_diag_bc = 64;
     g_diag_sm_consumed = 4;
     g_diag_bp_wr = 2;
     g_diag_bp_ioctl = 4;
