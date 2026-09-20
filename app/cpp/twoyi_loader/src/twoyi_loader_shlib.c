@@ -5386,6 +5386,54 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     static int (*real_connect)(int, const struct sockaddr *, socklen_t) = NULL;
     if (!real_connect) real_connect = dlsym(RTLD_NEXT, "connect");
 
+    // 6-Z489a: THE PROPERTY-SERVICE CONNECT — TRANSLATED UNCONDITIONALLY.
+    //
+    // rn458-463 decode chain: the guest clients' property sets NEVER
+    // reach the guest init. The rare-ring census proved the client
+    // connects happen — `connect fd=79 sa_len=31
+    // path='/dev/socket/property_service' ret=0` — but sa_len=31 is the
+    // RAW GUEST path at the syscall, and ret=0 means the kernel resolved
+    // it against the CONTAINER's mount namespace: the REDROID HOST's own
+    // property service (same path, same container!) answered. The guest's
+    // sets went to the WRONG init — sys.boot_completed (and every
+    // framework ctl.*/sys.* set) never landed in the guest's property
+    // area, the 6-Z481 bridge never armed, and the app's boot gate
+    // honestly timed out.
+    //
+    // The tracer's 6-Z305q in-place translation — the designed fix —
+    // fired ONLY for the +0.8-1.3 s era pids (init + the first services);
+    // the late-era pids' connects (the zygote, system_server, every
+    // framework process) never reached it (the dispatch divergence,
+    // 6-Z489-follow-up: the arms' blob-read or match silently skipped
+    // them). Rather than chase the tracer-side divergence, THIS hook
+    // translates the property-service connect itself — the PROVEN
+    // logdw-branch pattern (the zygote's logdw connects arrive
+    // pre-translated by this hook and ret=0 against the GUEST logd):
+    // same hook, same g_rootfs prefixing, the exact-path match so no
+    // other socket is touched. The tracer's 6-Z305q arm then sees the
+    // already-prefixed path and correctly declines (never double-prefix).
+    if (addr && addr->sa_family == AF_UNIX && g_rootfs) {
+        struct sockaddr_un *un_6z489 = (struct sockaddr_un *)addr;
+        if (un_6z489->sun_path[0] == '/' &&
+            strncmp(un_6z489->sun_path, "/dev/socket/property_service", 28) == 0) {
+            char prop_path_6z489[600];
+            snprintf(prop_path_6z489, sizeof(prop_path_6z489),
+                     "%s/dev/socket/property_service", g_rootfs);
+            struct sockaddr_un prop_sa_6z489;
+            memset(&prop_sa_6z489, 0, sizeof(prop_sa_6z489));
+            prop_sa_6z489.sun_family = AF_UNIX;
+            strncpy(prop_sa_6z489.sun_path, prop_path_6z489,
+                    sizeof(prop_sa_6z489.sun_path) - 1);
+            static int z489_diag = 2;
+            if (z489_diag > 0) {
+                z489_diag--;
+                write_str(2, "[twoyi_loader] 6-Z489a: connect(/dev/socket/property_service) -> guest listener (g_rootfs-prefixed)\n");
+            }
+            return (int)syscall(SYS_connect, sockfd, &prop_sa_6z489,
+                                sizeof(prop_sa_6z489));
+        }
+    }
+
     // 6-Z272p: /dev/socket/logdw has NO reader in recovery images (they
     // don't run logd — unlike the full OrangeFox/TWRP ramdisks, which is
     // exactly why those worked while the AOSP-recovery cohort stalled).
@@ -6548,12 +6596,90 @@ static int no_props(void) {
     return g_no_props;
 }
 
+// 6-Z489b: THE GUEST-SIDE BOOT-COMPLETED BRIDGE. rn458-463 proved the
+// 6-Z305 bridge (the kr64 sender thread) depends on the tracer seeing
+// the sys.boot_completed=1 frame on the property-service wire — and the
+// tracer's connect arms never fire for the late-era pids (the dispatch
+// divergence), so the bridge never armed. THIS bridge needs NO tracer:
+// the shlib IS inside every guest process; when the DELEGATED real
+// bionic __system_property_set returns 0 for sys.boot_completed="1",
+// the set reached the guest init AND the ack came back — the honest
+// boot-completion fact, observed at the strongest possible layer. The
+// notification then goes straight to the app's abstract boot sockets
+// (@TWOYI_BOOT_SOCK / @TWOYI_SOCK, SOCK_SEQPACKET, "BOOT_COMPLETED\n" —
+// the same contract the kr64 sender uses), from a detached retry
+// thread (250 ms × 480 = 120 s) because the app's listener binds when
+// Render2Activity attaches, which may be AFTER this set (the rn462
+// ordering: the guest's BOOT_COMPLETED landed ~21 s before the UI's
+// gate even started waiting).
+//
+// System mode ONLY (no_props() — the delegated path); recovery keeps
+// the in-memory table and never fires this (the corpus unchanged).
+static void *z489b_boot_notify_thread(void *arg) {
+    (void)arg;
+    static const char *z489b_names[2] = {"TWOYI_BOOT_SOCK", "TWOYI_SOCK"};
+    for (int attempt = 0; attempt < 480; attempt++) { // 480 × 250 ms = 120 s
+        for (int i = 0; i < 2; i++) {
+            int fd = (int)syscall(SYS_socket, AF_UNIX, SOCK_SEQPACKET, 0);
+            if (fd < 0) continue;
+            struct sockaddr_un addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            addr.sun_path[0] = 0; // the abstract namespace marker
+            size_t nlen = strlen(z489b_names[i]);
+            if (nlen > sizeof(addr.sun_path) - 2) {
+                syscall(SYS_close, fd);
+                continue;
+            }
+            for (size_t k = 0; k < nlen; k++) {
+                addr.sun_path[1 + k] = z489b_names[i][k];
+            }
+            socklen_t alen =
+                (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + nlen);
+            if (syscall(SYS_connect, fd, &addr, alen) == 0) {
+                syscall(SYS_sendto, fd, "BOOT_COMPLETED\n", 15, 0, (long)0, 0);
+                syscall(SYS_close, fd);
+                write_str(2, "[twoyi_loader] 6-Z489b: BOOT_COMPLETED delivered to the app boot gate\n");
+                return NULL;
+            }
+            syscall(SYS_close, fd);
+        }
+        struct timespec z489b_ts = {0, 250 * 1000 * 1000};
+        nanosleep(&z489b_ts, NULL);
+    }
+    write_str(2, "[twoyi_loader] 6-Z489b: the boot-gate delivery window expired (120 s)\n");
+    return NULL;
+}
+
+static void z489b_notify_boot_completed(void) {
+    static volatile int z489b_started = 0;
+    if (__sync_lock_test_and_set(&z489b_started, 1)) return;
+    pthread_t z489b_t;
+    if (pthread_create(&z489b_t, NULL, z489b_boot_notify_thread, NULL) == 0) {
+        pthread_detach(z489b_t);
+        write_str(2, "[twoyi_loader] 6-Z489b: the guest set sys.boot_completed=1 (real bionic ack) — the boot-gate notify thread started\n");
+    } else {
+        z489b_started = 0;
+    }
+}
+
 // Hook __system_property_set — store in our in-memory table
 int __system_property_set(const char *key, const char *value) {
     if (no_props()) {
         static int (*real_fn)(const char *, const char *);
         if (!real_fn) real_fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "__system_property_set");
-        if (real_fn) return real_fn(key, value);
+        if (real_fn) {
+            int rc_6z489b = real_fn(key, value);
+            // 6-Z489b: the honest bridge — fire ONLY after the real
+            // delegated set returned success (the ack arrived from the
+            // guest's init: the property is in the guest's area).
+            if (rc_6z489b == 0 && key && value &&
+                strcmp(key, "sys.boot_completed") == 0 &&
+                strcmp(value, "1") == 0) {
+                z489b_notify_boot_completed();
+            }
+            return rc_6z489b;
+        }
     }
     return prop_set(key, value);
 }
