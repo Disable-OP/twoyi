@@ -3515,6 +3515,28 @@ static Z504_RET_PENDING: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<libc::pid_t, &'static str>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+// 6-Z507: the one-in-flight (pid → guest path) stash for the INIT
+// socket-node CLEANUP census — the ENTRY half (init's unlinkat on
+// /dev/socket/... paths, the stale-socket cleanup inside init's
+// CreateSocket) inserts; the EXIT half resolves the real return into
+// the 6-Z507 line. The rn488 decode: 32× INIT-BIND-RET ret=-98
+// (EADDRINUSE) on /dev/socket/{statsdw,tombstoned_*,dnsproxyd} —
+// init's CreateSocket unlinks the stale node BEFORE binding, so a
+// bind EADDRINUSE on a FRESH rootfs means the cleanup half and the
+// bind half disagree about the node. This census names WHICH cleanup
+// call fails (or proves the unlink succeeds and the node reappears
+// from another layer) — the decisive split for the fix.
+static Z507_UNLINK_PENDING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<libc::pid_t, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 6-Z507 pure core: does this GUEST path spell a /dev/socket node
+/// (the CreateSocket cleanup class)? The raw guest spelling is the
+/// discriminator — the translated host path never starts with it.
+fn z507_is_dev_socket_path(path: &str) -> bool {
+    path.starts_with("/dev/socket/")
+}
+
 /// 6-Z504: the pure sockaddr descriptor for the census lines — the
 /// FS-spelled AF_UNIX path, the abstract spelling, a short blob, or a
 /// non-UNIX family (deduplicated from the z487 connect peek so the
@@ -35559,6 +35581,33 @@ pub fn run_ptrace_loop(
                                         ));
                                     }
                                 }
+                                // ── 6-Z507: the INIT socket-node CLEANUP
+                                // census (the ENTRY half) — init's
+                                // CreateSocket unlinks the stale
+                                // /dev/socket/<name> node before binding;
+                                // the rn488 32× bind-EADDRINUSE class on a
+                                // FRESH rootfs means cleanup-vs-bind view
+                                // disagreement. Stash the path for the EXIT
+                                // resolver (unconditional — the failure
+                                // pool depends on it); the ENTRY log keeps
+                                // its own small budget (the arrival proof).
+                                if pid == init_pid && z507_is_dev_socket_path(&path) {
+                                    if let Ok(mut p) = Z507_UNLINK_PENDING.lock() {
+                                        p.insert(pid, path.clone());
+                                    }
+                                    static Z507_ENTRY_LOG_BUDGET: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(12);
+                                    let z507_left = Z507_ENTRY_LOG_BUDGET
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    if z507_left > 0 {
+                                        Z507_ENTRY_LOG_BUDGET
+                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                        crate::z504_klog(
+                                            rootfs,
+                                            &format!("INIT-UNLINK pid={} path={}", pid, path),
+                                        );
+                                    }
+                                }
                                 if translated != path
                                     && !write_translated_path(
                                         pid,
@@ -40503,6 +40552,55 @@ pub fn run_ptrace_loop(
                                         &format!(
                                             "INIT-{}-RET pid={} ret={}",
                                             z504_class, pid, z504_ret
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // 6-Z507: the INIT socket-node CLEANUP census ret
+                    // resolver — the ENTRY half (init's /dev/socket
+                    // unlinkat) stashed the path; here the real return is
+                    // known: the unlink SUCCEEDS (the node was removed and
+                    // the bind's EADDRINUSE lives in ANOTHER layer — the
+                    // fix targets the bind-side view) or FAILS with WHICH
+                    // errno (the fix targets the cleanup side). The same
+                    // failure-priority budget discipline as 6-Z506.
+                    if let Ok(mut p) = Z507_UNLINK_PENDING.lock() {
+                        if let Some(z507_path) = p.remove(&pid) {
+                            let z507_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            if z507_ret < 0 {
+                                static Z507_FAIL_RET_BUDGET: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(32);
+                                let z507_left =
+                                    Z507_FAIL_RET_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+                                if z507_left > 0 {
+                                    Z507_FAIL_RET_BUDGET
+                                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    crate::z504_klog(
+                                        rootfs,
+                                        &format!(
+                                            "INIT-UNLINK-RET pid={} path={} ret={} ({})",
+                                            pid,
+                                            z507_path,
+                                            z507_ret,
+                                            z506_errno_name(-z507_ret)
+                                        ),
+                                    );
+                                }
+                            } else {
+                                static Z507_OK_RET_BUDGET: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(8);
+                                let z507_left =
+                                    Z507_OK_RET_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+                                if z507_left > 0 {
+                                    Z507_OK_RET_BUDGET
+                                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    crate::z504_klog(
+                                        rootfs,
+                                        &format!(
+                                            "INIT-UNLINK-RET pid={} path={} ret={}",
+                                            pid, z507_path, z507_ret
                                         ),
                                     );
                                 }
@@ -59949,6 +60047,31 @@ mod z506_errno_name_tests {
     fn z506_unknown_errno_spells_the_number() {
         assert_eq!(z506_errno_name(1337), "<e1337>");
         assert_eq!(z506_errno_name(0), "<e0>");
+    }
+}
+
+// 6-Z507: the INIT socket-node cleanup census path classifier.
+#[cfg(test)]
+mod z507_path_tests {
+    use super::z507_is_dev_socket_path;
+
+    /// init's CreateSocket cleanup paths classify (the rn488 failure
+    /// class: statsdw / tombstoned_* / dnsproxyd).
+    #[test]
+    fn z507_dev_socket_paths_classify() {
+        assert!(z507_is_dev_socket_path("/dev/socket/statsdw"));
+        assert!(z507_is_dev_socket_path("/dev/socket/tombstoned_crash"));
+        assert!(z507_is_dev_socket_path("/dev/socket/dnsproxyd"));
+    }
+
+    /// Everything else stays out of the census (the budget discipline:
+    /// init's other unlinks never burn the pool).
+    #[test]
+    fn z507_non_socket_paths_stay_out() {
+        assert!(!z507_is_dev_socket_path("/dev/__kmsg__"));
+        assert!(!z507_is_dev_socket_path("/data/anr/anr_1"));
+        assert!(!z507_is_dev_socket_path("/dev/socketx/evil"));
+        assert!(!z507_is_dev_socket_path(""));
     }
 }
 
