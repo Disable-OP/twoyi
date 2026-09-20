@@ -12292,7 +12292,13 @@ fn z501_futex_park_probe(pid: libc::pid_t) {
             iov_base: uaddr as *mut libc::c_void,
             iov_len: std::mem::size_of::<u32>(),
         };
-        let rc = libc::process_vm_readv(
+        let rc = libc::syscall(
+            // 6-Z501: the RAW syscall — bionic's process_vm_readv wrapper
+            // does not exist at the android21 API level (the ladder's NDK
+            // target) and the libc link failed with "undefined symbol"
+            // on #475's APK build. The kernel syscall number is
+            // arch-resolved by the libc crate's SYS_process_vm_readv.
+            libc::SYS_process_vm_readv,
             pid,
             &mut local as *mut libc::iovec,
             1,
