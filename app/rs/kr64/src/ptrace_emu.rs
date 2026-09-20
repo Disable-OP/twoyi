@@ -12270,7 +12270,11 @@ fn z501_futex_park_probe(pid: libc::pid_t) {
     if nr != 98 && nr != 202 && nr != 240 {
         return;
     }
-    let (uaddr, val, op) = (args[0], args[1], args[2]);
+    // The futex syscall signature: futex(uaddr, op, val, ...) —
+    // op = args[1], val = args[2] (the 6-Z271f STALL-DUMP's arg1=op/
+    // arg2=val ordering is the ground truth; the rn476 decode caught
+    // the initial swapped mapping).
+    let (uaddr, op, val) = (args[0], args[1], args[2]);
     let pc = {
         // The pc is the EIGHTH token (after the six args); the parser
         // above stops at six — re-read the tail here.
@@ -59234,12 +59238,14 @@ mod z501_futex_tests {
     /// shape (→ None), and the truncated-line tolerance.
     #[test]
     fn z501_parse_procfs_syscall_shapes() {
-        let blocked = "98 0x7f8a2c0d30 0x0 0x85 0x0 0x0 0x0 0x7f8a2c0c90 0x7f8a2b0fecc\n";
+        // futex(uaddr, op, val, ...): arg1 = op, arg2 = val (the
+        // kernel prints the RAW syscall args in order).
+        let blocked = "98 0x7f8a2c0d30 0x80 0x5 0x0 0x0 0x0 0x7f8a2c0c90 0x7f8a2b0fecc\n";
         let (nr, args) = z501_parse_procfs_syscall(blocked).expect("blocked parses");
         assert_eq!(nr, 98);
         assert_eq!(args[0], 0x7f8a2c0d30); // uaddr
-        assert_eq!(args[1], 0); // val
-        assert_eq!(args[2], 0x85); // op (WAIT | PRIVATE)
+        assert_eq!(args[1], 0x80); // op (WAIT | PRIVATE)
+        assert_eq!(args[2], 0x5); // val
         let userspace = "-1 0x7f8a2c0c90 0xffffffffffffffff\n";
         assert!(z501_parse_procfs_syscall(userspace).is_none());
         assert!(z501_parse_procfs_syscall("running\n").is_none());
