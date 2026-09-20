@@ -3493,6 +3493,11 @@ static Z483_FDOPS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<libc::pid_t, Z483Ring>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 static Z483_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// 6-Z486: the RARE-op ring (socket/connect/recvmsg/fcntl/close_range)
+// — 16 slots per pid, never evicted by the close churn.
+static Z483_RARE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<libc::pid_t, Z483Ring>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 // close_range is nr 436 on aarch64 AND x86_64 (asm-generic + x86_64
 // unified) — not in ChildAbi; a raw match is exact.
 const Z483_CLOSE_RANGE: i64 = 436;
@@ -13986,11 +13991,27 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
         }
         // 6-Z483: the fd-op ring flush — the LAST 48 fd-number-affecting
         // syscall entries of this pid (a floored fork-child), oldest→
-        // newest, then the ring clears. rn454's unknown: fd 0 flipped to
+        // newest, then the ring clears. rn452's unknown: fd 0 flipped to
         // a socket with every dup denied and no connect traced — this
         // flush names the vector (a close the floors miss, a
         // close_range, an SCM_RIGHTS recvmsg, an F_DUPFD on a free slot)
         // in exactly one more ladder cycle.
+        // 6-Z486: the RARE ring flushes FIRST (it never rotates — the
+        // socket/connect evidence from the process's whole lifetime).
+        if let Ok(mut z483_rare_map) = Z483_RARE.lock() {
+            if let Some(ring) = z483_rare_map.remove(&pid) {
+                if !ring.is_empty() {
+                    crate::trace_log_line(&format!(
+                        "6-Z486: rare fd-op ring pid={} ({} entries, oldest->newest):",
+                        pid,
+                        ring.len()
+                    ));
+                    for (seq, name, desc) in ring.iter() {
+                        crate::trace_log_line(&format!("6-Z486:   #{:06} {} {}", seq, name, desc));
+                    }
+                }
+            }
+        }
         if let Ok(mut z483_map) = Z483_FDOPS.lock() {
             if let Some(ring) = z483_map.remove(&pid) {
                 if !ring.is_empty() {
@@ -26049,7 +26070,32 @@ pub fn run_ptrace_loop(
                             if let Some((name, desc)) = z483_rec {
                                 let seq =
                                     Z483_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if let Ok(mut ring_map) = Z483_FDOPS.lock() {
+                                // 6-Z486: SPLIT rings. The common ops (the
+                                // close churn) rotate in the 48-slot main
+                                // ring; the RARE ops (socket/connect/
+                                // recvmsg/fcntl/close_range) live in their
+                                // own 16-slot ring that the churn can NEVER
+                                // evict — rn457's flushes showed the last
+                                // 48 entries ALL close(139/136) noise with
+                                // any property-connect evidence rotated
+                                // out.
+                                let z483_rare = matches!(
+                                    name,
+                                    "socket"
+                                        | "connect"
+                                        | "recvmsg"
+                                        | "fcntl/F_DUPFD"
+                                        | "close_range"
+                                );
+                                if z483_rare {
+                                    if let Ok(mut rare_map) = Z483_RARE.lock() {
+                                        let rare = rare_map.entry(pid).or_default();
+                                        if rare.len() >= 16 {
+                                            rare.pop_front();
+                                        }
+                                        rare.push_back((seq, name, desc));
+                                    }
+                                } else if let Ok(mut ring_map) = Z483_FDOPS.lock() {
                                     let ring = ring_map.entry(pid).or_default();
                                     if ring.len() >= 48 {
                                         ring.pop_front();
