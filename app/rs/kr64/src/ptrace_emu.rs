@@ -12250,15 +12250,162 @@ fn z501_futex_op_name(op: u64) -> &'static str {
     }
 }
 
+// ── 6-Z503: the z501 PER-PID THROTTLE (the rn476 budget lesson) ──
+//
+// rn476's decode: ALL 8 of the z501 futex-park verdicts were spent in
+// the boot's FIRST 30 SECONDS on normal transient parks (the daemon
+// fleet's routine scheduling waits), so when the interesting late-boot
+// walls arrived (the AMS-boundary monitor park at ~+200-300 s), the
+// budget was already gone. The fix is NOT a bigger budget — it is a
+// THROTTLE that spends only on parks worth decoding:
+//
+// 1. THE DWELL GATE: a verdict spends only when the SAME pid has been
+//    observed parked-in-futex on the SAME uaddr across a >= 10 s window
+//    (two stall-probe catches at the ~15 s cadence). The transient
+//    parks that burned the rn476 budget last well under 10 s and never
+//    confirm; the wall parks (the rn474 AMS monitor: 50 s+) confirm on
+//    their second catch. The dwell anchors on first_seen of the park
+//    EPISODE — a fast re-catch (< 10 s, same uaddr) refreshes the
+//    liveness clock only, so a rapid poller cannot manufacture dwell
+//    by mere frequency.
+// 2. THE PER-PID CAP: at most 2 verdicts per pid per RUN (the initial
+//    verdict + one re-check after another full dwell window). One
+//    chronic parker can no longer starve the rest of the fleet. The
+//    cap is deliberately NOT reset by stale episodes — it bounds one
+//    pid's total consumption (episodes and tid reuse included).
+// 3. THE GLOBAL BUDGET (unchanged): 8 verdicts per run, shared.
+//
+// A uaddr CHANGE re-arms the dwell (the pid moved futexes — the old
+// episode's persistence says nothing about the new word). A catch
+// after > 60 s of silence starts a fresh episode (stale entry).
+// One honest one-time THROTTLE line is logged when the global budget
+// exhausts; the per-catch behavior stays silent (the caller's
+// 6-Z415 PROCFS-PROBE line already logs the catch).
+
+/// The dwell window: the same pid must be parked on the same uaddr
+/// across at least this many seconds before a verdict spends.
+const Z503_DWELL_SECS: u64 = 10;
+/// A catch after this much silence starts a fresh park episode.
+const Z503_STALE_SECS: u64 = 60;
+/// Verdicts per pid per run (across episodes).
+const Z503_PER_PID_CAP: u32 = 2;
+/// The global verdict budget per run (the z501 budget, unchanged).
+const Z503_GLOBAL_BUDGET: u64 = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct Z503PidState {
+    last_uaddr: u64,
+    first_seen_secs: u64,
+    last_seen_secs: u64,
+    spent: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Z503Decision {
+    /// Spend a verdict (the caller decrements the global budget).
+    Spend,
+    /// Observe only (arming/refreshing the dwell state).
+    Arm,
+    /// The pid hit its per-run cap.
+    PerPidCapped,
+    /// The global budget is gone.
+    GlobalEmpty,
+}
+
+/// The 6-Z503 pure core: the throttle decision for one catch.
+/// (pid, uaddr, now) against the per-pid dwell state + the budget.
+fn z503_throttle_decide(
+    state: &mut std::collections::HashMap<libc::pid_t, Z503PidState>,
+    budget_left: u64,
+    pid: libc::pid_t,
+    uaddr: u64,
+    now_secs: u64,
+) -> Z503Decision {
+    if budget_left == 0 {
+        return Z503Decision::GlobalEmpty;
+    }
+    match state.get_mut(&pid) {
+        None => {
+            state.insert(
+                pid,
+                Z503PidState {
+                    last_uaddr: uaddr,
+                    first_seen_secs: now_secs,
+                    last_seen_secs: now_secs,
+                    spent: 0,
+                },
+            );
+            Z503Decision::Arm
+        }
+        Some(st) => {
+            // Stale: the last catch is long gone — a fresh episode
+            // (the per-pid cap is per RUN and is deliberately kept).
+            if now_secs.saturating_sub(st.last_seen_secs) > Z503_STALE_SECS {
+                st.last_uaddr = uaddr;
+                st.first_seen_secs = now_secs;
+                st.last_seen_secs = now_secs;
+                return Z503Decision::Arm;
+            }
+            if uaddr != st.last_uaddr {
+                // The pid moved to another futex — re-dwell.
+                st.last_uaddr = uaddr;
+                st.first_seen_secs = now_secs;
+                st.last_seen_secs = now_secs;
+                return Z503Decision::Arm;
+            }
+            if now_secs.saturating_sub(st.first_seen_secs) >= Z503_DWELL_SECS {
+                if st.spent >= Z503_PER_PID_CAP {
+                    st.last_seen_secs = now_secs;
+                    Z503Decision::PerPidCapped
+                } else {
+                    st.spent += 1;
+                    // The next verdict from this pid needs another full
+                    // dwell window.
+                    st.first_seen_secs = now_secs;
+                    st.last_seen_secs = now_secs;
+                    Z503Decision::Spend
+                }
+            } else {
+                // Fast re-catch inside the dwell window: refresh the
+                // liveness clock only (frequency alone never confirms).
+                st.last_seen_secs = now_secs;
+                Z503Decision::Arm
+            }
+        }
+    }
+}
+
+fn z503_throttle_state(
+) -> &'static std::sync::Mutex<std::collections::HashMap<libc::pid_t, Z503PidState>> {
+    static Z503_STATE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<libc::pid_t, Z503PidState>>,
+    > = std::sync::OnceLock::new();
+    Z503_STATE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn z503_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// 6-Z501: the FUTEX-PARK forensics probe — a blocked-in-futex tracee's
 /// uaddr/val/op + the parking pc's maps row + the futex word's value,
 /// all read-only (the /proc syscall file + process_vm_readv; NO ptrace
 /// interaction — the 6-Z415 vanish-class discipline). Budget: 8 verdicts
 /// per run (the probe cadence re-fires every ~15 s per pid; a budgeted
 /// window at the stall's start is what the decode needs).
+///
+/// 6-Z503: the verdicts are THROTTLED (the rn476 budget lesson) — the
+/// dwell gate (the same pid parked on the same uaddr across >= 10 s)
+/// + the per-pid cap (2/run) guard the global budget (8/run) so the
+/// early-boot transient parks can no longer starve the late walls.
 fn z501_futex_park_probe(pid: libc::pid_t) {
-    static Z501_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(8);
-    if Z501_BUDGET.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    static Z501_BUDGET: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(Z503_GLOBAL_BUDGET);
+    let budget_left = Z501_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+    if budget_left == 0 {
         return;
     }
     let Ok(line) = std::fs::read_to_string(format!("/proc/{}/syscall", pid)) else {
@@ -12285,6 +12432,22 @@ fn z501_futex_park_probe(pid: libc::pid_t) {
             0
         }
     };
+    // ── 6-Z503: the throttle decides BEFORE any spend ──
+    //
+    // Only a park that PERSISTS (the same pid on the same uaddr across
+    // the dwell window) is worth a verdict; the rn476 first-30 s
+    // transients never confirm and never spend.
+    let decision = {
+        let mut st = z503_throttle_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        z503_throttle_decide(&mut st, budget_left, pid, uaddr, z503_now_secs())
+    };
+    if decision != Z503Decision::Spend {
+        // Silent: the caller's 6-Z415 PROCFS-PROBE line already logged
+        // the catch; the throttle adds no per-catch noise.
+        return;
+    }
     // The futex word's value at park time (read-only; failure is honest).
     let word = unsafe {
         let mut buf: u32 = 0;
@@ -12316,7 +12479,20 @@ fn z501_futex_park_probe(pid: libc::pid_t) {
             None
         }
     };
-    Z501_BUDGET.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    let prev = Z501_BUDGET.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if prev == 0 {
+        // A racing spend emptied the budget between our entry check and
+        // this decrement — restore the floor and drop the verdict.
+        Z501_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    if prev == 1 {
+        // The ONE-TIME exhaustion line (honest accounting for the decode).
+        crate::trace_log_line(&format!(
+            "6-Z503 THROTTLE: the z501 global budget exhausted ({} verdicts spent; the per-pid cap {} + the {}s dwell gate remain armed)",
+            Z503_GLOBAL_BUDGET, Z503_PER_PID_CAP, Z503_DWELL_SECS
+        ));
+    }
     crate::trace_log_line(&format!(
         "6-Z501 FUTEX-PARK: pid={} nr={} uaddr={:#x} val={} op={:#x} ({}) word={} pc={:#x} {}",
         pid,
@@ -59225,6 +59401,134 @@ mod z497_reattach_tests {
         // own errno path then reports honestly).
         assert_eq!(z497_tracer_pid("TracerPid:\t-5\n"), -5);
         assert_eq!(z497_tracer_pid("TracerPid:\t99999999999999999999\n"), 0);
+    }
+}
+
+/// 6-Z503 pure cores (the z501 per-pid throttle: the dwell gate + the
+/// per-pid cap + the global budget — the rn476 budget lesson).
+#[cfg(test)]
+mod z503_throttle_tests {
+    use super::{
+        z503_throttle_decide, Z503Decision, Z503PidState, Z503_DWELL_SECS, Z503_GLOBAL_BUDGET,
+        Z503_PER_PID_CAP, Z503_STALE_SECS,
+    };
+    use std::collections::HashMap;
+
+    fn decide(
+        s: &mut HashMap<libc::pid_t, Z503PidState>,
+        budget: u64,
+        pid: libc::pid_t,
+        uaddr: u64,
+        now: u64,
+    ) -> Z503Decision {
+        z503_throttle_decide(s, budget, pid, uaddr, now)
+    }
+
+    /// The rn476 pathology, reproduced and killed: a transient park
+    /// (one catch, gone before the dwell window closes) never spends.
+    #[test]
+    fn z503_transient_park_never_spends() {
+        let mut s = HashMap::new();
+        assert_eq!(decide(&mut s, 8, 100, 0xf00, 1000), Z503Decision::Arm);
+        // The pid is awake again — no second catch ever comes. Budget
+        // untouched (the caller only decrements on Spend, which the
+        // decision never issued).
+        assert_eq!(s.get(&100).map(|st| st.spent), Some(0));
+    }
+
+    /// The dwell gate: frequency alone never confirms — the dwell
+    /// anchors on the EPISODE's first sight, and fast re-catches only
+    /// refresh the liveness clock.
+    #[test]
+    fn z503_fast_refire_never_confirms_dwell() {
+        let mut s = HashMap::new();
+        assert_eq!(decide(&mut s, 8, 100, 0xf00, 1000), Z503Decision::Arm);
+        for t in [1001u64, 1003, 1007, 1009] {
+            assert_eq!(decide(&mut s, 8, 100, 0xf00, t), Z503Decision::Arm);
+        }
+        // 10 s after the FIRST sight (not the last refire): Spend.
+        assert_eq!(decide(&mut s, 8, 100, 0xf00, 1010), Z503Decision::Spend);
+        assert_eq!(s.get(&100).map(|st| st.spent), Some(1));
+    }
+
+    /// A persistent wall park (the rn474 AMS monitor shape: 50 s+)
+    /// confirms on its second catch and spends once per dwell window.
+    #[test]
+    fn z503_persistent_park_spends_once_per_window() {
+        let mut s = HashMap::new();
+        decide(&mut s, 8, 7, 0xf00, 1000); // Arm
+        assert_eq!(decide(&mut s, 8, 7, 0xf00, 1015), Z503Decision::Spend);
+        // The spend re-anchored first_seen: an immediate re-catch
+        // must dwell AGAIN before the second (cap) verdict.
+        assert_eq!(decide(&mut s, 8, 7, 0xf00, 1016), Z503Decision::Arm);
+        assert_eq!(decide(&mut s, 8, 7, 0xf00, 1025), Z503Decision::Spend);
+        assert_eq!(
+            decide(&mut s, 8, 7, 0xf00, 1040),
+            Z503Decision::PerPidCapped
+        );
+    }
+
+    /// A uaddr CHANGE re-arms the dwell — the pid moved futexes.
+    #[test]
+    fn z503_uaddr_change_re_arms_the_dwell() {
+        let mut s = HashMap::new();
+        decide(&mut s, 8, 9, 0xf00, 1000);
+        assert_eq!(decide(&mut s, 8, 9, 0xbeef, 1015), Z503Decision::Arm);
+        assert_eq!(decide(&mut s, 8, 9, 0xbeef, 1020), Z503Decision::Arm);
+        assert_eq!(decide(&mut s, 8, 9, 0xbeef, 1025), Z503Decision::Spend);
+    }
+
+    /// A stale episode (> 60 s silence) re-arms, but the per-RUN cap
+    /// is deliberately kept (episodes and tid reuse included).
+    #[test]
+    fn z503_stale_episode_re_arms_but_keeps_the_cap() {
+        let mut s = HashMap::new();
+        decide(&mut s, 8, 5, 0xf00, 1000);
+        assert_eq!(decide(&mut s, 8, 5, 0xf00, 1010), Z503Decision::Spend);
+        assert_eq!(decide(&mut s, 8, 5, 0xf00, 1100), Z503Decision::Arm); // stale
+        assert_eq!(decide(&mut s, 8, 5, 0xf00, 1110), Z503Decision::Spend); // cap hit
+        assert_eq!(decide(&mut s, 8, 5, 0xf00, 1200), Z503Decision::Arm); // stale again
+        assert_eq!(
+            decide(&mut s, 8, 5, 0xf00, 1210),
+            Z503Decision::PerPidCapped
+        );
+    }
+
+    /// The empty global budget wins over everything.
+    #[test]
+    fn z503_global_budget_empty_wins_over_everything() {
+        let mut s = HashMap::new();
+        assert_eq!(
+            decide(&mut s, 0, 42, 0xf00, 1000),
+            Z503Decision::GlobalEmpty
+        );
+        decide(&mut s, 8, 42, 0xf00, 1000); // arm under a real budget
+        assert_eq!(
+            decide(&mut s, 0, 42, 0xf00, 1100),
+            Z503Decision::GlobalEmpty
+        );
+    }
+
+    /// The per-pid caps are independent — one chronic parker cannot
+    /// starve the rest of the fleet (the rn476 lesson's second half).
+    #[test]
+    fn z503_pids_are_independent() {
+        let mut s = HashMap::new();
+        decide(&mut s, 8, 1, 0xf00, 1000);
+        decide(&mut s, 8, 1, 0xf00, 1010); // pid 1 spent=1
+        decide(&mut s, 8, 1, 0xf00, 1020); // pid 1 spent=2 → capped
+        decide(&mut s, 8, 2, 0xf00, 1000); // pid 2 arms fresh
+        assert_eq!(decide(&mut s, 8, 2, 0xf00, 1010), Z503Decision::Spend);
+    }
+
+    /// The mission shape: the z501 budget (8) unchanged, the cap 2,
+    /// the dwell 10 s, the stale window 60 s.
+    #[test]
+    fn z503_constants_match_the_mission_shape() {
+        assert_eq!(Z503_GLOBAL_BUDGET, 8);
+        assert_eq!(Z503_PER_PID_CAP, 2);
+        assert_eq!(Z503_DWELL_SECS, 10);
+        assert_eq!(Z503_STALE_SECS, 60);
     }
 }
 
