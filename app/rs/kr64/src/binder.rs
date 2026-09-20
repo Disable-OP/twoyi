@@ -2326,6 +2326,154 @@ const Z495_EXCHANGE_STUCK: std::time::Duration = std::time::Duration::from_secs(
 /// Per-conn verdict throttle for the 6-Z495 sweep.
 const Z495_VERDICT_GAP: std::time::Duration = std::time::Duration::from_secs(10);
 
+// ── 6-Z498: the per-conn HANDLER-STAGE tracker (the transport-layer
+//    witness the bus-side instruments cannot be) ─────────────────────
+//
+// rn472 decode (ladder #472 on 98bc2048): the guest system_server (pid
+// 4090) parked in recvfrom on its PROXY socket (the 6-Z403 BT at
+// +142.986s: nr=207 fd=39 ← libbinder talkWithDriver ← the shlib) for
+// 1600+ s while the daemon-side bus showed ZERO pending state — no
+// 6-Z402 tick line after #1 (the tick only logs conns holding PENDING
+// state), no z491 verdict (the conn's ioctl never COMPLETED), no z495
+// stamp (the stamp fires AFTER the daemon reads the request frame).
+// The exchange never reached the daemon's frame-read: the wedge lives
+// in a layer NONE of the bus-side instruments observe — the request
+// frame stuck IN THE SOCKET (the per-conn handler blocked in an
+// earlier dispatch/write) or the handler stuck pre-read. The stage
+// tracker + the FIONREAD oracle on the heartbeat name the exact layer:
+//
+//   Reading  + FIONREAD>0 → the frame IS in the socket and the handler
+//                           never got to it (the transport/loop layer);
+//   Reading  + FIONREAD=0 → a healthy idle conn (NEVER a verdict);
+//   Dispatching           → the frame was read; the BUS lost it;
+//   Writing               → the response path is blocked.
+
+/// How long a non-idle handler stage may persist before the sweep names
+/// it stuck (a healthy sync round-trip is µs-ms; the 250 ms idle tick is
+/// the slowest healthy dispatch).
+const Z498_STAGE_STUCK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-conn verdict throttle for the 6-Z498 sweep.
+const Z498_VERDICT_GAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 6-Z498: the per-conn handler stage (see the module block above).
+#[derive(Clone, Copy)]
+struct Z498Stage {
+    kind: Z498StageKind,
+    since: std::time::Instant,
+    /// The proxy stream's raw fd (for the FIONREAD oracle on the
+    /// Reading stage). The fd stays valid while the conn handler lives;
+    /// the sweep tolerates EBADF (a dying conn) by reporting None.
+    fd: i32,
+}
+
+/// 6-Z498: the handler-stage kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Z498StageKind {
+    /// Waiting for the next request frame (healthy when FIONREAD=0).
+    Reading,
+    /// The request frame was read; `dispatch_request` is running.
+    Dispatching,
+    /// The response is being written back.
+    Writing,
+}
+
+/// 6-Z498 (pure): the per-stage verdict decision. Returns Some(reason)
+/// when the sweep should emit a CONN-STAGE line for this conn, None
+/// when the shape is healthy/idle/throttled/below the threshold. The
+/// FIONREAD byte count is `Option<i32>`: None = the oracle failed
+/// (EBADF — a dying conn is never a verdict).
+fn z498_stage_verdict(
+    kind: Z498StageKind,
+    age: std::time::Duration,
+    fionread: Option<i32>,
+    since_last_verdict: Option<std::time::Duration>,
+) -> Option<String> {
+    if age < Z498_STAGE_STUCK {
+        return None;
+    }
+    if since_last_verdict.map_or(false, |g| g < Z498_VERDICT_GAP) {
+        return None;
+    }
+    match kind {
+        Z498StageKind::Reading => {
+            // The ONLY Reading shape worth a verdict: bytes queued in
+            // the socket with the handler parked in its read — the
+            // request frame the handler never reached. FIONREAD=0 is a
+            // healthy idle conn (a looper conn waits in read forever —
+            // that is the DESIGN); FIONREAD failure is a dying conn.
+            match fionread {
+                Some(n) if n > 0 => Some(format!(
+                    "stage=reading age={}s fionread={}B (the request frame never reached the handler)",
+                    age.as_secs(),
+                    n
+                )),
+                _ => None,
+            }
+        }
+        Z498StageKind::Dispatching => Some(format!(
+            "stage=dispatching age={}s (the frame was read; the BUS never answered it)",
+            age.as_secs()
+        )),
+        Z498StageKind::Writing => Some(format!(
+            "stage=writing age={}s (the response path is blocked)",
+            age.as_secs()
+        )),
+    }
+}
+
+/// 6-Z498: the CONN-STAGE sweep — runs on the 6-Z402 heartbeat thread
+/// (every 30 s, right after the z495 exchange sweep), scans every
+/// conn's handler stage and turns a stuck one into a budgeted one-line
+/// verdict. Returns the number of verdicts emitted (unit-test seam).
+fn z498_stage_sweep(bus: &Arc<Mutex<BusState>>, vm_id: u32) -> usize {
+    static Z498_VERDICT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32);
+    let mut b = bus.lock().expect("binder bus poisoned");
+    let now = std::time::Instant::now();
+    let mut emitted = 0usize;
+    for (cid, bx) in b.conns.iter_mut() {
+        let Some(rec) = bx.z498_stage else {
+            continue;
+        };
+        let age = now.duration_since(rec.since);
+        let gap = bx.z498_last_verdict.map(|t| now.duration_since(t));
+        // The FIONREAD oracle only matters for the Reading stage (the
+        // other stages imply the frame was already consumed).
+        let fionread = if rec.kind == Z498StageKind::Reading && rec.fd > 0 {
+            let mut n: libc::c_int = 0;
+            let rc = unsafe { libc::ioctl(rec.fd, libc::FIONREAD, &mut n) };
+            z498_fionread_oracle(rc, n)
+        } else {
+            None
+        };
+        let Some(reason) = z498_stage_verdict(rec.kind, age, fionread, gap) else {
+            continue;
+        };
+        if Z498_VERDICT_LOG.load(Ordering::Relaxed) == 0 {
+            return emitted;
+        }
+        Z498_VERDICT_LOG.fetch_sub(1, Ordering::Relaxed);
+        bx.z498_last_verdict = Some(now);
+        info!(
+            "[KR64][binder][vm{}] 6-Z498 CONN-STAGE conn={} pid={} tid={} dev={} {}",
+            vm_id, cid, bx.sender_pid, bx.sender_tid, bx.dev_code, reason,
+        );
+        emitted += 1;
+    }
+    emitted
+}
+
+/// 6-Z498 (pure): the FIONREAD byte count from an ioctl result — a
+/// negative count (kernel-side sign tricks) reads as None, never as a
+/// verdict trigger.
+fn z498_fionread_oracle(rc: libc::c_int, n: libc::c_int) -> Option<i32> {
+    if rc == 0 && n >= 0 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
 /// 6-Z495: the EXCHANGE-STUCK sweep — runs on the 6-Z402 heartbeat
 /// thread (every 30 s), scans every conn's in-flight exchange and turns
 /// a stuck one into a budgeted one-line verdict. Returns the number of
@@ -2515,6 +2663,13 @@ struct ConnBox {
     /// 6-Z495 verdict throttle: the last EXCHANGE-STUCK line for this
     /// conn.
     z495_last_verdict: Option<std::time::Instant>,
+    /// 6-Z498: the per-conn HANDLER-STAGE tracker (see [`Z498Stage`]) —
+    /// the transport-layer witness for the rn472 class (a request frame
+    /// stuck in the socket / a handler stuck pre-read — invisible to
+    /// every bus-side instrument).
+    z498_stage: Option<Z498Stage>,
+    /// 6-Z498 verdict throttle: the last CONN-STAGE line for this conn.
+    z498_last_verdict: Option<std::time::Instant>,
 }
 
 /// Shared per-VM bus state: the service registry with OWNER routing, the
@@ -4430,6 +4585,13 @@ impl BinderProxy {
                             // completes another ioctl, so the z491
                             // tail-of-ioctl tick can never see it).
                             z495_exchange_sweep(&bus_hb, vm_id_hb);
+                            // 6-Z498: the CONN-STAGE sweep — the rn472
+                            // class (the request frame stuck IN THE
+                            // SOCKET / the handler stuck pre-read) never
+                            // reaches the z495 stamp either; the stage
+                            // tracker + the FIONREAD oracle name the
+                            // exact stuck layer.
+                            z498_stage_sweep(&bus_hb, vm_id_hb);
                         }
                     })
                     .expect("kr64-binder-hb spawn");
@@ -4741,7 +4903,25 @@ fn connection_loop(
     let mut fds_in_total: u64 = 0;
     let mut fd_frames_out: u64 = 0;
     let mut fds_out_total: u64 = 0;
+    // 6-Z498: the proxy stream's raw fd — the FIONREAD oracle's handle
+    // for the Reading-stage sweep (valid while this handler lives).
+    let z498_stream_fd = stream.as_raw_fd();
     loop {
+        // 6-Z498: the handler enters its Reading stage (waiting for the
+        // next request frame). A looper conn parks here FOREVER by
+        // design — the sweep only verdicts when FIONREAD shows bytes
+        // queued in the socket the handler never reached.
+        {
+            if let Ok(mut b) = bus.lock() {
+                if let Some(bx) = b.conns.get_mut(&conn_id) {
+                    bx.z498_stage = Some(Z498Stage {
+                        kind: Z498StageKind::Reading,
+                        since: std::time::Instant::now(),
+                        fd: z498_stream_fd,
+                    });
+                }
+            }
+        }
         // 6-Z355: the request frame may carry SCM_RIGHTS fds (fd-bearing
         // blobs) — captured by the control-buffered header read.
         let (req, wire_fds) = match read_frame_with_fds(stream) {
@@ -4806,6 +4986,15 @@ fn connection_loop(
                             0
                         },
                     });
+                    // 6-Z498: the frame was READ — the handler enters its
+                    // Dispatching stage (the BUS owns the exchange now;
+                    // a stuck dispatch is the bus's answer, never the
+                    // transport's).
+                    bx.z498_stage = Some(Z498Stage {
+                        kind: Z498StageKind::Dispatching,
+                        since: std::time::Instant::now(),
+                        fd: z498_stream_fd,
+                    });
                 }
             }
         }
@@ -4848,6 +5037,20 @@ fn connection_loop(
         if !resp.fds.is_empty() {
             fd_frames_out += 1;
             fds_out_total += resp.fds.len() as u64;
+        }
+        // 6-Z498: the handler enters its Writing stage (the response is
+        // about to leave — a blocked write means the requester stopped
+        // reading its socket).
+        {
+            if let Ok(mut b) = bus.lock() {
+                if let Some(bx) = b.conns.get_mut(&conn_id) {
+                    bx.z498_stage = Some(Z498Stage {
+                        kind: Z498StageKind::Writing,
+                        since: std::time::Instant::now(),
+                        fd: z498_stream_fd,
+                    });
+                }
+            }
         }
         write_frame(stream, &resp)?;
         // 6-Z495: the exchange completed — clear the in-flight stamp so
@@ -19368,5 +19571,124 @@ mod tests {
             0,
             "the throttle must suppress the immediate re-verdict"
         );
+    }
+}
+
+// ============================================================================
+// 6-Z498 tests — the handler-stage truth table + the sweep verdicts.
+// ============================================================================
+
+#[cfg(test)]
+mod z498_tests {
+    use super::*;
+
+    /// The pure verdict truth table: ONLY the stuck shapes verdict; the
+    /// healthy idle Reading (FIONREAD=0), the dying fd (None), and the
+    /// below-threshold ages stay silent; the throttle suppresses.
+    #[test]
+    fn z498_verdict_truth_table() {
+        use Z498StageKind::*;
+        let stuck = Z498_STAGE_STUCK + Duration::from_secs(5);
+        let fresh = Duration::from_secs(3);
+        // Reading: bytes in the socket past the threshold = THE verdict
+        // (the request frame never reached the handler).
+        assert!(z498_stage_verdict(Reading, stuck, Some(128), None).is_some());
+        // Reading: empty socket = a healthy idle looper conn — NEVER.
+        assert!(z498_stage_verdict(Reading, stuck, Some(0), None).is_none());
+        // Reading: oracle failure (EBADF) = a dying conn — NEVER.
+        assert!(z498_stage_verdict(Reading, stuck, None, None).is_none());
+        // Below the stuck threshold — silent in every shape.
+        assert!(z498_stage_verdict(Reading, fresh, Some(128), None).is_none());
+        assert!(z498_stage_verdict(Dispatching, fresh, None, None).is_none());
+        assert!(z498_stage_verdict(Writing, fresh, None, None).is_none());
+        // Dispatching/Writing past the threshold ALWAYS verdict (the
+        // frame was consumed; the bus or the response path owns it).
+        assert!(z498_stage_verdict(Dispatching, stuck, None, None).is_some());
+        assert!(z498_stage_verdict(Writing, stuck, None, None).is_some());
+        // The per-conn throttle: a fresh verdict < GAP suppresses.
+        assert!(
+            z498_stage_verdict(Dispatching, stuck, None, Some(Duration::from_secs(3))).is_none()
+        );
+        // ...but a stale one does not.
+        assert!(z498_stage_verdict(
+            Dispatching,
+            stuck,
+            None,
+            Some(Z498_VERDICT_GAP + Duration::from_secs(1))
+        )
+        .is_some());
+    }
+
+    /// The FIONREAD oracle: rc=0 + non-negative → Some; rc=0 + negative
+    /// (a kernel-side sign trick) → None; rc=-1 → None (never a verdict
+    /// trigger from a broken oracle).
+    #[test]
+    fn z498_fionread_oracle_truth_table() {
+        assert_eq!(z498_fionread_oracle(0, 0), Some(0));
+        assert_eq!(z498_fionread_oracle(0, 128), Some(128));
+        assert_eq!(z498_fionread_oracle(0, -1), None);
+        assert_eq!(z498_fionread_oracle(-1, 128), None);
+    }
+
+    /// The sweep on a real bus: a conn stuck in Dispatching verdicts; a
+    /// conn in Reading with a REAL queued frame (a socketpair with bytes
+    /// written to the daemon end) verdicts with the byte count; a
+    /// dying-fd Reading conn stays silent; the throttle holds.
+    #[test]
+    fn z498_sweep_names_the_stuck_layer() {
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(BusState::new()));
+        // A dying-fd Reading conn (fd ≤ 0): the oracle short-circuits →
+        // silent (the conn is going away; never a wedge verdict).
+        {
+            bus.lock().unwrap().conns.insert(700, ConnBox::default());
+            bus.lock().unwrap().conns.get_mut(&700).unwrap().z498_stage = Some(Z498Stage {
+                kind: Z498StageKind::Reading,
+                since: std::time::Instant::now() - Z498_STAGE_STUCK - Duration::from_secs(5),
+                fd: -1,
+            });
+            assert_eq!(
+                z498_stage_sweep(&bus, 1),
+                0,
+                "a dying-fd Reading conn must stay silent"
+            );
+        }
+        // A Reading conn with a REAL queued frame: bytes written to the
+        // peer end arrive in the daemon end's receive queue (FIONREAD > 0
+        // while the handler is parked in its read).
+        {
+            let (mut peer, daemon_end) = UnixStream::pair().unwrap();
+            use std::io::Write;
+            peer.write_all(&[0u8; 64]).unwrap();
+            bus.lock().unwrap().conns.insert(710, ConnBox::default());
+            bus.lock().unwrap().conns.get_mut(&710).unwrap().z498_stage = Some(Z498Stage {
+                kind: Z498StageKind::Reading,
+                since: std::time::Instant::now() - Z498_STAGE_STUCK - Duration::from_secs(5),
+                fd: daemon_end.as_raw_fd(),
+            });
+            assert_eq!(
+                z498_stage_sweep(&bus, 1),
+                1,
+                "a queued frame + a parked reader = the transport-layer verdict"
+            );
+            // The per-conn throttle: the immediate re-sweep is silent.
+            assert_eq!(z498_stage_sweep(&bus, 1), 0);
+            drop(peer);
+            drop(daemon_end);
+        }
+        // A Dispatching-stuck conn: the frame was read, the bus never
+        // answered — the bus-layer verdict fires despite the dead fd.
+        {
+            bus.lock().unwrap().conns.insert(720, ConnBox::default());
+            bus.lock().unwrap().conns.get_mut(&720).unwrap().z498_stage = Some(Z498Stage {
+                kind: Z498StageKind::Dispatching,
+                since: std::time::Instant::now() - Z498_STAGE_STUCK - Duration::from_secs(5),
+                fd: -1,
+            });
+            assert_eq!(
+                z498_stage_sweep(&bus, 1),
+                1,
+                "a stuck dispatch = the bus-layer verdict"
+            );
+        }
     }
 }
