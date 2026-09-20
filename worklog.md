@@ -32092,3 +32092,4 @@ Stage Summary:
   unwound; (4) the secondary legs unchanged (the z501 per-pid
   throttle; the statsdw socket-creation class + the 6-Z391
   EXIT-CATCH zero-fire re-audit).
+- **Task 248 addendum (in-session, post-commit verification)**: kr64 lint+test on 3a393c9e = run 35528835122 **SUCCESS** (CI green on the 6-Z502 tree); rn481 = run 35528840171 **in_progress**; rn480 (cdceda28) finished **CANCELLED** — the workflow's concurrency group cancelled it when rn481 entered, and NO rn480 asset was uploaded (the release's last bundle = rn479) → rn480 has no decodable bundle; its decode agenda (the child-process story + the hold-shape census) folds into rn481's decode (same observables, now with the escape aboard).
