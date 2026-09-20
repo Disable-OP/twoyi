@@ -3535,6 +3535,69 @@ fn z504_sockaddr_desc(blob: &[u8]) -> String {
         None => "<unreadable-sun_path>".to_string(),
     }
 }
+
+/// 6-Z506: the pure errno namer for the census failure lines — the
+/// rn487 lesson: the 64-line z504 budget burned on init's EARLY
+/// SUCCESSFUL socket storm (all ret >= 0 within +2.35 s) and closed the
+/// window before the statsd-era failure class. The failure lines are
+/// now budget-prioritized and spell the errno, making the next decode's
+/// verdict decisive without a manual errno table lookup.
+fn z506_errno_name(e: i64) -> String {
+    let name = match e {
+        1 => "EPERM",
+        2 => "ENOENT",
+        4 => "EINTR",
+        5 => "EIO",
+        9 => "EBADF",
+        11 => "EAGAIN",
+        12 => "ENOMEM",
+        13 => "EACCES",
+        14 => "EFAULT",
+        16 => "EBUSY",
+        17 => "EEXIST",
+        20 => "ENOTDIR",
+        21 => "EISDIR",
+        22 => "EINVAL",
+        23 => "ENFILE",
+        24 => "EMFILE",
+        28 => "ENOSPC",
+        30 => "EROFS",
+        31 => "EMLINK",
+        36 => "ENAMETOOLONG",
+        38 => "ENOSYS",
+        39 => "ENOTEMPTY",
+        40 => "ELOOP",
+        75 => "EOVERFLOW",
+        84 => "EILSEQ",
+        88 => "ENOTSOCK",
+        89 => "EDESTADDRREQ",
+        90 => "EMSGSIZE",
+        91 => "EPROTOTYPE",
+        92 => "ENOPROTOOPT",
+        93 => "EPROTONOSUPPORT",
+        94 => "ESOCKTNOSUPPORT",
+        95 => "EOPNOTSUPP",
+        96 => "EPFNOSUPPORT",
+        97 => "EAFNOSUPPORT",
+        98 => "EADDRINUSE",
+        99 => "EADDRNOTAVAIL",
+        100 => "ENETDOWN",
+        101 => "ENETUNREACH",
+        102 => "ENETRESET",
+        103 => "ECONNABORTED",
+        104 => "ECONNRESET",
+        105 => "ENOBUFS",
+        106 => "EISCONN",
+        107 => "ENOTCONN",
+        110 => "ETIMEDOUT",
+        111 => "ECONNREFUSED",
+        113 => "EHOSTUNREACH",
+        114 => "EALREADY",
+        115 => "EINPROGRESS",
+        _ => return format!("<e{}>", e),
+    };
+    name.to_string()
+}
 // close_range is nr 436 on aarch64 AND x86_64 (asm-generic + x86_64
 // unified) — not in ChildAbi; a raw match is exact.
 const Z483_CLOSE_RANGE: i64 = 436;
@@ -12324,6 +12387,54 @@ const Z503_PER_PID_CAP: u32 = 2;
 /// The global verdict budget per run (the z501 budget, unchanged).
 const Z503_GLOBAL_BUDGET: u64 = 8;
 
+// ── 6-Z505: the ERA-SPLIT verdict budget (the rn487 budget lesson) ──
+//
+// rn487 decode: the 6-Z503 throttle kept its per-pid + dwell guarantees
+// and STILL drained the 8-verdict global budget by +44.9 s — eight
+// DISTINCT early-boot processes (pids 2999..3429: the svc-/dexopt fleet)
+// each genuinely dwelled >= 10 s on their own uaddr, and every spend was
+// honest. The wall parks (the PMS-monitor shape: the rn476/rn487 main
+// thread park with the permission fleet blocked) arrive no earlier than
+// ~+95 s (PMS start) and last >= 50 s — and got ZERO coverage.
+//
+// The fix is temporal, not semantic: the run clock splits the budget.
+// The EARLY era (before the PMS/AMS boundary era) keeps a small witness
+// pool (2); the LATE era — where every observed wall lives — keeps the
+// FULL 8-verdict pool with unchanged semantics. The verdict line format
+// (`6-Z501 FUTEX-PARK:`) and the per-pid cap / dwell gate are UNCHANGED
+// (the decode recipes grep them).
+
+/// 6-Z505: the early-era witness pool (spends only before the late era).
+const Z505_EARLY_BUDGET: u64 = 2;
+/// 6-Z505: the run time where the wall era begins. The decode data
+/// (rn474/476/477/479/487) puts every early-boot dwell at <= +45 s and
+/// the wall era (PMS start, the crawl, the AMS boundary) at >= +95 s.
+const Z505_LATE_ERA_FROM_MS: u128 = 90_000;
+
+/// 6-Z505: which budget pool a catch spends from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Z505Era {
+    Early,
+    Late,
+}
+
+/// 6-Z505 pure core: pick the era + the budget pool for a catch at
+/// `run_ms`. The pools are disjoint by design — an exhausted early pool
+/// NEVER leaks into the late pool (protecting the wall era is the whole
+/// point; the rn487 lesson).
+fn z505_era_budget_pick(
+    run_ms: u128,
+    late_from_ms: u128,
+    early_left: u64,
+    late_left: u64,
+) -> (Z505Era, u64) {
+    if run_ms >= late_from_ms {
+        (Z505Era::Late, late_left)
+    } else {
+        (Z505Era::Early, early_left)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Z503PidState {
     last_uaddr: u64,
@@ -12434,9 +12545,18 @@ fn z503_now_secs() -> u64 {
 /// + the per-pid cap (2/run) guard the global budget (8/run) so the
 /// early-boot transient parks can no longer starve the late walls.
 fn z501_futex_park_probe(pid: libc::pid_t) {
+    // 6-Z505: the LATE-era pool keeps the z501 semantics verbatim; the
+    // EARLY-era pool is the separate small witness pool.
     static Z501_BUDGET: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(Z503_GLOBAL_BUDGET);
-    let budget_left = Z501_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+    static Z505_EARLY_POOL: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(Z505_EARLY_BUDGET);
+    let (era, budget_left) = z505_era_budget_pick(
+        crate::boot_elapsed_ms(),
+        Z505_LATE_ERA_FROM_MS,
+        Z505_EARLY_POOL.load(std::sync::atomic::Ordering::Relaxed),
+        Z501_BUDGET.load(std::sync::atomic::Ordering::Relaxed),
+    );
     if budget_left == 0 {
         return;
     }
@@ -12511,19 +12631,32 @@ fn z501_futex_park_probe(pid: libc::pid_t) {
             None
         }
     };
-    let prev = Z501_BUDGET.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    // 6-Z505: the spend drains the ERA'S OWN pool only.
+    let pool = match era {
+        Z505Era::Late => &Z501_BUDGET,
+        Z505Era::Early => &Z505_EARLY_POOL,
+    };
+    let prev = pool.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     if prev == 0 {
-        // A racing spend emptied the budget between our entry check and
+        // A racing spend emptied the pool between our entry check and
         // this decrement — restore the floor and drop the verdict.
-        Z501_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+        pool.store(0, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     if prev == 1 {
-        // The ONE-TIME exhaustion line (honest accounting for the decode).
-        crate::trace_log_line(&format!(
-            "6-Z503 THROTTLE: the z501 global budget exhausted ({} verdicts spent; the per-pid cap {} + the {}s dwell gate remain armed)",
-            Z503_GLOBAL_BUDGET, Z503_PER_PID_CAP, Z503_DWELL_SECS
-        ));
+        // The ONE-TIME exhaustion line per pool (honest accounting for
+        // the decode; the late-era text is UNCHANGED — the decode
+        // recipes grep it).
+        match era {
+            Z505Era::Late => crate::trace_log_line(&format!(
+                "6-Z503 THROTTLE: the z501 global budget exhausted ({} verdicts spent; the per-pid cap {} + the {}s dwell gate remain armed)",
+                Z503_GLOBAL_BUDGET, Z503_PER_PID_CAP, Z503_DWELL_SECS
+            )),
+            Z505Era::Early => crate::trace_log_line(&format!(
+                "6-Z505 THROTTLE-EARLY: the early witness pool exhausted ({} verdicts spent before +{}ms; the late wall-era pool of {} remains armed)",
+                Z505_EARLY_BUDGET, Z505_LATE_ERA_FROM_MS, Z503_GLOBAL_BUDGET
+            )),
+        }
     }
     crate::trace_log_line(&format!(
         "6-Z501 FUTEX-PARK: pid={} nr={} uaddr={:#x} val={} op={:#x} ({}) word={} pc={:#x} {}",
@@ -29089,14 +29222,20 @@ pub fn run_ptrace_loop(
                                 // a bind failing before fchmodat. Log
                                 // init's bind ENTRY (the descriptor) and
                                 // resolve the ret at the EXIT half.
+                                // 6-Z506: the stash insert is UNCONDITIONAL
+                                // (the failure pool depends on it); only the
+                                // entry LOG is budgeted.
                                 if pid == init_pid {
-                                    static Z504_BIND_BUDGET: std::sync::atomic::AtomicU64 =
-                                        std::sync::atomic::AtomicU64::new(0);
-                                    if Z504_BIND_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
-                                        < 24
-                                    {
-                                        Z504_BIND_BUDGET
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if let Ok(mut p) = Z504_RET_PENDING.lock() {
+                                        p.insert(pid, "BIND");
+                                    }
+                                    static Z506_BIND_LOG_BUDGET: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(12);
+                                    let z506_left = Z506_BIND_LOG_BUDGET
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    if z506_left > 0 {
+                                        Z506_BIND_LOG_BUDGET
+                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                         let z504_fd = get_syscall_arg(&regs, abi.reg_arg1);
                                         crate::z504_klog(
                                             rootfs,
@@ -29107,9 +29246,6 @@ pub fn run_ptrace_loop(
                                                 z504_sockaddr_desc(&blob)
                                             ),
                                         );
-                                        if let Ok(mut p) = Z504_RET_PENDING.lock() {
-                                            p.insert(pid, "BIND");
-                                        }
                                     }
                                 }
                                 {
@@ -36600,11 +36736,22 @@ pub fn run_ptrace_loop(
                     // half) — placed BEFORE the 6-Z202 netlink rewrite so
                     // the census names the ORIGINAL domain/type; the ret
                     // resolves at the EXIT half via Z504_RET_PENDING.
+                    // 6-Z506: the stash insert is UNCONDITIONAL (the ret
+                    // resolver's failure pool needs the stash even after
+                    // the entry LOG budget closes — the rn487 lesson: the
+                    // entry logs burned out at +2.35 s and the stash must
+                    // keep arming for the statsd-era failures).
                     if abi.socket_nr != -1 && syscall_num == abi.socket_nr && pid == init_pid {
-                        static Z504_SOCKET_BUDGET: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        if Z504_SOCKET_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < 16 {
-                            Z504_SOCKET_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Ok(mut p) = Z504_RET_PENDING.lock() {
+                            p.insert(pid, "SOCKET");
+                        }
+                        static Z506_SOCKET_LOG_BUDGET: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(12);
+                        let z506_left =
+                            Z506_SOCKET_LOG_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+                        if z506_left > 0 {
+                            Z506_SOCKET_LOG_BUDGET
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             let z504_domain = get_syscall_arg(&regs, abi.reg_arg1);
                             let z504_type = get_syscall_arg(&regs, abi.reg_arg2);
                             crate::z504_klog(
@@ -36614,9 +36761,6 @@ pub fn run_ptrace_loop(
                                     pid, z504_domain, z504_type
                                 ),
                             );
-                            if let Ok(mut p) = Z504_RET_PENDING.lock() {
-                                p.insert(pid, "SOCKET");
-                            }
                         }
                     }
                     // ── 6-Z202: uevent netlink socket → REAL AF_UNIX
@@ -40317,13 +40461,52 @@ pub fn run_ptrace_loop(
                     // re-audit's decisive data — a bind ret=-2 ENOENT vs
                     // a fchmodat that never comes names the failing link
                     // without any guesswork).
+                    // 6-Z506: FAILURE-PRIORITY budgets (the rn487 lesson:
+                    // the old single 64-line pool burned on the early
+                    // SUCCESS storm by +2.35 s and the statsd-era failures
+                    // went unobserved). A failing ret owns a dedicated
+                    // pool and spells the errno; success lines keep a
+                    // small sample. Worst case 12+12+32+8 = 64 = the
+                    // z504_klog self-bury backstop.
                     if let Ok(mut p) = Z504_RET_PENDING.lock() {
                         if let Some(z504_class) = p.remove(&pid) {
                             let z504_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                            crate::z504_klog(
-                                rootfs,
-                                &format!("INIT-{}-RET pid={} ret={}", z504_class, pid, z504_ret),
-                            );
+                            if z504_ret < 0 {
+                                static Z506_FAIL_RET_BUDGET: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(32);
+                                let z506_left =
+                                    Z506_FAIL_RET_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+                                if z506_left > 0 {
+                                    Z506_FAIL_RET_BUDGET
+                                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    crate::z504_klog(
+                                        rootfs,
+                                        &format!(
+                                            "INIT-{}-RET pid={} ret={} ({})",
+                                            z504_class,
+                                            pid,
+                                            z504_ret,
+                                            z506_errno_name(-z504_ret)
+                                        ),
+                                    );
+                                }
+                            } else {
+                                static Z506_OK_RET_BUDGET: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(8);
+                                let z506_left =
+                                    Z506_OK_RET_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+                                if z506_left > 0 {
+                                    Z506_OK_RET_BUDGET
+                                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    crate::z504_klog(
+                                        rootfs,
+                                        &format!(
+                                            "INIT-{}-RET pid={} ret={}",
+                                            z504_class, pid, z504_ret
+                                        ),
+                                    );
+                                }
+                            }
                         }
                     }
                     // 6-Z481: the REAL-wire BOOT_COMPLETED bridge — the
@@ -59688,6 +59871,84 @@ mod z503_throttle_tests {
         assert_eq!(Z503_PER_PID_CAP, 2);
         assert_eq!(Z503_DWELL_SECS, 10);
         assert_eq!(Z503_STALE_SECS, 60);
+    }
+}
+
+// 6-Z505: the era-split verdict budget (the rn487 budget lesson).
+#[cfg(test)]
+mod z505_era_budget_tests {
+    use super::{z505_era_budget_pick, Z505Era, Z505_EARLY_BUDGET, Z505_LATE_ERA_FROM_MS};
+
+    /// An early catch (before the wall era) picks the EARLY pool — the
+    /// early-boot dwell fleet can no longer drain the wall-era budget.
+    #[test]
+    fn z505_early_catch_picks_the_early_pool() {
+        let (era, left) = z505_era_budget_pick(44_900, 90_000, 2, 8);
+        assert_eq!(era, Z505Era::Early);
+        assert_eq!(left, 2);
+    }
+
+    /// A late catch at exactly the era boundary picks the LATE pool
+    /// (>= — the wall era opens at +90 s).
+    #[test]
+    fn z505_boundary_catch_picks_the_late_pool() {
+        let (era, left) = z505_era_budget_pick(90_000, 90_000, 0, 8);
+        assert_eq!(era, Z505Era::Late);
+        assert_eq!(left, 8);
+    }
+
+    /// The pools are disjoint: an exhausted early pool NEVER leaks into
+    /// the late pool (protecting the wall era is the whole point).
+    #[test]
+    fn z505_empty_early_pool_never_leaks_into_the_late_pool() {
+        let (era, left) = z505_era_budget_pick(10_000, 90_000, 0, 8);
+        assert_eq!(era, Z505Era::Early);
+        assert_eq!(left, 0);
+        // And the late pool is untouched for the late era.
+        let (era2, left2) = z505_era_budget_pick(120_000, 90_000, 0, 8);
+        assert_eq!(era2, Z505Era::Late);
+        assert_eq!(left2, 8);
+    }
+
+    /// An exhausted late pool reports honestly too (no phantom budget).
+    #[test]
+    fn z505_empty_late_pool_reports_zero() {
+        let (era, left) = z505_era_budget_pick(300_000, 90_000, 2, 0);
+        assert_eq!(era, Z505Era::Late);
+        assert_eq!(left, 0);
+    }
+
+    /// The mission shape: the early witness pool is 2, the wall era
+    /// opens at +90 s (the decode data: every early dwell <= +45 s,
+    /// every wall park >= +95 s).
+    #[test]
+    fn z505_constants_match_the_mission_shape() {
+        assert_eq!(Z505_EARLY_BUDGET, 2);
+        assert_eq!(Z505_LATE_ERA_FROM_MS, 90_000);
+    }
+}
+
+// 6-Z506: the failure-priority census errno namer.
+#[cfg(test)]
+mod z506_errno_name_tests {
+    use super::z506_errno_name;
+
+    /// The socket-creation failure class errnos spell their names (the
+    /// decode recipes read the line directly).
+    #[test]
+    fn z506_known_errnos_spell_their_names() {
+        assert_eq!(z506_errno_name(2), "ENOENT");
+        assert_eq!(z506_errno_name(13), "EACCES");
+        assert_eq!(z506_errno_name(98), "EADDRINUSE");
+        assert_eq!(z506_errno_name(97), "EAFNOSUPPORT");
+        assert_eq!(z506_errno_name(111), "ECONNREFUSED");
+    }
+
+    /// Unknown errnos fall back to the honest numeric spelling.
+    #[test]
+    fn z506_unknown_errno_spells_the_number() {
+        assert_eq!(z506_errno_name(1337), "<e1337>");
+        assert_eq!(z506_errno_name(0), "<e0>");
     }
 }
 
