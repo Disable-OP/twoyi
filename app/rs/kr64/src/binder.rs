@@ -2298,6 +2298,111 @@ impl Z491Acct {
     }
 }
 
+/// 6-Z495: one IN-FLIGHT BINDER_WRITE_READ exchange, stamped by the
+/// per-conn loop the moment the request frame is read and cleared the
+/// moment the response leaves. This is the state the 6-Z491 tail-of-
+/// ioctl tick CANNOT see: the tick only runs on COMPLETED ioctls, and
+/// the rn470 (ladder rn471) decode caught the wedge class living exactly
+/// there — the era-2 system_server main thread (conn=182) parked inside
+/// `bp_exchange_anc` for the rest of the run while the 6-Z402 heartbeat
+/// ticked its inbox=1 — the conn never completed another ioctl, so no
+/// z491 verdict ever fired. The 6-Z495 sweep turns an in-flight
+/// exchange older than [`Z495_EXCHANGE_STUCK`] into a budgeted one-line
+/// verdict carrying the full stuck shape.
+#[derive(Clone, Copy)]
+struct Z495InFlight {
+    arrived_at: std::time::Instant,
+    /// The request's write_size (the BC stream length).
+    ws: u32,
+    /// The request's read_capacity.
+    rc: u32,
+}
+
+/// How long an exchange may stay in flight before the sweep names it
+/// stuck (a healthy sync round-trip is µs-ms; the 250 ms idle tick is
+/// the slowest healthy loop iteration).
+const Z495_EXCHANGE_STUCK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-conn verdict throttle for the 6-Z495 sweep.
+const Z495_VERDICT_GAP: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 6-Z495: the EXCHANGE-STUCK sweep — runs on the 6-Z402 heartbeat
+/// thread (every 30 s), scans every conn's in-flight exchange and turns
+/// a stuck one into a budgeted one-line verdict. Returns the number of
+/// verdicts emitted (unit-test seam).
+fn z495_exchange_sweep(bus: &Arc<Mutex<BusState>>, vm_id: u32) -> usize {
+    static Z495_VERDICT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32);
+    let mut b = bus.lock().expect("binder bus poisoned");
+    let now = std::time::Instant::now();
+    // The 6-Z408 hold state per conn, computed in an immutable pass (the
+    // hold predicate borrows the bus; the verdict loop borrows conns
+    // mutably). The ONE shape where an undelivered inbox front is BY
+    // DESIGN (the held item waits for the conn's own nested call to
+    // unwind) — the decode must be able to tell held-by-design from
+    // wedged.
+    let holds: std::collections::HashMap<ConnId, bool> = b
+        .conns
+        .iter()
+        .map(|(cid, bx)| {
+            let held = match bx.inbox.front() {
+                Some(InboxItem::Tx(tx)) => b.z408_sync_delivery_blocked(*cid, tx),
+                _ => false,
+            };
+            (*cid, held)
+        })
+        .collect();
+    let mut emitted = 0usize;
+    for (cid, bx) in b.conns.iter_mut() {
+        let Some(inflight) = bx.z495_inflight else {
+            continue;
+        };
+        let age = now.duration_since(inflight.arrived_at);
+        if age < Z495_EXCHANGE_STUCK {
+            continue;
+        }
+        if bx
+            .z495_last_verdict
+            .map_or(false, |t| now.duration_since(t) < Z495_VERDICT_GAP)
+        {
+            continue;
+        }
+        if Z495_VERDICT_LOG.load(Ordering::Relaxed) == 0 {
+            return emitted;
+        }
+        Z495_VERDICT_LOG.fetch_sub(1, Ordering::Relaxed);
+        bx.z495_last_verdict = Some(now);
+        let z408_held = holds.get(cid).copied().unwrap_or(false);
+        info!(
+            "[KR64][binder][vm{}] 6-Z495 EXCHANGE-STUCK conn={} pid={} tid={} dev={} age={}s ws={} rc={} reader_waiting={} inbox={} pending_in={} replies={} stack={:?} out_sync={} z408_held={} tx_enq={} tx_del={} reply_enq={} reply_del={} bc_reply={} bc_free={} wr={} noop={}",
+            vm_id,
+            cid,
+            bx.sender_pid,
+            bx.sender_tid,
+            bx.dev_code,
+            age.as_secs(),
+            inflight.ws,
+            inflight.rc,
+            bx.reader_waiting,
+            bx.inbox.len(),
+            bx.pending_in.len(),
+            bx.reply_queue.len(),
+            bx.txn_stack,
+            bx.out_sync.len(),
+            z408_held,
+            bx.z491.tx_enq,
+            bx.z491.tx_del,
+            bx.z491.reply_enq,
+            bx.z491.reply_del,
+            bx.z491.bc_reply_rx,
+            bx.z491.bc_free_rx,
+            bx.z491.wr_calls,
+            bx.z491.noop_polls,
+        );
+        emitted += 1;
+    }
+    emitted
+}
+
 /// Per-connection mailbox state, held inside [`BusState`].
 #[derive(Default)]
 struct ConnBox {
@@ -2399,6 +2504,17 @@ struct ConnBox {
     last_sm_get: Option<(String, std::time::Instant)>,
     /// 6-Z491: the delivery-vs-consumed accounting (see [`Z491Acct`]).
     z491: Z491Acct,
+    /// 6-Z495: the exchange CURRENTLY being serviced by the per-conn
+    /// loop (stamped after the request frame is read, cleared after the
+    /// response is written). None = the conn is idle between ioctls.
+    /// The [`z495_exchange_sweep`] heartbeat reads this — the rn470
+    /// (ladder rn471) wedge class (a conn stuck mid-exchange, no ioctl
+    /// ever completing again) is invisible to the tail-of-ioctl z491
+    /// tick by construction.
+    z495_inflight: Option<Z495InFlight>,
+    /// 6-Z495 verdict throttle: the last EXCHANGE-STUCK line for this
+    /// conn.
+    z495_last_verdict: Option<std::time::Instant>,
 }
 
 /// Shared per-VM bus state: the service registry with OWNER routing, the
@@ -4306,6 +4422,14 @@ impl BinderProxy {
                                     lines.join(" || ")
                                 );
                             }
+                            // 6-Z495: the EXCHANGE-STUCK sweep — the same
+                            // 30 s heartbeat names any conn whose
+                            // BINDER_WRITE_READ has been in flight past
+                            // the stuck threshold (the rn470/ladder-rn471
+                            // class: a conn parked mid-exchange never
+                            // completes another ioctl, so the z491
+                            // tail-of-ioctl tick can never see it).
+                            z495_exchange_sweep(&bus_hb, vm_id_hb);
                         }
                     })
                     .expect("kr64-binder-hb spawn");
@@ -4660,6 +4784,31 @@ fn connection_loop(
                 vm_id, conn_id, ws, rc
             );
         }
+        // 6-Z495: stamp the in-flight exchange BEFORE dispatch — the
+        // sweep on the 6-Z402 heartbeat thread names any exchange that
+        // never comes back (the rn470/ladder-rn471 wedge class: the
+        // guest parked inside bp_exchange_anc while the conn never
+        // completed another ioctl — invisible to the z491 tail-of-ioctl
+        // tick by construction).
+        if req.cmd == BINDER_WRITE_READ {
+            if let Ok(mut b) = bus.lock() {
+                if let Some(bx) = b.conns.get_mut(&conn_id) {
+                    bx.z495_inflight = Some(Z495InFlight {
+                        arrived_at: std::time::Instant::now(),
+                        ws: if req.payload.len() >= 4 {
+                            u32::from_ne_bytes(req.payload[0..4].try_into().unwrap())
+                        } else {
+                            0
+                        },
+                        rc: if req.payload.len() >= 8 {
+                            u32::from_ne_bytes(req.payload[4..8].try_into().unwrap())
+                        } else {
+                            0
+                        },
+                    });
+                }
+            }
+        }
         let resp = dispatch_request(&req, vm_id, bus, conn_id, wire_fds);
         if req.cmd == BINDER_WRITE_READ && wr_diag_budget > 0 {
             let (rs, blobs) = if resp.payload.len() >= 4 {
@@ -4701,6 +4850,16 @@ fn connection_loop(
             fds_out_total += resp.fds.len() as u64;
         }
         write_frame(stream, &resp)?;
+        // 6-Z495: the exchange completed — clear the in-flight stamp so
+        // the sweep only ever names exchanges the loop GENUINELY never
+        // returned (a stuck dispatch or a blocked response write).
+        if req.cmd == BINDER_WRITE_READ {
+            if let Ok(mut b) = bus.lock() {
+                if let Some(bx) = b.conns.get_mut(&conn_id) {
+                    bx.z495_inflight = None;
+                }
+            }
+        }
     }
 }
 
@@ -19139,6 +19298,75 @@ mod tests {
         assert_eq!(
             b.conns[&315].z491.last_verdict, first,
             "inside the gap → throttled (same verdict instant)"
+        );
+    }
+
+    // -- 6-Z495: the EXCHANGE-STUCK sweep (the mid-exchange blind spot) --
+
+    /// An exchange in flight past the stuck threshold → the sweep verdicts
+    /// exactly once and stamps the throttle. This is the rn470 (ladder
+    /// rn471) shape: the era-2 main thread parked inside bp_exchange_anc
+    /// for the rest of the run — no completed ioctl, no z491 verdict, the
+    /// 6-Z402 heartbeat showing inbox=1.
+    #[test]
+    fn z495_sweep_names_stuck_inflight_exchange() {
+        let mut b = BusState::new();
+        b.conns.insert(410u64, ConnBox::default());
+        b.conns.get_mut(&410).unwrap().z495_inflight = Some(Z495InFlight {
+            arrived_at: std::time::Instant::now()
+                - Z495_EXCHANGE_STUCK
+                - std::time::Duration::from_secs(5),
+            ws: 96,
+            rc: 256,
+        });
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(b));
+        let emitted = z495_exchange_sweep(&bus, 1);
+        assert_eq!(emitted, 1, "a stuck exchange must verdict once");
+        let b = bus.lock().unwrap();
+        assert!(b.conns[&410].z495_last_verdict.is_some());
+        assert!(
+            b.conns[&410].z495_inflight.is_some(),
+            "the sweep observes; the loop owns the stamp"
+        );
+    }
+
+    /// Fresh stamps (inside the threshold) and cleared stamps (the
+    /// exchange completed) never verdict — the sweep is silent on health.
+    #[test]
+    fn z495_sweep_silent_for_fresh_and_cleared_exchanges() {
+        let mut b = BusState::new();
+        b.conns.insert(411u64, ConnBox::default());
+        b.conns.insert(412u64, ConnBox::default());
+        b.conns.get_mut(&411).unwrap().z495_inflight = Some(Z495InFlight {
+            arrived_at: std::time::Instant::now(),
+            ws: 0,
+            rc: 256,
+        });
+        // conn 412: no stamp at all (idle between ioctls).
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(b));
+        let emitted = z495_exchange_sweep(&bus, 1);
+        assert_eq!(emitted, 0, "fresh/idle conns are not stuck");
+    }
+
+    /// The per-conn throttle: a second sweep inside Z495_VERDICT_GAP must
+    /// not re-verdict the same stuck exchange.
+    #[test]
+    fn z495_sweep_throttles_per_conn() {
+        let mut b = BusState::new();
+        b.conns.insert(413u64, ConnBox::default());
+        b.conns.get_mut(&413).unwrap().z495_inflight = Some(Z495InFlight {
+            arrived_at: std::time::Instant::now()
+                - Z495_EXCHANGE_STUCK
+                - std::time::Duration::from_secs(5),
+            ws: 96,
+            rc: 256,
+        });
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(b));
+        assert_eq!(z495_exchange_sweep(&bus, 1), 1);
+        assert_eq!(
+            z495_exchange_sweep(&bus, 1),
+            0,
+            "the throttle must suppress the immediate re-verdict"
         );
     }
 }
