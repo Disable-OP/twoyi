@@ -12213,6 +12213,117 @@ fn z404_walk_chain(pid: libc::pid_t, fp: u64, frames_cap: usize) -> usize {
     frames
 }
 
+/// 6-Z501 (pure): parse a /proc/<pid>/syscall line — "nr arg0..arg5 sp pc"
+/// with the args in 0x-hex (the kernel prints `running` or `-1 0x...` for
+/// the non-blocked shapes; those parse to None). Returns the syscall nr
+/// plus the six args.
+fn z501_parse_procfs_syscall(line: &str) -> Option<(i64, [u64; 6])> {
+    let mut tokens = line.split_whitespace();
+    let nr: i64 = tokens.next()?.parse().ok()?;
+    if nr < 0 {
+        return None;
+    }
+    let mut args = [0u64; 6];
+    for a in args.iter_mut() {
+        let t = tokens.next()?;
+        *a = u64::from_str_radix(t.trim_start_matches("0x"), 16).ok()?;
+    }
+    Some((nr, args))
+}
+
+/// 6-Z501 (pure): the futex op's command name (op & FUTEX_CMD_MASK — the
+/// low 7 bits; the private/shared flags live in bit 7 and are irrelevant
+/// for the park classification).
+fn z501_futex_op_name(op: u64) -> &'static str {
+    match op & 0x7f {
+        0 => "WAIT",
+        1 => "WAKE",
+        2 => "FD",
+        3 => "REQUEUE",
+        4 => "CMP_REQUEUE",
+        5 => "WAKE_OP",
+        6 => "LOCK_PI",
+        7 => "UNLOCK_PI",
+        8 => "TRYLOCK_PI",
+        9 => "WAIT_BITSET",
+        _ => "OTHER",
+    }
+}
+
+/// 6-Z501: the FUTEX-PARK forensics probe — a blocked-in-futex tracee's
+/// uaddr/val/op + the parking pc's maps row + the futex word's value,
+/// all read-only (the /proc syscall file + process_vm_readv; NO ptrace
+/// interaction — the 6-Z415 vanish-class discipline). Budget: 8 verdicts
+/// per run (the probe cadence re-fires every ~15 s per pid; a budgeted
+/// window at the stall's start is what the decode needs).
+fn z501_futex_park_probe(pid: libc::pid_t) {
+    static Z501_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(8);
+    if Z501_BUDGET.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    let Ok(line) = std::fs::read_to_string(format!("/proc/{}/syscall", pid)) else {
+        return;
+    };
+    let Some((nr, args)) = z501_parse_procfs_syscall(&line) else {
+        return;
+    };
+    if nr != 98 && nr != 202 && nr != 240 {
+        return;
+    }
+    let (uaddr, val, op) = (args[0], args[1], args[2]);
+    let pc = {
+        // The pc is the EIGHTH token (after the six args); the parser
+        // above stops at six — re-read the tail here.
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() >= 8 {
+            u64::from_str_radix(toks[7].trim_start_matches("0x"), 16).unwrap_or(0)
+        } else {
+            0
+        }
+    };
+    // The futex word's value at park time (read-only; failure is honest).
+    let word = unsafe {
+        let mut buf: u32 = 0;
+        let mut local = libc::iovec {
+            iov_base: (&mut buf as *mut u32) as *mut libc::c_void,
+            iov_len: std::mem::size_of::<u32>(),
+        };
+        let remote = libc::iovec {
+            iov_base: uaddr as *mut libc::c_void,
+            iov_len: std::mem::size_of::<u32>(),
+        };
+        let rc = libc::process_vm_readv(
+            pid,
+            &mut local as *mut libc::iovec,
+            1,
+            &remote as *const libc::iovec,
+            1,
+            0,
+        );
+        if rc == 4 {
+            Some(buf)
+        } else {
+            None
+        }
+    };
+    Z501_BUDGET.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    crate::trace_log_line(&format!(
+        "6-Z501 FUTEX-PARK: pid={} nr={} uaddr={:#x} val={} op={:#x} ({}) word={} pc={:#x} {}",
+        pid,
+        nr,
+        uaddr,
+        val,
+        op,
+        z501_futex_op_name(op),
+        match word {
+            Some(w) => w.to_string(),
+            None => "unreadable".to_string(),
+        },
+        pc,
+        maps_region_for_pc(pid, pc),
+    ));
+}
+
 /// 6-Z305t-18: SIGSTOP stall probe — the portable way to name a
 /// long-stalled tracee's TRUE blocked syscall on ATTACH-attached tracees.
 ///
@@ -12264,10 +12375,46 @@ fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
     const Z415_SIGSTOP_PROBE_DISABLED: bool = true;
     if Z415_SIGSTOP_PROBE_DISABLED {
         match z404_procfs_syscall_nr(pid) {
-            Some(nr) if nr >= 0 => crate::trace_log_line(&format!(
-                "6-Z415 PROCFS-PROBE: pid={} blocked-in-kernel nr={} (no SIGSTOP issued, no stop consumed)",
-                pid, nr
-            )),
+            Some(nr) if nr >= 0 => {
+                crate::trace_log_line(&format!(
+                    "6-Z415 PROCFS-PROBE: pid={} blocked-in-kernel nr={} (no SIGSTOP issued, no stop consumed)",
+                    pid, nr
+                ));
+                // ── 6-Z501: the FUTEX-PARK forensics (the rn474 wall) ──
+                //
+                // The rn474 decode (ladder #474, the first run with a
+                // WORKING heartbeat): the boot passed the crawl
+                // (AppDataPrepare 227.5s COMPLETED — the daemon-wall
+                // class did not fire) and stalled at the AMS boundary —
+                // the guest system_server's MAIN thread parked in the
+                // guest futex (nr=98) WHILE HOLDING the PMS monitor
+                // (getInstantAppPackageName frame, 50s+ contention,
+                // waiters 0→2), "activity" (AMS) never registered, and
+                // a helper thread burned the getService(activity) SM
+                // poll loop at ~4 Hz to the run end. The missing datum:
+                // WHICH futex the main thread parks on (the monitor's
+                // native word) and the parking pc's frame.
+                //
+                // /proc/<pid>/syscall is READ-ONLY (no tracer
+                // interaction — the 6-Z415 vanish-class discipline) and
+                // carries the FULL argument set: "nr arg0..arg5 sp pc".
+                // For a futex park: arg0 = the uaddr (the futex word),
+                // arg1 = the expected val, arg2 = the op (the low bits =
+                // the command). The pc names the parking frame via the
+                // existing maps resolver. The futex word itself is read
+                // with process_vm_readv (read-only) — locked-vs-free at
+                // park time.
+                if nr == 98 || nr == 202 || nr == 240 {
+                    // The futex syscall numbers: aarch64=98, x86_64=202,
+                    // i386/arm32=240. The ladder's guests are aarch64
+                    // (nr=98); the compat covers the cross-ABI probes.
+                    // READ-ONLY diagnostics: a mislabeled number can
+                    // only print odd args, never mutate anything (the
+                    // z471 verified-table discipline applies to
+                    // memory-REWRITE arms, not to read-only forensics).
+                    z501_futex_park_probe(pid);
+                }
+            }
             Some(_) => crate::trace_log_line(&format!(
                 "6-Z415 PROCFS-PROBE: pid={} userspace-parked (procfs -1) (no SIGSTOP issued)",
                 pid
@@ -59068,5 +59215,44 @@ mod z497_reattach_tests {
         // own errno path then reports honestly).
         assert_eq!(z497_tracer_pid("TracerPid:\t-5\n"), -5);
         assert_eq!(z497_tracer_pid("TracerPid:\t99999999999999999999\n"), 0);
+    }
+}
+
+/// 6-Z501 pure cores (the futex-park forensics).
+#[cfg(test)]
+mod z501_futex_tests {
+    use super::{z501_futex_op_name, z501_parse_procfs_syscall};
+
+    /// The /proc/syscall line parser: the blocked shape (nr + 6 hex args
+    /// + sp + pc), the userspace-park shape (-1 → None), the running
+    /// shape (→ None), and the truncated-line tolerance.
+    #[test]
+    fn z501_parse_procfs_syscall_shapes() {
+        let blocked = "98 0x7f8a2c0d30 0x0 0x85 0x0 0x0 0x0 0x7f8a2c0c90 0x7f8a2b0fecc\n";
+        let (nr, args) = z501_parse_procfs_syscall(blocked).expect("blocked parses");
+        assert_eq!(nr, 98);
+        assert_eq!(args[0], 0x7f8a2c0d30); // uaddr
+        assert_eq!(args[1], 0); // val
+        assert_eq!(args[2], 0x85); // op (WAIT | PRIVATE)
+        let userspace = "-1 0x7f8a2c0c90 0xffffffffffffffff\n";
+        assert!(z501_parse_procfs_syscall(userspace).is_none());
+        assert!(z501_parse_procfs_syscall("running\n").is_none());
+        assert!(z501_parse_procfs_syscall("").is_none());
+        // A truncated arg list → None (no partial verdicts).
+        assert!(z501_parse_procfs_syscall("98 0x1 0x2\n").is_none());
+    }
+
+    /// The op-name table: the private flag (bit 7 = 128) is masked off;
+    /// the low-7-bit command names match the futex.h constants.
+    #[test]
+    fn z501_futex_op_names() {
+        assert_eq!(z501_futex_op_name(0), "WAIT");
+        assert_eq!(z501_futex_op_name(0x80), "WAIT"); // FUTEX_PRIVATE_FLAG with WAIT
+        assert_eq!(z501_futex_op_name(1), "WAKE");
+        assert_eq!(z501_futex_op_name(0x80 | 1), "WAKE");
+        assert_eq!(z501_futex_op_name(0x85), "WAKE_OP"); // PRIVATE|WAKE_OP — the mask works
+        assert_eq!(z501_futex_op_name(4), "CMP_REQUEUE");
+        assert_eq!(z501_futex_op_name(6), "LOCK_PI");
+        assert_eq!(z501_futex_op_name(0x7f), "OTHER");
     }
 }
