@@ -238,8 +238,15 @@ def main(art, out_path):
        hit("SURFACEFLINGER", r"surfaceflinger", watch_names_text, "watch-ps") or \
        hit("SURFACEFLINGER", r"starting service 'surfaceflinger'", kr_all, "kr64-klog"):
         rung, stage = 7, "SURFACEFLINGER"
-    if hit("SYSTEMUI_LAUNCHER", r"com\.android\.systemui|launcher", guest_names, "guest-ps") or \
-       hit("SYSTEMUI_LAUNCHER", r"com\.android\.systemui|launcher", watch_names_text, "watch-ps") or \
+    # 6-Z494 (rn469 decode): the app processes' ps NAME column is the
+    # kernel comm (prctl PR_SET_NAME), truncated to 15 chars —
+    # "com.android.systemui" appears as "com.android.sys" and
+    # "com.android.launcher3" as "com.android.lau"; the full-name regex
+    # could never match. The truncated forms are unique in the A11 fleet
+    # (settings="com.android.set", phone="com.android.pho" don't
+    # collide), and the raw name rides the evidence line for the audit.
+    if hit("SYSTEMUI_LAUNCHER", r"com\.android\.systemui|com\.android\.sys|launcher|com\.android\.lau", guest_names, "guest-ps") or \
+       hit("SYSTEMUI_LAUNCHER", r"com\.android\.systemui|com\.android\.sys|launcher|com\.android\.lau", watch_names_text, "watch-ps") or \
        hit("SYSTEMUI_LAUNCHER", r"Start proc \d+:[^ ]*(?:systemui|launcher)", guest_logcat, "guest-logcat"):
         rung, stage = 8, "SYSTEMUI_LAUNCHER"
     # 9 BOOT_COMPLETED — the ONLY honest source: the kr64 bridge line

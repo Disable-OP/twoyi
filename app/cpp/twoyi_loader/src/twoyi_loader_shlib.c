@@ -5429,8 +5429,35 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
                 z489_diag--;
                 write_str(2, "[twoyi_loader] 6-Z489a: connect(/dev/socket/property_service) -> guest listener (g_rootfs-prefixed)\n");
             }
-            return (int)syscall(SYS_connect, sockfd, &prop_sa_6z489,
-                                sizeof(prop_sa_6z489));
+            int rc_6z493 = (int)syscall(SYS_connect, sockfd, &prop_sa_6z489,
+                                        sizeof(prop_sa_6z489));
+            // 6-Z493 (the rn469 decode): the property-wire connect health
+            // monitor. The rn469 decode named the wall: the guest's boot
+            // stalls after the 227 s prepareAppData (the daemon-wall
+            // desync) — the boot_completed set never happens. The wire
+            // itself still needs the health check for the post-stall
+            // eras: ret=-115 (EINPROGRESS) is the NORMAL nonblocking
+            // shape; -111 (ECONNREFUSED) is the init backlog-overflow
+            // class; -13 (EACCES) names the perms class. Budget
+            // 32/process, SEPARATE from the spent z489_diag cap (the
+            // early sets consume that cap — the late-era connects would
+            // be silent without this).
+            {
+                static int z493_conn_diag = 32;
+                if (z493_conn_diag > 0) {
+                    z493_conn_diag--;
+                    char z493_buf[128];
+                    int en_6z493 = (rc_6z493 < 0) ? errno : 0;
+                    int n_6z493 = snprintf(z493_buf, sizeof(z493_buf),
+                                           "[twoyi_loader] 6-Z493: property_service connect ret=%d (errno=%d %s)\n",
+                                           rc_6z493, en_6z493,
+                                           en_6z493 == EINPROGRESS ? "EINPROGRESS/normal" :
+                                           en_6z493 == ECONNREFUSED ? "ECONNREFUSED/backlog" :
+                                           en_6z493 == EACCES ? "EACCES" : "");
+                    if (n_6z493 > 0) write_str(2, z493_buf);
+                }
+            }
+            return rc_6z493;
         }
     }
 
@@ -6670,6 +6697,26 @@ int __system_property_set(const char *key, const char *value) {
         if (!real_fn) real_fn = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "__system_property_set");
         if (real_fn) {
             int rc_6z489b = real_fn(key, value);
+            // 6-Z493 (the rn469 decode): the boot-completed wire monitor.
+            // rn469 verdict: the boot stalled AFTER prepareAppData (227 s!
+            // — the daemon-wall desync class) and never reached
+            // finishBooting, so the sys.boot_completed set never happens
+            // (the rung-9 gate stays honestly silent). This DIAG keeps
+            // watch on the wire for the era when the boot DOES get there:
+            // the hook call + the real set's rc (budget 8). If the line
+            // prints with rc=0 but the bridge still never arms, the
+            // failure is post-ack; rc!=0 names the socket-layer failure.
+            if (key && strcmp(key, "sys.boot_completed") == 0) {
+                static int z493_set_diag = 8;
+                if (z493_set_diag > 0) {
+                    z493_set_diag--;
+                    char z493_buf[128];
+                    int n_6z493 = snprintf(z493_buf, sizeof(z493_buf),
+                                           "[twoyi_loader] 6-Z493: __system_property_set(sys.boot_completed, %s) -> real_fn rc=%d\n",
+                                           value ? value : "(null)", rc_6z489b);
+                    if (n_6z493 > 0) write_str(2, z493_buf);
+                }
+            }
             // 6-Z489b: the honest bridge — fire ONLY after the real
             // delegated set returned success (the ack arrived from the
             // guest's init: the property is in the guest's area).
@@ -6702,7 +6749,19 @@ int __system_property_update(prop_info *pi, const char *value, unsigned int len)
     if (no_props()) {
         static int (*real_fn)(prop_info *, const char *, unsigned int);
         if (!real_fn) real_fn = (int (*)(prop_info *, const char *, unsigned int))dlsym(RTLD_NEXT, "__system_property_update");
-        if (real_fn) return real_fn(pi, value, len);
+        if (real_fn) {
+            // 6-Z493 (the rn469 decode): the update leg — a raw-area
+            // update by a non-init process would BYPASS the property
+            // service entirely (no socket, no trigger, no bridge) while
+            // failing silently on the read-only client mapping. Budget
+            // 8, name-only (the prop_info does not carry the name).
+            static int z493_upd_diag = 8;
+            if (z493_upd_diag > 0) {
+                z493_upd_diag--;
+                write_str(2, "[twoyi_loader] 6-Z493: __system_property_update called (delegated, name unknown)\n");
+            }
+            return real_fn(pi, value, len);
+        }
     }
     (void)len;
     if (!pi) return -1;

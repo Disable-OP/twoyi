@@ -416,8 +416,12 @@ jobs:
                   # systemui), and head -12 truncated deep guest subtrees once the
                   # host's own 7 rows were counted first (rn328 samples sat at
                   # exactly 12 rows).
+                  # 6-Z494 (rn469 decode): the guest's app processes surface as
+                  # their 15-char TRUNCATED comm ("com.android.sys" for
+                  # com.android.systemui, "com.android.lau" for launcher3) —
+                  # 'systemui|launcher' never matched them; 'com.android' does.
                   sudo docker exec redroid sh -c \
-                    "ps -A -o PID,PPID,NAME 2>/dev/null | grep -E 'twoyi|kr64|init|zygote|system_server|surfaceflinger|systemui|launcher'" 2>&1 | head -48
+                    "ps -A -o PID,PPID,NAME 2>/dev/null | grep -E 'twoyi|kr64|init|zygote|system_server|surfaceflinger|systemui|launcher|com.android'" 2>&1 | head -48
                 else
                   echo "-- container: NOT RUNNING"
                   sudo docker logs redroid 2>&1 | tail -n 30
