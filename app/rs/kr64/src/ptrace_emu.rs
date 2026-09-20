@@ -3503,6 +3503,38 @@ static Z483_RARE: std::sync::LazyLock<
 static Z483_RET_PENDING: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<libc::pid_t, (u64, &'static str)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+// 6-Z504: the one-in-flight (pid → class) stash for the INIT-SOCKCREATE
+// census — the ENTRY half (init's socket()/bind()) inserts; the EXIT
+// half resolves the real return into the drop-proof 6-Z504 line. The
+// rn477/478 re-audit: 24 "Could not create socket" failures with ZERO
+// z391 EXIT-CATCH lines — the catch lives inside the fchmodat arm and
+// is structurally blind to a creation failing at socket()/bind(); the
+// census answers arrival-vs-bypass and names the failing call + errno
+// in one run.
+static Z504_RET_PENDING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<libc::pid_t, &'static str>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 6-Z504: the pure sockaddr descriptor for the census lines — the
+/// FS-spelled AF_UNIX path, the abstract spelling, a short blob, or a
+/// non-UNIX family (deduplicated from the z487 connect peek so the
+/// census shapes are unit-testable).
+fn z504_sockaddr_desc(blob: &[u8]) -> String {
+    if blob.len() < 3 {
+        return "<short>".to_string();
+    }
+    let family = u16::from_ne_bytes([blob[0], blob[1]]);
+    if family != 1 {
+        return format!("<family={}>", family);
+    }
+    if blob[2] == 0 {
+        return "<abstract>".to_string();
+    }
+    match unix_fs_sun_path(blob) {
+        Some(p) => p.to_string(),
+        None => "<unreadable-sun_path>".to_string(),
+    }
+}
 // close_range is nr 436 on aarch64 AND x86_64 (asm-generic + x86_64
 // unified) — not in ChildAbi; a raw match is exact.
 const Z483_CLOSE_RANGE: i64 = 436;
@@ -29050,6 +29082,36 @@ pub fn run_ptrace_loop(
                                 }
                             }
                             if let Some(blob) = blob {
+                                // 6-Z504: the INIT bind census (the ENTRY
+                                // half) — the rn477/478 "Could not create
+                                // socket" ×24 came with ZERO z391
+                                // EXIT-CATCH lines; the catch is blind to
+                                // a bind failing before fchmodat. Log
+                                // init's bind ENTRY (the descriptor) and
+                                // resolve the ret at the EXIT half.
+                                if pid == init_pid {
+                                    static Z504_BIND_BUDGET: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    if Z504_BIND_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+                                        < 24
+                                    {
+                                        Z504_BIND_BUDGET
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        let z504_fd = get_syscall_arg(&regs, abi.reg_arg1);
+                                        crate::z504_klog(
+                                            rootfs,
+                                            &format!(
+                                                "INIT-BIND pid={} fd={} {}",
+                                                pid,
+                                                z504_fd,
+                                                z504_sockaddr_desc(&blob)
+                                            ),
+                                        );
+                                        if let Ok(mut p) = Z504_RET_PENDING.lock() {
+                                            p.insert(pid, "BIND");
+                                        }
+                                    }
+                                }
                                 {
                                     // 6-Z163b: determine the rewrite target.
                                     // FS spelling ("/dev/socket/...") → the
@@ -36534,6 +36596,29 @@ pub fn run_ptrace_loop(
                             // Not an intercepted syscall — let it through.
                         }
                     }
+                    // ── 6-Z504: the INIT socket-create census (the ENTRY
+                    // half) — placed BEFORE the 6-Z202 netlink rewrite so
+                    // the census names the ORIGINAL domain/type; the ret
+                    // resolves at the EXIT half via Z504_RET_PENDING.
+                    if abi.socket_nr != -1 && syscall_num == abi.socket_nr && pid == init_pid {
+                        static Z504_SOCKET_BUDGET: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if Z504_SOCKET_BUDGET.load(std::sync::atomic::Ordering::Relaxed) < 16 {
+                            Z504_SOCKET_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let z504_domain = get_syscall_arg(&regs, abi.reg_arg1);
+                            let z504_type = get_syscall_arg(&regs, abi.reg_arg2);
+                            crate::z504_klog(
+                                rootfs,
+                                &format!(
+                                    "INIT-SOCKET pid={} domain={:#x} type={:#x}",
+                                    pid, z504_domain, z504_type
+                                ),
+                            );
+                            if let Ok(mut p) = Z504_RET_PENDING.lock() {
+                                p.insert(pid, "SOCKET");
+                            }
+                        }
+                    }
                     // ── 6-Z202: uevent netlink socket → REAL AF_UNIX
                     // DGRAM socket (ENTRY-side arg rewrite) ──
                     //
@@ -40223,6 +40308,22 @@ pub fn run_ptrace_loop(
                                 }
                                 let _ = z487_op;
                             }
+                        }
+                    }
+                    // 6-Z504: the INIT-SOCKCREATE census ret resolver —
+                    // the ENTRY half (init's socket()/bind()) stashed the
+                    // class; here the real return is known: WHICH call
+                    // fails and WHICH errno (the rn477/478 zero-fire
+                    // re-audit's decisive data — a bind ret=-2 ENOENT vs
+                    // a fchmodat that never comes names the failing link
+                    // without any guesswork).
+                    if let Ok(mut p) = Z504_RET_PENDING.lock() {
+                        if let Some(z504_class) = p.remove(&pid) {
+                            let z504_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            crate::z504_klog(
+                                rootfs,
+                                &format!("INIT-{}-RET pid={} ret={}", z504_class, pid, z504_ret),
+                            );
                         }
                     }
                     // 6-Z481: the REAL-wire BOOT_COMPLETED bridge — the
@@ -59401,6 +59502,64 @@ mod z497_reattach_tests {
         // own errno path then reports honestly).
         assert_eq!(z497_tracer_pid("TracerPid:\t-5\n"), -5);
         assert_eq!(z497_tracer_pid("TracerPid:\t99999999999999999999\n"), 0);
+    }
+}
+
+/// 6-Z504 pure cores (the INIT-SOCKCREATE census descriptor — the
+/// rn477/478 EXIT-CATCH zero-fire re-audit's shapes).
+#[cfg(test)]
+mod z504_census_tests {
+    use super::z504_sockaddr_desc;
+
+    fn unix_blob(path: &[u8]) -> Vec<u8> {
+        let mut blob = 1u16.to_ne_bytes().to_vec(); // AF_UNIX
+        blob.extend_from_slice(path);
+        blob
+    }
+
+    /// The FS-spelled statsdw bind names the path verbatim (the census
+    /// line the decode greps).
+    #[test]
+    fn z504_fs_spelled_af_unix_names_the_path() {
+        let mut blob = unix_blob(b"/dev/socket/statsdw");
+        blob.push(0);
+        assert_eq!(z504_sockaddr_desc(&blob), "/dev/socket/statsdw");
+    }
+
+    /// The abstract spelling (the property_service shape) is named
+    /// honestly, never translated.
+    #[test]
+    fn z504_abstract_spelling_is_named_not_translated() {
+        let mut blob = unix_blob(b"\0property_service");
+        blob.push(0);
+        assert_eq!(z504_sockaddr_desc(&blob), "<abstract>");
+    }
+
+    /// A non-UNIX family is named with its number.
+    #[test]
+    fn z504_non_unix_family_is_named() {
+        let mut blob = 2u16.to_ne_bytes().to_vec(); // AF_INET
+        blob.extend_from_slice(&[10, 0, 0, 1, 0, 0]);
+        assert_eq!(z504_sockaddr_desc(&blob), "<family=2>");
+        let mut nl = 16u16.to_ne_bytes().to_vec(); // AF_NETLINK
+        nl.extend_from_slice(&[15, 0, 0, 0]);
+        assert_eq!(z504_sockaddr_desc(&nl), "<family=16>");
+    }
+
+    /// Short blobs are honest — no fabricated shapes.
+    #[test]
+    fn z504_short_blob_is_honest() {
+        assert_eq!(z504_sockaddr_desc(&[]), "<short>");
+        assert_eq!(z504_sockaddr_desc(&[1]), "<short>");
+        assert_eq!(z504_sockaddr_desc(&[1, 0]), "<short>");
+    }
+
+    /// A relative sun_path is not an FS path — the honest fallback.
+    #[test]
+    fn z504_relative_sun_path_is_not_fs() {
+        let mut blob = unix_blob(b"relative");
+        blob.push(0);
+        assert_eq!(z504_sockaddr_desc(&blob), "<unreadable-sun_path>");
     }
 }
 

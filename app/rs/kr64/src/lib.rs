@@ -356,6 +356,38 @@ pub(crate) fn z391_klog(rootfs: &str, msg: &str) {
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
+// ── 6-Z504: the INIT socket-CREATE census (the EXIT-CATCH zero-fire
+// re-audit) ─────────────────────────────────────────────────────────
+//
+// The rn477/478 evidence: 24 "Could not create socket" failures in the
+// guest with ZERO 6-Z391 EXIT-CATCH trace lines (and no z408b backstop
+// fire). The z391 ENTRY/DECISION gates live INSIDE the fchmodat arm —
+// a socket creation that fails EARLIER (at socket() or bind()) is
+// structurally invisible to them. The census answers arrival-vs-bypass
+// for init's socket-create path in one run:
+//   - INIT-SOCKET   : init's socket() ENTRY (the ORIGINAL domain/type,
+//                     read BEFORE the 6-Z202 netlink rewrite)
+//   - INIT-BIND     : init's bind() ENTRY (fd + the sockaddr descriptor)
+//   - INIT-*-RET    : the real return at the EXIT half (WHICH call
+//                     fails, WHICH errno — or the proof that socket/
+//                     bind succeed and the failure lives past them)
+// Own 64-line budget (the rn350 self-bury discipline): the shared z391
+// budget must neither bury the census nor be buried by it.
+pub(crate) fn z504_klog(rootfs: &str, msg: &str) {
+    static Z504_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = Z504_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 64 {
+        return;
+    }
+    let path = format!("{}/dev/__kmsg__", rootfs);
+    let line = format!("<6>[kr64] 6-Z504 +{}ms {}\n", boot_elapsed_ms(), msg);
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
 /// 6-Z392's own budget (rn350 decode: the shared 96-line z391 budget was
 /// exhausted at +1.46s by init's early chmod/fchownat storms — the
 /// +30s watchdog lines silently hit the cap and never reached the
