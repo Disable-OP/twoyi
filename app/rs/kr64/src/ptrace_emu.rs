@@ -29174,10 +29174,21 @@ pub fn run_ptrace_loop(
                         // The rewrite is PATH-driven (absolute FS sun_path,
                         // or the abstract property-service spelling) — the
                         // sandbox boundary, not a recovery special-case.
+                        // 6-Z509: the gate no longer requires a scratch
+                        // window — the DEFAULT path rewrites the sockaddr
+                        // IN PLACE in the child's own buffer (the 110-byte
+                        // sockaddr_un holds the translated path; the child
+                        // never re-reads it after bind). The scratch path
+                        // remains only as the oversized-blob fallback. The
+                        // rn490 decode: three +6.3s binds ran RAW (no
+                        // scratch → the z431 sp-window guard disabled the
+                        // area) and EADDRINUSEd against the HOST's own
+                        // /dev/socket/<name> (redroid's Android owns the
+                        // same service names) — the host-collision class
+                        // this gate widening closes.
                         let z305d_bind_gate = abi.bind_nr != -1
                             && syscall_num == abi.bind_nr
-                            && abi.socketcall_nr == -1
-                            && scratch_addr != 0;
+                            && abi.socketcall_nr == -1;
                         if abi.bind_nr != -1 && syscall_num == abi.bind_nr && !z305d_bind_gate {
                             spin_diag_bind_skip_count = spin_diag_bind_skip_count.saturating_add(1);
                             if spin_diag_bind_skip_count <= 12 {
@@ -29412,43 +29423,40 @@ pub fn run_ptrace_loop(
                                             // EADDRINUSEs on it (existence check
                                             // before permission check).
                                             let rm_res = std::fs::remove_file(&host_path);
-                                            // Scratch write (the area was
-                                            // re-reserved at THIS ENTRY stop
-                                            // — see the reservation block —
-                                            // so a LOCAL cursor is enough;
-                                            // mutating scratch_offset here
-                                            // would be dead: the next ENTRY
-                                            // resets it).
-                                            let aligned = (new_sa.len() + 7) & !7;
-                                            let cursor = if scratch_offset + aligned > 4096 {
-                                                0
-                                            } else {
-                                                scratch_offset
-                                            };
-                                            let sa_scratch = scratch_addr + cursor as u64;
-                                            if write_child_blob(pid, sa_scratch, &new_sa) {
+                                            // ── 6-Z509: the IN-PLACE sockaddr rewrite
+                                            // (the DEFAULT) — the child's own
+                                            // sockaddr_un buffer (110 bytes for a
+                                            // full sun_path) holds family + the
+                                            // translated host path whenever it fits;
+                                            // the child never re-reads the buffer
+                                            // after bind (init's CreateSocket uses
+                                            // the address once). This needs NO
+                                            // scratch window (the rn490 +6.3s RAW
+                                            // binds: the z431 sp-window guard had
+                                            // disabled the area → the raw bind
+                                            // collided with the HOST's /dev/socket)
+                                            // and kills the scratch-clobber class
+                                            // (the rn488/rn490 forensics blobs
+                                            // overwritten by path text before EXIT).
+                                            // The scratch flow stays as the fallback
+                                            // for oversized paths only.
+                                            let use_in_place = new_sa.len() <= sa_len as usize;
+                                            if use_in_place
+                                                && write_child_blob(pid, sa_ptr, &new_sa)
+                                            {
                                                 let new_len = new_sa.len() as i64;
                                                 let mut fresh: Regs = unsafe { std::mem::zeroed() };
                                                 let mut rewrite_ok = false;
                                                 if let Err(e) = ptrace_getregs_wide(pid, &mut fresh)
                                                 {
-                                                    // 6-Z268: NO silent branch left —
-                                                    // run 33387194667 hit an
-                                                    // invisible failure here (blob
-                                                    // written, no 6-Z163 line, raw
-                                                    // bind → host EADDRINUSE → 6-Z101
-                                                    // fake → canonical fchmodat/fchownat
-                                                    // ENOENT → init FATAL exit(6)).
                                                     log(&format!(
-                                                        "6-Z163 FAILED: ptrace_getregs_wide after sockaddr blob write: {} — bind will run on the RAW path",
+                                                        "6-Z163 FAILED (in-place): ptrace_getregs_wide after sockaddr write: {} — bind will run on the RAW path",
                                                         e
                                                     ));
                                                 } else {
-                                                    set_syscall_arg(
-                                                        &mut fresh,
-                                                        abi.reg_arg2,
-                                                        sa_scratch,
-                                                    );
+                                                    // arg2 (sa_ptr) UNCHANGED — the
+                                                    // blob was rewritten in place;
+                                                    // only the length moves.
                                                     set_syscall_arg(
                                                         &mut fresh,
                                                         abi.reg_arg3,
@@ -29457,12 +29465,110 @@ pub fn run_ptrace_loop(
                                                     match ptrace_setregs(pid, &fresh, iov_len) {
                                                         Ok(()) => rewrite_ok = true,
                                                         Err(e) => {
-                                                            // 6-Z268: one retry — a
-                                                            // transient GETREGSET/SETREGSET
-                                                            // failure here silently
-                                                            // downgraded the whole
-                                                            // property-service bootstrap.
+                                                            // 6-Z268: one retry — the
+                                                            // established pattern.
                                                             match ptrace_setregs(
+                                                                pid, &fresh, iov_len,
+                                                            ) {
+                                                                Ok(()) => {
+                                                                    rewrite_ok = true;
+                                                                    log(&format!(
+                                                                        "6-Z163 (in-place): setregs retried OK after {}",
+                                                                        e
+                                                                    ));
+                                                                }
+                                                                Err(e2) => {
+                                                                    log(&format!(
+                                                                        "6-Z163 FAILED (in-place): setregs after retry: {} — bind will run on the RAW path",
+                                                                        e2
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                if rewrite_ok {
+                                                    // 6-Z305t-60: stash for the bind-EXIT
+                                                    // forensics (the blob address = the
+                                                    // child's own sockaddr buffer).
+                                                    let mut expect = [0u8; 16];
+                                                    for (i, b) in new_sa.iter().take(16).enumerate()
+                                                    {
+                                                        expect[i] = *b;
+                                                    }
+                                                    pending_bind_path.insert(
+                                                        pid,
+                                                        (
+                                                            guest_path.clone(),
+                                                            rm_res,
+                                                            sa_ptr,
+                                                            expect,
+                                                        ),
+                                                    );
+                                                    log(&format!(
+                                                        "6-Z163: bind(fd={}, {}) sockaddr REWRITTEN IN PLACE at {:#x} to {} (len {} -> {}) — kernel will bind FOR REAL",
+                                                        get_syscall_arg(&regs, abi.reg_arg1),
+                                                        guest_path,
+                                                        sa_ptr,
+                                                        host_path,
+                                                        sa_len,
+                                                        new_len
+                                                    ));
+                                                }
+                                            } else if scratch_addr != 0 {
+                                                // Scratch write (the area was
+                                                // re-reserved at THIS ENTRY stop
+                                                // — see the reservation block —
+                                                // so a LOCAL cursor is enough;
+                                                // mutating scratch_offset here
+                                                // would be dead: the next ENTRY
+                                                // resets it).
+                                                let aligned = (new_sa.len() + 7) & !7;
+                                                let cursor = if scratch_offset + aligned > 4096 {
+                                                    0
+                                                } else {
+                                                    scratch_offset
+                                                };
+                                                let sa_scratch = scratch_addr + cursor as u64;
+                                                if write_child_blob(pid, sa_scratch, &new_sa) {
+                                                    let new_len = new_sa.len() as i64;
+                                                    let mut fresh: Regs =
+                                                        unsafe { std::mem::zeroed() };
+                                                    let mut rewrite_ok = false;
+                                                    if let Err(e) =
+                                                        ptrace_getregs_wide(pid, &mut fresh)
+                                                    {
+                                                        // 6-Z268: NO silent branch left —
+                                                        // run 33387194667 hit an
+                                                        // invisible failure here (blob
+                                                        // written, no 6-Z163 line, raw
+                                                        // bind → host EADDRINUSE → 6-Z101
+                                                        // fake → canonical fchmodat/fchownat
+                                                        // ENOENT → init FATAL exit(6)).
+                                                        log(&format!(
+                                                        "6-Z163 FAILED: ptrace_getregs_wide after sockaddr blob write: {} — bind will run on the RAW path",
+                                                        e
+                                                    ));
+                                                    } else {
+                                                        set_syscall_arg(
+                                                            &mut fresh,
+                                                            abi.reg_arg2,
+                                                            sa_scratch,
+                                                        );
+                                                        set_syscall_arg(
+                                                            &mut fresh,
+                                                            abi.reg_arg3,
+                                                            new_len as u64,
+                                                        );
+                                                        match ptrace_setregs(pid, &fresh, iov_len) {
+                                                            Ok(()) => rewrite_ok = true,
+                                                            Err(e) => {
+                                                                // 6-Z268: one retry — a
+                                                                // transient GETREGSET/SETREGSET
+                                                                // failure here silently
+                                                                // downgraded the whole
+                                                                // property-service bootstrap.
+                                                                match ptrace_setregs(
                                                                 pid, &fresh, iov_len,
                                                             ) {
                                                                 Ok(()) => {
@@ -29476,88 +29582,96 @@ pub fn run_ptrace_loop(
                                                                     e, e2
                                                                 )),
                                                             }
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                if rewrite_ok {
-                                                    set_syscall_arg(
-                                                        &mut regs,
-                                                        abi.reg_arg2,
-                                                        sa_scratch,
-                                                    );
-                                                    set_syscall_arg(
-                                                        &mut regs,
-                                                        abi.reg_arg3,
-                                                        new_len as u64,
-                                                    );
-                                                    // 6-Z305t-58: READBACK — re-read the
-                                                    // child's registers to confirm the
-                                                    // sockaddr rewrite STUCK (a later
-                                                    // stale-regs writer within the same
-                                                    // stop would silently revert it; the
-                                                    // ladders #113-#115 EADDRINUSE chain
-                                                    // suggests exactly that class).
-                                                    let mut rb: Regs =
-                                                        unsafe { std::mem::zeroed() };
-                                                    let rb_ok = ptrace_getregs_wide(pid, &mut rb)
-                                                        .map(|_| {
-                                                            (
-                                                                get_syscall_arg(&rb, abi.reg_arg2),
-                                                                get_syscall_arg(&rb, abi.reg_arg3),
-                                                            )
-                                                        })
-                                                        .ok();
-                                                    match rb_ok {
-                                                        Some((a2, a3))
-                                                            if a2 == sa_scratch as u64
-                                                                && a3 == new_len as u64 =>
-                                                        {
-                                                            static BIND_RB_OK:
+                                                    if rewrite_ok {
+                                                        set_syscall_arg(
+                                                            &mut regs,
+                                                            abi.reg_arg2,
+                                                            sa_scratch,
+                                                        );
+                                                        set_syscall_arg(
+                                                            &mut regs,
+                                                            abi.reg_arg3,
+                                                            new_len as u64,
+                                                        );
+                                                        // 6-Z305t-58: READBACK — re-read the
+                                                        // child's registers to confirm the
+                                                        // sockaddr rewrite STUCK (a later
+                                                        // stale-regs writer within the same
+                                                        // stop would silently revert it; the
+                                                        // ladders #113-#115 EADDRINUSE chain
+                                                        // suggests exactly that class).
+                                                        let mut rb: Regs =
+                                                            unsafe { std::mem::zeroed() };
+                                                        let rb_ok =
+                                                            ptrace_getregs_wide(pid, &mut rb)
+                                                                .map(|_| {
+                                                                    (
+                                                                        get_syscall_arg(
+                                                                            &rb,
+                                                                            abi.reg_arg2,
+                                                                        ),
+                                                                        get_syscall_arg(
+                                                                            &rb,
+                                                                            abi.reg_arg3,
+                                                                        ),
+                                                                    )
+                                                                })
+                                                                .ok();
+                                                        match rb_ok {
+                                                            Some((a2, a3))
+                                                                if a2 == sa_scratch as u64
+                                                                    && a3 == new_len as u64 =>
+                                                            {
+                                                                static BIND_RB_OK:
                                                                 std::sync::atomic::AtomicU64 =
                                                                 std::sync::atomic::AtomicU64::new(
                                                                     0,
                                                                 );
-                                                            let n = BIND_RB_OK.fetch_add(
+                                                                let n = BIND_RB_OK.fetch_add(
                                                                 1,
                                                                 std::sync::atomic::Ordering::Relaxed,
                                                             );
-                                                            if n < 12 {
-                                                                log(&format!(
+                                                                if n < 12 {
+                                                                    log(&format!(
                                                                     "6-Z305t-58: bind rewrite READBACK OK (scratch={:#x} len={}) for {}",
                                                                     sa_scratch, new_len, host_path
                                                                 ));
+                                                                }
                                                             }
-                                                        }
-                                                        Some((a2, a3)) => {
-                                                            log(&format!(
+                                                            Some((a2, a3)) => {
+                                                                log(&format!(
                                                                 "6-Z305t-58: bind rewrite READBACK MISMATCH — child arg2={:#x} arg3={} want scratch={:#x} len={}: a LATER ENTRY arm clobbered the rewrite",
                                                                 a2, a3, sa_scratch, new_len
                                                             ));
-                                                        }
-                                                        None => {
-                                                            log(
+                                                            }
+                                                            None => {
+                                                                log(
                                                                 "6-Z305t-58: bind rewrite READBACK FAILED (getregs) — cannot verify",
                                                             );
+                                                            }
                                                         }
-                                                    }
-                                                    // 6-Z305t-60: stash for the bind-EXIT
-                                                    // forensics (scratch address + the
-                                                    // expected blob prefix).
-                                                    let mut expect = [0u8; 16];
-                                                    for (i, b) in new_sa.iter().take(16).enumerate()
-                                                    {
-                                                        expect[i] = *b;
-                                                    }
-                                                    pending_bind_path.insert(
-                                                        pid,
-                                                        (
-                                                            guest_path.clone(),
-                                                            rm_res,
-                                                            sa_scratch,
-                                                            expect,
-                                                        ),
-                                                    );
-                                                    log(&format!(
+                                                        // 6-Z305t-60: stash for the bind-EXIT
+                                                        // forensics (scratch address + the
+                                                        // expected blob prefix).
+                                                        let mut expect = [0u8; 16];
+                                                        for (i, b) in
+                                                            new_sa.iter().take(16).enumerate()
+                                                        {
+                                                            expect[i] = *b;
+                                                        }
+                                                        pending_bind_path.insert(
+                                                            pid,
+                                                            (
+                                                                guest_path.clone(),
+                                                                rm_res,
+                                                                sa_scratch,
+                                                                expect,
+                                                            ),
+                                                        );
+                                                        log(&format!(
                                                         "6-Z163: bind(fd={}, {}) sockaddr REWRITTEN to {} (len {} -> {}) — kernel will bind FOR REAL",
                                                         get_syscall_arg(&regs, abi.reg_arg1),
                                                         guest_path,
@@ -29565,22 +29679,22 @@ pub fn run_ptrace_loop(
                                                         sa_len,
                                                         new_len
                                                     ));
-                                                } else {
-                                                    // 6-Z268: the register rewrite
-                                                    // failed — the real bind will run
-                                                    // against the RAW guest path (host
-                                                    // /dev/socket/...) and fail with
-                                                    // EACCES/EADDRINUSE, and init's
-                                                    // follow-up fchmodat/fchownat on the
-                                                    // CANONICAL translated name would
-                                                    // ENOENT → LOG(FATAL) exit (the
-                                                    // 6-Z229-documented starlte class).
-                                                    // Create a placeholder node at the
-                                                    // translated path so the follow-up
-                                                    // chmod/chown see a real entry (the
-                                                    // 6-Z257 family fake covers the
-                                                    // EPERM case; ENOENT was fatal).
-                                                    match std::fs::OpenOptions::new()
+                                                    } else {
+                                                        // 6-Z268: the register rewrite
+                                                        // failed — the real bind will run
+                                                        // against the RAW guest path (host
+                                                        // /dev/socket/...) and fail with
+                                                        // EACCES/EADDRINUSE, and init's
+                                                        // follow-up fchmodat/fchownat on the
+                                                        // CANONICAL translated name would
+                                                        // ENOENT → LOG(FATAL) exit (the
+                                                        // 6-Z229-documented starlte class).
+                                                        // Create a placeholder node at the
+                                                        // translated path so the follow-up
+                                                        // chmod/chown see a real entry (the
+                                                        // 6-Z257 family fake covers the
+                                                        // EPERM case; ENOENT was fatal).
+                                                        match std::fs::OpenOptions::new()
                                                         .create(true)
                                                         .append(true)
                                                         .open(&host_path)
@@ -29594,8 +29708,9 @@ pub fn run_ptrace_loop(
                                                             host_path, e
                                                         )),
                                                     }
+                                                    }
                                                 }
-                                            }
+                                            } // 6-Z509: closes the scratch-fallback arm
                                         }
                                     }
                                 }
