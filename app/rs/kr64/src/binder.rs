@@ -4535,47 +4535,64 @@ impl BinderProxy {
                                 break;
                             }
                             tick += 1;
-                            let Ok(b) = bus_hb.lock() else {
-                                continue;
-                            };
-                            let now = std::time::Instant::now();
-                            let mut lines: Vec<String> = Vec::new();
-                            for (cid, bx) in b.conns.iter() {
-                                let mut parts: Vec<String> = Vec::new();
-                                for (t, _o, at) in bx.out_sync.iter() {
-                                    parts.push(format!(
-                                        "sync#{} age={}s",
-                                        t,
-                                        now.duration_since(*at).as_secs()
-                                    ));
+                            // 6-Z500: the tick's MutexGuard is an OWNED
+                            // value — it lives to the END of the loop
+                            // iteration, NOT to its last use (NLL bounds
+                            // borrows, not drops). With the guard held to
+                            // the bottom of the iteration, the in-scope
+                            // z495/z498 sweep calls re-locked the SAME
+                            // non-reentrant mutex ON THIS THREAD and the
+                            // heartbeat froze holding the bus forever
+                            // (the ladder-#473-era CI hang:
+                            // z271i_reply_timeout — the ONLY test that
+                            // spans a full 30 s heartbeat tick — hung
+                            // from 98bc2048 on; #2113/#2115/#2116 all
+                            // died to it under the job timeout). The
+                            // explicit inner scope drops the guard BEFORE
+                            // the sweeps run.
+                            {
+                                let Ok(b) = bus_hb.lock() else {
+                                    continue;
+                                };
+                                let now = std::time::Instant::now();
+                                let mut lines: Vec<String> = Vec::new();
+                                for (cid, bx) in b.conns.iter() {
+                                    let mut parts: Vec<String> = Vec::new();
+                                    for (t, _o, at) in bx.out_sync.iter() {
+                                        parts.push(format!(
+                                            "sync#{} age={}s",
+                                            t,
+                                            now.duration_since(*at).as_secs()
+                                        ));
+                                    }
+                                    if !bx.reply_queue.is_empty() {
+                                        parts.push(format!("replies={}", bx.reply_queue.len()));
+                                    }
+                                    if !bx.inbox.is_empty() {
+                                        parts.push(format!("inbox={}", bx.inbox.len()));
+                                    }
+                                    if !bx.txn_stack.is_empty() {
+                                        parts.push(format!("stack={:?}", bx.txn_stack));
+                                    }
+                                    if !parts.is_empty() {
+                                        lines.push(format!(
+                                            "conn={} pid={} dev={} {}",
+                                            cid,
+                                            bx.sender_pid,
+                                            bx.dev_code,
+                                            parts.join(" ")
+                                        ));
+                                    }
                                 }
-                                if !bx.reply_queue.is_empty() {
-                                    parts.push(format!("replies={}", bx.reply_queue.len()));
+                                if !lines.is_empty() {
+                                    info!(
+                                        "[KR64][binder][vm{}] 6-Z402 bus-state tick #{}: {} conn(s) pending | {}",
+                                        vm_id_hb,
+                                        tick,
+                                        lines.len(),
+                                        lines.join(" || ")
+                                    );
                                 }
-                                if !bx.inbox.is_empty() {
-                                    parts.push(format!("inbox={}", bx.inbox.len()));
-                                }
-                                if !bx.txn_stack.is_empty() {
-                                    parts.push(format!("stack={:?}", bx.txn_stack));
-                                }
-                                if !parts.is_empty() {
-                                    lines.push(format!(
-                                        "conn={} pid={} dev={} {}",
-                                        cid,
-                                        bx.sender_pid,
-                                        bx.dev_code,
-                                        parts.join(" ")
-                                    ));
-                                }
-                            }
-                            if !lines.is_empty() {
-                                info!(
-                                    "[KR64][binder][vm{}] 6-Z402 bus-state tick #{}: {} conn(s) pending | {}",
-                                    vm_id_hb,
-                                    tick,
-                                    lines.len(),
-                                    lines.join(" || ")
-                                );
                             }
                             // 6-Z495: the EXCHANGE-STUCK sweep — the same
                             // 30 s heartbeat names any conn whose
