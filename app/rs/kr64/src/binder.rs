@@ -2238,6 +2238,66 @@ struct IncomingTx {
     cookie: u64,
 }
 
+/// 6-Z491: per-connection delivery-vs-consumed accounting — the
+/// daemon-wall instrument (the rn464/rn466/rn468 decode).
+///
+/// The wall class: a guest daemon (idmap2d's createIdmap, installd's
+/// createAppData) RECEIVES transactions (the bus's "delivered
+/// transaction" lines), serves the first few, then STOPS REPLYING
+/// mid-loop while its binder threads park in the normal idle state —
+/// the delivered-but-unprocessed tail is the reader-wakeup /
+/// read-buffer accounting desync hypothesis. The real kernel counts
+/// this exact shape per-proc/per-thread (todo lists, transaction
+/// stacks, async space); the bus so far had NO per-conn counters, so
+/// a decode could not decide WHERE the chain broke:
+/// `queued → delivered → (BC_REPLY | BC_FREE_BUFFER) acked`.
+///
+/// Every counter moves ONLY on the already-audited delivery paths
+/// (queue_transaction, the mailbox drains, the BC_REPLY /
+/// BC_FREE_BUFFER arms); the tail-of-ioctl wedge scan
+/// ([`z491_ioctl_tick`]) turns a ≥5 s divergence into a budgeted
+/// one-line verdict that packs the FULL counter set — the decode joins
+/// it against the guest's SM-REPLY svclog era and the 6-Z407 reply
+/// trace to name the break.
+#[derive(Default)]
+struct Z491Acct {
+    /// `InboxItem::Tx` queued for this conn ([`BusState::queue_transaction`]).
+    tx_enq: u64,
+    /// `InboxItem::Tx` popped for delivery (main drain / 6-Z271g steal /
+    /// 6-Z469 take / 6-Z383 recheck) — the "delivered transaction" lines.
+    tx_del: u64,
+    /// `DeferredReply` queued for this conn (all eight push sites).
+    reply_enq: u64,
+    /// `DeferredReply` popped into a read response (the BR_REPLY side).
+    reply_del: u64,
+    /// BC_REPLY / BC_REPLY_SG received FROM this conn.
+    bc_reply_rx: u64,
+    /// BC_FREE_BUFFER received FROM this conn (the consumed ack — the
+    /// guest's executeCommand ran the delivered transaction to its
+    /// Parcel-teardown end).
+    bc_free_rx: u64,
+    /// Completed BINDER_WRITE_READ ioctls on this conn.
+    wr_calls: u64,
+    /// Ioctls that returned an EMPTY read stream (the BR_NOOP idle
+    /// ticks — the kernel's `wait_for_proc_work` analog).
+    noop_polls: u64,
+    /// High-water inbox depth (a MAX_QUEUED_ITEMS reject names itself).
+    max_inbox: u32,
+    /// Last delivery to this conn (tx or reply); None = never.
+    last_del: Option<std::time::Instant>,
+    /// Last write-side activity (BC_TRANSACTION/BC_REPLY/BC_FREE_BUFFER
+    /// from this conn); None = never. The wedge gate reads this.
+    last_rx: Option<std::time::Instant>,
+    /// Verdict throttle: the last wedge line emitted for this conn.
+    last_verdict: Option<std::time::Instant>,
+}
+
+impl Z491Acct {
+    fn note_rx(&mut self) {
+        self.last_rx = Some(std::time::Instant::now());
+    }
+}
+
 /// Per-connection mailbox state, held inside [`BusState`].
 #[derive(Default)]
 struct ConnBox {
@@ -2337,6 +2397,8 @@ struct ConnBox {
     sm_last_was_hit: bool,
     /// The previous SM GET on this connection: (service name, at).
     last_sm_get: Option<(String, std::time::Instant)>,
+    /// 6-Z491: the delivery-vs-consumed accounting (see [`Z491Acct`]).
+    z491: Z491Acct,
 }
 
 /// Shared per-VM bus state: the service registry with OWNER routing, the
@@ -2918,6 +2980,7 @@ impl BusState {
         for txn_id in dead_txns.drain(..) {
             if let Some(requester) = self.waiters.remove(&txn_id) {
                 if let Some(rb) = self.conns.get_mut(&requester) {
+                    rb.z491.reply_enq += 1;
                     rb.reply_queue.push_back(DeferredReply::Failed);
                 }
             }
@@ -3168,6 +3231,14 @@ impl BusState {
                     b.pending_in.push(tx.txn_id);
                 }
                 b.inbox.push_back(InboxItem::Tx(tx));
+                // 6-Z491: the enqueue leg of the delivery-vs-consumed
+                // accounting (the deliver leg lives at the four drain
+                // sites; the wedge scan reads the gap).
+                b.z491.tx_enq += 1;
+                let depth = b.inbox.len() as u32;
+                if depth > b.z491.max_inbox {
+                    b.z491.max_inbox = depth;
+                }
                 true
             }
             _ => false,
@@ -3703,6 +3774,7 @@ impl BusState {
         // Delivery-time process liveness is the owner /proc probe,
         // checked in the RefCmd359 arm.
         if let Some(box_) = self.conns.get_mut(&owner) {
+            box_.z491.reply_enq += 1;
             box_.reply_queue.push_back(DeferredReply::RefCmd359 {
                 br,
                 ptr,
@@ -4767,6 +4839,125 @@ fn handle_version(vm_id: u32) -> Resp {
 }
 
 // ============================================================================
+// 6-Z491: the delivery-vs-consumed wedge scan (the daemon-wall instrument).
+// ============================================================================
+
+/// 6-Z491: the wedge-verdict budget (lines/run). The self-bury rule
+/// (the rn350/rn362 lessons): a correlation instrument must outlive the
+/// boot's first minute — 64 verdicts at the 5 s per-conn throttle spans
+/// the full ladder window even with several wedged conns.
+static Z491_VERDICT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
+
+/// How long a conn must show NO write-side activity and NO deliveries
+/// before its stuck mailbox/stack may count as a wedge (not a transient:
+/// a sync round-trip is µs-ms; the 6-Z152 idle tick is 250 ms).
+const Z491_WEDGE_QUIESCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Per-conn verdict throttle.
+const Z491_VERDICT_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 6-Z491: the per-ioctl accounting tick + the budgeted wedge scan.
+/// Called at the tail of EVERY completed `BINDER_WRITE_READ` (before the
+/// response leaves for the guest); one lock acquisition.
+///
+/// Verdict shapes (the decode joins the line against the guest's
+/// SM-REPLY svclog era and the 6-Z407 reply trace):
+///
+/// * `WEDGE-A-QUEUED-NEVER-TAKEN` — inbox/pending_in stuck non-empty
+///   through the quiesce window while the conn shows no write-side
+///   activity: frames queued for this conn that NO reader consumed
+///   (the reader-wakeup desync shape). The 6-Z408 reentrancy hold is
+///   EXCLUDED (`out_sync` non-empty = the conn parked on its own nested
+///   call; `z408_note_hold` already names that shape and the
+///   REPLY_TIMEOUT guarantees the unwind).
+/// * `WEDGE-B-TAKEN-NEVER-ANSWERED` — `txn_stack` stuck non-empty with
+///   `out_sync` empty and no BC_REPLY inbound: the conn TOOK the
+///   transactions but never replies — the rn466/rn468 installd shape
+///   to the letter (BR-TX delivered ✓, the first few served, then NO
+///   reply while the binder threads idle).
+/// * `WEDGE-C-REPLY-NEVER-POLLED` — a resolved reply stuck on this
+///   conn's reply_queue: the client stopped reading between its calls
+///   (the client-side half of the rn464 createIdmap wall).
+///
+/// A fully-drained conn (every mailbox empty — the healthy idle looper)
+/// never verdicts, whatever its poll rate.
+fn z491_ioctl_tick(bus: &Arc<Mutex<BusState>>, vm_id: u32, conn_id: ConnId, read_buf_empty: bool) {
+    let mut b = bus.lock().expect("binder bus poisoned");
+    let Some(bx) = b.conns.get_mut(&conn_id) else {
+        return;
+    };
+    bx.z491.wr_calls += 1;
+    if read_buf_empty {
+        bx.z491.noop_polls += 1;
+    }
+    let now = std::time::Instant::now();
+    let rx_idle = bx
+        .z491
+        .last_rx
+        .map_or(true, |t| now.duration_since(t) >= Z491_WEDGE_QUIESCE);
+    let del_idle = bx
+        .z491
+        .last_del
+        .map_or(true, |t| now.duration_since(t) >= Z491_WEDGE_QUIESCE);
+    if !rx_idle || !del_idle {
+        // The conn consumed or acknowledged something inside the window —
+        // live; refresh nothing, verdict nothing.
+        return;
+    }
+    if bx
+        .z491
+        .last_verdict
+        .map_or(false, |t| now.duration_since(t) < Z491_VERDICT_GAP)
+    {
+        return;
+    }
+    let nested = !bx.out_sync.is_empty();
+    let kind = if !bx.inbox.is_empty() && !nested {
+        "A-QUEUED-NEVER-TAKEN"
+    } else if !bx.txn_stack.is_empty() && !nested {
+        "B-TAKEN-NEVER-ANSWERED"
+    } else if !bx.reply_queue.is_empty() {
+        "C-REPLY-NEVER-POLLED"
+    } else {
+        return;
+    };
+    if Z491_VERDICT_LOG.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    Z491_VERDICT_LOG.fetch_sub(1, Ordering::Relaxed);
+    bx.z491.last_verdict = Some(now);
+    let ms = |t: Option<std::time::Instant>| match t {
+        Some(t) => format!("{}ms", (now - t).as_millis()),
+        None => "never".to_string(),
+    };
+    info!(
+        "[KR64][binder][vm{}] 6-Z491 WEDGE-{} conn={} pid={} dev={} reader_waiting={} inbox={} pin={} stack={} out_sync={} replies={} wr={} noop={} tx_enq={} tx_del={} reply_enq={} reply_del={} bc_reply={} bc_free={} max_inbox={} last_del={} last_rx={}",
+        vm_id,
+        kind,
+        conn_id,
+        bx.sender_pid,
+        bx.dev_code,
+        bx.reader_waiting,
+        bx.inbox.len(),
+        bx.pending_in.len(),
+        bx.txn_stack.len(),
+        bx.out_sync.len(),
+        bx.reply_queue.len(),
+        bx.z491.wr_calls,
+        bx.z491.noop_polls,
+        bx.z491.tx_enq,
+        bx.z491.tx_del,
+        bx.z491.reply_enq,
+        bx.z491.reply_del,
+        bx.z491.bc_reply_rx,
+        bx.z491.bc_free_rx,
+        bx.z491.max_inbox,
+        ms(bx.z491.last_del),
+        ms(bx.z491.last_rx),
+    );
+}
+
+// ============================================================================
 // BINDER_WRITE_READ handler — the workhorse.
 // ============================================================================
 
@@ -4795,6 +4986,9 @@ fn handle_version(vm_id: u32) -> Resp {
 ///   250 ms `BR_NOOP` idle tick.
 /// * `BC_REQUEST_DEATH_NOTIFICATION` / `BC_CLEAR_DEATH_NOTIFICATION` are
 ///   recorded; owner death pushes `BR_DEAD_BINDER`.
+///
+/// 6-Z491: every completed ioctl runs the per-conn accounting tick
+/// ([`z491_ioctl_tick`]) — the delivery-vs-consumed wedge scan.
 fn handle_write_read(
     payload: &[u8],
     vm_id: u32,
@@ -5069,6 +5263,14 @@ fn handle_write_read(
 
         match cmd {
             BC_TRANSACTION | BC_TRANSACTION_SG => {
+                // 6-Z491: the conn's own OUTGOING call — proof its writer
+                // path is alive (the wedge gate reads last_rx).
+                {
+                    let mut b = bus.lock().expect("binder bus poisoned");
+                    if let Some(bx) = b.conns.get_mut(&conn_id) {
+                        bx.z491.note_rx();
+                    }
+                }
                 // Pull the next v2 blob as this transaction's parcel.
                 let req_blob = if is_v2 && blob_idx < req_blobs.len() {
                     let b = &req_blobs[blob_idx];
@@ -5254,7 +5456,14 @@ fn handle_write_read(
                 };
                 let inflight = {
                     let mut b = bus.lock().expect("binder bus poisoned");
-                    b.conns.get_mut(&conn_id).and_then(|bx| bx.txn_stack.pop())
+                    b.conns.get_mut(&conn_id).and_then(|bx| {
+                        // 6-Z491: the REPLY-RX leg — the daemon ANSWERED.
+                        // Counts even when the stack pop drifts (None):
+                        // a BC_REPLY arrived, period.
+                        bx.z491.bc_reply_rx += 1;
+                        bx.z491.note_rx();
+                        bx.txn_stack.pop()
+                    })
                 };
                 // 6-Z407: the reply-correlation trace — rn361's SF wall
                 // (code=10 retries with no reply) needs the EXACT chain:
@@ -5330,6 +5539,7 @@ fn handle_write_read(
                                 );
                                 match b.conns.get_mut(&rc) {
                                     Some(rbx) => {
+                                        rbx.z491.reply_enq += 1;
                                         rbx.reply_queue.push_back(DeferredReply::Reply {
                                             data,
                                             offsets,
@@ -5474,6 +5684,11 @@ fn handle_write_read(
                 if cmd == BC_FREE_BUFFER {
                     let mut b = bus.lock().expect("binder bus poisoned");
                     if let Some(bx) = b.conns.get_mut(&conn_id) {
+                        // 6-Z491: the CONSUMED ack — the guest's
+                        // executeCommand ran the delivered transaction to
+                        // its Parcel-teardown end.
+                        bx.z491.bc_free_rx += 1;
+                        bx.z491.note_rx();
                         if let Some((t0, code)) = bx.steal_watch.take() {
                             info!(
                                 "[KR64][binder][vm{}] 6-Z325: steal-delivered oneway (code={}) freed after {}ms — the pool thread executed the callback transaction",
@@ -5579,6 +5794,7 @@ fn handle_write_read(
             for t in expired {
                 b.waiters.remove(&t);
                 if let Some(bx) = b.conns.get_mut(&conn_id) {
+                    bx.z491.reply_enq += 1;
                     bx.reply_queue.push_back(DeferredReply::Failed);
                 }
                 // 6-Z407: the timeout trace — rn361's SF wall needs the
@@ -5633,9 +5849,13 @@ fn handle_write_read(
         let mut reply_delivered = false;
         if let Some(dr) = {
             let mut b = bus.lock().expect("binder bus poisoned");
-            b.conns
-                .get_mut(&conn_id)
-                .and_then(|bx| bx.reply_queue.pop_front())
+            b.conns.get_mut(&conn_id).and_then(|bx| {
+                // 6-Z491: the reply DELIVER leg (the enqueue leg lives
+                // at the eight reply_queue push sites).
+                bx.z491.reply_del += 1;
+                bx.z491.last_del = Some(std::time::Instant::now());
+                bx.reply_queue.pop_front()
+            })
         } {
             match dr {
                 DeferredReply::Reply {
@@ -5912,6 +6132,9 @@ fn handle_write_read(
                     match b.conns.get_mut(&conn_id) {
                         Some(bx) => match bx.inbox.pop_front() {
                             Some(InboxItem::Tx(tx)) => {
+                                // 6-Z491: the tx DELIVER leg (main drain).
+                                bx.z491.tx_del += 1;
+                                bx.z491.last_del = Some(std::time::Instant::now());
                                 // Mark the delivered transaction as owing a reply
                                 // (sync only — one-way has txn_id 0 and expects
                                 // no reply). Remove it from pending_in: it's no
@@ -6019,8 +6242,14 @@ fn handle_write_read(
                             }
                         }
                         if let Some(tx) = &item {
-                            if tx.txn_id != 0 {
-                                if let Some(bx) = b.conns.get_mut(&conn_id) {
+                            if let Some(bx) = b.conns.get_mut(&conn_id) {
+                                // 6-Z491: the tx DELIVER leg (6-Z271g steal —
+                                // counted on the DELIVERING conn; oneway
+                                // steals carry no stack frame but ARE
+                                // deliveries).
+                                bx.z491.tx_del += 1;
+                                bx.z491.last_del = Some(std::time::Instant::now());
+                                if tx.txn_id != 0 {
                                     // 6-Z306ag: PUSH onto the stealing conn's
                                     // transaction stack (LIFO reply
                                     // correlation; death-resolvable via the
@@ -6065,8 +6294,12 @@ fn handle_write_read(
                     let mut b = bus.lock().expect("binder bus poisoned");
                     let tx = b.z469_take_held_sync(conn_id);
                     if let Some(tx) = &tx {
-                        if tx.txn_id != 0 {
-                            if let Some(bx) = b.conns.get_mut(&conn_id) {
+                        if let Some(bx) = b.conns.get_mut(&conn_id) {
+                            // 6-Z491: the tx DELIVER leg (6-Z469 proc-todo
+                            // take — same shape as the 6-Z271g steal).
+                            bx.z491.tx_del += 1;
+                            bx.z491.last_del = Some(std::time::Instant::now());
+                            if tx.txn_id != 0 {
                                 // 6-Z306ag: PUSH onto the taking conn's
                                 // transaction stack (LIFO reply
                                 // correlation; same as the 6-Z271g steal).
@@ -6156,6 +6389,7 @@ fn handle_write_read(
                                     }
                                     if let Some(requester) = b.waiters.remove(&tx.txn_id) {
                                         if let Some(rb) = b.conns.get_mut(&requester) {
+                                            rb.z491.reply_enq += 1;
                                             rb.reply_queue.push_back(DeferredReply::Dead);
                                         }
                                     }
@@ -6315,6 +6549,10 @@ fn handle_write_read(
                             match b.conns.get_mut(&conn_id) {
                                 Some(bx) => match bx.inbox.pop_front() {
                                     Some(InboxItem::Tx(tx)) => {
+                                        // 6-Z491: the tx DELIVER leg (the
+                                        // 6-Z383 post-idle-tick recheck).
+                                        bx.z491.tx_del += 1;
+                                        bx.z491.last_del = Some(std::time::Instant::now());
                                         if tx.txn_id != 0 {
                                             bx.txn_stack.push(tx.txn_id);
                                             z306ag_note_stack_depth(bx.txn_stack.len());
@@ -6467,6 +6705,12 @@ fn handle_write_read(
             resp_fds.clear();
         }
     }
+
+    // 6-Z491: the per-ioctl accounting tick + the budgeted wedge scan —
+    // the decode's delivery-vs-consumed join reads these lines. One lock;
+    // runs on every completed W-R (the idle looper's drained mailbox
+    // never verdicts).
+    z491_ioctl_tick(bus, vm_id, conn_id, read_buf.is_empty());
 
     Resp {
         ret: 0,
@@ -7619,6 +7863,7 @@ fn servicemanager_proxy(
                 if acq_mirrored {
                     if z306am_skip_prefix(conn_id, conn_id) {
                         if let Some(bx) = b.conns.get_mut(&conn_id) {
+                            bx.z491.reply_enq += 1;
                             bx.reply_queue.push_back(DeferredReply::RefCmd {
                                 br: BR_ACQUIRE,
                                 ptr,
@@ -8528,6 +8773,7 @@ fn servicemanager_hidl(
                 if acq_mirrored {
                     if z306am_skip_prefix(conn_id, conn_id) {
                         if let Some(bx) = b.conns.get_mut(&conn_id) {
+                            bx.z491.reply_enq += 1;
                             bx.reply_queue.push_back(DeferredReply::RefCmd {
                                 br: BR_ACQUIRE,
                                 ptr,
@@ -8785,6 +9031,7 @@ fn servicemanager_hidl(
                 if acq_mirrored {
                     if z306am_skip_prefix(conn_id, conn_id) {
                         if let Some(bx) = b.conns.get_mut(&conn_id) {
+                            bx.z491.reply_enq += 1;
                             bx.reply_queue.push_back(DeferredReply::RefCmd {
                                 br: BR_ACQUIRE,
                                 ptr,
@@ -18730,5 +18977,168 @@ mod tests {
         assert_eq!(taken.txn_id, 1, "conn 100 < conn 200 → its txn pops first");
         assert_eq!(b.conns[&100].inbox.len(), 0);
         assert_eq!(b.conns[&200].inbox.len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // 6-Z491 — the delivery-vs-consumed accounting + the wedge scan
+    // ------------------------------------------------------------------
+
+    /// Backdate a conn's last_rx/last_del past the wedge quiesce window
+    /// so the scan's idle gate trips deterministically.
+    fn z491_backdate(bx: &mut ConnBox) {
+        let past =
+            std::time::Instant::now() - Z491_WEDGE_QUIESCE - std::time::Duration::from_millis(200);
+        bx.z491.last_rx = Some(past);
+        bx.z491.last_del = Some(past);
+    }
+
+    /// The ENQUEUE leg: queue_transaction bumps tx_enq and the inbox
+    /// high-water mark (the deliver leg is inline in handle_write_read —
+    /// exercised end-to-end by the boot ladder; here the counters are).
+    #[test]
+    fn z491_queue_transaction_counts_enqueue_leg() {
+        let mut b = BusState::new();
+        b.conns.insert(300u64, ConnBox::default());
+        assert!(
+            b.queue_transaction(z469_tx(200, 41, 10485), 300),
+            "queue must succeed"
+        );
+        assert_eq!(b.conns[&300].z491.tx_enq, 1);
+        assert_eq!(b.conns[&300].z491.max_inbox, 1);
+        assert!(
+            b.queue_transaction(z469_tx(200, 42, 10485), 300),
+            "second queue must succeed"
+        );
+        assert_eq!(b.conns[&300].z491.tx_enq, 2);
+        assert_eq!(b.conns[&300].z491.max_inbox, 2, "high-water stays");
+    }
+
+    /// The rn466/rn468 installd shape: the conn TOOK sync transactions
+    /// (txn_stack non-empty), shows no write-side activity through the
+    /// quiesce window, no nested call outstanding → WEDGE-B verdicts
+    /// (last_verdict arms).
+    #[test]
+    fn z491_wedge_b_fires_for_taken_never_answered() {
+        let mut b = BusState::new();
+        b.conns.insert(310u64, ConnBox::default());
+        b.conns.get_mut(&310).unwrap().sender_pid = 10485;
+        b.conns.get_mut(&310).unwrap().dev_code = 1;
+        b.conns.get_mut(&310).unwrap().txn_stack.push(7);
+        z491_backdate(b.conns.get_mut(&310).unwrap());
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(b));
+        z491_ioctl_tick(&bus, 1, 310, true);
+        let b = bus.lock().unwrap();
+        assert!(
+            b.conns[&310].z491.last_verdict.is_some(),
+            "stack non-empty + quiescent → WEDGE-B must verdict"
+        );
+        assert_eq!(b.conns[&310].z491.wr_calls, 1, "the tick counts the ioctl");
+        assert_eq!(b.conns[&310].z491.noop_polls, 1, "empty read stream");
+    }
+
+    /// The healthy idle looper: every mailbox empty, whatever its poll
+    /// rate — the tick counts the ioctl but NEVER verdicts.
+    #[test]
+    fn z491_drained_conn_never_verdicts() {
+        let mut b = BusState::new();
+        b.conns.insert(311u64, ConnBox::default());
+        z491_backdate(b.conns.get_mut(&311).unwrap());
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(b));
+        z491_ioctl_tick(&bus, 1, 311, true);
+        z491_ioctl_tick(&bus, 1, 311, true);
+        let b = bus.lock().unwrap();
+        assert!(b.conns[&311].z491.last_verdict.is_none());
+        assert_eq!(b.conns[&311].z491.wr_calls, 2);
+        assert_eq!(b.conns[&311].z491.noop_polls, 2);
+    }
+
+    /// The 6-Z408 exclusion: inbox/stack stuck while the conn is parked
+    /// on its OWN nested call (out_sync non-empty) is the gate-hold shape
+    /// z408_note_hold already names — the wedge scan must stay silent
+    /// (the REPLY_TIMEOUT machinery owns the unwind).
+    #[test]
+    fn z491_nested_call_excludes_wedge_a_and_b() {
+        let mut b = BusState::new();
+        b.conns.insert(312u64, ConnBox::default());
+        {
+            let bx = b.conns.get_mut(&312).unwrap();
+            bx.txn_stack.push(9);
+            bx.out_sync.push_back((777, 41, std::time::Instant::now()));
+            z491_backdate(bx);
+        }
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(b));
+        z491_ioctl_tick(&bus, 1, 312, true);
+        let b = bus.lock().unwrap();
+        assert!(
+            b.conns[&312].z491.last_verdict.is_none(),
+            "nested-call parking is the 6-Z408 shape, not a wedge"
+        );
+    }
+
+    /// A resolved reply stuck on the reply_queue (the client stopped
+    /// reading between its calls — the rn464 client-side half) → WEDGE-C.
+    #[test]
+    fn z491_wedge_c_fires_for_reply_never_polled() {
+        let mut b = BusState::new();
+        b.conns.insert(313u64, ConnBox::default());
+        {
+            let bx = b.conns.get_mut(&313).unwrap();
+            bx.reply_queue.push_back(DeferredReply::Failed);
+            z491_backdate(bx);
+        }
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(b));
+        z491_ioctl_tick(&bus, 1, 313, false);
+        let b = bus.lock().unwrap();
+        assert!(
+            b.conns[&313].z491.last_verdict.is_some(),
+            "stuck reply + quiescent → WEDGE-C must verdict"
+        );
+    }
+
+    /// Fresh write-side activity (last_rx inside the window) disarms the
+    /// scan even with a stuck stack — a conn making outgoing calls is
+    /// alive; the verdict would be noise.
+    #[test]
+    fn z491_fresh_rx_disarms_the_scan() {
+        let mut b = BusState::new();
+        b.conns.insert(314u64, ConnBox::default());
+        {
+            let bx = b.conns.get_mut(&314).unwrap();
+            bx.txn_stack.push(7);
+            bx.z491.note_rx();
+            bx.z491.last_del = Some(
+                std::time::Instant::now()
+                    - Z491_WEDGE_QUIESCE
+                    - std::time::Duration::from_millis(200),
+            );
+        }
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(b));
+        z491_ioctl_tick(&bus, 1, 314, true);
+        let b = bus.lock().unwrap();
+        assert!(b.conns[&314].z491.last_verdict.is_none());
+    }
+
+    /// The per-conn verdict throttle: a second tick inside Z491_VERDICT_GAP
+    /// must NOT re-verdict (last_verdict unchanged) — 64 budget lines span
+    /// the run instead of flooding on one conn.
+    #[test]
+    fn z491_verdict_throttles_within_gap() {
+        let mut b = BusState::new();
+        b.conns.insert(315u64, ConnBox::default());
+        b.conns.get_mut(&315).unwrap().txn_stack.push(7);
+        z491_backdate(b.conns.get_mut(&315).unwrap());
+        let bus = std::sync::Arc::new(std::sync::Mutex::new(b));
+        z491_ioctl_tick(&bus, 1, 315, true);
+        let first = {
+            let b = bus.lock().unwrap();
+            b.conns[&315].z491.last_verdict
+        };
+        assert!(first.is_some(), "first tick verdicts");
+        z491_ioctl_tick(&bus, 1, 315, true);
+        let b = bus.lock().unwrap();
+        assert_eq!(
+            b.conns[&315].z491.last_verdict, first,
+            "inside the gap → throttled (same verdict instant)"
+        );
     }
 }
