@@ -3498,6 +3498,11 @@ static Z483_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static Z483_RARE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<libc::pid_t, Z483Ring>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+// 6-Z487: the one-in-flight (pid → (seq, op)) stash for the socket/
+// connect entries whose ret gets appended at the EXIT updater.
+static Z483_RET_PENDING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<libc::pid_t, (u64, &'static str)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 // close_range is nr 436 on aarch64 AND x86_64 (asm-generic + x86_64
 // unified) — not in ChildAbi; a raw match is exact.
 const Z483_CLOSE_RANGE: i64 = 436;
@@ -26034,7 +26039,43 @@ pub fn run_ptrace_loop(
                                     format!("domain={:#x} type={:#x}", z483_a1, z483_a2),
                                 ))
                             } else if abi.connect_nr != -1 && syscall_num == abi.connect_nr {
-                                Some(("connect", format!("fd={} sa_len={}", z483_a1, z483_a3)))
+                                // 6-Z487: read the sockaddr path (the blob
+                                // at arg2 — the same peek the 6-Z305q arm
+                                // does) so the ring names WHERE the connect
+                                // went: the rn458 census showed the zygote's
+                                // property-shaped STREAM socket with NO
+                                // connect ever following — the path + the
+                                // ret (added at the EXIT updater) close the
+                                // (a)/(b)/(c) question in one run.
+                                let z487_sa_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                let z487_sa_len = std::cmp::min(z483_a3 as usize, 128);
+                                let z487_path = if z487_sa_ptr != 0 && z487_sa_len >= 2 {
+                                    read_child_bytes(pid, z487_sa_ptr, z487_sa_len)
+                                        .map(|blob| {
+                                            let family = u16::from_le_bytes([blob[0], blob[1]]);
+                                            let path_bytes = &blob[2..];
+                                            let end = path_bytes
+                                                .iter()
+                                                .position(|&b| b == 0)
+                                                .unwrap_or(path_bytes.len());
+                                            if family == 1 {
+                                                String::from_utf8_lossy(&path_bytes[..end])
+                                                    .into_owned()
+                                            } else {
+                                                format!("<family={}>", family)
+                                            }
+                                        })
+                                        .unwrap_or_else(|| "<unreadable>".to_string())
+                                } else {
+                                    "<none>".to_string()
+                                };
+                                Some((
+                                    "connect",
+                                    format!(
+                                        "fd={} sa_len={} path='{}'",
+                                        z483_a1, z483_a3, z487_path
+                                    ),
+                                ))
                             } else if abi.dup2_nr != -1 && syscall_num == abi.dup2_nr {
                                 Some(("dup2", format!("old={} new={}", z483_a1, z483_a2)))
                             } else if abi.dup3_nr != -1 && syscall_num == abi.dup3_nr {
@@ -26094,6 +26135,17 @@ pub fn run_ptrace_loop(
                                             rare.pop_front();
                                         }
                                         rare.push_back((seq, name, desc));
+                                    }
+                                    // 6-Z487: socket/connect get their ret
+                                    // appended at the EXIT updater (the
+                                    // one-in-flight stash — the ret is the
+                                    // new fd number for socket() and the
+                                    // success/errno for connect(): the
+                                    // rn458 (a)/(b)/(c) closure data).
+                                    if matches!(name, "socket" | "connect") {
+                                        if let Ok(mut pending) = Z483_RET_PENDING.lock() {
+                                            pending.insert(pid, (seq, name));
+                                        }
                                     }
                                 } else if let Ok(mut ring_map) = Z483_FDOPS.lock() {
                                     let ring = ring_map.entry(pid).or_default();
@@ -39523,6 +39575,35 @@ pub fn run_ptrace_loop(
                                         e, pending.fd, pending.length
                                     ));
                                 }
+                            }
+                        }
+                    }
+                    // 6-Z487: the rare-ring ret updater — the EXIT half of
+                    // the socket/connect rare entries. The ENTRY half
+                    // stashed (seq, op) in Z483_RET_PENDING; here the
+                    // syscall's real return is known: append " ret=N" to
+                    // the matching rare entry (the new fd number for
+                    // socket(), the success/errno for connect()). The
+                    // rn458 (a)/(b)/(c) closure data: a connect with
+                    // ret=0 to the property path vs a missing connect vs
+                    // a non-property path names the property-set failure
+                    // layer in one run.
+                    if (abi.socket_nr != -1 && syscall_num == abi.socket_nr)
+                        || (abi.connect_nr != -1 && syscall_num == abi.connect_nr)
+                    {
+                        if let Ok(mut pending) = Z483_RET_PENDING.lock() {
+                            if let Some((z487_seq, z487_op)) = pending.remove(&pid) {
+                                let z487_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                                if let Ok(mut rare_map) = Z483_RARE.lock() {
+                                    if let Some(ring) = rare_map.get_mut(&pid) {
+                                        if let Some((_, _, desc)) =
+                                            ring.iter_mut().rev().find(|(s, _, _)| *s == z487_seq)
+                                        {
+                                            desc.push_str(&format!(" ret={}", z487_ret));
+                                        }
+                                    }
+                                }
+                                let _ = z487_op;
                             }
                         }
                     }
