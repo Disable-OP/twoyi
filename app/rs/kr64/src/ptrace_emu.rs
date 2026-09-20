@@ -26002,6 +26002,35 @@ pub fn run_ptrace_loop(
                                                     ));
                                                 }
                                                 z481_parsed.insert(pid, (name, value));
+                                            } else {
+                                                // 6-Z487b: the payload is ≥128 B
+                                                // but NOT a classic prop_msg —
+                                                // log the first 32 bytes hex so
+                                                // the actual wire protocol names
+                                                // itself (rn460: the connects
+                                                // ret=0 yet zero parses — the
+                                                // frames exist, the parse is
+                                                // blind to their layout).
+                                                static Z487B_NONE_DIAG:
+                                                    std::sync::atomic::AtomicU64 =
+                                                    std::sync::atomic::AtomicU64::new(0);
+                                                let nn = Z487B_NONE_DIAG.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                if nn < 8 {
+                                                    let mut hexs = String::new();
+                                                    for b in payload.iter().take(32) {
+                                                        hexs.push_str(&format!("{:02x}", b));
+                                                    }
+                                                    log(&format!(
+                                                        "6-Z487b: wire payload NOT classic prop_msg pid={} len={} head={}… seq={}",
+                                                        pid,
+                                                        req_len,
+                                                        hexs,
+                                                        seq
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
