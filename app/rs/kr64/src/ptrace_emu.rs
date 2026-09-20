@@ -14926,7 +14926,10 @@ fn z497_post_dump_reattach(
     let mut got_stop = false;
     for _ in 0..20 {
         let mut st: libc::c_int = 0;
-        let w = unsafe { libc::waitpid(tid, &mut st, libc::WNOHANG) };
+        // __WALL: the released set contains THREAD tids (the 6-Z418
+        // dance's own wait uses the same flag — a non-__WALL wait can
+        // miss a thread tracee's stop report).
+        let w = unsafe { libc::waitpid(tid, &mut st, libc::__WALL | libc::WNOHANG) };
         if w == tid {
             got_stop = true;
             break;

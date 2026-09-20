@@ -66,7 +66,15 @@ jobs:
   test:
     name: fmt + clippy + test (kr64)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 6-Z499 (rn472/473 era): the suite outgrew the 10-minute cap — the
+    # unit-test step was cancelled mid-flight on 98bc2048 (#2113) and
+    # 2d1c3fef (#2115) after fmt+clippy had already passed, so every
+    # marker-commit validation since the ~1028-test mark silently lost
+    # its test leg (the run verdict reads "cancelled", easy to misread
+    # as the same-group dispatch race — it is the JOB TIMEOUT). 20
+    # minutes gives the deterministic suite room; the shim job keeps
+    # its own 2-minute cap.
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code
