@@ -14831,6 +14831,135 @@ fn sweep_untraced_guest_processes(
     attached
 }
 
+// ── 6-Z497: the post-dump IMMEDIATE re-acquisition bookkeeping ─────
+//
+// rn471 decode (ladder #471, the gen-1 system_server pid 4123): the
+// 6-Z418 eager hand-off released the dumped process's tids at
+// +203.127s, the 6-Z411 post-dump SIGCONT resumed them at +203.596s,
+// and the gen-1 fatal SIGSEGV delivered at +203.8s — UNWITNESSED (no
+// delivery stop, no 6-Z472/6-Z306m forensics, no tombstone: the
+// death-site story is reconstructed only from the 6-Z472 snapshot +
+// the zygote's reap at +204.025s). The re-tracing of released tids was
+// left to the 6-Z190 coverage sweep, whose cadence (SWEEP_MIN_INTERVAL
+// + 25k-iteration boundaries) leaves a multi-second untraced window
+// exactly where (a) a pending/arriving FATAL signal delivers with no
+// delivery stop — the death-site forensics arm (maps, registers,
+// 6-Z306m crash instructions, abort message, fd tables) never fires —
+// and (b) an ALIVE dumped process runs with every syscall untranslated
+// (the silent-corruption class the 6-Z190 doc names). This module
+// closes the window: the 6-Z396/6-Z411 release sites call
+// [`z497_post_dump_reattach`] BEFORE the SIGCONT, so the tid is already
+// re-traced when it resumes and every subsequent fatal signal delivers
+// UNDER TRACE into the existing forensics arm.
+//
+// Outcomes, all kernel-true, all logged:
+//   * attach OK → the tid rejoins the traced domain; the call site
+//     issues the 6-Z411 SIGCONT + the PTRACE_SYSCALL resume; a later
+//     fatal delivery stop both runs the full forensics and tags the
+//     6-Z497 FAULT-WITNESS correlation line (the era-1 class becomes
+//     witnessed end to end);
+//   * attach fails ESRCH/EPERM → logged (ESRCH = the tid died INSIDE
+//     the dump window, before the release — itself the witness that
+//     used to be missing);
+//   * TracerPid != 0 → a live dump child still owns the tid — silent
+//     skip (the 6-Z424 rule; the sweep will pick it up later).
+
+/// 6-Z497 FAULT-WITNESS registry: the tids re-attached via
+/// [`z497_post_dump_reattach`]. The fatal-delivery arm removes a tid on
+/// its first fatal stop and logs the correlation line. Hygiene note: an
+/// entry lingers if the tid never dies fatally (the live-dump class) —
+/// a later pid-REUSE could then mis-tag one fatal stop. Diagnostic-only
+/// harm; the entry is removed by the first fatal either way.
+static Z497_REATTACHED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<libc::pid_t>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// 6-Z497 (pure): parse the TracerPid line of a /proc/<pid>/status body.
+/// Returns 0 when the process has no tracer (or the field is missing or
+/// malformed) — the attach path must only proceed when this is 0.
+fn z497_tracer_pid(status_body: &str) -> libc::pid_t {
+    status_body
+        .lines()
+        .find_map(|l| l.strip_prefix("TracerPid:"))
+        .and_then(|v| v.trim().parse::<libc::pid_t>().ok())
+        .unwrap_or(0)
+}
+
+/// 6-Z497: re-attach ONE released handed-off tid (the mechanics twin of
+/// the 6-Z190 sweep's attach body, run at the release moment instead of
+/// at the next sweep pass). Attaches, consumes the attach stop (bounded
+/// WNOHANG budget, the sweep's 20×5 ms), installs the full option mask,
+/// and registers the tracked bookkeeping — the CALL SITE issues the
+/// 6-Z411 SIGCONT and the PTRACE_SYSCALL resume so the group-stop class
+/// sees the CONT before the resume. Returns TRUE when the tid is now
+/// traced again; FALSE when the call site must fall back to the plain
+/// 6-Z411 behavior (another tracer owns it / the attach failed / the
+/// stop-observe budget expired). Never blocks the release loop.
+fn z497_post_dump_reattach(
+    tid: libc::pid_t,
+    tracked_pids: &mut Vec<libc::pid_t>,
+    pid_starttimes: &mut std::collections::HashMap<libc::pid_t, u64>,
+    in_syscall_map: &mut std::collections::HashMap<libc::pid_t, bool>,
+) -> bool {
+    // 6-Z424 guard: another tracer (a live dump child's SEIZE — the
+    // vm_pid fork chain outlives the worker's death bookkeeping by
+    // microseconds) still owns this tid — never steal it.
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", tid)) {
+        if z497_tracer_pid(&status) != 0 {
+            return false;
+        }
+    }
+    let r = unsafe { libc::ptrace(libc::PTRACE_ATTACH, tid, 0, 0) };
+    if r == -1 {
+        static Z497_ATTACH_FAIL: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let n = Z497_ATTACH_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 8 {
+            let e = std::io::Error::last_os_error();
+            crate::info!(
+                "[KR64][ptrace] 6-Z497: post-dump re-attach tid={} FAILED ({}) — ESRCH reads as the tid died INSIDE the dump window (the in-dump death witness)",
+                tid, e
+            );
+        }
+        return false;
+    }
+    let mut got_stop = false;
+    for _ in 0..20 {
+        let mut st: libc::c_int = 0;
+        let w = unsafe { libc::waitpid(tid, &mut st, libc::WNOHANG) };
+        if w == tid {
+            got_stop = true;
+            break;
+        }
+        if w == -1 {
+            break; // ECHILD: died between the attach and the wait
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if !got_stop {
+        // Never stopped within the budget — detach best-effort (the
+        // sweep's fallback; a later sweep will retry if it is around).
+        let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
+        return false;
+    }
+    let opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
+        | libc::PTRACE_O_TRACEFORK
+        | libc::PTRACE_O_TRACECLONE
+        | libc::PTRACE_O_TRACEVFORK
+        | libc::PTRACE_O_TRACEVFORKDONE
+        | libc::PTRACE_O_TRACEEXEC
+        | libc::PTRACE_O_TRACEEXIT
+        | libc::PTRACE_O_EXITKILL) as libc::c_int;
+    let _ = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, tid, 0, opts) };
+    tracked_pids.push(tid);
+    pid_starttimes.insert(tid, proc_starttime(tid).unwrap_or(0));
+    in_syscall_map.entry(tid).or_insert(false);
+    if let Ok(mut set) = Z497_REATTACHED.lock() {
+        set.insert(tid);
+    }
+    true
+}
+
 /// Task 6-Z89 FIX 1a: the precise outcome of [`reap_child`].
 enum Reaped {
     /// Reaped — the status word carries WIFEXITED/WIFSIGNALED. The
@@ -22194,6 +22323,22 @@ pub fn run_ptrace_loop(
                 for tid in &released {
                     z388_handed_off_to.remove(tid);
                     z388_handed_off.remove(tid);
+                    // 6-Z497: the IMMEDIATE post-dump re-acquisition —
+                    // attach FIRST (the attach-stop preempts both the
+                    // running and the group-stopped state), THEN the
+                    // 6-Z411 SIGCONT, THEN the PTRACE_SYSCALL resume: a
+                    // pending or arriving fatal signal now delivers
+                    // UNDER TRACE into the death-site forensics arm
+                    // instead of unwitnessed (the rn471 era-1 class:
+                    // the gen-1 system_server SIGSEGV that delivered in
+                    // the multi-second gap before the next 6-Z190 sweep
+                    // pass).
+                    let z497_reattached = z497_post_dump_reattach(
+                        *tid,
+                        &mut tracked_pids,
+                        &mut pid_starttimes,
+                        &mut in_syscall_map,
+                    );
                     // 6-Z411: THE POST-DUMP RESUME — the crash_dump
                     // SIGSTOP dance leaves the dumped process in a
                     // GROUP-STOP (do_signal_stop, state T) that survives
@@ -22211,10 +22356,18 @@ pub fn run_ptrace_loop(
                     // kernel-true flow), the LIVE-dump class (ANR /
                     // intercept) resumes and keeps running.
                     let rc = unsafe { libc::kill(*tid, libc::SIGCONT) };
-                    log(&format!(
-                        "6-Z411: post-dump SIGCONT tid={} (kill rc={}) — the group-stop must end so pending work (or the queued fatal signal) delivers",
-                        tid, rc
-                    ));
+                    if z497_reattached {
+                        let _ = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, *tid, 0, 0) };
+                        log(&format!(
+                            "6-Z497: tid={} re-attached post-dump, SIGCONT rc={} — traced again NOW (a pending fatal signal delivers under trace; the era-1 blind window closed for this tid)",
+                            tid, rc
+                        ));
+                    } else {
+                        log(&format!(
+                            "6-Z411: post-dump SIGCONT tid={} (kill rc={}) — the group-stop must end so pending work (or the queued fatal signal) delivers",
+                            tid, rc
+                        ));
+                    }
                 }
                 if !released.is_empty() {
                     log(&format!(
@@ -22547,13 +22700,31 @@ pub fn run_ptrace_loop(
                 for tid in &released {
                     z388_handed_off_to.remove(tid);
                     z388_handed_off.remove(tid);
+                    // 6-Z497: the immediate re-acquisition (the
+                    // WIFSIGNALED twin — the full rationale lives at the
+                    // WIFEXITED site): attach BEFORE the SIGCONT so a
+                    // pending fatal signal delivers under trace.
+                    let z497_reattached = z497_post_dump_reattach(
+                        *tid,
+                        &mut tracked_pids,
+                        &mut pid_starttimes,
+                        &mut in_syscall_map,
+                    );
                     // 6-Z411: post-dump SIGCONT (WIFSIGNALED twin — the
                     // full rationale lives at the WIFEXITED site).
                     let rc = unsafe { libc::kill(*tid, libc::SIGCONT) };
-                    log(&format!(
-                        "6-Z411: post-dump SIGCONT tid={} (kill rc={}) — the group-stop must end so pending work (or the queued fatal signal) delivers",
-                        tid, rc
-                    ));
+                    if z497_reattached {
+                        let _ = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, *tid, 0, 0) };
+                        log(&format!(
+                            "6-Z497: tid={} re-attached post-dump, SIGCONT rc={} — traced again NOW (a pending fatal signal delivers under trace; the era-1 blind window closed for this tid)",
+                            tid, rc
+                        ));
+                    } else {
+                        log(&format!(
+                            "6-Z411: post-dump SIGCONT tid={} (kill rc={}) — the group-stop must end so pending work (or the queued fatal signal) delivers",
+                            tid, rc
+                        ));
+                    }
                 }
                 if !released.is_empty() {
                     log(&format!(
@@ -48125,6 +48296,33 @@ pub fn run_ptrace_loop(
                     sig,
                     libc::SIGABRT | libc::SIGBUS | libc::SIGILL | libc::SIGFPE | libc::SIGSEGV
                 ) {
+                    // ── 6-Z497 FAULT-WITNESS: did this fatal stop land on
+                    // a tid the post-dump immediate re-acquisition just
+                    // re-traced? The rn471 era-1 class (the gen-1
+                    // system_server SIGSEGV that delivered UNWITNESSED
+                    // between the 6-Z411 SIGCONT and the next 6-Z190
+                    // sweep pass) now delivers UNDER TRACE — this line
+                    // marks the correlation; the full forensics below
+                    // (maps, registers, 6-Z306m instructions, abort
+                    // message, fd tables) is the payload the blind
+                    // window used to destroy.
+                    {
+                        let mut was_z497 = false;
+                        if let Ok(mut set) = Z497_REATTACHED.lock() {
+                            was_z497 = set.remove(&pid);
+                        }
+                        if was_z497 {
+                            static Z497_WITNESS: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let n = Z497_WITNESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 8 {
+                                log(&format!(
+                                    "6-Z497 FAULT-WITNESS: fatal signal {} on tid {} — a POST-DUMP re-attached tid (the era-1 blind-window class, now witnessed)",
+                                    sig, pid
+                                ));
+                            }
+                        }
+                    }
                     if let Some(abort_msg) = read_bionic_abort_message(pid) {
                         if let Some(total) =
                             stop_log_allow(&mut stop_log_budget, SITE_ABORT_MSG, pid, 4096)
@@ -58833,5 +59031,39 @@ mod z472_snapshot_tests {
         let mut names = ["10", "2", "0", "129", "junk"];
         names.sort_by_key(|n| z475_fd_sort_key(n).unwrap_or(i64::MAX));
         assert_eq!(names, ["0", "2", "10", "129", "junk"]);
+    }
+}
+
+/// 6-Z497 pure cores (the post-dump immediate re-acquisition).
+#[cfg(test)]
+mod z497_reattach_tests {
+    use super::z497_tracer_pid;
+
+    /// The TracerPid parse: 0 = no tracer (attach allowed), nonzero =
+    /// another tracer owns the tid (the 6-Z424 guard must skip). A
+    /// missing or malformed field reads as 0 (fail-open to the attach
+    /// attempt, whose own EPERM/ESRCH path then reports honestly).
+    #[test]
+    fn z497_tracer_pid_parse() {
+        let untraced = "Name:\tsystem_server\nUmask:\t0022\nState:\tT (stopped)\nTgid:\t4123\nTracerPid:\t0\nUid:\t0\t0\t0\t0\n";
+        assert_eq!(z497_tracer_pid(untraced), 0);
+        let traced = "Name:\tsystem_server\nState:\tt (tracing stop)\nTgid:\t4123\nTracerPid:\t4462\nUid:\t0\t0\t0\t0\n";
+        assert_eq!(z497_tracer_pid(traced), 4462);
+        // TracerPid is a PREFIX match — the parser must not be fooled by
+        // a similarly-prefixed field name (e.g. a hypothetical
+        // "TracerPidFoo:").
+        let prefixed = "Name:\tx\nTracerPidExtra:\t9\nTracerPid:\t0\n";
+        assert_eq!(z497_tracer_pid(prefixed), 0);
+        assert_eq!(z497_tracer_pid("Name:\tx\nTgid:\t1\n"), 0);
+        assert_eq!(z497_tracer_pid(""), 0);
+        assert_eq!(z497_tracer_pid("TracerPid:\tgarbage\n"), 0);
+        // Whitespace tolerance: the kernel pads with a tab.
+        assert_eq!(z497_tracer_pid("TracerPid:  \t77\n"), 77);
+        // A negative parse (never real) still reads nonzero → the guard
+        // skips the attach (safe direction); overflow junk fails the
+        // parse and unwrap_or(0) applies (attach allowed, the attach's
+        // own errno path then reports honestly).
+        assert_eq!(z497_tracer_pid("TracerPid:\t-5\n"), -5);
+        assert_eq!(z497_tracer_pid("TracerPid:\t99999999999999999999\n"), 0);
     }
 }
