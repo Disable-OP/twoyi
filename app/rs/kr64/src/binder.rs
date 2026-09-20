@@ -2735,7 +2735,35 @@ pub struct BusState {
     node_by_key: HashMap<(ConnId, u64, u64), u32>,
     next_conn: u64,
     next_txn: u64,
+    /// 6-Z502: the BR_SPAWN_LOOPER pool-growth escape — PIDs armed by a
+    /// 6-Z408 REENTRANCY-HOLD (the PARKED conn's own process; the proc
+    /// todo — and the pool thread that must take the held work — belongs
+    /// to the target proc). The next reply-construction for an armed pid
+    /// PREPENDS BR_SPAWN_LOOPER (the 6-Z324 push; binder.h-correct order:
+    /// SPAWN before the terminal COMPLETE/REPLY) so the guest's
+    /// IPCThreadState::executeCommand spawns a fresh pool thread whose
+    /// first ioctl takes the held sync txn via
+    /// [`BusState::z469_take_held_sync`] — the reentrancy embrace
+    /// unwinds. rn477/478: ONE pid's own conns (162/177, then 109/177
+    /// against the AMS server conn) call each other's server sides
+    /// code=45 both ways; both threads park; the holds never drain. The
+    /// set itself is the per-PID dedup (one arm per pid per hold epoch);
+    /// a pid re-arms on the NEXT hold after its spawn fired.
+    z502_spawn_armed_pids: std::collections::HashSet<i32>,
+    /// 6-Z502: the hold-existence budget — the spawn cap per run (the
+    /// bus lives one boot). A spawn only fires while a hold EXISTS (the
+    /// arm), and at most this many fire per run; past the cap the arm
+    /// drops and the holds unwind via their own REPLY_TIMEOUT exactly as
+    /// before 6-Z502 (the pre-existing bounded-behavior guarantee).
+    z502_spawn_budget: u32,
 }
+
+/// 6-Z502: the per-run spawn budget default (the hold-existence cap).
+const Z502_SPAWN_BUDGET_DEFAULT: u32 = 8;
+
+/// 6-Z502: capped budget for the budget-exhausted notices — the decode
+/// must see WHY the spawns stopped; 4 lines name it per boot.
+static Z502_EXHAUSTED_LOG: AtomicU32 = AtomicU32::new(4);
 
 /// 6-Z442: one flat crossing's grant record — the node ref granted plus
 /// the owner-side mirrors the kernel would queue for it.
@@ -2815,6 +2843,8 @@ impl BusState {
             node_by_key: HashMap::new(),
             next_conn: PROXY_CONN_ID + 1,
             next_txn: 1,
+            z502_spawn_armed_pids: std::collections::HashSet::new(),
+            z502_spawn_budget: Z502_SPAWN_BUDGET_DEFAULT,
         };
         bus.ensure_virtual_services();
         bus
@@ -3491,6 +3521,84 @@ impl BusState {
             }
         }
         None
+    }
+
+    // ── 6-Z502: the BR_SPAWN_LOOPER pool-growth escape ──────────────────
+    //
+    // The kernel-true escape the proxy lacked for the 6-Z408 reentrancy
+    // EMBRACE (rn477/478: one guest pid's own conns call each other's
+    // server sides, both threads park, the holds never drain): on the
+    // real driver the held sync txn sits on the PROC todo and the driver
+    // recruits a looper — binder_thread_read emits BR_SPAWN_LOOPER, the
+    // guest's IPCThreadState spawns a fresh pool thread, and that
+    // thread's ioctl takes the proc-todo work (the 6-Z469 take) — the
+    // cycle unwinds. The proxy replicates exactly that: the hold ARMS
+    // the parked conn's pid ([`BusState::z502_arm_parked_conn`]), and
+    // the next reply-construction for that pid PREPENDS BR_SPAWN_LOOPER
+    // via the 6-Z324 push ([`BusState::z502_take_spawn_arm`]). The
+    // injection points are the three reply constructions a parked
+    // process actually reaches: its own reply_queue resolution, and the
+    // servicemanager proxy's AIDL/HIDL replies (the SM poll loop is the
+    // steady read stream of a booting system_server — rn479's 11,629
+    // getService misses are the delivery vehicle).
+
+    /// 6-Z502 THE ARM: a 6-Z408 hold parked `parked_conn` while holding a
+    /// sync txn in its inbox — arm the conn's own PROCESS. Idempotent per
+    /// pid (the set insert dedups a hold wave down to one arm); a pid
+    /// re-arms only on a hold AFTER its spawn fired (the inject removed
+    /// it). The z408 hold-age observation line stays untouched.
+    fn z502_arm_parked_conn(&mut self, vm_id: u32, parked_conn: ConnId) {
+        let pid = self
+            .conns
+            .get(&parked_conn)
+            .map(|bx| bx.sender_pid)
+            .unwrap_or(0);
+        if pid == 0 {
+            return;
+        }
+        if self.z502_spawn_armed_pids.insert(pid) {
+            info!(
+                "[KR64][binder][vm{}] 6-Z502: spawn arm pid={} (parked conn={}) — the BR_SPAWN_LOOPER pool-growth escape armed (budget={})",
+                vm_id, pid, parked_conn, self.z502_spawn_budget
+            );
+        }
+    }
+
+    /// 6-Z502 THE INJECT: called at a reply-construction for `conn_id` —
+    /// true exactly when this reply must PREPEND BR_SPAWN_LOOPER (the
+    /// conn's pid is armed AND the per-run budget has spawns left). The
+    /// arm is consumed here (one spawn per arm; a hold re-arms); past
+    /// the budget the arm drops (capped line) and the take refuses.
+    fn z502_take_spawn_arm(&mut self, conn_id: ConnId) -> bool {
+        if self.z502_spawn_armed_pids.is_empty() {
+            return false;
+        }
+        let pid = self
+            .conns
+            .get(&conn_id)
+            .map(|bx| bx.sender_pid)
+            .unwrap_or(0);
+        if pid == 0 || !self.z502_spawn_armed_pids.remove(&pid) {
+            return false;
+        }
+        if self.z502_spawn_budget == 0 {
+            if Z502_EXHAUSTED_LOG.load(Ordering::Relaxed) > 0 {
+                Z502_EXHAUSTED_LOG.fetch_sub(1, Ordering::Relaxed);
+                info!(
+                    "[KR64][binder] 6-Z502: spawn budget EXHAUSTED — the re-armed pid={} arm dropped (holds unwind via REPLY_TIMEOUT as before)",
+                    pid
+                );
+            }
+            return false;
+        }
+        self.z502_spawn_budget -= 1;
+        info!(
+            "[KR64][binder] 6-Z502: BR_SPAWN_LOOPER injected on the reply to conn={} (pid={}) — the guest spawns a pool thread whose ioctl takes the held txn (z469 take; budget left={})",
+            conn_id,
+            pid,
+            self.z502_spawn_budget
+        );
+        true
     }
 
     /// Route a transaction to its owner's mailbox. Returns false when the
@@ -6226,16 +6334,33 @@ fn handle_write_read(
         // waitForResponse consumes ONE reply per ioctl (kernel order —
         // thread todo before proc todo).
         let mut reply_delivered = false;
-        if let Some(dr) = {
+        // 6-Z502: the parked-conn's own exchange-completion point — when
+        // the armed pid's reply resolves here, the SPAWN rides the same
+        // read stream ([BR_SPAWN_LOOPER][BR_REPLY]; the COMPLETE was
+        // consumed at dispatch) so the parked thread spawns its proc's
+        // pool thread in the same waitForResponse that completes its own
+        // call. Taken ONLY when a reply actually resolves (a reply-less
+        // read leaves the arm for the next construction point).
+        let (resolved_reply, z502_spawn_reply) = {
             let mut b = bus.lock().expect("binder bus poisoned");
-            b.conns.get_mut(&conn_id).and_then(|bx| {
+            let dr = b.conns.get_mut(&conn_id).and_then(|bx| {
                 // 6-Z491: the reply DELIVER leg (the enqueue leg lives
                 // at the eight reply_queue push sites).
                 bx.z491.reply_del += 1;
                 bx.z491.last_del = Some(std::time::Instant::now());
                 bx.reply_queue.pop_front()
-            })
-        } {
+            });
+            let z502 = if dr.is_some() {
+                b.z502_take_spawn_arm(conn_id)
+            } else {
+                false
+            };
+            (dr, z502)
+        };
+        if z502_spawn_reply {
+            push_br_spawn_looper(&mut read_buf);
+        }
+        if let Some(dr) = resolved_reply {
             match dr {
                 DeferredReply::Reply {
                     data,
@@ -6505,6 +6630,13 @@ fn handle_write_read(
                     }
                     _ => false,
                 };
+                // 6-Z502: THE ARM — the gate held a sync txn on parked
+                // conn_id: arm the conn's own process for the
+                // BR_SPAWN_LOOPER pool-growth escape (per-PID dedup
+                // inside; the z408 hold-age line above stays the witness).
+                if z408_held {
+                    b.z502_arm_parked_conn(vm_id, conn_id);
+                }
                 if z408_held {
                     Delivery::None
                 } else {
@@ -6922,6 +7054,11 @@ fn handle_write_read(
                             }
                             _ => false,
                         };
+                        // 6-Z502: THE ARM (the 6-Z383 recheck's twin of
+                        // the primary-drain arm above).
+                        if z408_held {
+                            b.z502_arm_parked_conn(vm_id, conn_id);
+                        }
                         if z408_held {
                             None
                         } else {
@@ -8400,6 +8537,18 @@ fn servicemanager_proxy(
     }
 
     let (data, offsets) = writer.into_parts();
+    // 6-Z502: the SM reply path is a booting proc's STEADY read stream
+    // (the getService/register polls) — a reply to an ARMED pid recruits
+    // the pool thread that takes the 6-Z408-held txn (the z469 take).
+    // Skipped when this reply already recruits (one spawn is enough).
+    if !spawn_looper
+        && bus
+            .lock()
+            .expect("binder bus poisoned")
+            .z502_take_spawn_arm(conn_id)
+    {
+        spawn_looper = true;
+    }
     if spawn_looper {
         // 6-Z324/6-Z325: the registerForNotifications replies carry BOTH
         // the pool-thread recruitment AND (when a new watcher was stored)
@@ -9669,6 +9818,16 @@ fn servicemanager_hidl(
     }
 
     let (data, offsets, sg) = writer.into_parts_with_sg();
+    // 6-Z502: the HIDL twin of the AIDL arm-take above — the hwservicemanager
+    // reply path recruits the armed proc's pool thread.
+    if !spawn_looper
+        && bus
+            .lock()
+            .expect("binder bus poisoned")
+            .z502_take_spawn_arm(conn_id)
+    {
+        spawn_looper = true;
+    }
     if spawn_looper {
         // 6-Z324/6-Z325: the HIDL registerForNotifications replies carry
         // BOTH the pool-thread recruitment AND (when a new watcher was
@@ -19356,6 +19515,142 @@ mod tests {
         assert_eq!(taken.txn_id, 1, "conn 100 < conn 200 → its txn pops first");
         assert_eq!(b.conns[&100].inbox.len(), 0);
         assert_eq!(b.conns[&200].inbox.len(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // 6-Z502 — the BR_SPAWN_LOOPER pool-growth escape (the embrace unwind)
+    // ------------------------------------------------------------------
+
+    /// THE ARM keys on the PARKED conn's process — not the held tx's
+    /// sender: the proc todo (and the pool thread that must take the
+    /// held work) belongs to the target proc. rn478: conn=161 (pid 4126)
+    /// parked, held txs from senders 3490/4119. The set dedups a hold
+    /// wave to ONE arm per pid.
+    #[test]
+    fn z502_hold_arms_parked_conn_pid_once() {
+        let mut b = BusState::new();
+        for c in [161u64, 177] {
+            b.conns.insert(c, ConnBox::default());
+        }
+        b.conns.get_mut(&161).unwrap().sender_pid = 4126;
+        b.conns.get_mut(&161).unwrap().dev_code = 1;
+        b.conns.get_mut(&177).unwrap().sender_pid = 4126;
+        b.conns.get_mut(&177).unwrap().dev_code = 1;
+        b.z502_arm_parked_conn(7, 161);
+        // The hold wave repeats on the same parked conn (rn478: 16 holds
+        // on conn=161) — the arm stays a single entry:
+        b.z502_arm_parked_conn(7, 161);
+        b.z502_arm_parked_conn(7, 177);
+        assert_eq!(
+            b.z502_spawn_armed_pids.len(),
+            1,
+            "per-PID dedup: one pid, one arm"
+        );
+        assert!(b.z502_spawn_armed_pids.contains(&4126));
+    }
+
+    /// THE INJECT consumes the arm exactly once; any conn of the armed
+    /// pid can take it (the SM poll threads are the steady read stream —
+    /// rn479's 11,629 getService misses); a foreign pid never does.
+    #[test]
+    fn z502_take_consumes_arm_once_and_only_for_armed_pid() {
+        let mut b = BusState::new();
+        for c in [161u64, 200, 201] {
+            b.conns.insert(c, ConnBox::default());
+        }
+        b.conns.get_mut(&161).unwrap().sender_pid = 4126;
+        b.conns.get_mut(&200).unwrap().sender_pid = 4126;
+        b.conns.get_mut(&201).unwrap().sender_pid = 999;
+        b.z502_arm_parked_conn(7, 161);
+        assert!(
+            b.z502_take_spawn_arm(200),
+            "a sibling conn of the armed pid takes the arm"
+        );
+        assert!(
+            !b.z502_take_spawn_arm(161),
+            "one spawn per arm — the set entry is consumed"
+        );
+        assert!(
+            !b.z502_take_spawn_arm(201),
+            "a foreign pid never takes another proc's arm"
+        );
+        assert!(b.z502_spawn_armed_pids.is_empty());
+    }
+
+    /// The hold-existence budget caps spawns per run; past the cap the
+    /// re-armed pid's arm DROPS and the take refuses — the holds unwind
+    /// via their own REPLY_TIMEOUT exactly as before 6-Z502.
+    #[test]
+    fn z502_budget_caps_spawns_per_run() {
+        let mut b = BusState::new();
+        assert_eq!(b.z502_spawn_budget, 8, "the hold-existence budget default");
+        for i in 0..8u32 {
+            let c = 300u64 + i as u64;
+            b.conns.insert(c, ConnBox::default());
+            b.conns.get_mut(&c).unwrap().sender_pid = 500 + i as i32;
+            b.z502_arm_parked_conn(7, c);
+            assert!(b.z502_take_spawn_arm(c), "spawn #{} fires", i + 1);
+        }
+        assert_eq!(b.z502_spawn_budget, 0, "the 8 budgeted spawns burned");
+        b.conns.insert(400, ConnBox::default());
+        b.conns.get_mut(&400).unwrap().sender_pid = 999;
+        b.z502_arm_parked_conn(7, 400);
+        assert!(
+            !b.z502_take_spawn_arm(400),
+            "the budget refuses the 9th spawn"
+        );
+        assert!(
+            b.z502_spawn_armed_pids.is_empty(),
+            "the refused arm drops (no retry storm)"
+        );
+    }
+
+    /// The full unwind shape, bus-level: the hold arms the parked proc;
+    /// the fresh pool conn (the spawn's product) takes the arm, then the
+    /// EXISTING z469 take pops the gate-held txn from the parked sibling
+    /// — serving it unblocks the cycle partner and the embrace unwinds.
+    #[test]
+    fn z502_spawned_pool_thread_takes_held_txn_via_z469() {
+        let mut b = BusState::new();
+        for c in [161u64, 177, 250] {
+            b.conns.insert(c, ConnBox::default());
+        }
+        b.conns.get_mut(&161).unwrap().sender_pid = 4126;
+        b.conns.get_mut(&161).unwrap().dev_code = 1;
+        // parked mid-call to conn 177 (the cycle's own pid):
+        b.conns
+            .get_mut(&161)
+            .unwrap()
+            .out_sync
+            .push_back((900, 177, std::time::Instant::now()));
+        b.conns.get_mut(&177).unwrap().sender_pid = 4126;
+        b.conns.get_mut(&177).unwrap().dev_code = 1;
+        // the gate-held front: a FOREIGN sender's sync txn in the parked
+        // conn's inbox (sender != the parked call's target pid → held):
+        b.conns
+            .get_mut(&161)
+            .unwrap()
+            .inbox
+            .push_back(InboxItem::Tx(z469_tx(141, 778, 4119)));
+        b.conns.get_mut(&161).unwrap().pending_in.push(778);
+        // the escape: the hold arms the parked proc; the fresh pool conn
+        // takes the arm; its ioctl takes the held txn via z469.
+        b.z502_arm_parked_conn(7, 161);
+        b.conns.get_mut(&250).unwrap().sender_pid = 4126;
+        b.conns.get_mut(&250).unwrap().dev_code = 1;
+        assert!(
+            b.z502_take_spawn_arm(250),
+            "the spawned pool thread's reply construction fires the SPAWN"
+        );
+        let taken = b
+            .z469_take_held_sync(250)
+            .expect("the spawned looper takes the gate-held txn");
+        assert_eq!(taken.txn_id, 778);
+        assert!(
+            b.conns[&161].inbox.is_empty(),
+            "the hold drains — the embrace unwinds"
+        );
+        assert!(!b.conns[&161].pending_in.contains(&778));
     }
 
     // ------------------------------------------------------------------
