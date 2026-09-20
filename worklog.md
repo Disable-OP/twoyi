@@ -32032,3 +32032,63 @@ Stage Summary:
 - **The standing agenda (unchanged priorities)**: (1) IMPLEMENT 6-Z502 from the Task-246 wiring map (the arm/inject/unwind via the existing take) — the 16-hold fleet persists across three runs; (2) the 6-Z501 per-pid throttle; (3) the statsdw/socket-creation class + the EXIT-CATCH zero-fire re-audit; (4) the rung 8/9 push.
 - **Gates**: fmt clean; clippy clean; #2123 green.
 - **rn480 DISPATCHED via this marker** — the decode agenda: (1) the child-process story (which process the ZygoteInit child is — the ps subtree + the IDENT records); (2) the hold fleet's shape (does the 16-hold band persist or drain); (3) the BOOT_COMPLETED/Phase480/600 approach; (4) the 6-Z502's implementation lands NEXT session per the Task-246 map.
+
+## Task 248 — 6-Z502 LANDED per the Task-246 wiring map: the BR_SPAWN_LOOPER pool-growth escape — the ARM at both z408 hold sites, the INJECT at the three reply constructions a parked proc reaches, the UNWIND via the EXISTING z469 take — +4 tests, 1037/1037 — rn481 DISPATCHED via this marker
+
+- **The implementation (the wiring map, executed faithfully)**:
+  1. THE ARM: `BusState::z502_arm_parked_conn` (binder.rs, next to the
+     z469 take) — invoked at BOTH `z408_note_hold` sites (the primary
+     drain AND the 6-Z383 idle-recheck) right after the hold is noted —
+     inserts the PARKED conn's `sender_pid` into the new
+     `z502_spawn_armed_pids: HashSet<i32>`. Per-PID dedup = the set
+     itself (a 16-hold wave = ONE arm); a pid re-arms only on a hold
+     AFTER its spawn fired. The arm keys the PARKED conn's process, NOT
+     the held tx's sender — the proc todo belongs to the target proc.
+     The z408 hold-age observation line is untouched.
+  2. THE INJECT: `BusState::z502_take_spawn_arm(conn_id)` — called at
+     the THREE reply-construction points an armed (parked) proc actually
+     reaches: (a) the parked conn's OWN reply_queue resolution (the
+     exchange's completion point; the SPAWN rides [SPAWN][REPLY] — the
+     COMPLETE was consumed at dispatch), (b) the SM proxy's AIDL reply
+     construction, (c) the HIDL twin — (b)/(c) fold into the existing
+     6-Z324 `spawn_looper` flag → `TransactionResult::ReplySpawnLooper`
+     → `push_br_spawn_looper` batch (binder.h-correct SPAWN-first
+     order; BR_SPAWN_LOOPER = _IO('r',13) = 0x720d, constant at :795).
+     The getService poll stream is the delivery vehicle (rn479: 11,629
+     misses = a steady read stream of exactly the parked pid's conns).
+  3. THE UNWIND: zero new guest-side machinery needed — the guest's
+     real libbinder `IPCThreadState::executeCommand` handles
+     BR_SPAWN_LOOPER natively (the 6-Z324 precedent, in vivo since
+     rn273); the fresh pool thread's conn ioctl takes the held sync txn
+     via the EXISTING `z469_take_held_sync` → serves it → the cycle
+     partner unblocks → the embrace drains.
+- **The guards (all required ones)**: the hold-existence budget —
+  `z502_spawn_budget: u32` per bus (= per run), default 8
+  (Z502_SPAWN_BUDGET_DEFAULT): a spawn only fires while a hold EXISTS
+  (the arm), and at most 8 fire per run; past the cap the re-armed pid's
+  arm DROPS (no retry storm) and a capped Z502_EXHAUSTED_LOG line (4/run)
+  names it — the holds unwind via their own REPLY_TIMEOUT exactly as
+  before 6-Z502.
+- **The tests (+4, mirroring the z408/z469 style)**:
+  `z502_hold_arms_parked_conn_pid_once` (the arm keys the parked pid;
+  the hold wave dedups), `z502_take_consumes_arm_once_and_only_for_
+  armed_pid` (one spawn per arm; a sibling conn of the armed pid can
+  take it; a foreign pid never), `z502_budget_caps_spawns_per_run`
+  (8 fire, the 9th refuses, the arm drops), and
+  `z502_spawned_pool_thread_takes_held_txn_via_z469` (the full bus-
+  level unwind: hold → arm → the fresh pool conn takes the arm → the
+  z469 take pops the held txn → the parked conn's inbox drains).
+- **Gates**: fmt clean; clippy clean (zero new warnings); the FULL
+  suite 1037/1037 in 32.39s (was 1033).
+- **rn480 status**: run 35527097443 (boot-ladder on cdceda28) was still
+  IN PROGRESS at session close (the kr64 run #35527093013 green) — per
+  the proceed-anyway rule its decode lands next session.
+- **rn481 DISPATCHED via this marker** — the decode agenda: (1) the
+  6-Z502 verdict lines (the arm/inject/exhausted lines; did the 16-hold
+  fleet DRAIN — the before/after vs rn477-479's steady 16); (2) the
+  spawned-pool-thread story (the armed pid's NEW conns in the IDENT
+  census + the holds' drain timing); (3) the Phase480/600 /
+  BOOT_COMPLETED approach — the rung 8/9 push with the embrace
+  unwound; (4) the secondary legs unchanged (the z501 per-pid
+  throttle; the statsdw socket-creation class + the 6-Z391
+  EXIT-CATCH zero-fire re-audit).
