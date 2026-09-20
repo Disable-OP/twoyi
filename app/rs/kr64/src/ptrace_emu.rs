@@ -45509,7 +45509,25 @@ pub fn run_ptrace_loop(
                                                     format!(
                                                         "guest_path={} remove_file={} target_now_exists={} scratch_intact={} scratch_now={:?} expect={:?}",
                                                         gp,
-                                                        if rm.is_ok() { "ok" } else { "FAILED" },
+                                                        // 6-Z508a: SPELL the remove errno —
+                                                        // the rn488 forensics showed
+                                                        // remove_file=FAILED with
+                                                        // target_now_exists=true and an
+                                                        // INTACT scratch (the rewrite held;
+                                                        // the stale node survived the prep
+                                                        // for a reason the bare "FAILED"
+                                                        // could not name — the #118-era
+                                                        // benign-ENOENT decode does NOT
+                                                        // cover this shape). The errno is
+                                                        // the fix site's decisive datum:
+                                                        // EACCES/EPERM = the permission
+                                                        // topology; EISDIR = a dir shipped
+                                                        // at the socket path; ENOENT = the
+                                                        // #118 benign class (gone already).
+                                                        match &rm {
+                                                            Ok(()) => "ok".to_string(),
+                                                            Err(e) => format!("FAILED({})", e),
+                                                        },
                                                         now_exists,
                                                         intact,
                                                         now,
