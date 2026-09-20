@@ -25990,7 +25990,18 @@ pub fn run_ptrace_loop(
                         // displacement-vector evidence for the STALL-FD
                         // flush — fd 0 turned into a socket in rn454 with
                         // every dup denied and no connect traced.
-                        if z475_sserver_floor_pids.contains(&pid) {
+                        // 6-Z483b (rn455): the ring now also covers the
+                        // FULL zygote lineage (z306_zygote_lineage = the
+                        // pinned zygote + every pid it forked) — rn455's
+                        // stalls (pids 4237/4238, fd 0 = socket:[364300],
+                        // the SAME inode = one shared OFD) showed the
+                        // socket INHERITED from the zygote at fork: the
+                        // children's own rings were empty, so the
+                        // displacement happened in the ZYGOTE before the
+                        // fork — the zygote's own fd ops must be recorded.
+                        if z475_sserver_floor_pids.contains(&pid)
+                            || z306_zygote_lineage.contains(&pid)
+                        {
                             let z483_a1 = get_syscall_arg(&regs, abi.reg_arg1);
                             let z483_a2 = get_syscall_arg(&regs, abi.reg_arg2);
                             let z483_a3 = get_syscall_arg(&regs, abi.reg_arg3);
@@ -31652,6 +31663,53 @@ pub fn run_ptrace_loop(
                                         "6-Z305t-75d: pid={} close_range({}, {}) pc={:#x} maps[pc]={}",
                                         pid, first, last, pc_val, region
                                     ));
+                                }
+                                // 6-Z484: the close_range FLOOR — the
+                                // close-floor's sibling. rn454/455: fd 0 of
+                                // the zygote lineage turned into a socket
+                                // (the STALL-FD readout; the main thread's
+                                // read-on-stdin stall) while close(0) was
+                                // floored, every dup denied and ZERO
+                                // close_range traced — with 6-Z482's fdsan
+                                // disable the libc-internal closes that
+                                // used to abort now run, and ANY bulk-close
+                                // helper (bionic's __cxa/ART teardown
+                                // paths, a close_range-based fd sweep) can
+                                // free a stdio slot the floors believe
+                                // they own; the next socket()/open() then
+                                // re-allocates it and the children inherit
+                                // a foreign object on fd 0. Same honest
+                                // no-op as the close floor: rewrite the
+                                // syscall to getpid (the 6-Z147/6-Z305f
+                                // precedent), force ret=0 at EXIT via the
+                                // same z305y_zclose_pending machinery.
+                                // Every other close_range (first > 2) is
+                                // untouched — the bulk-cleanup semantics
+                                // stay.
+                                let z484_floor_pid =
+                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid);
+                                if z305y_stdio_pin_pid == Some(pid)
+                                    || z475_sserver_floor_pids.contains(&z484_floor_pid)
+                                {
+                                    static Z484_LOGGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let ln = Z484_LOGGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if ln < 24 {
+                                        log(&format!(
+                                            "6-Z484: floor close_range(first={}, last={}) pid={} → getpid rewrite (stdio floor at the syscall layer) [#{}]",
+                                            first, last, pid, ln + 1
+                                        ));
+                                    }
+                                    set_syscall_num(&mut regs, &abi, abi.getpid);
+                                    if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                        z305y_zclose_pending.insert(pid);
+                                    } else {
+                                        log(&format!(
+                                            "6-Z484: floor setregs FAILED pid={} — the close_range will execute",
+                                            pid
+                                        ));
+                                    }
                                 }
                             }
                         }
