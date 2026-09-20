@@ -9573,6 +9573,60 @@ fn parse_prop_msg(frame: &[u8]) -> Option<(String, String)> {
     Some((name, value))
 }
 
+/// 6-Z488: the SETPROP2 chunked-stream parser — the rn461 decode's
+/// predecessor. The rn458-460 evidence chain: the client property
+/// connects SUCCEED (ret=0 against the guest listener) yet the
+/// classic 188-byte prop_msg frames NEVER appear on the wire — the
+/// tracked-wire census is 29×5 B + 3×4 B writes. The modern bionic
+/// `__system_property_set` (Android 10+ / this rootfs's libc) sends
+/// the SETPROP2 protocol as MULTIPLE SMALL WRITES:
+///   1. a 4-byte little-endian magic `0x0002_0001` (PROP_MSG_SETPROP2)
+///   2. the name, NUL-terminated
+///   3. the value, NUL-terminated
+/// (init's handle_property_set_fd reads exactly this: RecvUint32 cmd,
+/// then RecvString name, then RecvString value — each RecvString
+/// consumes up to the NUL).
+///
+/// This parser consumes the ACCUMULATED per-fd byte stream (the
+/// 6-Z488 ENTRY arm appends every write/sendto payload on a tracked
+/// property-service fd, cap 512 B):
+///   - fewer than 4 bytes, or a non-SETPROP2 magic → None (keep
+///     accumulating / not ours);
+///   - the magic present but the name/value NULs not yet arrived →
+///     None (the stream is incomplete — the caller keeps the buffer);
+///   - the complete name+value → Some((name, value)) and the caller
+///     CLEARS the buffer (one set per stream).
+///
+/// PURE CORE — unit-locked against the rn461 hex-dump expectations.
+fn parse_setprop2_stream(buf: &[u8]) -> Option<(String, String)> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if magic != 0x0002_0001 {
+        return None;
+    }
+    // The name: from offset 4 to the first NUL (empty names rejected —
+    // bionic never sets an empty name).
+    let name_end = buf[4..].iter().position(|&b| b == 0)? + 4;
+    if name_end <= 4 {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&buf[4..name_end]).into_owned();
+    if name.is_empty() {
+        return None;
+    }
+    // The value: from name_end+1 to the next NUL. Missing NUL = the
+    // value chunk has not arrived yet — the stream stays incomplete.
+    if name_end + 1 >= buf.len() {
+        return None;
+    }
+    let vstart = name_end + 1;
+    let vend = buf[vstart..].iter().position(|&b| b == 0)? + vstart;
+    let value = String::from_utf8_lossy(&buf[vstart..vend]).into_owned();
+    Some((name, value))
+}
+
 /// 6-Z305: the real-Android BOOT_COMPLETED bridge predicate. TRUE exactly
 /// when a guest-observed property set IS the Android boot-completion signal:
 /// `sys.boot_completed` = "1" (init writes "1" when the framework finishes
@@ -18905,6 +18959,13 @@ pub fn run_ptrace_loop(
     // predicate check; dropped at close/process death like z307p fds.
     let mut z481_parsed: std::collections::HashMap<libc::pid_t, (String, String)> =
         std::collections::HashMap::new();
+    // 6-Z488: the per-(pid, fd) SETPROP2 chunked-stream accumulator —
+    // the modern bionic client sends the magic + the name + the value
+    // as MULTIPLE small writes; the accumulation stitches them until
+    // parse_setprop2_stream completes (cap 512 B, dropped honestly on
+    // overflow), cleared on the successful parse / close / death.
+    let mut z481_stream: std::collections::HashMap<(libc::pid_t, i64), Vec<u8>> =
+        std::collections::HashMap::new();
     // 6-Z305c: ENTRY-side readlink/readlinkat arg stash — (pid → (path_ptr,
     // buf_ptr)). bionic realpath (android-11) = open(O_PATH) + fstat(fd) +
     // readlink(/proc/self/fd/N) + stat(dst) with a dev/ino compare. At the
@@ -22257,6 +22318,8 @@ pub fn run_ptrace_loop(
             z307p_pending.remove(&pid);
             // 6-Z481: the wire-parse stash dies with the process.
             z481_parsed.remove(&pid);
+            // 6-Z488: the chunked-stream accumulator dies with the process.
+            z481_stream.retain(|(p, _), _| *p != pid);
             z306k_last.remove(&pid);
             z306k_last_natural.remove(&pid);
             z306k_probe_pending.remove(&pid);
@@ -22707,6 +22770,8 @@ pub fn run_ptrace_loop(
             z307p_pending.remove(&pid);
             // 6-Z481: the wire-parse stash dies with the process.
             z481_parsed.remove(&pid);
+            // 6-Z488: the chunked-stream accumulator dies with the process.
+            z481_stream.retain(|(p, _), _| *p != pid);
             z306k_last.remove(&pid);
             z306k_last_natural.remove(&pid);
             z306k_probe_pending.remove(&pid);
@@ -25979,58 +26044,72 @@ pub fn run_ptrace_loop(
                                     || (abi.sendto_nr != -1 && syscall_num == abi.sendto_nr)
                                 {
                                     let buf_ptr = get_syscall_arg(&regs, abi.reg_arg2);
-                                    let req_len = std::cmp::min(z307p_len as usize, 256);
-                                    // A legacy prop_msg frame is >= 128 bytes;
-                                    // the 4-5-byte early-wire noise (rn452
-                                    // census) never reaches the parser.
-                                    if buf_ptr != 0 && req_len >= 128 {
+                                    // 6-Z488: the SETPROP2 CHUNKED protocol —
+                                    // accumulate EVERY payload byte on the
+                                    // tracked wire (any length; the rn458-461
+                                    // census proved the sets flow as 4/5-byte
+                                    // writes: the SETPROP2 magic + the NUL-
+                                    // terminated name + value chunks — the
+                                    // ≥128-B classic gate skipped them ALL).
+                                    if buf_ptr != 0 && z307p_len > 0 {
+                                        let req_len = std::cmp::min(z307p_len as usize, 512);
                                         if let Some(payload) =
                                             read_child_bytes(pid, buf_ptr, req_len)
                                         {
-                                            if let Some((name, value)) = parse_prop_msg(&payload) {
+                                            let z488_key = (pid, z307p_fd);
+                                            let z488_buf = z481_stream.entry(z488_key).or_default();
+                                            if z488_buf.len() + payload.len() <= 512 {
+                                                z488_buf.extend_from_slice(&payload);
+                                            }
+                                            // Try BOTH protocols on the
+                                            // accumulated stream: the legacy
+                                            // single-frame (a ≥128-B write) or
+                                            // the chunked SETPROP2.
+                                            let z488_parsed_pair = parse_prop_msg(z488_buf)
+                                                .or_else(|| parse_setprop2_stream(z488_buf));
+                                            if let Some((name, value)) = z488_parsed_pair {
                                                 let n = Z481_PARSE.fetch_add(
                                                     1,
                                                     std::sync::atomic::Ordering::Relaxed,
                                                 );
                                                 if n < 4 {
                                                     log(&format!(
-                                                        "6-Z481: wire payload parsed pid={} name='{}' value.len={} seq={}",
+                                                        "6-Z488: wire payload parsed pid={} name='{}' value.len={} stream.len={} seq={}",
                                                         pid,
                                                         name,
                                                         value.len(),
+                                                        z488_buf.len(),
                                                         seq
                                                     ));
                                                 }
                                                 z481_parsed.insert(pid, (name, value));
-                                            } else {
-                                                // 6-Z487b: the payload is ≥128 B
-                                                // but NOT a classic prop_msg —
-                                                // log the first 32 bytes hex so
-                                                // the actual wire protocol names
-                                                // itself (rn460: the connects
-                                                // ret=0 yet zero parses — the
-                                                // frames exist, the parse is
-                                                // blind to their layout).
-                                                static Z487B_NONE_DIAG:
+                                                z488_buf.clear();
+                                            } else if z488_buf.len() >= 512 {
+                                                // A stuck accumulation (neither
+                                                // protocol completed) — drop it
+                                                // honestly; the next write starts
+                                                // fresh.
+                                                static Z488_DROP_DIAG:
                                                     std::sync::atomic::AtomicU64 =
                                                     std::sync::atomic::AtomicU64::new(0);
-                                                let nn = Z487B_NONE_DIAG.fetch_add(
+                                                let nn = Z488_DROP_DIAG.fetch_add(
                                                     1,
                                                     std::sync::atomic::Ordering::Relaxed,
                                                 );
                                                 if nn < 8 {
                                                     let mut hexs = String::new();
-                                                    for b in payload.iter().take(32) {
+                                                    for b in z488_buf.iter().take(32) {
                                                         hexs.push_str(&format!("{:02x}", b));
                                                     }
                                                     log(&format!(
-                                                        "6-Z487b: wire payload NOT classic prop_msg pid={} len={} head={}… seq={}",
+                                                        "6-Z488: stream dropped (no protocol match) pid={} len={} head={}… seq={}",
                                                         pid,
-                                                        req_len,
+                                                        z488_buf.len(),
                                                         hexs,
                                                         seq
                                                     ));
                                                 }
+                                                z488_buf.clear();
                                             }
                                         }
                                     }
@@ -37878,6 +37957,9 @@ pub fn run_ptrace_loop(
                             // 6-Z481: a parsed frame on a now-closed fd can
                             // never reach its EXIT check — drop it.
                             z481_parsed.remove(&pid);
+                            // 6-Z488: the partial chunked-stream for a
+                            // closed fd is dropped with it.
+                            z481_stream.remove(&(pid, closed_fd as i64));
                         }
                     }
                     // Task 6-V Part A2 — open()/openat()/openat2() EXIT:
@@ -56809,6 +56891,55 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         frame2[36..36 + value2.len()].copy_from_slice(value2);
         let (name2, value2) = parse_prop_msg(&frame2).expect("classic prop_msg must parse");
         assert!(!is_boot_completed_prop(&name2, &value2));
+    }
+
+    #[test]
+    fn z488_setprop2_chunked_stream_parser() {
+        // 6-Z488: the SETPROP2 chunked-stream parser — the rn461 decode
+        // identified the modern bionic property-set wire protocol:
+        // a 4-byte LE magic (0x0002_0001) + the NUL-terminated name +
+        // the NUL-terminated value, ARRIVING AS MULTIPLE SMALL WRITES
+        // (the rn452-460 census: 29×5 B + 3×4 B on the tracked wires —
+        // the classic ≥128-B parse gate skipped them all).
+        //
+        // The magic only:
+        let mut stream = vec![0x01, 0x00, 0x02, 0x00];
+        assert!(parse_setprop2_stream(&stream).is_none());
+        // + the name chunk:
+        stream.extend_from_slice(b"sys.boot_completed\0");
+        assert!(parse_setprop2_stream(&stream).is_none()); // the value not yet arrived
+                                                           // + the value chunk — the set COMPLETES:
+        stream.extend_from_slice(b"1\0");
+        let (name, value) =
+            parse_setprop2_stream(&stream).expect("the complete SETPROP2 stream must parse");
+        assert_eq!(name, "sys.boot_completed");
+        assert_eq!(value, "1");
+        assert!(is_boot_completed_prop(&name, &value));
+
+        // The mixed-chunk arrival (the magic+name in one write, the
+        // value in the next) parses identically once complete.
+        let mut mixed = vec![0x01, 0x00, 0x02, 0x00];
+        mixed.extend_from_slice(b"sys.boot_completed\0");
+        assert!(parse_setprop2_stream(&mixed).is_none());
+        mixed.extend_from_slice(b"1\0");
+        let (name2, value2) =
+            parse_setprop2_stream(&mixed).expect("the mixed-chunk stream must parse");
+        assert!(is_boot_completed_prop(&name2, &value2));
+
+        // A wrong magic is rejected (the parser stays silent — the
+        // accumulator keeps waiting for the honest stream).
+        let mut bad = vec![0x99, 0x00, 0x02, 0x00];
+        bad.extend_from_slice(b"sys.boot_completed\x00");
+        bad.extend_from_slice(b"1\x00");
+        assert!(parse_setprop2_stream(&bad).is_none());
+
+        // A non-boot property parses but never arms the bridge.
+        let mut ctl = vec![0x01, 0x00, 0x02, 0x00];
+        ctl.extend_from_slice(b"ctl.start\0");
+        ctl.extend_from_slice(b"bootanim\0");
+        let (cname, cvalue) = parse_setprop2_stream(&ctl).expect("the ctl stream must parse");
+        assert_eq!(cname, "ctl.start");
+        assert!(!is_boot_completed_prop(&cname, &cvalue));
     }
 
     #[test]
