@@ -49667,6 +49667,7 @@ pub fn run_ptrace_loop(
                                                 pid,
                                                 sig,
                                                 si_code,
+                                                si_addr,
                                                 z515_fatal_resolve_note(
                                                     &rows515,
                                                     pc515,
