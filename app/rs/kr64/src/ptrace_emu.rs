@@ -6397,6 +6397,19 @@ fn marker_present_in_regs(regs: &Regs, abi: &ChildAbi) -> bool {
     hook_marker_present(regs, abi)
 }
 
+/// 6-Z523a: the APEX-ENUM log cap — one line per FRESH (pid, fd) verdict
+/// whose fd origin lives under /apex/. The rn503 decode (Task 260) proved
+/// the guest PMS's per-boot apex-package flip (163 vs 153 scanned packages
+/// → the "Required services extension package" SIGKILL class): in the
+/// crash boots EVERY /apex/<name>/{priv-app,app} enumeration yielded zero
+/// packages while the flattened host trees were complete since +543 ms,
+/// and the emu logged NO denials on any /apex path. This probe makes the
+/// next crash boot's decode decisive: zero APEX-ENUM lines for priv-app
+/// dirs means the scans never reached a working fd (an open-side failure
+/// the guest swallowed); present lines mean the emu handed out a real
+/// directory fd and the kernel enumerated it (a guest-side PMS state).
+static Z523_APEX_ENUM_LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The backstop itself. See the module-style comment above. Returns
 /// and logs only; the pending map drives the EXIT-side fake return.
 ///
@@ -6471,6 +6484,24 @@ fn sandbox_backstop_at_entry(
                 getdents_verdict_cache.clear();
             }
             getdents_verdict_cache.insert(key, v);
+            // 6-Z523a: APEX-ENUM — apex-visibility telemetry on the FRESH
+            // (pid, fd) verdict only (one readlink per new fd; the cache
+            // memoizes the rest). Allowed fds only — a denial already
+            // logs its own SANDBOX BACKSTOP line.
+            if v {
+                if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
+                    let t = target.to_string_lossy().into_owned();
+                    if t.contains("/apex/")
+                        && Z523_APEX_ENUM_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            < 64
+                    {
+                        log(&format!(
+                            "6-Z523 APEX-ENUM: pid={} fd={} origin={}",
+                            pid, fd, t
+                        ));
+                    }
+                }
+            }
             v
         };
         if !allow {
@@ -23763,6 +23794,34 @@ pub fn run_ptrace_loop(
         // parks. See the 6-Z520a block for the full design.
         if stall_tick % 256 == 0 {
             z520a_wall_park_sweep(&tracked_pids);
+        }
+
+        // ── 6-Z523d: the APEX-TREE census + repair (the rn503 flip) ─────
+        //
+        // rn503 (Task 260): the guest PMS's per-boot apex flip — boots
+        // that scanned 153 packages (zero /apex/<name> packages despite
+        // the flattened host trees being complete since +543 ms) died of
+        // the "Required services extension package" SIGKILL class; boots
+        // that scanned 163 sailed through. The emu logged NO denials on
+        // any /apex path, so the flip's mechanism is still open — this
+        // census (every 1024 stall ticks ≈ 60 s of guest time) both
+        // (a) TELEMETERS the host-side tree state per tick and (b) REPAIRS
+        // a loss in place (re-extracts the damaged apex from its
+        // /system/apex source), so a mid-run tree loss can no longer kill
+        // the FOLLOWING eras. The getdents64-side APEX-ENUM probe
+        // (6-Z523a, in the backstop) completes the per-boot telemetry.
+        if stall_tick % 1024 == 0 {
+            let rootfs = sandbox.rootfs().to_string_lossy().into_owned();
+            let data_dir = sandbox
+                .staging_dir()
+                .and_then(|p| p.parent().map(|p| p.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
+            if crate::apex_tree_census_and_repair(&rootfs, &data_dir) {
+                // The host tree mutated — the canonical-resolution cache
+                // (deepest-existing-ancestor memoization) may hold stale
+                // shallower ancestors for the repaired subtrees.
+                sandbox.invalidate_resolve_cache();
+            }
         }
 
         // ── 6-Z306an: FORGOTTEN-RESUME watchdog — the #228 zygote wall ──

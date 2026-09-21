@@ -5664,6 +5664,125 @@ fn flatten_apex_payloads(cfg: &Config) {
     );
 }
 
+/// 6-Z523d: the apex-tree CENSUS + mid-run REPAIR — the rn503 flip hedge.
+///
+/// The rn503 decode (Task 260) proved the guest PMS's per-boot apex flip:
+/// boots whose PMS scan registered 153 packages (zero /apex/<name>
+/// packages — EVERY apex dir scan came up empty) died of the
+/// "Required services extension package" RuntimeException → the runtime
+/// SIGKILL'd itself → the zygote died (the era-death SIGKILL class,
+/// +188.8 s wasted per crashed era); boots that registered 163 (the 10
+/// apex packages present) sailed past the check. The flattened host
+/// trees were complete since +543 ms in BOTH shapes and the emu logged
+/// NO denials on any /apex path — so the mechanism (who made the trees
+/// invisible to the scan) is still open. This census runs on the tracer's
+/// stall tick (every ~60 s of guest time) and:
+///   (a) TELEMETERS the host-side tree state per tick (one
+///       `6-Z523 APEX-TREE-CENSUS` line: checked / damaged / repaired);
+///   (b) REPAIRS a loss IN PLACE: a package-bearing apex whose priv-app
+///       dir went missing/empty is re-extracted from its /system/apex
+///       source via the same [`flatten_one_apex`] the boot flatten uses —
+///       a mid-run tree loss can no longer kill the FOLLOWING eras.
+/// Returns true when at least one repair happened (the caller then
+/// invalidates the sandbox's canonical-resolution cache — the deepest-
+/// existing-ancestor memoization may hold stale shallower ancestors for
+/// the repaired subtrees).
+pub(crate) fn apex_tree_census_and_repair(rootfs: &str, data_dir: &str) -> bool {
+    const PACKAGE_BEARING: [&str; 6] = [
+        "com.android.extservices",
+        "com.android.tethering",
+        "com.android.permission",
+        "com.android.cellbroadcast",
+        "com.android.wifi",
+        "com.android.mediaprovider",
+    ];
+    // 1. manifest-name → source .apex path map (the flattened dir name is
+    // the MANIFEST name, not the file name — 6-Z305t-7).
+    let src_dir = format!("{}/system/apex", rootfs);
+    let mut sources: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if !name.ends_with(".apex") {
+                continue;
+            }
+            let path = format!("{}/{}", src_dir, name);
+            let manifest = crate::apex_extract::apex_manifest_name(&path)
+                .unwrap_or_else(|| name.trim_end_matches(".apex").to_string());
+            sources.insert(manifest, path);
+        }
+    }
+    // 2. the census: a package-bearing apex is DAMAGED when its priv-app
+    // dir is missing or empty (the scan-empty signature).
+    let mut damaged: Vec<&str> = Vec::new();
+    for name in PACKAGE_BEARING {
+        let priv_app = format!("{}/apex/{}/priv-app", rootfs, name);
+        let has_entries = std::fs::read_dir(&priv_app)
+            .map(|mut rd| rd.next().is_some())
+            .unwrap_or(false);
+        if !has_entries {
+            damaged.push(name);
+        }
+    }
+    // 3. the repair: re-extract each damaged apex from its source.
+    let mut repaired = 0usize;
+    for name in &damaged {
+        let Some(src) = sources.get(*name) else {
+            info!(
+                "[KR64][apex] 6-Z523 APEX-TREE-REPAIR: {} damaged but NO source .apex found in {} — cannot repair",
+                name, src_dir
+            );
+            continue;
+        };
+        let (len, mtime) = match std::fs::metadata(src) {
+            Ok(m) => (
+                m.len(),
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ),
+            Err(e) => {
+                info!(
+                    "[KR64][apex] 6-Z523 APEX-TREE-REPAIR: {} source stat failed: {}",
+                    name, e
+                );
+                continue;
+            }
+        };
+        let want = format!("v4:{}:{}", len, mtime);
+        let dst = format!("{}/apex/{}", rootfs, name);
+        let marker = format!("{}/.twoyi_extracted", dst);
+        match flatten_one_apex(src, &dst, &marker, &want, data_dir, rootfs) {
+            Ok(n) => {
+                repaired += 1;
+                info!(
+                    "[KR64][apex] 6-Z523 APEX-TREE-REPAIR: {} re-extracted ({} entries) — the mid-run tree loss is repaired in place",
+                    name, n
+                );
+            }
+            Err(e) => {
+                warning!(
+                    "[KR64][apex] 6-Z523 APEX-TREE-REPAIR: {} re-extraction failed: {}",
+                    name,
+                    e
+                );
+            }
+        }
+    }
+    info!(
+        "[KR64][apex] 6-Z523 APEX-TREE-CENSUS: checked={} damaged={} repaired={}",
+        PACKAGE_BEARING.len(),
+        damaged.len(),
+        repaired
+    );
+    repaired > 0
+}
+
 /// Extract one .apex payload into `dst` (6-Z305t-2). Returns the number
 /// of materialized entries. The ZIP side (apex_extract's STORED-entry
 /// reader) hands us the ext4 apex_payload.img bytes; apex_fs parses the
@@ -5853,6 +5972,68 @@ fn ensure_guest_keystore_dir(rootfs: &str) {
         "[KR64] PARENT: 6-Z305t-42b: guest /data/misc/keystore ensured at {} (0700, {}) — keystore2's chdir(argv[1]) can no longer ENOENT",
         keystore_dir, chown_note
     );
+}
+
+/// 6-Z523c: ensure the guest's apexdata trees exist with real-Android
+/// semantics. #rn503 svclog (Task 260): EVERY boot's
+/// RuntimePermissionsPersistenceImpl write failed with
+/// "Failed to create directory for
+/// /data/misc_de/0/apexdata/com.android.permission/runtime-permissions.xml.new"
+/// — AtomicFile.startWrite's parentDir.mkdirs() came back false, so the
+/// runtime-permissions write has been failing (and restoring backups)
+/// fleet-wide on every ladder run. The guest /data maps to {rootfs}/data
+/// (vfs.rs), so this is a boot-time staging gap exactly like the
+/// 6-Z305t-42b keystore dir: pre-create the DE-0 (device-protected) and
+/// CE (credential-protected) apexdata roots for the apex modules that
+/// write there at boot (com.android.permission's runtime-permissions,
+/// com.android.extservices' AdServices/ExtServices data). Idempotent:
+/// existing dirs are never wiped or recreated — only the mode/owner are
+/// re-asserted (02771 like the real /data/misc_de tree; chown
+/// system:system best-effort — rootless EPERMs harmlessly into the log).
+fn ensure_guest_apexdata_dirs(rootfs: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    const APEXDATA_DIRS: [&str; 3] = [
+        "data/misc_de/0/apexdata/com.android.permission",
+        "data/misc_de/0/apexdata/com.android.extservices",
+        "data/misc/apexdata/com.android.permission",
+    ];
+    let mut ensured = 0usize;
+    for rel in APEXDATA_DIRS {
+        let dir = format!("{}/{}", rootfs, rel);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            info!(
+                "[KR64] PARENT: 6-Z523c: create_dir_all({}) failed: {} (errno={}) — the runtime-permissions write keeps failing",
+                dir,
+                e,
+                e.raw_os_error().unwrap_or(0)
+            );
+            continue;
+        }
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2771));
+        let chown_note = match std::ffi::CString::new(dir.as_str()) {
+            Ok(c_path) => {
+                let r = unsafe { libc::chown(c_path.as_ptr(), 1000, 1000) };
+                if r == 0 {
+                    "chown ok"
+                } else {
+                    "chown failed (expected rootless)"
+                }
+            }
+            Err(_) => "chown skipped (non-UTF8 path)",
+        };
+        ensured += 1;
+        info!(
+            "[KR64] PARENT: 6-Z523c: apexdata dir ensured {} (2771, {}) — AtomicFile.mkdirs() can no longer ENOENT",
+            dir, chown_note
+        );
+    }
+    if ensured == APEXDATA_DIRS.len() {
+        // one compact success line keeps the log greppable per boot
+        info!(
+            "[KR64] PARENT: 6-Z523c: all {} apexdata dirs staged",
+            ensured
+        );
+    }
 }
 
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
@@ -6650,6 +6831,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // real-Android semantics (0700, system:system best-effort) — the same
     // staging-side pattern as the linkerconfig perms pass above.
     ensure_guest_keystore_dir(&cfg.rootfs);
+    // 6-Z523c: the apexdata trees (the per-boot runtime-permissions write
+    // failure fleet — see the fn doc for the rn503 svclog evidence).
+    ensure_guest_apexdata_dirs(&cfg.rootfs);
 
     // ---------------------------------------------------------------
     // Step 4: set up mount namespace + bind mounts + tmpfs.
@@ -18432,6 +18616,125 @@ mod tests {
         assert!(
             marker.exists(),
             "existing keystore dir must never be recreated/wiped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 6-Z523c: ensure_guest_apexdata_dirs ──
+    #[test]
+    fn ensure_guest_apexdata_dirs_creates_missing_trees() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z523c-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rootfs = dir.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("system")).unwrap();
+
+        ensure_guest_apexdata_dirs(rootfs.to_str().unwrap());
+
+        for rel in [
+            "data/misc_de/0/apexdata/com.android.permission",
+            "data/misc_de/0/apexdata/com.android.extservices",
+            "data/misc/apexdata/com.android.permission",
+        ] {
+            let d = rootfs.join(rel);
+            assert!(d.is_dir(), "apexdata dir must be staged: {}", rel);
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&d).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o771,
+                0o771,
+                "group/other must be able to traverse+write into the shared apexdata root: {:o}",
+                mode
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_guest_apexdata_dirs_is_idempotent_never_wipes() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z523c-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rootfs = dir.join("rootfs");
+        let perm = rootfs.join("data/misc_de/0/apexdata/com.android.permission");
+        std::fs::create_dir_all(&perm).unwrap();
+        let marker = perm.join("runtime-permissions.xml");
+        std::fs::write(&marker, b"keep").unwrap();
+
+        ensure_guest_apexdata_dirs(rootfs.to_str().unwrap());
+
+        assert!(
+            marker.exists(),
+            "existing apexdata dir must never be recreated/wiped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 6-Z523d: apex_tree_census_and_repair ──
+    #[test]
+    fn apex_tree_census_reports_undamaged_trees() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z523d-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rootfs = dir.join("rootfs");
+        for name in [
+            "com.android.extservices",
+            "com.android.tethering",
+            "com.android.permission",
+            "com.android.cellbroadcast",
+            "com.android.wifi",
+            "com.android.mediaprovider",
+        ] {
+            std::fs::create_dir_all(rootfs.join(format!("apex/{}/priv-app/ExtServices@1", name)))
+                .unwrap();
+        }
+
+        let repaired = apex_tree_census_and_repair(rootfs.to_str().unwrap(), dir.to_str().unwrap());
+
+        assert!(
+            !repaired,
+            "all six package-bearing apexes have non-empty priv-app dirs — no repair may fire"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apex_tree_census_flags_missing_priv_app_without_source_honestly() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z523d-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rootfs = dir.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("system/apex")).unwrap();
+        // NO apex trees, NO sources: the census must flag all six damaged,
+        // log the honest per-name NO-source line, repair nothing, and
+        // return false (nothing mutated → no cache invalidation needed).
+
+        let repaired = apex_tree_census_and_repair(rootfs.to_str().unwrap(), dir.to_str().unwrap());
+
+        assert!(
+            !repaired,
+            "without sources nothing can be repaired — the caller must not invalidate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apex_tree_census_repair_fails_honestly_on_garbage_source() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z523d-c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rootfs = dir.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("system/apex")).unwrap();
+        // A source .apex whose manifest name resolves to the damaged apex
+        // (apex_manifest_name falls back to the file name for non-ZIP
+        // garbage) — the extraction must fail HONESTLY (no panic, no
+        // partial repair claim) and the fn must return false.
+        std::fs::write(
+            rootfs.join("system/apex/com.android.extservices.apex"),
+            b"junk",
+        )
+        .unwrap();
+
+        let repaired = apex_tree_census_and_repair(rootfs.to_str().unwrap(), dir.to_str().unwrap());
+
+        assert!(
+            !repaired,
+            "a failed re-extraction is not a repair — the caller must not invalidate"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

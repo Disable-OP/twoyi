@@ -1440,6 +1440,22 @@ impl SandboxPolicy {
         self.canon_cache.borrow_mut().clear();
     }
 
+    /// 6-Z523d: read-only accessor for the sandbox rootfs — the tracer-side
+    /// apex-tree census/repair ([`crate::apex_tree_census_and_repair`])
+    /// needs the same root the syscall backstop verifies against, without
+    /// duplicating the rootfs string through every layer.
+    pub fn rootfs(&self) -> &std::path::Path {
+        &self.rootfs
+    }
+
+    /// 6-Z523d: read-only accessor for the exec-staging dir (its PARENT is
+    /// the app data dir's cache area — the apex repair reuses it for the
+    /// transient apex_payload.img file, same layout as the boot-time
+    /// flatten). None when this boot runs without a staging dir.
+    pub fn staging_dir(&self) -> Option<&std::path::Path> {
+        self.staging_dir.as_deref()
+    }
+
     /// 6-Z268: memoized `Path::exists()` for the runtime-host-fallback
     /// class (see `fallback_exists_cache`). The probe runs on EVERY
     /// /system|/apex lib-open attempt (linker dlopen storms — thousands
