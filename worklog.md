@@ -32745,3 +32745,18 @@ survives the import) or re-filled, does prepareAppData shorten and does system_s
 resume past the wall? (3) the wall verdicts round 4 (the probe budget resets per boot);
 (4) the rung-8 push — the boot's deepest marker is phase 100/PMS; the watchdog freeze is
 the only documented blocker left.
+
+## Task 263 addendum (6-Z529b: the blind-spot count — "none" must mean NONE)
+
+- The offline pipe-origin hunt (during the rn509 flight) found: the 6-Z319 PIPE2/FORK-GATE
+  lines are pure OBSERVATION (guest pipes are REAL kernel pipes — "the close itself
+  executes natively"); zygote's fork-gate pipes (99409/99410 at +145.3s) ≠ the watchdog's
+  127315 (created later). A REAL kernel pipe read with zero writers returns EOF
+  immediately — so "blocked in pipe read + writers=[] among tracked" almost certainly
+  means an UNTRACKED HOST process holds the write end silently.
+- **6-Z529b hardened the hunt**: a live host pid whose /proc/<pid>/fd is UNREADABLE
+  (EACCES/EPERM — another UID) is a BLIND SPOT — counted, never silently skipped.
+  `host-writers=none(blind=N)` is NOT a clean none (the writer could be behind EACCES);
+  only `none` (blind=0) names the EOF-semantics class. Hits carry the blind tag too.
+  Same test expanded (blind=0/3/1/2 cases) = 1119/1119; fmt/clippy clean.
+- Rides rn510 (rn509 was already cut on b8005b9d).

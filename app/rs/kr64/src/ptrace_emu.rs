@@ -13680,18 +13680,34 @@ fn z529_fd_entry(fd_no: &str, mode: &str, pos: Option<u64>) -> String {
     }
 }
 
-/// 6-Z529 (pure): the host-sweep verdict — "none" (no untracked holder
-/// anywhere → the EOF-semantics hunt), the joined hit list up to 6
-/// entries, or the 6-entry cap with an ellipsis marker.
-fn z529_host_verdict(hits: &[String]) -> String {
+/// 6-Z529b (pure): the host-sweep verdict — "none" (no untracked holder
+/// ANYWHERE readable → the EOF-semantics hunt), the joined hit list up
+/// to 6 entries, or the 6-entry cap with an ellipsis marker. A
+/// non-zero `blind` counts live processes whose fd dirs were
+/// UNREADABLE (EACCES/EPERM — another UID's /proc): the writer could
+/// be hiding there, so "none(blind=N)" is NOT a clean none.
+fn z529_host_verdict(hits: &[String], blind: usize) -> String {
     const CAP: usize = 6;
+    let blind_tag = if blind > 0 {
+        format!("(blind={})", blind)
+    } else {
+        String::new()
+    };
     if hits.is_empty() {
-        return "none".to_string();
+        if blind == 0 {
+            return "none".to_string();
+        }
+        return format!("none{}", blind_tag);
     }
     if hits.len() <= CAP {
-        return hits.join(",");
+        return format!("{}{}", hits.join(","), blind_tag);
     }
-    format!("{},…+{}", hits[..CAP].join(","), hits.len() - CAP)
+    format!(
+        "{},…+{}{}",
+        hits[..CAP].join(","),
+        hits.len() - CAP,
+        blind_tag
+    )
 }
 
 /// 6-Z529: the writer hunt for a readers-only pipe — the rn508 verdict
@@ -13738,7 +13754,11 @@ fn z529_writer_hunt(owner: libc::pid_t, ino: u64, tracked: &[libc::pid_t]) -> St
     // 2. the host sweep — EVERY /proc/<pid> outside the tracked list
     //    (the tracked pids were classified above; the twoyi app, the
     //    logcat piper and the spawn brokers are all untracked hosts).
+    //    A live pid whose fd dir is UNREADABLE (EACCES/EPERM — another
+    //    UID) is a BLIND SPOT: the write end could be there — counted,
+    //    never silently skipped (6-Z529b).
     let mut hits: Vec<String> = Vec::new();
+    let mut blind: usize = 0;
     if let Ok(dirs) = std::fs::read_dir("/proc") {
         for d in dirs.flatten() {
             let Ok(pid) = d.file_name().to_string_lossy().parse::<libc::pid_t>() else {
@@ -13747,7 +13767,19 @@ fn z529_writer_hunt(owner: libc::pid_t, ino: u64, tracked: &[libc::pid_t]) -> St
             if tracked.contains(&pid) {
                 continue;
             }
-            let Ok(fd_dir) = std::fs::read_dir(format!("/proc/{}/fd", pid)) else {
+            let fd_dir = std::fs::read_dir(format!("/proc/{}/fd", pid));
+            let Ok(fd_dir) = fd_dir else {
+                // The dir itself gone = the pid died mid-sweep (a dead
+                // process holds no fds — not a blind spot). A live dir
+                // we cannot LIST = the writer could be hiding there.
+                if std::path::Path::new(&format!("/proc/{}", pid)).exists()
+                    && matches!(
+                        std::fs::read_dir(format!("/proc/{}/fd", pid)),
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+                    )
+                {
+                    blind += 1;
+                }
                 continue;
             };
             for e in fd_dir.flatten() {
@@ -13784,7 +13816,7 @@ fn z529_writer_hunt(owner: libc::pid_t, ino: u64, tracked: &[libc::pid_t]) -> St
     format!(
         "6-Z529 owner-fds=[{}] host-writers={}",
         fds.join(","),
-        z529_host_verdict(&hits)
+        z529_host_verdict(&hits, blind)
     )
 }
 
@@ -62822,20 +62854,25 @@ mod z520a_wall_park_tests {
     /// marker so a noisy host cannot flood the trace.
     #[test]
     fn z529_host_verdict_caps_hits_and_names_none() {
-        assert_eq!(z529_host_verdict(&[]), "none");
+        assert_eq!(z529_host_verdict(&[], 0), "none");
+        assert_eq!(z529_host_verdict(&[], 3), "none(blind=3)"); // the writer could be behind EACCES
         assert_eq!(
-            z529_host_verdict(&["2035(io.twoyi.debug,write)".to_string()]),
+            z529_host_verdict(&["2035(io.twoyi.debug,write)".to_string()], 0),
             "2035(io.twoyi.debug,write)"
+        );
+        assert_eq!(
+            z529_host_verdict(&["2035(io.twoyi.debug,write)".to_string()], 1),
+            "2035(io.twoyi.debug,write)(blind=1)"
         );
         let six: Vec<String> = (1..=6).map(|i| format!("{}(p,write)", i)).collect();
         assert_eq!(
-            z529_host_verdict(&six),
+            z529_host_verdict(&six, 0),
             "1(p,write),2(p,write),3(p,write),4(p,write),5(p,write),6(p,write)"
         );
         let eight: Vec<String> = (1..=8).map(|i| format!("{}(p,write)", i)).collect();
         assert_eq!(
-            z529_host_verdict(&eight),
-            "1(p,write),2(p,write),3(p,write),4(p,write),5(p,write),6(p,write),…+2"
+            z529_host_verdict(&eight, 2),
+            "1(p,write),2(p,write),3(p,write),4(p,write),5(p,write),6(p,write),…+2(blind=2)"
         );
     }
 
