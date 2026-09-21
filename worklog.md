@@ -32605,3 +32605,43 @@ payload-absent files; a dest-wipe would not).
   live test IF dex2oat succeeds; (5) the payload dissection decides 6-Z526.
 - Disk: decode/rn505 (239M incl. the apk) + rsr2.tar.gz (497M in flight) on disk; prune
   rn505's tmp-x after the dissection to keep >4G free.
+
+---
+
+## Task 262 addendum (session 262, ~14:45Z — the WALL NAMED + the dex2oat flip narrowed to the open sequence)
+
+**rn506 decoded (17e27651; artifacts 10644545163): the mission's headline verdict landed.**
+- **THE WALL-ARTMUTEX FIRED WITH THE FULL NAME**: `6-Z520a WALL-ARTMUTEX: pid=4446
+  uaddr=0xe11835020fe4 state=3 owner=4534 owner-comm="watchdog" owner-wchan="anon_pipe_read"
+  flags=0x38 name="a monitor lock"` — the system_server MAIN THREAD parks on the ART monitor
+  lock (state=3, the exact rn499 shape) whose HOLDER IS THE WATCHDOG THREAD parked in
+  anon_pipe_read (a blocking pipe read). The 6-Z520a-v4 IDLE-COMM gate WORKED: 4 denies
+  (FinalizerDaemon +126.8s; Jit thread pool + ReferenceQueueD +267.8s — rn505's exact drain
+  fleet) and ALL 6 verdicts reached real walls: the init-pool worker (4535 "system-server-i",
+  word=0x2, +285.8s), CpuTracker (word=0x0), batterystats-wo (word=0x2), THE MAIN THREAD
+  (4446, word=0x3, +316.9s), and two iorapd parks (op=0x0 raw WAIT, +563.9s/+1233.9s —
+  waiting for package_native that never publishes).
+- **THE HANG CHAIN (the fix target)**: hung threads → the watchdog's 30s check trips → the
+  watchdog initiates the hung-thread dump → parks in anon_pipe_read HOLDING "a monitor
+  lock" → every thread needing that monitor (the main thread) parks in futex WAIT with
+  census wakes=NEVER → the whole start sequence freezes. 6-Z527b candidate: the
+  WALL-OWNER-PIPE probe (name the pipe's inode + readers/writers from /proc/<tid>/fd when
+  the ARTMUTEX owner's wchan is anon_pipe_read) — the writer's identity decides the fix.
+- **The dex2oat flip narrowed to ONE unknown**: rn506's trio (4456/4460/4463) died CANNOT
+  LINK libprofile.so AGAIN — while the 6-Z525 census (checked=7) reported damaged=0 on
+  EVERY tick (the host file exists from +652ms through the run). The census workflow round
+  2 (47e0c6b2) readelf'd the payload's dex2oat64: **libprofile.so is the FIRST DT_NEEDED**
+  (then libart-compiler/dexlayout/libart/libcrypto/libdexfile/libartbase/libartpalette/
+  libbase/libsigchain/libc++...), /system/lib64 has ONLY libbacktrace/libbase/libsigchain,
+  the ROM ships NO /linkerconfig/ld.config.txt. The forensics diff rn503-vs-rn506:
+  **BYTE-IDENTICAL generated ld.config.txt (85956 bytes)**. The 6-Z479a env captures:
+  **LD_LIBRARY_PATH=/dev in BOTH rn503 (success) and rn505/506 (fail)**. Everything matches
+  except the OUTCOME — the only remaining variable is the linker's ACTUAL open sequence.
+- **6-Z527a implemented (bd22a801, 1113/1113, clippy clean)**: the dex2oat linker-resolution
+  open TRACE — pids armed at the 6-Z450 events (cap 3) log every open/openat/openat2
+  ENTRY (the final post-rewrite path) paired with the EXIT ret (fd/-errno), 48 lines/pid,
+  pid-keyed pending (cross-tracee stops can't drop it), exit_group disarms (the pid-reuse
+  hazard). rn507's trace names the linker's search sequence — the fix writes itself.
+- **rn507 (#507) in flight on bd22a801 since ~14:47Z** (HTTP 204, full inputs, single-flight
+  held — rn506 was complete). The lint #2180 rides.
+- Sandbox: decode/rn503 (kr64.log + forensics) + rn505 + rn506 on disk; 5.1G free.
