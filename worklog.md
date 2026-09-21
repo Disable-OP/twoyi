@@ -32501,3 +32501,107 @@ Stage Summary:
 - Repo: main @ 4fd1b282, clean, in sync; host gates 1110/1110; both android targets clean. TWO implementation commits this session: 17464b41 (6-Z524) + 4fd1b282 (6-Z525).
 - **The rn505 decode agenda**: (1) **THE dex2oat LINK FATE** — does dex2oat64 link libprofile.so in the fresh boot (guest-logcat CANNOT LINK present/absent)? Present → the file loss is INTERMITTENT (a per-boot race in the 6-Z305t-2 walk); absent again → deterministic-ish (a payload-parse bug). (2) **THE UTIMENSAT VERDICT** — if dex2oat SUCCEEDS: the post-success utime must be TRANSLATED (no SANDBOX BACKSTOP deny, no "Could not update access times" PLOG) — the 6-Z524 arm's first live test; (3) the oat cache: does /data/dalvik-cache/arm64/ finally hold apex@…jar@classes.dex files (the re-dexopt-per-boot economy); (4) the era depth vs rn504's iorapd +369.1s + the post-iorapd wall (the 6-Z526 re-arm candidate); (5) the 6-Z525 census: rides rn506.
 - Next session: decode rn505 by sha (17464b41) → the dex2oat-link fate decides the extraction-walk hunt (6-Z526) vs the intermittent-race hedge → the loop continues.
+
+---
+
+## Task 262 (2026-09-21, session 262 — the SANDBOX-RESET RECOVERY + the rn505 decode + 6-Z520a-v4)
+
+**THE SANDBOX RESET (the session's opening event):** the entire sandbox state was wiped
+between session 261 (~12:20Z) and this session (~12:57Z): /home/z/twoyi-work (repo + all
+decode artifacts), the private auth state, $HOME/.cargo (rustup), and the
+cron automation (job 401668 gone — the cron list empty). The mission brief's fresh-sandbox
+provision held: the authentication material is embedded in the mission text (the upload/Pasted-Content copy of
+the brief SURVIVED the reset inside /tmp/my-project — the old sandbox's my-project snapshot
+at /tmp — including worklog.md @12:14 and the .zscripts). RECOVERY COMPLETED 13:00-13:36Z:
+(1) the authentication files rebuilt to the canonical private locations, the
+gh_header file) DIRECTLY from the brief's base64 line — never displayed, umask 077, the
+auth verified (the API login resolves to the repo owner); (2) the git credential helper
+re-pointed at the token file; (3) the repo re-cloned (main @ 08b499f9, the exact session-261
+handover head); (4) rustup 1.98.1 reinstalled (PATH needs $HOME/.cargo/bin); (5) the cron
+automation REBUILT as job 403309 (webDevReview kind, fixed_rate 3600s, priority 15). NOTE
+for future sessions: after ANY sandbox reset, re-derive everything from the mission brief
+at /tmp/my-project/upload/ (survives resets) — the brief carries the mission credentials, the repo URL, and
+the full dispatch recipe.
+
+**THE rn505 DECODE (by SHA 17464b41; artifacts re-downloaded from run 35596861004):**
+- Result: **rung 7 SURFACEFLINGER** (final). ONE system_server era (pid 4423, spawned
+  ~+198s) — no era deaths. surfaceflinger started +57.3s (rung 7's marker). The window-end
+  fleet: the FULL daemon set + zygote + SF + installd + iorapd + AMS's own threads
+  (ActivityManager ×3, android.bg in healthy ep_poll) — but NO SystemUI, NO launcher
+  (rung 8 never hit), and the main thread + android.fg + the system-server-init worker all
+  futex_do_wait.
+- **THE DEX2OAT LINK FATE: FAILED AGAIN — all 3 (service-permission pid 4433 +210.9s,
+  service-wifi pid 4446 +211.5s, ipsec pid 4448 +212.2s) exited 1 with `CANNOT LINK
+  EXECUTABLE "/apex/com.android.art/bin/dex2oat64": library "libprofile.so" not found`.
+  The rn503 (success) vs rn504/rn505 (fail) flip therefore stands: the file WAS resolvable
+  in rn503's boots and is NOT in rn504/rn505's.** The ZERO dalvik-cache deny fleet in rn505
+  is CONSISTENT with the 6-Z524 explanation (the failed dex2oat's early return precedes the
+  utime) but the utimensat arm still awaits its first live success-path test.
+- **THE NEW WALL (the rn505 headline): prepareAppData took 300,396ms** — the
+  SystemServerTimingAsync record: `InitThreadPoolExec:prepareAppData took to complete:
+  300396ms` (AppDataPrepare 299202ms; AppDataFixup 1191ms) inside StartPackageManagerService.
+  After it completed (~+500s) the start sequence NEVER RESUMED: zero further
+  SystemServerTiming lines, PMS's 'package' never published in this run, no SystemUI —
+  22 more minutes of idle binder waits (4423's HwBinder threads still doing ioctls at
+  +1475s: alive-but-stalled, not dead). The trio dex2oat failures sit INSIDE this window
+  (+210-212s) — the per-app prepare phase is where the boot bleeds 5 minutes and then
+  parks forever.
+- **THE BUDGET LESSON #3 — the v3 op filter DISPROVEN**: the 6-Z520a sweep spent ALL 6
+  late-pool verdicts by +271.8s: two Finalizer threads (3573/3588, a process spawned +67.4s,
+  gone by window end) at +126.8s, then FOUR of system_server's own ART daemons
+  (HeapTaskDaemon 4428 val=4 / ReferenceQueueD 4429 / FinalizerDaemon 4430 /
+  FinalizerWatchd 4431) at +269.8s — **all op=0x80 WAIT|PRIVATE, all 60s+ spans, all
+  census wakes=NEVER**. The v3 premise ("the idle-daemon fleet parks BITSET-only") is
+  WRONG on arm64: ART's Object.wait/Unsafe.park land on futex WAIT|PRIVATE too. The REAL
+  wall parks (main thread + android.fg, formed ~+500s) got ZERO verdicts. The
+  WALL-ARTMUTEX decode fired nowhere (the daemon parks' shapes/strings failed the
+  art::Mutex gate — honest Nones).
+- The 6-Z525 key-file census is NOT in rn505's binary (17464b41 predates 4fd1b282) —
+  the census said checked=6 damaged=0 on every tick (the priv-app check cannot see a
+  missing lib) and it RIDES RN506.
+
+**6-Z520a-v4 implemented (17e27651, +72/−6, +2 tests): the IDLE-COMM gate.**
+The sweep now reads /proc/<pid>/comm at spend time and denies the 9 ALWAYS-IDLE runtime
+daemon comms (HeapTaskDaemon, ReferenceQueueD, FinalizerDaemon, FinalizerWatchd, Jit thread
+pool, Signal Catcher, perfetto_hprof_, ADB-JDWP Connec, Profile Saver — case-sensitive
+EXACT matches against the kernel's deterministic 15-char truncations): a denied park never
+spends, never drains the pool, never records a pid spend; the first 4 denials per boot log
+a bounded `6-Z520a-v4 IDLE-COMM-DENY` witness; the WALL-PARK verdict line now carries
+`comm="..."` (every future decode names the waiter without a /proc walk). With the gate,
+rn506's 6 late verdicts should reach the ~+500s wall fleet (main thread + android.fg + the
+init-pool worker) with word re-reads. Quality gates: fmt clean, clippy ZERO, **1112/1112**
+(+2: the deny set verbatim from the rn505 verdicts; the wall-candidate comms pass; empty/
+case/length edges honest).
+
+**Dispatch discipline:** rn505 completed 10:08Z-class (no zombies); single-flight free;
+**rn506 (#506, run 35606476455) in flight on 17e27651 since ~13:36Z** (HTTP 204, full
+inputs: confirm_dispatch=yes, expect_rung=0, boot_wait_seconds=1800, stall_seconds=90,
+import_wait_seconds=300). The lint workflow #2175 rides the same push.
+
+**THE 6-Z526 LEAD (the libprofile.so root cause — first moves next session):** the
+workflow's rsr2 rootfs (the input DEFAULTS name rsr2; the download step's rsr1 fallbacks
+are dead code for dispatch events) is being fetched into the sandbox for the payload
+dissection: does system/apex/com.android.art.debug.apex's apex_payload.img contain
+lib64/libprofile.so at all (the manifest-name = "com.android.art" per the 6-Z305t-7 line —
+the SDK image ships the DEBUG art apex as THE art apex)? Present in the payload → the
+6-Z305t-2 walk loses it per-boot (a race or a dir-entry edge — hunt the walk); absent from
+the payload → the ROM-content gap class: the fix is to MATERIALIZE the missing DT_NEEDED
+(shipping/stubbing libprofile.so or patching the staged dex2oat64) — a decision the
+payload dissection settles. The rn503-vs-rn504 flip (same code, same asset) additionally
+points at ANY per-boot nondeterminism in read_dir order or the flatten merge — check
+whether the ROM ALSO ships a pre-flattened /apex/com.android.art (the merge would keep
+payload-absent files; a dest-wipe would not).
+
+**Stage Summary (Task 262):**
+- Repo: main @ 17e27651 (implementation; worklog head follows this entry), clean; gates
+  1112/1112; fmt/clippy zero. ONE implementation commit this session (17e27651 6-Z520a-v4).
+- The sandbox-reset playbook is now PROVEN end-to-end (credentials → repo → toolchain →
+  cron in ~36 minutes); cron 403309 restored.
+- rn506's decode agenda: (1) the v4 deny witnesses (expect HeapTask/ReferenceQueue/
+  Finalizer denies pre-+300s) + the LATE verdicts on the ~+500s wall fleet (main thread +
+  android.fg + the worker, word re-reads, the census answers); (2) the 6-Z525 key-file
+  census verdict (checked=7 — does it flag art and re-extract? does the repair fix the
+  dex2oat link mid-boot?); (3) the dex2oat link fate #3; (4) the utimensat arm's first
+  live test IF dex2oat succeeds; (5) the payload dissection decides 6-Z526.
+- Disk: decode/rn505 (239M incl. the apk) + rsr2.tar.gz (497M in flight) on disk; prune
+  rn505's tmp-x after the dissection to keep >4G free.
