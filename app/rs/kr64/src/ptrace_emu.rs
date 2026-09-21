@@ -3979,6 +3979,23 @@ fn z306af_resolve_pc(rows: &[(u64, u64, String)], pc: u64) -> Option<String> {
         .map(|(s, _, p)| format!("{}+{:#x}", p, pc - s))
 }
 
+/// 6-Z515 (pure): the compact fatal-signal module-attribution note —
+/// pc / lr / x17 resolved against an exec-map snapshot, raw-hex fallback
+/// when a value falls in no exec row (heap / stack / JIT / a dead address
+/// space). The rn494+rn495 system_server era deaths produced debuggerd
+/// tombstones whose frames were ALL `<unknown>` (crash_dump can never
+/// unwind under the emulation — every tracee is already traced by kr64)
+/// while the tracer's own capture dumped hundreds of raw MAPS lines
+/// without NAMING anything. This note turns the SAME snapshot into the
+/// one-line verdict — e.g. `pc=/...libandroid_servers.so+0x3e384` — so
+/// the next decode names the dying module outright instead of grepping
+/// the raw maps by hand.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn z515_fatal_resolve_note(rows: &[(u64, u64, String)], pc: u64, lr: u64, x17: u64) -> String {
+    let n = |v: u64| z306af_resolve_pc(rows, v).unwrap_or_else(|| format!("{v:#x}"));
+    format!("pc={} lr={} x17={}", n(pc), n(lr), n(x17))
+}
+
 /// 6-Z305t-71i: decode bionic's abort message at a fatal-signal stop.
 ///
 /// The debuggerd crash_dump CANNOT attach to any guest process — every
@@ -21381,6 +21398,11 @@ pub fn run_ptrace_loop(
     const SITE_QPIPE_INJECT_FAIL: u8 = 14;
     const SITE_ABORT_MSG: u8 = 15;
     const SITE_SIGSEGV_MAPS: u8 = 16;
+    // 6-Z515: the fatal-signal module-attribution line — per-pid keyed
+    // like SITE_ABORT_MSG (each crash-loop generation is a DISTINCT pid,
+    // so each generation names its dying module once).
+    #[cfg_attr(not(target_arch = "aarch64"), expect(dead_code))]
+    const SITE_Z515_RESOLVE: u8 = 17;
 
     // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
     // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
@@ -49539,6 +49561,62 @@ pub fn run_ptrace_loop(
                                 // leaf-wrapper shape on aarch64).
                                 let (z365_lr, z365_fp) = bt_lr_fp_of(&crash_regs);
                                 bt_walk_6z364(pid, rsp, z365_lr, z365_fp, 0);
+                                // ── 6-Z515: the fatal-signal MODULE ATTRIBUTION ──
+                                //
+                                // The rn494+rn495 era deaths (system_server
+                                // SIGSEGV at 0x0 and at 0xffffffffffffffe8)
+                                // left BOTH evidence carriers anonymous: the
+                                // debuggerd tombstones printed `<unknown>`
+                                // frames (crash_dump can never attach — every
+                                // tracee is already traced by kr64) and the
+                                // tracer's own capture dumped the full maps
+                                // RAW without resolving anything. At THIS
+                                // stop the child is stopped and
+                                // /proc/<tid>/maps is still live (the
+                                // EXIT-event read is the ENOENT one — the
+                                // #212/#213 lesson): resolve pc, lr (x30) and
+                                // the aarch64 dispatch register x17 against
+                                // the exec-map snapshot into ONE compact
+                                // line. Bounded per-pid like SITE_ABORT_MSG
+                                // (each crash-loop generation is a distinct
+                                // pid and names its module once). The rn495
+                                // post-mortem proved the shape: pc
+                                // 0xfebeab5cc384 → libandroid_servers.so
+                                // +0x3e384, x17 → libc.so+0xee40.
+                                #[cfg(target_arch = "aarch64")]
+                                {
+                                    if let Some(z515n) = stop_log_allow(
+                                        &mut stop_log_budget,
+                                        SITE_Z515_RESOLVE,
+                                        pid,
+                                        4096,
+                                    ) {
+                                        if let Ok(maps515) =
+                                            std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                        {
+                                            let rows515 = z306af_parse_exec_maps(&maps515);
+                                            let rp515 = &crash_regs as *const Regs as *const u64;
+                                            let pc515 = unsafe { *rp515.add(32) }; // user_pt_regs.pc
+                                            let lr515 = unsafe { *rp515.add(30) }; // x30
+                                            let x17_515 = unsafe { *rp515.add(17) };
+                                            let x8_515 = unsafe { *rp515.add(8) };
+                                            log(&format!(
+                                                "6-Z515 FATAL-SIGNAL-RESOLVE [occurrence #{} of this pid]: tid={} sig={} si_code={} si_addr={:#x} {} x8={:#x}",
+                                                z515n,
+                                                pid,
+                                                sig,
+                                                si_code,
+                                                z515_fatal_resolve_note(
+                                                    &rows515,
+                                                    pc515,
+                                                    lr515,
+                                                    x17_515
+                                                ),
+                                                x8_515
+                                            ));
+                                        }
+                                    }
+                                }
                                 // ── 6-Z306u: faulting-object memory peek ──
                                 //
                                 // #234 decode: the vendor-gralloc crash loop
@@ -51314,6 +51392,46 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         );
         assert!(z306af_resolve_pc(&rows, 0xaaaa2000).is_none());
         assert!(z306af_resolve_pc(&rows, 0xaaaa0fff).is_none());
+    }
+
+    #[test]
+    fn z515_fatal_resolve_note_names_modules_with_hex_fallback() {
+        let rows = vec![
+            (0xaaaa1000, 0xaaaa2000, "/system/lib64/liba.so".to_string()),
+            (0xbbbb0000, 0xbbbb1000, "/system/lib64/libc.so".to_string()),
+        ];
+        // pc + lr fall inside named exec rows; x17 lands in no row → the
+        // raw-hex fallback (heap / stack / JIT / dead address space).
+        assert_eq!(
+            z515_fatal_resolve_note(&rows, 0xaaaa1234, 0xbbbb0010, 0xdead_beef),
+            "pc=/system/lib64/liba.so+0x234 lr=/system/lib64/libc.so+0x10 x17=0xdeadbeef"
+        );
+        // A fully-anonymous crash (no maps rows at all) stays raw hex.
+        assert_eq!(
+            z515_fatal_resolve_note(&[], 0x1000, 0x2000, 0x3000),
+            "pc=0x1000 lr=0x2000 x17=0x3000"
+        );
+    }
+
+    #[test]
+    fn z515_fatal_resolve_note_reproduces_the_rn495_era_death_shape() {
+        // The rn495 era-1 death (system_server, si_addr=0x0): pc 0xfebeab5cc384
+        // resolved by hand against the tracer's own maps dump — the note must
+        // produce the same verdict in one line.
+        let rows = vec![(
+            0xfebeab58e000,
+            0xfebeab5e9000,
+            "/data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libandroid_servers.so"
+                .to_string(),
+        )];
+        let note = z515_fatal_resolve_note(&rows, 0xfebeab5cc384, 0xfebeab5cc384, 0xfec15292ae40);
+        assert!(note.starts_with(
+            "pc=/data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libandroid_servers.so+0x3e384"
+        ));
+        // pc == lr on that death (a dispatch-shaped leaf) — both named.
+        assert!(note.contains("lr=/data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libandroid_servers.so+0x3e384"));
+        // x17 was libc text (the dispatch target) — anonymous here → hex.
+        assert!(note.ends_with("x17=0xfec15292ae40"));
     }
 
     /// 6-Z460: the raw ret-scan candidate extraction — synthetic
