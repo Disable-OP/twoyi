@@ -12757,6 +12757,418 @@ fn z503_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+// ── 6-Z520a: the WALL-PARK sweep (the rn499 wall) ────────────────────
+//
+// rn499's decode (Task 258 + addendum): the boot's frontier moved past
+// the sensors edge (StartSensorService COMPLETED, sensor_privacy +
+// sensorservice registered) and the new stall is THREAD COORDINATION:
+// system_server's main thread parked in a futex from ~+242 s to the
+// window end (word=0x3 — an ART-style sequence/counter word, WAKE-CENSUS
+// wakes=NEVER) and the InitThreadPool worker (4135) parked the same way
+// after completing the sensors task — 2 hw replies + 2 inbox items
+// UNCOLLECTED. The park instruments exist (6-Z501 the uaddr/val/op/word
+// probe; 6-Z271f the stall dump; 6-Z403 the wake census; 6-Z446/447 the
+// monitor window + the CV decode) but their budgets all EXHAUSTED long
+// before the wall: the z501 late pool (8) drained by +105.3 s on the
+// daemon fleet's routine 10-15 s parks, and the z404/z406 probe budgets
+// (3/6 per pid) stopped re-probing parked pids after 1-2 catches —
+// 4135's 20-minute park was probed exactly 3 times (+458.7→+488.7 s).
+//
+// 6-Z520a is a SEPARATE, read-only sweep with its OWN budget that
+// structurally cannot be starved by routine parks:
+//   * THE WALL GATE: a verdict spends only when the same (pid, uaddr)
+//     park episode has been OBSERVED PARKED across >= 60 s of sweep
+//     catches (the rn499 walls parked for 20+ minutes; the routine
+//     fleet parks for seconds). No dwell gaming: a catch when NOT
+//     parked (running, a non-wait syscall, a wake-family futex op)
+//     ends the episode honestly (the sweep teardown).
+//   * THE REFIRE CADENCE: after the first verdict the episode re-fires
+//     every >= 60 s, up to 3 verdicts per episode — each re-reads the
+//     futex word, so the decode sees FROZEN (never-signaled: the word
+//     never moved; excludes the 6-Z447 lost-wake fingerprint) vs
+//     ADVANCING (signals landed in memory but no wake-family futex was
+//     ever traced on the address — the emulator lost-wake class) over
+//     the park's lifetime.
+//   * THE BUDGET: 6 verdicts per run, its own pool (the z501/z503/z505
+//     pools are untouched).
+//   * THE PAYLOAD per verdict (all read-only — /proc + process_vm_readv;
+//     ZERO tracee interaction, the 6-Z415 vanish-class discipline):
+//     uaddr/op/val + the CURRENT word + the park span + the wchan +
+//     the 6-Z403 wake-census answer for the uaddr + the recent sibling
+//     parks (other pids observed on the SAME uaddr within 30 s — the
+//     waiter census the "name the waiter" discipline asks for) + the
+//     kernel-stack head + the parking pc's maps row.
+//
+// The sweep runs on the ~15 s stall tick (the Z404/Z406 cadence) over
+// the tracked pid list — ONE /proc/<pid>/syscall read per pid per tick
+// (the Z406 pass already pays a /proc/<tid>/status read per pid per
+// tick; same cost class).
+
+/// The wall gate: an episode must be observed parked across at least
+/// this many seconds before its first verdict spends.
+const Z520A_WALL_DWELL_SECS: u64 = 60;
+/// Re-fire interval between two verdicts of the same episode.
+const Z520A_REFIRE_SECS: u64 = 60;
+/// Verdicts per episode (1 first fire + 2 re-fires).
+const Z520A_EPISODE_CAP: u32 = 3;
+/// The run budget (the sweep's own pool).
+const Z520A_BUDGET: u64 = 6;
+/// A catch after this much park-gap re-arms the episode (the park ENDED:
+/// observed running, a non-wait syscall, or a wake-family op).
+const Z520A_STALE_SECS: u64 = 120;
+/// The episode-map cap (stale-evicted; the fleet is hundreds of pids).
+const Z520A_EPISODE_MAP_CAP: usize = 1024;
+/// The sibling-parks recency window (the sweep cadence is ~15 s).
+const Z520A_SIBLING_WINDOW_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy)]
+struct Z520AEpisode {
+    first_seen_secs: u64,
+    last_seen_secs: u64,
+    last_verdict_secs: u64,
+    last_word: Option<u32>,
+    refires: u32,
+}
+
+type Z520AEpisodes = std::collections::HashMap<(libc::pid_t, u64), Z520AEpisode>;
+
+fn z520a_episodes() -> &'static std::sync::Mutex<Z520AEpisodes> {
+    static S: std::sync::OnceLock<std::sync::Mutex<Z520AEpisodes>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn z520a_budget_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static B: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    B.get_or_init(|| std::sync::atomic::AtomicU64::new(Z520A_BUDGET))
+}
+
+/// 6-Z520a (pure): does this futex op BLOCK (a park)? WAIT-family only:
+/// WAIT(0), LOCK_PI(6), WAIT_BITSET(9), WAIT_REQUEUE_PI(11) under the
+/// 0x7f command mask (the PRIVATE flag in bit 7 is irrelevant). The
+/// wake/requeue family (1/3/4/5/10) and FD(2) never park.
+fn z520a_op_is_wait_family(op: u64) -> bool {
+    matches!(op & 0x7f, 0 | 6 | 9 | 11)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Z520ADecision {
+    /// Arm/refresh the episode (no spend).
+    Observe,
+    /// Spend a verdict (the caller drains its budget atomically).
+    Spend,
+}
+
+/// 6-Z520a (pure): the wall-gate decision for one sweep catch.
+/// budget_left == 0 keeps OBSERVING (silent; the episode tracking stays
+/// honest but nothing can spend).
+fn z520a_wall_decide(
+    eps: &mut Z520AEpisodes,
+    budget_left: u64,
+    pid: libc::pid_t,
+    uaddr: u64,
+    now_secs: u64,
+) -> Z520ADecision {
+    if budget_left == 0 {
+        return Z520ADecision::Observe;
+    }
+    if eps.len() >= Z520A_EPISODE_MAP_CAP {
+        // Stale-evict first; entries still fresh at the cap stay (new
+        // keys are skipped until room appears).
+        eps.retain(|_, e| now_secs.saturating_sub(e.last_seen_secs) <= Z520A_STALE_SECS);
+    }
+    match eps.get_mut(&(pid, uaddr)) {
+        None => {
+            if eps.len() < Z520A_EPISODE_MAP_CAP {
+                eps.insert(
+                    (pid, uaddr),
+                    Z520AEpisode {
+                        first_seen_secs: now_secs,
+                        last_seen_secs: now_secs,
+                        last_verdict_secs: 0,
+                        last_word: None,
+                        refires: 0,
+                    },
+                );
+            }
+            Z520ADecision::Observe
+        }
+        Some(e) => {
+            if now_secs.saturating_sub(e.last_seen_secs) > Z520A_STALE_SECS {
+                // The park ended long ago — a fresh episode (the spend
+                // history of the dead episode does not carry over).
+                *e = Z520AEpisode {
+                    first_seen_secs: now_secs,
+                    last_seen_secs: now_secs,
+                    last_verdict_secs: 0,
+                    last_word: None,
+                    refires: 0,
+                };
+                return Z520ADecision::Observe;
+            }
+            e.last_seen_secs = now_secs;
+            let span = now_secs.saturating_sub(e.first_seen_secs);
+            if span >= Z520A_WALL_DWELL_SECS
+                && e.refires < Z520A_EPISODE_CAP
+                && now_secs.saturating_sub(e.last_verdict_secs) >= Z520A_REFIRE_SECS
+            {
+                e.refires += 1;
+                e.last_verdict_secs = now_secs;
+                Z520ADecision::Spend
+            } else {
+                Z520ADecision::Observe
+            }
+        }
+    }
+}
+
+/// 6-Z520a (pure): the word-delta class between two verdicts of the same
+/// park episode — the never-signaled vs lost-wake discriminator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Z520AWordDelta {
+    FirstObservation,
+    Frozen,
+    Changed(u32, u32),
+}
+
+fn z520a_word_delta(prev: Option<u32>, cur: Option<u32>) -> Z520AWordDelta {
+    match (prev, cur) {
+        (Some(p), Some(c)) if p == c => Z520AWordDelta::Frozen,
+        (Some(p), Some(c)) => Z520AWordDelta::Changed(p, c),
+        _ => Z520AWordDelta::FirstObservation,
+    }
+}
+
+/// 6-Z520a: the futex word's CURRENT value (read-only process_vm_readv —
+/// the raw syscall; bionic's wrapper does not exist at the android21 API
+/// level, the z501 precedent). None = unreadable (honest).
+fn z520a_read_futex_word(pid: libc::pid_t, uaddr: u64) -> Option<u32> {
+    let mut buf: u32 = 0;
+    let mut local = libc::iovec {
+        iov_base: (&mut buf as *mut u32) as *mut libc::c_void,
+        iov_len: std::mem::size_of::<u32>(),
+    };
+    let remote = libc::iovec {
+        iov_base: uaddr as *mut libc::c_void,
+        iov_len: std::mem::size_of::<u32>(),
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_process_vm_readv,
+            pid,
+            &mut local as *mut libc::iovec,
+            1,
+            &remote as *const libc::iovec,
+            1,
+            0,
+        )
+    };
+    if rc == 4 {
+        Some(buf)
+    } else {
+        None
+    }
+}
+
+/// 6-Z520a: the kernel-stack head (/proc/<pid>/stack — root-readable on
+/// the ladder host; a failure is honest and the rest of the payload
+/// carries the verdict).
+fn z520a_kstack_summary(pid: libc::pid_t) -> String {
+    match std::fs::read_to_string(format!("/proc/{}/stack", pid)) {
+        Ok(s) => {
+            let lines: Vec<&str> = s
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .take(3)
+                .collect();
+            if lines.is_empty() {
+                "empty".to_string()
+            } else {
+                lines.join(" | ")
+            }
+        }
+        Err(e) => format!("unreadable ({})", e),
+    }
+}
+
+/// 6-Z520a: the recent sibling parks — distinct OTHER pids observed on
+/// the SAME uaddr within the sibling window (the Z520a episode map + the
+/// z503 throttle state; both record "last seen parked here"). The waiter
+/// census the "name the waiter" discipline asks for.
+fn z520a_sibling_parks(uaddr: u64, now_secs: u64, exclude: libc::pid_t) -> String {
+    let mut pids: Vec<libc::pid_t> = Vec::new();
+    {
+        let eps = z520a_episodes().lock().unwrap_or_else(|e| e.into_inner());
+        for ((p, ua), e) in eps.iter() {
+            if *p != exclude
+                && *ua == uaddr
+                && now_secs.saturating_sub(e.last_seen_secs) <= Z520A_SIBLING_WINDOW_SECS
+            {
+                pids.push(*p);
+            }
+        }
+    }
+    {
+        let z503 = z503_throttle_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (p, st) in z503.iter() {
+            if *p != exclude
+                && st.last_uaddr == uaddr
+                && now_secs.saturating_sub(st.last_seen_secs) <= Z520A_SIBLING_WINDOW_SECS
+                && !pids.contains(p)
+            {
+                pids.push(*p);
+            }
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    if pids.is_empty() {
+        "n=0".to_string()
+    } else {
+        let shown: Vec<String> = pids.iter().take(3).map(|p| p.to_string()).collect();
+        format!("n={} pids=[{}]", pids.len(), shown.join(", "))
+    }
+}
+
+/// 6-Z520a: the sweep — one read-only pass over the tracked pids on the
+/// ~15 s stall tick. Any catch that shows the pid NOT parked in a
+/// wait-family futex (running, another syscall, a wake-family op, an
+/// unreadable proc entry) ends that pid's episodes honestly.
+fn z520a_wall_park_sweep(pids: &[libc::pid_t]) {
+    let now_secs = z503_now_secs();
+    for &pid in pids {
+        let read_ok = match std::fs::read_to_string(format!("/proc/{}/syscall", pid)) {
+            Ok(line) => {
+                let parsed = z501_parse_procfs_syscall(&line);
+                match parsed {
+                    Some((nr, args))
+                        if (nr == 98 || nr == 202 || nr == 240)
+                            && z520a_op_is_wait_family(args[1]) =>
+                    {
+                        // Parked in a wait-family futex: uaddr = args[0].
+                        let uaddr = args[0];
+                        let op = args[1];
+                        let val = args[2];
+                        let budget_left =
+                            z520a_budget_cell().load(std::sync::atomic::Ordering::Relaxed);
+                        let decision = {
+                            let mut eps =
+                                z520a_episodes().lock().unwrap_or_else(|e| e.into_inner());
+                            z520a_wall_decide(&mut eps, budget_left, pid, uaddr, now_secs)
+                        };
+                        if decision == Z520ADecision::Spend {
+                            z520a_wall_park_verdict(pid, uaddr, op, val, &line, now_secs);
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Err(_) => false,
+        };
+        if !read_ok {
+            // Not parked (or gone): end the pid's episodes.
+            z520a_episodes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(p, _), _| *p != pid);
+        }
+    }
+}
+
+/// 6-Z520a: emit one WALL-PARK verdict (the spend path; the budget drain
+/// uses the z501 floor-restore pattern).
+fn z520a_wall_park_verdict(
+    pid: libc::pid_t,
+    uaddr: u64,
+    op: u64,
+    val: u64,
+    syscall_line: &str,
+    now_secs: u64,
+) {
+    let prev = z520a_budget_cell().fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if prev == 0 {
+        // A racing spend emptied the pool between the decide and the
+        // drain — restore the floor and drop the verdict (the z501
+        // tolerance).
+        z520a_budget_cell().store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    if prev == 1 {
+        crate::trace_log_line(&format!(
+            "6-Z520a BUDGET: the wall-park budget exhausted ({} verdicts spent; the {}s dwell gate + the per-episode cap {} remain armed)",
+            Z520A_BUDGET,
+            Z520A_WALL_DWELL_SECS,
+            Z520A_EPISODE_CAP
+        ));
+    }
+    let (span_secs, prev_word, word) = {
+        let mut eps = z520a_episodes().lock().unwrap_or_else(|e| e.into_inner());
+        match eps.get_mut(&(pid, uaddr)) {
+            Some(e) => {
+                let span = now_secs.saturating_sub(e.first_seen_secs);
+                let pw = e.last_word;
+                let w = z520a_read_futex_word(pid, uaddr);
+                e.last_word = w;
+                (span, pw, w)
+            }
+            None => (0, None, None),
+        }
+    };
+    let census = match z403_wake_census_lookup(uaddr) {
+        Some((calls, woken, age)) => format!(
+            "wake-calls={} woken={} last={:.0}s-ago",
+            calls,
+            woken,
+            age.as_secs_f32()
+        ),
+        None => "wakes=NEVER".to_string(),
+    };
+    let siblings = z520a_sibling_parks(uaddr, now_secs, pid);
+    let wchan = std::fs::read_to_string(format!("/proc/{}/wchan", pid))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    let pc = {
+        let toks: Vec<&str> = syscall_line.split_whitespace().collect();
+        if toks.len() >= 8 {
+            u64::from_str_radix(toks[7].trim_start_matches("0x"), 16).unwrap_or(0)
+        } else {
+            0
+        }
+    };
+    let delta = match z520a_word_delta(prev_word, word) {
+        Z520AWordDelta::FirstObservation => "first-observation".to_string(),
+        Z520AWordDelta::Frozen => "frozen".to_string(),
+        Z520AWordDelta::Changed(p, c) => format!("changed {:#x}->{:#x}", p, c),
+    };
+    crate::trace_log_line(&format!(
+        "6-Z520a WALL-PARK: pid={} uaddr={:#x} op={:#x} ({}) val={} word={} span={}s wchan={} census={} siblings={} word-delta={} pc={:#x} {}",
+        pid,
+        uaddr,
+        op,
+        z501_futex_op_name(op),
+        val,
+        match word {
+            Some(w) => format!("{:#x}", w),
+            None => "unreadable".to_string(),
+        },
+        span_secs,
+        wchan,
+        census,
+        siblings,
+        delta,
+        pc,
+        maps_region_for_pc(pid, pc),
+    ));
+    crate::trace_log_line(&format!(
+        "6-Z520a WALL-KSTACK: pid={} [{}]",
+        pid,
+        z520a_kstack_summary(pid)
+    ));
+}
+
 /// 6-Z501: the FUTEX-PARK forensics probe — a blocked-in-futex tracee's
 /// uaddr/val/op + the parking pc's maps row + the futex word's value,
 /// all read-only (the /proc syscall file + process_vm_readv; NO ptrace
@@ -23097,6 +23509,20 @@ pub fn run_ptrace_loop(
                     stall_interrupt_probe(tid, &abi);
                 }
             }
+        }
+
+        // ── 6-Z520a: the WALL-PARK sweep (the rn499 wall) ───────────────
+        //
+        // The read-only wall tier: a (pid, uaddr) futex park observed
+        // across >= 60 s earns its OWN verdict pool (6/run), structurally
+        // immune to the routine parks that drained the z501 late pool by
+        // +105 s and the z404/z406 per-pid probe budgets (4135's 20-min
+        // park got exactly 3 probes). Re-fires every 60 s re-read the
+        // futex word — frozen vs advancing decides the never-signaled vs
+        // lost-wake question for the system_server main + InitThreadPool
+        // parks. See the 6-Z520a block for the full design.
+        if stall_tick % 256 == 0 {
+            z520a_wall_park_sweep(&tracked_pids);
         }
 
         // ── 6-Z306an: FORGOTTEN-RESUME watchdog — the #228 zygote wall ──
@@ -61216,6 +61642,178 @@ mod z503_throttle_tests {
         assert_eq!(Z503_PER_PID_CAP, 2);
         assert_eq!(Z503_DWELL_SECS, 10);
         assert_eq!(Z503_STALE_SECS, 60);
+    }
+}
+
+/// 6-Z520a pure cores (the WALL-PARK sweep: the 60 s wall gate + the
+/// 60 s refire cadence + the per-episode cap + the honest episode
+/// teardown — the rn499 wall's instrument, immune to the routine-park
+/// budget drain that starved the z501 late pool and the z404/z406
+/// probe budgets).
+#[cfg(test)]
+mod z520a_wall_park_tests {
+    use super::{
+        z520a_op_is_wait_family, z520a_wall_decide, z520a_word_delta, Z520ADecision, Z520AEpisodes,
+        Z520AWordDelta, Z520A_BUDGET, Z520A_EPISODE_CAP, Z520A_REFIRE_SECS,
+        Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
+    };
+
+    /// The rn499 shapes: the main thread AND the pool worker parked with
+    /// op=0x80 (WAIT|PRIVATE); WAIT_BITSET parks (the daemon fleet) too.
+    /// Wakes/requeues/FD never park — and a wake op caught mid-syscall
+    /// must END a park episode (the sweep teardown's predicate).
+    #[test]
+    fn z520a_op_is_wait_family_pins_the_block_table() {
+        assert!(z520a_op_is_wait_family(0x00)); // WAIT
+        assert!(z520a_op_is_wait_family(0x80)); // WAIT|PRIVATE (the rn499 wall shape)
+        assert!(z520a_op_is_wait_family(0x09)); // WAIT_BITSET
+        assert!(z520a_op_is_wait_family(0x89)); // WAIT_BITSET|PRIVATE (the routine-fleet shape)
+        assert!(z520a_op_is_wait_family(0x86)); // LOCK_PI|PRIVATE
+        assert!(z520a_op_is_wait_family(0x8b)); // WAIT_REQUEUE_PI|PRIVATE
+        assert!(!z520a_op_is_wait_family(0x81)); // WAKE|PRIVATE
+        assert!(!z520a_op_is_wait_family(0x83)); // REQUEUE|PRIVATE
+        assert!(!z520a_op_is_wait_family(0x84)); // CMP_REQUEUE|PRIVATE
+        assert!(!z520a_op_is_wait_family(0x8a)); // WAKE_BITSET|PRIVATE
+        assert!(!z520a_op_is_wait_family(0x82)); // FD
+    }
+
+    /// The routine fleet's parks (10-15 s dwells — the shapes that
+    /// drained the z501 late pool by +105.3 s in rn499) can NEVER spend:
+    /// the wall gate needs 60 s of OBSERVED park on the same uaddr.
+    #[test]
+    fn z520a_routine_park_dwells_never_reach_the_wall_gate() {
+        let mut eps = Z520AEpisodes::new();
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1000),
+            Z520ADecision::Observe
+        );
+        for t in [1015u64, 1030, 1045] {
+            assert_eq!(
+                z520a_wall_decide(&mut eps, 6, 100, 0xf00d, t),
+                Z520ADecision::Observe
+            );
+        }
+        // 60 s of observed park from the FIRST sight: the first verdict.
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1060),
+            Z520ADecision::Spend
+        );
+    }
+
+    /// The rn499 wall shape: a 20+ minute park earns its first verdict
+    /// at 60 s, re-fires on the 60 s cadence, and caps at 3 verdicts —
+    /// the re-fires carry the word re-reads (frozen vs advancing).
+    #[test]
+    fn z520a_refire_cadence_and_episode_cap() {
+        let mut eps = Z520AEpisodes::new();
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1000),
+            Z520ADecision::Observe
+        );
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1060),
+            Z520ADecision::Spend
+        );
+        // A fast re-catch inside the refire interval never spends again.
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1075),
+            Z520ADecision::Observe
+        );
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1120),
+            Z520ADecision::Spend
+        );
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1180),
+            Z520ADecision::Spend
+        );
+        // The episode cap: no 4th verdict from this episode.
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1300),
+            Z520ADecision::Observe
+        );
+    }
+
+    /// The honest teardown: a catch showing the pid NOT parked (the
+    /// sweep removes the pid's episodes) re-arms from zero — a poller
+    /// that wakes between catches cannot accumulate a fake wall.
+    #[test]
+    fn z520a_non_parked_catch_ends_the_episode() {
+        let mut eps = Z520AEpisodes::new();
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1000),
+            Z520ADecision::Observe
+        );
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1030),
+            Z520ADecision::Observe
+        );
+        // The sweep's teardown for a non-parked catch (running / a wake
+        // op / another syscall): drop the pid's episodes.
+        eps.retain(|(p, _), _| *p != 100);
+        // The re-park re-arms; the span restarts from the new sight.
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1400),
+            Z520ADecision::Observe
+        );
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1460),
+            Z520ADecision::Spend
+        );
+    }
+
+    /// A stale episode (> 120 s park-gap) re-arms and the budget-empty
+    /// pool stays silent forever (tracking continues, nothing spends).
+    #[test]
+    fn z520a_stale_re_arms_and_budget_zero_observes() {
+        let mut eps = Z520AEpisodes::new();
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1000),
+            Z520ADecision::Observe
+        );
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1060),
+            Z520ADecision::Spend
+        );
+        // A > 120 s gap: a fresh episode — the old spend history dies.
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1400),
+            Z520ADecision::Observe
+        );
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 0, 100, 0xf00d, 1600),
+            Z520ADecision::Observe
+        );
+    }
+
+    /// The word-delta classes — the never-signaled (frozen) vs lost-wake
+    /// (changed under wakes=NEVER) discriminator at the wall tier.
+    #[test]
+    fn z520a_word_delta_pins_the_frozen_vs_changed_classes() {
+        assert_eq!(
+            z520a_word_delta(None, Some(3)),
+            Z520AWordDelta::FirstObservation
+        );
+        assert_eq!(z520a_word_delta(Some(3), Some(3)), Z520AWordDelta::Frozen);
+        assert_eq!(
+            z520a_word_delta(Some(3), Some(4)),
+            Z520AWordDelta::Changed(3, 4)
+        );
+        assert_eq!(
+            z520a_word_delta(Some(3), None),
+            Z520AWordDelta::FirstObservation
+        );
+    }
+
+    /// The sibling window and the mission constants.
+    #[test]
+    fn z520a_constants_match_the_mission_shape() {
+        assert_eq!(Z520A_WALL_DWELL_SECS, 60);
+        assert_eq!(Z520A_REFIRE_SECS, 60);
+        assert_eq!(Z520A_EPISODE_CAP, 3);
+        assert_eq!(Z520A_BUDGET, 6);
+        assert_eq!(Z520A_STALE_SECS, 120);
+        assert_eq!(Z520A_SIBLING_WINDOW_SECS, 30);
     }
 }
 
