@@ -13884,6 +13884,28 @@ fn z532_read_injection_plan(store_len: usize, requested: u64) -> Option<usize> {
     Some(store_len.min(requested as usize))
 }
 
+/// 6-Z533: the per-(pid, fd) ACK-PENDING registry for captured property
+/// fds — after a faked send (the bytes captured + applied by the 6-Z111
+/// layer, the real host socket saw NOTHING), the client's SETPROP2 ack
+/// read must return a SUCCESS response, not EOF: bionic's
+/// __system_property_set reads a 4-byte result and "recv failed" on
+/// short/EOF reads → the caller sees 0x8-class errors (the rn510+ klog:
+/// `Unable to set property ... recv failed; errno=-1`) and R's
+/// SystemServer.run() FATALS on its own start_count set. One 4-byte
+/// zero ack (= kSuccess) per send, then back to EOF.
+static Z110_ACK_PENDING: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<i32, std::collections::HashSet<i64>>>,
+> = std::sync::OnceLock::new();
+
+fn z110_ack_pending_set(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<i32, std::collections::HashSet<i64>>>
+{
+    Z110_ACK_PENDING
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// 6-Z501: the FUTEX-PARK forensics probe — a blocked-in-futex tracee's
 /// uaddr/val/op + the parking pc's maps row + the futex word's value,
 /// all read-only (the /proc syscall file + process_vm_readv; NO ptrace
@@ -41005,9 +41027,23 @@ pub fn run_ptrace_loop(
                         if ret >= 0 && orig.starts_with("/proc/sys/") {
                             let store_prefix =
                                 format!("{}/dev/.twoyi-sysctl/", rootfs.trim_end_matches('/'));
-                            let leaked = std::fs::read_link(format!("/proc/{}/fd/{}", pid, ret))
-                                .map(|t| !t.to_string_lossy().starts_with(&store_prefix))
-                                .unwrap_or(false);
+                            let synthetic_prefix =
+                                format!("{}/proc/sys/", rootfs.trim_end_matches('/'));
+                            let fd_target = std::fs::read_link(format!("/proc/{}/fd/{}", pid, ret))
+                                .map(|t| t.to_string_lossy().into_owned())
+                                .unwrap_or_else(|_| "<unreadable>".to_string());
+                            // 6-Z532c: THREE legitimate resolutions exist —
+                            // the store, the rootfs's SYNTHETIC /proc/sys tree
+                            // (the 6-Z124 0666 files — a COHERENT read/write
+                            // pair: both the ofstream and the ifstream land
+                            // there and the verify passes by itself), and the
+                            // HOST twin (incoherent — the leak). Only the
+                            // host-twin target is shadowed: shadowing a
+                            // synthetic-tree fd would inject the STALE store
+                            // content over a COHERENT pair (the rn512/513
+                            // FATALs were self-inflicted exactly this way).
+                            let leaked = !fd_target.starts_with(&store_prefix)
+                                && !fd_target.starts_with(&synthetic_prefix);
                             if leaked {
                                 let rel = orig["/proc/sys/".len()..].to_string();
                                 static Z532_SHADOW_LOG: std::sync::atomic::AtomicU64 =
@@ -41016,8 +41052,8 @@ pub fn run_ptrace_loop(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if n < 8 {
                                     log(&format!(
-                                        "6-Z532: sysctl open LEAKED to the host twin pid={} fd={} rel={} — shadowing reads to the virtual store",
-                                        pid, ret, rel
+                                        "6-Z532: sysctl open LEAKED pid={} fd={} rel={} actual-target={} — shadowing reads to the virtual store (6-Z532c: the target names WHERE the rewrite miss landed)",
+                                        pid, ret, rel, fd_target
                                     ));
                                 }
                                 z532_shadow_set().entry(pid).or_default().insert(ret, rel);
@@ -48538,8 +48574,49 @@ pub fn run_ptrace_loop(
                                             let msghdr_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                                             iov_total_len_child(pid, msghdr_ptr, is_i386)
                                         }
-                                        _ => (0, false), // recv/read/shutdown/setsockopt/getsockopt/fcntl/close
+                                        PropServOp::RecvFrom
+                                        | PropServOp::RecvMsg
+                                        | PropServOp::Read => {
+                                            // 6-Z533: the first read after a captured
+                                            // send = the SETPROP2 ack — 4 zero bytes
+                                            // (kSuccess) injected at arg2, ret=4; the
+                                            // send was faked (the host saw NOTHING) so
+                                            // EOF here reads as "recv failed" → 0x8-class
+                                            // errors at the caller (SystemServer.run()
+                                            // FATALS on its own start_count set).
+                                            let ack = z110_ack_pending_set()
+                                                .get(&pid)
+                                                .map_or(false, |s| s.contains(&fd));
+                                            if ack {
+                                                z110_ack_pending_set()
+                                                    .get_mut(&pid)
+                                                    .map(|s| s.remove(&fd));
+                                                let ack_buf: [u8; 4] = [0, 0, 0, 0];
+                                                let ack_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                                let (n, _) = write_child_bytes_injection(
+                                                    pid,
+                                                    ack_ptr,
+                                                    &ack_buf,
+                                                    &mut vm_writev_usable,
+                                                );
+                                                (n as i64, false)
+                                            } else {
+                                                (0, false)
+                                            }
+                                        }
+                                        _ => (0, false), // shutdown/setsockopt/getsockopt/fcntl/close
                                     };
+                                    // 6-Z533: every faked send leaves an ack owed to
+                                    // the client (the SETPROP2 protocol reads a 4-byte
+                                    // response; the legacy protocol never reads).
+                                    if matches!(
+                                        op,
+                                        PropServOp::SendTo
+                                            | PropServOp::SendMsg
+                                            | PropServOp::WriteV
+                                    ) {
+                                        z110_ack_pending_set().entry(pid).or_default().insert(fd);
+                                    }
                                     // 6-Z111 hook: at the SendTo send-fake,
                                     // parse the prop_msg payload (linear
                                     // buffer at arg2, length = arg3, capped
@@ -48602,6 +48679,7 @@ pub fn run_ptrace_loop(
                                         if let Some(s) = fake_propserv_fds.get_mut(&pid) {
                                             s.remove(&fd);
                                         }
+                                        z110_ack_pending_set().get_mut(&pid).map(|s| s.remove(&fd));
                                     }
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
                                     if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
@@ -48703,21 +48781,55 @@ pub fn run_ptrace_loop(
                             .get(&pid)
                             .map_or(false, |s| s.contains(&fd));
                         if is_tracked {
+                            // 6-Z533: the first read after a captured send =
+                            // the SETPROP2 ack — 4 zero bytes (kSuccess),
+                            // injected into the child's buffer; further reads
+                            // see EOF (the legacy fire-and-forget clients
+                            // never read at all — unchanged).
+                            let ack_pending = z110_ack_pending_set()
+                                .get(&pid)
+                                .map_or(false, |s| s.contains(&fd));
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
                             if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
-                                set_syscall_ret(&mut regs2, &abi, 0);
-                                if let Err(e) = ptrace_setregs(pid, &regs2, len) {
-                                    log(&format!(
-                                        "6-Z110 FAILED: ptrace_setregs for read on tracked fd {}: {} — child sees the kernel's raw return",
-                                        fd, e
-                                    ));
-                                } else if propserv_log_count < PROPSERV_LOG_CAP {
-                                    propserv_log_count += 1;
-                                    log(&format!(
-                                        "6-Z110: property-client fd {}: Read returned {} — faked to 0 (EOF; reply-reading variants quit cleanly)",
-                                        fd,
-                                        get_syscall_arg(&regs, abi.reg_ret) as i64
-                                    ));
+                                if ack_pending {
+                                    z110_ack_pending_set().get_mut(&pid).map(|s| s.remove(&fd));
+                                    let ack: [u8; 4] = [0, 0, 0, 0];
+                                    let buf_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                    let (n, _) = write_child_bytes_injection(
+                                        pid,
+                                        buf_ptr,
+                                        &ack,
+                                        &mut vm_writev_usable,
+                                    );
+                                    set_syscall_ret(&mut regs2, &abi, n as i64);
+                                    if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                        log(&format!(
+                                            "6-Z533 FAILED: ptrace_setregs for the ack read on tracked fd {}: {}",
+                                            fd, e
+                                        ));
+                                    } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                        propserv_log_count += 1;
+                                        log(&format!(
+                                            "6-Z533: property-client fd {}: ack read — injected 4-byte success response (real ret {})",
+                                            fd,
+                                            get_syscall_arg(&regs, abi.reg_ret) as i64
+                                        ));
+                                    }
+                                } else {
+                                    set_syscall_ret(&mut regs2, &abi, 0);
+                                    if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                        log(&format!(
+                                            "6-Z110 FAILED: ptrace_setregs for read on tracked fd {}: {} — child sees the kernel's raw return",
+                                            fd, e
+                                        ));
+                                    } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                        propserv_log_count += 1;
+                                        log(&format!(
+                                            "6-Z110: property-client fd {}: Read returned {} — faked to 0 (EOF; reply-reading variants quit cleanly)",
+                                            fd,
+                                            get_syscall_arg(&regs, abi.reg_ret) as i64
+                                        ));
+                                    }
                                 }
                             }
                         }

@@ -32894,3 +32894,32 @@ live):**
 - Gates 1121/1121; fmt/clippy clean.
 - **rn513 agenda**: (1) the 6-Z532 write-persist lines + ZERO InitFatalReboot → rung 7+
   restored; (2) the wall round 5; (3) the property 0x8s stay zero.
+
+## Task 263 addendum 6 (rn513 decoded: the shadow reads+writes both WORK — but the leak discriminator itself missed the THIRD resolution; 6-Z532c + 6-Z533)
+
+**rn513 decoded (3e656c7b, rung 3 — the SAME FATAL, machinery fully working):**
+- The shadow layer fired END-TO-END: LEAKED detected (fd 16 ifstream + fd 17 ofstream ×3),
+  the writes persisted into the store (3×: "4"/"3"/"2" — the SetHighestAvailableOptionValue
+  loop's three iterations), the first read injected from the store — **and the verify STILL
+  failed all three iterations**. rn513's stderr also revealed the rn510+ klog line
+  `Unable to set property ... recv failed; errno=-1` — the CAPTURED property fds' ack reads.
+- **THE BREAKTHROUGH (6-Z532c)**: the leak discriminator only excluded the store — but a
+  THIRD legitimate /proc/sys resolution exists: the ROOTFS's own SYNTHETIC /proc/sys tree
+  (the 6-Z124 0666 files, seeded "2\n"). An ifstream+ofstream pair landing THERE is fully
+  coherent (write "4" → re-read "4" → verify passes unaided). My shadow INJECTED THE STALE
+  STORE CONTENT over the coherent reads → the verify compared "2" (stale store) vs "4"
+  (written to the synthetic file) → **the rn512/513 FATALs were SELF-INFLICTED by the
+  shadow**. Fix: the discriminator now excludes BOTH the store AND {rootfs}/proc/sys/ —
+  only a REAL host-twin target ("/proc/sys/..." resolved on the host root) is shadowed;
+  the LEAKED log now carries actual-target= to prove where each miss landed.
+- **6-Z533 (the property ack)**: the rn510+ `recv failed; errno=-1` klog fleet = the
+  CAPTURED property fds' SETPROP2 ack reads seeing EOF (the 6-Z110 recv fake) — the send
+  was faked (the host saw nothing) so no ack can ever arrive. The ack-pending registry:
+  every faked send arms ONE 4-byte zero response (kSuccess) injected at the next
+  read/recvfrom/recvmsg on the fd, ret=4, then back to EOF. This kills the 0x8 class at
+  the CLIENT level (system_server's start_count FATAL) — without it the boot would die at
+  rung 6+ even with the kptr wall gone.
+- Gates 1121/1121; fmt/clippy clean.
+- **rn514 agenda**: (1) the LEAKED actual-target lines decide the kptr story (store vs
+  synthetic vs host); ZERO InitFatalReboot → rung 7+; (2) the 6-Z533 ack lines + zero
+  "recv failed" + zero 0x8s; (3) the wall round 5; (4) the dexopt economy round 4.
