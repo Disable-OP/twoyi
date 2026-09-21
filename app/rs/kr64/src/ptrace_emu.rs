@@ -11338,6 +11338,21 @@ fn z296_dump_words(
 /// /proc/<tid>/status is unreadable (group leaders read tgid == tid,
 /// so the fallback is correct for exactly the common single-thread
 /// case; a cache entry short-circuits the file read).
+///
+/// 6-Z512: the FLOOR ARMS now resolve their pid through this fn too
+/// (the close-floor, the 6-Z477 dup net, the 6-Z484 close_range floor,
+/// the tgkill-abort floor, and the z319 keys). The rn492 decode: the
+/// old raw pattern `cache.get(&pid).unwrap_or(pid)` returned the raw
+/// TID for any thread whose clone-time mapping the cache had not
+/// captured, so a floored process's OWN thread failed the
+/// `z475_sserver_floor_pids.contains(&floor_pid)` check and its
+/// `dup3(5, 0)` (the libtwrp_fb_hook.so stdio wiring — fd 5 in a
+/// zygote child is the ART/bridge pipe, NOT the hook's log fd)
+/// EXECUTED raw; F_DUPFD(fd=0) then spread the pipe's read end to a
+/// fresh fd (79) and system_server's MAIN thread blocked in
+/// read(fd=79) at the libmeminfo JNI for the rest of the boot (the
+/// rn491/rn492 READ-PARK WALL, fd 83/79). The /proc Tgid fallback
+/// makes the tgid resolution honest for EVERY traced thread.
 fn z296_tgid_of(
     pid: libc::pid_t,
     cache: &mut std::collections::HashMap<libc::pid_t, libc::pid_t>,
@@ -32833,7 +32848,7 @@ pub fn run_ptrace_loop(
                                 // exact-pid check (the zygote's closes run
                                 // on its main thread, pid == tgid).
                                 let z476_floor_pid =
-                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid);
+                                    z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
                                 if z305y_stdio_pin_pid == Some(pid)
                                     || z475_sserver_floor_pids.contains(&z476_floor_pid)
                                 {
@@ -32872,7 +32887,7 @@ pub fn run_ptrace_loop(
                                 let z319_key = if z306_zygote_lineage.contains(&pid) {
                                     pid
                                 } else {
-                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid)
+                                    z296_tgid_of(pid, &mut z306_lineage_tgid_cache)
                                 };
                                 let z319_is_pipe = z319_pipes_seen
                                     .get(&z319_key)
@@ -32937,7 +32952,7 @@ pub fn run_ptrace_loop(
                             let dst_fd = get_syscall_arg(&regs, abi.reg_arg2) as i64;
                             if dst_fd >= 0 && dst_fd <= 2 {
                                 let z477_floor_pid =
-                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid);
+                                    z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
                                 if z305y_stdio_pin_pid == Some(pid)
                                     || z475_sserver_floor_pids.contains(&z477_floor_pid)
                                 {
@@ -33052,7 +33067,7 @@ pub fn run_ptrace_loop(
                                 // untouched — the bulk-cleanup semantics
                                 // stay.
                                 let z484_floor_pid =
-                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid);
+                                    z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
                                 if z305y_stdio_pin_pid == Some(pid)
                                     || z475_sserver_floor_pids.contains(&z484_floor_pid)
                                 {
@@ -33315,8 +33330,7 @@ pub fn run_ptrace_loop(
                             // flows through the pre-existing rewrite arms
                             // untouched.
                             if is_tgkill && sig_arg == 6 && !z475_sserver_floor_pids.is_empty() {
-                                let z477b_tgid =
-                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid);
+                                let z477b_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
                                 if z475_sserver_floor_pids.contains(&z477b_tgid)
                                     || z305y_stdio_pin_pid == Some(pid)
                                 {
@@ -42531,7 +42545,7 @@ pub fn run_ptrace_loop(
                                 let z319_key = if z306_zygote_lineage.contains(&pid) {
                                     pid
                                 } else {
-                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid)
+                                    z296_tgid_of(pid, &mut z306_lineage_tgid_cache)
                                 };
                                 if z319_pipe2_budget < 32 {
                                     z319_pipe2_budget += 1;
@@ -42555,7 +42569,7 @@ pub fn run_ptrace_loop(
                                 let z319_key = if z306_zygote_lineage.contains(&pid) {
                                     pid
                                 } else {
-                                    z306_lineage_tgid_cache.get(&pid).copied().unwrap_or(pid)
+                                    z296_tgid_of(pid, &mut z306_lineage_tgid_cache)
                                 };
                                 if z319_dup_budget < 32 {
                                     z319_dup_budget += 1;
@@ -58176,6 +58190,20 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         // itself (correct for group leaders) and the result is cached.
         assert_eq!(z296_tgid_of(4243, &mut cache), 4243);
         assert_eq!(cache.get(&4243), Some(&4243));
+    }
+
+    /// 6-Z512: the /proc Tgid fallback resolves a REAL process's tgid
+    /// (the tracer's own process here) — the path the floor arms now
+    /// depend on for thread-tids whose clone-time mapping the lineage
+    /// cache never captured. The single-thread self-check: this test
+    /// process's main tid IS its tgid.
+    #[test]
+    fn z296_tgid_of_resolves_the_live_tgid_from_proc() {
+        let mut cache: std::collections::HashMap<libc::pid_t, libc::pid_t> =
+            std::collections::HashMap::new();
+        let me = std::process::id() as libc::pid_t;
+        assert_eq!(z296_tgid_of(me, &mut cache), me);
+        assert_eq!(cache.get(&me), Some(&me));
     }
 
     // ── 6-Z301: glog-redirect write classification ──────────────────────
