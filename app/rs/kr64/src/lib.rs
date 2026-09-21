@@ -5556,6 +5556,63 @@ const ART_APEX_KEY_FILES: [&str; 4] = [
     "javalib/core-oj.jar",
 ];
 
+/// 6-Z528: the dex2oat64 LINKER-CLOSURE materialization — the rn507
+/// 6-Z527a trace's fix. The failing dex2oat's linker probed EXACTLY
+/// three paths for libprofile.so and returned -2 on all: /dev
+/// (LD_LIBRARY_PATH=/dev — the 6-Z479a capture), /system/lib64 and
+/// /system_ext/lib64 — it NEVER searched /apex/com.android.art/lib64
+/// (where the file demonstrably lives: the 6-Z525 census, the flatten's
+/// key-files=4/4). The mechanism: the staged exec's AT_EXECFN (the
+/// tracer's 6-Z101 rewrite target, {data}/cache/twoyi_stage/… under the
+/// /data prefix) matches `dir.system = /data` in the generated
+/// ld.config.txt, so the exec gets the [system] section's default
+/// namespace — whose search paths carry NO apex dirs; a real device's
+/// dex2oat64 runs at its REAL /apex/... path and gets the [apex]
+/// section. The host-layout staging can never match dir.apex (the
+/// guest /apex lives under the host /data), so the section selection is
+/// structurally broken for staged apex binaries — the honest fix is to
+/// make the [system] namespace RESOLVE the ART closure: materialize
+/// every /apex/com.android.art/lib64/<lib>.so that /system/lib64 lacks
+/// as a RELATIVE symlink (../../apex/com.android.art/lib64/<lib>.so —
+/// the 6-Z312 proven-resolvable class; the host kernel resolves it to
+/// the flattened tree's OWN file). The loads that legitimately prefer
+/// the apex (zygote's LD_LIBRARY_PATH=/apex/... from its init rc) keep
+/// resolving there first; the copies-shadow concern is void (one
+/// libart.so exists per boot and the links re-materialize with the
+/// flatten). Returns (count, the materialized names).
+fn z528_materialize_art_linker_closure(
+    rootfs: &str,
+    art_dest: &str,
+) -> Result<(usize, String), String> {
+    let art_lib64 = format!("{}/lib64", art_dest);
+    let sys_lib64 = format!("{}/system/lib64", rootfs);
+    std::fs::create_dir_all(&sys_lib64).map_err(|e| e.to_string())?;
+    let entries = std::fs::read_dir(&art_lib64).map_err(|e| e.to_string())?;
+    let mut count = 0usize;
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if !name.ends_with(".so") {
+            continue;
+        }
+        let dst_path = format!("{}/{}", sys_lib64, name);
+        if std::path::Path::new(&dst_path).symlink_metadata().is_ok() {
+            continue; // a real file or an earlier link — never touch it
+        }
+        // The RELATIVE target: from {rootfs}/system/lib64/<name> up two
+        // levels = {rootfs}/, then the flattened tree's own lib.
+        let rel_target = format!("../../apex/com.android.art/lib64/{}", name);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&rel_target, &dst_path).map_err(|e| e.to_string())?;
+        count += 1;
+        names.push(name);
+    }
+    Ok((count, names.join(", ")))
+}
+
 fn flatten_apex_payloads(cfg: &Config) {
     if cfg.boot_recovery {
         return; // TWRP: statically linked init, no APEX consumers
@@ -5725,6 +5782,22 @@ fn flatten_apex_payloads(cfg: &Config) {
                             Err(e2) => {
                                 warning!("[KR64][apex] 6-Z526 ART-RETRY-FAILED: {}", e2);
                             }
+                        }
+                    }
+                    // 6-Z528: the dex2oat64 LINKER-CLOSURE materialization.
+                    // Runs unconditionally after the art tree is verified —
+                    // see the fn doc for the rn507 trace evidence.
+                    let materialized = z528_materialize_art_linker_closure(&cfg.rootfs, &dst);
+                    if let Ok((count, names)) = materialized {
+                        if count > 0 {
+                            info!(
+                                "[KR64][apex] 6-Z528 ART-LINKER-CLOSURE: {} linker path(s) into /system/lib64: {}",
+                                count, names
+                            );
+                        } else {
+                            info!(
+                                "[KR64][apex] 6-Z528 ART-LINKER-CLOSURE: /system/lib64 already carries the closure (0 materialized)"
+                            );
                         }
                     }
                 }
@@ -18871,6 +18944,55 @@ mod tests {
         assert!(ART_APEX_KEY_FILES.contains(&"lib64/libart.so"));
         assert!(ART_APEX_KEY_FILES.contains(&"bin/dex2oat64"));
         assert!(ART_APEX_KEY_FILES.contains(&"javalib/core-oj.jar"));
+    }
+
+    // ── 6-Z528: the linker-closure materialization ──
+    #[test]
+    fn z528_materializes_only_the_missing_art_libs_idempotently() {
+        // The rn507 shape: the flattened art tree carries the closure;
+        // /system/lib64 has SOME real files (libbase.so is ROM-shipped)
+        // and misses the rest. The materialization adds RELATIVE
+        // symlinks ONLY for the missing names, never touches a real
+        // file, and is idempotent (the second pass materializes 0).
+        let dir = std::env::temp_dir().join(format!("twoyi-6z528-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rootfs = dir.join("rootfs");
+        let art_dest = rootfs.join("apex/com.android.art");
+        std::fs::create_dir_all(art_dest.join("lib64")).unwrap();
+        std::fs::create_dir_all(rootfs.join("system/lib64")).unwrap();
+        std::fs::write(art_dest.join("lib64/libprofile.so"), b"prof").unwrap();
+        std::fs::write(art_dest.join("lib64/libart.so"), b"art").unwrap();
+        std::fs::write(rootfs.join("system/lib64/libbase.so"), b"base").unwrap();
+
+        let (count, names) = z528_materialize_art_linker_closure(
+            rootfs.to_str().unwrap(),
+            art_dest.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(count, 2, "exactly the two missing libs get links");
+        assert!(names.contains("libprofile.so") && names.contains("libart.so"));
+
+        // The links resolve to the flattened tree's OWN files.
+        let link = rootfs.join("system/lib64/libprofile.so");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read(&link).unwrap(),
+            b"prof".to_vec(),
+            "the relative link resolves into the flattened tree"
+        );
+        // A ROM-shipped real file is NEVER touched.
+        let base = rootfs.join("system/lib64/libbase.so");
+        assert!(!base.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&base).unwrap(), b"base".to_vec());
+
+        // Idempotent: the second pass materializes nothing.
+        let (count2, _) = z528_materialize_art_linker_closure(
+            rootfs.to_str().unwrap(),
+            art_dest.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(count2, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
