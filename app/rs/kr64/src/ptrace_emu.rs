@@ -3620,6 +3620,89 @@ fn z506_errno_name(e: i64) -> String {
     };
     name.to_string()
 }
+
+/// 6-Z510 (pure): the stall probe's syscall-name spelling for the
+/// fd-park / wait-park forensics — a compact AArch64 table of the
+/// blocking-capable syscalls the probe actually observes. None = not
+/// in the table (the caller prints the raw nr).
+fn z510_probe_nr_name(nr: i64) -> Option<&'static str> {
+    let name = match nr {
+        22 => "epoll_pwait",
+        29 => "ioctl",
+        43 => "sendto",
+        44 => "recvfrom",
+        45 => "sendmsg",
+        46 => "recvmsg",
+        59 => "pipe2",
+        63 => "read",
+        64 => "write",
+        65 => "readv",
+        66 => "writev",
+        73 => "ppoll",
+        98 => "futex",
+        101 => "nanosleep",
+        115 => "clock_nanosleep",
+        221 => "execve",
+        260 => "wait4",
+        _ => return None,
+    };
+    Some(name)
+}
+
+/// 6-Z510 (pure): the per-pid probe gate — true when the probe may
+/// fire for this pid (the first 3 fires), false once the cap is spent.
+/// A per-PID cap (not a global one) because the wall's identity is
+/// per-pid: one system_server-class park needs the fd named ONCE.
+fn z510_per_pid_gate(
+    map: &mut std::collections::HashMap<libc::pid_t, u64>,
+    pid: libc::pid_t,
+) -> bool {
+    let spent = map.entry(pid).or_insert(0);
+    if *spent >= 3 {
+        return false;
+    }
+    *spent += 1;
+    true
+}
+
+/// 6-Z511a (pure): render an abstract-namespace sockaddr_un name
+/// (sun_path[0] == 0; the name is the bytes AFTER the leading NUL and
+/// is NOT NUL-terminated — its true length is the bind's addrlen, so
+/// the render stops at the first NUL or 64 bytes, whichever first).
+/// Printable ASCII is kept verbatim; every other byte is hex-escaped.
+/// None = the blob is not an AF_UNIX abstract name (a short blob, a
+/// non-unix family, or the FS-spelled class).
+fn z511a_render_abstract_name(blob: &[u8]) -> Option<String> {
+    // The sockaddr_un layout: sun_family (2 bytes LE) at +0, sun_path at +2.
+    if blob.len() < 4 {
+        return None;
+    }
+    let family = u16::from_le_bytes([blob[0], blob[1]]);
+    if family != 1 {
+        // AF_UNIX = 1 — anything else is not a unix bind.
+        return None;
+    }
+    if blob[2] != 0 {
+        // sun_path[0] != 0 — the FS-spelled class, not abstract.
+        return None;
+    }
+    let mut out = String::new();
+    for &b in blob.iter().skip(3).take(64) {
+        if b == 0 {
+            break;
+        }
+        if (0x20..0x7f).contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("\\x{:02x}", b));
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
 // close_range is nr 436 on aarch64 AND x86_64 (asm-generic + x86_64
 // unified) — not in ChildAbi; a raw match is exact.
 const Z483_CLOSE_RANGE: i64 = 436;
@@ -12697,6 +12780,172 @@ fn z501_futex_park_probe(pid: libc::pid_t) {
     ));
 }
 
+/// 6-Z510: the FD-PARK / WAIT-PARK forensics — the rn491 wall's
+/// instrument. The decode: system_server's MAIN thread (era-3, pid
+/// 5727) sat blocked-in-kernel in read(fd=83) for 22+ minutes (the
+/// 6-Z415 probe's nr=63, the PROBE-CTX owner map returned "?" and the
+/// z305t-14b sweep's 24-fd cap ended at fd 23) while its service
+/// threads (android.display / android.anim / ActivityManager / the
+/// binder loopers) stayed healthy — the boot's kmsg went silent at the
+/// SAME moment (the framework's logging lives on the blocked main
+/// thread) and the rung-8 era never arrived. THE MISSING DATUM: fd 83's
+/// identity (which pipe/socket/file the read parks on — the candidates:
+/// an emulation bridge fd inherited or landed by SCM_RIGHTS, an
+/// unintercepted open, a dup-class slot).
+///
+/// This probe answers it READ-ONLY from /proc (the 6-Z415 vanish-class
+/// discipline — zero tracee interaction):
+///   * nr=63/65 (read/readv), 29 (ioctl), 22 (epoll_pwait): arg0 = the
+///     fd → /proc/<pid>/fd/<fd> symlink (the host-authoritative target
+///     object), /proc/<pid>/fdinfo/<fd> (pos + flags — an O_NONBLOCK fd
+///     CANNOT block in read: flags falsify the class), and for socket
+///     inodes the /proc/net/unix name.
+///   * nr=73 (ppoll): arg0 is the pollfd ARRAY pointer, not an fd —
+///     the pointer + nfds are reported read-only.
+///   * nr=260 (wait4): the child-reap park (era-2's do_wait_intr_irq
+///     class in the ps wchan) — /proc/<pid>/task/<pid>/children names
+///     what the reaper waits for (an EMPTY list + a blocked wait4 = the
+///     lost-SIGCHLD class).
+///
+/// Budgets: a run-level pool (24) + a per-pid cap (3, the z510 gate) —
+/// the probe re-fires on the ~15 s stall cadence and the identity is
+/// needed ONCE, not as a stream.
+fn z510_fd_park_probe(pid: libc::pid_t) {
+    static Z510_RUN_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(24);
+    static Z510_PER_PID: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<libc::pid_t, u64>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let Ok(line) = std::fs::read_to_string(format!("/proc/{}/syscall", pid)) else {
+        return;
+    };
+    let Some((nr, args)) = z501_parse_procfs_syscall(&line) else {
+        return;
+    };
+    let name = z510_probe_nr_name(nr).unwrap_or("syscall");
+    // The budget gate: only a MATCHING park class may spend.
+    let class: Option<ParkClass> = match nr {
+        63 | 65 | 29 | 22 => Some(ParkClass::Fd(args[0] as i64)),
+        73 => Some(ParkClass::PollArray),
+        260 => Some(ParkClass::Wait4),
+        _ => None,
+    };
+    let Some(class) = class else {
+        return;
+    };
+    if Z510_RUN_BUDGET.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    {
+        let Ok(mut per) = Z510_PER_PID.lock() else {
+            return;
+        };
+        if !z510_per_pid_gate(&mut per, pid) {
+            return;
+        }
+    }
+    // The spend: a racing drain restores the floor and drops (the
+    // z506 fetch_sub discipline).
+    let prev = Z510_RUN_BUDGET.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if prev == 0 {
+        Z510_RUN_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    match class {
+        ParkClass::Wait4 => {
+            let children = std::fs::read_to_string(format!("/proc/{}/task/{}/children", pid, pid))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "(unreadable)".to_string());
+            let note = if children.is_empty() {
+                " — nothing to reap: this wait can never return (the lost-SIGCHLD class)"
+            } else {
+                ""
+            };
+            crate::trace_log_line(&format!(
+                "6-Z510 WAIT-PARK: pid={} nr={} (wait4) children=[{}]{}",
+                pid, nr, children, note
+            ));
+        }
+        ParkClass::PollArray => {
+            crate::trace_log_line(&format!(
+                "6-Z510 POLL-PARK: pid={} nr={} (ppoll) fds_array={:#x} nfds={} — the pollfd set lives in guest memory (read-only probe: not dereferenced)",
+                pid, nr, args[0], args[1] as i64
+            ));
+        }
+        ParkClass::Fd(fd) => {
+            if fd < 0 {
+                return;
+            }
+            let link = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                .map(|l| l.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "(unreadable)".to_string());
+            let (pos, flags, nonblock) =
+                std::fs::read_to_string(format!("/proc/{}/fdinfo/{}", pid, fd))
+                    .map(|txt| {
+                        let mut pos = String::from("?");
+                        let mut flags = String::from("?");
+                        for l in txt.lines() {
+                            if let Some(v) = l.strip_prefix("pos:") {
+                                pos = v.trim().to_string();
+                            }
+                            if let Some(v) = l.strip_prefix("flags:") {
+                                flags = v.trim().to_string();
+                            }
+                        }
+                        // fdinfo flags are OCTAL; O_NONBLOCK = 0o4000.
+                        let parsed =
+                            u64::from_str_radix(flags.trim_start_matches('0'), 8).unwrap_or(0);
+                        (pos, flags, parsed & 0o4000 != 0)
+                    })
+                    .unwrap_or(("?".to_string(), "?".to_string(), false));
+            let mut sock_name = String::new();
+            if let Some(ino) = link
+                .strip_prefix("socket:[")
+                .and_then(|r| r.strip_suffix(']'))
+            {
+                let mut found = false;
+                if let Ok(unix_txt) = std::fs::read_to_string("/proc/net/unix") {
+                    for l in unix_txt.lines().skip(1) {
+                        // Format: Num: RefCount Protocol Flags Type State Inode Path
+                        let cols: Vec<&str> = l.split_whitespace().collect();
+                        if cols.len() >= 7 && cols[6] == ino {
+                            let p = cols.iter().skip(7).cloned().collect::<Vec<_>>().join(" ");
+                            sock_name = if p.is_empty() {
+                                " unix_name=(unnamed/abstract)".to_string()
+                            } else {
+                                format!(" unix_name={}", p)
+                            };
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if !found {
+                    sock_name = " unix_name=(not in /proc/net/unix — unbound)".to_string();
+                }
+            }
+            let class_note = if nonblock {
+                " — fd is O_NONBLOCK: a read on it CANNOT block; the park must be a restart-loop or the nr is stale"
+            } else {
+                ""
+            };
+            crate::trace_log_line(&format!(
+                "6-Z510 FD-PARK: pid={} nr={} ({}) fd={} -> {} pos={} flags={}{}{}",
+                pid, nr, name, fd, link, pos, flags, sock_name, class_note
+            ));
+        }
+    }
+}
+
+/// 6-Z510 (internal): the park classes the probe distinguishes.
+enum ParkClass {
+    /// read/readv/ioctl/epoll_pwait — arg0 IS the fd.
+    Fd(i64),
+    /// ppoll — arg0 is the pollfd array pointer.
+    PollArray,
+    /// wait4 — the child-reap park.
+    Wait4,
+}
+
 /// 6-Z305t-18: SIGSTOP stall probe — the portable way to name a
 /// long-stalled tracee's TRUE blocked syscall on ATTACH-attached tracees.
 ///
@@ -12786,6 +13035,24 @@ fn stall_interrupt_probe(pid: libc::pid_t, abi: &ChildAbi) -> bool {
                     // z471 verified-table discipline applies to
                     // memory-REWRITE arms, not to read-only forensics).
                     z501_futex_park_probe(pid);
+                }
+                // ── 6-Z510: the FD-PARK / WAIT-PARK forensics (the rn491
+                // wall) ──
+                //
+                // rn491: system_server's MAIN thread (era-3, pid 5727)
+                // blocked in read(fd=83) for 22+ minutes — the fd sat
+                // beyond the z305t-14b 24-fd sweep cap and outside the
+                // open_fd_owner_paths map (an un-intercepted open, a
+                // dup-class slot, an SCM_RIGHTS landing, or an inherited
+                // bridge fd), the boot's kmsg went silent at the same
+                // moment (the framework logging lives on that thread),
+                // and the rung-8 era never arrived. The read/poll/wait4
+                // park classes now get the SAME read-only procfs
+                // forensics the futex parks have had since 6-Z501:
+                // aarch64 read=63, readv=65, ioctl=29, epoll_pwait=22,
+                // ppoll=73, wait4=260.
+                if nr == 63 || nr == 65 || nr == 29 || nr == 22 || nr == 73 || nr == 260 {
+                    z510_fd_park_probe(pid);
                 }
             }
             Some(_) => crate::trace_log_line(&format!(
@@ -14549,9 +14816,59 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
     // swallowed; the fd table names the actual socket/file the poll sits
     // on. Bounded: first 24 fds, one dump per (pid) per stall class
     // (the 271f dump itself is already capped upstream).
+    //
+    // 6-Z510: the rn491 lesson — the wall (system_server main blocked in
+    // read(fd=83)) sat BEYOND this sweep's 24-fd cap: the sweep ended at
+    // fd 23 and the answer was invisible. Two upgrades:
+    //   (a) the BLOCKED fd is resolved FIRST (from /proc/<pid>/syscall's
+    //       arg0 for the fd-arg classes) with its fdinfo pos/flags —
+    //       the decisive line, logged even when it is fd 500;
+    //   (b) the sweep cap rises 24 → 48 (the emulation bridges live in
+    //       the 24..128 range; the dump is budget-capped upstream so the
+    //       added 24 readlinks only fire at stall time).
     {
+        // (a) the blocked-fd targeted line.
+        if let Ok(line) = std::fs::read_to_string(format!("/proc/{}/syscall", pid)) {
+            if let Some((nr, args)) = z501_parse_procfs_syscall(&line) {
+                let fd_arg: Option<i64> = match nr {
+                    // aarch64: read=63, readv=65, ioctl=29, epoll_pwait=22.
+                    63 | 65 | 29 | 22 => Some(args[0] as i64),
+                    _ => None,
+                };
+                if let Some(fd) = fd_arg.filter(|f| *f >= 0) {
+                    let link = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                        .map(|l| l.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| "(unreadable)".to_string());
+                    let fdinfo = std::fs::read_to_string(format!("/proc/{}/fdinfo/{}", pid, fd))
+                        .map(|txt| {
+                            let mut pos = String::from("?");
+                            let mut flags = String::from("?");
+                            for l in txt.lines() {
+                                if let Some(v) = l.strip_prefix("pos:") {
+                                    pos = v.trim().to_string();
+                                }
+                                if let Some(v) = l.strip_prefix("flags:") {
+                                    flags = v.trim().to_string();
+                                }
+                            }
+                            format!("pos={} flags={}", pos, flags)
+                        })
+                        .unwrap_or_else(|_| "fdinfo=(unreadable)".to_string());
+                    crate::trace_log_line(&format!(
+                        "6-Z510 STALL-FD-TARGET: pid={} nr={} ({}) fd={} -> {} {}",
+                        pid,
+                        nr,
+                        z510_probe_nr_name(nr).unwrap_or("syscall"),
+                        fd,
+                        link,
+                        fdinfo
+                    ));
+                }
+            }
+        }
+        // (b) the general sweep — cap 48 (was 24; the rn491 fd-83 lesson).
         let mut fd_lines = 0usize;
-        for fd in 0..24i32 {
+        for fd in 0..48i32 {
             if let Ok(target) = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)) {
                 fd_lines += 1;
                 crate::trace_log_line(&format!(
@@ -45693,6 +46010,33 @@ pub fn run_ptrace_loop(
                                                 else {
                                                     break 'z413b;
                                                 };
+                                                // ── 6-Z511a: the ABSTRACT-bind name
+                                                // capture (rn491's residual class) ──
+                                                //
+                                                // The rn491 decode: 3 bind failures
+                                                // whose /proc/net/unix path printed
+                                                // "(ABSTRACT or unnamed)" with NO
+                                                // stash (the 6-Z163b rewrite covers
+                                                // FS-spelled + the property-service
+                                                // abstract name only) — the guest's
+                                                // un-rewritten ABSTRACT binds
+                                                // collided with the HOST's shared
+                                                // abstract namespace (the sandbox
+                                                // shares the redroid host's netns;
+                                                // the host's Android 14 owns the
+                                                // same names). The missing datum:
+                                                // WHICH abstract names. The
+                                                // z413b_blob is the child's OWN
+                                                // sockaddr at bind-EXIT — the exact
+                                                // bytes the kernel saw. Read-only.
+                                                if let Some(abs) =
+                                                    z511a_render_abstract_name(&z413b_blob)
+                                                {
+                                                    log(&format!(
+                                                        "6-Z511a ABSTRACT-BIND: pid={} fd={} ret={} name=\"{}\" addrlen={} — the guest's un-rewritten abstract bind failed in the HOST abstract namespace (the 6-Z511 rewrite candidate)",
+                                                        pid, fd, ret, abs, z413b_len
+                                                    ));
+                                                }
                                                 let Some(z413b_gp) = unix_fs_sun_path(&z413b_blob)
                                                     .map(|gp| gp.to_string())
                                                 else {
@@ -60180,6 +60524,115 @@ mod z506_errno_name_tests {
     fn z506_unknown_errno_spells_the_number() {
         assert_eq!(z506_errno_name(1337), "<e1337>");
         assert_eq!(z506_errno_name(0), "<e0>");
+    }
+}
+
+#[cfg(test)]
+mod z510_probe_nr_name_tests {
+    use super::z510_probe_nr_name;
+
+    /// The park-class syscall numbers spell their names (the aarch64
+    /// table the stall probe prints from).
+    #[test]
+    fn z510_park_class_nrs_spell_their_names() {
+        assert_eq!(z510_probe_nr_name(63), Some("read"));
+        assert_eq!(z510_probe_nr_name(65), Some("readv"));
+        assert_eq!(z510_probe_nr_name(29), Some("ioctl"));
+        assert_eq!(z510_probe_nr_name(22), Some("epoll_pwait"));
+        assert_eq!(z510_probe_nr_name(73), Some("ppoll"));
+        assert_eq!(z510_probe_nr_name(260), Some("wait4"));
+        assert_eq!(z510_probe_nr_name(98), Some("futex"));
+    }
+
+    /// Numbers outside the table are honest None (the caller prints
+    /// the raw nr instead of a wrong name).
+    #[test]
+    fn z510_unknown_nr_is_none() {
+        assert_eq!(z510_probe_nr_name(9999), None);
+        assert_eq!(z510_probe_nr_name(-1), None);
+    }
+}
+
+#[cfg(test)]
+mod z510_per_pid_gate_tests {
+    use super::z510_per_pid_gate;
+
+    /// The per-pid cap (3) lets the first three fires through and
+    /// blocks the rest; other pids are unaffected.
+    #[test]
+    fn z510_gate_caps_at_three_per_pid() {
+        let mut m = std::collections::HashMap::new();
+        assert!(z510_per_pid_gate(&mut m, 7));
+        assert!(z510_per_pid_gate(&mut m, 7));
+        assert!(z510_per_pid_gate(&mut m, 7));
+        assert!(!z510_per_pid_gate(&mut m, 7));
+        assert!(!z510_per_pid_gate(&mut m, 7));
+        assert!(z510_per_pid_gate(&mut m, 8));
+    }
+}
+
+#[cfg(test)]
+mod z511a_abstract_name_tests {
+    use super::z511a_render_abstract_name;
+
+    /// An abstract name (family=AF_UNIX, sun_path[0]=0) renders the
+    /// name bytes up to the first NUL.
+    #[test]
+    fn z511a_abstract_name_renders() {
+        let mut blob = vec![0x01, 0x00, 0x00];
+        blob.extend_from_slice(b"vndservicemanager");
+        blob.resize(110, 0);
+        assert_eq!(
+            z511a_render_abstract_name(&blob).as_deref(),
+            Some("vndservicemanager")
+        );
+    }
+
+    /// A FS-spelled sun_path (sun_path[0] != 0) is NOT the abstract
+    /// class — None.
+    #[test]
+    fn z511a_fs_path_is_not_abstract() {
+        let mut blob = vec![0x01, 0x00, b'/'];
+        blob.extend_from_slice(b"dev/socket/logd");
+        blob.resize(110, 0);
+        assert_eq!(z511a_render_abstract_name(&blob), None);
+    }
+
+    /// A non-unix family is None (the bind forensics blob could in
+    /// principle hold any sockaddr the failed bind saw).
+    #[test]
+    fn z511a_non_unix_family_is_none() {
+        let mut blob = vec![0x02, 0x00, 0x00];
+        blob.extend_from_slice(b"x");
+        blob.resize(110, 0);
+        assert_eq!(z511a_render_abstract_name(&blob), None);
+    }
+
+    /// Non-printable name bytes are hex-escaped (the decode reads the
+    /// line directly; embedded control bytes must not corrupt it).
+    #[test]
+    fn z511a_nonprintable_bytes_are_escaped() {
+        let mut blob = vec![0x01, 0x00, 0x00];
+        blob.extend_from_slice(b"a\x01b");
+        blob.resize(110, 0);
+        assert_eq!(
+            z511a_render_abstract_name(&blob).as_deref(),
+            Some("a\\x01b")
+        );
+    }
+
+    /// An all-NUL name (abstract but empty) is None — nothing to name.
+    #[test]
+    fn z511a_empty_abstract_name_is_none() {
+        let blob = vec![0x01, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(z511a_render_abstract_name(&blob), None);
+    }
+
+    /// A short blob (< the 4-byte minimum) is None, not a panic.
+    #[test]
+    fn z511a_short_blob_is_none() {
+        assert_eq!(z511a_render_abstract_name(&[0x01, 0x00]), None);
+        assert_eq!(z511a_render_abstract_name(&[]), None);
     }
 }
 
