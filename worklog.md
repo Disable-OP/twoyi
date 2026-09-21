@@ -32840,3 +32840,30 @@ ABSENT this boot (the hang itself flips per-boot) but the boot died a WORSE deat
   present pre-init) and ZERO InitFatalReboot — the boot must reach rung 7+ again;
   (2) the 6-Z530 capture line round 2; (3) the wall round 4 (the monitor-lock hang +
   the 6-Z529 pipe-writer hunt if it returns); (4) the property 0x8s must stay zero.
+
+## Task 263 addendum 4 (rn511 decoded: the eager seed wasn't enough — the VERIFY RE-READ leaks; 6-Z532 the sysctl SHADOW layer)
+
+**rn511 decoded (631e04c8, rung 3 again — the SAME SetKptrRestrict FATAL at ~+2s):**
+- The eager 6-Z531a seed made the ofstream's store write work (rn511 had ZERO failed
+  /proc/sys opens — the 6-Z531b log stayed silent) but init STILL fataled:
+  `Unable to set minimum option value 2 in /proc/sys/kernel/kptr_restrict` — the WRITE
+  step's VERIFY RE-READ saw a DIFFERENT value than what init wrote. The decode: the
+  ifstream opens (initial read AND the verify re-read) can each MISS the ENTRY rewrite
+  independently — a missed READ open hits the HOST twin, which SUCCEEDS (the host sysctl
+  is 0644-root, world-readable — so 6-Z531b never fires!) and returns the HOST's
+  pre-raise value ≠ the store's "2" → SetHighestAvailableOptionValue returns false →
+  LOG(FATAL). The leak is INVISIBLE to failure-only instrumentation because it succeeds.
+- **6-Z532 (the fix, +1 test = 1121/1121)**: the sysctl SHADOW-FD layer —
+  (1) at open-EXIT, ANY successful /proc/sys/** open whose fd's readlink does NOT point
+  into {rootfs}/dev/.twoyi-sysctl/ is registered in the shadow registry (pid, fd → the
+  store-relative path) with a capped log "6-Z532: sysctl open LEAKED to the host twin";
+  (2) read() on a shadowed fd injects the STORE's content over the real host bytes
+  (write_child_bytes_injection + the ret faked to the injected length) — the verify
+  re-read is coherent no matter which side the open landed on; (3) the registry is a
+  static OnceLock<Mutex<HashMap>> (no ~40-field signature surgery) and forget_dead_pid
+  _state drops dead pids' shadow entries (the recycled-pid discipline).
+- Gates 1121/1121; fmt/clippy clean.
+- **rn512 agenda**: (1) the 6-Z532 LEAKED lines must appear (the race observed live!) and
+  ZERO InitFatalReboot — rung 7+ restored; (2) the 6-Z530 capture + zero 0x8s round 3;
+  (3) the wall round 5 (the monitor-lock hang + the 6-Z529 pipe hunt if it returns);
+  (4) the dexopt economy round 4.

@@ -9736,6 +9736,9 @@ fn forget_dead_pid_state(
     fake_netlink_fds.remove(&pid);
     netlink_fd_next.remove(&pid);
     fake_propserv_fds.remove(&pid);
+    // 6-Z532: a dead pid's shadowed sysctl fds must never be inherited
+    // by a pid-recycled successor.
+    z532_shadow_set().remove(&pid);
     prctl_rewritten_args.remove(&pid);
     seccomp_rewritten_ops.remove(&pid);
     pending_epoll_readback.remove(&pid);
@@ -13850,6 +13853,35 @@ fn z527b_pipe_probe_budget_take() -> bool {
 /// case; anything ≥ 1 cannot come out of a real connect.
 fn z530_capture_real_listener(ret: i64) -> bool {
     ret == 0
+}
+
+/// 6-Z532: the sysctl SHADOW-FD registry — (pid, fd) → the store-relative
+/// sysctl path for opens that LEAKED past the ENTRY rewrite to the host
+/// twin (the 6-Z306an-r race class). A static (not a tracer-local map):
+/// the forget_dead_pid_state cleanup site touches it without threading a
+/// new parameter through the ~40-field state signature.
+static Z532_SHADOW_SYSCTL_FDS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<i32, std::collections::HashMap<i64, String>>>,
+> = std::sync::OnceLock::new();
+
+fn z532_shadow_set() -> std::sync::MutexGuard<
+    'static,
+    std::collections::HashMap<i32, std::collections::HashMap<i64, String>>,
+> {
+    Z532_SHADOW_SYSCTL_FDS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// 6-Z532 (pure): the read-injection plan for a shadowed sysctl fd —
+/// inject min(store_len, requested) bytes; None → the store file is
+/// gone (fall through to the honest real read).
+fn z532_read_injection_plan(store_len: usize, requested: u64) -> Option<usize> {
+    if requested == 0 {
+        return None;
+    }
+    Some(store_len.min(requested as usize))
 }
 
 /// 6-Z501: the FUTEX-PARK forensics probe — a blocked-in-futex tracee's
@@ -40945,6 +40977,42 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         }
+                        // ── 6-Z532: the sysctl SHADOW — a /proc/sys/**
+                        // open whose fd did NOT land in the virtual store
+                        // LEAKED to the host twin (the ENTRY rewrite race —
+                        // rn511: BOTH ifstream opens missed while the
+                        // ofstream hit the store; the verify re-read then
+                        // saw the HOST's pre-raise value ≠ what init wrote
+                        // → "Unable to set minimum option value 2" →
+                        // SetKptrRestrict FATAL → InitFatalReboot at rung
+                        // 3). The leaked open itself SUCCEEDS (the host
+                        // sysctl is 0644-root — READABLE), so 6-Z531b never
+                        // fires — shadow the fd instead: reads inject the
+                        // STORE's content (the eager 6-Z531a seed + init's
+                        // own writes are the ground truth), so the verify
+                        // re-read is coherent no matter which side the open
+                        // landed on. Capped log 8/boot.
+                        if ret >= 0 && orig.starts_with("/proc/sys/") {
+                            let store_prefix =
+                                format!("{}/dev/.twoyi-sysctl/", rootfs.trim_end_matches('/'));
+                            let leaked = std::fs::read_link(format!("/proc/{}/fd/{}", pid, ret))
+                                .map(|t| !t.to_string_lossy().starts_with(&store_prefix))
+                                .unwrap_or(false);
+                            if leaked {
+                                let rel = orig["/proc/sys/".len()..].to_string();
+                                static Z532_SHADOW_LOG: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let n = Z532_SHADOW_LOG
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n < 8 {
+                                    log(&format!(
+                                        "6-Z532: sysctl open LEAKED to the host twin pid={} fd={} rel={} — shadowing reads to the virtual store",
+                                        pid, ret, rel
+                                    ));
+                                }
+                                z532_shadow_set().entry(pid).or_default().insert(ret, rel);
+                            }
+                        }
                         // ── 6-Z513: the BINDER driver-fd REGISTRATION (the
                         // open EXIT half) ──
                         //
@@ -48575,6 +48643,52 @@ pub fn run_ptrace_loop(
                             Some((nr, f)) if *nr == syscall_num => *f,
                             _ => get_syscall_arg(&regs, abi.reg_arg1) as i64,
                         };
+                        // ── 6-Z532: a SHADOWED sysctl fd's read injects the
+                        // virtual store's content — the real read already
+                        // executed against the HOST twin (the ENTRY rewrite
+                        // raced), so the buffer holds the host's value and
+                        // must be overwritten with the store's (the eager
+                        // 6-Z531a seed + init's own store writes are the
+                        // ground truth) for the SetHighestAvailableOption
+                        // Value verify re-read to stay coherent.
+                        let z532_rel = z532_shadow_set()
+                            .get(&pid)
+                            .and_then(|m| m.get(&fd).cloned());
+                        if let Some(rel) = z532_rel {
+                            let store_path = format!(
+                                "{}/dev/.twoyi-sysctl/{}",
+                                rootfs.trim_end_matches('/'),
+                                rel
+                            );
+                            if let Ok(content) = std::fs::read(&store_path) {
+                                let requested = get_syscall_arg(&regs, abi.reg_arg3);
+                                let buf_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                if let Some(n) = z532_read_injection_plan(content.len(), requested)
+                                {
+                                    let injected = write_child_bytes_injection(
+                                        pid,
+                                        buf_ptr,
+                                        &content[..n],
+                                        &mut vm_writev_usable,
+                                    );
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
+                                        set_syscall_ret(&mut regs2, &abi, injected.0 as i64);
+                                        let _ = ptrace_setregs(pid, &regs2, len);
+                                    }
+                                    static Z532_READ_LOG: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let rn = Z532_READ_LOG
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if rn < 8 {
+                                        log(&format!(
+                                            "6-Z532: shadowed sysctl read pid={} fd={} rel={} injected {} bytes from the store ({} real host bytes overwritten)",
+                                            pid, fd, rel, injected.0, ret
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                         let is_tracked = fake_propserv_fds
                             .get(&pid)
                             .map_or(false, |s| s.contains(&fd));
@@ -62799,9 +62913,9 @@ mod z520a_wall_park_tests {
         z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_comm_is_idle_daemon,
         z520a_op_is_wait_family, z520a_op_is_wall_class, z520a_wall_decide, z520a_word_delta,
         z527b_access_mode, z527b_pipe_inode, z529_fd_entry, z529_fdinfo_pos, z529_host_verdict,
-        z530_capture_real_listener, Z520ADecision, Z520AEpisodes, Z520AWordDelta, Z520A_BUDGET,
-        Z520A_EARLY_BUDGET, Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS,
-        Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
+        z530_capture_real_listener, z532_read_injection_plan, Z520ADecision, Z520AEpisodes,
+        Z520AWordDelta, Z520A_BUDGET, Z520A_EARLY_BUDGET, Z520A_EPISODE_CAP, Z520A_PER_PID_CAP,
+        Z520A_REFIRE_SECS, Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
     };
 
     /// The rn499 shapes: the main thread AND the pool worker parked with
@@ -62987,6 +63101,16 @@ mod z520a_wall_park_tests {
         assert!(!z530_capture_real_listener(-2)); // ENOENT — the 6-Z110 fake path
         assert!(!z530_capture_real_listener(-111)); // ECONNREFUSED — the 6-Z110 fake path
         assert!(!z530_capture_real_listener(1)); // not a real connect result
+    }
+
+    /// 6-Z532 (pure): the shadowed-sysctl read-injection plan — inject
+    /// min(store_len, requested); a zero-count read never injects.
+    #[test]
+    fn z532_read_injection_plan_caps_at_request_and_store() {
+        assert_eq!(z532_read_injection_plan(2, 128), Some(2)); // the store's "2\n"
+        assert_eq!(z532_read_injection_plan(256, 8), Some(8)); // capped by the request
+        assert_eq!(z532_read_injection_plan(0, 8), Some(0)); // an empty store file injects nothing
+        assert_eq!(z532_read_injection_plan(2, 0), None); // a zero-count read never injects
     }
 
     /// The routine fleet's parks (10-15 s dwells — the shapes that
