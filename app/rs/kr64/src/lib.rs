@@ -5544,6 +5544,18 @@ fn z192_property_format_probe_detects_new_format() {
 /// (marker not found in the new dest). One payload failing is logged
 /// and skipped (honest, non-fatal): the host apex underneath still
 /// covers that name and apexd-bootstrap still runs in-guest.
+/// 6-Z525/6-Z526: the com.android.art key files — dex2oat64's DT_NEEDED
+/// closure + the boot-classpath anchor (the rn504/rn505 CANNOT LINK
+/// libprofile.so class). The 60 s census (6-Z525) and the
+/// post-extraction verification (6-Z526) check the SAME set.
+const ART_APEX_NAME: &str = "com.android.art";
+const ART_APEX_KEY_FILES: [&str; 4] = [
+    "lib64/libart.so",
+    "lib64/libprofile.so",
+    "bin/dex2oat64",
+    "javalib/core-oj.jar",
+];
+
 fn flatten_apex_payloads(cfg: &Config) {
     if cfg.boot_recovery {
         return; // TWRP: statically linked init, no APEX consumers
@@ -5645,8 +5657,77 @@ fn flatten_apex_payloads(cfg: &Config) {
             }
         }
         match flatten_one_apex(&path, &dst, &marker, &want, &cfg.data_dir, &cfg.rootfs) {
-            Ok(_) => {
+            Ok(n) => {
                 flattened += 1;
+                // 6-Z526: the rn504/rn505 libprofile.so class — the walk
+                // reported success (skipped 0, failed 0) yet the DEST tree
+                // lacked lib64/libprofile.so at the dex2oat exec (+210 s),
+                // while rn503's identical code+asset boot linked fine. Two
+                // live hypotheses, both decided by telemetry this run:
+                //  (a) THE WALK lost the file (a silent per-entry miss):
+                //      the post-extraction key-file check below names it
+                //      AT EXTRACTION TIME (+0.5 s) instead of at the
+                //      dex2oat exec (+210 s), and the one retry names
+                //      whether a second pass heals it;
+                //  (b) THE IMPORT (the app-side untar of the 494 MB
+                //      tar.gz on the device) delivered a different/corrupt
+                //      art.debug.apex SOURCE: the APEX-SOURCES summary
+                //      line records the on-device source sizes (the
+                //      release tarball's art.debug.apex = 78529606 bytes
+                //      — any per-boot deviation indicts the import).
+                if apex_name == ART_APEX_NAME {
+                    let missing: Vec<&str> = ART_APEX_KEY_FILES
+                        .iter()
+                        .filter(|f| !Path::new(&format!("{}/{}", dst, f)).exists())
+                        .copied()
+                        .collect();
+                    if missing.is_empty() {
+                        info!(
+                            "[KR64][apex] 6-Z526 FLATTEN-ART: walk-files={} key-files=4/4 OK (source {} bytes)",
+                            n,
+                            meta.len()
+                        );
+                    } else {
+                        warning!(
+                            "[KR64][apex] 6-Z526 ART-KEYFILE-POSTMISS: walk-files={} MISSING {} (source {} bytes) — re-extracting once in place",
+                            n,
+                            missing.join(", "),
+                            meta.len()
+                        );
+                        match flatten_one_apex(
+                            &path,
+                            &dst,
+                            &marker,
+                            &want,
+                            &cfg.data_dir,
+                            &cfg.rootfs,
+                        ) {
+                            Ok(n2) => {
+                                let still: Vec<&str> = ART_APEX_KEY_FILES
+                                    .iter()
+                                    .filter(|f| !Path::new(&format!("{}/{}", dst, f)).exists())
+                                    .copied()
+                                    .collect();
+                                if still.is_empty() {
+                                    info!(
+                                        "[KR64][apex] 6-Z526 ART-RETRY-HEALED: walk-files={} (first pass {}) — the loss is a walk-instance transient, the tree is complete now",
+                                        n2, n
+                                    );
+                                } else {
+                                    warning!(
+                                        "[KR64][apex] 6-Z526 ART-RETRY-STILL-MISSING: {} after walk-files={} (first pass {}) — the walk or the SOURCE reproducibly lacks the files",
+                                        still.join(", "),
+                                        n2,
+                                        n
+                                    );
+                                }
+                            }
+                            Err(e2) => {
+                                warning!("[KR64][apex] 6-Z526 ART-RETRY-FAILED: {}", e2);
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 failed += 1;
@@ -5662,6 +5743,32 @@ fn flatten_apex_payloads(cfg: &Config) {
         "[KR64][apex] apex: flattened {} payload(s) (skipped {}, failed {}) (6-Z305t-2)",
         flattened, skipped, failed
     );
+    // 6-Z526: the on-device SOURCE integrity line — the import-corruption
+    // verdict needs the per-boot source sizes (the release tarball's
+    // com.android.art.debug.apex = 78529606 bytes; the vndk.current.apex
+    // = 76549033). A per-boot deviation indicts the app-side untar, not
+    // the ext4 walk.
+    let mut source_line = String::new();
+    if let Ok(entries) = std::fs::read_dir(&apex_src_dir) {
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if !name.ends_with(".apex") {
+                continue;
+            }
+            if let Ok(m) = entry.metadata() {
+                if !source_line.is_empty() {
+                    source_line.push(' ');
+                }
+                source_line.push_str(&format!("{}={}", name, m.len()));
+            }
+        }
+    }
+    if !source_line.is_empty() {
+        info!("[KR64][apex] 6-Z526 APEX-SOURCES: {}", source_line);
+    }
 }
 
 /// 6-Z523d: the apex-tree CENSUS + mid-run REPAIR — the rn503 flip hedge.
@@ -5741,16 +5848,11 @@ pub(crate) fn apex_tree_census_and_repair(rootfs: &str, data_dir: &str) -> bool 
     // class the flatten's "skipped 0, failed 0" counter does not see).
     // The priv-app check cannot see a missing lib: each key-file miss
     // flags the apex damaged so the repair re-extracts it in place.
-    const ART_APEX: &str = "com.android.art";
-    const ART_KEY_FILES: [&str; 4] = [
-        "lib64/libart.so",
-        "lib64/libprofile.so",
-        "bin/dex2oat64",
-        "javalib/core-oj.jar",
-    ];
+    // (6-Z526: the key-file set is the module-level ART_APEX_KEY_FILES,
+    // shared with the flatten's post-extraction verification.)
     let mut art_key_missing: Vec<&str> = Vec::new();
-    for f in ART_KEY_FILES {
-        let path = format!("{}/apex/{}/{}", rootfs, ART_APEX, f);
+    for f in ART_APEX_KEY_FILES {
+        let path = format!("{}/apex/{}/{}", rootfs, ART_APEX_NAME, f);
         if !std::path::Path::new(&path).exists() {
             art_key_missing.push(f);
         }
@@ -5759,10 +5861,10 @@ pub(crate) fn apex_tree_census_and_repair(rootfs: &str, data_dir: &str) -> bool 
     if art_damaged {
         info!(
             "[KR64][apex] 6-Z525 APEX-KEYFILE-MISSING: {}: {} — the repair re-extraction follows",
-            ART_APEX,
+            ART_APEX_NAME,
             art_key_missing.join(", ")
         );
-        damaged.push(ART_APEX);
+        damaged.push(ART_APEX_NAME);
     }
     let checked = PACKAGE_BEARING.len() + 1; // the 6 package apexes + the art key-file census
                                              // 3. the repair: re-extract each damaged apex from its source.
@@ -18748,6 +18850,27 @@ mod tests {
             "all six package-bearing apexes + the art key files are present — no repair may fire"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 6-Z526: the flatten's post-extraction key-file verification ──
+    #[test]
+    fn z526_art_key_file_set_pins_the_rn504_signature() {
+        // The shared set (the 6-Z525 60s census AND the 6-Z526 flatten
+        // post-check + one retry) must keep naming the rn504/rn505 loss
+        // signature — lib64/libprofile.so, dex2oat64's DT_NEEDED — plus
+        // the linker-critical libart.so, the dex2oat binary itself, and
+        // the boot-classpath anchor. The census workflow (the rsr2
+        // payload dissection) proved ALL FOUR exist in the
+        // com.android.art.debug.apex payload (libprofile.so = inode 110,
+        // 260544 bytes, mode 100644) — so a post-extraction miss indicts
+        // the 6-Z305t-2 walk or the app-side ROM import, never the ROM
+        // content.
+        assert_eq!(ART_APEX_NAME, "com.android.art");
+        assert_eq!(ART_APEX_KEY_FILES.len(), 4);
+        assert!(ART_APEX_KEY_FILES.contains(&"lib64/libprofile.so"));
+        assert!(ART_APEX_KEY_FILES.contains(&"lib64/libart.so"));
+        assert!(ART_APEX_KEY_FILES.contains(&"bin/dex2oat64"));
+        assert!(ART_APEX_KEY_FILES.contains(&"javalib/core-oj.jar"));
     }
 
     #[test]
