@@ -12932,6 +12932,60 @@ const Z520A_EPISODE_MAP_CAP: usize = 1024;
 /// The sibling-parks recency window (the sweep cadence is ~15 s).
 const Z520A_SIBLING_WINDOW_SECS: u64 = 30;
 
+/// 6-Z520a-v4 (the rn505 budget lesson): the ART runtime's ALWAYS-IDLE
+/// daemon thread names (comm, truncated to the kernel's 15-char
+/// pthread_setname_np limit). These threads park in FUTEX_WAIT|PRIVATE
+/// for their whole idle life on arm64 (Object.wait/Unsafe.park land on
+/// futexes), so the v3 op filter (WAIT_PRIVATE = wall-class) passes
+/// them: the rn505 sweep spent ALL 6 late-pool verdicts by +271.8 s on
+/// four of these daemons (+ two Finalizer threads of a short-lived
+/// process at +126.8 s) while the REAL wall parks — the system_server
+/// main thread AND android.fg, parked in futex_do_wait from ~+500 s —
+/// arrived after the budget died and got ZERO verdicts. These daemons
+/// can never BE the boot wall: their parks are the runtime's idle
+/// state, not a coordination point.
+const Z520A_IDLE_DAEMON_COMMS: [&str; 9] = [
+    "HeapTaskDaemon",
+    "ReferenceQueueD", // ReferenceQueueDaemon → the kernel's 15-char comm
+    "FinalizerDaemon",
+    "FinalizerWatchd",
+    "Jit thread pool",
+    "Signal Catcher",
+    "perfetto_hprof_", // perfetto_hprof_thread → 15-char comm
+    "ADB-JDWP Connec", // ADB-JDWP Connection → 15-char comm
+    "Profile Saver",
+];
+
+/// 6-Z520a-v4 (pure): does this comm belong to the ART runtime's
+/// always-idle daemon fleet? Case-sensitive EXACT match (comm is the
+/// thread's own pthread name truncated to 15 chars; the ART names are
+/// stable and their truncations are deterministic). An empty comm
+/// (the read failed) is NEVER idle — the verdict spend proceeds and
+/// the honest "?" reaches the line.
+fn z520a_comm_is_idle_daemon(comm: &str) -> bool {
+    !comm.is_empty() && Z520A_IDLE_DAEMON_COMMS.contains(&comm)
+}
+
+/// 6-Z520a-v4: the bounded deny witness — the first 4 denied spends per
+/// boot name the pid + comm (the budget-drain post-mortem needs the
+/// names; no log storms across the daemon fleet).
+static Z520A_V4_DENY_WITNESS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn z520a_idle_comm_deny_witness(pid: libc::pid_t, comm: &str) {
+    let spent = Z520A_V4_DENY_WITNESS.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |b| if b < 4 { Some(b + 1) } else { None },
+    );
+    if spent.is_ok() {
+        crate::trace_log_line(&format!(
+            "6-Z520a-v4 IDLE-COMM-DENY: pid={} comm=\"{}\" — the wall verdict NOT spent (the ART runtime's always-idle daemon; the rn505 budget lesson)",
+            pid, comm
+        ));
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Z520AEpisode {
     first_seen_secs: u64,
@@ -13231,11 +13285,29 @@ fn z520a_wall_park_sweep(pids: &[libc::pid_t]) {
                                 )
                             };
                             if decision == Z520ADecision::Spend {
-                                let pool = match era {
-                                    Z505Era::Late => z520a_budget_cell(),
-                                    Z505Era::Early => z520a_early_budget_cell(),
-                                };
-                                z520a_wall_park_verdict(pid, uaddr, op, val, &line, now_secs, pool);
+                                // 6-Z520a-v4: the comm gate — the ART
+                                // runtime's always-idle daemons park in
+                                // WAIT|PRIVATE legitimately for MINUTES
+                                // (the rn505 sweep drained the whole
+                                // late pool on them by +271.8 s; the
+                                // real walls formed at ~+500 s and got
+                                // nothing). Denied parks never spend,
+                                // never touch the pool, and never
+                                // record a pid spend.
+                                let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                    .map(|c| c.trim().to_string())
+                                    .unwrap_or_default();
+                                if z520a_comm_is_idle_daemon(&comm) {
+                                    z520a_idle_comm_deny_witness(pid, &comm);
+                                } else {
+                                    let pool = match era {
+                                        Z505Era::Late => z520a_budget_cell(),
+                                        Z505Era::Early => z520a_early_budget_cell(),
+                                    };
+                                    z520a_wall_park_verdict(
+                                        pid, uaddr, op, val, &line, now_secs, pool,
+                                    );
+                                }
                             }
                         }
                         true
@@ -13316,6 +13388,11 @@ fn z520a_wall_park_verdict(
     let wchan = std::fs::read_to_string(format!("/proc/{}/wchan", pid))
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "?".to_string());
+    // 6-Z520a-v4: the thread's comm on the line — every future decode
+    // gets the waiter's name without a /proc walk.
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .map(|c| c.trim().to_string())
+        .unwrap_or_else(|_| "?".to_string());
     let pc = {
         let toks: Vec<&str> = syscall_line.split_whitespace().collect();
         if toks.len() >= 8 {
@@ -13330,8 +13407,9 @@ fn z520a_wall_park_verdict(
         Z520AWordDelta::Changed(p, c) => format!("changed {:#x}->{:#x}", p, c),
     };
     crate::trace_log_line(&format!(
-        "6-Z520a WALL-PARK: pid={} uaddr={:#x} op={:#x} ({}) val={} word={} span={}s wchan={} census={} siblings={} word-delta={} pc={:#x} {}",
+        "6-Z520a WALL-PARK: pid={} comm=\"{}\" uaddr={:#x} op={:#x} ({}) val={} word={} span={}s wchan={} census={} siblings={} word-delta={} pc={:#x} {}",
         pid,
+        comm,
         uaddr,
         op,
         z501_futex_op_name(op),
@@ -62212,10 +62290,11 @@ mod z503_throttle_tests {
 #[cfg(test)]
 mod z520a_wall_park_tests {
     use super::{
-        z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_op_is_wait_family,
-        z520a_op_is_wall_class, z520a_wall_decide, z520a_word_delta, Z520ADecision, Z520AEpisodes,
-        Z520AWordDelta, Z520A_BUDGET, Z520A_EARLY_BUDGET, Z520A_EPISODE_CAP, Z520A_PER_PID_CAP,
-        Z520A_REFIRE_SECS, Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
+        z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_comm_is_idle_daemon,
+        z520a_op_is_wait_family, z520a_op_is_wall_class, z520a_wall_decide, z520a_word_delta,
+        Z520ADecision, Z520AEpisodes, Z520AWordDelta, Z520A_BUDGET, Z520A_EARLY_BUDGET,
+        Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS, Z520A_SIBLING_WINDOW_SECS,
+        Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
     };
 
     /// The rn499 shapes: the main thread AND the pool worker parked with
@@ -62254,6 +62333,55 @@ mod z520a_wall_park_tests {
         assert!(!z520a_op_is_wall_class(0x89)); // WAIT_BITSET|PRIVATE (the rn501 daemon-fleet shape)
         assert!(!z520a_op_is_wall_class(0x81)); // WAKE|PRIVATE
         assert!(!z520a_op_is_wall_class(0x8a)); // WAKE_BITSET|PRIVATE
+    }
+
+    /// 6-Z520a-v4 (the rn505 budget lesson): the comm gate — the ART
+    /// runtime's always-idle daemons park in FUTEX_WAIT|PRIVATE for
+    /// MINUTES legitimately (the rn505 verdicts: HeapTaskDaemon/
+    /// ReferenceQueueD/FinalizerDaemon/FinalizerWatchd, all op=0x80, all
+    /// 60 s+ spans, all census wakes=NEVER — the v3 op filter passed
+    /// them and the whole late pool died at +271.8 s). The exact comm
+    /// set is denied; the truncations are the kernel's 15-char
+    /// pthread_setname_np limit and are deterministic.
+    #[test]
+    fn z520a_v4_idle_daemon_comms_never_spend() {
+        // The rn505 drain fleet, verbatim from the verdict lines.
+        assert!(z520a_comm_is_idle_daemon("HeapTaskDaemon"));
+        assert!(z520a_comm_is_idle_daemon("ReferenceQueueD"));
+        assert!(z520a_comm_is_idle_daemon("FinalizerDaemon"));
+        assert!(z520a_comm_is_idle_daemon("FinalizerWatchd"));
+        // The rest of the always-idle runtime fleet.
+        assert!(z520a_comm_is_idle_daemon("Jit thread pool"));
+        assert!(z520a_comm_is_idle_daemon("Signal Catcher"));
+        assert!(z520a_comm_is_idle_daemon("perfetto_hprof_"));
+        assert!(z520a_comm_is_idle_daemon("ADB-JDWP Connec"));
+        assert!(z520a_comm_is_idle_daemon("Profile Saver"));
+    }
+
+    /// 6-Z520a-v4: the wall-CANDIDATE comms must pass the gate — the
+    /// rn505 end-state's real walls (the system_server main thread,
+    /// android.fg, the InitThreadPool worker) plus the honest edge
+    /// cases: an empty comm (read failure) spends, case differs are
+    /// not the daemons, and a longer-than-15 name is not the truncated
+    /// comm the kernel would report.
+    #[test]
+    fn z520a_v4_wall_candidate_comms_always_spend() {
+        assert!(!z520a_comm_is_idle_daemon("system_server"));
+        assert!(!z520a_comm_is_idle_daemon("android.fg"));
+        assert!(!z520a_comm_is_idle_daemon("system-server-i"));
+        assert!(!z520a_comm_is_idle_daemon("android.display"));
+        assert!(!z520a_comm_is_idle_daemon("surfaceflinger"));
+        assert!(!z520a_comm_is_idle_daemon("zygote64"));
+        assert!(!z520a_comm_is_idle_daemon("binder:4423_1"));
+        assert!(!z520a_comm_is_idle_daemon("main"));
+        // Empty (the /proc read failed) is honest — never idle.
+        assert!(!z520a_comm_is_idle_daemon(""));
+        // Case-sensitive: ART names the daemons in CamelCase.
+        assert!(!z520a_comm_is_idle_daemon("finalizerdaemon"));
+        assert!(!z520a_comm_is_idle_daemon("HEAPTASKDAEMON"));
+        // Not a truncation the kernel would produce.
+        assert!(!z520a_comm_is_idle_daemon("HeapTaskDaemons"));
+        assert!(!z520a_comm_is_idle_daemon("HeapTask"));
     }
 
     /// The routine fleet's parks (10-15 s dwells — the shapes that
