@@ -744,6 +744,29 @@ struct ChildAbi {
     // fchownat (no fchownat2 exists) was caught every time. -1 = the ABI's
     // table predates the syscall (the sentinel convention above).
     fchmodat2_nr: i64,
+    // 6-Z524: utimensat — the path-mtime syscall. installd's
+    // update_out_oat_access_times() (dexopt.cpp:2272, android-11.0.0_r1)
+    // calls utime(out_oat_path, &ut) immediately after the dex2oat child
+    // is reaped; asm-generic has NO utime syscall at all, so bionic's
+    // wrapper lowers to utimensat(AT_FDCWD, path, ts, 0) (sys_time.cpp
+    // funnels utimes/lutimes/futimesat the same way). Pre-6-Z524 the
+    // syscall had a sandbox-backstop slot but NO translation arm, so the
+    // raw guest path /data/dalvik-cache/arm64/apex@…jar@classes.dex
+    // resolved against the HOST filesystem (the redroid Android-14 twin
+    // EXISTS) and the 6-Z185 backstop denied it — 11 deny lines in rn503
+    // and the oat file's atime/mtime never matched the apk's. Numbers
+    // verified against the kernel UAPI headers:
+    //   i386:   __NR_utimensat 320
+    //   x86_64: __NR_utimensat 280
+    //   aarch64 (asm-generic): __NR_utimensat 88
+    //   arm32:  __NR_utimensat 320
+    utimensat: i64,
+    // 6-Z524b: faccessat2 — the faccessat family's modern-kernel variant
+    // (uniform nr 439 on every ABI; kernels >= 5.8; Android-13+-era
+    // bionic routes faccessat() through it). Same (dirfd, path, mode,
+    // flags) layout as faccessat — the 6-Z524 ENTRY arm treats it
+    // identically (see the access/faccessat arm).
+    faccessat2: i64,
     // execve syscall number for this ABI. Used to detect when the child
     // replaces its image (kr64 → TWRP init, or TWRP init → recovery), so
     // we can reset the lazily-detected ABI and re-read /proc/<pid>/exe
@@ -1767,6 +1790,10 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // 6-Z416: -1 — the x86_64 e2e guests are pre-fchmodat2 images; the
     // arm64 redroid path is where Android-14-era bionic needs this.
     fchmodat2_nr: -1,
+    // 6-Z524: x86_64 __NR_utimensat 280, __NR_faccessat2 439 (verified
+    // against /usr/include/x86_64-linux-gnu/asm/unistd_64.h).
+    utimensat: 280,
+    faccessat2: 439,
     execve: 59, // SYS_execve (x86_64)
     mount: 165,
     chroot: 161,
@@ -2114,7 +2141,11 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     fchmodat: 306,
     fchownat: 298,
     fchmodat2_nr: -1, // 6-Z416: not needed on the i386-compat path
-    execve: 11,       // SYS_execve (i386)
+    // 6-Z524: i386 __NR_utimensat 320, __NR_faccessat2 439 (verified
+    // against /usr/include/x86_64-linux-gnu/asm/unistd_32.h).
+    utimensat: 320,
+    faccessat2: 439,
+    execve: 11, // SYS_execve (i386)
     mount: 21,
     chroot: 61,
     mkdir: 39,
@@ -2524,6 +2555,15 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // 6-Z416: the redroid host kernel is 6.6+ and the guest's Android-14-era
     // bionic routes fchmodat() through fchmodat2 — uniform nr 452.
     fchmodat2_nr: 452,
+    // 6-Z524: aarch64 (asm-generic) __NR_utimensat 88 — THE rn503 deny
+    // class: installd's post-dexopt utime(out_oat_path) lowers to this
+    // (bionic sys_time.cpp; asm-generic has no utime syscall at all), the
+    // raw guest path /data/dalvik-cache/arm64/apex@…jar@classes.dex hit
+    // the host twin and the 6-Z185 backstop faked -13, one deny per
+    // successful dexopt (11 lines in rn503). __NR_faccessat2 439 (same
+    // header). See the 6-Z524a ENTRY arm.
+    utimensat: 88,
+    faccessat2: 439,
     execve: 221, // SYS_execve (aarch64)
     // aarch64 mount = 40 (per /usr/include/asm-generic/unistd.h,
     // verified directly against the kernel's UAPI header in Task 5-T).
@@ -2894,7 +2934,11 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     fchmodat: 333,
     fchownat: 325,
     fchmodat2_nr: -1, // 6-Z416: not needed on the arm32-compat path
-    execve: 11,       // SYS_execve (arm32)
+    // 6-Z524: arm32 __NR_utimensat 320, __NR_faccessat2 439 (per
+    // arch/arm/tools/syscall.tbl; matches the 6-Z306v slot-table tuple).
+    utimensat: 320,
+    faccessat2: 439,
+    execve: 11, // SYS_execve (arm32)
     mknodat: 324,
     mount: 21,
     chroot: 61,
@@ -5214,6 +5258,15 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "getitimer"
     } else if abi.alarm_nr != -1 && nr == abi.alarm_nr {
         "alarm"
+    } else if abi.utimensat != -1 && nr == abi.utimensat {
+        // 6-Z524b: label the path-mtime syscall — the rn503 deny fleet
+        // read as `DENIED unknown("/data/dalvik-cache/...")` (the
+        // installd post-dexopt utime class; see the 6-Z524a arm).
+        "utimensat"
+    } else if abi.faccessat2 != -1 && nr == abi.faccessat2 {
+        // 6-Z524b: the faccessat family's modern-kernel variant (uniform
+        // nr 439; Android-13+-era bionic routes faccessat() through it).
+        "faccessat2"
     } else if abi.openat == 56 && abi.execve == 221 {
         // 6-Z180: arm64 generic-name fallback. The aarch64 ABI carries
         // dedicated fields only for the syscalls the tracer INTERCEPTS;
@@ -5370,10 +5423,19 @@ fn arm64_generic_syscall_name(nr: i64) -> &'static str {
         232 => "mincore",
         233 => "madvise",
         261 => "prlimit64",
-        262 => "renameat2",
-        266 => "memfd_create",
+        // 6-Z524b CORRECTIONS (verified against
+        // /usr/include/asm-generic/unistd.h): the old entries had drifted
+        // — 262 is fanotify_init (NOT renameat2), 266 is clock_adjtime
+        // (NOT memfd_create), 281 is execveat (NOT epoll_pwait2); the
+        // real numbers are renameat2=276, memfd_create=279,
+        // epoll_pwait2=441. Labels only — no intercept on this path.
+        262 => "fanotify_init",
+        266 => "clock_adjtime",
+        276 => "renameat2",
         278 => "getrandom",
-        281 => "epoll_pwait2",
+        279 => "memfd_create",
+        281 => "execveat",
+        441 => "epoll_pwait2",
         435 => "clone3",
         436 => "close_range",
         _ => "unknown",
@@ -5916,10 +5978,17 @@ fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> ([(PathArgSlot, bool); 4],
         );
     }
     if nr == symlinkat {
+        // 6-Z524c FIX: symlinkat(target, newdirfd, linkpath) — the PATH
+        // is arg3 (the new link's location), NOT arg2; arg2 is the dirfd.
+        // The old slot read arg2 (the dirfd register — AT_FDCWD is
+        // 0xffffff9c) as a string pointer, read_child_string failed on
+        // the bogus address, and the backstop silently NEVER verified
+        // symlinkat's real path argument. Mirrors the renameat/linkat
+        // oldpath/newpath slot layout (each path against its own dirfd).
         push(
             PathArgSlot {
-                path_reg: a2,
-                dirfd_reg: Some(a1),
+                path_reg: abi.reg_arg3,
+                dirfd_reg: Some(a2),
             },
             false,
         );
@@ -36621,7 +36690,13 @@ pub fn run_ptrace_loop(
                                 });
                             }
                         }
-                        n if n == abi.access || n == abi.faccessat => {
+                        n if n == abi.access
+                            || n == abi.faccessat
+                            || (abi.faccessat2 != -1 && n == abi.faccessat2) =>
+                        {
+                            // 6-Z524b: faccessat2 joins the family —
+                            // identical (dirfd, path, mode, flags) layout
+                            // to faccessat (path = arg2).
                             let path_arg_index = if syscall_num == abi.access {
                                 abi.reg_arg1
                             } else {
@@ -36754,6 +36829,57 @@ pub fn run_ptrace_loop(
                                         &mut regs,
                                         iov_len,
                                         abi.reg_arg1,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &translated,
+                                    )
+                                {
+                                    write_child_string(pid, path_addr, &translated);
+                                }
+                            }
+                        }
+                        // ── 6-Z524a: utimensat ENTRY path translation —
+                        // the dexopt-utime leg ─────────────────────────
+                        //
+                        // rn503 decode: installd's
+                        // update_out_oat_access_times()
+                        // (dexopt.cpp:2272, android-11.0.0_r1) calls
+                        // utime(out_oat_path, &ut) immediately after the
+                        // dex2oat child is reaped — asm-generic has no
+                        // utime(2) syscall at all, so bionic's wrapper
+                        // lowers to utimensat(AT_FDCWD, path, ts, 0)
+                        // (aarch64 nr 88; bionic SYSCALLS.TXT
+                        // "utimensat ... all"; sys_time.cpp funnels
+                        // utimes/lutimes/futimesat the same way).
+                        // utimensat had a BACKSTOP SLOT but no
+                        // translation arm: the raw guest path
+                        // /data/dalvik-cache/arm64/apex@…jar@classes.dex
+                        // resolved against the HOST filesystem — where
+                        // the redroid Android-14's OWN
+                        // /data/dalvik-cache/arm64 exists — so the 6-Z185
+                        // backstop denied it ("real
+                        // /data/dalvik-cache/arm64 — resolved outside the
+                        // rootfs sandbox — faking -13", one deny per
+                        // successful dexopt, 11 lines in rn503) and the
+                        // oat file's atime/mtime never matched the apk's
+                        // (installd's own PLOG WARNING:
+                        // "Could not update access times for ... during
+                        // dexopt"). The kernel now acts on the TRANSLATED
+                        // path — same pattern as the chdir arm above.
+                        n if abi.utimensat != -1 && n == abi.utimensat => {
+                            // utimensat(dirfd, path, times, flags):
+                            // arg2 = the path (arg1 = the dirfd; the
+                            // times/flags args are data — untouched).
+                            let path_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                            if let Some(path) = read_child_string(pid, path_addr) {
+                                let translated =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &path);
+                                if translated != path
+                                    && !write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        abi.reg_arg2,
                                         scratch_addr,
                                         &mut scratch_offset,
                                         &translated,
@@ -53045,6 +53171,124 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         assert_eq!(syscall_name(abi.shmget, &abi), "shmget");
         assert_eq!(syscall_name(abi.shmat, &abi), "shmat");
         assert_eq!(syscall_name(abi.shmctl, &abi), "shmctl");
+    }
+
+    #[test]
+    fn z524_utimensat_faccessat2_abi_numbers_and_labels() {
+        // 6-Z524b: the rn503 deny fleet read as
+        // `SANDBOX BACKSTOP: DENIED unknown("/data/dalvik-cache/...")` —
+        // installd's post-dexopt utime(out_oat_path) is utimensat and it
+        // had NEITHER a ChildAbi field NOR a label. Lock the numbers
+        // (kernel UAPI headers, see the field docs) + the labels per ABI.
+        // arm32 compiles on every host: utimensat=320, faccessat2=439.
+        assert_eq!(ABI_ARM32.utimensat, 320);
+        assert_eq!(syscall_name(ABI_ARM32.utimensat, &ABI_ARM32), "utimensat");
+        assert_eq!(syscall_name(ABI_ARM32.faccessat2, &ABI_ARM32), "faccessat2");
+        assert_eq!(ABI_ARM32.faccessat2, 439);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn z524_utimensat_faccessat2_x86_numbers_and_labels() {
+        // x86_64: utimensat=280; i386: utimensat=320; faccessat2=439
+        // everywhere (see the 6-Z524 field docs).
+        assert_eq!(ABI_X86_64.utimensat, 280);
+        assert_eq!(syscall_name(ABI_X86_64.utimensat, &ABI_X86_64), "utimensat");
+        assert_eq!(
+            syscall_name(ABI_X86_64.faccessat2, &ABI_X86_64),
+            "faccessat2"
+        );
+        assert_eq!(ABI_X86_32.utimensat, 320);
+        assert_eq!(syscall_name(ABI_X86_32.utimensat, &ABI_X86_32), "utimensat");
+        assert_eq!(
+            syscall_name(ABI_X86_32.faccessat2, &ABI_X86_32),
+            "faccessat2"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn z524_utimensat_faccessat2_aarch64_numbers_and_labels() {
+        // aarch64 (asm-generic): utimensat=88 — THE rn503 deny class —
+        // and faccessat2=439.
+        assert_eq!(ABI_AARCH64.utimensat, 88);
+        assert_eq!(
+            syscall_name(ABI_AARCH64.utimensat, &ABI_AARCH64),
+            "utimensat"
+        );
+        assert_eq!(ABI_AARCH64.faccessat2, 439);
+        assert_eq!(
+            syscall_name(ABI_AARCH64.faccessat2, &ABI_AARCH64),
+            "faccessat2"
+        );
+    }
+
+    #[test]
+    fn arm64_generic_syscall_name_z524_corrections() {
+        // 6-Z524b: the 6-Z180 fallback table had drifted — 262 is
+        // fanotify_init (NOT renameat2), 266 is clock_adjtime (NOT
+        // memfd_create), 281 is execveat (NOT epoll_pwait2); the real
+        // numbers are renameat2=276, memfd_create=279, epoll_pwait2=441
+        // (all verified against /usr/include/asm-generic/unistd.h).
+        // Labels only, but a wrong label sends the next decode chasing a
+        // ghost syscall (the 5-X lesson).
+        assert_eq!(arm64_generic_syscall_name(262), "fanotify_init");
+        assert_eq!(arm64_generic_syscall_name(266), "clock_adjtime");
+        assert_eq!(arm64_generic_syscall_name(276), "renameat2");
+        assert_eq!(arm64_generic_syscall_name(279), "memfd_create");
+        assert_eq!(arm64_generic_syscall_name(281), "execveat");
+        assert_eq!(arm64_generic_syscall_name(441), "epoll_pwait2");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn z524_utimensat_slot_layout_matches_the_entry_arm() {
+        // utimensat(dirfd, path, times, flags) — the backstop slot reads
+        // the path from arg2 against the arg1 dirfd, non-fake-success (a
+        // deny is a real -EACCES, unlike the chmod/mknod families). The
+        // 6-Z524a ENTRY arm translates the SAME slot, so the slot layout
+        // and the arm must never drift apart. (x86_64 utimensat=280.)
+        let (slots, len) = sandbox_path_arg_slots(ABI_X86_64.utimensat, &ABI_X86_64);
+        assert_eq!(len, 1);
+        assert_eq!(slots[0].0.path_reg, ABI_X86_64.reg_arg2);
+        assert_eq!(slots[0].0.dirfd_reg, Some(ABI_X86_64.reg_arg1));
+        assert!(!slots[0].1);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn z524_utimensat_slot_layout_matches_the_entry_arm_aarch64() {
+        // aarch64 parity: utimensat=88 — the rn503 deny class.
+        let (slots, len) = sandbox_path_arg_slots(ABI_AARCH64.utimensat, &ABI_AARCH64);
+        assert_eq!(len, 1);
+        assert_eq!(slots[0].0.path_reg, ABI_AARCH64.reg_arg2);
+        assert_eq!(slots[0].0.dirfd_reg, Some(ABI_AARCH64.reg_arg1));
+        assert!(!slots[0].1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn z524_symlinkat_slot_reads_arg3_not_the_dirfd() {
+        // 6-Z524c: symlinkat(target, newdirfd, linkpath) — the backstop's
+        // path slot must read arg3 (the new link's location) with arg2 as
+        // the dirfd. The old slot read arg2 (the dirfd register) as the
+        // path — read_child_string failed on the AT_FDCWD integer and
+        // symlinkat escapes were silently never verified. (x86_64
+        // symlinkat = 266.)
+        let (slots64, len64) = sandbox_path_arg_slots(266, &ABI_X86_64);
+        assert_eq!(len64, 1);
+        assert_eq!(slots64[0].0.path_reg, ABI_X86_64.reg_arg3);
+        assert_eq!(slots64[0].0.dirfd_reg, Some(ABI_X86_64.reg_arg2));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn z524_symlinkat_slot_reads_arg3_not_the_dirfd_aarch64() {
+        // aarch64 parity: asm-generic symlinkat = 36.
+        let (slots, len) = sandbox_path_arg_slots(36, &ABI_AARCH64);
+        assert_eq!(len, 1);
+        assert_eq!(slots[0].0.path_reg, ABI_AARCH64.reg_arg3);
+        assert_eq!(slots[0].0.dirfd_reg, Some(ABI_AARCH64.reg_arg2));
     }
 
     // ── chmod / fchown / sibling EXIT-return-value tests ──────────

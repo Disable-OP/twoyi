@@ -1666,6 +1666,41 @@ mod sandbox_policy_tests {
     }
 
     #[test]
+    fn z524_dalvik_cache_oat_path_translates_into_rootfs() {
+        // The rn503 deny fleet: installd's post-dexopt
+        // update_out_oat_access_times() → utime() → utimensat on
+        // /data/dalvik-cache/arm64/apex@…jar@classes.dex had NO
+        // translation arm, so the raw guest path resolved against the
+        // HOST's own /data/dalvik-cache (the redroid Android-14 twin
+        // EXISTS — the backstop read "real /data/dalvik-cache/arm64 —
+        // resolved outside the rootfs sandbox") and was denied with a
+        // faked -EACCES. The 6-Z524a ENTRY arm translates the path first:
+        // the /data/* rule must map the oat-cache path INSIDE the rootfs
+        // (string-level, host-fs independent) and the translated literal
+        // must satisfy the sandbox verdict the backstop enforces.
+        let p = policy();
+        let guest = "/data/dalvik-cache/arm64/apex@com.android.permission@javalib@service-permission.jar@classes.dex";
+        let translated = p.translate_guest(guest);
+        assert_eq!(
+            translated,
+            "/data/user/0/io.twoyi/rootfs/data/dalvik-cache/arm64/apex@com.android.permission@javalib@service-permission.jar@classes.dex"
+        );
+        // The translated literal passes the prefix verdict (the same
+        // check verify_real_path applies to the resolved form).
+        assert!(matches!(
+            p.verify_real_path(Path::new(translated.as_str())),
+            SandboxVerdict::Allow
+        ));
+        // The service-wifi twin from the same fleet.
+        assert_eq!(
+            p.translate_guest(
+                "/data/dalvik-cache/arm64/apex@com.android.wifi@javalib@service-wifi.jar@classes.dex"
+            ),
+            "/data/user/0/io.twoyi/rootfs/data/dalvik-cache/arm64/apex@com.android.wifi@javalib@service-wifi.jar@classes.dex"
+        );
+    }
+
+    #[test]
     fn translate_runtime_fallback_is_narrow() {
         let p = policy();
         // PT_INTERP parity — the two exact linker paths stay on host:
