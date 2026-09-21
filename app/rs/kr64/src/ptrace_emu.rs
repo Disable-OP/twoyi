@@ -34332,6 +34332,16 @@ pub fn run_ptrace_loop(
                         // zero rewrites.
                         n if abi.close_nr != -1 && n == abi.close_nr => {
                             let close_fd = get_syscall_arg(&regs, abi.reg_arg1);
+                            // 6-Z532: a closed shadowed sysctl fd's entry dies
+                            // NOW — fd numbers are reused immediately (the
+                            // ofstream close → the next open reuses the slot);
+                            // a stale entry would inject store bytes into an
+                            // unrelated file's reads.
+                            if close_fd > 0 {
+                                z532_shadow_set()
+                                    .get_mut(&pid)
+                                    .map(|m| m.remove(&(close_fd as i64)));
+                            }
                             if close_fd <= 2 {
                                 let cnt = {
                                     let c = close_diag_budget.entry(pid).or_insert(0);
@@ -48707,6 +48717,64 @@ pub fn run_ptrace_loop(
                                         "6-Z110: property-client fd {}: Read returned {} — faked to 0 (EOF; reply-reading variants quit cleanly)",
                                         fd,
                                         get_syscall_arg(&regs, abi.reg_ret) as i64
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    // ── 6-Z532b: a SHADOWED sysctl fd's WRITE persists the
+                    // child's bytes into the virtual store ──
+                    //
+                    // SetHighestAvailableOptionValue's ofstream writes the
+                    // candidate value then the SAME ifstream seekg(0)-
+                    // re-reads it for the verify; when the ofstream's open
+                    // LEAKED to the host twin the real write hits the host
+                    // (failbit or a host-twin mutation — both wrong) while
+                    // the injected reads keep seeing the STALE store value
+                    // → the verify never matches → current counts down to
+                    // < min → "Unable to set minimum option value" →
+                    // SetKptrRestrict FATAL. Persisting each shadowed write
+                    // into the store makes the store the coherent ground
+                    // truth for the verify loop (and keeps the guest's
+                    // sysctl writes OFF the host twin).
+                    if abi.write != -1 && syscall_num == abi.write {
+                        let fd = match pending_entry_fd.get(&pid) {
+                            Some((nr, f)) if *nr == syscall_num => *f,
+                            _ => get_syscall_arg(&regs, abi.reg_arg1) as i64,
+                        };
+                        let z532_rel = z532_shadow_set()
+                            .get(&pid)
+                            .and_then(|m| m.get(&fd).cloned());
+                        if let Some(rel) = z532_rel {
+                            let count = get_syscall_arg(&regs, abi.reg_arg3) as usize;
+                            let buf_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let cap = count.min(256);
+                            let mut buf = vec![0u8; cap];
+                            let n = fb0_bridge_read_child_mem(pid, buf_ptr, &mut buf);
+                            if n > 0 {
+                                let store_path = format!(
+                                    "{}/dev/.twoyi-sysctl/{}",
+                                    rootfs.trim_end_matches('/'),
+                                    rel
+                                );
+                                // sysctl semantics: the ofstream is O_TRUNC —
+                                // each write-representative payload overwrites
+                                // the store value.
+                                let _ = std::fs::write(&store_path, &buf[..n as usize]);
+                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
+                                    set_syscall_ret(&mut regs2, &abi, count as i64);
+                                    let _ = ptrace_setregs(pid, &regs2, len);
+                                }
+                                static Z532_WRITE_LOG: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let wn = Z532_WRITE_LOG
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if wn < 8 {
+                                    log(&format!(
+                                        "6-Z532: shadowed sysctl write pid={} fd={} rel={} persisted {} bytes to the store (real write returned {})",
+                                        pid, fd, rel, n, ret
                                     ));
                                 }
                             }

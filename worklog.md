@@ -32867,3 +32867,30 @@ ABSENT this boot (the hang itself flips per-boot) but the boot died a WORSE deat
   ZERO InitFatalReboot — rung 7+ restored; (2) the 6-Z530 capture + zero 0x8s round 3;
   (3) the wall round 5 (the monitor-lock hang + the 6-Z529 pipe hunt if it returns);
   (4) the dexopt economy round 4.
+
+## Task 263 addendum 5 (rn512 decoded: the shadow reads WORKED but the ofstream's writes leaked; 6-Z532b the write persist)
+
+**rn512 decoded (59488f49, rung 3 — the SAME FATAL, but the shadow layer OBSERVED the leak
+live):**
+- `6-Z532: sysctl open LEAKED ... pid=2787 fd=16 rel=kernel/kptr_restrict` ×2 (+2118ms) and
+  fd=17 — **the ENTRY-rewrite leak is REAL and now OBSERVED**; the shadowed read injected
+  the store's "2\n" over the host's bytes ✓. But the FATAL persisted: the AOSP-R source
+  (fetched: init/security.cpp SetHighestAvailableOptionValue) shows the algorithm — ONE
+  ifstream held open across the whole loop, and per iteration a FRESH ofstream writes the
+  candidate value then inf.seekg(0) re-reads THE SAME ifstream for the verify. With the
+  ofstream's open ALSO leaking (fd 17 — its open SUCCEEDED against the host twin), the
+  write hit the HOST (not the store) while the injected reads kept seeing the STALE store
+  value → verify never matched → current counted down 4→3→2 → "Unable to set minimum
+  option value 2" → FATAL. My read-arm's second injection (+2122, fd 16's re-read) showed
+  the stale store content — the write-side gap.
+- **6-Z532b (the fix)**: a write() on a shadowed sysctl fd is intercepted at EXIT — the
+  child's bytes are read (fb0_bridge_read_child_mem, cap 256) and PERSISTED into the
+  virtual store file (O_TRUNC semantics — each ofstream payload overwrites), the write's
+  return faked to the requested count. The store becomes the coherent ground truth for
+  the verify loop, and the guest's sysctl writes NEVER touch the host twin (a hygiene win:
+  the leaked host opens were mutating a REAL host sysctl).
+- **The stale-entry fix**: the shadow registry now unregisters on close() (the fd-reuse
+  corruption class — the fd-16 slot was reused while the entry lived).
+- Gates 1121/1121; fmt/clippy clean.
+- **rn513 agenda**: (1) the 6-Z532 write-persist lines + ZERO InitFatalReboot → rung 7+
+  restored; (2) the wall round 5; (3) the property 0x8s stay zero.
