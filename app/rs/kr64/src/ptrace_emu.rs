@@ -13167,6 +13167,84 @@ fn z520a_wall_park_verdict(
         pid,
         z520a_kstack_summary(pid)
     ));
+    // The ART-Mutex decode (shape-gated): when the parked word's
+    // neighborhood matches the art::Mutex layout, name the lock (the
+    // libart rodata string) and the holder (owner tid + comm + wchan) —
+    // the rn499 main-thread park's shape (state=3, owner=4134).
+    if let Some(art) = z520a_art_mutex_decode(pid, uaddr) {
+        crate::trace_log_line(&format!(
+            "6-Z520a WALL-ARTMUTEX: pid={} uaddr={:#x} {}",
+            pid, uaddr, art
+        ));
+    }
+}
+
+/// 6-Z520a (pure): the ART-Mutex shape — the LP64 art::Mutex layout
+/// (base/mutex.h) puts the name_ pointer at uaddr-12, the level/shutdown
+/// flag u32 at uaddr-4, the state futex word at uaddr, and the owner_
+/// tid u32 at uaddr+4. The rn499 main-thread park decoded EXACTLY under
+/// this layout: name_=0x0000f3e13d0084c8 (libart rodata), flags=0x38,
+/// state=3, owner=4134 (the 6-Z446 MONITOR-WINDOW's ±32B dump, the true
+/// qword boundary at window+20 = uaddr-12). Returns (name_ptr, flags,
+/// state, owner) or None on any implausible field.
+fn z520a_art_mutex_shape(bytes: &[u8]) -> Option<(u64, u32, u32, u32)> {
+    if bytes.len() < 20 {
+        return None;
+    }
+    let name = u64::from_ne_bytes(bytes[0..8].try_into().ok()?);
+    let flags = u32::from_ne_bytes(bytes[8..12].try_into().ok()?);
+    let state = u32::from_ne_bytes(bytes[12..16].try_into().ok()?);
+    let owner = u32::from_ne_bytes(bytes[16..20].try_into().ok()?);
+    let name_ok = name > 0x1000 && (name & 0xffff_0000_0000_0000) == 0;
+    let state_ok = state < 0x1000;
+    let owner_ok = owner > 1 && owner < 0x10_0000;
+    if !name_ok || !state_ok || !owner_ok {
+        return None;
+    }
+    Some((name, flags, state, owner))
+}
+
+/// 6-Z520a (pure): the mutex NAME sanity gate — printable ASCII, 3..48
+/// chars (the libart mutex names: "Locks::thread_list_lock_", "a thread
+/// wait condition variable", ...).
+fn z520a_art_mutex_name_ok(s: &str) -> bool {
+    (3..=48).contains(&s.len()) && s.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+}
+
+/// 6-Z520a: the ART-Mutex decode for a wall park — when the word's
+/// neighborhood matches the art::Mutex layout, read the mutex NAME (the
+/// libart rodata string, LIVE via /proc/pid/mem — the 6-Z447 CV-NAME
+/// precedent) and the OWNER tid's liveness (comm + wchan: an ALIVE
+/// holder names the never-notifying holder outright; a DEAD owner
+/// proves the abandoned lock). Read-only; any miss is honest (None →
+/// no line — the park may not be an ART Mutex at all).
+fn z520a_art_mutex_decode(pid: libc::pid_t, uaddr: u64) -> Option<String> {
+    if uaddr < 12 {
+        return None;
+    }
+    let bytes = read_child_bytes(pid, uaddr - 12, 24)?;
+    let (name_ptr, flags, state, owner) = z520a_art_mutex_shape(&bytes)?;
+    let name = read_child_string_proc_mem(pid, name_ptr).filter(|s| z520a_art_mutex_name_ok(s))?;
+    // The owner: an ART Mutex owner_ is a kernel tid — probe the task
+    // dir under this process first (the expected shape); a gone task is
+    // honest ("gone").
+    let task_dir = format!("/proc/{}/task/{}", pid, owner);
+    let (comm, wchan) = if std::path::Path::new(&task_dir).exists() {
+        (
+            std::fs::read_to_string(format!("{}/comm", task_dir))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "?".to_string()),
+            std::fs::read_to_string(format!("{}/wchan", task_dir))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "?".to_string()),
+        )
+    } else {
+        ("gone".to_string(), "-".to_string())
+    };
+    Some(format!(
+        "state={} owner={} owner-comm=\"{}\" owner-wchan=\"{}\" flags={:#x} name=\"{}\"",
+        state, owner, comm, wchan, flags, name
+    ))
 }
 
 /// 6-Z501: the FUTEX-PARK forensics probe — a blocked-in-futex tracee's
@@ -61653,9 +61731,10 @@ mod z503_throttle_tests {
 #[cfg(test)]
 mod z520a_wall_park_tests {
     use super::{
-        z520a_op_is_wait_family, z520a_wall_decide, z520a_word_delta, Z520ADecision, Z520AEpisodes,
-        Z520AWordDelta, Z520A_BUDGET, Z520A_EPISODE_CAP, Z520A_REFIRE_SECS,
-        Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
+        z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_op_is_wait_family, z520a_wall_decide,
+        z520a_word_delta, Z520ADecision, Z520AEpisodes, Z520AWordDelta, Z520A_BUDGET,
+        Z520A_EPISODE_CAP, Z520A_REFIRE_SECS, Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS,
+        Z520A_WALL_DWELL_SECS,
     };
 
     /// The rn499 shapes: the main thread AND the pool worker parked with
@@ -61814,6 +61893,62 @@ mod z520a_wall_park_tests {
         assert_eq!(Z520A_BUDGET, 6);
         assert_eq!(Z520A_STALE_SECS, 120);
         assert_eq!(Z520A_SIBLING_WINDOW_SECS, 30);
+    }
+
+    /// The ART-Mutex shape against the rn499 main-thread park's RAW
+    /// window (the 6-Z446 MONITOR-WINDOW at +242.5s, the true qword
+    /// boundary at window+20 = uaddr-12): name=0x0000f3e13d0084c8 (the
+    /// libart rodata pointer), flags=0x38, state=3, owner=4134 (the
+    /// holder tid). This pins the layout the live name read rides on.
+    #[test]
+    fn z520a_art_mutex_shape_decodes_the_rn499_window() {
+        let bytes: Vec<u8> = [
+            0xc8u8, 0x84, 0x00, 0x3d, 0xe1, 0xf3, 0x00, 0x00, // name_ = 0x0000f3e13d0084c8
+            0x38, 0x00, 0x00, 0x00, // flags = 0x38
+            0x03, 0x00, 0x00, 0x00, // state (the futex word) = 3
+            0x26, 0x10, 0x00, 0x00, // owner_ = 4134
+        ]
+        .to_vec();
+        let (name, flags, state, owner) =
+            z520a_art_mutex_shape(&bytes).expect("the rn499 shape must parse");
+        assert_eq!(name, 0x0000f3e13d0084c8);
+        assert_eq!(flags, 0x38);
+        assert_eq!(state, 3);
+        assert_eq!(owner, 4134);
+    }
+
+    /// Shape rejections: a null/implausible name, a garbage state, an
+    /// out-of-range owner — each honest None (the decode stays silent
+    /// for non-Mutex parks).
+    #[test]
+    fn z520a_art_mutex_shape_rejects_implausible_fields() {
+        let mut bytes: Vec<u8> = vec![
+            0xc8, 0x84, 0x00, 0x3d, 0xe1, 0xf3, 0x00, 0x00, 0x38, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x00, 0x26, 0x10, 0x00, 0x00,
+        ];
+        assert!(z520a_art_mutex_shape(&bytes).is_some());
+        // Null name.
+        bytes[0..8].copy_from_slice(&[0u8; 8]);
+        assert!(z520a_art_mutex_shape(&bytes).is_none());
+        // Restore; garbage state.
+        bytes[0..8].copy_from_slice(&[0xc8, 0x84, 0x00, 0x3d, 0xe1, 0xf3, 0x00, 0x00]);
+        bytes[12..16].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        assert!(z520a_art_mutex_shape(&bytes).is_none());
+        // Restore; owner 0 (unowned/unlocked) is not a held mutex.
+        bytes[12..16].copy_from_slice(&[0x03, 0x00, 0x00, 0x00]);
+        bytes[16..20].copy_from_slice(&[0, 0, 0, 0]);
+        assert!(z520a_art_mutex_shape(&bytes).is_none());
+    }
+
+    /// The name sanity gate: the libart mutex-name shapes pass, garbage
+    /// fails.
+    #[test]
+    fn z520a_art_mutex_name_gate() {
+        assert!(z520a_art_mutex_name_ok("Locks::thread_list_lock_"));
+        assert!(z520a_art_mutex_name_ok("a thread wait condition variable"));
+        assert!(!z520a_art_mutex_name_ok("ab"));
+        assert!(!z520a_art_mutex_name_ok(&"x".repeat(49)));
+        assert!(!z520a_art_mutex_name_ok("bad\u{1F600}name"));
     }
 }
 
