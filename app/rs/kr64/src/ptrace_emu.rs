@@ -16991,6 +16991,67 @@ fn build_translated_unix_sockaddr(host_path: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// 6-Z519 (pure): the guest abstract name carried by an AF_UNIX abstract
+/// sockaddr blob — the bytes after the leading NUL, length = addrlen-3
+/// (family 2 + the leading NUL 1). None when the blob is not abstract or
+/// the lengths don't line up.
+fn z519_abstract_name(blob: &[u8], sa_len: i64) -> Option<String> {
+    if sa_len < 4 {
+        return None;
+    }
+    let sa_len = sa_len as usize;
+    if sa_len > blob.len() {
+        return None;
+    }
+    if u16::from_le_bytes([blob[0], blob[1]]) != 1 {
+        return None;
+    }
+    if blob[2] != 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&blob[3..sa_len]).into_owned())
+}
+
+/// 6-Z519 (pure): the guest-local FS alias for an abstract name that must
+/// NOT leak into the HOST abstract namespace. The CI sandbox shares the
+/// redroid host's netns, so every un-rewritten abstract bind collides
+/// with the host's own service of the same name: the guest's adbd bind
+/// of @jdwp-control got EADDRINUSE (-98 — the 6-Z511a first name), the
+/// 6-Z101 fake masked the failure, and the accept loop then spammed
+/// `adbd failed to accept client on JDWP control socket: Invalid
+/// argument` in the kmsg tail for the rest of every run (the rn496
+/// shape). The rewrite covers BOTH directions so the whole conversation
+/// becomes guest-local and REAL: the bind (the 6-Z163b abstract arm)
+/// creates the guest-local FS socket, and the in-guest ART connects
+/// (the 6-Z305q arm) land on the SAME path — no host-namespace leak, no
+/// fake success anywhere.
+fn z519_abstract_fs_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "jdwp-control" => Some("/dev/socket/jdwp_control"),
+        _ => None,
+    }
+}
+
+/// 6-Z519 (pure): the connect-side rewrite target for an abstract
+/// sockaddr whose name has a guest-local FS alias — same triple shape
+/// as [`connect_translate_target`] (guest label, host path, the rewritten
+/// blob). None for non-abstract blobs / un-aliased names (the caller
+/// falls through to the FS-spelling translator).
+fn z519_abstract_connect_target(
+    blob: &[u8],
+    rootfs: &str,
+    sa_len: i64,
+) -> Option<(String, String, Vec<u8>)> {
+    if rootfs.is_empty() {
+        return None;
+    }
+    let name = z519_abstract_name(blob, sa_len)?;
+    let fs = z519_abstract_fs_alias(&name)?;
+    let host_path = translate_path(rootfs, fs);
+    let new_sa = build_translated_unix_sockaddr(&host_path)?;
+    Some((format!("@{name}"), host_path, new_sa))
+}
+
 /// 6-Z305p: PURE decision core for the connect() sockaddr translation —
 /// the client-side mirror of the 6-Z305d bind rewrite.
 ///
@@ -29823,11 +29884,30 @@ pub fn run_ptrace_loop(
                                         && blob[2] == 0
                                         && sockaddr_blob_is_property_service(&blob, sa_len, &abi)
                                             .is_some();
+                                    // 6-Z519: the abstract names with a
+                                    // guest-local FS alias (jdwp-control) —
+                                    // the bind lands on the FS spelling so
+                                    // the guest's service OWNS its listener
+                                    // (the host's own @jdwp-control in the
+                                    // shared netns is no longer in the way;
+                                    // the in-guest connects ride the same
+                                    // alias — see the connect side).
+                                    let abstract_fs_alias = if fs_target.is_none()
+                                        && !abstract_is_propserv
+                                        && blob.len() > 2
+                                        && blob[2] == 0
+                                    {
+                                        z519_abstract_name(&blob, sa_len).and_then(|n| {
+                                            z519_abstract_fs_alias(&n).map(str::to_string)
+                                        })
+                                    } else {
+                                        None
+                                    };
                                     let rewrite_guest_path = fs_target.or_else(|| {
                                         if abstract_is_propserv {
                                             Some("/dev/socket/property_service".to_string())
                                         } else {
-                                            None
+                                            abstract_fs_alias
                                         }
                                     });
                                     // 6-Z163b DIAG: when NO rewrite happens,
@@ -30439,8 +30519,14 @@ pub fn run_ptrace_loop(
                                 } else {
                                     read_child_bytes(pid, z305q_sa_ptr, 128)
                                 };
-                            let z305q_target =
-                                z305q_blob.and_then(|b| connect_translate_target(&b, rootfs));
+                            let z305q_target = z305q_blob.and_then(|b| {
+                                // 6-Z519: the abstract-namespace aliases go
+                                // FIRST — the un-aliased abstracts fall
+                                // through to the FS translator (which leaves
+                                // abstracts alone, so nothing changes there).
+                                z519_abstract_connect_target(&b, rootfs, z305q_sa_len)
+                                    .or_else(|| connect_translate_target(&b, rootfs))
+                            });
                             match z305q_target {
                                 Some((guest_path, host_path, new_sa)) => {
                                     // 6-Z305s-n: IN-PLACE sockaddr translation.
@@ -51494,6 +51580,70 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         assert!(note.contains("lr=/data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libandroid_servers.so+0x3e384"));
         // x17 was libc text (the dispatch target) — anonymous here → hex.
         assert!(note.ends_with("x17=0xfec15292ae40"));
+    }
+
+    #[test]
+    fn z519_abstract_name_extracts_by_addrlen() {
+        // bionic's stack sockaddr_un: family LE + NUL + the abstract name,
+        // NUL-padded garbage after the used length (the kernel bounds by
+        // addrlen, NOT a NUL). The rn494 6-Z511a first name: @jdwp-control,
+        // addrlen 15 = family(2) + NUL(1) + 12 name bytes.
+        let mut blob = vec![0x01, 0x00, 0x00];
+        blob.extend_from_slice(b"jdwp-control");
+        blob.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // caller-stack garbage
+        assert_eq!(
+            z519_abstract_name(&blob, 15).as_deref(),
+            Some("jdwp-control")
+        );
+        // A shorter addrlen truncates (the kernel's honest view):
+        // 9 = family(2) + NUL(1) + 6 name bytes.
+        assert_eq!(z519_abstract_name(&blob, 9).as_deref(), Some("jdwp-c"));
+        // FS-spelled / non-unix / too-short: None.
+        assert_eq!(z519_abstract_name(b"/dev/socket/x", 13), None);
+        assert_eq!(z519_abstract_name(&blob, 2), None);
+        assert_eq!(z519_abstract_name(&blob, 200), None);
+    }
+
+    #[test]
+    fn z519_alias_covers_jdwp_and_nothing_else() {
+        assert_eq!(
+            z519_abstract_fs_alias("jdwp-control"),
+            Some("/dev/socket/jdwp_control")
+        );
+        // The property-service name keeps its OWN rewrite (6-Z163b) — the
+        // alias table must not grow arms for it.
+        assert_eq!(z519_abstract_fs_alias("property_service"), None);
+        assert_eq!(z519_abstract_fs_alias("mdns"), None);
+    }
+
+    #[test]
+    fn z519_abstract_connect_target_builds_the_fs_sockaddr() {
+        let mut blob = vec![0x01, 0x00, 0x00];
+        blob.extend_from_slice(b"jdwp-control");
+        blob.extend_from_slice(&[0; 32]);
+        let rootfs = "/data/data/io.twoyi/rootfs";
+        let (guest_label, host_path, new_sa) =
+            z519_abstract_connect_target(&blob, rootfs, 15).expect("jdwp alias");
+        assert_eq!(guest_label, "@jdwp-control");
+        assert_eq!(
+            host_path,
+            "/data/data/io.twoyi/rootfs/dev/socket/jdwp_control"
+        );
+        // The rewritten blob: family + translated path + NUL (the
+        // builder always appends it); fits the 110-byte stack struct
+        // (the 6-Z305s-n in-place guard).
+        assert_eq!(new_sa[0], 0x01);
+        assert_eq!(new_sa[1], 0x00);
+        assert_eq!(&new_sa[2..new_sa.len() - 1], host_path.as_bytes());
+        assert_eq!(new_sa.last(), Some(&0u8));
+        assert!(new_sa.len() <= 110);
+        // Un-aliased names fall through (None) — the caller then tries
+        // the FS translator, which leaves abstracts alone.
+        let mut other = vec![0x01, 0x00, 0x00];
+        other.extend_from_slice(b"mdns");
+        assert!(z519_abstract_connect_target(&other, rootfs, 9).is_none());
+        // Empty rootfs: fail-closed.
+        assert!(z519_abstract_connect_target(&blob, "", 15).is_none());
     }
 
     #[test]
