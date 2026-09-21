@@ -41273,6 +41273,68 @@ pub fn run_ptrace_loop(
                             }
                         }
                     }
+                    // ── 6-Z513c: the BINDER-PROXY CONNECT registration (the
+                    // EXIT half) ──
+                    //
+                    // In the CI sandbox the binder device nodes are UNIX
+                    // SOCKETS (the kr64 proxy at {rootfs}/dev/binder et al;
+                    // the rn495 decode's ENTRY forensics: mode=140666
+                    // ftype=other rdev=0:0), and the guest-side open() hook
+                    // (the shim's binder_open_fallback → binder_proxy_connect)
+                    // creates the driver fd with socket()+connect() — so the
+                    // open-EXIT registration NEVER runs for the proxied
+                    // opens (zero 6-Z513 lines in rn495). The tracer DOES
+                    // see the raw connect(): at a successful connect EXIT
+                    // whose sockaddr resolves to the binder family
+                    // (is_binder_path covers both the guest and the
+                    // translated host spelling — the final-component rule),
+                    // register (tgid, fd). The aarch64 arg registers survive
+                    // to the EXIT stop (the 6-Z413b proof), so fd + the
+                    // sockaddr pointer are read from the EXIT regs.
+                    if abi.connect_nr != -1 && syscall_num == abi.connect_nr {
+                        let z513c_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if z513c_ret == 0 {
+                            let z513c_fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            let z513c_sa = get_syscall_arg(&regs, abi.reg_arg2);
+                            if z513c_fd >= 0 && z513c_sa > 0 {
+                                if let Some(blob) = read_child_bytes(pid, z513c_sa, 110) {
+                                    // AF_UNIX = 1; the FS spelling is
+                                    // NUL-terminated at sun_path (+2).
+                                    if blob.len() > 2 && u16::from_le_bytes([blob[0], blob[1]]) == 1
+                                    {
+                                        let sp = &blob[2..];
+                                        let end =
+                                            sp.iter().position(|&b| b == 0).unwrap_or(sp.len());
+                                        let z513c_path =
+                                            String::from_utf8_lossy(&sp[..end]).into_owned();
+                                        if is_binder_path(&z513c_path) {
+                                            let z513c_tgid =
+                                                z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                            let z513c_fresh = Z513_BINDER_FDS
+                                                .lock()
+                                                .ok()
+                                                .map(|mut m| {
+                                                    m.entry(z513c_tgid)
+                                                        .or_default()
+                                                        .insert(z513c_fd)
+                                                })
+                                                .unwrap_or(false);
+                                            static Z513C_LOGGED: std::sync::atomic::AtomicU64 =
+                                                std::sync::atomic::AtomicU64::new(0);
+                                            let z513c_ln = Z513C_LOGGED
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if z513c_fresh && z513c_ln < 48 {
+                                                log(&format!(
+                                                    "6-Z513 BINDER-FD-REGISTERED (connect): pid={} (tgid {}) fd={} path={:?} — the proxied driver fd is floor-protected",
+                                                    pid, z513c_tgid, z513c_fd, z513c_path
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // 6-Z504: the INIT-SOCKCREATE census ret resolver —
                     // the ENTRY half (init's socket()/bind()) stashed the
                     // class; here the real return is known: WHICH call
