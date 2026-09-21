@@ -115,10 +115,43 @@ jobs:
           echo "== symlink check on lib64 (mode 012000 in ls -l output) =="
           debugfs -R "ls -l /lib64" art/apex_payload.img 2>/dev/null | grep -E '012[0-7]{3}' | head -40 | tee -a out/census.txt || echo "(no symlinks in lib64)" | tee -a out/census.txt
 
+      - name: The linker-resolution census (the rn506 round — DT_NEEDED order + the shipped ld.config)
+        run: |
+          set -e
+          mkdir -p out
+          APEX=$(find x -path '*system/apex*' -name 'com.android.art*.apex' | head -1)
+          unzip -o "$APEX" apex_payload.img -d art/ >/dev/null
+          echo "== dex2oat64 DT_NEEDED order (the linker resolves IN THIS ORDER) ==" | tee -a out/linker-census.txt
+          debugfs -R "dump /bin/dex2oat64 /tmp/dex2oat64" art/apex_payload.img 2>/dev/null || echo "dump failed" | tee -a out/linker-census.txt
+          if [ -f /tmp/dex2oat64 ]; then
+            readelf -d /tmp/dex2oat64 | grep -E 'NEEDED|INTERP|RUNPATH' | tee -a out/linker-census.txt
+            echo "== the interp (6-Z196 patches this to the guest linker64) ==" | tee -a out/linker-census.txt
+            readelf -l /tmp/dex2oat64 | grep -A1 INTERP | tee -a out/linker-census.txt || true
+          fi
+          echo "== /system/lib64 ART-core grep (the FULL tar listing — no truncation) ==" | tee -a out/linker-census.txt
+          tar -tzf rootfs.tar.gz | grep -E '(^|/)system/lib64/(libart|libartbase|libprofile|libdexfile|libsigchain|libbacktrace|libbase)\.so$' | tee -a out/linker-census.txt || echo "(NONE of the ART-core libs in /system/lib64)" | tee -a out/linker-census.txt
+          echo "== /system_ext/lib64 ART-core grep ==" | tee -a out/linker-census.txt
+          tar -tzf rootfs.tar.gz | grep -E '(^|/)system_ext/lib64/(libart|libprofile|libdexfile|libsigchain)\.so$' | tee -a out/linker-census.txt || echo "(none in system_ext)" | tee -a out/linker-census.txt
+          echo "== the ROM's SHIPPED /linkerconfig/ld.config.txt: dir.* lines + the [apex] section ==" | tee -a out/linker-census.txt
+          tar -xzf rootfs.tar.gz -C x --wildcards './linkerconfig/ld.config.txt' 2>/dev/null || tar -xzf rootfs.tar.gz -C x --wildcards 'linkerconfig/ld.config.txt' 2>/dev/null || true
+          LC=$(find x -name 'ld.config.txt' -path '*linkerconfig*' | head -1)
+          if [ -n "$LC" ]; then
+            echo "-- dir.* lines --" | tee -a out/linker-census.txt
+            grep -E '^dir\.' "$LC" | tee -a out/linker-census.txt
+            echo "-- the [apex] section (full) --" | tee -a out/linker-census.txt
+            sed -n '/^\[apex\]/,/^\[/p' "$LC" | head -40 | tee -a out/linker-census.txt
+            echo "-- the com_android_art namespace block --" | tee -a out/linker-census.txt
+            grep -E 'com_android_art' "$LC" | head -30 | tee -a out/linker-census.txt
+          else
+            echo "(the ROM ships NO /linkerconfig/ld.config.txt — generated per boot)" | tee -a out/linker-census.txt
+          fi
+
       - name: Upload the census
         uses: actions/upload-artifact@v4
         with:
           name: art-payload-census
-          path: out/census.txt
+          path: |
+            out/census.txt
+            out/linker-census.txt
           if-no-files-found: ignore
           retention-days: 30
