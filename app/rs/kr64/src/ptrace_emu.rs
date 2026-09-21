@@ -3503,6 +3503,13 @@ static Z483_RARE: std::sync::LazyLock<
 static Z483_RET_PENDING: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<libc::pid_t, (u64, &'static str)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+// 6-Z517: the one-in-flight (pid → (fd, sockaddr)) stash for the
+// connect ARG capture — the ENTRY half inserts (the raw args), the
+// EXIT half consumes (the ret decides). Same one-in-flight shape as
+// Z483_RET_PENDING; dies with the process at both death sites.
+static Z517_CONNECT_PENDING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<libc::pid_t, (i64, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 // 6-Z504: the one-in-flight (pid → class) stash for the INIT-SOCKCREATE
 // census — the ENTRY half (init's socket()/bind()) inserts; the EXIT
 // half resolves the real return into the drop-proof 6-Z504 line. The
@@ -3994,6 +4001,23 @@ fn z306af_resolve_pc(rows: &[(u64, u64, String)], pc: u64) -> Option<String> {
 fn z515_fatal_resolve_note(rows: &[(u64, u64, String)], pc: u64, lr: u64, x17: u64) -> String {
     let n = |v: u64| z306af_resolve_pc(rows, v).unwrap_or_else(|| format!("{v:#x}"));
     format!("pc={} lr={} x17={}", n(pc), n(lr), n(x17))
+}
+
+/// 6-Z517 (pure): the EXIT-half verdict for a stashed connect —
+/// `Some((fd, sockaddr_ptr))` when the binder-fd registration may
+/// proceed (the syscall succeeded AND the stashed ENTRY args are sane),
+/// `None` otherwise (no stash / failed connect / fd<0 / null sockaddr).
+/// The rn496 decode proved WHY the args must come from ENTRY: aarch64
+/// syscall-exit puts the RETURN VALUE in x0 — the 6-Z513c EXIT-half read
+/// of arg1 (the connect fd) recorded the return value (0) as the fd
+/// (every rn496 `BINDER-FD-REGISTERED (connect)` line says fd=0; the fd
+/// census proved fd 0 was a lib file — the REAL driver fd went
+/// unprotected while fd 0 got floor-protected, and 19 legit
+/// libtwrp_fb_hook.so dup(4,0) stdio-recoveries were rewritten to
+/// getpid no-ops).
+fn z517_connect_exit_ok(stash: Option<(i64, u64)>, ret: i64) -> Option<(i64, u64)> {
+    let (fd, sa) = stash?;
+    (ret == 0 && fd >= 0 && sa > 0).then_some((fd, sa))
 }
 
 /// 6-Z305t-71i: decode bionic's abort message at a fatal-signal stop.
@@ -23465,6 +23489,12 @@ pub fn run_ptrace_loop(
             if let Ok(mut z513_m) = Z513_BINDER_FDS.lock() {
                 z513_m.remove(&pid);
             }
+            // 6-Z517: the connect-arg stash dies with the process — a
+            // stale (fd, sockaddr) pair must never be consumed by a
+            // pid-RECYCLED successor's unrelated connect.
+            if let Ok(mut z517_m) = Z517_CONNECT_PENDING.lock() {
+                z517_m.remove(&pid);
+            }
             // Print the last few SIGSYS-intercepted syscalls so we can
             // identify what init was doing right before it died. This is
             // critical for diagnosing the "init exits with code 1 at
@@ -23938,6 +23968,11 @@ pub fn run_ptrace_loop(
             // (WIFSIGNALED mirror of the WIFEXITED cleanup above).
             if let Ok(mut z513_m) = Z513_BINDER_FDS.lock() {
                 z513_m.remove(&pid);
+            }
+            // 6-Z517: the connect-arg stash dies with the process
+            // (WIFSIGNALED mirror of the WIFEXITED cleanup above).
+            if let Ok(mut z517_m) = Z517_CONNECT_PENDING.lock() {
+                z517_m.remove(&pid);
             }
             if !recent_sigsys.is_empty() {
                 let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
@@ -26276,6 +26311,28 @@ pub fn run_ptrace_loop(
                 if is_entry {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
+
+                    // ── 6-Z517: the CONNECT ARG CAPTURE (the ENTRY half) ──
+                    //
+                    // aarch64 syscall-exit clobbers x0 with the RETURN
+                    // VALUE — the 6-Z513c EXIT-half read of arg1 (the
+                    // connect fd) from the EXIT regs therefore recorded
+                    // the return value (0) as the fd (rn496: every
+                    // `BINDER-FD-REGISTERED (connect)` line says fd=0;
+                    // the fd census proved fd 0 was a lib file — the
+                    // REAL driver fd went unprotected while fd 0 got
+                    // floor-protected). The ENTRY regs still hold the
+                    // raw args: stash (fd, sockaddr) per tid here, the
+                    // EXIT half consumes it. Ungated: EVERY connect is
+                    // captured (the 6-Z483 DIAG census is sampled — a
+                    // gated capture would miss connects).
+                    if abi.connect_nr != -1 && syscall_num == abi.connect_nr {
+                        let z517_fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                        let z517_sa = get_syscall_arg(&regs, abi.reg_arg2);
+                        if let Ok(mut pend) = Z517_CONNECT_PENDING.lock() {
+                            pend.insert(pid, (z517_fd, z517_sa));
+                        }
+                    }
 
                     // ── 6-Z306c: the CHILD-SIDE gate ──
                     //
@@ -41310,47 +41367,51 @@ pub fn run_ptrace_loop(
                     // whose sockaddr resolves to the binder family
                     // (is_binder_path covers both the guest and the
                     // translated host spelling — the final-component rule),
-                    // register (tgid, fd). The aarch64 arg registers survive
-                    // to the EXIT stop (the 6-Z413b proof), so fd + the
-                    // sockaddr pointer are read from the EXIT regs.
+                    // register (tgid, fd).
+                    // 6-Z517: fd + the sockaddr pointer come from the ENTRY
+                    // stash — aarch64 syscall-exit clobbers x0 with the
+                    // RETURN VALUE, so the original EXIT-regs read recorded
+                    // ret (0) as the fd (rn496: every registration line said
+                    // fd=0; the fd census proved fd 0 was a lib file — the
+                    // REAL driver fd went unprotected while fd 0 got
+                    // floor-protected, and 19 legit libtwrp_fb_hook.so
+                    // dup(4,0) stdio-recoveries were rewritten).
                     if abi.connect_nr != -1 && syscall_num == abi.connect_nr {
                         let z513c_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        if z513c_ret == 0 {
-                            let z513c_fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
-                            let z513c_sa = get_syscall_arg(&regs, abi.reg_arg2);
-                            if z513c_fd >= 0 && z513c_sa > 0 {
-                                if let Some(blob) = read_child_bytes(pid, z513c_sa, 110) {
-                                    // AF_UNIX = 1; the FS spelling is
-                                    // NUL-terminated at sun_path (+2).
-                                    if blob.len() > 2 && u16::from_le_bytes([blob[0], blob[1]]) == 1
-                                    {
-                                        let sp = &blob[2..];
-                                        let end =
-                                            sp.iter().position(|&b| b == 0).unwrap_or(sp.len());
-                                        let z513c_path =
-                                            String::from_utf8_lossy(&sp[..end]).into_owned();
-                                        if is_binder_path(&z513c_path) {
-                                            let z513c_tgid =
-                                                z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
-                                            let z513c_fresh = Z513_BINDER_FDS
-                                                .lock()
-                                                .ok()
-                                                .map(|mut m| {
-                                                    m.entry(z513c_tgid)
-                                                        .or_default()
-                                                        .insert(z513c_fd)
-                                                })
-                                                .unwrap_or(false);
-                                            static Z513C_LOGGED: std::sync::atomic::AtomicU64 =
-                                                std::sync::atomic::AtomicU64::new(0);
-                                            let z513c_ln = Z513C_LOGGED
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            if z513c_fresh && z513c_ln < 48 {
-                                                log(&format!(
+                        let z517_stash = Z517_CONNECT_PENDING
+                            .lock()
+                            .ok()
+                            .and_then(|mut p| p.remove(&pid));
+                        if let Some((z513c_fd, z513c_sa)) =
+                            z517_connect_exit_ok(z517_stash, z513c_ret)
+                        {
+                            if let Some(blob) = read_child_bytes(pid, z513c_sa, 110) {
+                                // AF_UNIX = 1; the FS spelling is
+                                // NUL-terminated at sun_path (+2).
+                                if blob.len() > 2 && u16::from_le_bytes([blob[0], blob[1]]) == 1 {
+                                    let sp = &blob[2..];
+                                    let end = sp.iter().position(|&b| b == 0).unwrap_or(sp.len());
+                                    let z513c_path =
+                                        String::from_utf8_lossy(&sp[..end]).into_owned();
+                                    if is_binder_path(&z513c_path) {
+                                        let z513c_tgid =
+                                            z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                        let z513c_fresh = Z513_BINDER_FDS
+                                            .lock()
+                                            .ok()
+                                            .map(|mut m| {
+                                                m.entry(z513c_tgid).or_default().insert(z513c_fd)
+                                            })
+                                            .unwrap_or(false);
+                                        static Z513C_LOGGED: std::sync::atomic::AtomicU64 =
+                                            std::sync::atomic::AtomicU64::new(0);
+                                        let z513c_ln = Z513C_LOGGED
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        if z513c_fresh && z513c_ln < 48 {
+                                            log(&format!(
                                                     "6-Z513 BINDER-FD-REGISTERED (connect): pid={} (tgid {}) fd={} path={:?} — the proxied driver fd is floor-protected",
                                                     pid, z513c_tgid, z513c_fd, z513c_path
                                                 ));
-                                            }
                                         }
                                     }
                                 }
@@ -51432,6 +51493,32 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         assert!(note.contains("lr=/data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libandroid_servers.so+0x3e384"));
         // x17 was libc text (the dispatch target) — anonymous here → hex.
         assert!(note.ends_with("x17=0xfec15292ae40"));
+    }
+
+    #[test]
+    fn z517_connect_exit_ok_gates_the_registration() {
+        // The rn496 regression shape: a SUCCESSFUL connect whose EXIT-reg
+        // fd read was really the return value. With the ENTRY stash the
+        // real (fd, sockaddr) pair flows through — the registration
+        // proceeds only for a successful connect with sane args.
+        assert_eq!(
+            z517_connect_exit_ok(Some((3, 0xffff_ee00)), 0),
+            Some((3, 0xffff_ee00))
+        );
+        assert_eq!(
+            z517_connect_exit_ok(Some((0, 0x1000)), 0),
+            Some((0, 0x1000))
+        );
+        // A fd of 0 is LEGITIMATE (the shim's socket() allocates the
+        // lowest free fd — services with closed stdin get fd 0) — the
+        // rn496 bug was that fd was ALWAYS 0, not that it sometimes is.
+        // Failed connect → no registration.
+        assert_eq!(z517_connect_exit_ok(Some((3, 0x1000)), -111), None);
+        // No stash (the EXIT consumed nothing — a missed ENTRY) → none.
+        assert_eq!(z517_connect_exit_ok(None, 0), None);
+        // Negative fd / null sockaddr → none.
+        assert_eq!(z517_connect_exit_ok(Some((-1, 0x1000)), 0), None);
+        assert_eq!(z517_connect_exit_ok(Some((3, 0)), 0), None);
     }
 
     /// 6-Z460: the raw ret-scan candidate extraction — synthetic
