@@ -3703,6 +3703,69 @@ fn z511a_render_abstract_name(blob: &[u8]) -> Option<String> {
         Some(out)
     }
 }
+
+// ── 6-Z513: the BINDER-FD FLOOR ─────────────────────────────────────
+//
+// The rn493 decode's era-killer: system_server era-1's HwBinder
+// ProcessState fd was CLOSED 22s before the SystemServer Watchdog's
+// HIDL service-manager query (the hwbinder proxy conns 166/167
+// disconnected at +172.7s with ZERO transaction frames after the
+// IDENT handshake); the query then failed WITHOUT an ioctl (libhwbinder's
+// talkWithDriver sees mDriverFD < 0 and returns the EBADF fast-path —
+// the tracer's 6-Z305t-42 net saw NO ioctl in the window), the
+// Status(EX_TRANSACTION_FAILED): '-9 (Bad file descriptor)' surfaced as
+// java.util.NoSuchElementException inside Watchdog.getInterestingHalPids,
+// and the WATCHDOG thread died FATAL — the era died, init group-killed
+// ~35 core services, and the boot restarted system_server (the restart
+// cycle). Any future 30s+ main-thread stall would hit the same
+// amplifier: the watchdog's getInterestingHalPids runs at EVERY
+// WAITED_HALF report.
+//
+// A zygote-lineage process NEVER legitimately closes its
+// binder/vndbinder/hwbinder driver fd mid-boot: ProcessState opens it
+// once and caches it (mDriverFD) for the process lifetime. The floor
+// registers every proxied binder-family open of the zygote lineage and
+// turns close/close_range-covering/dup3-targeting that fd into the
+// honest getpid no-op (the 6-Z305y/6-Z477/6-Z484 precedent) while
+// NAMING the closer (the pc attribution).
+//
+// The displacement vectors on aarch64 are exactly three: close(fd),
+// close_range(first<=fd<=last), and dup3(x, fd) (dup3 closes the
+// target first). dup(23)/F_DUPFD/F_DUPFD_CLOEXEC allocate the LOWEST
+// free fd — they can never displace a specific fd.
+static Z513_BINDER_FDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 6-Z513 (pure): is this fd a REGISTERED binder driver fd of this
+/// tgid? The registry membership alone decides — the zygote-lineage
+/// gating happens at registration time and at the call sites.
+fn z513_fd_is_binder(
+    registry: &std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
+    tgid: libc::pid_t,
+    fd: i64,
+) -> bool {
+    registry.get(&tgid).is_some_and(|s| s.contains(&fd))
+}
+
+/// 6-Z513 (pure): does the close_range [first, last] cover ANY
+/// registered binder fd of this tgid? Returns the first covered fd
+/// (the floor log names it).
+fn z513_range_covers_binder(
+    registry: &std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
+    tgid: libc::pid_t,
+    first: i64,
+    last: i64,
+) -> Option<i64> {
+    let mut fds: Vec<i64> = registry
+        .get(&tgid)?
+        .iter()
+        .copied()
+        .filter(|fd| *fd >= first && *fd <= last)
+        .collect();
+    fds.sort_unstable();
+    fds.into_iter().next()
+}
 // close_range is nr 436 on aarch64 AND x86_64 (asm-generic + x86_64
 // unified) — not in ChildAbi; a raw match is exact.
 const Z483_CLOSE_RANGE: i64 = 436;
@@ -23339,6 +23402,14 @@ pub fn run_ptrace_loop(
             // dead pid + the prop_area_maps entries — see
             // forget_dead_pid_state_areas).
             forget_dead_pid_state_areas(pid, &mut property_area_fds, &mut prop_area_maps);
+            // 6-Z513: the binder-fd registry dies with the process — a
+            // pid-RECYCLED successor must not inherit the previous
+            // occupant's floor-protected fd numbers (the stale floor
+            // would deny the successor's legitimate closes of those
+            // numbers before it ever opens binder).
+            if let Ok(mut z513_m) = Z513_BINDER_FDS.lock() {
+                z513_m.remove(&pid);
+            }
             // Print the last few SIGSYS-intercepted syscalls so we can
             // identify what init was doing right before it died. This is
             // critical for diagnosing the "init exits with code 1 at
@@ -23808,6 +23879,11 @@ pub fn run_ptrace_loop(
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
             // above).
             forget_dead_pid_state_areas(pid, &mut property_area_fds, &mut prop_area_maps);
+            // 6-Z513: the binder-fd registry dies with the process
+            // (WIFSIGNALED mirror of the WIFEXITED cleanup above).
+            if let Ok(mut z513_m) = Z513_BINDER_FDS.lock() {
+                z513_m.remove(&pid);
+            }
             if !recent_sigsys.is_empty() {
                 let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
                 log(&format!(
@@ -32873,6 +32949,66 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             }
+                            // ── 6-Z513: the BINDER-FD FLOOR (the close
+                            // vector) ──
+                            //
+                            // A registered binder driver fd of a
+                            // zygote-lineage process must never be closed
+                            // mid-boot: libbinder/libhwbinder cache it
+                            // (mDriverFD) and every later transaction
+                            // EBADF-fails without an ioctl (the rn493
+                            // watchdog FATAL — see the Z513 block comment).
+                            // The floor: rewrite to the getpid no-op and
+                            // NAME the closer (the pc attribution — the
+                            // 6-Z477 pattern). The registry membership
+                            // implies the lineage (registration is
+                            // lineage-gated); the lineage re-check guards
+                            // the pid-recycled edge.
+                            if close_fd > 2 {
+                                let z513_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                let z513_hit = Z513_BINDER_FDS.lock().ok().is_some_and(|m| {
+                                    z513_fd_is_binder(&m, z513_tgid, close_fd as i64)
+                                }) && z306_in_zygote_lineage(
+                                    pid,
+                                    &z306_zygote_lineage,
+                                    &mut z306_lineage_tgid_cache,
+                                );
+                                if z513_hit {
+                                    static Z513_FLOOR_LOGGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let z513_ln = Z513_FLOOR_LOGGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    #[cfg(target_arch = "aarch64")]
+                                    let z513_pc =
+                                        unsafe { *(&regs as *const Regs as *const u64).add(32) };
+                                    #[cfg(target_arch = "x86_64")]
+                                    let z513_pc =
+                                        unsafe { *(&regs as *const Regs as *const u64).add(16) };
+                                    #[cfg(not(any(
+                                        target_arch = "aarch64",
+                                        target_arch = "x86_64"
+                                    )))]
+                                    let z513_pc: u64 = 0;
+                                    if z513_ln < 24 {
+                                        log(&format!(
+                                            "6-Z513 BINDER-FD-FLOOR: pid={} close(fd={}) → getpid rewrite (the binder driver fd is process-critical) pc={:#x} maps[pc]={}",
+                                            pid,
+                                            close_fd,
+                                            z513_pc,
+                                            maps_region_for_pc(pid, z513_pc)
+                                        ));
+                                    }
+                                    set_syscall_num(&mut regs, &abi, abi.getpid);
+                                    if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                        z305y_zclose_pending.insert(pid);
+                                    } else {
+                                        log(&format!(
+                                            "6-Z513: floor setregs FAILED pid={} — the close will execute",
+                                            pid
+                                        ));
+                                    }
+                                }
+                            }
                             // ── 6-Z319: the PIPE-CLOSE observation ────
                             //
                             // fd > 2 and this (process, fd) is a KNOWN pipe
@@ -33012,6 +33148,65 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             }
+                            // ── 6-Z513: the BINDER-FD FLOOR (the dup3-target
+                            // vector) ──
+                            //
+                            // dup3 CLOSES its target first: a dup3 whose
+                            // target is a registered binder driver fd of a
+                            // zygote-lineage process displaces the fd exactly
+                            // like a close (the rn493 watchdog-FATAL chain).
+                            // No /dev/null exemption — nothing may rebind the
+                            // driver fd. The deny mirrors the stdio arm:
+                            // the getpid no-op with the honest dup return
+                            // (the target fd) forced at EXIT.
+                            let z513_binder_dst = dst_fd >= 0 && {
+                                let z513_lineage = z306_in_zygote_lineage(
+                                    pid,
+                                    &z306_zygote_lineage,
+                                    &mut z306_lineage_tgid_cache,
+                                );
+                                z513_lineage
+                                    && Z513_BINDER_FDS.lock().ok().is_some_and(|m| {
+                                        z513_fd_is_binder(
+                                            &m,
+                                            z296_tgid_of(pid, &mut z306_lineage_tgid_cache),
+                                            dst_fd,
+                                        )
+                                    })
+                            };
+                            if z513_binder_dst {
+                                static Z513_DUP_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let z513_ln = Z513_DUP_LOGGED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                #[cfg(target_arch = "aarch64")]
+                                let z513_pc =
+                                    unsafe { *(&regs as *const Regs as *const u64).add(32) };
+                                #[cfg(target_arch = "x86_64")]
+                                let z513_pc =
+                                    unsafe { *(&regs as *const Regs as *const u64).add(16) };
+                                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                                let z513_pc: u64 = 0;
+                                if z513_ln < 24 {
+                                    log(&format!(
+                                        "6-Z513 BINDER-FD-FLOOR: pid={} dup({},{}) → getpid rewrite (dup3 displaces the binder driver fd) pc={:#x} maps[pc]={}",
+                                        pid,
+                                        src_fd,
+                                        dst_fd,
+                                        z513_pc,
+                                        maps_region_for_pc(pid, z513_pc)
+                                    ));
+                                }
+                                z477_dup2_ret_pending.insert(pid, dst_fd);
+                                set_syscall_num(&mut regs, &abi, abi.getpid);
+                                if ptrace_setregs(pid, &regs, iov_len).is_err() {
+                                    z477_dup2_ret_pending.remove(&pid);
+                                    log(&format!(
+                                        "6-Z513: dup-floor setregs FAILED pid={} — the dup will execute",
+                                        pid
+                                    ));
+                                }
+                            }
                         }
                         436 => {
                             // close_range(first, last, flags) — if the
@@ -33087,6 +33282,58 @@ pub fn run_ptrace_loop(
                                     } else {
                                         log(&format!(
                                             "6-Z484: floor setregs FAILED pid={} — the close_range will execute",
+                                            pid
+                                        ));
+                                    }
+                                }
+                            }
+                            // ── 6-Z513: the BINDER-FD FLOOR (the close_range
+                            // vector) ──
+                            //
+                            // A bulk close_range covering a registered binder
+                            // driver fd of a zygote-lineage process
+                            // displaces it exactly like a close (the rn493
+                            // watchdog-FATAL chain). The floor is
+                            // INDEPENDENT of the stdio floor-set check above
+                            // (the registry membership + the lineage
+                            // re-check decide). Same honest no-op: the
+                            // getpid rewrite with ret=0 forced at EXIT.
+                            if last >= first {
+                                let z513_lineage_ok = z306_in_zygote_lineage(
+                                    pid,
+                                    &z306_zygote_lineage,
+                                    &mut z306_lineage_tgid_cache,
+                                );
+                                let z513_covered = if z513_lineage_ok {
+                                    let z513_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                    Z513_BINDER_FDS.lock().ok().and_then(|m| {
+                                        z513_range_covers_binder(
+                                            &m,
+                                            z513_tgid,
+                                            first as i64,
+                                            last as i64,
+                                        )
+                                    })
+                                } else {
+                                    None
+                                };
+                                if let Some(z513_fd) = z513_covered {
+                                    static Z513_CR_LOGGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let z513_ln = Z513_CR_LOGGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if z513_ln < 24 {
+                                        log(&format!(
+                                            "6-Z513 BINDER-FD-FLOOR: pid={} close_range({}, {}) covers the binder driver fd {} → getpid rewrite",
+                                            pid, first, last, z513_fd
+                                        ));
+                                    }
+                                    set_syscall_num(&mut regs, &abi, abi.getpid);
+                                    if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                        z305y_zclose_pending.insert(pid);
+                                    } else {
+                                        log(&format!(
+                                            "6-Z513: close_range floor setregs FAILED pid={} — the close_range will execute",
                                             pid
                                         ));
                                     }
@@ -39120,6 +39367,47 @@ pub fn run_ptrace_loop(
                                     fd_note,
                                     kmsg_open_diag_exit_count
                                 ));
+                            }
+                        }
+                        // ── 6-Z513: the BINDER driver-fd REGISTRATION (the
+                        // open EXIT half) ──
+                        //
+                        // A zygote-lineage process's successful open of
+                        // /dev/binder | /dev/vndbinder | /dev/hwbinder (or
+                        // the binderfs variants — is_binder_path covers the
+                        // final-component forms) registers the returned fd
+                        // in the Z513_BINDER_FDS registry (keyed by TGID —
+                        // the threads share the fd table). The close /
+                        // close_range / dup3 arms then floor any
+                        // displacement of that fd (the rn493 era-killer:
+                        // the HwBinder ProcessState fd closed 22s before
+                        // the watchdog's HIDL SM query → the EBADF
+                        // fast-path → the FATAL era death). Registration is
+                        // budget-free (binder opens are rare — a handful
+                        // per process); the log is capped.
+                        if ret >= 0 && (is_binder_path(&orig) || is_binder_path(&p)) {
+                            let z513_lineage = z306_in_zygote_lineage(
+                                pid,
+                                &z306_zygote_lineage,
+                                &mut z306_lineage_tgid_cache,
+                            );
+                            if z513_lineage {
+                                let z513_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                let z513_fresh = Z513_BINDER_FDS
+                                    .lock()
+                                    .ok()
+                                    .map(|mut m| m.entry(z513_tgid).or_default().insert(ret))
+                                    .unwrap_or(false);
+                                static Z513_REG_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                let z513_ln = Z513_REG_LOGGED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if z513_fresh && z513_ln < 48 {
+                                    log(&format!(
+                                        "6-Z513 BINDER-FD-REGISTERED: pid={} (tgid {}) fd={} orig={:?} translated={:?} — the driver fd is floor-protected (close/close_range/dup3-target)",
+                                        pid, z513_tgid, ret, orig, p
+                                    ));
+                                }
                             }
                         }
                         // ── 6-Z451: BOOT-IMAGE-OPEN result (rn415 decode) ──
@@ -60661,6 +60949,53 @@ mod z511a_abstract_name_tests {
     fn z511a_short_blob_is_none() {
         assert_eq!(z511a_render_abstract_name(&[0x01, 0x00]), None);
         assert_eq!(z511a_render_abstract_name(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod z513_binder_fd_floor_tests {
+    use super::{z513_fd_is_binder, z513_range_covers_binder};
+    use std::collections::{HashMap, HashSet};
+
+    fn registry() -> HashMap<libc::pid_t, HashSet<i64>> {
+        let mut m = HashMap::new();
+        let mut fds = HashSet::new();
+        fds.insert(17); // /dev/binder
+        fds.insert(23); // /dev/hwbinder
+        m.insert(4000, fds);
+        m
+    }
+
+    /// The membership check: a registered (tgid, fd) hits; a different
+    /// fd, a different tgid, or an absent tgid misses.
+    #[test]
+    fn z513_membership_is_per_tgid_and_fd() {
+        let m = registry();
+        assert!(z513_fd_is_binder(&m, 4000, 17));
+        assert!(z513_fd_is_binder(&m, 4000, 23));
+        assert!(!z513_fd_is_binder(&m, 4000, 18));
+        assert!(!z513_fd_is_binder(&m, 4001, 17));
+        assert!(!z513_fd_is_binder(&HashMap::new(), 4000, 17));
+    }
+
+    /// The close_range cover check: the range covering a registered fd
+    /// returns it (the LOWEST first); a non-covering range is None.
+    #[test]
+    fn z513_range_cover_names_the_lowest_fd() {
+        let m = registry();
+        assert_eq!(z513_range_covers_binder(&m, 4000, 0, 100), Some(17));
+        assert_eq!(z513_range_covers_binder(&m, 4000, 18, 100), Some(23));
+        assert_eq!(z513_range_covers_binder(&m, 4000, 24, 100), None);
+        assert_eq!(z513_range_covers_binder(&m, 4000, 0, 16), None);
+        assert_eq!(z513_range_covers_binder(&m, 4001, 0, 100), None);
+    }
+
+    /// An inverted range (first > last) covers nothing (the caller
+    /// gates on last >= first, but the pure core stays honest).
+    #[test]
+    fn z513_inverted_range_covers_nothing() {
+        let m = registry();
+        assert_eq!(z513_range_covers_binder(&m, 4000, 100, 0), None);
     }
 }
 
