@@ -1,0 +1,124 @@
+# 6-Z526: the ART apex payload census — the dex2oat CANNOT LINK
+# libprofile.so hunt.
+#
+# rn504/rn505: the guest dex2oat64 (staged from /apex/com.android.art/bin/)
+# aborts with `CANNOT LINK EXECUTABLE ... library "libprofile.so" not
+# found` while rn503's trio succeeded — a per-boot flip in the flattened
+# /apex/com.android.art tree. The flatten (6-Z305t-2) reads the payload
+# from system/apex/com.android.art.debug.apex (the SDK image ships the
+# DEBUG art apex; its apex_manifest.pb name is "com.android.art", the
+# 6-Z305t-7 identity line). THE OPEN QUESTION this workflow answers from
+# the PRIMARY SOURCE (the vendored rootfs release asset, downloaded on a
+# fat CI pipe instead of the throttled sandbox):
+#   (a) does the payload's ext4 contain lib64/libprofile.so at all?
+#   (b) what else is in lib64 / bin (the debug-apex content census)?
+#   (c) does the ROM ALSO ship a pre-flattened /apex tree (the merge-keep
+#       vs dest-wipe question)?
+#   (d) the tarball's top-level layout (for future rootfs forensics).
+# Read-only vs the ROM; diagnostic only (never gates anything).
+name: art-payload-census
+on:
+  workflow_dispatch:
+    inputs:
+      rootfs_release_tag:
+        description: 'Release tag holding the vendored rootfs'
+        required: false
+        default: 'android11-aosp-arm64-rsr2'
+      rootfs_asset_name:
+        description: 'Asset name of the vendored rootfs tar.gz'
+        required: false
+        default: 'twoyi-android11-aosp-arm64-rsr2.tar.gz'
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    name: ART payload census (the 6-Z526 hunt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download the vendored rootfs release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.rootfs_release_tag || 'android11-aosp-arm64-rsr2' }}
+          ASSET_NAME: ${{ github.event.inputs.rootfs_asset_name || 'twoyi-android11-aosp-arm64-rsr2.tar.gz' }}
+        run: |
+          set -e
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$RELEASE_TAG"
+          URL=$(curl -sf -H "Authorization: token $GH_TOKEN" "$API" \
+                | python3 -c "import json,sys,os; d=json.load(sys.stdin); print(next(a['url'] for a in d['assets'] if a['name']==os.environ['ASSET_NAME']))")
+          curl -fL --retry 3 -H "Authorization: token $GH_TOKEN" \
+               -H "Accept: application/octet-stream" -o rootfs.tar.gz "$URL"
+          stat -c 'asset: %s bytes' rootfs.tar.gz
+
+      - name: Discover the tarball layout
+        run: |
+          set -e
+          echo "── first 40 entries ──"
+          tar -tzf rootfs.tar.gz | head -40 || true
+          echo "── apex-related entries ──"
+          tar -tzf rootfs.tar.gz | grep -iE '(^|/)apex/' | head -60 || true
+
+      - name: Extract the system/apex dir (+ any pre-flattened /apex)
+        run: |
+          set -e
+          mkdir -p x
+          # Pull the apex sources and (if shipped) the pre-flattened tree.
+          tar -xzf rootfs.tar.gz -C x --wildcards '*/system/apex/*.apex' 2>/dev/null || \
+            tar -xzf rootfs.tar.gz -C x --wildcards 'system/apex/*.apex' 2>/dev/null || true
+          tar -xzf rootfs.tar.gz -C x --wildcards '*/apex/com.android.art/*' 2>/dev/null || \
+            tar -xzf rootfs.tar.gz -C x --wildcards 'apex/com.android.art/*' 2>/dev/null || true
+          echo "── extracted tree (depth 3) ──"
+          find x -maxdepth 3 | head -60 || true
+          echo "── system/apex listing ──"
+          find x -type d -name apex -maxdepth 3 | head -5
+          find x -path '*system/apex*' -name '*.apex' -exec ls -la {} \; || true
+
+      - name: The ART apex payload census (debugfs over apex_payload.img)
+        run: |
+          set -e
+          APEX=$(find x -path '*system/apex*' -name 'com.android.art*.apex' | head -1)
+          if [ -z "$APEX" ]; then
+            echo "!! no com.android.art*.apex found under system/apex — dumping whatever apexes exist:"
+            find x -name '*.apex' | head -30
+            exit 1
+          fi
+          echo "== APEX FILE: $APEX =="
+          ls -la "$APEX"
+          file "$APEX" || true
+          mkdir -p art
+          unzip -o "$APEX" apex_payload.img -d art/ || {
+            echo "!! not a ZIP apex — trying as a raw ext4 image"
+            cp "$APEX" art/apex_payload.img
+          }
+          ls -la art/apex_payload.img
+          echo "== payload ext4: / listing =="
+          debugfs -R "ls -l /" art/apex_payload.img 2>/dev/null | head -40
+          echo "== payload ext4: /lib64 listing (THE CENSUS) =="
+          debugfs -R "ls -l /lib64" art/apex_payload.img 2>/dev/null | head -100
+          echo "== payload ext4: /bin listing =="
+          debugfs -R "ls -l /bin" art/apex_payload.img 2>/dev/null | head -60
+          echo "== payload ext4: /javalib listing =="
+          debugfs -R "ls -l /javalib" art/apex_payload.img 2>/dev/null | head -30
+          echo "== KEY FILE stats (the 6-Z526 verdict) =="
+          mkdir -p out
+          for f in /lib64/libprofile.so /lib64/libart.so /lib64/libartbase.so /lib64/libdexfile.so /lib64/libsigchain.so /lib64/libbacktrace.so /lib64/libbase.so /lib64/libunwindstack.so /bin/dex2oat64 /bin/dex2oatd64 /javalib/core-oj.jar; do
+            OUT=$(debugfs -R "stat $f" art/apex_payload.img 2>&1 || true)
+            if echo "$OUT" | grep -qiE 'not found|not a directory|invalid inode'; then
+              echo "$f: NOT IN PAYLOAD" | tee -a out/census.txt
+            else
+              echo "== $f: PRESENT ==" | tee -a out/census.txt
+              echo "$OUT" | head -14 | tee -a out/census.txt
+            fi
+          done
+          echo "== symlink check on lib64 (mode 012000 in ls -l output) =="
+          debugfs -R "ls -l /lib64" art/apex_payload.img 2>/dev/null | grep -E '012[0-7]{3}' | head -40 | tee -a out/census.txt || echo "(no symlinks in lib64)" | tee -a out/census.txt
+
+      - name: Upload the census
+        uses: actions/upload-artifact@v4
+        with:
+          name: art-payload-census
+          path: out/census.txt
+          if-no-files-found: ignore
+          retention-days: 30
