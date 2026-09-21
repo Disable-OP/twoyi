@@ -14178,6 +14178,76 @@ fn z446_mem_window_line(pid: libc::pid_t, uaddr: u64) -> Option<String> {
     ))
 }
 
+// ── 6-Z515b: the per-pid exec-rows SNAPSHOT (the rn502 era-1 lesson) ──
+//
+// rn502's era-1 death (pid 4144, +500.9s): the delivery stop HAD the
+// full registers (si_addr=0xffffffffffffffe8 = the rn495 era-2 class —
+// the container_of-style negative-offset load from a NULL x8) but the
+// LIVE /proc/<pid>/maps read FAILED ("UNREADABLE-MAPS" — the mm was
+// already gone: the death rode the crash_dump teardown's exit path
+// after the 6-Z471a lenient timers fired) — so the 6-Z515 resolve went
+// SILENT and the era death stayed unnamed (again).
+//
+// The fix: snapshot each MAIN THREAD's exec rows ONCE (at the 6-Z406
+// MAIN-PROBE pass's first sighting — the death-class pids are main
+// threads by definition) and let the 6-Z515 resolve FALL BACK to the
+// snapshot when the live maps read fails. ASLR is stable for a
+// process's lifetime, so the first-sighting exec rows resolve the
+// death's pc/lr/x17 honestly (the line notes the provenance).
+type Z515BSnapshots = std::collections::HashMap<libc::pid_t, Vec<(u64, u64, String)>>;
+
+const Z515B_SNAPSHOT_CAP: usize = 64;
+
+fn z515b_snapshot_store() -> &'static std::sync::Mutex<Z515BSnapshots> {
+    static S: std::sync::OnceLock<std::sync::Mutex<Z515BSnapshots>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 6-Z515b (pure): the cache insert decision — one snapshot per pid, the
+/// cap bounds the cache (a new pid beyond the cap stays unsnapshotted).
+fn z515b_snapshot_insert(
+    cache: &mut Z515BSnapshots,
+    pid: libc::pid_t,
+    rows: Vec<(u64, u64, String)>,
+) -> bool {
+    if cache.contains_key(&pid) || cache.len() >= Z515B_SNAPSHOT_CAP {
+        return false;
+    }
+    cache.insert(pid, rows);
+    true
+}
+
+/// 6-Z515b: populate at the first main-thread sighting (one maps read +
+/// exec-rows parse per process per run; the raw text is not retained).
+fn z515b_snapshot_populate(pid: libc::pid_t) {
+    let mut cache = z515b_snapshot_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.contains_key(&pid) || cache.len() >= Z515B_SNAPSHOT_CAP {
+        return;
+    }
+    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{}/maps", pid)) {
+        let rows = z306af_parse_exec_maps(&maps);
+        if !rows.is_empty() {
+            z515b_snapshot_insert(&mut cache, pid, rows);
+        }
+    }
+}
+
+/// 6-Z515b: the resolve-time fallback lookup (a clone; the caller uses it
+/// exactly like the live-parsed rows).
+/// (allow(dead_code): called only from the aarch64-gated fatal-signal
+/// resolve — the x86_64 lib build never references it; kept
+/// host-independent so the z515b tests exercise the same code.)
+#[allow(dead_code)]
+fn z515b_snapshot_lookup(pid: libc::pid_t) -> Option<Vec<(u64, u64, String)>> {
+    z515b_snapshot_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&pid)
+        .cloned()
+}
+
 fn z403_wake_census_lookup(uaddr: u64) -> Option<(u64, u64, std::time::Duration)> {
     let m = Z403_WAKE_CENSUS.get_or_init(|| std::sync::Mutex::new(Z403WakeCensus::new()));
     let g = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -23649,6 +23719,12 @@ pub fn run_ptrace_loop(
                 if tgid != Some(tid) {
                     continue; // not a main thread
                 }
+                // 6-Z515b: the exec-maps SNAPSHOT at the first main-thread
+                // sighting — the fatal-signal resolve's fallback source (the
+                // rn502 era-1 death's maps were already gone at the delivery
+                // stop; the snapshot names such deaths honestly). One maps
+                // read + exec-rows parse per process per run.
+                z515b_snapshot_populate(tid);
                 if state == 'R' || state == 'Z' || state == 'X' {
                     continue; // running or dead — nothing to probe
                 }
@@ -50328,17 +50404,32 @@ pub fn run_ptrace_loop(
                                         pid,
                                         4096,
                                     ) {
-                                        if let Ok(maps515) =
-                                            std::fs::read_to_string(format!("/proc/{}/maps", pid))
-                                        {
-                                            let rows515 = z306af_parse_exec_maps(&maps515);
+                                        // 6-Z515b: the live maps read first;
+                                        // the 6-Z406 first-sighting exec-rows
+                                        // SNAPSHOT as the fallback (the rn502
+                                        // era-1 death's maps were already gone
+                                        // at the delivery stop — the resolve
+                                        // went silent; the snapshot names the
+                                        // death honestly, with provenance).
+                                        let rows515_src = match std::fs::read_to_string(format!(
+                                            "/proc/{}/maps",
+                                            pid
+                                        )) {
+                                            Ok(maps515) => {
+                                                Some((z306af_parse_exec_maps(&maps515), ""))
+                                            }
+                                            Err(_) => z515b_snapshot_lookup(pid).map(|r| {
+                                                (r, " (snapshot-maps: live maps unreadable)")
+                                            }),
+                                        };
+                                        if let Some((rows515, snap_tag)) = rows515_src {
                                             let rp515 = &crash_regs as *const Regs as *const u64;
                                             let pc515 = unsafe { *rp515.add(32) }; // user_pt_regs.pc
                                             let lr515 = unsafe { *rp515.add(30) }; // x30
                                             let x17_515 = unsafe { *rp515.add(17) };
                                             let x8_515 = unsafe { *rp515.add(8) };
                                             log(&format!(
-                                                "6-Z515 FATAL-SIGNAL-RESOLVE [occurrence #{} of this pid]: tid={} sig={} si_code={} si_addr={:#x} {} x8={:#x}",
+                                                "6-Z515 FATAL-SIGNAL-RESOLVE [occurrence #{} of this pid]: tid={} sig={} si_code={} si_addr={:#x} {} x8={:#x}{}",
                                                 z515n,
                                                 pid,
                                                 sig,
@@ -50350,7 +50441,8 @@ pub fn run_ptrace_loop(
                                                     lr515,
                                                     x17_515
                                                 ),
-                                                x8_515
+                                                x8_515,
+                                                snap_tag
                                             ));
                                         }
                                     }
@@ -62075,6 +62167,43 @@ mod z520a_wall_park_tests {
 }
 
 // 6-Z505: the era-split verdict budget (the rn487 budget lesson).
+/// 6-Z515b pure core (the exec-rows snapshot cache: one snapshot per pid,
+/// the cap bounds it — the rn502 era-1 lesson: the maps were gone at the
+/// delivery stop and the resolve went silent).
+#[cfg(test)]
+mod z515b_snapshot_tests {
+    use super::{z515b_snapshot_insert, Z515B_SNAPSHOT_CAP};
+
+    /// One snapshot per pid; a re-populate is a no-op.
+    #[test]
+    fn z515b_snapshot_insert_pins_one_per_pid() {
+        let mut c = std::collections::HashMap::new();
+        assert!(z515b_snapshot_insert(
+            &mut c,
+            100,
+            vec![(0x1000, 0x2000, "lib.so".into())]
+        ));
+        assert!(!z515b_snapshot_insert(
+            &mut c,
+            100,
+            vec![(0x3000, 0x4000, "x.so".into())]
+        ));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.get(&100).unwrap()[0].2, "lib.so");
+    }
+
+    /// The cap bounds the cache (the fleet cannot grow it unbounded).
+    #[test]
+    fn z515b_snapshot_insert_respects_the_cap() {
+        let mut c = std::collections::HashMap::new();
+        for p in 0..Z515B_SNAPSHOT_CAP as libc::pid_t {
+            assert!(z515b_snapshot_insert(&mut c, p, vec![]));
+        }
+        assert_eq!(c.len(), Z515B_SNAPSHOT_CAP);
+        assert!(!z515b_snapshot_insert(&mut c, 99_999, vec![]));
+    }
+}
+
 #[cfg(test)]
 mod z505_era_budget_tests {
     use super::{z505_era_budget_pick, Z505Era, Z505_EARLY_BUDGET, Z505_LATE_ERA_FROM_MS};
