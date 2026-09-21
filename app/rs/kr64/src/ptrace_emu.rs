@@ -21320,6 +21320,26 @@ pub fn run_ptrace_loop(
     let mut kmsg_fd: Option<i32> = None;
     let mut pending_kmsg_open_pid: Option<libc::pid_t> = None; // 6-Z83: per-pid
 
+    // ── 6-Z527a: the dex2oat linker-resolution TRACE ──────────────────
+    //
+    // rn504/505/506's dex2oat64 dies CANNOT LINK libprofile.so (the FIRST
+    // DT_NEEDED — the linker census proved the order) while rn503's
+    // identical trio exited 0 in 1.36 s — same env (LD_LIBRARY_PATH=/dev
+    // captured by 6-Z479a in BOTH), same staged path, byte-identical
+    // generated ld.config.txt (the forensics diff), and the 6-Z525 census
+    // proving the host file exists at every tick. The ONLY unknown left
+    // is the linker's ACTUAL open sequence for a DT_NEEDED: which paths
+    // it probed and which returned ENOENT. The trace: armed pids (the
+    // 6-Z450 dex2oat/odrefresh execve events, cap 3/run) log every
+    // open/openat/openat2 at ENTRY (the path) paired with its EXIT (the
+    // fd or -errno), bounded at 48 lines/pid. Read-only; the pairing
+    // rides the tracer's strict ENTRY/EXIT alternation per tracee.
+    let mut z527_armed_pids: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    let mut z527_pending: Option<(libc::pid_t, String)> = None;
+    let mut z527_logged: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+
     // ── 6-Z305t-71: /dev/qemu_pipe raw-open fd injection ──────────────
     //
     // Ladder #131 + #134: SurfaceFlinger aborts "connect: failed to
@@ -28922,6 +28942,12 @@ pub fn run_ptrace_loop(
                                         orig,
                                         argv_e.join("][")
                                     ));
+                                    // 6-Z527a: arm this pid for the
+                                    // linker-resolution open trace (cap 3
+                                    // armed pids per run — the trio + 1).
+                                    if z527_armed_pids.len() < 3 {
+                                        z527_armed_pids.insert(pid);
+                                    }
                                     // 6-Z479a: the ENV capture. The rn449 decode
                                     // named the PMS-grind dex2oat death: the
                                     // STAGED exec's linker fails
@@ -39287,6 +39313,27 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // ── 6-Z527a: the armed pid's open-family ENTRY stashes
+                    // the FINAL path (post-rewrite — exactly what the
+                    // kernel will act on) for the EXIT pairing. The EXIT
+                    // stop's arg registers are unreliable (the
+                    // 6-Z305t-36 lesson), so the path must be captured
+                    // here.
+                    if z527_armed_pids.contains(&pid)
+                        && (syscall_num == abi.open
+                            || syscall_num == abi.openat
+                            || syscall_num == abi.openat2)
+                    {
+                        let z527_path_addr = if syscall_num == abi.open {
+                            get_syscall_arg(&regs, abi.reg_arg1)
+                        } else {
+                            get_syscall_arg(&regs, abi.reg_arg2)
+                        };
+                        if let Some(z527_p) = read_child_string(pid, z527_path_addr) {
+                            z527_pending = Some((pid, z527_p));
+                        }
+                    }
+
                     // ── Security fix 6-Z185: sandbox enforcement backstop ──
                     //
                     // The LAST line of defense, running at the very END
@@ -40396,6 +40443,41 @@ pub fn run_ptrace_loop(
                     // syscall convention preserves arg registers
                     // (ebx/ecx/edx) across the syscall, so the EXIT
                     // snapshot's abi.reg_ret holds the new fd.
+                    // 6-Z527a: the armed pid's open EXIT — log the
+                    // path + the fd/-errno pair (the linker's actual
+                    // search sequence). The pending is keyed by pid so
+                    // another tracee's stop in between can't drop it.
+                    if let Some((z527_tpid, _z527_tpath)) = z527_pending.as_ref() {
+                        if *z527_tpid == pid
+                            && (syscall_num == abi.open
+                                || syscall_num == abi.openat
+                                || syscall_num == abi.openat2)
+                        {
+                            let (z527_tpid, z527_tpath) = z527_pending.take().unwrap();
+                            let z527_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            let z527_used = z527_logged.entry(z527_tpid).or_insert(0);
+                            if *z527_used < 48 {
+                                *z527_used += 1;
+                                log(&format!(
+                                    "6-Z527a DEX2OAT-OPEN: pid={} ret={} path={}",
+                                    z527_tpid, z527_ret, z527_tpath
+                                ));
+                            }
+                        }
+                    }
+                    // 6-Z527a: an armed pid's exit_group disarms it (the
+                    // pid-reuse hazard: a recycled pid must not inherit
+                    // the trace). The pending is cleared only when it
+                    // belongs to THIS pid — another tracee's exit_group
+                    // must not drop an in-flight armed-pid open.
+                    if syscall_num == abi.exit_group_nr {
+                        z527_armed_pids.remove(&pid);
+                        if let Some((z527_tp, _)) = z527_pending.as_ref() {
+                            if *z527_tp == pid {
+                                z527_pending = None;
+                            }
+                        }
+                    }
                     if pending_kmsg_open_pid == Some(pid) // 6-Z83: per-pid
                         && (syscall_num == abi.open
                             || syscall_num == abi.openat
