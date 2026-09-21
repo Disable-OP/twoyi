@@ -40909,6 +40909,42 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         }
+                        // ── 6-Z531b: the /proc/sys open-FAILURE
+                        // observability (the rn510 rung-3 class) ──
+                        //
+                        // The 6-Z305i sysctl store depends on EVERY
+                        // /proc/sys/** open's ENTRY rewrite landing; the
+                        // 6-Z306an-r stale-bookkeeping race can MISS one —
+                        // the open then resolves against the REAL host
+                        // sysctl and EACCESes (init's SetKptrRestrict
+                        // LOG(FATAL) → InitFatalReboot at +2.2 s in rn510,
+                        // rung 3, zero zygote). Until that EXIT, the miss
+                        // left ZERO trace (the 6-Z305i arm only logs when
+                        // IT runs). Log every failed /proc/sys open with
+                        // the orig/translated pair + errno — a line here
+                        // with translated==orig is the rewrite-miss proof.
+                        // Budget 8/boot (boot-fatal sysctl opens are rare).
+                        if orig.starts_with("/proc/sys/") && ret < 0 {
+                            static Z531_SYSCTL_FAIL_LOG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let n = Z531_SYSCTL_FAIL_LOG
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 8 {
+                                log(&format!(
+                                    "6-Z531: sysctl open FAILED pid={} orig={:?} translated={:?} ret={} (errno={}){}",
+                                    pid,
+                                    orig,
+                                    p,
+                                    ret,
+                                    -ret,
+                                    if p == orig || p.is_empty() {
+                                        " — REWRITE MISSED (the 6-Z306an-r race class; the open hit the RAW host sysctl)"
+                                    } else {
+                                        " (rewritten — the store itself failed; the 6-Z305i prep/log will say why)"
+                                    }
+                                ));
+                            }
+                        }
                         // ── 6-Z513: the BINDER driver-fd REGISTRATION (the
                         // open EXIT half) ──
                         //

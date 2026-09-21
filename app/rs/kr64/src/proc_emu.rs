@@ -83,6 +83,14 @@ pub fn populate_proc(rootfs: &str, cpu_count: u32, mem_mb: u64) -> std::io::Resu
     write_proc_mounts(&proc_dir)?;
     write_proc_self(&proc_dir)?;
     write_proc_sys(&proc_dir)?;
+    // 6-Z531: the .twoyi-sysctl store's EAGER seed — see below.
+    if let Err(e) = seed_sysctl_store(rootfs) {
+        warning!(
+            "[KR64][proc_emu] warning: 6-Z531 sysctl-store seed incomplete: {} -- \
+             init's SetKptrRestrict/SetMmapRndBits may fatal if the lazy 6-Z305i seed races",
+            e
+        );
+    }
 
     // ro.vm.* system properties — written to a dedicated prop file under
     // the rootfs's /system/etc so the guest's property loader picks them
@@ -605,6 +613,63 @@ fn write_proc_sys(proc_dir: &str) -> std::io::Result<()> {
     write_file(&vm_dir, "swappiness", "60\n")?;
     write_file(&vm_dir, "max_map_count", "65536\n")?;
 
+    Ok(())
+}
+
+/// 6-Z531: the `.twoyi-sysctl` STORE's boot-time EAGER seed.
+///
+/// The VFS 6-Z305i rule maps /proc/sys/** to `{rootfs}/dev/.twoyi-
+/// sysctl/**` (the host's /proc/sys is read-only for the untrusted
+/// app), but the store was seeded LAZILY at the first open-ENTRY — and
+/// the read-intent seed copies the HOST's CURRENT value. rn510: the
+/// guest's early boot raced the redroid host's own init — the store's
+/// kernel/kptr_restrict seeded the host's PRE-RAISE value (< 2) →
+/// init's SetHighestAvailableOptionValue attempted the write → the
+/// open-ENTRY path rewrite MISSED (the 6-Z306an-r stale-bookkeeping
+/// race) → the ofstream hit the REAL host sysctl → EACCES →
+/// LOG(FATAL) "Unable to set adequate kptr_restrict value!" →
+/// InitFatalReboot at +2.2 s (rung 3; the boot never reached zygote).
+/// The eager seed (idempotent, 0666 like the 6-Z124 trio, BEFORE the
+/// guest ever runs) means init's ifstream reads the in-range seed →
+/// the store is app-writable → every boot-fatal sysctl interaction
+/// lands in the store, never on the host twin. The lazy 6-Z305i/r arms
+/// stay as the safety net for unknown sysctls.
+fn seed_sysctl_store(rootfs: &str) -> std::io::Result<()> {
+    let store = format!("{}/dev/.twoyi-sysctl", rootfs);
+    let kernel_dir = format!("{}/kernel", store);
+    let vm_dir = format!("{}/vm", store);
+    fs::create_dir_all(&kernel_dir)?;
+    fs::create_dir_all(&vm_dir)?;
+
+    // Idempotent per-file: never overwrite an existing store file (a
+    // live boot's guest-written values are the ground truth).
+    let seed = |dir: &str, name: &str, content: &str| -> std::io::Result<()> {
+        if std::path::Path::new(&format!("{}/{}", dir, name)).exists() {
+            return Ok(());
+        }
+        write_file_mode(dir, name, content, 0o666)
+    };
+
+    // The boot-fatal trio (init LOG(FATAL)s on their failure — the
+    // 6-Z124 run's analysis) + the same supporting files the synthetic
+    // rootfs /proc tree carries (write_proc_sys above).
+    seed(&kernel_dir, "kptr_restrict", "2\n")?;
+    seed(&kernel_dir, "dmesg_restrict", "1\n")?;
+    seed(&kernel_dir, "ngroups_max", "65536\n")?;
+    seed(&kernel_dir, "hostname", "twoyi\n")?;
+    seed(&kernel_dir, "domainname", "localdomain\n")?;
+    seed(
+        &kernel_dir,
+        "osrelease",
+        "4.14.190-g45619c7d3dc8-ab7891234\n",
+    )?;
+    seed(&kernel_dir, "ostype", "Linux\n")?;
+    seed(&vm_dir, "mmap_rnd_bits", "32\n")?;
+    seed(&vm_dir, "mmap_rnd_compat_bits", "16\n")?;
+    seed(&vm_dir, "overcommit_memory", "1\n")?;
+    seed(&vm_dir, "overcommit_ratio", "50\n")?;
+    seed(&vm_dir, "swappiness", "60\n")?;
+    seed(&vm_dir, "max_map_count", "65536\n")?;
     Ok(())
 }
 

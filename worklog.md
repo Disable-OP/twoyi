@@ -32803,3 +32803,40 @@ ABSENT this boot (the hang itself flips per-boot) but the boot died a WORSE deat
   rn509 no); the 6-Z529 pipe-writer hunt rides if it returns; (3) the dexopt economy
   round 3; (4) the rung-8 push — with the property wire healed, system_server should
   finally SURVIVE past run():436 and reach the service starts.
+
+## Task 263 addendum 3 (rn510 decoded: 6-Z530 VERIFIED — zero 0x8s, zero era suicides — but a NEW rung-3 wall: the sysctl-store rewrite race; 6-Z531 the eager seed + observability)
+
+**rn510 decoded (7710bcae, rung 3 — the boot died at +2.2 s):**
+- **THE 6-Z530 FIX VERIFIED**: `6-Z530: connect(fd=11) returned 0 — REAL host
+  property_service listener captured into the emulated protocol` fired at +1711ms (×3 —
+  the host's listener WAS up again); **ZERO "error code: 0x8" lines, ZERO "FATAL EXCEPTION
+  IN SYSTEM PROCESS", ZERO era deaths** — the property wire is healed on the real-listener
+  boots. The rn509 class is dead.
+- **THE NEW WALL (rung 3, PROPERTY_SERVICE post-mortem)**: `init: Unable to set adequate
+  kptr_restrict value! → InitFatalReboot: signal 6 → Reboot ending, jumping to kernel` at
+  +2.2s — the guest init FATALED in SetKptrRestrict (rn508/509 survived this action).
+  Root cause chain: the VFS 6-Z305i rule maps /proc/sys/** to {rootfs}/dev/.twoyi-sysctl/**
+  (the virtual sysctl store), but the store was seeded LAZILY at the first open-ENTRY and
+  the read-intent seed copies the HOST's CURRENT value — the guest's early boot raced the
+  redroid host's own init, so the store's kernel/kptr_restrict seeded the host's
+  PRE-RAISE value (< 2) → init attempted the write → the open-ENTRY path rewrite MISSED
+  (the documented 6-Z306an-r stale-bookkeeping race) → the ofstream hit the REAL host
+  sysctl → EACCES → LOG(FATAL). Evidence: rn510 had ZERO 6-Z305i/r events (the lazy seed
+  never ran) vs rn509's 2 events at +5.4s; zero kptr open traces (the miss leaves no
+  trace — the 6-Z305i arm only logs when it runs).
+- **6-Z531a (the fix)**: the sysctl store is EAGERLY seeded at boot prep
+  (seed_sysctl_store in proc_emu.rs, called right after write_proc_sys) with the 6-Z124
+  trio values at 0666 (kernel/kptr_restrict="2", vm/mmap_rnd_bits="32",
+  vm/mmap_rnd_compat_bits="16" + the supporting set) — idempotent, per-file (never
+  overwrites a live boot's guest-written values). init's ifstream reads the in-range
+  seed and the store is app-writable, so every boot-fatal sysctl interaction lands in
+  the store, never on the host twin; the lazy 6-Z305i/r arms remain the safety net.
+- **6-Z531b (the observability)**: every FAILED open of a /proc/sys/** path logs
+  `6-Z531: sysctl open FAILED pid= orig= translated= ret= errno=` with a
+  rewrite-miss discriminator (translated==orig ⇒ the 6-Z306an-r race class PROVEN).
+  Budget 8/boot.
+- Gates 1120/1120; fmt/clippy clean.
+- **rn511 agenda**: (1) the eager seed must show in the artifacts (the store files
+  present pre-init) and ZERO InitFatalReboot — the boot must reach rung 7+ again;
+  (2) the 6-Z530 capture line round 2; (3) the wall round 4 (the monitor-lock hang +
+  the 6-Z529 pipe-writer hunt if it returns); (4) the property 0x8s must stay zero.
