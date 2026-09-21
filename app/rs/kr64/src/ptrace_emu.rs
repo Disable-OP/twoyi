@@ -12813,6 +12813,17 @@ const Z520A_REFIRE_SECS: u64 = 60;
 const Z520A_EPISODE_CAP: u32 = 3;
 /// The run budget (the sweep's own pool).
 const Z520A_BUDGET: u64 = 6;
+/// 6-Z520a-v2 (the rn500 budget lesson): the EARLY witness pool — the
+/// idle-DAEMON parks (a service thread waiting for work parks for
+/// MINUTES legitimately: rn500 spent ALL 6 wall verdicts by +76.3s on
+/// six distinct daemon pids' 60s+ WAIT_BITSET idle parks, census
+/// wakes=NEVER, before the walls ever arrived). The z505 era split
+/// shape: the early era keeps a small witness pool; the late era (the
+/// wall era: the system_server parks arrive +140s+) keeps the FULL pool.
+const Z520A_EARLY_BUDGET: u64 = 2;
+/// 6-Z520a-v2: the per-pid cap — one verdict per pid per RUN (a
+/// re-parking daemon cannot double-spend; the z503 cap shape).
+const Z520A_PER_PID_CAP: u32 = 1;
 /// A catch after this much park-gap re-arms the episode (the park ENDED:
 /// observed running, a non-wait syscall, or a wake-family op).
 const Z520A_STALE_SECS: u64 = 120;
@@ -12842,6 +12853,19 @@ fn z520a_budget_cell() -> &'static std::sync::atomic::AtomicU64 {
     B.get_or_init(|| std::sync::atomic::AtomicU64::new(Z520A_BUDGET))
 }
 
+/// 6-Z520a-v2: the early-era witness pool (the z505 era-split shape).
+fn z520a_early_budget_cell() -> &'static std::sync::atomic::AtomicU64 {
+    static B: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    B.get_or_init(|| std::sync::atomic::AtomicU64::new(Z520A_EARLY_BUDGET))
+}
+
+/// 6-Z520a-v2: the per-pid spend table (one verdict per pid per run).
+fn z520a_pid_spends() -> &'static std::sync::Mutex<std::collections::HashMap<libc::pid_t, u32>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<libc::pid_t, u32>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// 6-Z520a (pure): does this futex op BLOCK (a park)? WAIT-family only:
 /// WAIT(0), LOCK_PI(6), WAIT_BITSET(9), WAIT_REQUEUE_PI(11) under the
 /// 0x7f command mask (the PRIVATE flag in bit 7 is irrelevant). The
@@ -12859,16 +12883,17 @@ enum Z520ADecision {
 }
 
 /// 6-Z520a (pure): the wall-gate decision for one sweep catch.
-/// budget_left == 0 keeps OBSERVING (silent; the episode tracking stays
-/// honest but nothing can spend).
+/// budget_left == 0 or pid_cap_left == 0 keeps OBSERVING (silent; the
+/// episode tracking stays honest but nothing can spend).
 fn z520a_wall_decide(
     eps: &mut Z520AEpisodes,
     budget_left: u64,
+    pid_cap_left: u32,
     pid: libc::pid_t,
     uaddr: u64,
     now_secs: u64,
 ) -> Z520ADecision {
-    if budget_left == 0 {
+    if budget_left == 0 || pid_cap_left == 0 {
         return Z520ADecision::Observe;
     }
     if eps.len() >= Z520A_EPISODE_MAP_CAP {
@@ -13038,6 +13063,7 @@ fn z520a_sibling_parks(uaddr: u64, now_secs: u64, exclude: libc::pid_t) -> Strin
 /// unreadable proc entry) ends that pid's episodes honestly.
 fn z520a_wall_park_sweep(pids: &[libc::pid_t]) {
     let now_secs = z503_now_secs();
+    let run_ms = crate::boot_elapsed_ms();
     for &pid in pids {
         let read_ok = match std::fs::read_to_string(format!("/proc/{}/syscall", pid)) {
             Ok(line) => {
@@ -13051,15 +13077,43 @@ fn z520a_wall_park_sweep(pids: &[libc::pid_t]) {
                         let uaddr = args[0];
                         let op = args[1];
                         let val = args[2];
-                        let budget_left =
+                        // 6-Z520a-v2: the z505 era split — the early
+                        // era's idle-DAEMON parks spend the small
+                        // witness pool; the late wall era spends the
+                        // full pool. Plus the per-pid cap (1/run).
+                        let early_left =
+                            z520a_early_budget_cell().load(std::sync::atomic::Ordering::Relaxed);
+                        let late_left =
                             z520a_budget_cell().load(std::sync::atomic::Ordering::Relaxed);
+                        let (era, budget_left) = z505_era_budget_pick(
+                            run_ms,
+                            Z505_LATE_ERA_FROM_MS,
+                            early_left,
+                            late_left,
+                        );
+                        let pid_cap_left = {
+                            let spends =
+                                z520a_pid_spends().lock().unwrap_or_else(|e| e.into_inner());
+                            Z520A_PER_PID_CAP.saturating_sub(spends.get(&pid).copied().unwrap_or(0))
+                        };
                         let decision = {
                             let mut eps =
                                 z520a_episodes().lock().unwrap_or_else(|e| e.into_inner());
-                            z520a_wall_decide(&mut eps, budget_left, pid, uaddr, now_secs)
+                            z520a_wall_decide(
+                                &mut eps,
+                                budget_left,
+                                pid_cap_left,
+                                pid,
+                                uaddr,
+                                now_secs,
+                            )
                         };
                         if decision == Z520ADecision::Spend {
-                            z520a_wall_park_verdict(pid, uaddr, op, val, &line, now_secs);
+                            let pool = match era {
+                                Z505Era::Late => z520a_budget_cell(),
+                                Z505Era::Early => z520a_early_budget_cell(),
+                            };
+                            z520a_wall_park_verdict(pid, uaddr, op, val, &line, now_secs, pool);
                         }
                         true
                     }
@@ -13079,7 +13133,7 @@ fn z520a_wall_park_sweep(pids: &[libc::pid_t]) {
 }
 
 /// 6-Z520a: emit one WALL-PARK verdict (the spend path; the budget drain
-/// uses the z501 floor-restore pattern).
+/// uses the z501 floor-restore pattern against the ERA'S OWN pool).
 fn z520a_wall_park_verdict(
     pid: libc::pid_t,
     uaddr: u64,
@@ -13087,22 +13141,31 @@ fn z520a_wall_park_verdict(
     val: u64,
     syscall_line: &str,
     now_secs: u64,
+    pool: &'static std::sync::atomic::AtomicU64,
 ) {
-    let prev = z520a_budget_cell().fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    let prev = pool.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     if prev == 0 {
         // A racing spend emptied the pool between the decide and the
         // drain — restore the floor and drop the verdict (the z501
         // tolerance).
-        z520a_budget_cell().store(0, std::sync::atomic::Ordering::Relaxed);
+        pool.store(0, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     if prev == 1 {
+        let early = std::ptr::eq(pool, z520a_early_budget_cell());
         crate::trace_log_line(&format!(
-            "6-Z520a BUDGET: the wall-park budget exhausted ({} verdicts spent; the {}s dwell gate + the per-episode cap {} remain armed)",
-            Z520A_BUDGET,
+            "6-Z520a BUDGET{}: the wall-park budget exhausted ({} verdicts spent; the {}s dwell gate + the per-episode cap {} + the per-pid cap {} remain armed)",
+            if early { "-EARLY" } else { "" },
+            if early { Z520A_EARLY_BUDGET } else { Z520A_BUDGET },
             Z520A_WALL_DWELL_SECS,
-            Z520A_EPISODE_CAP
+            Z520A_EPISODE_CAP,
+            Z520A_PER_PID_CAP
         ));
+    }
+    // 6-Z520a-v2: the per-pid spend is recorded only on a REAL spend.
+    {
+        let mut spends = z520a_pid_spends().lock().unwrap_or_else(|e| e.into_inner());
+        *spends.entry(pid).or_insert(0) += 1;
     }
     let (span_secs, prev_word, word) = {
         let mut eps = z520a_episodes().lock().unwrap_or_else(|e| e.into_inner());
@@ -61733,8 +61796,8 @@ mod z520a_wall_park_tests {
     use super::{
         z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_op_is_wait_family, z520a_wall_decide,
         z520a_word_delta, Z520ADecision, Z520AEpisodes, Z520AWordDelta, Z520A_BUDGET,
-        Z520A_EPISODE_CAP, Z520A_REFIRE_SECS, Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS,
-        Z520A_WALL_DWELL_SECS,
+        Z520A_EARLY_BUDGET, Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS,
+        Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
     };
 
     /// The rn499 shapes: the main thread AND the pool worker parked with
@@ -61763,18 +61826,18 @@ mod z520a_wall_park_tests {
     fn z520a_routine_park_dwells_never_reach_the_wall_gate() {
         let mut eps = Z520AEpisodes::new();
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1000),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1000),
             Z520ADecision::Observe
         );
         for t in [1015u64, 1030, 1045] {
             assert_eq!(
-                z520a_wall_decide(&mut eps, 6, 100, 0xf00d, t),
+                z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, t),
                 Z520ADecision::Observe
             );
         }
         // 60 s of observed park from the FIRST sight: the first verdict.
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1060),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1060),
             Z520ADecision::Spend
         );
     }
@@ -61786,29 +61849,29 @@ mod z520a_wall_park_tests {
     fn z520a_refire_cadence_and_episode_cap() {
         let mut eps = Z520AEpisodes::new();
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1000),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1000),
             Z520ADecision::Observe
         );
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1060),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1060),
             Z520ADecision::Spend
         );
         // A fast re-catch inside the refire interval never spends again.
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1075),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1075),
             Z520ADecision::Observe
         );
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1120),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1120),
             Z520ADecision::Spend
         );
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1180),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1180),
             Z520ADecision::Spend
         );
         // The episode cap: no 4th verdict from this episode.
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1300),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1300),
             Z520ADecision::Observe
         );
     }
@@ -61820,11 +61883,11 @@ mod z520a_wall_park_tests {
     fn z520a_non_parked_catch_ends_the_episode() {
         let mut eps = Z520AEpisodes::new();
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1000),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1000),
             Z520ADecision::Observe
         );
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1030),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1030),
             Z520ADecision::Observe
         );
         // The sweep's teardown for a non-parked catch (running / a wake
@@ -61832,11 +61895,11 @@ mod z520a_wall_park_tests {
         eps.retain(|(p, _), _| *p != 100);
         // The re-park re-arms; the span restarts from the new sight.
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1400),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1400),
             Z520ADecision::Observe
         );
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1460),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1460),
             Z520ADecision::Spend
         );
     }
@@ -61847,20 +61910,20 @@ mod z520a_wall_park_tests {
     fn z520a_stale_re_arms_and_budget_zero_observes() {
         let mut eps = Z520AEpisodes::new();
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1000),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1000),
             Z520ADecision::Observe
         );
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1060),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1060),
             Z520ADecision::Spend
         );
         // A > 120 s gap: a fresh episode — the old spend history dies.
         assert_eq!(
-            z520a_wall_decide(&mut eps, 6, 100, 0xf00d, 1400),
+            z520a_wall_decide(&mut eps, 6, 1, 100, 0xf00d, 1400),
             Z520ADecision::Observe
         );
         assert_eq!(
-            z520a_wall_decide(&mut eps, 0, 100, 0xf00d, 1600),
+            z520a_wall_decide(&mut eps, 0, 1, 100, 0xf00d, 1600),
             Z520ADecision::Observe
         );
     }
@@ -61891,6 +61954,8 @@ mod z520a_wall_park_tests {
         assert_eq!(Z520A_REFIRE_SECS, 60);
         assert_eq!(Z520A_EPISODE_CAP, 3);
         assert_eq!(Z520A_BUDGET, 6);
+        assert_eq!(Z520A_EARLY_BUDGET, 2);
+        assert_eq!(Z520A_PER_PID_CAP, 1);
         assert_eq!(Z520A_STALE_SECS, 120);
         assert_eq!(Z520A_SIBLING_WINDOW_SECS, 30);
     }
@@ -61949,6 +62014,21 @@ mod z520a_wall_park_tests {
         assert!(!z520a_art_mutex_name_ok("ab"));
         assert!(!z520a_art_mutex_name_ok(&"x".repeat(49)));
         assert!(!z520a_art_mutex_name_ok("bad\u{1F600}name"));
+    }
+
+    /// 6-Z520a-v2 (the rn500 budget lesson): the per-pid cap — one
+    /// verdict per pid per RUN; the pid_cap_left==0 pool observes only.
+    #[test]
+    fn z520a_per_pid_cap_observes_silently() {
+        let mut eps = Z520AEpisodes::new();
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 0, 100, 0xf00d, 1000),
+            Z520ADecision::Observe
+        );
+        assert_eq!(
+            z520a_wall_decide(&mut eps, 6, 0, 100, 0xf00d, 1100),
+            Z520ADecision::Observe
+        );
     }
 }
 
