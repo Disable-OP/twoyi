@@ -13305,7 +13305,7 @@ fn z520a_wall_park_sweep(pids: &[libc::pid_t]) {
                                         Z505Era::Early => z520a_early_budget_cell(),
                                     };
                                     z520a_wall_park_verdict(
-                                        pid, uaddr, op, val, &line, now_secs, pool,
+                                        pid, uaddr, op, val, &line, now_secs, pool, pids,
                                     );
                                 }
                             }
@@ -13329,6 +13329,7 @@ fn z520a_wall_park_sweep(pids: &[libc::pid_t]) {
 
 /// 6-Z520a: emit one WALL-PARK verdict (the spend path; the budget drain
 /// uses the z501 floor-restore pattern against the ERA'S OWN pool).
+#[allow(clippy::too_many_arguments)] // the verdict payload is wide by design
 fn z520a_wall_park_verdict(
     pid: libc::pid_t,
     uaddr: u64,
@@ -13337,6 +13338,7 @@ fn z520a_wall_park_verdict(
     syscall_line: &str,
     now_secs: u64,
     pool: &'static std::sync::atomic::AtomicU64,
+    tracked: &[libc::pid_t],
 ) {
     let prev = pool.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     if prev == 0 {
@@ -13435,11 +13437,27 @@ fn z520a_wall_park_verdict(
     // neighborhood matches the art::Mutex layout, name the lock (the
     // libart rodata string) and the holder (owner tid + comm + wchan) —
     // the rn499 main-thread park's shape (state=3, owner=4134).
-    if let Some(art) = z520a_art_mutex_decode(pid, uaddr) {
+    if let Some((art, owner_tid, owner_wchan)) = z520a_art_mutex_decode(pid, uaddr) {
         crate::trace_log_line(&format!(
             "6-Z520a WALL-ARTMUTEX: pid={} uaddr={:#x} {}",
             pid, uaddr, art
         ));
+        // 6-Z527b: the rn506 headline — the holder parked in a pipe
+        // read while every contender parks behind the lock. Name the
+        // pipe's traffic topology (readers/writers + the writers'
+        // wchans) while the hang is LIVE. Bounded: 2 probes per boot.
+        if owner_wchan.contains("pipe") && z527b_pipe_probe_budget_take() {
+            match z527b_pipe_probe(owner_tid, tracked) {
+                Some(topology) => crate::trace_log_line(&format!(
+                    "6-Z527b WALL-OWNER-PIPE: owner={} {}",
+                    owner_tid, topology
+                )),
+                None => crate::trace_log_line(&format!(
+                    "6-Z527b WALL-OWNER-PIPE: owner={} — no pipe fds found (the read is on something else or the fd set changed)",
+                    owner_tid
+                )),
+            };
+        }
     }
 }
 
@@ -13482,7 +13500,12 @@ fn z520a_art_mutex_name_ok(s: &str) -> bool {
 /// holder names the never-notifying holder outright; a DEAD owner
 /// proves the abandoned lock). Read-only; any miss is honest (None →
 /// no line — the park may not be an ART Mutex at all).
-fn z520a_art_mutex_decode(pid: libc::pid_t, uaddr: u64) -> Option<String> {
+///
+/// 6-Z527b: ALSO returns (owner tid, owner wchan) so the verdict can
+/// run the WALL-OWNER-PIPE probe when the holder is parked in a pipe
+/// read — the rn506 headline (the watchdog holding "a monitor lock"
+/// while parked in anon_pipe_read, freezing every contender).
+fn z520a_art_mutex_decode(pid: libc::pid_t, uaddr: u64) -> Option<(String, libc::pid_t, String)> {
     if uaddr < 12 {
         return None;
     }
@@ -13505,10 +13528,136 @@ fn z520a_art_mutex_decode(pid: libc::pid_t, uaddr: u64) -> Option<String> {
     } else {
         ("gone".to_string(), "-".to_string())
     };
-    Some(format!(
-        "state={} owner={} owner-comm=\"{}\" owner-wchan=\"{}\" flags={:#x} name=\"{}\"",
-        state, owner, comm, wchan, flags, name
+    Some((
+        format!(
+            "state={} owner={} owner-comm=\"{}\" owner-wchan=\"{}\" flags={:#x} name=\"{}\"",
+            state, owner, comm, wchan, flags, name
+        ),
+        owner as libc::pid_t,
+        wchan,
     ))
+}
+
+/// 6-Z527b (pure): the pipe-inode extraction from a /proc/<pid>/fd
+/// readlink target — "pipe:[12345]" → Some(12345); everything else
+/// (sockets, anon inodes, real files, /dev/*) → None.
+fn z527b_pipe_inode(readlink_target: &str) -> Option<u64> {
+    let inner = readlink_target.strip_prefix("pipe:[")?.strip_suffix("]")?;
+    inner.parse::<u64>().ok()
+}
+
+/// 6-Z527b (pure): the access mode from an fdinfo "flags:" line (octal
+/// — the low 2 bits are O_ACCMODE: 0=read, 1=write, 2=rw; everything
+/// above is status flags). Unknown/missing → "?".
+fn z527b_access_mode(fdinfo_flags: &str) -> &'static str {
+    let val = u64::from_str_radix(fdinfo_flags.trim(), 8).unwrap_or(u64::MAX);
+    match val & 0o3 {
+        0 => "read",
+        1 => "write",
+        2 => "rw",
+        _ => "?",
+    }
+}
+
+/// 6-Z527b: the WALL-OWNER-PIPE probe — the rn506 headline class: the
+/// ART-Mutex holder parked in anon_pipe_read while every contender
+/// parks behind the lock. Names the pipe's traffic topology: the
+/// holder's pipe fds (the inode), then EVERY tracked pid's fds on the
+/// SAME inode classified by the fdinfo access mode (read/write), with
+/// each writer's wchan (a LIVE writer blocked elsewhere = a chained
+/// hang; NO writer at all = nobody will ever wake the holder — the
+/// emulated-pipe identity-mismatch hunt; a writer in anon_pipe_read
+/// TOO = a pipe-cycle class). Read-only /proc; a miss is honest.
+fn z527b_pipe_probe(owner: libc::pid_t, tracked: &[libc::pid_t]) -> Option<String> {
+    // 1. the holder's own pipe fds.
+    let mut inodes: Vec<u64> = Vec::new();
+    let fd_dir = format!("/proc/{}/fd", owner);
+    for entry in std::fs::read_dir(&fd_dir).ok()?.flatten() {
+        if let Ok(target) = std::fs::read_link(entry.path()) {
+            if let Some(ino) = z527b_pipe_inode(&target.to_string_lossy()) {
+                if !inodes.contains(&ino) {
+                    inodes.push(ino);
+                }
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for ino in inodes.iter().take(2) {
+        let mut readers: Vec<String> = Vec::new();
+        let mut writers: Vec<String> = Vec::new();
+        for pid in tracked {
+            let fd_dir = format!("/proc/{}/fd", pid);
+            let Ok(entries) = std::fs::read_dir(&fd_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(target) = std::fs::read_link(entry.path()) else {
+                    continue;
+                };
+                if z527b_pipe_inode(&target.to_string_lossy()) != Some(*ino) {
+                    continue;
+                }
+                // The fd number = the entry name; fdinfo carries the
+                // open flags (octal).
+                let flags = std::fs::read_to_string(format!(
+                    "/proc/{}/fdinfo/{}",
+                    pid,
+                    entry.file_name().to_string_lossy()
+                ))
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("flags:"))
+                        .and_then(|l| l.split_whitespace().nth(1).map(|s| s.to_string()))
+                })
+                .unwrap_or_default();
+                let wchan = std::fs::read_to_string(format!("/proc/{}/wchan", pid))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                match z527b_access_mode(&flags) {
+                    "read" => readers.push(format!("{}", pid)),
+                    "write" => {
+                        writers.push(format!("{}({})", pid, wchan));
+                    }
+                    "rw" => {
+                        readers.push(format!("{}", pid));
+                        writers.push(format!("{}({})", pid, wchan));
+                    }
+                    _ => {
+                        readers.push(format!("{}(?)", pid));
+                    }
+                }
+                break; // one fd per pid per inode is enough for topology
+            }
+        }
+        if !out.is_empty() {
+            out.push_str(" | ");
+        }
+        out.push_str(&format!(
+            "pipe-inode={} readers=[{}] writers=[{}]",
+            ino,
+            readers.join(","),
+            writers.join(",")
+        ));
+    }
+    Some(out)
+}
+
+/// 6-Z527b: the bounded witness — the probe runs at most 2 times per
+/// boot (the owner's state rarely changes between re-fires).
+static Z527B_PIPE_PROBE_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2);
+
+fn z527b_pipe_probe_budget_take() -> bool {
+    Z527B_PIPE_PROBE_BUDGET
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |b| if b > 0 { Some(b - 1) } else { None },
+        )
+        .is_ok()
 }
 
 /// 6-Z501: the FUTEX-PARK forensics probe — a blocked-in-futex tracee's
@@ -62374,9 +62523,9 @@ mod z520a_wall_park_tests {
     use super::{
         z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_comm_is_idle_daemon,
         z520a_op_is_wait_family, z520a_op_is_wall_class, z520a_wall_decide, z520a_word_delta,
-        Z520ADecision, Z520AEpisodes, Z520AWordDelta, Z520A_BUDGET, Z520A_EARLY_BUDGET,
-        Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS, Z520A_SIBLING_WINDOW_SECS,
-        Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
+        z527b_access_mode, z527b_pipe_inode, Z520ADecision, Z520AEpisodes, Z520AWordDelta,
+        Z520A_BUDGET, Z520A_EARLY_BUDGET, Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS,
+        Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
     };
 
     /// The rn499 shapes: the main thread AND the pool worker parked with
@@ -62464,6 +62613,37 @@ mod z520a_wall_park_tests {
         // Not a truncation the kernel would produce.
         assert!(!z520a_comm_is_idle_daemon("HeapTaskDaemons"));
         assert!(!z520a_comm_is_idle_daemon("HeapTask"));
+    }
+
+    /// 6-Z527b (pure): the pipe-inode extraction — the /proc fd readlink
+    /// target shapes. Only "pipe:[N]" counts; sockets, anon inodes,
+    /// /dev/* and real files are not pipes.
+    #[test]
+    fn z527b_pipe_inode_extracts_only_pipe_targets() {
+        assert_eq!(z527b_pipe_inode("pipe:[12345]"), Some(12345));
+        assert_eq!(z527b_pipe_inode("pipe:[0]"), Some(0));
+        assert_eq!(z527b_pipe_inode("socket:[12345]"), None);
+        assert_eq!(z527b_pipe_inode("anon_inode:[eventfd]"), None);
+        assert_eq!(z527b_pipe_inode("/dev/__kmsg__"), None);
+        assert_eq!(z527b_pipe_inode("pipe:[notanumber]"), None);
+        assert_eq!(z527b_pipe_inode("pipe:[12345"), None);
+        assert_eq!(z527b_pipe_inode(""), None);
+    }
+
+    /// 6-Z527b (pure): the fdinfo access-mode classification — the low
+    /// 2 bits of the octal flags field are O_ACCMODE; the status flags
+    /// above must not corrupt the classification.
+    #[test]
+    fn z527b_access_mode_classifies_the_fdinfo_octal_flags() {
+        assert_eq!(z527b_access_mode("0000000"), "read"); // O_RDONLY
+        assert_eq!(z527b_access_mode("0000001"), "write"); // O_WRONLY
+        assert_eq!(z527b_access_mode("0000002"), "rw"); // O_RDWR
+        assert_eq!(z527b_access_mode("0100002"), "rw"); // + O_CLOEXEC — the status bits stay out of the way
+        assert_eq!(z527b_access_mode("0100001"), "write");
+        assert_eq!(z527b_access_mode("0200000"), "read"); // + O_NONBLOCK
+        assert_eq!(z527b_access_mode("0"), "read");
+        assert_eq!(z527b_access_mode(""), "?"); // missing fdinfo — honest
+        assert_eq!(z527b_access_mode("garbage"), "?");
     }
 
     /// The routine fleet's parks (10-15 s dwells — the shapes that
