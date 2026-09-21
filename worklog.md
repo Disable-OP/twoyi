@@ -32645,3 +32645,33 @@ payload-absent files; a dest-wipe would not).
 - **rn507 (#507) in flight on bd22a801 since ~14:47Z** (HTTP 204, full inputs, single-flight
   held — rn506 was complete). The lint #2180 rides.
 - Sandbox: decode/rn503 (kr64.log + forensics) + rn505 + rn506 on disk; 5.1G free.
+
+---
+
+## Task 262 addendum 2 (session 262, ~15:55Z — THE DEX2OAT MECHANISM NAMED + 6-Z528 the fix)
+
+**rn507 decoded (bd22a801, run 35613901728): the 6-Z527a open trace DELIVERED the mechanism.**
+- `6-Z526 FLATTEN-ART: walk-files=108 key-files=4/4 OK (source 78529606 bytes)` — the art
+  walk completes with ALL key files at +519ms; the APEX-SOURCES line = byte-exact release
+  sizes (the import is faithful). The tree is COMPLETE at extraction time.
+- **THE TRACE**: the failing dex2oat's linker probed EXACTLY three paths for libprofile.so
+  (all ret=-2): `{rootfs}/dev/libprofile.so` (LD_LIBRARY_PATH=/dev), `{rootfs}/system/lib64/…`,
+  `{rootfs}/system_ext/lib64/…` — **NEVER /apex/com.android.art/lib64**. Mechanism: the
+  staged exec's AT_EXECFN ({data}/cache/twoyi_stage/… under /data) matches `dir.system =
+  /data` in the (byte-identical per-boot) ld.config.txt → the [system] section's default
+  namespace with NO apex search paths. A real device's dex2oat64 runs at its REAL /apex
+  path → the [apex] section. Our host-layout staging can NEVER match dir.apex — the
+  section selection is structurally broken for staged apex binaries. rn503's success
+  remains formally unexplained (same config/env — its 1.36s runs may have raced a different
+  section path pre-6-Z523-era), but the FIX does not depend on it.
+- **6-Z528 implemented (7afe059c, +1 test = 1116/1116)**: after the art flatten, every
+  /apex/com.android.art/lib64/<lib>.so missing from /system/lib64 is materialized as a
+  RELATIVE symlink (../../apex/com.android.art/lib64/<lib>.so — the 6-Z312 proven class)
+  so the [system] namespace RESOLVES the ART closure. zygote's LD_LIBRARY_PATH=/apex/…
+  keeps preferring the apex; ROM-shipped real files are never touched; idempotent.
+- **rn508 (#508) dispatched on 7afe059c (HTTP 204, full inputs)** — expect: the dexopt
+  trio LINKS (the first dex2oat success since rn503) → the oat cache fills → the 6-Z524
+  utimensat arm's first live success-path test (NO dalvik-cache deny, no "Could not update
+  access times") → the boot economy question (does prepareAppData shorten?) → the wall
+  verdicts round 3 (the v4 sweep + the 6-Z527b WALL-OWNER-PIPE probe if the watchdog holds
+  the monitor lock again).
