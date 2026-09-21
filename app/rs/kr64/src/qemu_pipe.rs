@@ -190,6 +190,9 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
     if channel == "qemud:gsm" {
         return serve_qemud_gsm_blackhole(guest, sid, leftover);
     }
+    if channel == "qemud:sensors" {
+        return serve_qemud_sensors_empty(guest, sid, leftover);
+    }
 
     if !FORWARD_CHANNELS.contains(&channel.as_str()) {
         // Unknown channel — close. (Future: route "audio", "camera", etc.)
@@ -601,6 +604,159 @@ fn serve_qemud_gsm_blackhole(
     }
 }
 
+// ── 6-Z518: the goldfish `qemud:sensors` channel ─────────────────────────
+//
+// The sensors.ranchu sub-HAL (loaded by vendor.sensors-hal-2-1-multihal)
+// opens `pipe:qemud:sensors` and speaks the legacy qemud framing: 4 ASCII
+// hex digits (payload length) + payload. The rn496 session shows the
+// opening burst parsed exactly: `0011` + "time:747291963120" + `000c` +
+// "list-sensors" (37B coalesced). The pre-6-Z518 proxy said "unknown
+// channel, closing" — and the sub-HAL's read loop then SPUN on the dead
+// pipe for the WHOLE RUN (pid 3171: a hot nr=63 read loop from +11s to
+// +1814s), so the HAL never registered ISensors/default, SensorService's
+// start blocked the system_server main thread forever, and
+// SensorPrivacyService (the very next startOtherServices entry) never
+// started — the rung-7→8 wall, root-caused.
+//
+// THE HONEST SEMANTIC (the 6-Z441 precedent — "an emulator without a
+// modem keeps the channel open and silent"): an emulator WITHOUT SENSOR
+// HARDWARE still answers the enumeration — with an EMPTY mask. Reply to
+// `list-sensors` with `0004` + `0000` (a 4-hex-framed 4-digit payload:
+// the available-sensor bitmask = 0 — the wire shape the Fuchsia
+// goldfish_sensor port documents verbatim: cmd "000clist-sensors" →
+// reply "0004" + the mask). The sub-HAL enumerates ZERO sensors,
+// completes its init, and the multihal registers ISensors/default — the
+// boot pushes past the sensors edge. NO fake data is ever produced:
+// with mask 0 the guest can never enable a device and no event frames
+// exist. After the reply, guest writes (`time:` poll frames) are
+// read+discarded and the channel NEVER EOFs while the guest holds it
+// open (the 6-Z441 lesson — closing the pipe spins the client).
+
+/// 6-Z518 (pure): parse ONE qemud frame from the head of `buf` —
+/// `Some((consumed, payload))` when a complete frame sits at the head
+/// (4 ASCII hex digits = payload length, then that many payload bytes),
+/// `None` when the buffer holds no complete frame yet (or not a parseable
+/// header — the caller resyncs).
+fn z518_parse_qemud_frame(buf: &[u8]) -> Option<(usize, String)> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let hdr = std::str::from_utf8(&buf[..4]).ok()?;
+    if !hdr.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let len = usize::from_str_radix(hdr, 16).ok()?;
+    if buf.len() < 4 + len {
+        return None;
+    }
+    let payload = String::from_utf8_lossy(&buf[4..4 + len]).into_owned();
+    Some((4 + len, payload))
+}
+
+/// 6-Z518 (pure): the host's answer to one parsed command —
+/// `Some(bytes)` to write back, `None` to stay silent. `list-sensors`
+/// gets the EMPTY mask exactly once (a second list-sensors in the same
+/// session is a client anomaly — silent); `time:`/unknown get silence.
+fn z518_sensors_reply_for(payload: &str, already_replied: bool) -> Option<Vec<u8>> {
+    if payload.starts_with("list-sensors") && !already_replied {
+        return Some(b"00040000".to_vec());
+    }
+    None
+}
+
+/// 6-Z518: the session handler — the empty-mask sensor pipe. Frames the
+/// guest's writes, answers the enumeration once, then parks on
+/// read+discard (never write, never EOF) until the guest end closes.
+fn serve_qemud_sensors_empty(
+    mut guest: UnixStream,
+    sid: u64,
+    leftover: Vec<u8>,
+) -> std::io::Result<()> {
+    info!(
+        "[KR64][qemu_pipe] 6-Z518 session {} 'qemud:sensors': the empty-mask sensor pipe (list-sensors → 0004/0000; no fake data; never EOF)",
+        sid
+    );
+    let mut buf: Vec<u8> = leftover;
+    let mut replied = false;
+    static Z518_ANOMALY_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut sink = [0u8; 4096];
+    loop {
+        // Parse and answer every complete frame the buffer holds.
+        loop {
+            match z518_parse_qemud_frame(&buf) {
+                Some((consumed, payload)) => {
+                    buf.drain(..consumed);
+                    if let Some(reply) = z518_sensors_reply_for(&payload, replied) {
+                        replied = true;
+                        guest.write_all(&reply)?;
+                        info!(
+                            "[KR64][qemu_pipe] 6-Z518 session {} 'list-sensors' → empty mask (0004/0000): the sub-HAL enumerates 0 sensors and completes its init",
+                            sid
+                        );
+                    } else if payload.starts_with("set:") {
+                        // Unreachable with mask 0 — the guest can only
+                        // enable a bit the mask advertised. Budgeted
+                        // anomaly line + discard (never fake an ack).
+                        let n = Z518_ANOMALY_LOG.fetch_add(1, Ordering::Relaxed);
+                        if n < 4 {
+                            warning!(
+                                "[KR64][qemu_pipe] 6-Z518 session {} unexpected 'set:' with mask 0 (anomaly #{}): {:?} — discarded",
+                                sid, n + 1, payload
+                            );
+                        }
+                    }
+                    // `time:<ms>` poll frames and anything else: silent.
+                }
+                None => {
+                    // No complete frame. If the head is not a hex header
+                    // at all, resync by dropping one byte (budgeted log —
+                    // a stuck client's garbage must not wedge the parser).
+                    if buf.len() >= 4 {
+                        let not_hdr = std::str::from_utf8(&buf[..4])
+                            .map(|s| !s.bytes().all(|b| b.is_ascii_hexdigit()))
+                            .unwrap_or(true);
+                        if not_hdr {
+                            let n = Z518_ANOMALY_LOG.fetch_add(1, Ordering::Relaxed);
+                            if n < 4 {
+                                warning!(
+                                    "[KR64][qemu_pipe] 6-Z518 session {} non-frame bytes at head (anomaly #{}): {:?} — resyncing",
+                                    sid, n + 1, String::from_utf8_lossy(&buf[..8])
+                                );
+                            }
+                            buf.remove(0);
+                            continue;
+                        }
+                    }
+                    break;
+                }
+            }
+            if buf.len() > 65536 {
+                // A client flooding frames without reading: cap the
+                // carry buffer (drop the head) — bounded memory, the
+                // list reply already went out.
+                buf.drain(..4096);
+            }
+        }
+        match guest.read(&mut sink) {
+            Ok(0) => {
+                info!(
+                    "[KR64][qemu_pipe] 6-Z518 session {} 'qemud:sensors' guest end closed, session ends",
+                    sid
+                );
+                return Ok(());
+            }
+            Ok(n) => buf.extend_from_slice(&sink[..n]),
+            Err(e) => {
+                info!(
+                    "[KR64][qemu_pipe] 6-Z518 session {} 'qemud:sensors' read error ({}), session ends",
+                    sid, e
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Serve the goldfish `GLProcessPipe` support channel.
 ///
 /// Pinned client: goldfish-opengl @ android11-release `ProcessPipe.cpp`
@@ -711,6 +867,69 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::thread;
+
+    #[test]
+    fn z518_frame_parses_the_rn496_opening_burst() {
+        // The rn496 37B peek, byte for byte: `0011` + "time:747291963120"
+        // (17 chars) + `000c` + "list-sensors" (12 chars).
+        let burst = b"0011time:747291963120000clist-sensors";
+        assert_eq!(burst.len(), 37);
+        let (c1, p1) = z518_parse_qemud_frame(burst).expect("frame 1");
+        assert_eq!(p1, "time:747291963120");
+        let (c2, p2) = z518_parse_qemud_frame(&burst[c1..]).expect("frame 2");
+        assert_eq!(p2, "list-sensors");
+        assert_eq!(c1 + c2, 37);
+    }
+
+    #[test]
+    fn z518_reply_is_the_empty_mask_exactly_once() {
+        // list-sensors → the 8-byte empty-mask reply, once.
+        assert_eq!(
+            z518_sensors_reply_for("list-sensors", false).unwrap(),
+            b"00040000".to_vec()
+        );
+        // A repeat is an anomaly — silence (never fake a second mask).
+        assert_eq!(z518_sensors_reply_for("list-sensors", true), None);
+        // time: and unknown commands: silence.
+        assert_eq!(z518_sensors_reply_for("time:747291963120", false), None);
+        assert_eq!(z518_sensors_reply_for("set:acceleration:0", false), None);
+    }
+
+    #[test]
+    fn z518_parser_survives_split_and_garbage() {
+        // A frame split mid-header parses only when complete.
+        let full = b"000clist-sensors";
+        assert!(z518_parse_qemud_frame(&full[..3]).is_none());
+        assert!(z518_parse_qemud_frame(&full[..8]).is_none());
+        let (c, p) = z518_parse_qemud_frame(full).expect("complete");
+        assert_eq!((c, p.as_str()), (16, "list-sensors"));
+        // Garbage at the head: not a header → None (the caller resyncs).
+        assert!(z518_parse_qemud_frame(b"zzzz").is_none());
+        assert!(z518_parse_qemud_frame(b"00zz").is_none());
+        // A length header whose payload has not fully arrived: None.
+        assert!(z518_parse_qemud_frame(b"000cshort").is_none());
+    }
+
+    #[test]
+    fn z518_session_answers_the_rn496_burst_end_to_end() {
+        // The full loopback: a fake guest writes the rn496 burst; the
+        // handler must send exactly the 8-byte empty-mask reply back.
+        let (a, b) = UnixStream::pair().expect("pair");
+        let writer = thread::spawn(move || {
+            let mut guest = a;
+            use std::io::Write as _;
+            guest
+                .write_all(b"0011time:747291963120000clist-sensors")
+                .expect("write burst");
+            let mut reply = [0u8; 8];
+            use std::io::Read as _;
+            guest.read_exact(&mut reply).expect("read reply");
+            reply
+        });
+        serve_qemud_sensors_empty(b, 424242, Vec::new()).expect("serve");
+        let reply = writer.join().expect("join");
+        assert_eq!(&reply, b"00040000");
+    }
 
     /// Helper: create a unique tmpdir for test isolation.
     fn tmpdir() -> PathBuf {
