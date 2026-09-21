@@ -32675,3 +32675,73 @@ payload-absent files; a dest-wipe would not).
   access times") → the boot economy question (does prepareAppData shorten?) → the wall
   verdicts round 3 (the v4 sweep + the 6-Z527b WALL-OWNER-PIPE probe if the watchdog holds
   the monitor lock again).
+
+---
+
+## Task 263 (session 263, ~16:05-16:45Z — SECOND sandbox reset recovered; rn508 decoded: the dex2oat economy HEALED + the watchdog pipe WRITER-LESS; 6-Z529 the writer hunt)
+
+**The reset**: between session 262's final handover (~16:00Z) and this session the sandbox
+was wiped again (repo/worklog/decode/auth-state/rustup all gone). Recovered per the
+playbook in ~12 min: credentials rebuilt from the mission brief (the /tmp snapshot
+survives resets), repo re-cloned (main @ 48f498b8 exactly as handed over), rustup 1.98.1
+reinstalled (the first attempt interrupted → broken toolchain manifest → rm + reinstall),
+gates re-verified 1116/1116. Cron tool UNAVAILABLE this session ("cron broke" confirmed) —
+continuous single-session mode; no auto-continuation.
+
+**rn508 decoded (7afe059c, run 35619710944, rung 7 SURFACEFLINGER, ~39 min) — FIVE headlines:**
+1. **THE DEX2OAT ECONOMY HEALED (the 6-Z528 fix VERIFIED)**: `6-Z528 ART-LINKER-CLOSURE: 43
+   linker path(s) into /system/lib64` at +566ms, then the dex2oat trio (service-permission
+   4497 → service-wifi 4517 → ipsec 4580, all exec'd at ~+230s) **LINKED — the first success
+   since rn503**: ZERO "CANNOT LINK" lines in the whole boot, and /data/dalvik-cache/arm64
+   FILLED (apex@com.android.permission/service-permission, service-wifi,
+   android.net.ipsec.ike — .dex 25440/66400/17248 B + .vdex companions, 15:40-15:44 wall).
+2. **THE 6-Z524 UTIMENSAT ARM'S FIRST LIVE SUCCESS**: ZERO dalvik-cache "SANDBOX BACKSTOP"
+   denies (rn504: 11) and zero "Could not update access times" PLOG — installd's
+   post-dexopt utime resolved INSIDE the rootfs and the oat cache persisted. The re-dexopt-
+   per-boot economy is BROKEN OPEN: the 16 BACKSTOP denies this boot are all benign
+   init/ueventd /dev entries (symlinkat/mknodat, pids 2800/2826).
+3. **6-Z526 CENSUS ROUND 2 CLEAN**: FLATTEN-ART walk-files=108 key-files=4/4 OK (source
+   78529606 bytes EXACT — no import deviation); APEX-SOURCES lists all 21 apexes; census
+   checked=7 damaged=0 repaired=0 for the whole boot. The rn504/505 per-boot file-loss did
+   NOT repeat (the 6-Z528 closure makes the linker immune regardless).
+4. **THE WALL REPRODUCED (round 3) + THE 6-Z527b PROBE DELIVERED**: the boot reached system
+   _server phase 100 (DisplayManager 6658 ms in onBootPhase, a 5.073 s monitor contention
+   on android.display 4629), the dexopt trio ran, then `WALL-ARTMUTEX: pid=4486 uaddr=…
+   state=3 owner=4639 owner-comm="watchdog" owner-wchan="anon_pipe_read" name="a monitor
+   lock"` at +352s (EARLIER than rn505/506's ~+500s wall — the healed dexopt economy moved
+   the wall INTO the PMS start), and the probe: **`6-Z527b WALL-OWNER-PIPE: owner=4639
+   pipe-inode=127315 readers=[all 33 system_server tids] writers=[]`** — NO WRITER. The fd
+   is process-wide (inherited at spawn — every tracked tid lists it), the v4 IDLE-COMM gate
+   held the budget (4 denies), the fleet verdicts hit the init-pool worker 4646 (word=0x2),
+   CpuTracker, batterystats-wo — the rn505 drain fleet EXACTLY.
+5. Known classes recurred benignly: bootanim SIGSEGV +315.3s (the parked 300s class); rung
+   stays 7 SURFACEFLINGER (rn505 parity) while the INTERNAL depth is the mission's deepest
+   (dexopt success + phase 100 + the wall mechanism fully named).
+
+**The writers=[] interpretation (three candidate classes)**: (a) an UNTRACKED HOST process
+holds the write end (the twoyi app's spawn broker / the logcat piper — the guest pids are a
+SUBSET of the host's; the 6-Z527b scan only covered tracked pids) and never writes/closes →
+the watchdog's read parks forever, holding "a monitor lock", freezing everything behind it;
+(b) no writer anywhere in the host → the read should have returned EOF (0) but parked → an
+emulated-pipe semantics bug; (c) an O_RDWR self-hold the per-pid pass would have caught
+(it writes to writers[] too — so effectively (a) vs (b)).
+
+**6-Z529 implemented (+3 tests = 1119/1119)**: the PIPE-WRITER HUNT — when the 6-Z527b
+topology finds a readers-only pipe, the SAME line carries `| 6-Z529 owner-fds=[fd=N(mode,
+pos=P)] host-writers=…`: (1) the owner's fd NUMBERS on the inode (fd=0 = the stdin
+spawn-wiring story) with the fdinfo pos (0 = nothing was ever written through this end);
+(2) the HOST SWEEP — every /proc/<pid> OUTSIDE the tracked list (the emulator sees the
+whole host /proc: the app, the spawn brokers, the logcat piper) for the SAME inode, each
+hit named pid(comm,mode), capped at 6 + "…+N". `host-writers=none` = the EOF-semantics
+class (6-Z530: instrument the emulated pipe read path); a named host writer = the
+spawn-broker leak class (close the write end / stdin=/dev/null). Pure helpers: z529_fdinfo
+_pos (the "pos:" parse), z529_fd_entry (the fd detail format), z529_host_verdict (none/join
+/cap). Gates: fmt clean; clippy zero; 1119/1119 (32.4s).
+
+**rn509 agenda (dispatched on this commit)**: (1) THE WRITER-HUNT VERDICT — the 6-Z529
+segment decides the fix (host writer named → the spawn-leak fix; none → the EOF-semantics
+hunt); (2) the dexopt economy round 2 — with the oat cache WARM at import (if the cache
+survives the import) or re-filled, does prepareAppData shorten and does system_server
+resume past the wall? (3) the wall verdicts round 4 (the probe budget resets per boot);
+(4) the rung-8 push — the boot's deepest marker is phase 100/PMS; the watchdog freeze is
+the only documented blocker left.

@@ -13642,8 +13642,150 @@ fn z527b_pipe_probe(owner: libc::pid_t, tracked: &[libc::pid_t]) -> Option<Strin
             readers.join(","),
             writers.join(",")
         ));
+        // 6-Z529: a readers-only pipe is the rn508 headline (the
+        // watchdog's pipe: writers=[] while the holder parks in the
+        // read) — the write end is either an untracked HOST holder
+        // (the spawn-broker leak: name it), or nowhere in the host
+        // (the read should have seen EOF — the semantics hunt), or an
+        // O_RDWR self-hold the per-pid pass missed (it would have
+        // landed in writers, but the fd-number detail still helps).
+        // Name WHICH fd the owner reads (0=stdin → the spawn wiring)
+        // with the fdinfo pos (0 = nothing was ever written), then
+        // sweep the WHOLE host /proc for the same inode.
+        if writers.is_empty() && !readers.is_empty() {
+            out.push_str(&format!(" | {}", z529_writer_hunt(owner, *ino, tracked)));
+        }
     }
     Some(out)
+}
+
+/// 6-Z529 (pure): the fdinfo "pos:" parse — the reader's byte offset
+/// through the pipe read end (0 = nothing was ever written on this
+/// end; >0 = data flowed then stopped). Missing/garbage → None.
+fn z529_fdinfo_pos(fdinfo: &str) -> Option<u64> {
+    fdinfo
+        .lines()
+        .find(|l| l.starts_with("pos:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// 6-Z529 (pure): the owner's fd-entry string — "fd=0(read,pos=0)" for
+/// the classic stdin shape, "fd=4(write,pos=512)" for a logger, and an
+/// honest "fd=N(?)" when the fdinfo is unreadable.
+fn z529_fd_entry(fd_no: &str, mode: &str, pos: Option<u64>) -> String {
+    match pos {
+        Some(p) => format!("fd={}({},pos={})", fd_no, mode, p),
+        None => format!("fd={}({})", fd_no, mode),
+    }
+}
+
+/// 6-Z529 (pure): the host-sweep verdict — "none" (no untracked holder
+/// anywhere → the EOF-semantics hunt), the joined hit list up to 6
+/// entries, or the 6-entry cap with an ellipsis marker.
+fn z529_host_verdict(hits: &[String]) -> String {
+    const CAP: usize = 6;
+    if hits.is_empty() {
+        return "none".to_string();
+    }
+    if hits.len() <= CAP {
+        return hits.join(",");
+    }
+    format!("{},…+{}", hits[..CAP].join(","), hits.len() - CAP)
+}
+
+/// 6-Z529: the writer hunt for a readers-only pipe — the rn508 verdict
+/// (WALL-OWNER-PIPE: writers=[] on the watchdog's pipe) leaves three
+/// candidate classes and this probe names the winner:
+/// (a) an UNTRACKED HOST process holds the write end (the spawn-broker
+///     leak — the twoyi app's own fds are visible to the emulator, it
+///     runs on the same host) → close it / spawn services with
+///     stdin=/dev/null;
+/// (b) NO writer anywhere in the host → the guest's read should have
+///     returned 0 (EOF) but parked instead → the emulated-pipe
+///     semantics hunt (6-Z530);
+/// (c) an O_RDWR self-hold — would have shown in writers already; the
+///     fd-number/pos detail still confirms it.
+/// Read-only /proc; every miss is honest ("fd=?(?)"/"none").
+fn z529_writer_hunt(owner: libc::pid_t, ino: u64, tracked: &[libc::pid_t]) -> String {
+    // 1. the owner's fd details on this inode — WHICH fd (0=stdin) and
+    //    how far the read side has ever been advanced.
+    let mut fds: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", owner)) {
+        for entry in entries.flatten() {
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            if z527b_pipe_inode(&target.to_string_lossy()) != Some(ino) {
+                continue;
+            }
+            let fd_no = entry.file_name().to_string_lossy().to_string();
+            let info = std::fs::read_to_string(format!("/proc/{}/fdinfo/{}", owner, fd_no))
+                .unwrap_or_default();
+            let flags = info
+                .lines()
+                .find(|l| l.starts_with("flags:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_string();
+            let pos = z529_fdinfo_pos(&info);
+            fds.push(z529_fd_entry(&fd_no, z527b_access_mode(&flags), pos));
+            if fds.len() >= 4 {
+                break;
+            }
+        }
+    }
+    // 2. the host sweep — EVERY /proc/<pid> outside the tracked list
+    //    (the tracked pids were classified above; the twoyi app, the
+    //    logcat piper and the spawn brokers are all untracked hosts).
+    let mut hits: Vec<String> = Vec::new();
+    if let Ok(dirs) = std::fs::read_dir("/proc") {
+        for d in dirs.flatten() {
+            let Ok(pid) = d.file_name().to_string_lossy().parse::<libc::pid_t>() else {
+                continue;
+            };
+            if tracked.contains(&pid) {
+                continue;
+            }
+            let Ok(fd_dir) = std::fs::read_dir(format!("/proc/{}/fd", pid)) else {
+                continue;
+            };
+            for e in fd_dir.flatten() {
+                let Ok(target) = std::fs::read_link(e.path()) else {
+                    continue;
+                };
+                if z527b_pipe_inode(&target.to_string_lossy()) != Some(ino) {
+                    continue;
+                }
+                let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                let mode = std::fs::read_to_string(format!(
+                    "/proc/{}/fdinfo/{}",
+                    pid,
+                    e.file_name().to_string_lossy()
+                ))
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("flags:"))
+                        .and_then(|l| l.split_whitespace().nth(1).map(|f| f.to_string()))
+                })
+                .map(|f| z527b_access_mode(&f))
+                .unwrap_or("?");
+                hits.push(format!("{}({},{})", pid, comm, mode));
+                break; // one hit per pid is enough for the topology
+            }
+            if hits.len() >= 6 {
+                break;
+            }
+        }
+    }
+    format!(
+        "6-Z529 owner-fds=[{}] host-writers={}",
+        fds.join(","),
+        z529_host_verdict(&hits)
+    )
 }
 
 /// 6-Z527b: the bounded witness — the probe runs at most 2 times per
@@ -62523,9 +62665,10 @@ mod z520a_wall_park_tests {
     use super::{
         z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_comm_is_idle_daemon,
         z520a_op_is_wait_family, z520a_op_is_wall_class, z520a_wall_decide, z520a_word_delta,
-        z527b_access_mode, z527b_pipe_inode, Z520ADecision, Z520AEpisodes, Z520AWordDelta,
-        Z520A_BUDGET, Z520A_EARLY_BUDGET, Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS,
-        Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
+        z527b_access_mode, z527b_pipe_inode, z529_fd_entry, z529_fdinfo_pos, z529_host_verdict,
+        Z520ADecision, Z520AEpisodes, Z520AWordDelta, Z520A_BUDGET, Z520A_EARLY_BUDGET,
+        Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS, Z520A_SIBLING_WINDOW_SECS,
+        Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
     };
 
     /// The rn499 shapes: the main thread AND the pool worker parked with
@@ -62644,6 +62787,56 @@ mod z520a_wall_park_tests {
         assert_eq!(z527b_access_mode("0"), "read");
         assert_eq!(z527b_access_mode(""), "?"); // missing fdinfo — honest
         assert_eq!(z527b_access_mode("garbage"), "?");
+    }
+
+    /// 6-Z529 (pure): the fdinfo pos parse — the read end's byte offset
+    /// (0 = nothing was ever written; a miss is honest None).
+    #[test]
+    fn z529_fdinfo_pos_parses_the_reader_offset() {
+        assert_eq!(z529_fdinfo_pos("pos:\t0\nflags:\t0100000\n"), Some(0));
+        assert_eq!(z529_fdinfo_pos("pos:\t512\n"), Some(512));
+        assert_eq!(
+            z529_fdinfo_pos("pos:\t18446744073709551615\n"),
+            Some(u64::MAX)
+        );
+        assert_eq!(z529_fdinfo_pos("flags:\t0100000\n"), None); // no pos line
+        assert_eq!(z529_fdinfo_pos("pos:\tnan\n"), None); // garbage is honest
+        assert_eq!(z529_fdinfo_pos(""), None); // unreadable fdinfo
+    }
+
+    /// 6-Z529 (pure): the owner fd-entry formatting — fd 0 names the
+    /// stdin shape outright; a missing pos stays honest.
+    #[test]
+    fn z529_fd_entry_formats_fd_number_mode_pos() {
+        assert_eq!(z529_fd_entry("0", "read", Some(0)), "fd=0(read,pos=0)");
+        assert_eq!(
+            z529_fd_entry("4", "write", Some(512)),
+            "fd=4(write,pos=512)"
+        );
+        assert_eq!(z529_fd_entry("7", "rw", None), "fd=7(rw)");
+        assert_eq!(z529_fd_entry("9", "?", None), "fd=9(?)");
+    }
+
+    /// 6-Z529 (pure): the host-sweep verdict — "none" names the
+    /// EOF-semantics class; the hit list caps at 6 with the ellipsis
+    /// marker so a noisy host cannot flood the trace.
+    #[test]
+    fn z529_host_verdict_caps_hits_and_names_none() {
+        assert_eq!(z529_host_verdict(&[]), "none");
+        assert_eq!(
+            z529_host_verdict(&["2035(io.twoyi.debug,write)".to_string()]),
+            "2035(io.twoyi.debug,write)"
+        );
+        let six: Vec<String> = (1..=6).map(|i| format!("{}(p,write)", i)).collect();
+        assert_eq!(
+            z529_host_verdict(&six),
+            "1(p,write),2(p,write),3(p,write),4(p,write),5(p,write),6(p,write)"
+        );
+        let eight: Vec<String> = (1..=8).map(|i| format!("{}(p,write)", i)).collect();
+        assert_eq!(
+            z529_host_verdict(&eight),
+            "1(p,write),2(p,write),3(p,write),4(p,write),5(p,write),6(p,write),…+2"
+        );
     }
 
     /// The routine fleet's parks (10-15 s dwells — the shapes that
