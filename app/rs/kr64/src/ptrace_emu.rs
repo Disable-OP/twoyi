@@ -32994,18 +32994,18 @@ pub fn run_ptrace_loop(
                             // The floor: rewrite to the getpid no-op and
                             // NAME the closer (the pc attribution — the
                             // 6-Z477 pattern). The registry membership
-                            // implies the lineage (registration is
-                            // lineage-gated); the lineage re-check guards
-                            // the pid-recycled edge.
+                            // ALONE decides (6-Z513b: registration is
+                            // ownership — the lineage re-check would exclude
+                            // the init-spawned HAL processes, the rn494
+                            // sensors-HAL ENOTSOCK abort class; the death
+                            // hygiene cleans the registry so the recycled-
+                            // pid edge is a hygiene bug, not a semantics
+                            // choice).
                             if close_fd > 2 {
                                 let z513_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
                                 let z513_hit = Z513_BINDER_FDS.lock().ok().is_some_and(|m| {
                                     z513_fd_is_binder(&m, z513_tgid, close_fd as i64)
-                                }) && z306_in_zygote_lineage(
-                                    pid,
-                                    &z306_zygote_lineage,
-                                    &mut z306_lineage_tgid_cache,
-                                );
+                                });
                                 if z513_hit {
                                     static Z513_FLOOR_LOGGED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
@@ -33186,26 +33186,21 @@ pub fn run_ptrace_loop(
                             //
                             // dup3 CLOSES its target first: a dup3 whose
                             // target is a registered binder driver fd of a
-                            // zygote-lineage process displaces the fd exactly
-                            // like a close (the rn493 watchdog-FATAL chain).
-                            // No /dev/null exemption — nothing may rebind the
+                            // ProcessState-owning process displaces the fd
+                            // exactly like a close (the rn493 watchdog-FATAL
+                            // chain; 6-Z513b: no lineage gate). No
+                            // /dev/null exemption — nothing may rebind the
                             // driver fd. The deny mirrors the stdio arm:
                             // the getpid no-op with the honest dup return
                             // (the target fd) forced at EXIT.
                             let z513_binder_dst = dst_fd >= 0 && {
-                                let z513_lineage = z306_in_zygote_lineage(
-                                    pid,
-                                    &z306_zygote_lineage,
-                                    &mut z306_lineage_tgid_cache,
-                                );
-                                z513_lineage
-                                    && Z513_BINDER_FDS.lock().ok().is_some_and(|m| {
-                                        z513_fd_is_binder(
-                                            &m,
-                                            z296_tgid_of(pid, &mut z306_lineage_tgid_cache),
-                                            dst_fd,
-                                        )
-                                    })
+                                Z513_BINDER_FDS.lock().ok().is_some_and(|m| {
+                                    z513_fd_is_binder(
+                                        &m,
+                                        z296_tgid_of(pid, &mut z306_lineage_tgid_cache),
+                                        dst_fd,
+                                    )
+                                })
                             };
                             if z513_binder_dst {
                                 static Z513_DUP_LOGGED: std::sync::atomic::AtomicU64 =
@@ -33332,24 +33327,19 @@ pub fn run_ptrace_loop(
                             // re-check decide). Same honest no-op: the
                             // getpid rewrite with ret=0 forced at EXIT.
                             if last >= first {
-                                let z513_lineage_ok = z306_in_zygote_lineage(
-                                    pid,
-                                    &z306_zygote_lineage,
-                                    &mut z306_lineage_tgid_cache,
-                                );
-                                let z513_covered = if z513_lineage_ok {
-                                    let z513_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
-                                    Z513_BINDER_FDS.lock().ok().and_then(|m| {
-                                        z513_range_covers_binder(
-                                            &m,
-                                            z513_tgid,
-                                            first as i64,
-                                            last as i64,
-                                        )
-                                    })
-                                } else {
-                                    None
-                                };
+                                // 6-Z513b: the registry membership alone
+                                // decides (the open is the ownership
+                                // contract — the init-spawned HAL processes
+                                // are covered too).
+                                let z513_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                let z513_covered = Z513_BINDER_FDS.lock().ok().and_then(|m| {
+                                    z513_range_covers_binder(
+                                        &m,
+                                        z513_tgid,
+                                        first as i64,
+                                        last as i64,
+                                    )
+                                });
                                 if let Some(z513_fd) = z513_covered {
                                     static Z513_CR_LOGGED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
@@ -39405,9 +39395,9 @@ pub fn run_ptrace_loop(
                         // ── 6-Z513: the BINDER driver-fd REGISTRATION (the
                         // open EXIT half) ──
                         //
-                        // A zygote-lineage process's successful open of
-                        // /dev/binder | /dev/vndbinder | /dev/hwbinder (or
-                        // the binderfs variants — is_binder_path covers the
+                        // A successful open of /dev/binder |
+                        // /dev/vndbinder | /dev/hwbinder (or the binderfs
+                        // variants — is_binder_path covers the
                         // final-component forms) registers the returned fd
                         // in the Z513_BINDER_FDS registry (keyed by TGID —
                         // the threads share the fd table). The close /
@@ -39418,29 +39408,42 @@ pub fn run_ptrace_loop(
                         // fast-path → the FATAL era death). Registration is
                         // budget-free (binder opens are rare — a handful
                         // per process); the log is capped.
+                        //
+                        // 6-Z513b: the zygote-lineage gate is GONE. The
+                        // rn494 decode: the guest's sensors HAL
+                        // (vendor.sensors-hal-2-1-multihal, an INIT-spawned
+                        // vendor service) aborted at early boot with
+                        // "getAndExecuteCommand(fd=3) returned unexpected
+                        // error -88 (ENOTSOCK)" — its own hwbinder fd 3 was
+                        // displaced by a non-socket — and every
+                        // system_server era then looped forever at
+                        // StartSensorService ("Waited one second for
+                        // android.hardware.sensors@2.1::ISensors/default").
+                        // The OPEN itself is the ownership contract: only
+                        // a ProcessState owner opens the driver, and a
+                        // ProcessState owner never legitimately closes it
+                        // mid-life. Short-lived tools (crash_dump et al.)
+                        // never OPEN the driver — they merely inherit the
+                        // fd — so they stay unregistered and their bulk
+                        // closes stay untouched.
                         if ret >= 0 && (is_binder_path(&orig) || is_binder_path(&p)) {
-                            let z513_lineage = z306_in_zygote_lineage(
-                                pid,
-                                &z306_zygote_lineage,
-                                &mut z306_lineage_tgid_cache,
-                            );
-                            if z513_lineage {
-                                let z513_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
-                                let z513_fresh = Z513_BINDER_FDS
-                                    .lock()
-                                    .ok()
-                                    .map(|mut m| m.entry(z513_tgid).or_default().insert(ret))
-                                    .unwrap_or(false);
-                                static Z513_REG_LOGGED: std::sync::atomic::AtomicU64 =
-                                    std::sync::atomic::AtomicU64::new(0);
-                                let z513_ln = Z513_REG_LOGGED
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if z513_fresh && z513_ln < 48 {
-                                    log(&format!(
-                                        "6-Z513 BINDER-FD-REGISTERED: pid={} (tgid {}) fd={} orig={:?} translated={:?} — the driver fd is floor-protected (close/close_range/dup3-target)",
-                                        pid, z513_tgid, ret, orig, p
-                                    ));
-                                }
+                            // 6-Z513b: NO lineage gate — the open is the
+                            // ownership contract (see the block comment).
+                            let z513_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                            let z513_fresh = Z513_BINDER_FDS
+                                .lock()
+                                .ok()
+                                .map(|mut m| m.entry(z513_tgid).or_default().insert(ret))
+                                .unwrap_or(false);
+                            static Z513_REG_LOGGED: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let z513_ln =
+                                Z513_REG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if z513_fresh && z513_ln < 48 {
+                                log(&format!(
+                                    "6-Z513 BINDER-FD-REGISTERED: pid={} (tgid {}) fd={} orig={:?} translated={:?} — the driver fd is floor-protected (close/close_range/dup3-target)",
+                                    pid, z513_tgid, ret, orig, p
+                                ));
                             }
                         }
                         // ── 6-Z451: BOOT-IMAGE-OPEN result (rn415 decode) ──
