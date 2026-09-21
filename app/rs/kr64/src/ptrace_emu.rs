@@ -12874,6 +12874,22 @@ fn z520a_op_is_wait_family(op: u64) -> bool {
     matches!(op & 0x7f, 0 | 6 | 9 | 11)
 }
 
+/// 6-Z520a-v3 (the rn501 budget lesson): the WALL-CLASS op filter — the
+/// verdict tier covers ONLY the FUTEX_WAIT|PRIVATE family (WAIT 0,
+/// LOCK_PI 6, WAIT_REQUEUE_PI 11 — the art::Mutex + the ART
+/// ConditionVariable + the bionic pthread_mutex contention paths), and
+/// EXCLUDES FUTEX_WAIT_BITSET (9): the rn501 decode showed the
+/// idle-DAEMON fleet parks EXCLUSIVELY via WAIT_BITSET (bionic's
+/// pthread_cond(_timedwait) — the unbounded idle waiters that drained
+/// both the v1 and the v2 budgets), while the mission-critical wall
+/// parks were op=0x80 (FUTEX_WAIT_PRIVATE: the rn499 main thread AND
+/// the pool worker). The episode tracking keeps ALL wait-family ops
+/// (a BITSET park is still a park — the teardown semantics stay
+/// honest); only the VERDICT spend is wall-class gated.
+fn z520a_op_is_wall_class(op: u64) -> bool {
+    matches!(op & 0x7f, 0 | 6 | 11)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Z520ADecision {
     /// Arm/refresh the episode (no spend).
@@ -13096,24 +13112,31 @@ fn z520a_wall_park_sweep(pids: &[libc::pid_t]) {
                                 z520a_pid_spends().lock().unwrap_or_else(|e| e.into_inner());
                             Z520A_PER_PID_CAP.saturating_sub(spends.get(&pid).copied().unwrap_or(0))
                         };
-                        let decision = {
-                            let mut eps =
-                                z520a_episodes().lock().unwrap_or_else(|e| e.into_inner());
-                            z520a_wall_decide(
-                                &mut eps,
-                                budget_left,
-                                pid_cap_left,
-                                pid,
-                                uaddr,
-                                now_secs,
-                            )
-                        };
-                        if decision == Z520ADecision::Spend {
-                            let pool = match era {
-                                Z505Era::Late => z520a_budget_cell(),
-                                Z505Era::Early => z520a_early_budget_cell(),
+                        // 6-Z520a-v3: the verdict spend is WALL-CLASS
+                        // gated (WAIT|PRIVATE only — the rn501 lesson:
+                        // the WAIT_BITSET idle-daemon fleet drained the
+                        // budgets); BITSET parks keep being TRACKED but
+                        // never spend.
+                        if z520a_op_is_wall_class(op) {
+                            let decision = {
+                                let mut eps =
+                                    z520a_episodes().lock().unwrap_or_else(|e| e.into_inner());
+                                z520a_wall_decide(
+                                    &mut eps,
+                                    budget_left,
+                                    pid_cap_left,
+                                    pid,
+                                    uaddr,
+                                    now_secs,
+                                )
                             };
-                            z520a_wall_park_verdict(pid, uaddr, op, val, &line, now_secs, pool);
+                            if decision == Z520ADecision::Spend {
+                                let pool = match era {
+                                    Z505Era::Late => z520a_budget_cell(),
+                                    Z505Era::Early => z520a_early_budget_cell(),
+                                };
+                                z520a_wall_park_verdict(pid, uaddr, op, val, &line, now_secs, pool);
+                            }
                         }
                         true
                     }
@@ -61794,10 +61817,10 @@ mod z503_throttle_tests {
 #[cfg(test)]
 mod z520a_wall_park_tests {
     use super::{
-        z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_op_is_wait_family, z520a_wall_decide,
-        z520a_word_delta, Z520ADecision, Z520AEpisodes, Z520AWordDelta, Z520A_BUDGET,
-        Z520A_EARLY_BUDGET, Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS,
-        Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
+        z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_op_is_wait_family,
+        z520a_op_is_wall_class, z520a_wall_decide, z520a_word_delta, Z520ADecision, Z520AEpisodes,
+        Z520AWordDelta, Z520A_BUDGET, Z520A_EARLY_BUDGET, Z520A_EPISODE_CAP, Z520A_PER_PID_CAP,
+        Z520A_REFIRE_SECS, Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
     };
 
     /// The rn499 shapes: the main thread AND the pool worker parked with
@@ -61817,6 +61840,25 @@ mod z520a_wall_park_tests {
         assert!(!z520a_op_is_wait_family(0x84)); // CMP_REQUEUE|PRIVATE
         assert!(!z520a_op_is_wait_family(0x8a)); // WAKE_BITSET|PRIVATE
         assert!(!z520a_op_is_wait_family(0x82)); // FD
+    }
+
+    /// 6-Z520a-v3 (the rn501 budget lesson): the WALL-CLASS filter — the
+    /// idle-DAEMON fleet parks EXCLUSIVELY via WAIT_BITSET (bionic's
+    /// pthread_cond(_timedwait): all 8 rn501 verdicts were op=0x89),
+    /// while the mission-critical wall parks were FUTEX_WAIT_PRIVATE
+    /// (op=0x80: the rn499 main thread AND the pool worker). The verdict
+    /// tier covers WAIT/LOCK_PI/WAIT_REQUEUE_PI only; BITSET parks stay
+    /// tracked but never spend.
+    #[test]
+    fn z520a_wall_class_excludes_the_bitset_idle_fleet() {
+        assert!(z520a_op_is_wall_class(0x00)); // WAIT (art::Mutex / ART CondVar)
+        assert!(z520a_op_is_wall_class(0x80)); // WAIT|PRIVATE (the rn499 wall shape)
+        assert!(z520a_op_is_wall_class(0x86)); // LOCK_PI|PRIVATE
+        assert!(z520a_op_is_wall_class(0x8b)); // WAIT_REQUEUE_PI|PRIVATE
+        assert!(!z520a_op_is_wall_class(0x09)); // WAIT_BITSET
+        assert!(!z520a_op_is_wall_class(0x89)); // WAIT_BITSET|PRIVATE (the rn501 daemon-fleet shape)
+        assert!(!z520a_op_is_wall_class(0x81)); // WAKE|PRIVATE
+        assert!(!z520a_op_is_wall_class(0x8a)); // WAKE_BITSET|PRIVATE
     }
 
     /// The routine fleet's parks (10-15 s dwells — the shapes that
