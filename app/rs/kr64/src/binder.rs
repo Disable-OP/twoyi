@@ -2765,6 +2765,36 @@ const Z502_SPAWN_BUDGET_DEFAULT: u32 = 8;
 /// must see WHY the spawns stopped; 4 lines name it per boot.
 static Z502_EXHAUSTED_LOG: AtomicU32 = AtomicU32::new(4);
 
+// ── 6-Z516: the service-miss RATE BUDGET ──────────────────────────────────
+// The rn495 run logged 100,376 `getService(sensor_privacy) miss` lines
+// (+337s → +1817s, ~11MB): the AOSP 11 startOtherServices order starts
+// SensorPrivacyService immediately AFTER SensorService, and SensorService's
+// start BLOCKS the system_server main thread polling ISensors/default — so
+// sensor_privacy never registers and the vendor HAL's client polls getService
+// with NO backoff for the rest of the run. The flood is honest evidence (the
+// hang is real) but it starves the artifact budget for the boot-timeline
+// lines around it. Budget per service NAME: the first 8 misses log verbatim
+// (a fresh name's first misses are pure signal), afterwards every 1000th
+// occurrence logs a rate heartbeat — the loop stays visible, the artifact
+// survives.
+static Z516_MISS_LOG: std::sync::LazyLock<Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 6-Z516 (pure): the per-occurrence visibility verdict — true when THIS
+/// occurrence should log (the first 8, then every 1000th), false when it
+/// stays silent. `count` is the 1-based occurrence for one name.
+fn z516_miss_log_allow(count: u64) -> bool {
+    count <= 8 || (count - 8) % 1000 == 0
+}
+
+/// 6-Z516: the keyed half — bump the per-name counter and decide.
+fn z516_service_miss(name: &str) -> Option<u64> {
+    let mut m = Z516_MISS_LOG.lock().ok()?;
+    let e = m.entry(name.to_string()).or_insert(0);
+    *e = e.wrapping_add(1);
+    z516_miss_log_allow(*e).then_some(*e)
+}
+
 /// 6-Z442: one flat crossing's grant record — the node ref granted plus
 /// the owner-side mirrors the kernel would queue for it.
 struct Z442FlatGrant {
@@ -8253,10 +8283,17 @@ fn servicemanager_proxy(
                     // Stability::set(null, !=0) is BAD_TYPE (harmless for
                     // a miss, but the honest value is 0).
                     writer.write_i32(ann_null);
-                    info!(
-                        "[KR64][binder][svc] getService({}) miss → null binder",
-                        name
-                    );
+                    if let Some(n516) = z516_service_miss(&name) {
+                        info!(
+                            "[KR64][binder][svc] getService({}) miss → null binder{}",
+                            name,
+                            if n516 <= 8 {
+                                String::new()
+                            } else {
+                                format!(" [6-Z516 heartbeat: occurrence #{} of this name]", n516)
+                            }
+                        );
+                    }
                 }
             }
         }
@@ -9170,7 +9207,17 @@ fn servicemanager_hidl(
                         binder: 0,
                         cookie: 0,
                     });
-                    info!("[KR64][binder][svc] HIDL get({}) miss → null binder", key);
+                    if let Some(n516) = z516_service_miss(&key) {
+                        info!(
+                            "[KR64][binder][svc] HIDL get({}) miss → null binder{}",
+                            key,
+                            if n516 <= 8 {
+                                String::new()
+                            } else {
+                                format!(" [6-Z516 heartbeat: occurrence #{} of this name]", n516)
+                            }
+                        );
+                    }
                 }
             }
         }
@@ -11631,6 +11678,60 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn z516_miss_log_allows_first_eight_then_every_1000th() {
+        // The rn495 shape: 100,376 identical misses must collapse to
+        // 8 verbatim lines + ~100 heartbeats.
+        let logged: Vec<u64> = (1..=100_376u64)
+            .filter(|&c| z516_miss_log_allow(c))
+            .collect();
+        assert_eq!(logged.len(), 8 + (100_376 - 8) / 1000);
+        // The first 8 all log, the 9th does not.
+        for c in 1..=8u64 {
+            assert!(z516_miss_log_allow(c), "occurrence {c} must log");
+        }
+        assert!(!z516_miss_log_allow(9));
+        assert!(!z516_miss_log_allow(1007));
+        // Every 1000th after the first 8 logs: #1008 is the first heartbeat.
+        assert!(z516_miss_log_allow(1008));
+        assert!(z516_miss_log_allow(2008));
+    }
+
+    #[test]
+    fn z516_service_miss_keys_the_budget_per_name() {
+        // The budget map is a PROCESS-GLOBAL static (tests in this binary
+        // may collide) — use a unique-per-run name, the tmpdir() pattern.
+        let nm = format!(
+            "z516-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+        // Distinct names get independent budgets; the same name counts up.
+        assert_eq!(z516_service_miss(&nm), Some(1));
+        assert_eq!(z516_service_miss(&nm), Some(2));
+        let nm2 = format!(
+            "z516-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+        assert_eq!(z516_service_miss(&nm2), Some(1));
+        // Counts 3..8 are still inside the first-8 window (each logs),
+        // and the counters are independent across names.
+        for _ in 0..6 {
+            let c = z516_service_miss(&nm).unwrap();
+            assert!((3..=8).contains(&c), "count {c} must still log");
+        }
+        // The loop consumed count 8; the next call is occurrence #9 →
+        // silent (the first-8 window is closed). #10 likewise.
+        assert_eq!(z516_service_miss(&nm), None);
+        assert_eq!(z516_service_miss(&nm), None);
+        // Skip forward deterministically via the pure half instead of
+        // 1000 map bumps: 1007 silent, 1008 the first heartbeat.
+        assert!(!z516_miss_log_allow(9));
+        assert!(!z516_miss_log_allow(1007));
+        assert!(z516_miss_log_allow(1008));
+    }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
