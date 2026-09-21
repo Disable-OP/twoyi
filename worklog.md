@@ -32994,3 +32994,22 @@ read 16 ret=1024 buf="aed33b6b5000-..." ← fd 16 reused post-inf.close() (a map
   flush sees EOF→fail-fast differently... the evidence decides); (2) the wall round 5
   once rung 3+ is restored; (3) the property ack economy round 2 (6-Z533 verified
   working: zero recv-failed in rn515/516).
+
+## Task 263 addendum 10 (6-Z535: /proc/sys/** remapped to the PROVEN-coherent synthetic tree)
+
+- The rn517 lseek journal confirmed the syscall-layer coherence ONE more time (write "4\n"
+  pos=2 → verify read "4\n" pos=2 → NO lseek events — the streambuf served the
+  iterations 2/3 verifies from its buffer without any syscall) — the divergence lives in
+  the C++ streambuf layer's interaction with the store file, which the emulator cannot
+  reach through syscalls.
+- **6-Z535**: the VFS /proc/sys/** rule now maps to the ROOTFS's OWN synthetic
+  /proc/sys tree (write_proc_sys's 6-Z124 0666 files: kptr="2\n", mmap_rnd_bits="32\n",
+  compat="16\n" — the PROVEN-coherent single-file store from the era when init PASSED
+  SetKptrRestrict). One file per sysctl, written and read through the SAME path — no
+  store indirection, no second copy to diverge. The 6-Z531a eager store seed stays
+  (harmless). The z305i test updated to the new mapping.
+- Gates 1121/1121; fmt/clippy clean.
+- **rn518 agenda**: (1) zero InitFatalReboot → the boot passes SetKptrRestrict → rung 7+
+  restored; (2) the 6-Z530 capture + the 6-Z533 ack economy at system_server time (the
+  start_count set must finally succeed) → the rung-6+ push; (3) the wall round 5 + the
+  6-Z529 pipe hunt; (4) the dexopt economy round 4.

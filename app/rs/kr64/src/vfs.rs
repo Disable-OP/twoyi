@@ -1225,9 +1225,26 @@ impl SandboxPolicy {
         // ({rootfs}/dev/.twoyi-sysctl/**): writes succeed honestly and
         // reads serve the container's own value, seeded ONCE from the
         // host's real sysctl (see the open-ENTRY prep in ptrace_emu.rs).
+        // 6-Z535 (the rn517 journal decree): /proc/sys/** now maps to the
+        // ROOTFS's OWN synthetic /proc/sys tree (write_proc_sys's 6-Z124
+        // 0666 files) instead of the .twoyi-sysctl store. The rn516/517
+        // journals PROVED the store's syscall layer coherent (the ofstream
+        // write "4\n" ret=2 → the ifstream verify read "4\n" ret=2) yet
+        // SetHighestAvailableOptionValue's verify still failed — the
+        // divergence is the C++ streambuf layer: the ifstream's buffer was
+        // populated by the OPEN-TIME read of the STORE file (created empty
+        // by the write-intent prep, then seeded), while the ofstream's
+        // writes and the ifstream's re-reads raced the buffer's staleness
+        // across the TWO store instances (the eager seed's rootfs spelling
+        // vs the resolved one). The synthetic tree is the PROVEN-coherent
+        // single-file store (the 6-Z124 era boots passed SetKptrRestrict
+        // with it): one file per sysctl, 0666, seeded "2\n"/"32\n"/"16\n"
+        // before the guest runs, written and read through the SAME path —
+        // no store indirection, no second copy to diverge. The eager
+        // 6-Z531a store seed stays (harmless; other readers may hold it).
         if path.starts_with("/proc/sys/") {
             return format!(
-                "{}/dev/.twoyi-sysctl/{}",
+                "{}/proc/sys/{}",
                 self.rootfs.to_string_lossy(),
                 &path["/proc/sys/".len()..]
             );
@@ -2797,28 +2814,31 @@ mod tests {
 
     #[test]
     fn z305i_proc_sys_translates_to_virtual_sysctl_store() {
-        // Guest /proc/sys/** must land in the per-profile virtual sysctl
-        // store {rootfs}/dev/.twoyi-sysctl/** — the host /proc/sys is
-        // read-only for the untrusted app and AOSP-11 init FATALs on the
-        // kptr_restrict write (SetKptrRestrictAction → InitFatalReboot,
-        // run 34005543435). The store makes writes succeed honestly and
-        // reads serve the container's own (host-seeded) value.
+        // 6-Z535: guest /proc/sys/** lands in the ROOTFS's OWN synthetic
+        // /proc/sys tree (write_proc_sys's 6-Z124 0666 files) — the host
+        // /proc/sys is read-only for the untrusted app and AOSP-11 init
+        // FATALs on the kptr_restrict write (SetKptrRestrictAction →
+        // InitFatalReboot). The synthetic tree is the PROVEN-coherent
+        // single-file store (the rn516/517 journals proved the
+        // .twoyi-sysctl store's syscall layer coherent yet the C++
+        // streambuf layer still diverged — one file per sysctl, written
+        // and read through the SAME path, has no second copy to diverge).
         let tmp = z196_tmp_rootfs("sysctl_store");
         let rootfs = tmp.to_str().unwrap();
         let p = SandboxPolicy::new(rootfs);
         assert_eq!(
             p.translate_guest("/proc/sys/kernel/kptr_restrict"),
-            format!("{rootfs}/dev/.twoyi-sysctl/kernel/kptr_restrict")
+            format!("{rootfs}/proc/sys/kernel/kptr_restrict")
         );
         assert_eq!(
             p.translate_guest("/proc/sys/vm/mmap_rnd_bits"),
-            format!("{rootfs}/dev/.twoyi-sysctl/vm/mmap_rnd_bits")
+            format!("{rootfs}/proc/sys/vm/mmap_rnd_bits")
         );
         // The translated backing path is INSIDE the rootfs → the
         // enforcement backstop allows it (no host escape).
         assert!(matches!(
             p.verify_real_path(std::path::Path::new(&format!(
-                "{rootfs}/dev/.twoyi-sysctl/kernel/kptr_restrict"
+                "{rootfs}/proc/sys/kernel/kptr_restrict"
             ))),
             crate::vfs::SandboxVerdict::Allow
         ));
