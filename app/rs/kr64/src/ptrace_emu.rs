@@ -13931,6 +13931,19 @@ fn z534_journal_event(pid: libc::pid_t, fd: i64, what: &str, ret: i64, buf_ptr: 
     if n >= 40 {
         return;
     }
+    // The fd's kernel position at the event (the streambuf's seek/underflow
+    // choreography is the rn516 mystery — the syscall layer was PROVEN
+    // coherent: the verify read returned the exact written bytes, yet the
+    // C++ loop continued; the position + the seek events are the remaining
+    // observable state).
+    let pos = std::fs::read_to_string(format!("/proc/{}/fdinfo/{}", pid, fd))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("pos:"))
+                .and_then(|l| l.split_whitespace().nth(1).map(|p| p.to_string()))
+        })
+        .unwrap_or_else(|| "?".to_string());
     let mut head = String::new();
     if buf_ptr != 0 {
         let mut buf = [0u8; 32];
@@ -13946,8 +13959,8 @@ fn z534_journal_event(pid: libc::pid_t, fd: i64, what: &str, ret: i64, buf_ptr: 
         }
     }
     crate::trace_log_line(&format!(
-        "6-Z534: kptr-fd journal pid={} fd={} {} ret={} buf[:32]={:?}",
-        pid, fd, what, ret, head
+        "6-Z534: kptr-fd journal pid={} fd={} {} ret={} pos={} buf[:32]={:?}",
+        pid, fd, what, ret, pos, head
     ));
 }
 
@@ -48762,6 +48775,28 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // ── 6-Z534: the kptr-fd LSEEK journal (aarch64 lseek
+                    // nr=62; the guest is arm64) — the seekg(0) between the
+                    // verify iterations is the unobserved half of the
+                    // SetHighestAvailableOptionValue choreography: whether
+                    // the underlying lseek fired, with what offset, and
+                    // where the fd position ended up.
+                    if syscall_num == 62 {
+                        let fd = match pending_entry_fd.get(&pid) {
+                            Some((nr, f)) if *nr == syscall_num => *f,
+                            _ => get_syscall_arg(&regs, abi.reg_arg1) as i64,
+                        };
+                        if z534_kptr_fds().get(&pid).map_or(false, |s| s.contains(&fd)) {
+                            z534_journal_event(
+                                pid,
+                                fd,
+                                "lseek",
+                                ret,
+                                get_syscall_arg(&regs, abi.reg_arg2),
+                            );
                         }
                     }
 

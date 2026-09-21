@@ -32967,3 +32967,30 @@ live):**
   the verify's ground truth); (2) the fix follows the evidence; (3) the rung-3 wall is
   the ONLY blocker between rung 3 and the rung-7 baseline (the property economy + the
   dexopt economy are both verified working once init survives SetKptrRestrict).
+
+## Task 263 addendum 9 (rn516 decoded: THE JOURNAL PARADOX — the syscall layer is PROVEN coherent, the divergence is in the C++ streambuf layer; the lseek journal rides rn517)
+
+**rn516 decoded (ad7e4925, rung 3) — the journal delivered the byte-level truth:**
+```
+open 16 (inf) | open 17 (of, current=4) | write 17 "4\n" ret=2
+read 16 ret=2 buf="4\n"     ← verify #1: the read saw EXACTLY the written bytes!
+open 17 (current=3) | write 17 "3\n" | open 17 (current=2) | write 17 "2\n"
+read 16 ret=1024 buf="aed33b6b5000-..." ← fd 16 reused post-inf.close() (a maps dump)
+```
+- **The syscall layer is PROVEN coherent**: the ofstream's write landed ("4\n" ret=2) and
+  the ifstream's verify re-read saw EXACTLY those bytes. `str_rec` should parse "4",
+  compare "4"=="4" → break → SUCCESS. **The loop continued anyway (iters 3, 2) → the
+  divergence is inside the C++ streambuf/seekg/extraction layer — invisible at the
+  syscall surface.** The iters 2/3 verifies issued NO read syscalls at all (the streambuf
+  served them from its buffer without underflow) — consistent with the buffer holding
+  stale bytes the extraction mis-parses, OR the seekg state machine diverging.
+- **6-Z534 extended (the lseek journal)**: lseek (aarch64 nr=62) on journaled kptr fds
+  now logs (ret=new position, fdinfo pos at every event) — the seekg half of the
+  choreography becomes observable in rn517.
+- Gates 1121/1121; fmt/clippy clean.
+- **rn517 agenda**: (1) decode the lseek journal — IF the seeks are absent/short, the
+  streambuf served stale buffer bytes → the fix = the emu-side POSIX-position discipline
+  for the store fds OR the nuclear option (fake the kptr write's ret so the ofstream's
+  flush sees EOF→fail-fast differently... the evidence decides); (2) the wall round 5
+  once rung 3+ is restored; (3) the property ack economy round 2 (6-Z533 verified
+  working: zero recv-failed in rn515/516).
