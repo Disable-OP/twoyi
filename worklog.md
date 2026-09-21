@@ -32760,3 +32760,46 @@ the only documented blocker left.
   only `none` (blind=0) names the EOF-semantics class. Hits carry the blind tag too.
   Same test expanded (blind=0/3/1/2 cases) = 1119/1119; fmt/clippy clean.
 - Rides rn510 (rn509 was already cut on b8005b9d).
+
+## Task 263 addendum 2 (rn509 decoded: the PROPERTY-WIRE FLIP named — 3 era suicides; 6-Z530 the real-listener capture + 6-Z530b the idle-comm gate)
+
+**rn509 decoded (b8005b9d, rung 7 SURFACEFLINGER, ~38.5 min) — the monitor-lock wall was
+ABSENT this boot (the hang itself flips per-boot) but the boot died a WORSE death ×3:**
+- **THE PROPERTY-WIRE FLIP (the new headline)**: THREE system_server eras (8522 → 9610 →
+  10827) all suicided via the SAME fatal: `RuntimeException: failed to set system property`
+  at `SystemServer.run(SystemServer.java:436)` (the sys.system_server.start_count set) —
+  the client property_set got **error 0x8** from the wire. rn509's "Unable to set property
+  … error code: 0x8" fleet: log.tag.APM_AudioPolicyManager, sys.system_server.start_count
+  (×eras), cache_key.is_compat_change_enabled ×2 — while rn508 had exactly ONE benign
+  sys.boot.reason 0x8 and ZERO fatals.
+- **THE MECHANISM**: the 6-Z110 property-client emulation only captures connect()s that
+  FAIL (no host listener). But the guest's sockaddr pathnames resolve against the HOST
+  root — and the redroid host IS a real Android with its OWN /dev/socket/property_service.
+  When the host's listener exists at the guest's first client connect, the connect
+  SUCCEEDS FOR REAL and every guest set lands in the HOST's property service (identity
+  mismatch) — the host rejects them (0x8 to the client) and the guest's read-back
+  verification never sees the value. **The per-boot flip**: rn508 booted before the host's
+  listener was up (connects failed → the fake path → the 6-Z111 capture/apply worked →
+  system_server sets verified OK); rn509 booted after it (the host heard everything).
+  ZERO 6-Z110 lines in rn509's whole log = the fake arm never fired — the smoking gun.
+- The guest's OWN area carries init.svc.* + sys.system_server.start_count (set in-process
+  by the guest init) — only the SOCKET-path sets died.
+- **6-Z530 (the fix, +1 test = 1120/1120)**: a MATCHED property_service sockaddr is
+  captured into the emulated protocol REGARDLESS of the kernel connect result — the
+  success case (z530_capture_real_listener) tracks the fd + logs
+  "6-Z530: … REAL host property_service listener captured …"; the ops arms (send→full-len
+  + the 6-Z111 apply, recv→EOF, close→untrack) take over, so the HOST never sees a byte of
+  guest traffic and the guest's read-back verification sees the applied value — the rn508
+  behavior on EVERY boot.
+- **6-Z530b (the rn509 budget lesson)**: the v4 IDLE-COMM gate gains the system-binary
+  daemon comms `_system_bin_tra` (traceur) + `_system_bin_ior` (iorapd) — rn509 spent ALL
+  3 of its boot's wall verdicts on their idle parks (+140 s/+543 s/+1226 s) while the boot
+  had NO wall. Gate = 11 comms; evidence-only entries.
+- Round 2 confirmations: the 6-Z528 closure holds (43 libs, ZERO CANNOT LINK — the dexopt
+  economy stable across boots); rung stays 7.
+- **rn510 agenda**: (1) the 6-Z530 verdict — the capture line MUST appear (or the flip
+  picked the fake path again); expect ZERO property 0x8s and ZERO era suicides;
+  (2) the wall round 4 — the monitor-lock freeze itself flips per-boot (rn508 yes /
+  rn509 no); the 6-Z529 pipe-writer hunt rides if it returns; (3) the dexopt economy
+  round 3; (4) the rung-8 push — with the property wire healed, system_server should
+  finally SURVIVE past run():436 and reach the service starts.

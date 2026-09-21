@@ -12944,7 +12944,7 @@ const Z520A_SIBLING_WINDOW_SECS: u64 = 30;
 /// arrived after the budget died and got ZERO verdicts. These daemons
 /// can never BE the boot wall: their parks are the runtime's idle
 /// state, not a coordination point.
-const Z520A_IDLE_DAEMON_COMMS: [&str; 9] = [
+const Z520A_IDLE_DAEMON_COMMS: [&str; 11] = [
     "HeapTaskDaemon",
     "ReferenceQueueD", // ReferenceQueueDaemon → the kernel's 15-char comm
     "FinalizerDaemon",
@@ -12954,6 +12954,13 @@ const Z520A_IDLE_DAEMON_COMMS: [&str; 9] = [
     "perfetto_hprof_", // perfetto_hprof_thread → 15-char comm
     "ADB-JDWP Connec", // ADB-JDWP Connection → 15-char comm
     "Profile Saver",
+    // 6-Z530b (the rn509 budget lesson): the system BINARY daemons —
+    // their 15-char comms are the exec-name truncations, and they park
+    // in futex_do_wait for their whole idle life waiting for binder
+    // work. rn509 spent 3 of the boot's verdicts on them (+140 s traceur,
+    // +543 s/+1226 s iorapd) while the boot had NO wall at all.
+    "_system_bin_tra", // /system/bin/traceur → 15-char comm
+    "_system_bin_ior", // /system/bin/iorapd → 15-char comm
 ];
 
 /// 6-Z520a-v4 (pure): does this comm belong to the ART runtime's
@@ -13832,6 +13839,17 @@ fn z527b_pipe_probe_budget_take() -> bool {
             |b| if b > 0 { Some(b - 1) } else { None },
         )
         .is_ok()
+}
+
+/// 6-Z530 (pure): the real-listener capture decision for a property_
+/// service connect whose sockaddr MATCHED. The kernel's success (ret ==
+/// 0) means a REAL host listener accepted the guest — the rn509 era-
+/// death flip — and the fd MUST be captured into the emulated protocol
+/// (tracked; the ops arms fake its I/O). A kernel failure (ret < 0) is
+/// the pre-existing 6-Z110 path (fake to 0 + track) — not this helper's
+/// case; anything ≥ 1 cannot come out of a real connect.
+fn z530_capture_real_listener(ret: i64) -> bool {
+    ret == 0
 }
 
 /// 6-Z501: the FUTEX-PARK forensics probe — a blocked-in-futex tracee's
@@ -48278,6 +48296,53 @@ pub fn run_ptrace_loop(
                                     }
                                     // TWRP mode + ret < 0: leave the real failure
                                     // untouched; TWRP's init handles it gracefully.
+                                } else if z530_capture_real_listener(ret)
+                                    && sockaddr_un_is_property_service(
+                                        pid,
+                                        get_syscall_arg(&regs, abi.reg_arg2),
+                                        get_syscall_arg(&regs, abi.reg_arg3) as i64,
+                                        &abi,
+                                    )
+                                    .is_some()
+                                {
+                                    // 6-Z530: the REAL-LISTENER CAPTURE — the rn509
+                                    // era-death class. The guest's connect() sockaddr
+                                    // pathname resolves against the HOST root (the
+                                    // translator never sees sockaddr pathnames); on the
+                                    // redroid host the REAL /dev/socket/property_service
+                                    // listener may exist — the kernel connect SUCCEEDS
+                                    // and every guest property set lands in the HOST's
+                                    // property service (identity mismatch: the host
+                                    // applies/rejects them by ITS policy — the guest's
+                                    // client sees the host's error code 0x8, and R's
+                                    // SystemServer.run() FATALS on its own
+                                    // sys.system_server.start_count set → era suicide ×3
+                                    // in rn509). The per-boot flip: rn508 booted before
+                                    // the host's listener existed (connect failed → the
+                                    // 6-Z110 fake path → sets applied in the guest area);
+                                    // rn509 booted after (real connect → the host heard
+                                    // everything). The fix: a MATCHED property_service
+                                    // sockaddr is captured into the emulated protocol
+                                    // REGARDLESS of the kernel's connect result — the
+                                    // success case leaves the return 0 (already success)
+                                    // and just TRACKS the fd, so the ops arms take over:
+                                    // sendto → full length + the 6-Z111 capture/apply,
+                                    // recv/read → EOF, close → untrack. The HOST service
+                                    // never sees a byte of guest traffic; the guest's
+                                    // read-back verification sees the 6-Z111-applied
+                                    // value — the rn508 (working) behavior on every boot.
+                                    let fd = match pending_entry_fd.get(&pid) {
+                                        Some((nr, f)) if *nr == syscall_num => *f as i32,
+                                        _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
+                                    };
+                                    fake_propserv_fds.entry(pid).or_default().insert(fd as i64);
+                                    if propserv_log_count < PROPSERV_LOG_CAP {
+                                        propserv_log_count += 1;
+                                        log(&format!(
+                                            "6-Z530: connect(fd={}) returned 0 — REAL host property_service listener captured into the emulated protocol (the rn509 0x8 era-death flip): send→len+apply, recv→EOF, close→0",
+                                            fd
+                                        ));
+                                    }
                                 } else if ret < 0 && ret > -4096 {
                                     // 6-Z199: ENTRY-stash fd (aarch64 x0-at-EXIT).
                                     let fd = match pending_entry_fd.get(&pid) {
@@ -62698,9 +62763,9 @@ mod z520a_wall_park_tests {
         z520a_art_mutex_name_ok, z520a_art_mutex_shape, z520a_comm_is_idle_daemon,
         z520a_op_is_wait_family, z520a_op_is_wall_class, z520a_wall_decide, z520a_word_delta,
         z527b_access_mode, z527b_pipe_inode, z529_fd_entry, z529_fdinfo_pos, z529_host_verdict,
-        Z520ADecision, Z520AEpisodes, Z520AWordDelta, Z520A_BUDGET, Z520A_EARLY_BUDGET,
-        Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS, Z520A_SIBLING_WINDOW_SECS,
-        Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
+        z530_capture_real_listener, Z520ADecision, Z520AEpisodes, Z520AWordDelta, Z520A_BUDGET,
+        Z520A_EARLY_BUDGET, Z520A_EPISODE_CAP, Z520A_PER_PID_CAP, Z520A_REFIRE_SECS,
+        Z520A_SIBLING_WINDOW_SECS, Z520A_STALE_SECS, Z520A_WALL_DWELL_SECS,
     };
 
     /// The rn499 shapes: the main thread AND the pool worker parked with
@@ -62874,6 +62939,18 @@ mod z520a_wall_park_tests {
             z529_host_verdict(&eight, 2),
             "1(p,write),2(p,write),3(p,write),4(p,write),5(p,write),6(p,write),…+2(blind=2)"
         );
+    }
+
+    /// 6-Z530 (pure): the real-listener capture decision — a kernel
+    /// SUCCESS on a matched property_service connect is the rn509
+    /// era-death flip and MUST capture; the failure classes belong to
+    /// the pre-existing 6-Z110 fake path.
+    #[test]
+    fn z530_capture_real_listener_pins_the_success_flip() {
+        assert!(z530_capture_real_listener(0)); // the real host listener accepted
+        assert!(!z530_capture_real_listener(-2)); // ENOENT — the 6-Z110 fake path
+        assert!(!z530_capture_real_listener(-111)); // ECONNREFUSED — the 6-Z110 fake path
+        assert!(!z530_capture_real_listener(1)); // not a real connect result
     }
 
     /// The routine fleet's parks (10-15 s dwells — the shapes that
