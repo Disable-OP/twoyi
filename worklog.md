@@ -32948,3 +32948,22 @@ live):**
   zero 0x8s → system_server survives run():436 → the rung-6+ property economy; (3) the
   wall round 5 (the monitor-lock hang + the 6-Z529 pipe hunt if it returns); (4) the
   dexopt economy round 4.
+
+## Task 263 addendum 8 (rn515 decoded: the false-LEAKED dead, the ack fixed, the kptr FATAL persists → 6-Z534 the kptr-fd journal)
+
+**rn515 decoded (7a147f9d, rung 3):**
+- The discriminator fix WORKED: ZERO 6-Z532 LEAKED lines (the false-positive dead — no
+  shadow interference); the 6-Z533 ack fix worked (zero "recv failed"); zero 0x8s.
+- **BUT the kptr FATAL persists** ("Unable to set minimum option value 2") — with the
+  opens landing in the store coherently (rn514's evidence), the verify loop should pass.
+  The remaining unknown: the exact syscall choreography of the verify loop (what the
+  ofstream's write returned, what the ifstream's re-read saw byte-for-byte).
+- **6-Z534 (the instrument)**: the kptr-fd syscall JOURNAL — every (pid, fd) opened for
+  EXACTLY /proc/sys/kernel/kptr_restrict is registered (cap 4 fds/boot); every read/write
+  on a journaled fd logs (nr-class, ret, the 32-byte buffer head). PURE OBSERVATION
+  (no behavior change), cap 40 events. This settles the verify mystery byte-for-byte.
+- Gates 1121/1121; fmt/clippy clean.
+- **rn516 agenda**: (1) decode the 6-Z534 journal (the write bytes vs the read bytes —
+  the verify's ground truth); (2) the fix follows the evidence; (3) the rung-3 wall is
+  the ONLY blocker between rung 3 and the rung-7 baseline (the property economy + the
+  dexopt economy are both verified working once init survives SetKptrRestrict).

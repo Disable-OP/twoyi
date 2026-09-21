@@ -13906,6 +13906,51 @@ fn z110_ack_pending_set(
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// 6-Z534: the kptr-fd syscall JOURNAL — every (pid, fd) opened for
+/// EXACTLY /proc/sys/kernel/kptr_restrict gets its reads/writes logged
+/// (nr, ret, the 32-byte buffer head) for the SetHighestAvailableOption
+/// Value verify-loop decode. PURE OBSERVATION — no behavior change; the
+/// registry caps at 4 fds/boot and the log at 40 events.
+static Z534_KPTR_FDS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<i32, std::collections::HashSet<i64>>>,
+> = std::sync::OnceLock::new();
+
+fn z534_kptr_fds(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<i32, std::collections::HashSet<i64>>>
+{
+    Z534_KPTR_FDS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+static Z534_EVENT_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn z534_journal_event(pid: libc::pid_t, fd: i64, what: &str, ret: i64, buf_ptr: u64) {
+    let n = Z534_EVENT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 40 {
+        return;
+    }
+    let mut head = String::new();
+    if buf_ptr != 0 {
+        let mut buf = [0u8; 32];
+        let got = fb0_bridge_read_child_mem(pid, buf_ptr, &mut buf);
+        if got > 0 {
+            for &b in &buf[..got as usize] {
+                if b.is_ascii_graphic() || b == b' ' {
+                    head.push(b as char);
+                } else {
+                    head.push_str(&format!("\\x{:02x}", b));
+                }
+            }
+        }
+    }
+    crate::trace_log_line(&format!(
+        "6-Z534: kptr-fd journal pid={} fd={} {} ret={} buf[:32]={:?}",
+        pid, fd, what, ret, head
+    ));
+}
+
 /// 6-Z501: the FUTEX-PARK forensics probe — a blocked-in-futex tracee's
 /// uaddr/val/op + the parking pc's maps row + the futex word's value,
 /// all read-only (the /proc syscall file + process_vm_readv; NO ptrace
@@ -41058,6 +41103,15 @@ pub fn run_ptrace_loop(
                                 }
                                 z532_shadow_set().entry(pid).or_default().insert(ret, rel);
                             }
+                            // 6-Z534: journal EVERY kptr fd (leaked or not) —
+                            // the verify-loop choreography needs the
+                            // byte-level record.
+                            if orig == "/proc/sys/kernel/kptr_restrict"
+                                && z534_kptr_fds().get(&pid).map_or(true, |s| s.len() < 4)
+                            {
+                                z534_kptr_fds().entry(pid).or_default().insert(ret);
+                                z534_journal_event(pid, ret, "open", ret, 0);
+                            }
                         }
                         // ── 6-Z513: the BINDER driver-fd REGISTRATION (the
                         // open EXIT half) ──
@@ -48739,6 +48793,15 @@ pub fn run_ptrace_loop(
                         // 6-Z531a seed + init's own store writes are the
                         // ground truth) for the SetHighestAvailableOption
                         // Value verify re-read to stay coherent.
+                        if z534_kptr_fds().get(&pid).map_or(false, |s| s.contains(&fd)) {
+                            z534_journal_event(
+                                pid,
+                                fd,
+                                "read",
+                                ret,
+                                get_syscall_arg(&regs, abi.reg_arg2),
+                            );
+                        }
                         let z532_rel = z532_shadow_set()
                             .get(&pid)
                             .and_then(|m| m.get(&fd).cloned());
@@ -48855,6 +48918,15 @@ pub fn run_ptrace_loop(
                             Some((nr, f)) if *nr == syscall_num => *f,
                             _ => get_syscall_arg(&regs, abi.reg_arg1) as i64,
                         };
+                        if z534_kptr_fds().get(&pid).map_or(false, |s| s.contains(&fd)) {
+                            z534_journal_event(
+                                pid,
+                                fd,
+                                "write",
+                                ret,
+                                get_syscall_arg(&regs, abi.reg_arg2),
+                            );
+                        }
                         let z532_rel = z532_shadow_set()
                             .get(&pid)
                             .and_then(|m| m.get(&fd).cloned());
