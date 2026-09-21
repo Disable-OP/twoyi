@@ -41025,25 +41025,25 @@ pub fn run_ptrace_loop(
                         // re-read is coherent no matter which side the open
                         // landed on. Capped log 8/boot.
                         if ret >= 0 && orig.starts_with("/proc/sys/") {
-                            let store_prefix =
-                                format!("{}/dev/.twoyi-sysctl/", rootfs.trim_end_matches('/'));
-                            let synthetic_prefix =
-                                format!("{}/proc/sys/", rootfs.trim_end_matches('/'));
                             let fd_target = std::fs::read_link(format!("/proc/{}/fd/{}", pid, ret))
                                 .map(|t| t.to_string_lossy().into_owned())
                                 .unwrap_or_else(|_| "<unreadable>".to_string());
-                            // 6-Z532c: THREE legitimate resolutions exist —
-                            // the store, the rootfs's SYNTHETIC /proc/sys tree
-                            // (the 6-Z124 0666 files — a COHERENT read/write
-                            // pair: both the ofstream and the ifstream land
-                            // there and the verify passes by itself), and the
-                            // HOST twin (incoherent — the leak). Only the
-                            // host-twin target is shadowed: shadowing a
-                            // synthetic-tree fd would inject the STALE store
-                            // content over a COHERENT pair (the rn512/513
-                            // FATALs were self-inflicted exactly this way).
-                            let leaked = !fd_target.starts_with(&store_prefix)
-                                && !fd_target.starts_with(&synthetic_prefix);
+                            // 6-Z532c (rn514's actual-target DECREE): the fd
+                            // target IS the store
+                            // (/data/.../rootfs/dev/.twoyi-sysctl/...) — the
+                            // opens NEVER leaked; the tracer's rootfs string
+                            // spells the rootfs through a DIFFERENT symlink
+                            // leg than the fd readlink reports, so the old
+                            // prefix comparison FALSE-LEAKED every boot and
+                            // the shadow injected stale content over a
+                            // COHERENT store pair (the rn512-514 FATALs were
+                            // self-inflicted). The ONE true leak signature: a
+                            // fd target under the HOST'S OWN /proc/sys (the
+                            // raw "/proc/sys/..." path — no /data prefix, no
+                            // rootfs leg). Everything else (the store, the
+                            // rootfs's synthetic /proc tree) is coherent and
+                            // must be left alone.
+                            let leaked = fd_target.starts_with("/proc/sys/");
                             if leaked {
                                 let rel = orig["/proc/sys/".len()..].to_string();
                                 static Z532_SHADOW_LOG: std::sync::atomic::AtomicU64 =

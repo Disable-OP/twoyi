@@ -32923,3 +32923,28 @@ live):**
 - **rn514 agenda**: (1) the LEAKED actual-target lines decide the kptr story (store vs
   synthetic vs host); ZERO InitFatalReboot → rung 7+; (2) the 6-Z533 ack lines + zero
   "recv failed" + zero 0x8s; (3) the wall round 5; (4) the dexopt economy round 4.
+
+## Task 263 addendum 7 (rn514 decoded: THE ACTUAL-TARGET DECREE — the opens never leaked; the symlink-spelling prefix mismatch; the discriminator fixed)
+
+**rn514 decoded (af97f828, rung 3 — and the smoking gun at last):**
+- `6-Z532: sysctl open LEAKED ... actual-target=/data/user/0/io.twoyi.debug/profiles/
+  default/rootfs/dev/.twoyi-sysctl/kernel/kptr_restrict` — **THE FD TARGET IS THE STORE
+  ITSELF. The kptr opens NEVER leaked to the host twin — not in rn512, not in rn513, not
+  in rn514.** The tracer's `rootfs` string spells the rootfs through a DIFFERENT symlink
+  leg (the dex2oat env's TWOYI_ROOTFS=/data/user/0/io.twoyi.debug/rootfs vs the resolved
+  profiles/default/rootfs), so the old starts_with(rootfs-prefix) comparison FALSE-LEAKED
+  every store-targeted open. The shadow then injected the tracer-side store content over
+  the child's OWN coherent store reads/writes — the verify loop compared injected stale
+  bytes against its own writes and exhausted → FATAL. **rn512/513/514's rung-3 FATALs were
+  100% self-inflicted by the shadow's false-positive registration.**
+- **The fix**: the leak discriminator is now ONE condition — `fd_target.starts_with
+  ("/proc/sys/")` — a fd target under the HOST'S OWN /proc/sys (the raw host-root path:
+  no /data prefix, no rootfs leg) is the ONLY true leak; the store and the rootfs's
+  synthetic /proc tree are coherent and left alone. The actual-target logging stays (any
+  future leak names its landing spot).
+- Gates 1121/1121; fmt/clippy clean.
+- **rn515 agenda**: (1) ZERO 6-Z532 LEAKED lines (the false-positive is dead) + ZERO
+  InitFatalReboot → rung 7+ restored; (2) the 6-Z533 ack lines + zero "recv failed" +
+  zero 0x8s → system_server survives run():436 → the rung-6+ property economy; (3) the
+  wall round 5 (the monitor-lock hang + the 6-Z529 pipe hunt if it returns); (4) the
+  dexopt economy round 4.
