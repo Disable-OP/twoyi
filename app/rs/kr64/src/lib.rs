@@ -5727,7 +5727,45 @@ pub(crate) fn apex_tree_census_and_repair(rootfs: &str, data_dir: &str) -> bool 
             damaged.push(name);
         }
     }
-    // 3. the repair: re-extract each damaged apex from its source.
+    // 2b. 6-Z525: the KEY-FILE census — the rn504 class: the six
+    // package-bearing priv-app dirs were intact (the census read
+    // damaged=0 on all 17237 ticks) but the ART apex tree was missing
+    // lib64/libprofile.so — dex2oat64's DT_NEEDED — so the guest linker
+    // aborted with `CANNOT LINK EXECUTABLE \"/apex/com.android.art/bin/
+    // dex2oat64\": library \"libprofile.so\" not found: needed by main
+    // executable` (three exits code 1 at +207-209s) and the dexopt trio
+    // produced NO oat cache (rn503's twin run instead denied the
+    // post-success utime — the 6-Z524 arm — because THAT dex2oat
+    // succeeded; the deny fleet's presence/absence tracks dex2oat
+    // success, and the deeper cause is the per-boot apex-file-loss
+    // class the flatten's "skipped 0, failed 0" counter does not see).
+    // The priv-app check cannot see a missing lib: each key-file miss
+    // flags the apex damaged so the repair re-extracts it in place.
+    const ART_APEX: &str = "com.android.art";
+    const ART_KEY_FILES: [&str; 4] = [
+        "lib64/libart.so",
+        "lib64/libprofile.so",
+        "bin/dex2oat64",
+        "javalib/core-oj.jar",
+    ];
+    let mut art_key_missing: Vec<&str> = Vec::new();
+    for f in ART_KEY_FILES {
+        let path = format!("{}/apex/{}/{}", rootfs, ART_APEX, f);
+        if !std::path::Path::new(&path).exists() {
+            art_key_missing.push(f);
+        }
+    }
+    let art_damaged = !art_key_missing.is_empty();
+    if art_damaged {
+        info!(
+            "[KR64][apex] 6-Z525 APEX-KEYFILE-MISSING: {}: {} — the repair re-extraction follows",
+            ART_APEX,
+            art_key_missing.join(", ")
+        );
+        damaged.push(ART_APEX);
+    }
+    let checked = PACKAGE_BEARING.len() + 1; // the 6 package apexes + the art key-file census
+                                             // 3. the repair: re-extract each damaged apex from its source.
     let mut repaired = 0usize;
     for name in &damaged {
         let Some(src) = sources.get(*name) else {
@@ -5775,8 +5813,8 @@ pub(crate) fn apex_tree_census_and_repair(rootfs: &str, data_dir: &str) -> bool 
         }
     }
     info!(
-        "[KR64][apex] 6-Z523 APEX-TREE-CENSUS: checked={} damaged={} repaired={}",
-        PACKAGE_BEARING.len(),
+        "[KR64][apex] 6-Z523 APEX-TREE-CENSUS: checked={} damaged={} repaired={} (6-Z525: +1 key-file apex)",
+        checked,
         damaged.len(),
         repaired
     );
@@ -18685,12 +18723,71 @@ mod tests {
             std::fs::create_dir_all(rootfs.join(format!("apex/{}/priv-app/ExtServices@1", name)))
                 .unwrap();
         }
+        // 6-Z525: the ART apex key files — a healthy tree must have them
+        // or the key-file census flags com.android.art damaged.
+        for f in [
+            "lib64/libart.so",
+            "lib64/libprofile.so",
+            "bin/dex2oat64",
+            "javalib/core-oj.jar",
+        ] {
+            std::fs::create_dir_all(
+                rootfs
+                    .join(format!("apex/com.android.art/{}", f))
+                    .parent()
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(rootfs.join(format!("apex/com.android.art/{}", f)), b"x").unwrap();
+        }
 
         let repaired = apex_tree_census_and_repair(rootfs.to_str().unwrap(), dir.to_str().unwrap());
 
         assert!(
             !repaired,
-            "all six package-bearing apexes have non-empty priv-app dirs — no repair may fire"
+            "all six package-bearing apexes + the art key files are present — no repair may fire"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apex_tree_census_6z525_keyfile_miss_flags_art_honestly() {
+        // 6-Z525: the rn504 shape — the six priv-app dirs are intact but
+        // the ART apex tree is missing lib64/libprofile.so (the dex2oat
+        // DT_NEEDED loss). The key-file census must flag com.android.art
+        // damaged; with no source .apex available the repair fails
+        // honestly (returns false, nothing mutated).
+        let dir = std::env::temp_dir().join(format!("twoyi-6z525-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rootfs = dir.join("rootfs");
+        for name in [
+            "com.android.extservices",
+            "com.android.tethering",
+            "com.android.permission",
+            "com.android.cellbroadcast",
+            "com.android.wifi",
+            "com.android.mediaprovider",
+        ] {
+            std::fs::create_dir_all(rootfs.join(format!("apex/{}/priv-app/ExtServices@1", name)))
+                .unwrap();
+        }
+        // The art tree with libprofile.so MISSING (the rn504 signature).
+        std::fs::create_dir_all(rootfs.join("apex/com.android.art/lib64")).unwrap();
+        std::fs::create_dir_all(rootfs.join("apex/com.android.art/bin")).unwrap();
+        std::fs::create_dir_all(rootfs.join("apex/com.android.art/javalib")).unwrap();
+        std::fs::write(rootfs.join("apex/com.android.art/lib64/libart.so"), b"x").unwrap();
+        std::fs::write(rootfs.join("apex/com.android.art/bin/dex2oat64"), b"x").unwrap();
+        std::fs::write(
+            rootfs.join("apex/com.android.art/javalib/core-oj.jar"),
+            b"x",
+        )
+        .unwrap();
+
+        let repaired = apex_tree_census_and_repair(rootfs.to_str().unwrap(), dir.to_str().unwrap());
+
+        assert!(
+            !repaired,
+            "the key-file miss flags art damaged, but with no source nothing can be repaired"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
