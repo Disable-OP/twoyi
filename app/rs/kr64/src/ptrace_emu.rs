@@ -12885,11 +12885,21 @@ fn z501_futex_park_probe(pid: libc::pid_t) {
 ///     what the reaper waits for (an EMPTY list + a blocked wait4 = the
 ///     lost-SIGCHLD class).
 ///
-/// Budgets: a run-level pool (24) + a per-pid cap (3, the z510 gate) —
+/// Budgets (6-Z514): the ERA-SPLIT pools — early 4 (before +90s) / late 20 —
+/// + a per-pid cap (3, the z510 gate) —
 /// the probe re-fires on the ~15 s stall cadence and the identity is
 /// needed ONCE, not as a stream.
 fn z510_fd_park_probe(pid: libc::pid_t) {
-    static Z510_RUN_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(24);
+    // 6-Z514: the ERA-SPLIT pool (the rn493 lesson) — the single 24-run
+    // pool drained on the early-boot service fleet's epoll parks BEFORE
+    // the era-6 main's read-park arrived (the FD-PARK verdict for the
+    // wall came from the unbudgeted STALL-FD-TARGET line instead). The
+    // z505 era-split: an early witness pool (4) + a late wall-era pool
+    // (20) at the z505 boundary (+90s — the framework era where the
+    // system_server-class walls live). One-time exhaustion lines per
+    // pool (the z505 wording).
+    static Z510_LATE_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(20);
+    static Z510_EARLY_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4);
     static Z510_PER_PID: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashMap<libc::pid_t, u64>>,
     > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -12910,7 +12920,14 @@ fn z510_fd_park_probe(pid: libc::pid_t) {
     let Some(class) = class else {
         return;
     };
-    if Z510_RUN_BUDGET.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    // 6-Z514: the era pick (the z505 pattern — the same +90s boundary).
+    let (era, budget_left) = z505_era_budget_pick(
+        crate::boot_elapsed_ms(),
+        Z505_LATE_ERA_FROM_MS,
+        Z510_EARLY_POOL.load(std::sync::atomic::Ordering::Relaxed),
+        Z510_LATE_POOL.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    if budget_left == 0 {
         return;
     }
     {
@@ -12922,11 +12939,27 @@ fn z510_fd_park_probe(pid: libc::pid_t) {
         }
     }
     // The spend: a racing drain restores the floor and drops (the
-    // z506 fetch_sub discipline).
-    let prev = Z510_RUN_BUDGET.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    // z506 fetch_sub discipline); the spend drains the ERA'S OWN pool.
+    let pool = match era {
+        Z505Era::Late => &Z510_LATE_POOL,
+        Z505Era::Early => &Z510_EARLY_POOL,
+    };
+    let prev = pool.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     if prev == 0 {
-        Z510_RUN_BUDGET.store(0, std::sync::atomic::Ordering::Relaxed);
+        pool.store(0, std::sync::atomic::Ordering::Relaxed);
         return;
+    }
+    if prev == 1 {
+        match era {
+            Z505Era::Late => crate::trace_log_line(&format!(
+                "6-Z514 THROTTLE: the z510 late pool exhausted ({} verdicts spent; the per-pid cap {} + the era boundary +{}ms remain armed)",
+                20, 3, Z505_LATE_ERA_FROM_MS
+            )),
+            Z505Era::Early => crate::trace_log_line(&format!(
+                "6-Z514 THROTTLE-EARLY: the z510 early witness pool exhausted ({} verdicts spent before +{}ms; the late pool of 20 remains armed)",
+                4, Z505_LATE_ERA_FROM_MS
+            )),
+        }
     }
     match class {
         ParkClass::Wait4 => {
