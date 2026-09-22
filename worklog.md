@@ -33354,3 +33354,19 @@ Stage Summary:
 - rn533 decode agenda: (1) rung ≥ 7 restored + lmkd alive (grep "Service 'lmkd' (pid" exits = 0); (2) milestones vs rn531 (+11.6/+23.3/+55.6/+151.8) — the filter's honest verdict now that the boot survives; (3) the 6-Z544 qemu-props spin engagement (expected: still spinning — its fix rides separately); (4) 6-Z547 has no boot-behavior surface beyond binder latency — watch the binder conn lines only if something regresses.
 - If lmkd STILL dies: the re-traced 21/22 give the decode DIRECT eyes — the 6-Z428 pwait ENTRY dumps + GSI exit rvals will name the failing call's errno verbatim.
 - Next ranked iterations: (a) 6-Z546 the qemu-props quiet-channel park pipe (the EOF spin is now fully characterized); (b) the 900s+ completion probe for rung 8/9; (c) the binder WRITE_READ log budget trim (200/conn → bounded, ~46k lines/boot).
+
+---
+Task ID: 1 (session 270 cont. — rn533 DECODED: rung 7 RESTORED, every milestone beats rn531 (class_start main −36%); 6-Z546 landed armed; rn534 dispatch pending)
+Agent: Z.ai Code (main implementation agent, session 270)
+
+Work Log:
+- rn533 (run 35771800055, success, sha e3fa4152 = 6-Z547 + 6-Z548): **RUNG 7 RESTORED, boot alive at +916s**. lmkd started once at +5.27s, ZERO exits (vs rn532's 4) — the epoll re-trace fixed the critical-process death chain. The filter is REAL and CLEAN: flip +582ms, phase CORRECTION = 1 (flip-time), phase2-skips = 28 (bounded), 6-Z542 = 0.
+- **THE MILESTONE VERDICT (vs rn531)**: zygote +23.3s → +20.5s (−12%); surfaceflinger +55.6s → +48.2s (−13%); **class_start main +151.8s → +97.8s (−36%)**; class_start core done +50.0s. The 6-Z547 binder idle-wake plausibly drives the class_start drop (main-class services' pure-read binder waits no longer pay up to 250ms each). The 6-Z543 speed campaign is now honestly, cumulatively vindicated: rung-7 arrival cost dropped ~46% vs the rn528 pre-filter baseline (main class +183.6s → +97.8s).
+- The 6-Z544 spin did NOT occur this run (intermittent: rn531 exit-1 / rn532 spin / rn533 absent) — 6-Z546 landed ARMED for the next occurrence.
+- **6-Z546 (27eef925)**: the quiet-channel park pipe — the spin's protocol answer. Arm (6-Z544 128-EOF engagement, z546_arm_verdict gates: EOF-only + qemu-props + kill switch) → inject (read ENTRY rewritten to pipe2(scratch,0)) → live (pipe2 EXIT reads the fd pair back) → park (spin reads redirected to the never-written pipe read-end; blocks in-kernel at ZERO tracer cost). Tests 1144/1144; fmt clean; clippy zero.
+- Tail composition (the rungs-8/9 question, next round): the +900s profile sustains ~9k stops/s — census tops are socket-family storms (pids 3827/3828: sendto/recvfrom/getsockopt/recvmsg pairs) and an mprotect/mmap/openat churner (pid 5062) — needs its own focused decode.
+
+Stage Summary:
+- Remote main: 27eef925. Gates: fmt clean, clippy zero, 1144/1144.
+- rn534 decode agenda: (1) variance check — rn533's milestone profile should repeat (zygote ~+20s, SF ~+48s, class_start main ~+98s); (2) the 6-Z546 engagement if the spin recurs (expect: ARMED → INJECT → PIPE LIVE → ENGAGED, then the spin's census shapes freeze); (3) the tail-storm decode: name the sendto/recvfrom pairs' pids + fds (the 6-Z510-style fd-target line) — the rungs-8/9 wall candidate.
+- Ranked next: (a) the tail-storm decode + the 900s+ completion probe (rung 8/9); (b) the binder WRITE_READ log budget trim; (c) the entry-only resume split — deprioritized by the audit (getpid's fake needs its exit; the safe set is small).
