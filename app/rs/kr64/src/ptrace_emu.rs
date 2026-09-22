@@ -35365,7 +35365,24 @@ pub fn run_ptrace_loop(
                                     set_syscall_num(&mut regs, &abi, libc::SYS_pipe2 as i64);
                                     set_syscall_arg(&mut regs, abi.reg_arg1, scratch_addr);
                                     set_syscall_arg(&mut regs, abi.reg_arg2, 0);
-                                    let _ = ptrace_setregs(pid, &regs, iov_len);
+                                    // 6-Z546 DIAG (rn535): the injection's setregs
+                                    // result MUST be visible — rn535 logged INJECT
+                                    // but the pipe2 EXIT hook never fired (no PIPE
+                                    // LIVE, no READBACK FAILED) while the spin
+                                    // continued, i.e. the rewrite's fate is the
+                                    // unlogged link (the #97 lesson verbatim).
+                                    match ptrace_setregs(pid, &regs, iov_len) {
+                                        Ok(()) => {}
+                                        Err(e) => {
+                                            log(&format!(
+                                                "6-Z546: quiet-channel INJECT setregs FAILED pid={}: {} — the read ran unrewritten; re-arming",
+                                                pid, e
+                                            ));
+                                            // Give the next spin read a fresh shot.
+                                            z546_arm.insert(pid);
+                                            z546_pending.remove(&pid);
+                                        }
+                                    }
                                     log(&format!(
                                         "6-Z546: quiet-channel INJECT pid={} — read(fd={}) rewritten to pipe2(scratch={:#x}, 0) in the child (one EOF-look for the guest; fds read back at the pipe2 EXIT)",
                                         pid, fd, scratch_addr
@@ -46080,6 +46097,22 @@ pub fn run_ptrace_loop(
                     // park mapping (r_fd, w_fd, spin_fd) — the next read of
                     // spin_fd is redirected to r_fd and parks in-kernel.
                     if past_first_execve && syscall_num == libc::SYS_pipe2 as i64 && ret == 0 {
+                        // 6-Z546 DIAG: a pipe2 EXIT with NO pending injection is
+                        // itself informative (the hook fired = the rewrite took;
+                        // the missing piece is the state) — budgeted to 4.
+                        if !z546_pending.contains_key(&pid) {
+                            static Z546_PIPE2_EXIT_NOSTATE: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let n = Z546_PIPE2_EXIT_NOSTATE
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 4 {
+                                log(&format!(
+                                    "6-Z546 DIAG: pipe2 EXIT (ret=0) pid={} with NO pending injection (the state was consumed or never stored) [#{}/4]",
+                                    pid,
+                                    n + 1
+                                ));
+                            }
+                        }
                         if let Some((spin_fd, buf_addr)) = z546_pending.remove(&pid) {
                             let r_fd = read_child_u32(pid, buf_addr)
                                 .map(|v| v as i64)
