@@ -33013,3 +33013,52 @@ read 16 ret=1024 buf="aed33b6b5000-..." ← fd 16 reused post-inf.close() (a map
   restored; (2) the 6-Z530 capture + the 6-Z533 ack economy at system_server time (the
   start_count set must finally succeed) → the rung-6+ push; (3) the wall round 5 + the
   6-Z529 pipe hunt; (4) the dexopt economy round 4.
+
+## Task 263 addendum 11 (rn518 decoded: the synthetic tree behaves IDENTICALLY — the divergence is conclusively the C++ streambuf layer; the session-263 wrap-up)
+
+**rn518 decoded (820f7f54, rung 3):** the synthetic-tree remap produced BYTE-IDENTICAL
+journal choreography (write "4\n" pos=2 → verify read "4\n" pos=2 → iters 3/2 → exhaust →
+InitFatalReboot). **The file layer is conclusively innocent — BOTH stores behave
+identically and perfectly at the syscall level; the divergence lives inside the child's
+C++ streambuf (libc++) seekg/extraction interaction, which no syscall can observe.**
+
+**The rn516/517/518 journal facts (the next session's ground truth):**
+- iter 4: ofstream(17) open → write "4\n" ret=2 → ifstream(16) read ret=2 "4\n" — coherent.
+- iters 3/2: ofstream opens+writes "3\n"/"2\n" — **NO ifstream read syscalls** — the
+  streambuf served the verifies from its buffer without underflow.
+- No lseek syscalls on the inf fd at all (seekg(0) never reached the kernel).
+- The one implausible step: iter 4's verify SAW "4\n" yet the compare
+  ("4".compare("4")==0 → break) allegedly failed. Either the extraction yields something
+  else (the locale/ctype path?) or the stream state diverges pre-compare.
+
+**The next session's fix options (in order of promise):**
+1. **The loader-shlib open hook** (the 6-Z124 precedent): twoyi_loader_shlib.c hooks
+   open/openat for /proc/sys/kernel/kptr_restrict and redirects to a file whose CONTENT
+   the shlib itself controls (e.g. always return "4\n" from a magic file) — bypasses the
+   stream/file coherence question entirely IF the divergence is position-related.
+2. **The ptrace single-step instrument** over the compare — heavy but decisive.
+3. **The init binary patch** — the ROM's init: NOP the SetKptrRestrictAction's
+   LOG(FATAL) — the binary-level patch at import time (the 6-Z305 overlay precedent).
+4. **The strace-style full syscall dump of init pid 2798 between +2070-2080ms** — the
+   6-Z305t family already logs sampled syscalls; widen the sample for the kptr pid.
+
+**Session 263 final state:**
+- Commits: 17e27651-inherited → b8005b9d (6-Z529 the pipe-writer hunt) → b8df4e5f
+  (6-Z529b blind spots) → 7710bcae (6-Z530 the real-listener capture + 6-Z530b) →
+  631e04c8 (6-Z531 the eager seed + observability) → 59488f49 (6-Z532 the shadow) →
+  3e656c7b (6-Z532b the write persist) → af97f828 (6-Z532c the actual-target + 6-Z533
+  the ack) → 7a147f9d (the discriminator decree) → ad7e4925 (6-Z534 the journal) →
+  d83fdfb3 (the lseek journal) → 820f7f54 (6-Z535 the synthetic-tree remap). Gates
+  **1121/1121**; fmt/clippy clean.
+- **VERIFIED-WORKING this session**: (1) the 6-Z528 dex2oat linker-closure (the oat
+  cache fills, zero CANNOT LINK, 2 boots); (2) the 6-Z524 utimensat success path; (3)
+  the 6-Z526 census (2 boots clean); (4) **the 6-Z530 property-service capture (the
+  rn509 era-death class DEAD — zero 0x8s since)**; (5) the 6-Z533 ack economy (zero
+  "recv failed"); (6) the 6-Z529/527b pipe probes (the rn508 wall's topology named).
+- **THE OPEN BLOCKER**: the SetKptrRestrict InitFatalReboot at rung 3 — the file layer
+  is proven coherent byte-for-byte; the divergence is the child's C++ streambuf layer.
+  The sandbox resets between sessions; the store/eager-seed/shadow/journal machinery is
+  all in place for the next session to land the fix with ONE more instrument round.
+- Sandbox: the cron tool unavailable all session (single-session mode); decode/
+  rn508-rn518 mined; disk ~5G free; the credentials + the repo + the toolchain restored
+  per the playbook (the reset playbook in the Session-262/263 handovers above).
