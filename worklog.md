@@ -33370,3 +33370,17 @@ Stage Summary:
 - Remote main: 27eef925. Gates: fmt clean, clippy zero, 1144/1144.
 - rn534 decode agenda: (1) variance check — rn533's milestone profile should repeat (zygote ~+20s, SF ~+48s, class_start main ~+98s); (2) the 6-Z546 engagement if the spin recurs (expect: ARMED → INJECT → PIPE LIVE → ENGAGED, then the spin's census shapes freeze); (3) the tail-storm decode: name the sendto/recvfrom pairs' pids + fds (the 6-Z510-style fd-target line) — the rungs-8/9 wall candidate.
 - Ranked next: (a) the tail-storm decode + the 900s+ completion probe (rung 8/9); (b) the binder WRITE_READ log budget trim; (c) the entry-only resume split — deprioritized by the audit (getpid's fake needs its exit; the safe set is small).
+
+---
+Task ID: 1 (session 270 cont.2 — THE RUNG-8 WALL NAMED: the media fleet crash-loops on /dev/binder because their execves never got the 6-Z305s LD_PRELOAD injection; rn534 in flight)
+Agent: Z.ai Code (main implementation agent, session 270)
+
+Work Log:
+- rn533 tail decode (what holds the boot at rung 7 for ~850s): a **media-fleet crash-restart loop** — init started 401 services post-main-class; vendor.media.omx x98, mediaextractor x95, media.swcodec x87 (280 of 401). Every death is signal 6 with the SAME abort message (the 6-Z306o abort-vma capture, verbatim): **"Binder driver '/dev/binder' could not be opened.  Terminating."**
+- ROOT CAUSE CHAIN: the proxy publishes /dev/binder as a SYMLINK to the proxy's UNIX SOCKET (vm0/dev/binder — open() on a socket file = ENXIO). Guest processes are supposed to reach binder through the LD_PRELOAD interposition (libtwoyi_loader_shlib), injected at execve by the 6-Z305s arm. **mediaextractor's execves show ONLY the 6-Z101 staged rewrite — NO 6-Z305s line** (zygote-class processes got "envp 1 entries + LD_PRELOAD+LD_LIBRARY_PATH injected (VERIFIED)"); without the shim, open("/dev/binder") hits the socket symlink raw → ENXIO → abort → init restarts → ~280 crash/restart cycles pinning the tracer and the boot tail.
+- rn534 (run 35775072073, #536, sha 5ac59afb) dispatched BEFORE this decode — its snapshot carries 6-Z546 but not a media fix; its agenda below is adjusted: the media fleet WILL crash-loop in rn534 too — the fleet's per-restart cost is now quantified (3 services x ~90 restarts / 800s).
+
+Stage Summary:
+- **NEXT SESSION'S RANK-1: fix the media fleet's binder open** — decode why the 6-Z305s injection skipped the media-class execves (a class/phase/budget gate in the execve arm — read the gate, widen it or add a 6-Z110-style /dev/binder open fake for unshimmed processes: open → a tracked wire fd whose ioctls map onto the proxy protocol the way the shim does). Expected payoff: the 280-restart churn dies and rungs 8/9 (system_server, boot complete) become reachable in the 900s window.
+- rn534 decode agenda: (1) milestone variance vs rn533 (zygote ~+20s / SF ~+48s / class_start main ~+98s); (2) 6-Z546 engagement if the spin recurs; (3) media fleet restart counts (expect ~x90 each — the rn533 baseline).
+
