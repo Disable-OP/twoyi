@@ -2329,6 +2329,25 @@ static unsigned char *bp_exchange_anc(int fd, uint32_t cmd,
     memcpy(&ret, hdr + 0, 4);
     memcpy(&rlen, hdr + 4, 4);
     if (rlen > BP_MAX_FRAME) {
+        // 6-Z549 DIAG (rn535 decode): the media fleet's abort maps to THIS
+        // branch — "getAndExecuteCommand(fd=5) returned unexpected error
+        // -71 (EPROTO)" is errno=EPROTO, the only EPROTO setter on the
+        // exchange path. Dump the RAW header words (budget 8/process): a
+        // genuinely huge ret/rlen pair names a real >1MiB response; a
+        // garbage pair (e.g. ret=0x???????? rlen=0x????????) names a wire
+        // DESYNC (the next header read starting mid-frame — the fd-tail
+        // accounting class, 6-Z355: the fleet is the first fd-heavy client
+        // class to get past the open wall that 6-Z549 fixed).
+        static unsigned oversized_log = 0;
+        if (oversized_log < 8) {
+            oversized_log++;
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] binder proxy exchange: cmd=0x%08x response "
+                     "rlen=0x%08x ret=0x%08x exceeds cap (desync or giant parcel)\n",
+                     cmd, rlen, ret);
+            write_str(2, msg);
+        }
         for (uint32_t i = 0; i < rnfds; i++) syscall(NR_close, rfds[i]);
         free(rfds);
         errno = EPROTO;
