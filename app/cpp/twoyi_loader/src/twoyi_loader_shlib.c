@@ -3385,9 +3385,28 @@ static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
     }
 
     if (req == BP_IOC_VERSION_GUEST || req == BP_IOC_VERSION_ALT) {
-        // Both guest spellings -> the proxy's BINDER_VERSION arm (nr 9).
-        wire = BP_IOC_VERSION_GUEST;
-    } else if (req == BP_IOC_SET_MAX_THREADS) {
+        // 6-Z549: answer BINDER_VERSION LOCALLY — the protocol version is
+        // a FIXED constant of the wire spec (8), not information the proxy
+        // owns. rn533's media-fleet decode (pid 3763 / conn=114): the open
+        // handshake completed connect + IDENT (proxy VERSION → 8 handled at
+        // +84.726s), yet the VERSION ioctl failed client-side within 2 ms —
+        // libbinder closed the fd (the socket RST with the UNREAD response
+        // in the receive buffer), open_driver returned -1, and
+        // ProcessState FATALed "Binder driver '/dev/binder' could not be
+        // opened. Terminating." — ~280 media-fleet restart cycles per boot
+        // (vendor.media.omx x98 / mediaextractor x95 / media.swcodec x87).
+        // The VERSION round-trip was the ONLY wire step in that window, so
+        // answering locally removes it from the open path entirely — the
+        // same discipline the /dev/null fallback class already applies
+        // ("we keep faking BINDER_VERSION (-> 8)") and what the mmap
+        // hook's version probe expects. The proxy's VERSION arm stays for
+        // any peer that still asks over the wire.
+        if (argp) {
+            *(int32_t *)argp = (int32_t)8;  // BINDER_CURRENT_PROTOCOL_VERSION
+        }
+        return 0;
+    }
+    if (req == BP_IOC_SET_MAX_THREADS) {
         if (argp) { cookie = *(const uint32_t *)argp; req_payload = &cookie; req_len = 4; }
     } else if (req == BP_IOC_SET_CTX_MGR_GUEST || req == BP_IOC_SET_CTX_MGR_WIRE) {
         // becomeContextManager passes 0/NULL as the arg — never deref.
