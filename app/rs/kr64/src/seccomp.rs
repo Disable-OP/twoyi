@@ -709,10 +709,24 @@ pub fn build_filter() -> Vec<SockFilter> {
 ///   1: JEQ  AUDIT_ARCH_AARCH64   ; match -> insn 3 (continue), else -> ALLOW
 ///   2: RET  ALLOW                ; wrong arch (arm32 compat guests etc.)
 ///   3: LD   ABS  nr              ; seccomp_data.nr
-///   4..4+N: JEQ nr_i jt=(N-i) jf=0   ; match -> RET TRACE
-///   4+N:     RET  TRACE
-///   5+N:     RET  ALLOW
+///   4..4+N: JEQ nr_i jt=(N-1-i) jf=(last?1:0)
+///            match -> RET TRACE; the LAST JEQ's non-match falls into
+///            RET ALLOW (jf=1) — every other non-match falls through
+///            to the next JEQ.
+///   4+N:     RET  TRACE          ; reached ONLY by a matching JEQ
+///   5+N:     RET  ALLOW          ; reached by the last JEQ's non-match
 /// ```
+///
+/// 6-Z545 (the rn531 decode): the original chain emitted jf=0 on EVERY
+/// JEQ — the last JEQ's non-match fell through into RET TRACE, so the
+/// filter returned SECCOMP_RET_TRACE for EVERY syscall number: the
+/// "filter" traced everything (the pre-filter legacy rhythm, with the
+/// only gain being the per-ENTRY GET_SYSCALL_INFO saving), and the
+/// census showed the untraced-by-design families (gettid 178,
+/// epoll_pwait 22) in full E/X storms. The fix is exactly one bit:
+/// the last JEQ's jf=1 skips the RET TRACE into the RET ALLOW. The
+/// interpreter-based semantic test below now LOCKS the non-match
+/// fall-through for both the toy set and the production set.
 pub fn build_trace_filter(nrs: &[i64]) -> Vec<SockFilter> {
     let mut sorted: Vec<i64> = nrs.iter().copied().filter(|nr| *nr >= 0).collect();
     sorted.sort_unstable();
@@ -735,18 +749,28 @@ pub fn build_trace_filter(nrs: &[i64]) -> Vec<SockFilter> {
 
     prog.push(bpf_ld_abs(OFF_NR));
     let n = sorted.len();
+    if n == 0 {
+        // Degenerate empty trace set: trace NOTHING (ALLOW everything).
+        // The old fall-through would have returned RET TRACE for every
+        // nr here — the one degenerate case the last-JEQ fix cannot
+        // reach (there is no last JEQ).
+        prog.push(bpf_ret(SECCOMP_RET_ALLOW));
+        return prog;
+    }
     for (i, nr) in sorted.iter().enumerate() {
         // Matched: jump forward to the shared RET TRACE. BPF jt counts
-        // instructions skipped from the NEXT insn, so from JEQ#i the
-        // remaining JEQs (n-i-1 of them) plus the RET TRACE insn give
-        // jt = n-i-1... precisely: target_idx = i+1+jt must equal 4+n-1
-        // (the RET TRACE slot within this program, since the 3-instr
-        // arch prefix + 1 LD precede the chain), i.e. jt = (4+n-1)-(i+1)
-        // = n-i+2 relative to the absolute layout; relative to the
-        // chain start it is (n-1-i). The assertion test pins the
+        // instructions skipped from the NEXT insn, so from JEQ#i (at
+        // absolute index 4+i) the target must be the RET TRACE at 4+n:
+        // jt = (4+n) - (4+i+1) = n-1-i. The shape test pins the
         // absolute landing.
         let jt = (n - 1 - i) as u8;
-        prog.push(bpf_jeq(*nr as u32, jt, 0));
+        // 6-Z545 THE FIX: the LAST JEQ's non-match must SKIP the RET
+        // TRACE and land on the final RET ALLOW (jf=1). Every other
+        // JEQ chains its non-match to the next JEQ (jf=0). With jf=0
+        // on the last JEQ, EVERY non-member nr fell into RET TRACE —
+        // the filter traced every syscall in the guest.
+        let jf: u8 = if i + 1 == n { 1 } else { 0 };
+        prog.push(bpf_jeq(*nr as u32, jt, jf));
     }
     prog.push(bpf_ret(SECCOMP_RET_TRACE));
     prog.push(bpf_ret(SECCOMP_RET_ALLOW));
@@ -1213,14 +1237,22 @@ mod tests {
         assert_eq!(prog[3].k, OFF_NR);
         // The four JEQs (sorted, deduped, sentinel dropped) with their
         // forward jumps landing on the shared RET TRACE (the last insn
-        // before the final ALLOW).
+        // before the final ALLOW). 6-Z545: the LAST JEQ's jf is 1 — its
+        // non-match must SKIP the RET TRACE and land on the final RET
+        // ALLOW (the rn531 decode: jf=0 there traced EVERY syscall).
         let mut seen = std::collections::BTreeSet::new();
         for (i, insn) in prog[4..8].iter().enumerate() {
             assert_eq!(insn.code, BPF_JMP | BPF_JEQ | BPF_K);
             seen.insert(insn.k as i64);
-            // jt = remaining JEQs after this one = (4 - i - 1); jf = 0.
+            // jt = remaining JEQs after this one = (4 - i - 1).
             assert_eq!(insn.jt as usize, 4 - i - 1, "insn {i}: bad jt");
-            assert_eq!(insn.jf, 0);
+            // jf = 0 (chain to the next JEQ) EXCEPT on the LAST JEQ,
+            // where jf = 1 (skip RET TRACE into RET ALLOW).
+            assert_eq!(
+                insn.jf as usize,
+                if i + 1 == 4 { 1 } else { 0 },
+                "insn {i}: bad jf"
+            );
             // The jump target must be the RET TRACE instruction.
             let target = 4 + i + 1 + insn.jt as usize; // next insn + jt
             assert_eq!(target, 8, "insn {i}: JEQ must land on RET TRACE");
@@ -1228,6 +1260,200 @@ mod tests {
         assert_eq!(seen, [56i64, 57, 98, 172].into_iter().collect());
         assert_eq!(prog[8].k, SECCOMP_RET_TRACE);
         assert_eq!(prog[9].k, SECCOMP_RET_ALLOW);
+    }
+
+    // ── 6-Z545: the cBPF interpreter — the semantic lock the shape test
+    // couldn't give ─────────────────────────────────────────────────
+    //
+    // The rn531 decode found the filter returning RET_TRACE for EVERY
+    // nr (the last JEQ's jf=0 fell through into RET TRACE) while the
+    // shape test stayed green — it pinned the MATCH-path landing but
+    // never walked the NON-match fall-through. This interpreter
+    // evaluates the program exactly like the kernel's classic-BPF
+    // filter evaluator (LD|W|ABS loads u32 LE from the seccomp_data
+    // buffer; JEQ jumps jt/jf instructions from the NEXT insn; RET
+    // returns k) and pins the verdict per probe nr.
+    fn bpf_eval_trace_filter(prog: &[SockFilter], nr: u32, arch: u32) -> u32 {
+        // seccomp_data layout: int nr; __u32 arch; __u64 ip; __u64 args[6].
+        let mut data = [0u8; 16];
+        data[0..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        let mut pc = 0usize;
+        let mut acc: u32 = 0;
+        loop {
+            let insn = &prog[pc];
+            let code = insn.code;
+            if code == BPF_LD | BPF_W | BPF_ABS {
+                let off = insn.k as usize;
+                assert!(off + 4 <= data.len(), "LD ABS out of range: {off}");
+                acc = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+                pc += 1;
+            } else if code == BPF_JMP | BPF_JEQ | BPF_K {
+                pc += if acc == insn.k {
+                    1 + insn.jt as usize
+                } else {
+                    1 + insn.jf as usize
+                };
+            } else if code == BPF_RET | BPF_K {
+                return insn.k;
+            } else {
+                panic!("interpreter: unsupported insn code {code:#x} at pc={pc}");
+            }
+        }
+    }
+
+    // AUDIT_ARCH_ARM (EM_ARM | __AUDIT_ARCH_32BIT) — the arm32-compat
+    // guest arch the trace filter must ALLOW wholesale (legacy mode).
+    const AUDIT_ARCH_ARM32_PROBE: u32 = 0x4000_0028;
+
+    #[test]
+    fn z545_trace_filter_nonmember_falls_to_allow() {
+        // Toy set (same four members as the shape test).
+        let nrs = vec![98i64, 56, 57, 172, -1];
+        let prog = build_trace_filter(&nrs);
+        // Every member -> TRACE (first, middle, last members — the
+        // last member's MATCH path must still reach RET TRACE with
+        // jt=0, and its NON-match path must reach ALLOW).
+        for nr in [56u32, 57, 98, 172] {
+            assert_eq!(
+                bpf_eval_trace_filter(&prog, nr, AUDIT_ARCH_EXPECTED),
+                SECCOMP_RET_TRACE,
+                "member nr={nr} must TRACE"
+            );
+        }
+        // Non-members — the untraced-by-design families plus both
+        // numeric neighbors of the sorted chain's edges (55/58 around
+        // 56/57; 171/173 around 172; 97/99 around 98) — must ALLOW.
+        for nr in [
+            22u32, 55, 58, 65, 96, 97, 99, 100, 113, 124, 171, 173, 178, 278, 435,
+        ] {
+            assert_eq!(
+                bpf_eval_trace_filter(&prog, nr, AUDIT_ARCH_EXPECTED),
+                SECCOMP_RET_ALLOW,
+                "non-member nr={nr} must ALLOW (6-Z545: no silent RET_TRACE fall-through)"
+            );
+        }
+        // Wrong arch (an arm32-compat guest) -> ALLOW on EVERY probe,
+        // members included (the legacy full-trace fallback).
+        for nr in [56u32, 178] {
+            assert_eq!(
+                bpf_eval_trace_filter(&prog, nr, AUDIT_ARCH_ARM32_PROBE),
+                SECCOMP_RET_ALLOW,
+                "wrong-arch nr={nr} must ALLOW"
+            );
+        }
+    }
+
+    #[test]
+    fn z545_trace_filter_production_set_semantics() {
+        // The PRODUCTION trace set, walked by the interpreter: every
+        // aarch64 member must TRACE; the storm families the census
+        // caught in rn530/531 (gettid 178 ×59k pairs, epoll_pwait 22,
+        // clock_gettime 113, nanosleep 101, set_tid_address 96,
+        // set_robust_list 99/100, sched_yield 124, clock_nanosleep 115,
+        // getrandom 278, lseek 62, readv 65) must ALLOW — they are the
+        // whole point of the filter.
+        //
+        // cfg(aarch64): z543_trace_nrs() (ABI_AARCH64) only exists on
+        // the aarch64 build — the arm CI boot-ladder runs this test;
+        // the x86_64 CI runs the mechanism variant below (the SAME
+        // lesson as the cfg(aarch64) E0133 trap: keep the aarch64-only
+        // surface minimal and mirror the mechanism on x86).
+        #[cfg(target_arch = "aarch64")]
+        {
+            let nrs = crate::ptrace_emu::z543_trace_nrs();
+            assert!(!nrs.is_empty());
+            let prog = build_trace_filter(&nrs);
+            for nr in [
+                56u32, // openat
+                57,    // close
+                63,    // read
+                64,    // write
+                66,    // writev
+                29,    // ioctl
+                98,    // futex (literal)
+                202,   // (literal)
+                436,   // close_range (literal)
+                164,   // setrlimit (literal)
+                449,   // futex_waitv (literal)
+                172,   // getpid (traced by design: the 6-Z147/6-Z381 arms)
+                242,   // accept4
+                203,   // connect
+                221,   // execve
+                220,   // clone
+                94,    // exit_group
+                260,   // wait4
+                452,   // fchmodat2
+                437,   // openat2
+            ] {
+                assert_eq!(
+                    bpf_eval_trace_filter(&prog, nr, AUDIT_ARCH_EXPECTED),
+                    SECCOMP_RET_TRACE,
+                    "production member nr={nr} must TRACE"
+                );
+            }
+            for nr in [
+                22u32, // epoll_pwait
+                62,    // lseek
+                65,    // readv
+                96,    // set_tid_address
+                99,    // set_robust_list
+                100,   // get_robust_list
+                101,   // nanosleep
+                113,   // clock_gettime
+                115,   // clock_nanosleep
+                124,   // sched_yield
+                178,   // gettid (rn531: 59k traced E/X pairs under the bug)
+                278,   // getrandom
+                438,   // between close_range(436)/openat2(437) and faccessat2(439)
+                448,   // next to futex_waitv(449)
+                450,   // past the literal block
+            ] {
+                assert_eq!(
+                    bpf_eval_trace_filter(&prog, nr, AUDIT_ARCH_EXPECTED),
+                    SECCOMP_RET_ALLOW,
+                    "untraced-by-design nr={nr} must ALLOW (6-Z545)"
+                );
+            }
+        }
+
+        // The x86_64 mechanism variant: same interpreter, a literal
+        // x86_64 member set — the NON-match fall-through semantics are
+        // arch-independent, so the x86 CI keeps exercising the class
+        // of bug the aarch64-only test cannot reach there.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let prog = build_trace_filter(&[0i64, 1, 257, 29, 436]); // read/write/openat/ioctl/close_range
+            for nr in [0u32, 1, 29, 257, 436] {
+                assert_eq!(
+                    bpf_eval_trace_filter(&prog, nr, AUDIT_ARCH_EXPECTED),
+                    SECCOMP_RET_TRACE,
+                    "x86 mechanism member nr={nr} must TRACE"
+                );
+            }
+            for nr in [178u32, 22, 113, 435, 437] {
+                assert_eq!(
+                    bpf_eval_trace_filter(&prog, nr, AUDIT_ARCH_EXPECTED),
+                    SECCOMP_RET_ALLOW,
+                    "x86 mechanism non-member nr={nr} must ALLOW"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn z545_trace_filter_empty_set_allows_everything() {
+        // Degenerate empty set: trace NOTHING. (The old fall-through
+        // would have returned RET TRACE for every nr here too.)
+        let prog = build_trace_filter(&[]);
+        assert_eq!(prog.len(), 3 + 1 + 1);
+        for nr in [0u32, 63, 178, 9999] {
+            assert_eq!(
+                bpf_eval_trace_filter(&prog, nr, AUDIT_ARCH_EXPECTED),
+                SECCOMP_RET_ALLOW,
+                "empty set: nr={nr} must ALLOW"
+            );
+        }
     }
 
     #[test]
