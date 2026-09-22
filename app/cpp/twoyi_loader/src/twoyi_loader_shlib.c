@@ -3301,7 +3301,7 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
                 snprintf(msg, sizeof(msg),
                          "[twoyi_loader] binder proxy exchange: cmd=0x%08x "
                          "out-of-range ret=%d rlen=0x%08x -> EPROTO (6-Z552)\n",
-                         cmd, ret, rlen);
+                         (int)BP_IOC_WRITE_READ, ret, rlen);
                 write_str(2, msg);
             }
         }
@@ -3322,7 +3322,7 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
             snprintf(msg, sizeof(msg),
                      "[twoyi_loader] binder proxy exchange: cmd=0x%08x ret=0 "
                      "rlen=%u < 4 -> EPROTO (misframed stream, 6-Z552)\n",
-                     cmd, rlen);
+                     (int)BP_IOC_WRITE_READ, rlen);
             write_str(2, msg);
         }
         free(resp);
@@ -3342,7 +3342,7 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
                      "[twoyi_loader] binder proxy exchange: cmd=0x%08x ret=0 "
                      "rlen=%u srv_read=%u (4+srv_read>rlen) -> EPROTO "
                      "(misframed stream, 6-Z552)\n",
-                     cmd, rlen, srv_read);
+                     (int)BP_IOC_WRITE_READ, rlen, srv_read);
             write_str(2, msg);
         }
         free(resp);
