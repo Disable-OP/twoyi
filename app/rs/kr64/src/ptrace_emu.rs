@@ -13663,41 +13663,82 @@ fn z540_stdio_sentinel_check(pid: libc::pid_t, site: &str) {
     }
 }
 
-/// 6-Z540: flush the Z483/Z486 fd-op rings for a parked process — the
+/// 6-Z540: flush the Z483/Z486 fd-op rings for a parked PROCESS — the
 /// wall-park verdict site's one-shot. Same shape as the 6-Z305t-14b
-/// STALL-FD flush (rare ring first — it never rotates), keyed by TGID,
-/// once per process per run.
-fn z540_flush_fdop_rings(tgid: libc::pid_t) {
+/// STALL-FD flush, but the rings are keyed by the RECORDING THREAD's
+/// pid (every syscalling thread of the floored process records under
+/// its own tid), so the sweep resolves each key's TGID and flushes
+/// every ring that belongs to the parked process's thread group —
+/// the rn523 lesson: the verdict fires for a THREAD (4786) while the
+/// vector evidence sat in the main thread's ring (4496).
+fn z540_flush_fdop_rings(pid: libc::pid_t) {
+    // Resolve the parked pid's own tgid first (the flush guard key).
+    let want_tgid = std::fs::read_to_string(format!("/proc/{}/status", pid))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Tgid:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<libc::pid_t>().ok())
+        })
+        .or(Some(pid));
+    let want_tgid = match want_tgid {
+        Some(t) => t,
+        None => return,
+    };
     {
         let mut flushed = Z540_FLUSHED.lock().unwrap_or_else(|e| e.into_inner());
-        if !flushed.insert(tgid) {
+        if !flushed.insert(want_tgid) {
             return;
         }
     }
+    // The tgid resolver for the ring keys — a dead key resolves to None
+    // and is flushed only if it IS the wanted tgid (the main thread's
+    // own key).
+    let ring_tgid = |ring_pid: libc::pid_t| -> Option<libc::pid_t> {
+        std::fs::read_to_string(format!("/proc/{}/status", ring_pid))
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Tgid:"))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse::<libc::pid_t>().ok())
+            })
+            .or(if ring_pid == want_tgid {
+                Some(ring_pid)
+            } else {
+                None
+            })
+            .filter(|t| *t == want_tgid)
+    };
+    let flush_one = |name: &str, ring: &std::collections::VecDeque<(u64, &'static str, String)>| {
+        if ring.is_empty() {
+            return;
+        }
+        crate::trace_log_line(&format!(
+            "6-Z540/{}: fd-op ring pid={} ({} entries, oldest->newest):",
+            name,
+            pid,
+            ring.len()
+        ));
+        for (seq, op, desc) in ring.iter() {
+            crate::trace_log_line(&format!("6-Z540/{}:   #{:06} {} {}", name, seq, op, desc));
+        }
+    };
     if let Ok(mut z483_rare_map) = Z483_RARE.lock() {
-        if let Some(ring) = z483_rare_map.remove(&tgid) {
-            if !ring.is_empty() {
-                crate::trace_log_line(&format!(
-                    "6-Z540/Z486: rare fd-op ring pid={} ({} entries, oldest->newest):",
-                    tgid,
-                    ring.len()
-                ));
-                for (seq, name, desc) in ring.iter() {
-                    crate::trace_log_line(&format!("6-Z540/Z486:   #{:06} {} {}", seq, name, desc));
+        let keys: Vec<libc::pid_t> = z483_rare_map.keys().copied().collect();
+        for ring_pid in keys {
+            if ring_tgid(ring_pid).is_some() {
+                if let Some(ring) = z483_rare_map.remove(&ring_pid) {
+                    flush_one("Z486-rare", &ring);
                 }
             }
         }
     }
     if let Ok(mut z483_map) = Z483_FDOPS.lock() {
-        if let Some(ring) = z483_map.remove(&tgid) {
-            if !ring.is_empty() {
-                crate::trace_log_line(&format!(
-                    "6-Z540/Z483: fd-op ring pid={} ({} entries, oldest->newest):",
-                    tgid,
-                    ring.len()
-                ));
-                for (seq, name, desc) in ring.iter() {
-                    crate::trace_log_line(&format!("6-Z540/Z483:   #{:06} {} {}", seq, name, desc));
+        let keys: Vec<libc::pid_t> = z483_map.keys().copied().collect();
+        for ring_pid in keys {
+            if ring_tgid(ring_pid).is_some() {
+                if let Some(ring) = z483_map.remove(&ring_pid) {
+                    flush_one("Z483", &ring);
                 }
             }
         }
