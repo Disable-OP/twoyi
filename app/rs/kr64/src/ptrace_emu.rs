@@ -9772,6 +9772,59 @@ fn forget_dead_pid_state(
     pending_getpeersec.remove(&pid);
 }
 
+/// 6-Z538: the property-client fd RECYCLE GUARD — the ROOT-CAUSE fix for
+/// the rn510-rn519 rung-3 kptr wall.
+///
+/// # The bug it closes (fully decoded from rn519's artifacts)
+///
+/// The 6-Z110/6-Z530 property-client tracking is keyed (pid, fd). When
+/// the guest's property client gives up (its reads are EOF-faked) it
+/// closes the fd — and the tracked-set removal happens in the
+/// PropServOp::Close arm, which recovers the fd from the per-pid
+/// `pending_entry_fd` ENTRY-stash. init is MULTI-THREADED: another
+/// thread's syscall ENTRY overwrites the ONE-slot-per-pid stash between
+/// the close's ENTRY and EXIT, the arm removes the WRONG fd, and the
+/// closed descriptor's number stays tracked.
+///
+/// The kernel then hands the SAME fd number to the next open — rn519:
+/// init's `SetHighestAvailableOptionValue` ifstream opened
+/// /proc/sys/kernel/kptr_restrict and got the still-tracked fd 16. The
+/// tracked-fd arms then faked the VERIFY READ: `6-Z110: property-client
+/// fd 16: Read returned 2 — faked to 0 (EOF)` — the journal captured the
+/// REAL syscall (ret=2, "4\n") but the CHILD received 0 bytes; the C++
+/// stream set eofbit+failbit, `str_rec` stayed empty, the compare never
+/// matched, the loop exhausted 4→3→2 (the iters 3/2 verifies issue NO
+/// syscalls — the failed-stream sentry blocks them, which is exactly the
+/// "libc++ streambuf divergence" the journals observed), and
+/// SetKptrRestrict LOG(FATAL)ed into InitFatalReboot at rung 3.
+/// rn508/509 passed the same loop because the property fd landed on a
+/// DIFFERENT descriptor number (no collision — the per-boot "flip" was
+/// fd-allocation luck); 6-Z530 (rn510) fixed the property client's
+/// lifecycle into a shape that collides SYSTEMATICALLY.
+///
+/// # The guard
+///
+/// The kernel NEVER hands out a fd number that is still open — so a
+/// successful open-family EXIT returning a fd that is still in the
+/// tracked set PROVES the tracking is stale. Drop it (and the 6-Z533
+/// ack-arm for the same fd, at the call site). This heals the registry
+/// no matter WHY the close-untrack missed, before the recycled fd's
+/// first read can be faked. (6-Z537's init binary patch stays as the
+/// independent belt-and-braces sidestep.)
+///
+/// Pure (no ptrace, no globals) so the test can construct a fake state,
+/// simulate the missed untrack + the recycle, and assert the drop —
+/// locking the contract independently of the ptrace loop plumbing.
+fn z538_drop_stale_prop_serv_fd(
+    fake_propserv_fds: &mut std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
+    pid: libc::pid_t,
+    new_fd: i64,
+) -> bool {
+    fake_propserv_fds
+        .get_mut(&pid)
+        .map_or(false, |s| s.remove(&new_fd))
+}
+
 /// Task 6-Z111: drop the dead pid's property-area registrations. The
 /// `property_area_fds` (per-(pid, fd) HashSet) is RETAINED entry-by-
 /// entry: only the dead pid's (pid, *) pairs are removed (the fd
@@ -41132,6 +41185,36 @@ pub fn run_ptrace_loop(
                         || syscall_num == abi.openat2
                     {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // ── 6-Z538: the property-fd RECYCLE GUARD ──
+                        //
+                        // The kernel never hands out a fd number that is
+                        // still open: a successful open returning an fd
+                        // that is STILL in the 6-Z110/6-Z530 tracked set
+                        // proves the tracking is stale (the close-arm's
+                        // per-pid ENTRY-stash lost the multi-threaded
+                        // race). Drop it BEFORE the recycled fd's first
+                        // read can be EOF-faked (the rn510-519 kptr wall:
+                        // the kptr ifstream's fd 16 verify read was faked
+                        // to EOF — `6-Z110: property-client fd 16: Read
+                        // returned 2 — faked to 0` at +2103 ms in rn519).
+                        // The 6-Z533 ack-arm dies with the tracking.
+                        if ret >= 0
+                            && z538_drop_stale_prop_serv_fd(&mut fake_propserv_fds, pid, ret as i64)
+                        {
+                            z110_ack_pending_set()
+                                .get_mut(&pid)
+                                .map(|s| s.remove(&(ret as i64)));
+                            static Z538_RECYCLE_LOG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let n =
+                                Z538_RECYCLE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 8 {
+                                log(&format!(
+                                    "6-Z538: RECYCLE GUARD pid={} fd={} — a fresh open handed out a fd still in the property-client tracking; the stale tracking (+ any armed ack) is DROPPED — the fd's I/O is the child's own file traffic again",
+                                    pid, ret
+                                ));
+                            }
+                        }
                         let orig = pending_open_original_path
                             .get(&pid)
                             .cloned()
@@ -59597,6 +59680,79 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         // are > 10^9, comfortably above any real kernel fd.
         assert!((NETLINK_FAKE_FD_BASE as i64) > 1_000_000i64);
         assert!((SYNTHETIC_FD_BASE as i64) > 1_000_000i64);
+    }
+
+    // ── 6-Z538: the property-fd RECYCLE GUARD ───────────────────────
+    #[test]
+    fn z538_recycle_guard_drops_stale_tracking() {
+        // THE rn519 SCENARIO, as a unit test: the property client's fd
+        // 16 was tracked; its close-untrack LOST the per-pid ENTRY-stash
+        // race (simulated here by NOT removing the entry — the bug);
+        // the kernel handed fd 16 to the kptr ifstream's open; the
+        // guard must drop the stale tracking so the verify read is the
+        // child's own file I/O again.
+        let pid: libc::pid_t = 2785;
+        let mut fake_propserv_fds: std::collections::HashMap<
+            libc::pid_t,
+            std::collections::HashSet<i64>,
+        > = std::collections::HashMap::new();
+        fake_propserv_fds.entry(pid).or_default().insert(16);
+
+        // A successful open returning the STILL-TRACKED fd 16 → dropped.
+        assert!(z538_drop_stale_prop_serv_fd(
+            &mut fake_propserv_fds,
+            pid,
+            16
+        ));
+        // The arms can never fire on it again.
+        assert!(!fake_propserv_fds
+            .get(&pid)
+            .map_or(false, |s| s.contains(&16)));
+
+        // An untracked fd's open → no-op (returns false).
+        assert!(!z538_drop_stale_prop_serv_fd(
+            &mut fake_propserv_fds,
+            pid,
+            17
+        ));
+
+        // Other pids' tracking is untouched by this pid's guard.
+        let other: libc::pid_t = 2810;
+        fake_propserv_fds.entry(other).or_default().insert(16);
+        assert!(z538_drop_stale_prop_serv_fd(
+            &mut fake_propserv_fds,
+            other,
+            16
+        ));
+        assert!(!fake_propserv_fds
+            .get(&pid)
+            .map_or(true, |s| s.contains(&16)));
+        assert!(fake_propserv_fds.get(&pid).map_or(true, |s| s.is_empty()));
+    }
+
+    #[test]
+    fn z538_recycle_guard_is_idempotent_and_pid_scoped() {
+        // Double-drop: the second call is a no-op false.
+        let pid: libc::pid_t = 42;
+        let mut fake_propserv_fds: std::collections::HashMap<
+            libc::pid_t,
+            std::collections::HashSet<i64>,
+        > = std::collections::HashMap::new();
+        fake_propserv_fds.entry(pid).or_default().insert(7);
+        assert!(z538_drop_stale_prop_serv_fd(&mut fake_propserv_fds, pid, 7));
+        assert!(!z538_drop_stale_prop_serv_fd(
+            &mut fake_propserv_fds,
+            pid,
+            7
+        ));
+        // A pid with NO tracking at all → false (the common path stays
+        // free — every open pays only a map lookup).
+        let bare: libc::pid_t = 43;
+        assert!(!z538_drop_stale_prop_serv_fd(
+            &mut fake_propserv_fds,
+            bare,
+            7
+        ));
     }
 
     // ── Task 6-Z101: staged-exe map guards ─────────────────────────
