@@ -33500,3 +33500,17 @@ Work Log:
 
 Stage Summary:
 - Decode agenda for rn541: 6-Z551 regs → the strlen(NULL) arg; 6-Z552 → the -71 branch; 6-Z553 → the z546 phase verdict.
+
+---
+Task ID: 1 (update 19 — session 271 cont.: rn541 (#541) DECODED = RECOVERY (no init crash, band-best milestones, system_server ALIVE at +246s); the -71 churn's dumps were /dev/null-silent → 6-Z557 klog channel; rn542 dispatched)
+Agent: Z.ai Code (main implementation agent, session 271)
+
+Work Log:
+- rn541 (run 35794174228, 4ea41487): **RECOVERY** — the rn537 init strlen(NULL) did NOT recur (intermittent). Milestones: early_hal +9.7s, **zygote +19.6s (best ever; band 20.4-21.6)**, class_start hal +42.7s, SF +45.1s (band best), class_start main COMPLETED +97.3s (+a second +135.0s), bootanim +98.2s, **system_server (4870) ALIVE and executing syscalls at +246s**. No InitFatalReboot, no restart.
+- THE -71 CHURN PERSISTS (174× fd=5 + 7× fd=6 aborts, 301 service exit lines; mediaextractor/omx killed at +913.9s) — and the 6-Z552/6-Z549 dumps appeared NOWHERE in ANY collected artifact: **fd 2 is /dev/null for the fleet guest services** (init service stdio; the 6-Z328 lesson named the guest klog as the only always-visible channel for exactly this class).
+- 6-Z557 LANDED (cd046fa0): all four binder dumps (the 6-Z549 rlen>cap + the three 6-Z552 silent-EPROTO branches) now ALSO write bp_klog_write_raw (/dev/__kmsg__ → the collected dev-__kmsg__ mirror). Syntax-parity gate green (zero new gcc errors vs baseline). Gates 1145/1145.
+- No 6-Z544 spin occurrence in rn541 (intermittent); 6-Z546 unexercised.
+- rn542 DISPATCHED (run 35797192962, #542, cd046fa0, boot_wait_seconds=900, single-flight).
+
+Stage Summary:
+- rn542 decode agenda: the klog-channel dump names the -71 branch (out-of-range ret vs rlen<4 vs srv_read>rlen) → THE fleet fix; milestone variance; the init crash recurrence watch (6-Z551).
