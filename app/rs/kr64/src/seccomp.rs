@@ -1348,11 +1348,16 @@ mod tests {
     fn z545_trace_filter_production_set_semantics() {
         // The PRODUCTION trace set, walked by the interpreter: every
         // aarch64 member must TRACE; the storm families the census
-        // caught in rn530/531 (gettid 178 ×59k pairs, epoll_pwait 22,
-        // clock_gettime 113, nanosleep 101, set_tid_address 96,
-        // set_robust_list 99/100, sched_yield 124, clock_nanosleep 115,
-        // getrandom 278, lseek 62, readv 65) must ALLOW — they are the
-        // whole point of the filter.
+        // caught in rn530/531 (gettid 178 ×59k pairs, clock_gettime 113,
+        // nanosleep 101, set_tid_address 96, set_robust_list 99/100,
+        // sched_yield 124, clock_nanosleep 115, getrandom 278, lseek 62,
+        // readv 65) must ALLOW — they are the whole point of the filter.
+        //
+        // 6-Z548 (rn532 decode): epoll_ctl 21 / epoll_pwait 22 moved from
+        // the ALLOW list back to the TRACE list — they are LOAD-BEARING
+        // (the 6-Z305t-62 PSI epoll_ctl fake + the EPOLLPRI result
+        // filter); untraced, the raw kernel EPERM on the .twoyi-psi
+        // regular-file fd killed lmkd 4x and the boot ended at rung 4.
         //
         // cfg(aarch64): z543_trace_nrs() (ABI_AARCH64) only exists on
         // the aarch64 build — the arm CI boot-ladder runs this test;
@@ -1385,6 +1390,8 @@ mod tests {
                 260,   // wait4
                 452,   // fchmodat2
                 437,   // openat2
+                21,    // epoll_ctl (6-Z548: load-bearing PSI fake)
+                22,    // epoll_pwait (6-Z548: load-bearing EPOLLPRI filter)
             ] {
                 assert_eq!(
                     bpf_eval_trace_filter(&prog, nr, AUDIT_ARCH_EXPECTED),
@@ -1393,8 +1400,7 @@ mod tests {
                 );
             }
             for nr in [
-                22u32, // epoll_pwait
-                62,    // lseek
+                62u32, // lseek
                 65,    // readv
                 96,    // set_tid_address
                 99,    // set_robust_list

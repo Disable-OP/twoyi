@@ -21063,16 +21063,35 @@ pub(crate) const Z543_PTRACE_O_TRACESECCOMP: libc::c_int = 0x0000_0080;
 ///      - 202  futex_time64  (the time64 spelling, 5.10+ arm64 kernels)
 ///      - 449  futex_waitv   (defensive: the waited-multiple variant)
 ///
+/// 6-Z548 (rn532 decode) — 21 epoll_ctl and 22 epoll_pwait JOIN this
+/// literal list. The 6-Z545 fix exposed them as LOAD-BEARING, not
+/// storm-freight: libpsi's trigger-registration fd is backed by a
+/// REGULAR file (the .twoyi-psi rootfs file), the real kernel refuses
+/// `epoll_ctl(ADD, psi_fd)` with EPERM, and the 6-Z305t-62 arm fakes
+/// that epoll_ctl to 0 + filters EPOLLPRI entries out of the
+/// epoll_pwait result (the comment there literally names the failure:
+/// "[glog V/libpsi] epoll_ctl for psi monitor failed; errno=1" and
+/// "an lmkd kill-storm"). rn532 — the FIRST boot with a working filter
+/// — untraced 21/22: the EPERM leaked raw into every daemon's libpsi,
+/// lmkd exited 0 (mainloop's epoll_pwait-failed path) ~1.4 s after
+/// every start, died 4x as a critical process, and init's
+/// InitFatalReboot ended the boot at rung 4 (vs rn531's rung 7). The
+/// untraced-frees list below keeps the HOT natives (gettid/getuid/
+/// clock/nanosleep/yield/madvise/brk/getrandom/rt_sigaction/prlimit64/
+/// membarrier/sched_getaffinity) — those have no handler arms and
+/// their native execution is identical to their traced execution.
+///
 /// Deliberately NOT traced (the rn528 census's hot natives — the point
 /// of the filter): gettid (178), getuid/getgid/geteuid/getegid
-/// (174-177), epoll_ctl (21), epoll_pwait (22), clock_gettime (113),
-/// clock_nanosleep (115), nanosleep (101), sched_yield (124), madvise
-/// (233), brk (214), getrandom (278), rt_sigaction (134), prlimit64
-/// (261), membarrier (283), sched_getaffinity (123), and every other
-/// number with no handler arm. The 6-Z451 munmap census (215/91) and
-/// the 6-Z428d epoll-pwait tombstoned census (21/22) go quiet under
-/// the filter — both are completed rn-era investigations, and the
-/// arms remain in place for the legacy mode (KR64_TRACE_FILTER=0).
+/// (174-177), clock_gettime (113), clock_nanosleep (115), nanosleep
+/// (101), sched_yield (124), madvise (233), brk (214), getrandom
+/// (278), rt_sigaction (134), prlimit64 (261), membarrier (283),
+/// sched_getaffinity (123), and every other number with no handler
+/// arm. The 6-Z451 munmap census (215/91) and the 6-Z428d
+/// epoll-pwait tombstoned census (22 — now re-traced by 6-Z548 and
+/// live again) — the latter's tombstoned evidence resumes; the former
+/// stays quiet under the filter, and the arms remain in place for the
+/// legacy mode (KR64_TRACE_FILTER=0).
 /// Module-private: `ChildAbi` is private, so this fn must be too; the
 /// `allow(dead_code)` covers x86_64 non-test builds where only the
 /// cfg-gated aarch64 wrapper (and the x86_64 test) would use it.
@@ -21214,8 +21233,10 @@ pub(crate) fn z543_trace_nrs() -> Vec<i64> {
         &ABI_AARCH64,
         // The literal arms that are NOT ChildAbi fields (see the doc
         // above): close_range, setrlimit (aarch64), futex,
-        // futex_time64, futex_waitv.
-        &[436, 164, 98, 202, 449],
+        // futex_time64, futex_waitv — and, since 6-Z548 (rn532 decode:
+        // the lmkd rung-4 death), epoll_ctl + epoll_pwait, whose
+        // 6-Z305t-62 PSI fake/EPOLLPRI filter are load-bearing.
+        &[436, 164, 98, 202, 449, 21, 22],
     )
 }
 
@@ -53343,7 +53364,7 @@ mod tests {
         }
         assert!(checked >= 100, "suspiciously few fields checked: {checked}");
         // The literal arms that are NOT ChildAbi fields.
-        for nr in [436i64, 164, 98, 202, 449] {
+        for nr in [436i64, 164, 98, 202, 449, 21, 22] {
             assert!(
                 list.contains(&nr),
                 "literal arm nr {nr} missing from the trace set"
@@ -53351,10 +53372,14 @@ mod tests {
         }
         // The hot natives the filter exists to FREE must NOT be traced
         // (a future edit that re-adds them silently undoes the campaign).
-        for nr in [178i64, 174, 21, 22, 113, 101, 124, 233, 214] {
+        // NOTE: 21/22 (epoll_ctl/epoll_pwait) left this list at 6-Z548 —
+        // they are load-bearing (the 6-Z305t-62 PSI epoll_ctl fake + the
+        // EPOLLPRI result filter), not storm-freight; rn532's lmkd
+        // death-chain proved it.
+        for nr in [178i64, 174, 113, 101, 124, 233, 214] {
             assert!(
                 !list.contains(&nr),
-                "nr {nr} (gettid/getuid/epoll/clock/nanosleep/yield/madvise/brk family) must stay UNTRACED by the 6-Z543 filter"
+                "nr {nr} (gettid/getuid/clock/nanosleep/yield/madvise/brk family) must stay UNTRACED by the 6-Z543 filter"
             );
         }
     }
