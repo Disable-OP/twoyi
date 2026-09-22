@@ -2750,6 +2750,24 @@ pub struct BusState {
     /// set itself is the per-PID dedup (one arm per pid per hold epoch);
     /// a pid re-arms on the NEXT hold after its spawn fired.
     z502_spawn_armed_pids: std::collections::HashSet<i32>,
+    /// 6-Z547: the idle-wake channel. A pure-read `BINDER_WRITE_READ` that
+    /// finds no work used to sleep the FULL [`IDLE_POLL_TICK`] (250 ms)
+    /// unconditionally — so every transaction queued during the sleep
+    /// waited ~125 ms (average) for its delivery even though the target
+    /// connection was parked doing nothing. The kernel analogue wakes the
+    /// waiting thread the moment work lands (`binder_wait_for_work`).
+    /// `z547_idle_wake` is notified by EVERY inbox push (Tx via
+    /// [`BusState::queue_transaction`], Death via the connection-death
+    /// cleanup); the waiter loops on `wait_timeout` against a DEADLINE of
+    /// `now + IDLE_POLL_TICK`, so a wake for a DIFFERENT connection (one
+    /// shared channel — no per-conn condvar registry to grow) re-parks for
+    /// the REMAINDER and the 6-Z152 anti-pinning ceiling (an idle read
+    /// returns BR_NOOP after at most one tick) is preserved exactly. The
+    /// gate mutex guards no state — it exists only because
+    /// `Condvar::wait_timeout` requires a guard to release while waiting.
+    z547_idle_wake: std::sync::Arc<std::sync::Condvar>,
+    /// 6-Z547: the wakeup gate (see [`BusState::z547_idle_wake`]).
+    z547_idle_gate: std::sync::Arc<std::sync::Mutex<()>>,
     /// 6-Z502: the hold-existence budget — the spawn cap per run (the
     /// bus lives one boot). A spawn only fires while a hold EXISTS (the
     /// arm), and at most this many fire per run; past the cap the arm
@@ -2875,6 +2893,8 @@ impl BusState {
             next_txn: 1,
             z502_spawn_armed_pids: std::collections::HashSet::new(),
             z502_spawn_budget: Z502_SPAWN_BUDGET_DEFAULT,
+            z547_idle_wake: std::sync::Arc::new(std::sync::Condvar::new()),
+            z547_idle_gate: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         bus.ensure_virtual_services();
         bus
@@ -3340,6 +3360,8 @@ impl BusState {
                     wb.inbox.push_back(InboxItem::Death(cookie));
                 }
             }
+            // 6-Z547: death notifications also wake parked readers.
+            self.z547_notify();
         }
         // 6-Z299: names the dying connection had TAKEN OVER from the
         // platform restore to the in-proxy virtual implementation under
@@ -3378,6 +3400,8 @@ impl BusState {
                     wb.inbox.push_back(InboxItem::Death(cookie));
                 }
             }
+            // 6-Z547: death notifications also wake parked readers.
+            self.z547_notify();
         }
         // 6-Z276: a dying connection's registerForNotifications watchers
         // are gone with it — no callback may target a dead conn's mailbox.
@@ -3418,6 +3442,8 @@ impl BusState {
                         wb.inbox.push_back(InboxItem::Death(wcookie));
                     }
                 }
+                // 6-Z547: node-death notifications also wake parked readers.
+                self.z547_notify();
             }
             // Drop this conn's refs on OTHER conns' nodes (may mirror
             // releases to live owners).
@@ -3631,10 +3657,18 @@ impl BusState {
         true
     }
 
+    /// 6-Z547: wake every parked pure-read wait after an inbox push. Cheap
+    /// when nobody waits (`Condvar::notify_all` on an empty waiter set is a
+    /// no-op); when a conn IS parked, its deadline loop re-drains its own
+    /// inbox immediately instead of at the next 250 ms tick.
+    fn z547_notify(&self) {
+        self.z547_idle_wake.notify_all();
+    }
+
     /// Route a transaction to its owner's mailbox. Returns false when the
     /// owner is gone or its mailbox is full.
     fn queue_transaction(&mut self, tx: IncomingTx, owner: ConnId) -> bool {
-        match self.conns.get_mut(&owner) {
+        let queued = match self.conns.get_mut(&owner) {
             Some(b) if b.inbox.len() < MAX_QUEUED_ITEMS => {
                 if tx.txn_id != 0 {
                     b.pending_in.push(tx.txn_id);
@@ -3651,7 +3685,13 @@ impl BusState {
                 true
             }
             _ => false,
+        };
+        if queued {
+            // 6-Z547: the parked owner (if any) wakes NOW instead of at the
+            // next idle tick. Outside the `conns` mutable borrow.
+            self.z547_notify();
         }
+        queued
     }
 
     // ── 6-Z359: kernel-true node handles + refcount mirroring ───────────
@@ -7035,10 +7075,60 @@ fn handle_write_read(
                     push_br_dead_binder(&mut read_buf, cookie);
                 }
                 Delivery::None => {
-                    // 6-Z152: BLOCKING idle — sleep before BR_NOOP so a
+                    // 6-Z152: BLOCKING idle — park before BR_NOOP so a
                     // guest poll loop can't pin the tracer (see the 6-Z268
                     // analysis in the original comment history).
-                    std::thread::sleep(IDLE_POLL_TICK);
+                    //
+                    // 6-Z547: the park is now WAKEABLE. The v1 `sleep` made
+                    // every transaction queued during the tick wait ~125 ms
+                    // (average) for delivery even though the target conn was
+                    // parked — the rn363 SF display race and the composer
+                    // callback latencies both lived inside that window. The
+                    // wait loops against a DEADLINE of now+IDLE_POLL_TICK:
+                    // an OWN-inbox push (6-Z547 notify from
+                    // queue_transaction / the death cleanups) breaks out and
+                    // the 6-Z383 recheck below delivers immediately; a
+                    // FOREIGN connection's notify (one shared channel)
+                    // re-parks for the REMAINDER — so an idle read still
+                    // returns BR_NOOP after at most one tick (the 6-Z152
+                    // anti-pinning ceiling is preserved to the microsecond).
+                    {
+                        let (gate, cv) = {
+                            let b = bus.lock().expect("binder bus poisoned");
+                            (
+                                std::sync::Arc::clone(&b.z547_idle_gate),
+                                std::sync::Arc::clone(&b.z547_idle_wake),
+                            )
+                        };
+                        let deadline = std::time::Instant::now() + IDLE_POLL_TICK;
+                        loop {
+                            let now = std::time::Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            let g = gate.lock().expect("binder idle gate poisoned");
+                            let (_g, to) = cv
+                                .wait_timeout(g, deadline - now)
+                                .expect("binder idle gate poisoned");
+                            drop(_g);
+                            if to.timed_out() {
+                                break;
+                            }
+                            // Foreign/spurious wake: re-park for the
+                            // remainder unless OUR inbox now has work (the
+                            // 6-Z383 recheck below will deliver it).
+                            let mine = {
+                                let b = bus.lock().expect("binder bus poisoned");
+                                b.conns
+                                    .get(&conn_id)
+                                    .map(|c| !c.inbox.is_empty())
+                                    .unwrap_or(false)
+                            };
+                            if mine {
+                                break;
+                            }
+                        }
+                    }
                     // 6-Z383: RE-CHECK the conn's OWN inbox after the idle
                     // tick — a transaction may have been queued DURING the
                     // sleep, and the kernel delivers proc-todo work to a
@@ -12166,6 +12256,168 @@ mod tests {
             "idle BINDER_WRITE_READ should return exactly one BR_NOOP"
         );
 
+        let br_cmd = u32::from_ne_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(br_cmd, BR_NOOP, "expected BR_NOOP");
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    // -------- 6-Z547: the WAKEABLE idle wait ---------------------------
+    //
+    // The v1 idle park was `thread::sleep(IDLE_POLL_TICK)` — a transaction
+    // queued mid-park waited the whole tick for its delivery (the 6-Z383
+    // recheck only ran AFTER the sleep). The 6-Z547 notify chain
+    // (queue_transaction / the death cleanups → the shared condvar) must
+    // deliver mid-park work BEFORE the tick while keeping the 6-Z152
+    // ceiling (a no-work read still parks the full tick).
+
+    #[test]
+    fn z547_transaction_pushed_during_idle_read_arrives_before_the_tick() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let bus = std::sync::Arc::clone(&proxy.bus);
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        // Pure read: write_size=0, read_capacity=64 — the proxy thread
+        // parks in the 6-Z547 wait (primary drain found nothing).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_ne_bytes());
+        payload.extend_from_slice(&64u32.to_ne_bytes());
+        let mut req = Vec::new();
+        req.extend_from_slice(&BINDER_WRITE_READ.to_ne_bytes());
+        req.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        req.extend_from_slice(&payload);
+
+        let send_start = std::time::Instant::now();
+        stream.write_all(&req).expect("write request");
+
+        // Let the reader actually park, then queue a one-way transaction
+        // on ITS connection from the bus side — the 6-Z547 notify must
+        // wake the parked reader NOW (v1 delivered only after the full
+        // 250 ms tick).
+        std::thread::sleep(Duration::from_millis(50));
+        {
+            let mut b = bus.lock().expect("bus");
+            let conn_id = *b.conns.keys().next().expect("the parked conn");
+            let tx = IncomingTx {
+                requester: conn_id,
+                txn_id: 0,
+                code: 34,
+                flags: 0x1, // TF_ONE_WAY
+                one_way: true,
+                sender_pid: 1,
+                sender_euid: 0,
+                blob: None,
+                ptr: 0,
+                cookie: 0,
+            };
+            assert!(
+                b.queue_transaction(tx, conn_id),
+                "queue onto the parked conn must succeed"
+            );
+        }
+
+        // Read response: [i32 ret][u32 arg_len][u32 read_size][bytes].
+        let mut hdr = [0u8; 8];
+        stream.read_exact(&mut hdr).expect("read response header");
+        let elapsed = send_start.elapsed();
+        let ret = i32::from_ne_bytes(hdr[0..4].try_into().unwrap());
+        let arg_len = u32::from_ne_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        assert_eq!(ret, 0);
+
+        // THE 6-Z547 ASSERTION: the wake delivered BEFORE the tick. The
+        // v1 sleep(250ms) path lands at ~300 ms (park + full tick +
+        // recheck); the wake path lands at ~the push time (we parked at
+        // ~50 ms). Generous ceiling — CI scheduling jitter — but strictly
+        // below the 6-Z152 tick that v1 always paid.
+        assert!(
+            elapsed < IDLE_POLL_TICK,
+            "a mid-park transaction must arrive BEFORE the 6-Z152 idle tick \
+             (got {:?} >= tick {:?}) — the 6-Z547 wake is not engaged",
+            elapsed,
+            IDLE_POLL_TICK
+        );
+
+        let mut resp = vec![0u8; arg_len];
+        stream.read_exact(&mut resp).expect("read response payload");
+        let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+        assert!(
+            read_size >= 4,
+            "the woken read must carry the delivered BR_TRANSACTION, not be empty"
+        );
+        let br_cmd = u32::from_ne_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(
+            br_cmd, BR_TRANSACTION,
+            "expected the queued one-way transaction as BR_TRANSACTION"
+        );
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z547_foreign_notify_does_not_shorten_the_idle_ceiling() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let bus = std::sync::Arc::clone(&proxy.bus);
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_ne_bytes());
+        payload.extend_from_slice(&64u32.to_ne_bytes());
+        let mut req = Vec::new();
+        req.extend_from_slice(&BINDER_WRITE_READ.to_ne_bytes());
+        req.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        req.extend_from_slice(&payload);
+
+        let send_start = std::time::Instant::now();
+        stream.write_all(&req).expect("write request");
+
+        // Let the reader park, then fire the shared wake channel with NO
+        // work queued for OUR conn (the foreign-notify shape: some other
+        // connection's push). The deadline loop must RE-PARK for the
+        // remainder — the 6-Z152 ceiling (a no-work read answers BR_NOOP
+        // only after the full tick) must survive the wakeable rewrite.
+        std::thread::sleep(Duration::from_millis(50));
+        bus.lock().expect("bus").z547_notify();
+        // A second foreign wake mid-park: still no own work.
+        std::thread::sleep(Duration::from_millis(30));
+        bus.lock().expect("bus").z547_notify();
+
+        let mut hdr = [0u8; 8];
+        stream.read_exact(&mut hdr).expect("read response header");
+        let elapsed = send_start.elapsed();
+        let ret = i32::from_ne_bytes(hdr[0..4].try_into().unwrap());
+        let arg_len = u32::from_ne_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        assert_eq!(ret, 0);
+        assert!(arg_len >= 4);
+
+        let min_expected = IDLE_POLL_TICK
+            .checked_sub(Duration::from_millis(30))
+            .unwrap();
+        assert!(
+            elapsed >= min_expected,
+            "foreign notifies must NOT shorten the idle park (got {:?} < {:?}) \
+             — the 6-Z152 anti-pinning ceiling is broken",
+            elapsed,
+            min_expected
+        );
+
+        let mut resp = vec![0u8; arg_len];
+        stream.read_exact(&mut resp).expect("read response payload");
+        let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+        assert_eq!(read_size, 4, "still exactly one BR_NOOP");
         let br_cmd = u32::from_ne_bytes(resp[4..8].try_into().unwrap());
         assert_eq!(br_cmd, BR_NOOP, "expected BR_NOOP");
 
