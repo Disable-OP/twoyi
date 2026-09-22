@@ -13767,19 +13767,25 @@ fn z540_flush_fdop_rings(pid: libc::pid_t) {
     // and is flushed only if it IS the wanted tgid (the main thread's
     // own key).
     let ring_tgid = |ring_pid: libc::pid_t| -> Option<libc::pid_t> {
-        std::fs::read_to_string(format!("/proc/{}/status", ring_pid))
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("Tgid:"))
-                    .and_then(|l| l.split_whitespace().nth(1)?.parse::<libc::pid_t>().ok())
-            })
-            .or(if ring_pid == want_tgid {
-                Some(ring_pid)
-            } else {
-                None
-            })
-            .filter(|t| *t == want_tgid)
+        match std::fs::read_to_string(format!("/proc/{}/status", ring_pid)) {
+            Ok(s) => s
+                .lines()
+                .find(|l| l.starts_with("Tgid:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<libc::pid_t>().ok())
+                .filter(|t| *t == want_tgid)
+                .or(if ring_pid == want_tgid {
+                    Some(ring_pid)
+                } else {
+                    None
+                }),
+            // 6-Z540d: a DEAD or raced owner is flushed ANYWAY — the
+            // rn526 lesson: the fd-0 free-er can be a thread that
+            // already exited by flush time; skipping its ring loses
+            // the only copy of the vector. Over-flushing bounded
+            // evidence (the per-tgid budget caps the cost) beats
+            // losing it.
+            Err(_) => Some(want_tgid),
+        }
     };
     let flush_one = |name: &str, ring: &std::collections::VecDeque<(u64, &'static str, String)>| {
         if ring.is_empty() {
