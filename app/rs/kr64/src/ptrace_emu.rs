@@ -3563,12 +3563,17 @@ static Z517_CONNECT_PENDING: std::sync::LazyLock<
 static Z540_SENTINEL: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<libc::pid_t, [Option<String>; 3]>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-// 6-Z540: the one-shot ring-flush guard — the Z483/Z486 rings flush
-// once per process at the first wall-park verdict (the futex/pipe
-// parks never trip the FD-shaped STALL-FD flush; the ring would die
-// with the guest unflushed, and it holds the displacement vector).
-static Z540_FLUSHED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<libc::pid_t>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+// 6-Z540: the ring-flush guard — the Z483/Z486 rings flush once per
+// process at the first wall-park verdict (the futex/pipe parks never
+// trip the FD-shaped STALL-FD flush; the ring would die with the
+// guest unflushed, and it holds the displacement vector).
+// 6-Z540c: the guard became a BUDGET — every sentinel FLIP also
+// flushes (the rn524 lesson: the wall-park flush fired at +290s while
+// the first flip landed at +244s — the freeing op had already rotated
+// out of the 48-entry window; a flush AT the flip pins its window).
+static Z540_FLUSHED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<libc::pid_t, u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 // 6-Z504: the one-in-flight (pid → class) stash for the INIT-SOCKCREATE
 // census — the ENTRY half (init's socket()/bind()) inserts; the EXIT
 // half resolves the real return into the drop-proof 6-Z504 line. The
@@ -13651,11 +13656,19 @@ fn z540_stdio_sentinel_check(pid: libc::pid_t, site: &str) {
                 ));
             }
             Some(prev) => {
-                for (slot, before, after) in z540_changed_slots(prev, &now) {
+                let flips = z540_changed_slots(prev, &now);
+                for (slot, before, after) in &flips {
                     crate::trace_log_line(&format!(
                         "6-Z540 STDIO-SENTINEL ({}): pid={} tgid={} fd={} target changed {} -> {} (the stdio floor expects the svclog/stdio wiring — a bypass vector displaced the slot; the fd-op ring names it)",
                         site, pid, tgid, slot, before, after
                     ));
+                }
+                // 6-Z540c: flush AT the flip — the ring window then
+                // covers the ops right before the displacement (the
+                // rn524 lesson: the wall-park-only flush fired one
+                // rotation too late and the freeing op was gone).
+                if !flips.is_empty() {
+                    z540_flush_fdop_rings(pid);
                 }
             }
         }
@@ -13671,6 +13684,8 @@ fn z540_stdio_sentinel_check(pid: libc::pid_t, site: &str) {
 /// every ring that belongs to the parked process's thread group —
 /// the rn523 lesson: the verdict fires for a THREAD (4786) while the
 /// vector evidence sat in the main thread's ring (4496).
+/// 6-Z540c: the guard is a BUDGET (8 per tgid) — every sentinel flip
+/// calls this too, so each flip pins its own ring window.
 fn z540_flush_fdop_rings(pid: libc::pid_t) {
     // Resolve the parked pid's own tgid first (the flush guard key).
     let want_tgid = std::fs::read_to_string(format!("/proc/{}/status", pid))
@@ -13687,9 +13702,11 @@ fn z540_flush_fdop_rings(pid: libc::pid_t) {
     };
     {
         let mut flushed = Z540_FLUSHED.lock().unwrap_or_else(|e| e.into_inner());
-        if !flushed.insert(want_tgid) {
+        let n = flushed.entry(want_tgid).or_insert(0);
+        if *n >= 8 {
             return;
         }
+        *n += 1;
     }
     // The tgid resolver for the ring keys — a dead key resolves to None
     // and is flushed only if it IS the wanted tgid (the main thread's
