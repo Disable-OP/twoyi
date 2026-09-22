@@ -11097,6 +11097,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             format!("{}{}", cfg.rootfs, cfg.init_path)
         };
 
+        // NOTE: the 6-Z543 trace-filter install lives at the BOTTOM of
+        // this child path (immediately before the execve) — it must be
+        // the LAST syscall side-effect before exec so that the cache-copy
+        // / staging / patching prep below runs BEFORE the filter is live
+        // (those are the tracer's own HOST-path file operations; under a
+        // live filter they would seccomp-stop and flow through the
+        // guest path-translation arms — mangling risk with zero upside).
+
         // NON-ROOT MODE: The rootfs is on the app's data partition which
         // has noexec. execve() of {rootfs}/init fails with EACCES.
         // Copy the init binary to the app's cache dir (which IS executable)
@@ -11883,6 +11891,76 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // app uid (rootless unchanged).
         unsafe {
             libc::umask(0o022);
+        }
+
+        // ── 6-Z543: THE PTRACE-STOP THROTTLE — the seccomp trace filter ──
+        //
+        // rn528 decode: the tracer is SATURATED at ~10k stops/s for the
+        // whole boot (6.66M stops / 674 s) — the guest's syscall
+        // throughput is capped at the tracer's service rate. This filter
+        // returns SECCOMP_RET_TRACE only for the ~120 handled syscall
+        // numbers (ptrace_emu::z543_trace_nrs) and ALLOW for everything
+        // else: ALLOWed syscalls NEVER stop the tracee — no entry stop,
+        // no exit stop, zero tracer wakeups. The parent's loop flips to
+        // the deterministic phase tracking the moment the first
+        // PTRACE_EVENT_SECCOMP stop arrives (self-synchronizing — a
+        // failed install silently degrades to the legacy full-trace
+        // flow), and resumes exits with PTRACE_CONT so untraced
+        // syscalls never re-arm TIF_SYSCALL_TRACE.
+        //
+        // ORDERING IS LOAD-BEARING: the install runs AFTER PTRACE_TRACEME
+        // + the pre-exec SIGSTOP (the parent has already issued
+        // PTRACE_SETOPTIONS with PTRACE_O_TRACESECCOMP at loop start —
+        // without the option, the kernel turns RET_TRACE into a silent
+        // -ENOSYS on every traced syscall), AFTER all exec prep (see the
+        // NOTE at the top of this child path), and it is the LAST syscall
+        // side-effect before execve. The 6-Z147/6-Z381 prctl/seccomp
+        // fake arms carry the `past_first_execve` carve-out so these
+        // two install calls execute NATIVELY.
+        //
+        // Guest-ABI gate: the BPF program is arch-locked to
+        // AUDIT_ARCH_AARCH64. An arm32-compat guest (AUDIT_ARCH_ARM)
+        // would be ALLOWed on every syscall — untraced, untranslated —
+        // so the filter installs ONLY when the init ELF is a 64-bit
+        // aarch64 image. 32-bit guests keep the legacy full-trace mode.
+        // (no #[cfg(target_arch)] gate here: the ELF-class check below is
+        // the real gate — an aarch64 init binary cannot appear on an x86_64
+        // host boot, and keeping the block unconditional keeps the builder
+        // fns used on every target so the -D-warnings CI build stays clean).
+        #[cfg(target_arch = "aarch64")]
+        if !cfg.use_namespaces && seccomp::trace_filter_enabled_from_env() {
+            let elf_is_aarch64 = (|| -> std::io::Result<bool> {
+                use std::io::Read;
+                let mut f = std::fs::File::open(&full_init_path)?;
+                let mut hdr = [0u8; 20];
+                f.read_exact(&mut hdr)?;
+                Ok(hdr[0] == 0x7f
+                    && &hdr[1..4] == b"ELF"
+                    && hdr[4] == 2 // ELFCLASS64
+                    && u16::from_le_bytes([hdr[18], hdr[19]]) == 183) // EM_AARCH64
+            })()
+            .unwrap_or(false);
+            if elf_is_aarch64 {
+                let nrs = ptrace_emu::z543_trace_nrs();
+                match seccomp::install_trace_filter(&nrs) {
+                    Ok(()) => {
+                        let _ = safe_write_err(
+                            b"[KR64 CHILD] 6-Z543: trace filter ARMED (RET_TRACE set; hot natives run free)\n",
+                        );
+                    }
+                    Err(e) => {
+                        let _ = safe_write_err(
+                            b"[KR64 CHILD] 6-Z543: trace filter install FAILED - legacy full-trace mode continues: ",
+                        );
+                        safe_write_err_errno(b"", e.raw_os_error().unwrap_or(0));
+                        safe_write_err(b"\n");
+                    }
+                }
+            } else {
+                safe_write_err(
+                    b"[KR64 CHILD] 6-Z543: init ELF is not aarch64 - trace filter skipped (legacy full-trace mode)\n",
+                );
+            }
         }
 
         let _r = unsafe { libc::execve(init_cstr.as_ptr(), argv.as_ptr(), env_ptrs.as_ptr()) };

@@ -438,7 +438,15 @@ const NT_PRSTATUS: libc::c_long = 1;
 /// Runtime-detected syscall numbers and register layout for the traced
 /// child. All fields are valid for the child's actual bitness — callers
 /// do not need to know whether the child is 32-bit or 64-bit.
-#[derive(Clone, Copy)]
+///
+/// 6-Z543: `Debug` is required by the trace-set completeness test
+/// (`z543_trace_nrs_covers_every_nr_field`), which Debug-formats the
+/// ABI_AARCH64 instance and asserts every non-negative syscall-number
+/// field appears in the seccomp trace list — a new `*_nr` field added
+/// to this struct without updating `z543_trace_nrs` now FAILS the test
+/// instead of silently running that syscall native (untranslated paths,
+/// unfaked returns) under the trace filter.
+#[derive(Clone, Copy, Debug)]
 struct ChildAbi {
     // Syscall numbers (the values the child puts in the syscall-number
     // register to request each syscall). -1 means "not present on this
@@ -17520,7 +17528,8 @@ fn sweep_untraced_guest_processes(
                 | libc::PTRACE_O_TRACEVFORKDONE
                 | libc::PTRACE_O_TRACEEXEC
                 | libc::PTRACE_O_TRACEEXIT
-                | libc::PTRACE_O_EXITKILL) as libc::c_int;
+                | libc::PTRACE_O_EXITKILL
+                | Z543_PTRACE_O_TRACESECCOMP) as libc::c_int;
             let _ = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, opts) };
             let _ = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) };
             tracked_pids.push(pid);
@@ -17661,7 +17670,8 @@ fn z497_post_dump_reattach(
         | libc::PTRACE_O_TRACEVFORKDONE
         | libc::PTRACE_O_TRACEEXEC
         | libc::PTRACE_O_TRACEEXIT
-        | libc::PTRACE_O_EXITKILL) as libc::c_int;
+        | libc::PTRACE_O_EXITKILL
+        | Z543_PTRACE_O_TRACESECCOMP) as libc::c_int;
     let _ = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, tid, 0, opts) };
     tracked_pids.push(tid);
     pid_starttimes.insert(tid, proc_starttime(tid).unwrap_or(0));
@@ -21007,6 +21017,274 @@ pub(crate) fn materialize_bind_tree(src: &str, tgt: &str) -> std::io::Result<usi
     Ok(count)
 }
 
+// ============================================================================
+// 6-Z543: THE PTRACE-STOP THROTTLE (the boot-speed campaign) ================
+// ============================================================================
+
+/// 6-Z543: live-mode flag — flipped true by the main loop the FIRST time
+/// a `PTRACE_EVENT_SECCOMP` stop arrives. Self-synchronizing with the
+/// child-side filter install: if the filter installed, the first traced
+/// syscall (init's execve) delivers a seccomp stop and the loop switches
+/// to the deterministic phase tracking; if the install failed (or the
+/// kill-switch disabled it), NO seccomp stop ever arrives and the loop
+/// keeps the legacy GET_SYSCALL_INFO flow — the mode can only flip
+/// forward, and the flip is the one-time proof the filter is live.
+pub(crate) static Z543_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `PTRACE_EVENT_SECCOMP` (0x80 as an option, 7 as an event). Defined
+/// locally so the file compiles against libc versions that may not
+/// export the constant on every target.
+pub(crate) const Z543_PTRACE_EVENT_SECCOMP: u32 = 7;
+pub(crate) const Z543_PTRACE_O_TRACESECCOMP: libc::c_int = 0x0000_0080;
+
+/// 6-Z543: the seccomp TRACE set for the aarch64 boot path — every
+/// syscall number whose emulation arms (ENTRY rewrites, EXIT fakes,
+/// tracked-wire bookkeeping, fd-floor/census machinery) must still see
+/// stops under the trace filter. Everything NOT listed runs natively
+/// with ZERO tracer interaction.
+///
+/// Composition:
+///   1. EVERY syscall-number field of the ABI_AARCH64 `ChildAbi`
+///      (the struct is the single source of truth for "the syscalls
+///      the tracer intercepts"; the completeness test
+///      `z543_trace_nrs_covers_every_nr_field` enforces coverage).
+///   2. The literal-arm numbers that are NOT ChildAbi fields:
+///      - 436  close_range  (the 6-Z305t-75d stdio-closer tracer +
+///                           the 6-Z484/6-Z541 stdio-floor rewrites)
+///      - 164  setrlimit     (the post-execve fingerprint fake,
+///                           aarch64 spelling — 167/prctl rides the
+///                           `prctl` field)
+///      - 98   futex         (the z403 ENTRY fp/lr stash + wake census
+///                           feed the stall-forensics verdicts; with
+///                           futex untraced a parked waiter's identity
+///                           would be the previous TRACED entry's —
+///                           misleading decode evidence)
+///      - 202  futex_time64  (the time64 spelling, 5.10+ arm64 kernels)
+///      - 449  futex_waitv   (defensive: the waited-multiple variant)
+///
+/// Deliberately NOT traced (the rn528 census's hot natives — the point
+/// of the filter): gettid (178), getuid/getgid/geteuid/getegid
+/// (174-177), epoll_ctl (21), epoll_pwait (22), clock_gettime (113),
+/// clock_nanosleep (115), nanosleep (101), sched_yield (124), madvise
+/// (233), brk (214), getrandom (278), rt_sigaction (134), prlimit64
+/// (261), membarrier (283), sched_getaffinity (123), and every other
+/// number with no handler arm. The 6-Z451 munmap census (215/91) and
+/// the 6-Z428d epoll-pwait tombstoned census (21/22) go quiet under
+/// the filter — both are completed rn-era investigations, and the
+/// arms remain in place for the legacy mode (KR64_TRACE_FILTER=0).
+/// Module-private: `ChildAbi` is private, so this fn must be too; the
+/// `allow(dead_code)` covers x86_64 non-test builds where only the
+/// cfg-gated aarch64 wrapper (and the x86_64 test) would use it.
+#[allow(dead_code)]
+fn z543_trace_nrs_with(a: &ChildAbi, extra: &[i64]) -> Vec<i64> {
+    let mut v: Vec<i64> = vec![
+        a.getpid,
+        a.getppid,
+        a.open,
+        a.openat,
+        a.openat2,
+        a.stat,
+        a.lstat,
+        a.fstat,
+        a.newfstatat,
+        a.statx,
+        a.getdents64,
+        a.stat64,
+        a.lstat64,
+        a.fstat64,
+        a.statfs_nr,
+        a.fstatfs_nr,
+        a.statfs64_nr,
+        a.fstatfs64_nr,
+        a.fstatat64_nr,
+        a.pread64,
+        a.access,
+        a.faccessat,
+        a.rt_sigprocmask,
+        a.readlink,
+        a.readlinkat,
+        a.chdir,
+        a.getcwd,
+        a.unlink,
+        a.unlinkat,
+        a.renameat,
+        a.renameat2,
+        a.linkat,
+        a.fchown,
+        a.fchmod,
+        a.capget,
+        a.capset,
+        a.ioprio_get,
+        a.ioprio_set,
+        a.chmod,
+        a.lchown,
+        a.chown,
+        a.fchmodat,
+        a.fchownat,
+        a.fchmodat2_nr,
+        a.utimensat,
+        a.faccessat2,
+        a.execve,
+        a.mknodat,
+        a.mount,
+        a.chroot,
+        a.mkdir,
+        a.mkdirat,
+        a.unshare,
+        a.setns,
+        a.bpf,
+        a.mknod,
+        a.setxattr,
+        a.lsetxattr,
+        a.fsetxattr,
+        a.shmget,
+        a.shmat,
+        a.shmctl,
+        a.pause,
+        a.clone_nr,
+        a.fork_nr,
+        a.vfork_nr,
+        a.wait4_nr,
+        a.exit_group_nr,
+        a.write,
+        a.read,
+        a.mmap,
+        a.mmap2,
+        a.socketcall_nr,
+        a.poll_nr,
+        a.set_thread_area_nr,
+        a.ioctl_nr,
+        a.socket_nr,
+        a.bind_nr,
+        a.listen_nr,
+        a.sendto_nr,
+        a.sendmsg_nr,
+        a.recvfrom_nr,
+        a.recvmsg_nr,
+        a.shutdown_nr,
+        a.setsockopt_nr,
+        a.getsockopt_nr,
+        a.close_nr,
+        a.fcntl_nr,
+        a.dup2_nr,
+        a.dup3_nr,
+        a.connect_nr,
+        a.writev_nr,
+        a.mprotect_nr,
+        a.ppoll_nr,
+        a.setuid_nr,
+        a.setgid_nr,
+        a.setresuid_nr,
+        a.setresgid_nr,
+        a.setgroups_nr,
+        a.setreuid_nr,
+        a.setregid_nr,
+        a.getxattr_nr,
+        a.lgetxattr_nr,
+        a.fgetxattr_nr,
+        a.getitimer_nr,
+        a.setitimer_nr,
+        a.timer_create_nr,
+        a.timer_settime_nr,
+        a.timer_delete_nr,
+        a.accept4_nr,
+        a.alarm_nr,
+        a.kill_nr,
+        a.tgkill_nr,
+        a.tkill_nr,
+        a.rt_sigqueueinfo_nr,
+        a.prctl,
+        a.seccomp,
+        a.ptrace_nr,
+    ];
+    v.extend_from_slice(extra);
+    v.retain(|nr| *nr >= 0);
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// 6-Z543: the production trace set (aarch64 boot path). ABI_AARCH64 is
+/// itself cfg-gated, so this wrapper is too; on x86_64 builds the
+/// generic `z543_trace_nrs_with` + the tests exercise the mechanism.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn z543_trace_nrs() -> Vec<i64> {
+    z543_trace_nrs_with(
+        &ABI_AARCH64,
+        // The literal arms that are NOT ChildAbi fields (see the doc
+        // above): close_range, setrlimit (aarch64), futex,
+        // futex_time64, futex_waitv.
+        &[436, 164, 98, 202, 449],
+    )
+}
+
+/// 6-Z542: the last SETPROP2 client-send records — (boot-ms, pid, name).
+/// The klog-timeline arm correlates init's
+/// `sys_prop: recv data is not properly obtained.` /
+/// `sys_prop(PROP_MSG_SETPROP2): error while reading name/value …`
+/// failures against the most recent client send so the rn529 decode can
+/// name WHICH property set failed, from WHICH client, and how long
+/// before init's read loop gave up (the A11 RecvFully budget is 3000 ms;
+/// a failure means the client's chunked writes were delayed past it).
+pub(crate) static Z542_LAST_SETS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::VecDeque<(u64, libc::pid_t, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+/// 6-Z542: record a completed client SETPROP2 parse (called at the
+/// z481/z488 parse-success site). Keeps the last 8.
+pub(crate) fn z542_record_set(pid: libc::pid_t, name: &str) {
+    if let Ok(mut q) = Z542_LAST_SETS.lock() {
+        if q.len() >= 8 {
+            q.pop_front();
+        }
+        q.push_back((crate::boot_elapsed_ms() as u64, pid, name.to_string()));
+    }
+}
+
+/// 6-Z542: the klog-correlation line for an init sys_prop read failure.
+/// Emits ONE drop-proof line per failure (global budget 64) naming the
+/// most recent client set within the 120 s window — the pairing turns
+/// the bare klog error into a client+property+timeline record.
+pub(crate) fn z542_klog_correlate(klog_line: &str) {
+    static Z542_CORR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = Z542_CORR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 64 {
+        return;
+    }
+    if !klog_line.contains("sys_prop")
+        || !(klog_line.contains("recv data is not properly obtained")
+            || klog_line.contains("error while reading name/value"))
+    {
+        return;
+    }
+    let now = crate::boot_elapsed_ms() as u64;
+    let matched = Z542_LAST_SETS.lock().ok().and_then(|q| {
+        q.iter()
+            .rev()
+            .find(|(ts, _, _)| now.saturating_sub(*ts) <= 120_000)
+            .cloned()
+    });
+    match matched {
+        Some((ts, pid, name)) => {
+            crate::trace_log_line_critical(&format!(
+                "6-Z542 PROP-FAIL-CORR: init sys_prop read FAILED (klog: '{}') — last client SETPROP2 within 120s: pid={} name='{}' sent +{}ms ({}ms before the failure)",
+                crate::cap_log_line(klog_line, 160),
+                pid,
+                name,
+                ts,
+                now - ts
+            ));
+        }
+        None => {
+            crate::trace_log_line_critical(&format!(
+                "6-Z542 PROP-FAIL-CORR: init sys_prop read FAILED (klog: '{}') — NO client SETPROP2 recorded in the 120s window (the writer may be a non-tracked-wire path or the failure predates the z488 accumulator)",
+                crate::cap_log_line(klog_line, 160)
+            ));
+        }
+    }
+}
+
 pub fn run_ptrace_loop(
     pid: libc::pid_t,
     rootfs: &str,
@@ -21160,7 +21438,14 @@ pub fn run_ptrace_loop(
         | libc::PTRACE_O_TRACEVFORKDONE
         | libc::PTRACE_O_TRACEEXEC
         | libc::PTRACE_O_TRACEEXIT
-        | libc::PTRACE_O_EXITKILL) as libc::c_int;
+        | libc::PTRACE_O_EXITKILL
+        // 6-Z543: SECCOMP_RET_TRACE stops are delivered ONLY to a tracer
+        // that asked for the event — without this option the kernel
+        // turns every traced-nr syscall into a silent -ENOSYS (the
+        // documented RET_TRACE fallback), so this MUST be live before
+        // the child's filter install (it is: issued here at loop start,
+        // before the first resume of the SIGSTOPped child).
+        | Z543_PTRACE_O_TRACESECCOMP) as libc::c_int;
     let r = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, ptrace_opts) };
     if r == -1 {
         let e = std::io::Error::last_os_error();
@@ -23758,12 +24043,31 @@ pub fn run_ptrace_loop(
                 resume_signal,
             });
             unsafe {
-                libc::ptrace(
-                    libc::PTRACE_SYSCALL,
-                    current_pid,
-                    0,
-                    resume_signal as libc::c_long,
-                )
+                let z543_req =
+                    if Z543_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) && !in_syscall {
+                        // 6-Z543 THE THROTTLE BREAKER: the stop just processed
+                        // was an EXIT (or a non-syscall stop) — the tracee is
+                        // NOT mid-syscall. Resume with PTRACE_CONT: TIF_
+                        // SYSCALL_TRACE stays CLEAR, so the next syscall entry
+                        // produces NO ptrace stop; the seccomp filter alone
+                        // decides (TRACE for the handled set, ALLOW = the
+                        // syscall runs with ZERO tracer interaction). The
+                        // loop-top PTRACE_SYSCALL here would RE-ARM TIF and
+                        // every syscall would stop twice again — the filter
+                        // would save nothing.
+                        libc::PTRACE_CONT
+                    } else {
+                        // Mid-syscall (an ENTRY — seccomp or legacy — was just
+                        // processed): PTRACE_SYSCALL arms TIF so the syscall's
+                        // EXIT stop is reported. This is the ONLY TIF-arming
+                        // resume under the filter, and it happens exactly once
+                        // per traced syscall, between its seccomp stop and its
+                        // exit stop — no entry stop is ever generated (TIF is
+                        // clear at every entry), so the seccomp stop fully
+                        // replaces the legacy entry stop.
+                        libc::PTRACE_SYSCALL
+                    };
+                libc::ptrace(z543_req, current_pid, 0, resume_signal as libc::c_long)
             }
         };
         // 6-Z305t-16: close the pending-resume entry for the tid this
@@ -25988,6 +26292,41 @@ pub fn run_ptrace_loop(
             // FORK/CLONE/VFORK we use PTRACE_GETEVENTMSG on the parent
             // to read the new child's PID — purely diagnostic, since
             // the kernel auto-attaches us to the new child regardless.
+            // ── 6-Z543: the SECCOMP-STOP route decision ──
+            //
+            // A `SECCOMP_RET_TRACE` stop arrives as SIGTRAP (WSTOPSIG,
+            // NO 0x80) with PTRACE_EVENT_SECCOMP (7) in bits 16+ — the
+            // exact shape the event-match below would swallow as
+            // "unknown PTRACE_EVENT ... continuing without signal
+            // delivery". The stop must instead flow through the
+            // syscall-ENTRY dispatch (the 6-Z68 GET_SYSCALL_INFO op==3
+            // arm already treats op SECCOMP as ENTRY). Detected here,
+            // BEFORE the event match, and routed by the two branch
+            // conditions below (`!z543_is_seccomp_stop` on the event
+            // match, `|| z543_is_seccomp_stop` on the syscall branch).
+            //
+            // The FIRST seccomp stop of the boot flips Z543_ACTIVE —
+            // the one-time proof the child-side filter is live. From
+            // that stop on, the syscall-branch phase classification
+            // switches from the per-stop GET_SYSCALL_INFO call to the
+            // deterministic shape rule (seccomp stop = ENTRY;
+            // SIGTRAP|0x80 = EXIT iff the pid's phase tracker says
+            // an ENTRY was consumed — the filter's PTRACE_SYSCALL
+            // resume rhythm makes the sequence fully determined),
+            // removing one ptrace round-trip from EVERY stop of the
+            // ~6.6M-stop boot.
+            let z543_event: u32 = ((status as u32) >> 16) & 0xFFFF;
+            let z543_is_seccomp_stop =
+                sig == libc::SIGTRAP && z543_event == Z543_PTRACE_EVENT_SECCOMP;
+            if z543_is_seccomp_stop {
+                if !Z543_ACTIVE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::trace_log_line_critical(&format!(
+                        "6-Z543 SECCOMP-STOP #1: pid={} nr-loader live — the trace filter is ACTIVE; switching the loop to deterministic phase tracking (event=ENTRY / 0x80-stop=EXIT, no per-stop GET_SYSCALL_INFO)",
+                        pid
+                    ));
+                }
+            }
+
             // DIAGNOSTIC (6-R): log SIGTRAP-family stops (with and without
             // 0x80) to diagnose why PTRACE_EVENT_FORK is never observed.
             // 6-Z305t-71: BOUNDED — this line fired on EVERY plain SIGTRAP
@@ -25995,7 +26334,7 @@ pub fn run_ptrace_loop(
             // plain-SIGTRAP dispatcher arm below) produced 7.35M
             // occurrences / ~735MB in ladder #131 alone. First 2 per pid,
             // then every 65536th with the running total.
-            if sig == libc::SIGTRAP {
+            if sig == libc::SIGTRAP && !z543_is_seccomp_stop {
                 if let Some(total) =
                     stop_log_allow(&mut stop_log_budget, SITE_PLAIN_SIGTRAP, pid, 65536)
                 {
@@ -26010,7 +26349,15 @@ pub fn run_ptrace_loop(
             }
 
             let ptrace_event: u32 = ((status as u32) >> 16) & 0xFFFF;
-            if ptrace_event != 0 {
+            // 6-Z543: seccomp stops (event 7) are NOT event-match
+            // material — they carry no GETEVENTMSG payload and their
+            // bookkeeping belongs to the syscall-ENTRY dispatch (the
+            // branch condition at the SIGTRAP|0x80 arm below now also
+            // admits them). Skipping the match here prevents the
+            // "unknown PTRACE_EVENT ... continuing without signal
+            // delivery" arm from consuming the stop and discarding the
+            // syscall.
+            if ptrace_event != 0 && !z543_is_seccomp_stop {
                 // ── 6-Z83 rolling last-16-stops ring (stop forensics) ──
                 if recent_stops.len() == RECENT_STOPS_CAP {
                     recent_stops.pop_front();
@@ -27376,7 +27723,12 @@ pub fn run_ptrace_loop(
             }
 
             // SIGTRAP | 0x80 = syscall stop (because we set TRACESYSGOOD).
-            if sig == (libc::SIGTRAP | 0x80) {
+            // 6-Z543: OR a SECCOMP-RET_TRACE stop (plain SIGTRAP + event
+            // 7, detected above) — both flow through the SAME entry/exit
+            // dispatch; the seccomp stop is always an ENTRY, and under
+            // the active filter every other syscall stop of a filtered
+            // pid is the EXIT of a PTRACE_SYSCALL-resumed entry.
+            if sig == (libc::SIGTRAP | 0x80) || z543_is_seccomp_stop {
                 loop_count += 1;
 
                 // Get the child's registers using the arch-specific function.
@@ -27741,24 +28093,50 @@ pub fn run_ptrace_loop(
                 const SYSCALL_INFO_OP_ENTRY: u8 = 1;
                 const SYSCALL_INFO_OP_EXIT: u8 = 2;
                 const SYSCALL_INFO_OP_SECCOMP: u8 = 3;
-                let mut sc_info: PtraceSyscallInfo = unsafe { std::mem::zeroed() };
-                let gsi_result = unsafe {
-                    libc::ptrace(
-                        PTRACE_GET_SYSCALL_INFO_REQ as _,
-                        pid,
-                        std::mem::size_of::<PtraceSyscallInfo>(),
-                        &mut sc_info as *mut PtraceSyscallInfo,
-                    )
-                };
-                let stop_phase: Option<bool> = if gsi_result > 0 {
-                    match sc_info.op {
-                        SYSCALL_INFO_OP_ENTRY | SYSCALL_INFO_OP_SECCOMP => Some(true),
-                        SYSCALL_INFO_OP_EXIT => Some(false),
-                        _ => None, // UNKNOWN — fall back to parity
-                    }
+                // 6-Z543: under the ACTIVE trace filter a SECCOMP stop is
+                // DEFINITELY an ENTRY (the kernel delivered it from the
+                // filter, before the syscall executed) — no ptrace call
+                // needed. A SIGTRAP|0x80 stop, however, stays AMBIGUOUS
+                // even under the filter: the dominant reading is the EXIT
+                // owed by the entry just processed (PTRACE_SYSCALL was
+                // issued exactly once, between the seccomp stop and this
+                // stop), but ART's suspension signals (SIGUSR1-class,
+                // SA_RESTART) ERESTARTSYS-restart traced syscalls
+                // constantly — and each restart re-runs the syscall-entry
+                // path with TIF still armed, delivering a 0x80 ENTRY that
+                // the shape rule alone would misread as an EXIT (the exit
+                // arms would then run on arg-garbage ret registers and
+                // the double seccomp stop would re-run the entry arms).
+                // Those 0x80 stops therefore still ask the kernel
+                // (GET_SYSCALL_INFO — definitive op). Net under ACTIVE:
+                // one ptrace call per 0x80 stop instead of legacy's one
+                // per stop, and zero for the untraced syscalls that no
+                // longer stop at all.
+                let z543_active_now = Z543_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+                let mut stop_phase: Option<bool> = if z543_active_now && z543_is_seccomp_stop {
+                    Some(true)
                 } else {
-                    None // EIO / old kernel — fall back to parity
+                    None
                 };
+                if stop_phase.is_none() {
+                    let mut sc_info: PtraceSyscallInfo = unsafe { std::mem::zeroed() };
+                    let gsi_result = unsafe {
+                        libc::ptrace(
+                            PTRACE_GET_SYSCALL_INFO_REQ as _,
+                            pid,
+                            std::mem::size_of::<PtraceSyscallInfo>(),
+                            &mut sc_info as *mut PtraceSyscallInfo,
+                        )
+                    };
+                    if gsi_result > 0 {
+                        stop_phase = match sc_info.op {
+                            SYSCALL_INFO_OP_ENTRY | SYSCALL_INFO_OP_SECCOMP => Some(true),
+                            SYSCALL_INFO_OP_EXIT => Some(false),
+                            _ => None, // UNKNOWN — fall back to parity
+                        };
+                    }
+                    // EIO / old kernel — fall back to parity (stop_phase None)
+                }
                 // Use the definitive phase when available; keep `in_syscall`
                 // in sync (the SIGSYS handler's DESYNC heuristic + the
                 // per-child switch map still read it).
@@ -28182,6 +28560,33 @@ pub fn run_ptrace_loop(
                 if is_entry {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
+
+                    // ── 6-Z543: the PHASE-2 CONTINUATION guard ──
+                    //
+                    // A seccomp stop that arrives while the tracker says
+                    // an ENTRY was already consumed (in_syscall==true) is
+                    // the filter's phase-2 stop of a TIF-armed entry — the
+                    // restarted-ENTRY double (see the phase block above):
+                    // the 0x80 ENTRY ran the arms, then the kernel's
+                    // seccomp check ALSO matched and stopped. Running the
+                    // ENTRY arms again would double-apply every rewrite
+                    // (path translation, getpid proxies, stashes). The
+                    // arms are SKIPPED; the stop is consumed and the
+                    // loop-top PTRACE_SYSCALL resume (in_syscall==true)
+                    // carries the syscall to its exit.
+                    if z543_active_now && z543_is_seccomp_stop {
+                        static Z543_PHASE2_SKIPS: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let n =
+                            Z543_PHASE2_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 32 {
+                            log(&format!(
+                                "6-Z543: phase-2 continuation skip pid={} nr={} (the TIF-armed entry already ran the arms at the 0x80 stop) [#{}/32]",
+                                pid, syscall_num, n + 1
+                            ));
+                        }
+                        continue;
+                    }
 
                     // ── 6-Z517: the CONNECT ARG CAPTURE (the ENTRY half) ──
                     //
@@ -29167,7 +29572,15 @@ pub fn run_ptrace_loop(
                                                         seq
                                                     ));
                                                 }
-                                                z481_parsed.insert(pid, (name, value));
+                                                z481_parsed.insert(pid, (name.clone(), value));
+                                                // 6-Z542: feed the klog-correlation
+                                                // ring — when init's RecvFully
+                                                // later fails with the EAGAIN
+                                                // budget burn, the PROP-FAIL-CORR
+                                                // line names THIS set (client pid
+                                                // + property + the send→failure
+                                                // latency).
+                                                z542_record_set(pid, &name);
                                                 z488_buf.clear();
                                             } else if z488_buf.len() >= 512 {
                                                 // A stuck accumulation (neither
@@ -31181,7 +31594,8 @@ pub fn run_ptrace_loop(
                                         | libc::PTRACE_O_TRACEVFORKDONE
                                         | libc::PTRACE_O_TRACEEXEC
                                         | libc::PTRACE_O_TRACEEXIT
-                                        | libc::PTRACE_O_EXITKILL)
+                                        | libc::PTRACE_O_EXITKILL
+                                        | Z543_PTRACE_O_TRACESECCOMP)
                                         as libc::c_int;
                                     unsafe {
                                         libc::ptrace(libc::PTRACE_SETOPTIONS, new_pid, 0, opts);
@@ -32936,7 +33350,16 @@ pub fn run_ptrace_loop(
                         // skipped the CAS → CumulativeLoggerLock
                         // "Unexpected state_ in unlock 0" FATAL per
                         // generation (ladder #142 decode).
-                        if syscall_num == abi.prctl {
+                        // 6-Z543 CARVE-OUT: `!past_first_execve` — the
+                        // pre-exec window is kr64's OWN child code (the
+                        // 6-Z543 trace-filter install runs prctl(NNP) +
+                        // seccomp(SET_MODE_FILTER) natively there); the
+                        // rewrite would eat the install call and the
+                        // unprivileged seccomp() would then fail EACCES
+                        // (NNP never landed). Guest prctls (post-init-exec
+                        // — minijail's PR_SET_SECCOMP, PR_SET_VMA probes)
+                        // keep the fake exactly as before.
+                        if syscall_num == abi.prctl && past_first_execve {
                             let prctl_option = get_syscall_arg(&regs, abi.reg_arg1);
                             let prctl_arg2 = get_syscall_arg(&regs, abi.reg_arg2);
                             // 6-Z382: budgeted wire-truth probe — rn339
@@ -32956,6 +33379,15 @@ pub fn run_ptrace_loop(
                                     pid, prctl_arg2
                                 ));
                             }
+                            // 6-Z543 CARVE-OUT: `!past_first_execve` —
+                            // the pre-exec window is kr64's OWN child code:
+                            // the trace-filter install runs prctl(NNP)
+                            // there and MUST execute natively (the rewrite
+                            // would eat it, NNP would never land, and the
+                            // unprivileged seccomp() would fail EACCES).
+                            // Guest prctls (post-init-exec: minijail's
+                            // PR_SET_SECCOMP, PR_SET_VMA, PR_CAPBSET_DROP)
+                            // keep the getpid fake exactly as before.
                             set_syscall_num(&mut regs, &abi, abi.getpid);
                             prctl_rewritten_args.insert(pid, (prctl_option, prctl_arg2));
                             if ptrace_setregs(pid, &regs, iov_len).is_err() {
@@ -32980,7 +33412,10 @@ pub fn run_ptrace_loop(
                         // mediaextractor/omx/swcodec ~256 times in the
                         // 600 s watch (~7 s/cycle ≈ the Watchdog budget
                         // the system_server boot needs).
-                        if abi.seccomp >= 0 && syscall_num == abi.seccomp {
+                        if abi.seccomp >= 0 && syscall_num == abi.seccomp && past_first_execve {
+                            // 6-Z543 CARVE-OUT: see the prctl arm above — the
+                            // pre-exec window's seccomp() is the REAL 6-Z543
+                            // filter install and must execute natively.
                             let seccomp_op = get_syscall_arg(&regs, abi.reg_arg1);
                             if Z382_PRCTL22_LOG.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                                 Z382_PRCTL22_LOG.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -44247,6 +44682,12 @@ pub fn run_ptrace_loop(
                                                 .map_or(false, |c| c.is_ascii_digit())
                                             && txt[1..].contains('>');
                                         if is_klog {
+                                            // 6-Z542: init's sys_prop read
+                                            // failures (the RecvFully EAGAIN /
+                                            // budget-burn class) get the
+                                            // client-send correlation line
+                                            // through the drop-proof channel.
+                                            z542_klog_correlate(&txt);
                                             static KLOG_TIMELINE: std::sync::atomic::AtomicU64 =
                                                 std::sync::atomic::AtomicU64::new(0);
                                             if KLOG_TIMELINE
@@ -51696,7 +52137,8 @@ pub fn run_ptrace_loop(
                             | libc::PTRACE_O_TRACEVFORKDONE
                             | libc::PTRACE_O_TRACEEXEC
                             | libc::PTRACE_O_TRACEEXIT
-                            | libc::PTRACE_O_EXITKILL)
+                            | libc::PTRACE_O_EXITKILL
+                            | Z543_PTRACE_O_TRACESECCOMP)
                             as libc::c_int;
                         let r = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, opts) };
                         if r == -1 {
@@ -52776,6 +53218,109 @@ pub fn z306_audit_fds_narrow(pid: libc::pid_t) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    // ── 6-Z543: the trace-set completeness lock ─────────────────────
+    //
+    // The seccomp trace filter traces EXACTLY `z543_trace_nrs()`. A
+    // ChildAbi field (a syscall number with handler arms) that the fn
+    // forgot would run NATIVE under the filter — untranslated paths,
+    // unfaked returns — silently, on every boot. This test Debug-formats
+    // the ABI_AARCH64 instance and demands every non-negative
+    // syscall-number field (anything not a `reg_*` register-index
+    // field) be present in the trace list.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn z543_trace_nrs_covers_every_nr_field() {
+        let list = z543_trace_nrs();
+        assert!(!list.is_empty());
+        assert_eq!(
+            list.len(),
+            list.iter().collect::<std::collections::HashSet<_>>().len(),
+            "duplicates"
+        );
+        let dbg = format!("{:?}", ABI_AARCH64);
+        let inner = dbg
+            .strip_prefix("ChildAbi {")
+            .and_then(|s| s.strip_suffix(" }"))
+            .expect("ChildAbi must Debug-format as `ChildAbi { ... }`");
+        let mut checked = 0usize;
+        for pair in inner.split(", ") {
+            let (name, val) = pair
+                .split_once(": ")
+                .unwrap_or_else(|| panic!("unparseable field pair: {pair}"));
+            if name.starts_with("reg_") {
+                continue; // register indices, not syscall numbers
+            }
+            let v: i64 = match val.parse() {
+                Ok(v) => v,
+                // Non-i64 fields (e.g. mmap2_rewrite_for_seccomp: bool)
+                // are not syscall numbers — skip them.
+                Err(_) => continue,
+            };
+            if v < 0 {
+                continue; // -1 = not present on aarch64 — nothing to trace
+            }
+            assert!(
+                list.contains(&v),
+                "field {name}={v} is MISSING from z543_trace_nrs — under the 6-Z543 filter that syscall would run native with NO handler arms (path translation, fakes, floors all bypassed)"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 100, "suspiciously few fields checked: {checked}");
+        // The literal arms that are NOT ChildAbi fields.
+        for nr in [436i64, 164, 98, 202, 449] {
+            assert!(
+                list.contains(&nr),
+                "literal arm nr {nr} missing from the trace set"
+            );
+        }
+        // The hot natives the filter exists to FREE must NOT be traced
+        // (a future edit that re-adds them silently undoes the campaign).
+        for nr in [178i64, 174, 21, 22, 113, 101, 124, 233, 214] {
+            assert!(
+                !list.contains(&nr),
+                "nr {nr} (gettid/getuid/epoll/clock/nanosleep/yield/madvise/brk family) must stay UNTRACED by the 6-Z543 filter"
+            );
+        }
+    }
+
+    // The completeness MECHANISM must hold on every arch: the x86_64
+    // CI build exercises it against ABI_X86_64 so a struct-field addition
+    // without a trace-set update fails HERE even though the filter only
+    // deploys on aarch64.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn z543_trace_nrs_mechanism_covers_x86_64_fields() {
+        let list = z543_trace_nrs_with(&ABI_X86_64, &[436, 160, 202]);
+        assert!(list.contains(&436));
+        let dbg = format!("{:?}", ABI_X86_64);
+        let inner = dbg
+            .strip_prefix("ChildAbi {")
+            .and_then(|s| s.strip_suffix(" }"))
+            .expect("ChildAbi must Debug-format as `ChildAbi { ... }`");
+        let mut checked = 0usize;
+        for pair in inner.split(", ") {
+            let (name, val) = pair
+                .split_once(": ")
+                .unwrap_or_else(|| panic!("unparseable field pair: {pair}"));
+            if name.starts_with("reg_") {
+                continue;
+            }
+            let v: i64 = match val.parse() {
+                Ok(v) => v,
+                Err(_) => continue, // non-i64 (bool) fields are not nrs
+            };
+            if v < 0 {
+                continue; // -1 = not present on x86_64
+            }
+            assert!(
+                list.contains(&v),
+                "field {name}={v} is MISSING from the trace set (mechanism check)"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 100, "suspiciously few fields checked: {checked}");
+    }
+
     // ── 6-Z306: the fork-gate fd sweep ──────────────────────────────
     //
     // Ladder #159 (e4e978a): the zygote froze inside its fatal-log write

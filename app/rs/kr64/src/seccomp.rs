@@ -666,6 +666,157 @@ pub fn build_filter() -> Vec<SockFilter> {
 }
 
 // ============================================================================
+// 6-Z543: the PTRACE-STOP THROTTLE — SECCOMP_RET_TRACE filter =============
+// ============================================================================
+
+/// 6-Z543: build the **trace filter** — the boot-speed BPF program.
+///
+/// Rationale (rn528 decode): the tracer is SATURATED at ~10,000 stops/sec
+/// for the whole boot (6.66M syscall stops / 674 s; the heartbeat loop
+/// counter advances at a flat ~10k/s from +5 s to +674 s). Every guest
+/// syscall costs an ENTRY stop + an EXIT stop (PTRACE_SYSCALL rhythm),
+/// each stop paying waitpid + GETREGS + GET_SYSCALL_INFO + the resume —
+/// and the guest's effective syscall throughput is capped at the
+/// tracer's service rate. The guest is throttled, not slow.
+///
+/// The fix: install a seccomp filter that returns `SECCOMP_RET_TRACE`
+/// ONLY for the syscall numbers whose emulation arms need to see stops
+/// (the `ChildAbi` interception set + the literal-arm nrs), and
+/// `SECCOMP_RET_ALLOW` for everything else. An ALLOWed syscall NEVER
+/// stops the tracee — the kernel runs it natively at full speed, the
+/// tracer never wakes, the exit-stop never happens. The hot identity/
+/// timing/event-loop families (gettid, epoll_ctl/epoll_pwait, clock_*,
+/// nanosleep, sched_yield, madvise, brk, getrandom, rt_sigaction…) run
+/// free; only the ~120 handled numbers still stop.
+///
+/// `SECCOMP_RET_TRACE` semantics (seccomp(2)): when matched, the syscall
+/// is suspended and the tracer receives a `PTRACE_EVENT_SECCOMP` stop
+/// (status = SIGTRAP | (PTRACE_EVENT_SECCOMP << 16)), with the syscall
+/// NOT yet executed — the tracer may inspect/rewrite the entry args and
+/// then resume with PTRACE_SYSCALL to still get the EXIT stop (the
+/// exit-side arms keep working unchanged). If no tracer is attached, or
+/// the tracer lacks `PTRACE_O_TRACESECCOMP`, the kernel treats the
+/// action as `SECCOMP_RET_ERRNO` with `ENOSYS` — which is why the
+/// install happens ONLY after the tracer is attached with the option
+/// set (the child is already SIGSTOPped under PTRACE_TRACEME at that
+/// point, and the parent issues `PTRACE_SETOPTIONS` at loop start
+/// BEFORE the first resume).
+///
+/// Program shape (N = nrs.len(), asserted ≤ 255 so the forward jumps
+/// stay within the u8 jt field):
+/// ```text
+///   0: LD   ABS  arch            ; seccomp_data.arch
+///   1: JEQ  AUDIT_ARCH_AARCH64   ; match -> insn 3 (continue), else -> ALLOW
+///   2: RET  ALLOW                ; wrong arch (arm32 compat guests etc.)
+///   3: LD   ABS  nr              ; seccomp_data.nr
+///   4..4+N: JEQ nr_i jt=(N-i) jf=0   ; match -> RET TRACE
+///   4+N:     RET  TRACE
+///   5+N:     RET  ALLOW
+/// ```
+pub fn build_trace_filter(nrs: &[i64]) -> Vec<SockFilter> {
+    let mut sorted: Vec<i64> = nrs.iter().copied().filter(|nr| *nr >= 0).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert!(
+        sorted.len() <= 255,
+        "6-Z543: trace set too large for u8 jumps ({})",
+        sorted.len()
+    );
+
+    // Arch gate: the trace filter exists for the AARCH64 boot path (the
+    // CI boot-ladder's redroid arm64 + stock AOSP arm64 guest). On any
+    // other audit arch the whole filter ALLOWs — a 32-bit compat guest
+    // (AUDIT_ARCH_ARM) keeps the legacy full-trace behaviour, because
+    // its syscall numbers are NOT in the aarch64 set and untraced
+    // guest syscalls would silently bypass the path translation.
+    let mut prog: Vec<SockFilter> = vec![bpf_ld_abs(OFF_ARCH)];
+    prog.push(bpf_jeq(AUDIT_ARCH_EXPECTED, 1, 0)); // match: skip the ALLOW
+    prog.push(bpf_ret(SECCOMP_RET_ALLOW)); // wrong arch: native, legacy mode
+
+    prog.push(bpf_ld_abs(OFF_NR));
+    let n = sorted.len();
+    for (i, nr) in sorted.iter().enumerate() {
+        // Matched: jump forward to the shared RET TRACE. BPF jt counts
+        // instructions skipped from the NEXT insn, so from JEQ#i the
+        // remaining JEQs (n-i-1 of them) plus the RET TRACE insn give
+        // jt = n-i-1... precisely: target_idx = i+1+jt must equal 4+n-1
+        // (the RET TRACE slot within this program, since the 3-instr
+        // arch prefix + 1 LD precede the chain), i.e. jt = (4+n-1)-(i+1)
+        // = n-i+2 relative to the absolute layout; relative to the
+        // chain start it is (n-1-i). The assertion test pins the
+        // absolute landing.
+        let jt = (n - 1 - i) as u8;
+        prog.push(bpf_jeq(*nr as u32, jt, 0));
+    }
+    prog.push(bpf_ret(SECCOMP_RET_TRACE));
+    prog.push(bpf_ret(SECCOMP_RET_ALLOW));
+    prog
+}
+
+/// 6-Z543: install the trace filter on the calling process.
+///
+/// Runs in the CHILD (pre-exec, post-SIGSTOP-resume) — the child is
+/// already under `PTRACE_TRACEME`, the parent's loop-start
+/// `PTRACE_SETOPTIONS` (with `PTRACE_O_TRACESECCOMP`) has fired, and
+/// the filter is inherited by every later fork/clone/exec of the
+/// guest tree. The prctl(NNP) + seccomp() calls made HERE execute
+/// natively because the 6-Z147/6-Z381 guest-fake arms carry the
+/// `!past_first_execve` carve-out (the pre-exec window is kr64's own
+/// code, not guest logic).
+///
+/// NO SIGSYS handler is installed (TRACE never raises SIGSYS) and no
+/// TRAP/kill classes are merged — in the ptrace-emulation boot mode
+/// the sandbox seccomp filter is not installed at all (Task 6-X), so
+/// this is the ONLY filter: the tracer stays the sole enforcement
+/// layer exactly as before; the filter only decides WHERE stops happen.
+pub fn install_trace_filter(nrs: &[i64]) -> std::io::Result<()> {
+    // PR_SET_NO_NEW_PRIVS — required for an unprivileged filter install.
+    let r = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if r != 0 {
+        let e = std::io::Error::last_os_error();
+        error!("[KR64][seccomp] 6-Z543: PR_SET_NO_NEW_PRIVS failed: {}", e);
+        return Err(e);
+    }
+
+    let prog = build_trace_filter(nrs);
+    #[repr(C)]
+    struct Fprog {
+        len: u16,
+        filter: *const SockFilter,
+    }
+    let fprog = Fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr(),
+    };
+    // SECCOMP_SET_MODE_FILTER, flags=0 (single-threaded pre-exec child;
+    // TSYNC unnecessary — every later thread inherits the filter).
+    let r = unsafe { libc::syscall(libc::SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0u32, &fprog) };
+    if r != 0 {
+        let e = std::io::Error::last_os_error();
+        error!(
+            "[KR64][seccomp] 6-Z543: seccomp(SET_MODE_FILTER) failed: {}",
+            e
+        );
+        return Err(e);
+    }
+    info!(
+        "[KR64][seccomp] 6-Z543 trace filter armed: {} nrs traced, {} instructions",
+        nrs.iter().copied().filter(|nr| *nr >= 0).count(),
+        prog.len()
+    );
+    Ok(())
+}
+
+/// 6-Z543: the kill-switch parse — `KR64_TRACE_FILTER=0` disables the
+/// trace filter (legacy full-trace behaviour); anything else (including
+/// unset) enables it on the aarch64 boot path.
+pub fn trace_filter_enabled_from_env() -> bool {
+    std::env::var("KR64_TRACE_FILTER")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+// ============================================================================
 // Install the filter + SIGSYS handler.
 // ============================================================================
 
@@ -1043,6 +1194,70 @@ fn advance_pc(uc: &mut ucontext_t) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 6-Z543: the trace-filter builder ────────────────────────────
+    #[test]
+    fn z543_trace_filter_shape_and_semantics() {
+        let nrs = vec![98i64, 56, 57, 172, -1 /* sentinel: dropped */];
+        let prog = build_trace_filter(&nrs);
+        // Layout: LD arch, JEQ arch, RET ALLOW (wrong arch), LD nr,
+        // 4 JEQs, RET TRACE, RET ALLOW.
+        assert_eq!(prog.len(), 3 + 1 + 4 + 2);
+        assert_eq!(prog[0].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(prog[0].k, OFF_ARCH);
+        // Wrong arch must ALLOW (not kill) — a 32-bit compat guest falls
+        // back to the legacy full-trace behaviour instead of dying.
+        assert_eq!(prog[1].jt, 1);
+        assert_eq!(prog[2].k, SECCOMP_RET_ALLOW);
+        // The nr load.
+        assert_eq!(prog[3].k, OFF_NR);
+        // The four JEQs (sorted, deduped, sentinel dropped) with their
+        // forward jumps landing on the shared RET TRACE (the last insn
+        // before the final ALLOW).
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, insn) in prog[4..8].iter().enumerate() {
+            assert_eq!(insn.code, BPF_JMP | BPF_JEQ | BPF_K);
+            seen.insert(insn.k as i64);
+            // jt = remaining JEQs after this one = (4 - i - 1); jf = 0.
+            assert_eq!(insn.jt as usize, 4 - i - 1, "insn {i}: bad jt");
+            assert_eq!(insn.jf, 0);
+            // The jump target must be the RET TRACE instruction.
+            let target = 4 + i + 1 + insn.jt as usize; // next insn + jt
+            assert_eq!(target, 8, "insn {i}: JEQ must land on RET TRACE");
+        }
+        assert_eq!(seen, [56i64, 57, 98, 172].into_iter().collect());
+        assert_eq!(prog[8].k, SECCOMP_RET_TRACE);
+        assert_eq!(prog[9].k, SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn z543_trace_filter_jump_bound() {
+        // A trace set at the u8 jump bound must still build; one past it
+        // must panic (the jump distances would truncate).
+        let at_bound: Vec<i64> = (0..255).collect();
+        let prog = build_trace_filter(&at_bound);
+        assert_eq!(prog.len(), 3 + 1 + 255 + 2);
+        // Every jt must be <= 254 (the first JEQ jumps over 254 insns).
+        assert!(prog[4].jt <= 254);
+    }
+
+    #[test]
+    #[should_panic(expected = "trace set too large")]
+    fn z543_trace_filter_rejects_oversized_set() {
+        let over: Vec<i64> = (0..300).collect();
+        let _ = build_trace_filter(&over);
+    }
+
+    #[test]
+    fn z543_kill_switch_parses() {
+        // The env-based kill-switch: only the exact "0" disables.
+        std::env::set_var("KR64_TRACE_FILTER", "0");
+        assert!(!trace_filter_enabled_from_env());
+        std::env::set_var("KR64_TRACE_FILTER", "1");
+        assert!(trace_filter_enabled_from_env());
+        std::env::remove_var("KR64_TRACE_FILTER");
+        assert!(trace_filter_enabled_from_env());
+    }
 
     #[test]
     fn filter_built_without_panic() {
