@@ -21247,18 +21247,20 @@ pub(crate) fn z546_park_pipe_enabled_from_env() -> bool {
 }
 
 /// 6-Z546 (pure): the arming verdict for one 6-Z544 spin engagement.
-/// Conservative by design: ONLY EOF-only streaks (ret==0 fakes — the
-/// 6-Z110 tracked-wire EOF answer; an EAGAIN streak is a DIFFERENT bug
+/// 6-Z546 v2 (rn534 decode): the MECHANICAL signature alone — an
+/// EOF-only streak (ret==0 fakes; an EAGAIN streak is a DIFFERENT bug
 /// class on a REAL nonblocking fd whose protocol answer is not ours to
-/// rewrite), ONLY the twice-observed spinner binary (rn530 + rn532 both
-/// named /vendor/bin/qemu-props), and only when the kill switch allows.
-pub(crate) fn z546_arm_verdict(
-    ret_eof: bool,
-    eagain_count: u64,
-    cmdline: &str,
-    enabled: bool,
-) -> bool {
-    ret_eof && eagain_count == 0 && enabled && cmdline.contains("qemu-props")
+/// rewrite) — plus the kill switch. The v1 cmdline gate ("qemu-props")
+/// was too narrow: rn534's spinner was a DIFFERENT binary
+/// (android.hardware.biometrics.fingerprint@2.1-service, fd=5,
+/// 1,146,880 EOF reads — the class is "EOF-retry loops on
+/// tracer-faked/closed sockets", not one process). The park is
+/// semantically identical to the EOF-retry status quo (both mean "this
+/// fd never delivers again" — the 6-Z110 fake wire NEVER has data, and
+/// a truly-closed peer stays closed; any data would have RESET the
+/// streak before arming) minus the CPU and tracer burn.
+pub(crate) fn z546_arm_verdict(ret_eof: bool, eagain_count: u64, enabled: bool) -> bool {
+    ret_eof && eagain_count == 0 && enabled
 }
 
 /// 6-Z542: the last SETPROP2 client-send records — (boot-ms, pid, name).
@@ -46151,7 +46153,6 @@ pub fn run_ptrace_loop(
                                 if z546_arm_verdict(
                                     ret == 0,
                                     e.1,
-                                    &cmdline,
                                     z546_park_pipe_enabled_from_env(),
                                 ) {
                                     let a = Z546_ARMED_LOGGED
@@ -53598,18 +53599,16 @@ mod tests {
     // radius of the mechanism is decided entirely by this verdict.
     #[test]
     fn z546_arm_verdict_gates() {
-        // The rn532 shape: EOF-only streak, the observed spinner → ARM.
-        assert!(z546_arm_verdict(true, 0, "/vendor/bin/qemu-props\0", true));
+        // The rn532 shape (qemu-props) AND the rn534 shape (the
+        // fingerprint HAL — 1,146,880 EOFs, a DIFFERENT binary): the v2
+        // verdict keys on the MECHANICAL signature, not the cmdline.
+        assert!(z546_arm_verdict(true, 0, true));
         // An EAGAIN component = a REAL nonblocking fd — never armed.
-        assert!(!z546_arm_verdict(true, 1, "/vendor/bin/qemu-props", true));
-        // A different binary (the spinner class is twice-observed as
-        // qemu-props only) — never armed.
-        assert!(!z546_arm_verdict(true, 0, "logd", true));
-        assert!(!z546_arm_verdict(true, 0, "", true));
+        assert!(!z546_arm_verdict(true, 1, true));
         // Not an EOF fake at all — never armed.
-        assert!(!z546_arm_verdict(false, 0, "/vendor/bin/qemu-props", true));
+        assert!(!z546_arm_verdict(false, 0, true));
         // The kill switch.
-        assert!(!z546_arm_verdict(true, 0, "/vendor/bin/qemu-props", false));
+        assert!(!z546_arm_verdict(true, 0, false));
     }
 
     // The completeness MECHANISM must hold on every arch: the x86_64
