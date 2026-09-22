@@ -33427,3 +33427,19 @@ Stage Summary:
 - rn535 decode agenda: (1) media fleet restart counts (expect ~1 each vs ~90; the abort message gone); (2) the 6-Z546 engagement on whatever spinner occurs (ARMED → INJECT → PIPE LIVE → ENGAGED; the spin's census shapes freeze); (3) rungs 8/9 reachability; (4) milestone variance.
 - Remote main: 7404fb52. Gates: fmt clean, clippy zero, 1144/1144.
 
+
+---
+Task ID: 1 (session 270 cont.6 — rn535 DECODED: 6-Z546 executed the surgery; 6-Z549 killed the open-failure abort; TWO new fronts named — the injection's silent fate + the fleet's EPROTO WRITE_READ; diagnostics landed)
+Agent: Z.ai Code (main implementation agent, session 270)
+
+Work Log:
+- rn535 (run 35778390988, sha 7404fb52): rung 7, alive; milestones zygote +21.6s / SF +51.1s / class_start main +90.3s (−41% vs rn531 — the band holds).
+- **6-Z549 WORKED at the protocol layer**: the "could not be opened" abort = 0 occurrences; the fingerprint... rather, the media fleet's open handshake now completes (VERSION answered locally, SET_MAX_THREADS ret=0 over the wire, conn=115 serves successful WRITE_READs).
+- **6-Z546 executed the register surgery**: the fingerprint-HAL spinner (pid 3918 — the rn534 binary again) got ARMED → INJECT (read fd=5 → pipe2(scratch=0xf09ebd5faa00, 0)). BUT the pipe2 EXIT hook never fired (no PIPE LIVE / no READBACK FAILED) and the spin CONTINUED (1,081,344 EOFs; census E63 ×296,927) — the `let _ = ptrace_setregs` swallowed the rewrite's outcome. DIAGNOSTICS LANDED (96526644): the INJECT setregs result logs (failure re-arms); a pipe2 EXIT with no pending state logs its own budgeted line. The rn536 decode will name the failing link.
+- **THE MEDIA FLEET'S NEW ABORT**: "getAndExecuteCommand(fd=5) returned unexpected error -71 (EPROTO), aborting" — restarts continue (omx x78 / extractor x68 / swcodec x62). The proxy serves their conns ret=0, so the -71 is CLIENT-side: the shim maps out-of-range wire rets (a desynced response parse) to EPROTO. Next round: budgeted per-exchange logging in the shim's bp_exchange/write_read path + the proxy's per-conn reply ret for the failing exchanges.
+- Worklog updated; pushed (main: 96526644).
+
+Stage Summary:
+- rn536 agenda: (1) the 6-Z546 INJECT setregs verdict (Ok vs the errno) + the pipe2-EXIT-nostate line → the park-pipe mechanism completes or names its blocker; (2) the fleet's EPROTO: instrument bp_exchange (shim) — one budgeted line per failed exchange naming wire/ret/errno — then fix the desync source; (3) milestone variance.
+- Session totals (270): 5 mechanisms landed (6-Z547/6-Z548/6-Z546+diags/6-Z549), runs rn532-535 decoded, gates 1144/1144 throughout, milestones now −12/−13/−41% vs rn531 with the real filter.
+
