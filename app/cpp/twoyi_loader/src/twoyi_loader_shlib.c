@@ -2315,6 +2315,22 @@ static unsigned char *bp_exchange_anc(int fd, uint32_t cmd,
                                       const int *req_fds, uint32_t req_nfds,
                                       int **resp_fds_out, uint32_t *resp_nfds_out,
                                       int32_t *ret_out, uint32_t *resp_len) {
+    // 6-Z558 (rn542 decode): the -71 abort dumps name a CLIENT-CURSOR
+    // desync (ret=0 rlen=0 = mid-frame zeros parsed as a header; ret=0
+    // rlen=100 srv_read=0x80000000 = a mid-payload window parsed as the
+    // read_size). A blocking socketpair cannot short-send, but the guest
+    // OWNS its binder fd and CAN fcntl O_NONBLOCK onto it (minijail fd
+    // sanitization and any guest code) — on a non-blocking socket a large
+    // request fails EAGAIN mid-send, the client bails, the proxy is stuck
+    // mid-frame, and every later exchange on the conn is misframed. The
+    // real binder ioctl is blocking by nature (libbinder never uses
+    // O_NONBLOCK WR_READ); force the socket blocking for the exchange.
+    {
+        int fl = (int)syscall(SYS_fcntl, fd, 3 /*F_GETFL*/);
+        if (fl >= 0 && (fl & O_NONBLOCK)) {
+            syscall(SYS_fcntl, fd, 4 /*F_SETFL*/, fl & ~O_NONBLOCK);
+        }
+    }
     unsigned char hdr[8];
     memcpy(hdr + 0, &cmd, 4);
     memcpy(hdr + 4, &req_len, 4);
