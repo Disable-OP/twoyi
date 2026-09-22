@@ -33412,3 +33412,18 @@ Stage Summary:
 - Remote main: ac2f3ef5. The media-fleet fix rides rn535 (rn534's snapshot 5ac59afb predates it).
 - rn535 decode agenda: (1) the media fleet's restart counts (expect ~1 each instead of ~90-98; the abort message should vanish); (2) post-class_start churn collapse; (3) rung 8/9 reachability in the 900s window (system_server / boot complete); (4) milestone variance vs rn533.
 
+
+---
+Task ID: 1 (session 270 cont.5 — rn534 decoded (variance ±5%, profile repeats; a SECOND spinner binary proved the 6-Z546 gate too narrow); 6-Z546 v2 + rn535 dispatched)
+Agent: Z.ai Code (main implementation agent, session 270)
+
+Work Log:
+- rn534 (run 35775072073, sha 5ac59afb = 6-Z546 armed): rung 7, alive +917s. Milestones zygote +21.3s / SF +50.8s / class_start main +102.9s — ±5% of rn533's +20.5/+48.2/+97.8 — **the rn533 speed profile REPEATS** (6-Z548+6-Z547 stable).
+- The media fleet reproduced (omx x76 / mediaextractor x74 / swcodec x63) — 6-Z549 not in this snapshot, as expected; its fix rides rn535.
+- **THE 6-Z544 INSTRUMENT'S SECOND CATCH**: /vendor/bin/hw/android.hardware.biometrics.fingerprint@2.1-service (pid 4016) spun on fd=5 with **1,146,880 consecutive EOF reads** — a DIFFERENT binary than rn532's qemu-props, and the v1 cmdline gate kept the park pipe DISARMED. 6-Z546 v2 (7404fb52): the arming verdict drops the cmdline term — the mechanical signature (128 EOF-only streaks + kill switch) is the sound gate (the 6-Z110 fake wire never delivers data; a closed peer stays closed; any data resets the streak). Gates test updated.
+- rn535 DISPATCHED (run 35778390988, #537, sha 7404fb52 = 6-Z549 + 6-Z546 v2, single-flight).
+
+Stage Summary:
+- rn535 decode agenda: (1) media fleet restart counts (expect ~1 each vs ~90; the abort message gone); (2) the 6-Z546 engagement on whatever spinner occurs (ARMED → INJECT → PIPE LIVE → ENGAGED; the spin's census shapes freeze); (3) rungs 8/9 reachability; (4) milestone variance.
+- Remote main: 7404fb52. Gates: fmt clean, clippy zero, 1144/1144.
+
