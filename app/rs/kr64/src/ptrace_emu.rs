@@ -4022,7 +4022,15 @@ fn qpipe_proxy_inject(pid: libc::pid_t, rootfs: &str) -> std::io::Result<i32> {
 /// (the live /proc/<pid>/maps is already ENOENT at a fatal-signal EXIT
 /// event — the #212/#213 lesson — so the resolution needs a snapshot
 /// taken while the process was healthy).
-fn z306af_parse_exec_maps(maps: &str) -> Vec<(u64, u64, String)> {
+fn z306af_parse_exec_maps(maps: &str) -> Vec<(u64, u64, u64, String)> {
+    // 6-Z556 (rn537 decode): the row now carries the mapping's FILE OFFSET
+    // (the 3rd /proc/maps field). The rn537 init SIGSEGV was resolved as
+    // `bootstrap/libc.so+0xf6c0` — arithmetically correct against the row
+    // START, but the pc genuinely sat in the bootstrap libc's SECOND
+    // LOAD segment (r-xp, file offset 0x3b000): the true file offset was
+    // 0xf6c0 + 0x3b000 = 0x4a6c0 (strlen+0x10). Every pc/lr/x17 offset
+    // reported for a non-first segment was skewed by its pgoff — the
+    // decode-class fix is to resolve against (pc − start) + pgoff.
     let mut rows = Vec::new();
     for line in maps.lines() {
         if !line.contains(" r-xp ") {
@@ -4035,14 +4043,17 @@ fn z306af_parse_exec_maps(maps: &str) -> Vec<(u64, u64, String)> {
         if path.is_empty() || !path.starts_with('/') {
             continue;
         }
-        let range = line.split(' ').next().unwrap_or("");
+        let mut fields = line.split_whitespace();
+        let range = fields.next().unwrap_or("");
+        let _perms = fields.next().unwrap_or("");
+        let pgoff = u64::from_str_radix(fields.next().unwrap_or("0"), 16).unwrap_or(0);
         let mut se = range.splitn(2, '-');
         let parsed = match (se.next(), se.next()) {
             (Some(s), Some(e)) => (u64::from_str_radix(s, 16), u64::from_str_radix(e, 16)),
             _ => continue,
         };
         if let (Ok(s), Ok(e)) = parsed {
-            rows.push((s, e, path.to_string()));
+            rows.push((s, e, pgoff, path.to_string()));
             if rows.len() >= 240 {
                 break;
             }
@@ -4052,10 +4063,14 @@ fn z306af_parse_exec_maps(maps: &str) -> Vec<(u64, u64, String)> {
 }
 
 /// 6-Z306af-d: resolve a pc against a parsed snapshot.
-fn z306af_resolve_pc(rows: &[(u64, u64, String)], pc: u64) -> Option<String> {
+/// 6-Z556: the printed offset is FILE-relative — (pc − start) + pgoff —
+/// so non-first LOAD segments (pgoff ≠ 0) resolve to the true file
+/// offset instead of the segment-window offset (the rn537
+/// bootstrap/libc.so strlen mis-offset class).
+fn z306af_resolve_pc(rows: &[(u64, u64, u64, String)], pc: u64) -> Option<String> {
     rows.iter()
-        .find(|(s, e, _)| pc >= *s && pc < *e)
-        .map(|(s, _, p)| format!("{}+{:#x}", p, pc - s))
+        .find(|(s, e, _, _)| pc >= *s && pc < *e)
+        .map(|(s, _, pgoff, p)| format!("{}+{:#x}", p, pc - s + pgoff))
 }
 
 /// 6-Z515 (pure): the compact fatal-signal module-attribution note —
@@ -4070,7 +4085,7 @@ fn z306af_resolve_pc(rows: &[(u64, u64, String)], pc: u64) -> Option<String> {
 /// the next decode names the dying module outright instead of grepping
 /// the raw maps by hand.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-fn z515_fatal_resolve_note(rows: &[(u64, u64, String)], pc: u64, lr: u64, x17: u64) -> String {
+fn z515_fatal_resolve_note(rows: &[(u64, u64, u64, String)], pc: u64, lr: u64, x17: u64) -> String {
     let n = |v: u64| z306af_resolve_pc(rows, v).unwrap_or_else(|| format!("{v:#x}"));
     format!("pc={} lr={} x17={}", n(pc), n(lr), n(x17))
 }
@@ -15271,7 +15286,7 @@ fn z446_mem_window_line(pid: libc::pid_t, uaddr: u64) -> Option<String> {
 // snapshot when the live maps read fails. ASLR is stable for a
 // process's lifetime, so the first-sighting exec rows resolve the
 // death's pc/lr/x17 honestly (the line notes the provenance).
-type Z515BSnapshots = std::collections::HashMap<libc::pid_t, Vec<(u64, u64, String)>>;
+type Z515BSnapshots = std::collections::HashMap<libc::pid_t, Vec<(u64, u64, u64, String)>>;
 
 const Z515B_SNAPSHOT_CAP: usize = 64;
 
@@ -15285,7 +15300,7 @@ fn z515b_snapshot_store() -> &'static std::sync::Mutex<Z515BSnapshots> {
 fn z515b_snapshot_insert(
     cache: &mut Z515BSnapshots,
     pid: libc::pid_t,
-    rows: Vec<(u64, u64, String)>,
+    rows: Vec<(u64, u64, u64, String)>,
 ) -> bool {
     if cache.contains_key(&pid) || cache.len() >= Z515B_SNAPSHOT_CAP {
         return false;
@@ -15317,7 +15332,7 @@ fn z515b_snapshot_populate(pid: libc::pid_t) {
 /// resolve — the x86_64 lib build never references it; kept
 /// host-independent so the z515b tests exercise the same code.)
 #[allow(dead_code)]
-fn z515b_snapshot_lookup(pid: libc::pid_t) -> Option<Vec<(u64, u64, String)>> {
+fn z515b_snapshot_lookup(pid: libc::pid_t) -> Option<Vec<(u64, u64, u64, String)>> {
     z515b_snapshot_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -23515,8 +23530,10 @@ pub fn run_ptrace_loop(
     // hook). At the fatal-signal EXIT event the live
     // /proc/<pid>/maps is already ENOENT, so the crash pc resolves
     // against this snapshot instead. Executable file-backed rows only.
-    let mut z306af_maps_cache: std::collections::HashMap<libc::pid_t, Vec<(u64, u64, String)>> =
-        std::collections::HashMap::new();
+    let mut z306af_maps_cache: std::collections::HashMap<
+        libc::pid_t,
+        Vec<(u64, u64, u64, String)>,
+    > = std::collections::HashMap::new();
     // 6-Z306af-g: pids that just NAMED an '[anon:abort message]' VMA via
     // PR_SET_VMA (addr, len) — the message content is written by bionic
     // AFTER the prctl returns, so it is read at the next traced ENTRY.
@@ -27388,7 +27405,7 @@ pub fn run_ptrace_loop(
                                                 // Snapshot rows for the FP-chain
                                                 // walk (own, else the group
                                                 // leader's — same address space).
-                                                let af_snap_rows: Vec<(u64, u64, String)> =
+                                                let af_snap_rows: Vec<(u64, u64, u64, String)> =
                                                     z306af_maps_cache
                                                         .get(&pid)
                                                         .or_else(|| {
@@ -34728,6 +34745,48 @@ pub fn run_ptrace_loop(
                                 tail.len(),
                                 format_syscall_buffer(&tail, Some(abi))
                             ));
+                            // 6-Z551 (rn537 decode): init's InitFatalReboot
+                            // SIGSEGV (bootstrap-libc strlen(NULL) from the
+                            // init+0x37e60 fmt-adjacent call site) left the
+                            // ARGUMENT of the fatal call unnamed — the
+                            // last-50 ring carries syscall numbers only, and
+                            // the 6-Z515 pc resolve mis-attributed the
+                            // module base (segment-confusion class). Dump
+                            // the FULL register file at the dying init's
+                            // exit stop: x0..x30 + sp + pc — x0..x3 of the
+                            // last syscalls + the callee-saved chain name
+                            // the failing string/arg in one decode. Once
+                            // per boot (the exit is terminal for init).
+                            {
+                                let n_words = if cfg!(target_arch = "aarch64") {
+                                    33usize // x0..x30 + sp + pc (user_pt_regs)
+                                } else {
+                                    27usize // x86_64 user_regs_struct prefix
+                                };
+                                let regs_ptr = &regs as *const Regs as *const u64;
+                                let mut words: Vec<String> = Vec::with_capacity(n_words);
+                                for i in 0..n_words {
+                                    let v = unsafe { *regs_ptr.add(i) };
+                                    let name = if cfg!(target_arch = "aarch64") {
+                                        if i < 31 {
+                                            format!("x{}", i)
+                                        } else if i == 31 {
+                                            "sp".to_string()
+                                        } else {
+                                            "pc".to_string()
+                                        }
+                                    } else {
+                                        format!("r{}", i)
+                                    };
+                                    words.push(format!("{}={:#x}", name, v));
+                                }
+                                log(&format!(
+                                    "6-Z551: init exit register dump pid={} ({}): {}",
+                                    pid,
+                                    n_words,
+                                    words.join(" ")
+                                ));
+                            }
                         }
                         // ── 6-Z229: fresh-ephemeral-/dev per boot cycle ──
                         //
@@ -35372,7 +35431,51 @@ pub fn run_ptrace_loop(
                                     // continued, i.e. the rewrite's fate is the
                                     // unlogged link (the #97 lesson verbatim).
                                     match ptrace_setregs(pid, &regs, iov_len) {
-                                        Ok(()) => {}
+                                        Ok(()) => {
+                                            // 6-Z553 (rn537 decode): rn537's
+                                            // INJECT returned Ok yet the child
+                                            // still executed READ (the spin
+                                            // continued at the exact cadence;
+                                            // the pipe2 EXIT never arrived, not
+                                            // even the NO-pending-state DIAG).
+                                            // Verify the write STUCK by reading
+                                            // the registers back immediately:
+                                            // a non-pipe2 nr names the
+                                            // setregs-ignored class (kernel
+                                            // phase semantics / a racing
+                                            // reg-state owner) instead of
+                                            // leaving it the unlogged link.
+                                            let mut vr: Regs = unsafe { std::mem::zeroed() };
+                                            match ptrace_getregs(pid, &mut vr) {
+                                                Ok(_) => {
+                                                    let nr_now = get_syscall_num(&vr, &abi);
+                                                    if nr_now != libc::SYS_pipe2 as i64 {
+                                                        static Z553_NOSTICKY:
+                                                            std::sync::atomic::AtomicU64 =
+                                                            std::sync::atomic::AtomicU64::new(0);
+                                                        let k = Z553_NOSTICKY.fetch_add(
+                                                            1,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                        if k < 4 {
+                                                            log(&format!(
+                                                                "6-Z553: z546 INJECT NOT STICKY pid={} — post-setregs nr={} (expected pipe2={}), phase={} — the kernel ignored the rewrite at this stop phase; the read ran unrewritten",
+                                                                pid,
+                                                                nr_now,
+                                                                libc::SYS_pipe2,
+                                                                if z543_is_seccomp_stop { "seccomp-stop" } else { "syscall-stop" }
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log(&format!(
+                                                        "6-Z553: z546 INJECT verify getregs FAILED pid={}: {} (setregs reported Ok)",
+                                                        pid, e
+                                                    ));
+                                                }
+                                            }
+                                        }
                                         Err(e) => {
                                             log(&format!(
                                                 "6-Z546: quiet-channel INJECT setregs FAILED pid={}: {} — the read ran unrewritten; re-arming",
@@ -36269,7 +36372,7 @@ pub fn run_ptrace_loop(
                                         // the region table: the rename-era
                                         // cache for the tgid, else a fresh
                                         // bounded parse
-                                        let z477b_regions_owned: Vec<(u64, u64, String)> =
+                                        let z477b_regions_owned: Vec<(u64, u64, u64, String)> =
                                             match z306af_maps_cache.get(&z477b_tgid) {
                                                 Some(rows) => rows.clone(),
                                                 None => std::fs::read_to_string(format!(
@@ -36282,7 +36385,7 @@ pub fn run_ptrace_loop(
                                         let z477b_regions: Vec<(u64, u64, &str)> =
                                             z477b_regions_owned
                                                 .iter()
-                                                .map(|(s, e, n)| (*s, *e, n.as_str()))
+                                                .map(|(s, e, _, n)| (*s, *e, n.as_str()))
                                                 .collect();
                                         // the FP chain (the aborting thread
                                         // reads its OWN memory — the tracer
@@ -54810,13 +54913,20 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 0xaaaa1000);
         assert_eq!(rows[0].1, 0xaaaa2000);
-        assert_eq!(rows[0].2, "/system/lib64/liba.so");
-        assert_eq!(rows[1].2, "/system/lib64/libb.so");
+        assert_eq!(rows[0].2, 0x1000);
+        assert_eq!(rows[0].3, "/system/lib64/liba.so");
+        assert_eq!(rows[1].2, 0);
+        assert_eq!(rows[1].3, "/system/lib64/libb.so");
     }
 
     #[test]
     fn z306af_resolve_pc_names_library_and_offset() {
-        let rows = vec![(0xaaaa1000, 0xaaaa2000, "/system/lib64/liba.so".to_string())];
+        let rows = vec![(
+            0xaaaa1000,
+            0xaaaa2000,
+            0u64,
+            "/system/lib64/liba.so".to_string(),
+        )];
         assert_eq!(
             z306af_resolve_pc(&rows, 0xaaaa1234).unwrap(),
             "/system/lib64/liba.so+0x234"
@@ -54826,10 +54936,38 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
     }
 
     #[test]
+    fn z306af_resolve_pc_adds_pgoff_for_second_segment_mappings() {
+        // 6-Z556 regression (the rn537 decode): a SECOND LOAD segment maps
+        // file offset 0x3b000 at its own window. The rn537 pc sat 0xf6c0
+        // into that window and the old resolver printed +0xf6c0 — the true
+        // FILE offset was 0xf6c0 + 0x3b000 = 0x4a6c0 (strlen+0x10). The
+        // resolver must add the row's pgoff.
+        let maps =
+            "55559000000-55559200000 r-xp 0003b000 00:01 9  /system/lib64/bootstrap/libc.so\n";
+        let rows = z306af_parse_exec_maps(maps);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, 0x3b000);
+        assert_eq!(
+            z306af_resolve_pc(&rows, 0x5555900f6c0).unwrap(),
+            "/system/lib64/bootstrap/libc.so+0x4a6c0"
+        );
+    }
+
+    #[test]
     fn z515_fatal_resolve_note_names_modules_with_hex_fallback() {
         let rows = vec![
-            (0xaaaa1000, 0xaaaa2000, "/system/lib64/liba.so".to_string()),
-            (0xbbbb0000, 0xbbbb1000, "/system/lib64/libc.so".to_string()),
+            (
+                0xaaaa1000,
+                0xaaaa2000,
+                0u64,
+                "/system/lib64/liba.so".to_string(),
+            ),
+            (
+                0xbbbb0000,
+                0xbbbb1000,
+                0u64,
+                "/system/lib64/libc.so".to_string(),
+            ),
         ];
         // pc + lr fall inside named exec rows; x17 lands in no row → the
         // raw-hex fallback (heap / stack / JIT / dead address space).
@@ -54852,6 +54990,7 @@ cccc0000-cccc2000 r-xp 00000000 00:01 3  /system/lib64/libb.so\n";
         let rows = vec![(
             0xfebeab58e000,
             0xfebeab5e9000,
+            0u64,
             "/data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libandroid_servers.so"
                 .to_string(),
         )];
@@ -65132,15 +65271,15 @@ mod z515b_snapshot_tests {
         assert!(z515b_snapshot_insert(
             &mut c,
             100,
-            vec![(0x1000, 0x2000, "lib.so".into())]
+            vec![(0x1000, 0x2000, 0u64, "lib.so".to_string())]
         ));
         assert!(!z515b_snapshot_insert(
             &mut c,
             100,
-            vec![(0x3000, 0x4000, "x.so".into())]
+            vec![(0x3000, 0x4000, 0u64, "x.so".to_string())]
         ));
         assert_eq!(c.len(), 1);
-        assert_eq!(c.get(&100).unwrap()[0].2, "lib.so");
+        assert_eq!(c.get(&100).unwrap()[0].3, "lib.so");
     }
 
     /// The cap bounds the cache (the fleet cannot grow it unbounded).

@@ -3287,15 +3287,64 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
         return -1;
     }
     if (ret != 0) {
+        // 6-Z552 (rn537 decode): the rn537 EPROTO abort did NOT come from the
+        // rlen>cap branch (the 6-Z549 dump was silent) — the remaining
+        // EPROTO setter on this path is an out-of-range proxy ret (mapped to
+        // EPROTO below). Dump it (budget 8/process): a legitimately-negative
+        // in-range ret should have been mapped honestly; anything else is a
+        // wire/desync signature.
+        if (ret > 0 || ret < -4095) {
+            static unsigned badret_log = 0;
+            if (badret_log < 8) {
+                badret_log++;
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "[twoyi_loader] binder proxy exchange: cmd=0x%08x "
+                         "out-of-range ret=%d rlen=0x%08x -> EPROTO (6-Z552)\n",
+                         cmd, ret, rlen);
+                write_str(2, msg);
+            }
+        }
         errno = (ret <= 0 && ret >= -4095) ? -ret : EPROTO;
         free(resp);
         return -1;
     }
     // Response payload: [u32 read_size][read_size bytes of BR_* stream].
-    if (rlen < 4) { free(resp); errno = EPROTO; return -1; }
+    if (rlen < 4) {
+        // 6-Z552: ret==0 with a <4-byte payload is structurally impossible
+        // from a healthy proxy (every WRITE_READ Resp carries >= the
+        // read_size u32) — a misframed-stream signature (the rn537 abort
+        // class: silent EPROTO with no dump). Budget 8/process.
+        static unsigned shortlen_log = 0;
+        if (shortlen_log < 8) {
+            shortlen_log++;
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] binder proxy exchange: cmd=0x%08x ret=0 "
+                     "rlen=%u < 4 -> EPROTO (misframed stream, 6-Z552)\n",
+                     cmd, rlen);
+            write_str(2, msg);
+        }
+        free(resp);
+        errno = EPROTO;
+        return -1;
+    }
     uint32_t srv_read;
     memcpy(&srv_read, resp + 0, 4);
     if (4ull + (uint64_t)srv_read > (uint64_t)rlen) {
+        // 6-Z552: the claimed stream size exceeds the frame — the second
+        // silent EPROTO branch (the rn537 abort class). Budget 8/process.
+        static unsigned badframe_log = 0;
+        if (badframe_log < 8) {
+            badframe_log++;
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] binder proxy exchange: cmd=0x%08x ret=0 "
+                     "rlen=%u srv_read=%u (4+srv_read>rlen) -> EPROTO "
+                     "(misframed stream, 6-Z552)\n",
+                     cmd, rlen, srv_read);
+            write_str(2, msg);
+        }
         free(resp);
         errno = EPROTO;
         return -1;
