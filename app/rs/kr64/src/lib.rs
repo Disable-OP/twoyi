@@ -66,6 +66,7 @@ pub mod compat_paths;
 pub mod devices;
 pub mod haptics;
 pub mod hostbridge;
+pub mod init_patch;
 pub mod mount_mgr;
 pub mod proc_emu;
 pub mod ptrace_emu;
@@ -6714,6 +6715,35 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     if let Err(e) = proc_emu::populate_proc(&cfg.rootfs, cpu_count, mem_mb) {
         warning!("[KR64] failed to populate /proc: {}", e);
     }
+
+    // ---------------------------------------------------------------
+    // Step 3.1 (6-Z537): neuter the guest init's
+    // SetHighestAvailableOptionValue LOG(FATAL) branches.
+    //
+    // Every boot since rn510 died at rung 3: init's SetKptrRestrict
+    // action runs a write/verify loop on /proc/sys/kernel/kptr_restrict
+    // whose C++ streambuf verify diverges under the emulator (PROVEN
+    // byte-coherent at the syscall surface by the 6-Z534/536 journals —
+    // the iters 3/2 verifies are served from libc++'s stale buffer
+    // without any syscall), the loop exhausts 4→3→2, and the
+    // LOG(FATAL) aborts init into InitFatalReboot. MAXVALUE=4 is a
+    // compile-time constant, so no file content can prevent the loop.
+    //
+    // This patch rewrites the in-edge branch that enters each FATAL
+    // emit block (kptr_restrict + the mmap-entropy twin) into an
+    // unconditional jump to the shared return tail — a strict-safety
+    // rewrite: on a passing verify the branch is never taken (the
+    // success path is bit-identical); on a failing verify the boot now
+    // continues instead of aborting. Validated offline against the REAL
+    // android11-aosp-arm64-rsr1 init (both FATAL emits located and the
+    // rewrite hand-checked).
+    //
+    // Runs BEFORE the guest spawns (the execve of /system/bin/init at
+    // ~+590ms stages the file bytes through 6-Z102 — the patch must be
+    // on disk by then) and is idempotent. Non-fatal on any skip: the
+    // boot behaves exactly as before.
+    // ---------------------------------------------------------------
+    init_patch::patch_guest_init_fatal_branches(&cfg.rootfs, &cfg.data_dir, &cfg.init_path);
 
     // ---------------------------------------------------------------
     // Step 3.5: materialise Samsung GameSDK compatibility paths.
