@@ -33384,3 +33384,18 @@ Stage Summary:
 - **NEXT SESSION'S RANK-1: fix the media fleet's binder open** — decode why the 6-Z305s injection skipped the media-class execves (a class/phase/budget gate in the execve arm — read the gate, widen it or add a 6-Z110-style /dev/binder open fake for unshimmed processes: open → a tracked wire fd whose ioctls map onto the proxy protocol the way the shim does). Expected payoff: the 280-restart churn dies and rungs 8/9 (system_server, boot complete) become reachable in the 900s window.
 - rn534 decode agenda: (1) milestone variance vs rn533 (zygote ~+20s / SF ~+48s / class_start main ~+98s); (2) 6-Z546 engagement if the spin recurs; (3) media fleet restart counts (expect ~x90 each — the rn533 baseline).
 
+
+---
+Task ID: 1 (session 270 cont.3 — media-fleet failure LOCALIZED: the shim aborts within 2ms AFTER a successful proxy IDENT, before the first WRITE_READ — the BINDER_VERSION window)
+Agent: Z.ai Code (main implementation agent, session 270)
+
+Work Log:
+- CORRECTION to the cont.2 note: the 6-Z305s LD_PRELOAD injection did NOT stop at +45s — the success log caps at 64 lines (Z305S_OK n<64), the injections continued silently (0 VERIFY/setregs/scratch/envp-FAIL lines in the whole log). The media fleet DID get the shim.
+- The fleet's proxy conns EXIST: mediaextractor pid 3763 = conn=114 (dev=binder), vendor.media.omx pid 3822 = conn=121 (dev=vndbinder); 432 proxy connections, 339 announced pids, NO cap drops.
+- conn=114 timeline: connect +84.726s → IDENT v2 announced (pid=3763 tid=3763) → **error exit "Connection reset by peer" at +84.728s** — ZERO WRITE_READ frames. The abort-vma capture ("Binder driver '/dev/binder' could not be opened. Terminating.") at +84.8s. THE ABORT WINDOW: after IDENT-ack, before the first WRITE_READ — i.e. the BINDER_VERSION ioctl exchange (invisible in the proxy log: response logging gates on req.cmd == BINDER_WRITE_READ).
+- Shim flow mapped (twoyi_loader_shlib.c): open("/dev/binder") ENXIO → binder_open_fallback → binder_proxy_connect (connect + IDENT + ACK drain → returns the socket fd) → ProcessState::open_driver does ioctl(fd, BINDER_VERSION) via the shim's ioctl hook → a failure there closes fd → ProcessState ctor LOG_ALWAYS_FATAL("Binder driver ... could not be opened") → abort → the RST we see.
+
+Stage Summary:
+- NEXT SESSION (rank-1 execution plan): instrument the VERSION exchange — (a) the proxy's dispatch_request BINDER_VERSION arm gets a bounded log (cmd, ret, payload length), (b) the shim's ioctl hook logs the VERSION send/recv outcome (bounded, to stderr). One boot (rn535) names the failing side; then fix accordingly (suspects: the VERSION wire shape for aarch64 shims, the ack-length handling, or the per-thread conn table missing the just-created conn).
+- rn534 (in flight) decode agenda unchanged; the media fleet will reproduce there (the failure is deterministic per the rn533 data).
+
