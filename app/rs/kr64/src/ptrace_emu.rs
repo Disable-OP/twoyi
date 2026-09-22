@@ -23348,6 +23348,19 @@ pub fn run_ptrace_loop(
     // throttle state (see the accept4 EXIT handler for the full story).
     let mut accept4_einval_streak: std::collections::HashMap<libc::pid_t, u64> =
         std::collections::HashMap::new();
+    // 6-Z544: consecutive EMPTY (ret==0 EOF / ret==-EAGAIN) read-class
+    // returns per (pid, fd) — the read-spin throttle state. The rn528
+    // census's #1 remaining stop generator: ONE pid burned 282,624 stops
+    // (141k read pairs) while the boot ran — at EXIT the fd comes from
+    // the pending_entry_fd ENTRY stash (aarch64 EXIT clobbers x1-x5);
+    // at >=128 consecutive empties the tracer parks 10ms per spin
+    // iteration (the tracee is STOPPED during the park — it burns no
+    // CPU, and the spin's stop share drops ~4x). Any ret>0 resets the
+    // streak (a real data stream never parks). The engagement line
+    // names the fd's /proc target ONCE so a mispark is visible in the
+    // decode.
+    let mut z544_read_streak: std::collections::HashMap<(libc::pid_t, i64), u64> =
+        std::collections::HashMap::new();
     // 6-Z148: RIP-sampling diagnostic state for the post-execve prctl
     // spin (run 32843174575: 16,326 consecutive prctls, ZERO other
     // syscalls — a pure userspace allocation loop; the rip + the scudo
@@ -45875,6 +45888,56 @@ pub fn run_ptrace_loop(
                     // (x86_64/aarch64) / 364 (i386). The previous literal
                     // 242 matched sched_getaffinity/mq_timedsend — an
                     // unrelated EINVAL loop was mislabeled + parked.
+                    // 6-Z544: THE EMPTY-READ SPIN BREAKER — the read-class
+                    // companion of the 6-Z177 accept4 park. The rn528 census:
+                    // the #1 remaining stop generator after the 6-Z543 filter
+                    // is read pairs (141k on ONE (pid,fd)). Consecutive EOF/
+                    // EAGAIN reads on the same fd are a spin; the park gives
+                    // the core back while keeping the loop honest.
+                    if past_first_execve
+                        && ((abi.read != -1 && syscall_num == abi.read)
+                            || (abi.pread64 != -1 && syscall_num == abi.pread64)
+                            || syscall_num == 65)
+                    // readv (aarch64)
+                    {
+                        let z544_fd = pending_entry_fd
+                            .get(&pid)
+                            .map(|(nr, f)| if *nr == syscall_num { *f } else { -1 })
+                            .unwrap_or(-1);
+                        if ret == 0 || ret == -11 {
+                            let n = z544_read_streak
+                                .entry((pid, z544_fd))
+                                .and_modify(|c| *c = c.saturating_add(1))
+                                .or_insert(1);
+                            if *n == 128 {
+                                let target =
+                                    std::fs::read_link(format!("/proc/{}/fd/{}", pid, z544_fd))
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_else(|_| "<unreadable>".to_string());
+                                log(&format!(
+                                    "6-Z544: empty-read spin detected pid={} fd={} target={} (128 consecutive EOF/EAGAIN reads) — engaging 10ms tracer-side park per iteration",
+                                    pid, z544_fd, target
+                                ));
+                            }
+                            if *n >= 128 {
+                                // Throttle: 10ms park (~100 wakeups/s max);
+                                // heartbeat every 8192 spin iterations.
+                                if *n % 8192 == 0 {
+                                    log(&format!(
+                                        "6-Z544: empty-read spin still running pid={} fd={} ({} consecutive)",
+                                        pid, z544_fd, n
+                                    ));
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                        } else {
+                            // A real data return (or a hard error other than
+                            // EAGAIN) resets the streak — stream readers and
+                            // one-shot EOF-then-close readers never park.
+                            z544_read_streak.remove(&(pid, z544_fd));
+                        }
+                    }
+
                     if past_first_execve && (syscall_num == 288 || syscall_num == 364) && ret == -22
                     {
                         let n = accept4_einval_streak
