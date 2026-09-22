@@ -21240,6 +21240,27 @@ pub(crate) fn z543_trace_nrs() -> Vec<i64> {
     )
 }
 
+/// 6-Z546 (pure): the kill-switch parse — `KR64_PARK_PIPE=0` disables
+/// the quiet-channel park pipe; everything else enables.
+pub(crate) fn z546_park_pipe_enabled_from_env() -> bool {
+    std::env::var("KR64_PARK_PIPE").ok().as_deref() != Some("0")
+}
+
+/// 6-Z546 (pure): the arming verdict for one 6-Z544 spin engagement.
+/// Conservative by design: ONLY EOF-only streaks (ret==0 fakes — the
+/// 6-Z110 tracked-wire EOF answer; an EAGAIN streak is a DIFFERENT bug
+/// class on a REAL nonblocking fd whose protocol answer is not ours to
+/// rewrite), ONLY the twice-observed spinner binary (rn530 + rn532 both
+/// named /vendor/bin/qemu-props), and only when the kill switch allows.
+pub(crate) fn z546_arm_verdict(
+    ret_eof: bool,
+    eagain_count: u64,
+    cmdline: &str,
+    enabled: bool,
+) -> bool {
+    ret_eof && eagain_count == 0 && enabled && cmdline.contains("qemu-props")
+}
+
 /// 6-Z542: the last SETPROP2 client-send records — (boot-ms, pid, name).
 /// The klog-timeline arm correlates init's
 /// `sys_prop: recv data is not properly obtained.` /
@@ -23378,6 +23399,35 @@ pub fn run_ptrace_loop(
     // streak. The engagement line names the fd's /proc target AND the
     // process cmdline so the decode can answer WHY the guest spins.
     let mut z544_read_streak: std::collections::HashMap<(libc::pid_t, i64), (u64, u64)> =
+        std::collections::HashMap::new();
+    // 6-Z546: THE QUIET-CHANNEL PARK PIPE — the spin's PROTOCOL answer.
+    // The 6-Z110 tracked-wire read fake answers EOF forever, and the
+    // rn530/rn532 spinner (/vendor/bin/qemu-props, fd=3, 40,960+ EOFs by
+    // +29s — the 6-Z544 instrument named it) retries forever: ~9k
+    // read-pairs/s of pure tracer burn for a process whose answer will
+    // never come. The rn530 lesson forbids TRACER-side parks (the
+    // single-threaded tracer sleeps the whole guest); the kernel-true
+    // answer is to make the read park IN-KERNEL: inject a REAL pipe into
+    // the child (one syscall-rewrite at the spin's own read ENTRY —
+    // x8=pipe2, arg1=the scratch buffer, the 6-Z9 rewrite pattern), read
+    // the two fds back at the pipe2 EXIT, then redirect every subsequent
+    // spin read's fd argument to the pipe's read-end. The write-end sits
+    // in the child's OWN fd table (never written, never closed — the
+    // 6-Z441 "never write, never EOF" precedent), so the read blocks in
+    // kernel until the child dies: ZERO tracer interaction, ZERO CPU,
+    // the spin thread becomes a sleeping thread. Gated HARD: only the
+    // 6-Z544-detected spin class (streak=128 EOF + cmdline contains
+    // 'qemu-props'), KR64_PARK_PIPE=0 disables, one pipe per pid.
+    // pids whose next spin-class read ENTRY is rewritten to pipe2
+    // (the injection is in flight).
+    let mut z546_arm: std::collections::HashSet<libc::pid_t> = std::collections::HashSet::new();
+    // pid → (spin_fd, scratch_buf_addr): the pipe2 rewrite is in flight;
+    // the EXIT side reads the two fds back from this buffer.
+    let mut z546_pending: std::collections::HashMap<libc::pid_t, (i64, u64)> =
+        std::collections::HashMap::new();
+    // pid → (r_fd, w_fd, spin_fd): the pipe lives in the child's table;
+    // every subsequent read of spin_fd is redirected to r_fd (blocks).
+    let mut z546_park: std::collections::HashMap<libc::pid_t, (i64, i64, i64)> =
         std::collections::HashMap::new();
     // 6-Z148: RIP-sampling diagnostic state for the post-execve prctl
     // spin (run 32843174575: 16,326 consecutive prctls, ZERO other
@@ -25589,6 +25639,12 @@ pub fn run_ptrace_loop(
             }
             // 6-Z417 hygiene: the dead pid's census dies with it.
             z417_stop_census.remove(&pid);
+            // 6-Z546 hygiene: the dead pid's park-pipe state dies with it
+            // (a pid-recycled successor must never inherit an injection
+            // in flight or a park mapping pointing at ITS fds).
+            z546_arm.remove(&pid);
+            z546_pending.remove(&pid);
+            z546_park.remove(&pid);
             // ── Task 6-Z110: per-pid fd-table cleanup ──
             //
             // Drop the dead pid's per-pid fd-table state so a
@@ -35225,6 +35281,96 @@ pub fn run_ptrace_loop(
                     }
 
                     match syscall_num {
+                        // ── 6-Z546: THE QUIET-CHANNEL PARK PIPE (the
+                        // spin's protocol answer) — ENTRY rewrite path ──
+                        //
+                        // Two one-shot register surgeries, both on the
+                        // spin process's OWN read syscall, both using the
+                        // proven 6-Z9/6-Z257 rewrite pattern (the kernel
+                        // executes what we wrote, the guest's libc reads
+                        // whatever the syscall returned):
+                        //
+                        // ARMED (the 6-Z544 engagement armed this pid):
+                        // rewrite the spin's read(fd=3, buf, len) to
+                        // pipe2(scratch_buf, 0). The kernel allocates a
+                        // REAL pipe in the child's fd table; the guest's
+                        // read() sees rax=0 — one harmless EOF-look (its
+                        // loop just retries). The EXIT side reads the two
+                        // fds back from the scratch buffer.
+                        //
+                        // PARKED (the pipe exists): rewrite the spin
+                        // read's fd argument to the pipe's READ-END. The
+                        // write-end lives in the child's own table, never
+                        // written, never closed (the 6-Z441 precedent) —
+                        // the read blocks IN-KERNEL until the child dies.
+                        // Zero tracer stops, zero CPU: the spin thread
+                        // becomes a sleeping thread. The guest's fd=3
+                        // socket stays open (harmless).
+                        //
+                        // This arm sits ABOVE every other read arm so a
+                        // rewritten stop never receives read-treatment;
+                        // when not armed/parked the guard is false and
+                        // dispatch falls through unchanged.
+                        n if abi.read != -1
+                            && n == abi.read
+                            && past_first_execve
+                            && (z546_arm.contains(&pid)
+                                || z546_park.get(&pid).map_or(false, |&(_, _, sf)| {
+                                    sf == get_syscall_arg(&regs, abi.reg_arg1) as i64
+                                })) =>
+                        {
+                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            if let Some(&(r_fd, _w_fd, spin_fd)) = z546_park.get(&pid) {
+                                if fd == spin_fd {
+                                    // Parked: redirect the read to the pipe's
+                                    // read-end. The real kernel read blocks;
+                                    // the tracked-wire EXIT fake never fires
+                                    // (r_fd is not in fake_propserv_fds, and
+                                    // the EXIT never arrives while blocked).
+                                    set_syscall_arg(&mut regs, abi.reg_arg1, r_fd as u64);
+                                    let _ = ptrace_setregs(pid, &regs, iov_len);
+                                    // Keep the ENTRY stash truthful for the
+                                    // EXIT consumers (the redirected read).
+                                    pending_entry_fd.insert(pid, (abi.read, r_fd));
+                                    static Z546_ENGAGED: std::sync::atomic::AtomicU64 =
+                                        std::sync::atomic::AtomicU64::new(0);
+                                    let k = Z546_ENGAGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if k < 4 {
+                                        log(&format!(
+                                            "6-Z546: quiet-channel ENGAGED pid={} spin_fd={} -> pipe_read={} (the read parks IN-KERNEL; write-end={} lives in the child, never written never closed — the 6-Z441 precedent; zero tracer cost)",
+                                            pid, spin_fd, r_fd, _w_fd
+                                        ));
+                                    }
+                                }
+                            } else if z546_arm.contains(&pid) {
+                                // Armed: this read ENTRY becomes the pipe2
+                                // injection. The scratch area was just
+                                // re-reserved this ENTRY (z431-gated); if
+                                // scratch is DISABLED (addr 0), defer — the
+                                // spin retries and the next ENTRY retries.
+                                if scratch_addr != 0 {
+                                    z546_arm.remove(&pid);
+                                    z546_pending.insert(pid, (fd, scratch_addr));
+                                    // Overwrite the pending_entry_fd stash
+                                    // with the REWRITTEN shape so no stale
+                                    // (read, fd) record survives for EXIT
+                                    // consumers (the doc: consumers match
+                                    // on the syscall number — (59, scratch)
+                                    // matches no read consumer).
+                                    pending_entry_fd
+                                        .insert(pid, (libc::SYS_pipe2 as i64, scratch_addr as i64));
+                                    set_syscall_num(&mut regs, &abi, libc::SYS_pipe2 as i64);
+                                    set_syscall_arg(&mut regs, abi.reg_arg1, scratch_addr);
+                                    set_syscall_arg(&mut regs, abi.reg_arg2, 0);
+                                    let _ = ptrace_setregs(pid, &regs, iov_len);
+                                    log(&format!(
+                                        "6-Z546: quiet-channel INJECT pid={} — read(fd={}) rewritten to pipe2(scratch={:#x}, 0) in the child (one EOF-look for the guest; fds read back at the pipe2 EXIT)",
+                                        pid, fd, scratch_addr
+                                    ));
+                                }
+                            }
+                        }
                         n if (abi.recvmsg_nr != -1 && n == abi.recvmsg_nr)
                             || (abi.recvfrom_nr != -1 && n == abi.recvfrom_nr) =>
                         {
@@ -45924,6 +46070,35 @@ pub fn run_ptrace_loop(
                     // breakdown (the 6-Z110 tracked-wire fake returns EOF
                     // BY DESIGN — parking on it punished the guest for the
                     // emulator's own protocol answer).
+                    //
+                    // 6-Z546: THE PIPE2 EXIT — the injection's second half.
+                    // The rewritten pipe2 (from the read-ENTRY arm) just
+                    // executed in the child; its two fds sit in the scratch
+                    // buffer this ENTRY stashed. Read them back, record the
+                    // park mapping (r_fd, w_fd, spin_fd) — the next read of
+                    // spin_fd is redirected to r_fd and parks in-kernel.
+                    if past_first_execve && syscall_num == libc::SYS_pipe2 as i64 && ret == 0 {
+                        if let Some((spin_fd, buf_addr)) = z546_pending.remove(&pid) {
+                            let r_fd = read_child_u32(pid, buf_addr)
+                                .map(|v| v as i64)
+                                .unwrap_or(-1);
+                            let w_fd = read_child_u32(pid, buf_addr + 4)
+                                .map(|v| v as i64)
+                                .unwrap_or(-1);
+                            if r_fd >= 0 && w_fd >= 0 {
+                                z546_park.insert(pid, (r_fd, w_fd, spin_fd));
+                                log(&format!(
+                                    "6-Z546: quiet-channel PIPE LIVE pid={} r={} w={} (spin_fd={} — its next read is redirected and parks in-kernel)",
+                                    pid, r_fd, w_fd, spin_fd
+                                ));
+                            } else {
+                                log(&format!(
+                                    "6-Z546: quiet-channel READBACK FAILED pid={} (scratch={:#x}) — the spin continues, instrument only",
+                                    pid, buf_addr
+                                ));
+                            }
+                        }
+                    }
                     if past_first_execve
                         && ((abi.read != -1 && syscall_num == abi.read)
                             || (abi.pread64 != -1 && syscall_num == abi.pread64)
@@ -45957,6 +46132,38 @@ pub fn run_ptrace_loop(
                                     "6-Z544: empty-read spin detected pid={} fd={} target={} cmd='{}' (128 consecutive: {} EOF + {} EAGAIN) — instrument only, no park (the rn530 lesson)",
                                     pid, z544_fd, target, cmdline, e.0, e.1
                                 ));
+                                // 6-Z546: THE QUIET-CHANNEL ARM — the spin
+                                // class named by the engagement line (the
+                                // rn530/rn532 spinner) gets the park pipe:
+                                // the next read ENTRY of a tracked-wire fd
+                                // is rewritten to pipe2, and every read of
+                                // the spin fd afterwards parks IN-KERNEL on
+                                // a never-written pipe. Gated: EOF-only
+                                // streaks (ret==0 fakes), the observed
+                                // spinner binary, and the KR64_PARK_PIPE=0
+                                // kill switch. NOT armed for EAGAIN streaks
+                                // (a nonblocking read spinning on EAGAIN is
+                                // a DIFFERENT bug class — the fd is real
+                                // and its protocol answer is not ours to
+                                // rewrite yet).
+                                static Z546_ARMED_LOGGED: std::sync::atomic::AtomicU64 =
+                                    std::sync::atomic::AtomicU64::new(0);
+                                if z546_arm_verdict(
+                                    ret == 0,
+                                    e.1,
+                                    &cmdline,
+                                    z546_park_pipe_enabled_from_env(),
+                                ) {
+                                    let a = Z546_ARMED_LOGGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    z546_arm.insert(pid);
+                                    if a < 8 {
+                                        log(&format!(
+                                            "6-Z546: quiet-channel ARMED pid={} fd={} cmd='{}' — the next read ENTRY of a tracked-wire fd is rewritten to pipe2; subsequent spin reads park IN-KERNEL on a never-written pipe (KR64_PARK_PIPE=0 disables)",
+                                            pid, z544_fd, cmdline
+                                        ));
+                                    }
+                                }
                             }
                             if n % 8192 == 0 && n > 0 {
                                 log(&format!(
@@ -53382,6 +53589,27 @@ mod tests {
                 "nr {nr} (gettid/getuid/clock/nanosleep/yield/madvise/brk family) must stay UNTRACED by the 6-Z543 filter"
             );
         }
+    }
+
+    // ── 6-Z546: the quiet-channel park-pipe GATES (the semantic lock) ──
+    //
+    // The register surgeries themselves are boot-validated (rn533+);
+    // what a unit test CAN lock is the arming decision — the blast
+    // radius of the mechanism is decided entirely by this verdict.
+    #[test]
+    fn z546_arm_verdict_gates() {
+        // The rn532 shape: EOF-only streak, the observed spinner → ARM.
+        assert!(z546_arm_verdict(true, 0, "/vendor/bin/qemu-props\0", true));
+        // An EAGAIN component = a REAL nonblocking fd — never armed.
+        assert!(!z546_arm_verdict(true, 1, "/vendor/bin/qemu-props", true));
+        // A different binary (the spinner class is twice-observed as
+        // qemu-props only) — never armed.
+        assert!(!z546_arm_verdict(true, 0, "logd", true));
+        assert!(!z546_arm_verdict(true, 0, "", true));
+        // Not an EOF fake at all — never armed.
+        assert!(!z546_arm_verdict(false, 0, "/vendor/bin/qemu-props", true));
+        // The kill switch.
+        assert!(!z546_arm_verdict(true, 0, "/vendor/bin/qemu-props", false));
     }
 
     // The completeness MECHANISM must hold on every arch: the x86_64
