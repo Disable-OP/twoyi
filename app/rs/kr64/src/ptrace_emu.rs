@@ -28572,22 +28572,20 @@ pub fn run_ptrace_loop(
 
                 if is_entry {
                     // ── Syscall ENTRY ──
-                    in_syscall = true;
-
-                    // ── 6-Z543: the PHASE-2 CONTINUATION guard ──
-                    //
-                    // A seccomp stop that arrives while the tracker says
-                    // an ENTRY was already consumed (in_syscall==true) is
-                    // the filter's phase-2 stop of a TIF-armed entry — the
-                    // restarted-ENTRY double (see the phase block above):
-                    // the 0x80 ENTRY ran the arms, then the kernel's
-                    // seccomp check ALSO matched and stopped. Running the
-                    // ENTRY arms again would double-apply every rewrite
-                    // (path translation, getpid proxies, stashes). The
-                    // arms are SKIPPED; the stop is consumed and the
-                    // loop-top PTRACE_SYSCALL resume (in_syscall==true)
-                    // carries the syscall to its exit.
-                    if z543_active_now && z543_is_seccomp_stop {
+                    // 6-Z543: the PHASE-2 CONTINUATION guard — BEFORE the
+                    // tracker update. The rn529b lesson: this guard was
+                    // originally placed AFTER `in_syscall = true`, read the
+                    // freshly-set value, and skipped EVERY seccomp entry —
+                    // zero entry arms ran post-flip, no path translation,
+                    // init died at exit(6) 13ms after the flip. The guard
+                    // must read the tracker state AS THE STOP ARRIVED: a
+                    // seccomp stop with the tracker ALREADY true is the
+                    // filter's phase-2 stop of a TIF-armed 0x80 entry (the
+                    // restarted-ENTRY double — the 0x80 ENTRY ran the arms,
+                    // then the kernel's seccomp check ALSO matched and
+                    // stopped); a seccomp stop with the tracker false is a
+                    // FRESH entry and must run the arms.
+                    if z543_active_now && z543_is_seccomp_stop && in_syscall {
                         static Z543_PHASE2_SKIPS: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
                         let n =
@@ -28598,8 +28596,10 @@ pub fn run_ptrace_loop(
                                 pid, syscall_num, n + 1
                             ));
                         }
+                        in_syscall = true;
                         continue;
                     }
+                    in_syscall = true;
 
                     // ── 6-Z517: the CONNECT ARG CAPTURE (the ENTRY half) ──
                     //
