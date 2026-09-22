@@ -33443,3 +33443,16 @@ Stage Summary:
 - rn536 agenda: (1) the 6-Z546 INJECT setregs verdict (Ok vs the errno) + the pipe2-EXIT-nostate line → the park-pipe mechanism completes or names its blocker; (2) the fleet's EPROTO: instrument bp_exchange (shim) — one budgeted line per failed exchange naming wire/ret/errno — then fix the desync source; (3) milestone variance.
 - Session totals (270): 5 mechanisms landed (6-Z547/6-Z548/6-Z546+diags/6-Z549), runs rn532-535 decoded, gates 1144/1144 throughout, milestones now −12/−13/−41% vs rn531 with the real filter.
 
+
+---
+Task ID: 1 (session 270 cont.7 — the EPROTO branch instrumented (6-Z549 DIAG): the rn535 abort maps to bp_exchange_anc's rlen>BP_MAX_FRAME — desync-vs-giant-parcel dump rides rn537)
+Agent: Z.ai Code (main implementation agent, session 270)
+
+Work Log:
+- Traced the fleet's "-71 EPROTO" to its ONLY source on the exchange path: bp_exchange_anc's `rlen > BP_MAX_FRAME` branch (errno=EPROTO). Both sides cap at 1 MiB (shim BP_MAX_FRAME; binder.rs read_frame MAX_PAYLOAD).
+- Instrumented (aa19d9ba): the branch dumps cmd/rlen/ret hex (budget 8/process) — a garbage pair names a wire DESYNC (the 6-Z355 fd-tail accounting class — the fleet is the first fd-heavy client class past the open wall), a huge-but-plausible rlen names a real giant parcel.
+
+Stage Summary:
+- rn536 (in flight) carries the 6-Z546 injection diagnostics; rn537 will carry this EPROTO dump.
+- Remote main: aa19d9ba.
+
