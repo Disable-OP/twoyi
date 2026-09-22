@@ -11944,22 +11944,30 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 let nrs = ptrace_emu::z543_trace_nrs();
                 match seccomp::install_trace_filter(&nrs) {
                     Ok(()) => {
-                        let _ = safe_write_err(
-                            b"[KR64 CHILD] 6-Z543: trace filter ARMED (RET_TRACE set; hot natives run free)\n",
-                        );
+                        let _ = unsafe {
+                            safe_write_err(
+                                b"[KR64 CHILD] 6-Z543: trace filter ARMED (RET_TRACE set; hot natives run free)\n",
+                            )
+                        };
                     }
                     Err(e) => {
-                        let _ = safe_write_err(
-                            b"[KR64 CHILD] 6-Z543: trace filter install FAILED - legacy full-trace mode continues: ",
-                        );
-                        safe_write_err_errno(b"", e.raw_os_error().unwrap_or(0));
-                        safe_write_err(b"\n");
+                        let _ = unsafe {
+                            safe_write_err(
+                                b"[KR64 CHILD] 6-Z543: trace filter install FAILED - legacy full-trace mode continues: ",
+                            )
+                        };
+                        unsafe {
+                            safe_write_err_errno(b"", e.raw_os_error().unwrap_or(0));
+                            safe_write_err(b"\n");
+                        }
                     }
                 }
             } else {
-                safe_write_err(
-                    b"[KR64 CHILD] 6-Z543: init ELF is not aarch64 - trace filter skipped (legacy full-trace mode)\n",
-                );
+                unsafe {
+                    safe_write_err(
+                        b"[KR64 CHILD] 6-Z543: init ELF is not aarch64 - trace filter skipped (legacy full-trace mode)\n",
+                    );
+                }
             }
         }
 
