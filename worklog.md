@@ -33168,3 +33168,52 @@ C++ streambuf (libc++) seekg/extraction interaction, which no syscall can observ
 - Infra note: the original twoyi rootfs tarball (cyanmint/twoyi "original", Android 8.1)
   was downloaded first and DISMISSED (no needles — the wrong ROM); the release-asset
   provenance gate in the workflow pointed at the true rsr1 asset.
+
+## Task 266 (session 266, ~03:15Z, 2026-09-22 — 6-Z538: the property-fd RECYCLE GUARD — the ROOT CAUSE of the rung-3 kptr wall, found in rn519's own artifacts; worklog entry backfilled)
+
+- **The state check**: the sandbox survived (repo main @ 471fbc71, gates 1131/1131
+  re-verified locally this session: fmt clean, clippy -D warnings zero, 1131 passed /
+  0 failed, 32s). The CI at takeover: rn520 (boot-ladder on 1d469ecb = 6-Z537) IN FLIGHT
+  (~21 min old, inside its normal window) + rn2201 (lint+test on 471fbc71 = 6-Z538) in
+  flight. Single-flight discipline held: NO second boot-ladder dispatched while rn520
+  runs. The Next.js scaffold untouched.
+- **THE BACKFILL**: the previous session landed 6-Z538 (471fbc71) but was cut off
+  BEFORE writing its worklog entry. This entry restores the record.
+- **THE ROOT CAUSE (retiring the C++-streambuf theory)**: the decisive evidence was in
+  rn519's OWN kr64.log at +2103 ms — the 6-Z536 journal shows the verify read
+  `ret=0x2 '4\n'` (the REAL syscall exit) while **6-Z110 logs
+  `property-client fd 16: Read returned 2 — FAKED TO 0 (EOF)`**. The
+  SetHighestAvailableOptionValue ifstream's fd 16 was a RECYCLED descriptor that still
+  sat in the STALE 6-Z110/6-Z530 property-client tracking set — its verify read was
+  EOF-faked by the property fake-arms. The C++ stream set eofbit+failbit, str_rec
+  stayed empty, the compare never matched, the iters 3/2 verifies issued NO syscalls
+  (the failed-stream sentry blocks them — this is what masqueraded as a 'streambuf
+  divergence'), the loop exhausted 4→3→2 → LOG(FATAL) → InitFatalReboot.
+  rn508/509 PASSED the same loop because the property fd landed on a DIFFERENT
+  descriptor number (the per-boot flip was fd-allocation luck); 6-Z530 (rn510+) made
+  the client's lifecycle collide SYSTEMATICALLY on fd 16 — which is why the wall
+  hardened exactly when the property capture landed.
+- **THE RACE (why the untrack missed)**: the tracked-set removal lives in the
+  PropServOp::Close arm, which recovers the fd from the per-pid pending_entry_fd
+  ONE-slot ENTRY-stash. init is multi-threaded — another thread's ENTRY overwrites the
+  slot between the close's ENTRY and EXIT, the arm untracks the WRONG fd, and the
+  closed descriptor's number stays tracked forever.
+- **6-Z538 THE GUARD (471fbc71, ptrace_emu.rs +156 lines)**: the kernel never hands out
+  a fd number that is still open — a successful open/openat/openat2 EXIT returning an
+  fd that is STILL in fake_propserv_fds PROVES the tracking is stale. The guard drops
+  the stale entry (+ the 6-Z533 ack-arm for the same fd) BEFORE the recycled fd's
+  first read can be faked. Heals the registry no matter WHY the untrack missed.
+  6-Z537's init binary patch (rn520, in flight) stays as the independent
+  belt-and-braces sidestep — the two fixes are complementary, not competing.
+- **Tests +2 = 1131**: the rn519 scenario as a unit test (stale tracking + the recycle
+  → dropped, the arms can never fire again), pid-scoping, double-drop idempotency, and
+  the no-tracking fast path.
+- **rn520 decode agenda** (in flight): (1) the 6-Z537 PATCHED line at boot-prep +
+  ZERO InitFatalReboot → the boot passes SetKptrRestrict/SetMmapRndBits → rung 7+
+  restored; (2) the 6-Z530 capture + zero 0x8s + zero 'recv failed'; (3) the wall
+  round 6 verdicts (the monitor-lock freeze + the 6-Z529 pipe hunt if they return).
+  NOTE: rn520 predates 6-Z538 — if the kptr FATAL somehow persists, rn521 (on
+  471fbc71) carries the recycle guard, which removes the ROOT cause outright.
+- **rn521 agenda** (post-rn520): dispatch on 471fbc71 with the full inputs; expect
+  rung 7+ → the rung-8 push (system_server past run():436 → the service starts) →
+  rung 9 / BOOT_COMPLETED.
