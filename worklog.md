@@ -33399,3 +33399,16 @@ Stage Summary:
 - NEXT SESSION (rank-1 execution plan): instrument the VERSION exchange — (a) the proxy's dispatch_request BINDER_VERSION arm gets a bounded log (cmd, ret, payload length), (b) the shim's ioctl hook logs the VERSION send/recv outcome (bounded, to stderr). One boot (rn535) names the failing side; then fix accordingly (suspects: the VERSION wire shape for aarch64 shims, the ack-length handling, or the per-thread conn table missing the just-created conn).
 - rn534 (in flight) decode agenda unchanged; the media fleet will reproduce there (the failure is deterministic per the rn533 data).
 
+
+---
+Task ID: 1 (session 270 cont.4 — 6-Z549 LANDED: BINDER_VERSION answered locally in the shim; the media-fleet fix rides rn535)
+Agent: Z.ai Code (main implementation agent, session 270)
+
+Work Log:
+- Shim ioctl-hook source audit (twoyi_loader_shlib.c binder_proxy_ioctl): the failure path logs "binder proxy ioctl FAIL" (8/process) — ZERO occurrences in ANY rn533 artifact (stderr is DIAG-sampled, inconclusive); bp_conn_for_ioctl/bp_thread_conn_lookup/insert all statically correct.
+- **6-Z549 (ac2f3ef5)**: binder_proxy_ioctl answers BINDER_VERSION LOCALLY ((int32_t)8 into argp, no wire round-trip). Rationale: the protocol version is a fixed wire-spec constant (the /dev/null fallback class already fakes it identically); it was the ONLY wire step in the 2ms failure window of conn=114; removing it cannot change any observable semantics. The proxy's VERSION arm remains for wire peers.
+
+Stage Summary:
+- Remote main: ac2f3ef5. The media-fleet fix rides rn535 (rn534's snapshot 5ac59afb predates it).
+- rn535 decode agenda: (1) the media fleet's restart counts (expect ~1 each instead of ~90-98; the abort message should vanish); (2) post-class_start churn collapse; (3) rung 8/9 reachability in the 900s window (system_server / boot complete); (4) milestone variance vs rn533.
+
