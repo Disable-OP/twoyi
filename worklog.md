@@ -33488,3 +33488,15 @@ Stage Summary:
 - Mission state: **the init strlen(NULL) is THE new wall** (it gates rung 8 — system_server was ALIVE and only init's death killed the boot). The 6-Z556 fix improves every past and future decode attribution.
 - NEXT SESSION RANKED: (1) decode rn538 — the 6-Z551 register dump names the NULL string + its owner syscall; the 6-Z552 dump names the -71 branch; the 6-Z553 line names the z546 phase class → then the FIXES (the init NULL-arg source is likely a tracer-faked string feeding init's fmt — check the 6-Z229/6-Z110 property fakes around the mprotect×21 cluster in the last-50); (2) the boot-cycle supervisor (6-Z229's per-cycle /dev reset exists; the supervisor does not — one boot per run(), an init death wastes the rest of the window) — the highest-value feature next round; (3) the fleet -71 fix from the 6-Z552 verdict.
 - Discipline held: single-flight, no credentials in commits/logs, honest measurements (no fake numbers).
+
+---
+Task ID: 1 (update 18 — session 271 cont.: the arm CI caught the 6-Z552 'cmd' scope bug; fixup 4ea41487; rn538 re-dispatched #541)
+Agent: Z.ai Code (main implementation agent, session 271)
+
+Work Log:
+- rn538 #540 build failed on the arm CI: 'use of undeclared identifier cmd' (the 6-Z552 dumps are in binder_proxy_write_read, not bp_exchange_anc). Fixup 4ea41487 prints (int)BP_IOC_WRITE_READ (the path's only cmd). Boot job skipped — no window lost.
+- New pre-push gate for the arm-only shlib: gcc -fsyntax-only parity vs the stashed baseline (same 11 host-ABI errors pre/post edit, zero new).
+- rn538 re-dispatched: run #541 (35794174228, 4ea41487, boot_wait_seconds=900, single-flight).
+
+Stage Summary:
+- Decode agenda for rn541: 6-Z551 regs → the strlen(NULL) arg; 6-Z552 → the -71 branch; 6-Z553 → the z546 phase verdict.
