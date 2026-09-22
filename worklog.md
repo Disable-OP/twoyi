@@ -33469,3 +33469,22 @@ Stage Summary:
 - rn537 decode agenda: (1) IF a spinner occurs: the INJECT setregs verdict + the pipe2-EXIT-nostate line → the park-pipe completes or names its blocker; (2) the fleet's "binder proxy exchange: cmd=0x???????? response rlen=0x???????? ret=0x???????? exceeds cap" line → desync vs giant parcel → the fix targets the fd-tail accounting or the frame cap accordingly; (3) milestone variance.
 - Remote main: a63b365a. Gates: fmt clean, clippy zero, 1144/1144.
 
+
+---
+Task ID: 1 (update 17 — session 271: rn537 DECODED = THE INIT SIGSEGV REGRESSION (bootstrap-libc strlen(NULL) at +123.4s → InitFatalReboot → 793s zombie); 6-Z551/552/553/556 landed; rn538 queued)
+Agent: Z.ai Code (main implementation agent, session 271)
+Task: Status assessment + QA + rn537 decode + the evidence round.
+
+Work Log:
+- QA baseline: local gates green on e009d160 (fmt/clippy zero/1144); rn537 (run 35785166807, #539, sha a63b365a) completed success ~21:35Z; decoded from the artifacts.
+- **rn537 = a REGRESSION run**: init (pid 2778) took SIGSEGV at +123.4s — si_code=1 si_addr=0, pc in bootstrap/libc strlen (SWAR, x8=0x0101010101010101 is strlen's own magic constant, NOT a poison fill), lr=init+0x37e60 (a {fmt}-adjacent decimal formatter 0x37b48-0x37f5c with an overflow-checked counter + modulo-N cadence + a libc++ SSO string walk — the tail-call passed a NULL char*). InitFatalReboot (signal 11) → exit_group(127) at +123.6s. **THE GUEST NEVER RESTARTED** — zygote alive, system_server (4202) parked futex wakes=NEVER, 793s of zombie window. Milestones before death: early_hal +11.8s, zygote start +30.0s (band 20.4-21.6s), class_start hal done +58.8s (band 44.1s), nonencrypted +89.6s (band 62.8s) — everything ~40% slower, then the crash; class_start main never completed (cameraserver→drm→idmap2d→incidentd→installd→iorapd→keystore→mediaextractor→mediametrics→media started; stuck at 'media' +121.1s). Only ONE media-fleet -71 abort this run (Binder:3902_1, +118.1s; init died before the fleet could churn).
+- **THE 6-Z549 DUMP NEVER FIRED** — the -71 came from a SILENT branch (rlen<4 / 4+srv_read>rlen / out-of-range ret): instrument-gap closed this round.
+- **6-Z546 verdict**: qemu-props (pid 2865) ARMED+INJECT at +8.56s, setregs Ok, yet the read ran UNREWRITTEN (368,640 EOFs by +543s; no pipe2 EXIT, not even the NO-pending-state DIAG) — the kernel-ignored-rewrite class, now phase-tagged + verified.
+- **6-Z556 CORRECTNESS FIX (the decode gem)**: the 6-Z515 pc resolve ignored /proc/maps' pgoff — rn537 printed bootstrap/libc.so+0xf6c0 but the true file offset was 0x4a6c0 = strlen+0x10 (the pc sat in the r-xp SECOND LOAD segment mapped at file offset 0x3b000). Cross-verified by byte-searching the crash instruction sequence (a9400c02/cb080044/b200d845/cb080066) through the vendored rootfs (release android11-aosp-arm64-rsr2 downloaded + com.android.runtime.apex carved) — the resolver now adds pgoff; EVERY future pc/lr/x17 attribution is file-true.
+- 6-Z551 landed: the dying init's exit_group stop dumps the FULL register file (x0..x30+sp+pc) — names the NULL argument next occurrence. 6-Z552 landed: the shlib's silent EPROTO branches dump cmd/ret/rlen/srv_read. 6-Z553 landed: z546 INJECT post-setregs getregs verify (NOT STICKY + phase tag).
+- Gates: fmt clean, clippy zero, 1145/1145 (+1 pgoff regression test). Commit 8a7f4db9.
+
+Stage Summary:
+- Mission state: **the init strlen(NULL) is THE new wall** (it gates rung 8 — system_server was ALIVE and only init's death killed the boot). The 6-Z556 fix improves every past and future decode attribution.
+- NEXT SESSION RANKED: (1) decode rn538 — the 6-Z551 register dump names the NULL string + its owner syscall; the 6-Z552 dump names the -71 branch; the 6-Z553 line names the z546 phase class → then the FIXES (the init NULL-arg source is likely a tracer-faked string feeding init's fmt — check the 6-Z229/6-Z110 property fakes around the mprotect×21 cluster in the last-50); (2) the boot-cycle supervisor (6-Z229's per-cycle /dev reset exists; the supervisor does not — one boot per run(), an init death wastes the rest of the window) — the highest-value feature next round; (3) the fleet -71 fix from the 6-Z552 verdict.
+- Discipline held: single-flight, no credentials in commits/logs, honest measurements (no fake numbers).
