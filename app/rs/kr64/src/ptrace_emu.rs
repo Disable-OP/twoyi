@@ -11656,6 +11656,61 @@ fn z296_tgid_of(
     tgid
 }
 
+/// 6-Z541 (the rn525 decode): the FLOOR-gate tgid resolver — the
+/// fail-closed variant of z296_tgid_of. The z296 fallback returns the
+/// raw TID when /proc/<tid>/status is unreadable — correct for group
+/// leaders, but a DYING THREAD's status read races the thread's exit
+/// (rn525: thread 4648's close-churn read failed at the exact
+/// close(0), the fallback returned 4648, the floor gate missed, and
+/// the close EXECUTED natively — fd 0 freed, the boot-time opens
+/// claimed slot 0 (property area → ANR file → overlay APKs →
+/// sockets), and the rung-8 wall's watchdog parked reading a foreign
+/// fd-0 object while holding the ART monitor lock). The floor gates
+/// must NEVER let a resolution failure free a stdio slot: None
+/// (unreadable) is fail-closed — the rewrite is a harmless getpid
+/// no-op for a dying thread. The failure is NOT cached (a later
+/// syscall of the same thread re-reads honestly).
+fn z541_floor_tgid_of(
+    pid: libc::pid_t,
+    cache: &mut std::collections::HashMap<libc::pid_t, libc::pid_t>,
+) -> Option<libc::pid_t> {
+    if let Some(t) = cache.get(&pid) {
+        return Some(*t);
+    }
+    match std::fs::read_to_string(format!("/proc/{}/status", pid)) {
+        Ok(s) => {
+            let tgid = s
+                .lines()
+                .find(|l| l.starts_with("Tgid:"))
+                .and_then(|l| {
+                    l.split(':')
+                        .nth(1)
+                        .and_then(|v| v.trim().parse::<libc::pid_t>().ok())
+                })
+                .unwrap_or(pid);
+            cache.insert(pid, tgid);
+            Some(tgid)
+        }
+        Err(_) => None,
+    }
+}
+
+/// 6-Z541 (pure): the floor-gate decision — does THIS pid's close/dup
+/// targeting a stdio slot hit the floor? Some(tgid) resolves
+/// normally; None (the /proc race) is fail-closed: the pin/floor
+/// applies regardless (a dying thread's rewritten close is a no-op).
+fn z541_floor_gate_hit(
+    pid: libc::pid_t,
+    resolved: Option<libc::pid_t>,
+    pin_pid: Option<libc::pid_t>,
+    floor_set: &std::collections::HashSet<libc::pid_t>,
+) -> bool {
+    match resolved {
+        Some(tgid) => pin_pid == Some(pid) || floor_set.contains(&tgid),
+        None => true,
+    }
+}
+
 /// 6-Z231: pure decision core of the fresh-create guarantee — should the
 /// tracer remove a stale backing file before the guest's exclusive create?
 ///
@@ -34887,10 +34942,16 @@ pub fn run_ptrace_loop(
                                 // exact-pid check (the zygote's closes run
                                 // on its main thread, pid == tgid).
                                 let z476_floor_pid =
-                                    z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
-                                if z305y_stdio_pin_pid == Some(pid)
-                                    || z475_sserver_floor_pids.contains(&z476_floor_pid)
-                                {
+                                    z541_floor_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                // 6-Z541: fail-closed — the rn525 decode
+                                // (thread 4648's close(0) slipped the
+                                // gate on a /proc race and freed fd 0).
+                                if z541_floor_gate_hit(
+                                    pid,
+                                    z476_floor_pid,
+                                    z305y_stdio_pin_pid,
+                                    &z475_sserver_floor_pids,
+                                ) {
                                     static Z305Y_PIN_LOGGED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
                                     let ln = Z305Y_PIN_LOGGED
@@ -35051,10 +35112,14 @@ pub fn run_ptrace_loop(
                             let dst_fd = get_syscall_arg(&regs, abi.reg_arg2) as i64;
                             if dst_fd >= 0 && dst_fd <= 2 {
                                 let z477_floor_pid =
-                                    z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
-                                if z305y_stdio_pin_pid == Some(pid)
-                                    || z475_sserver_floor_pids.contains(&z477_floor_pid)
-                                {
+                                    z541_floor_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                // 6-Z541: fail-closed (the rn525 decode).
+                                if z541_floor_gate_hit(
+                                    pid,
+                                    z477_floor_pid,
+                                    z305y_stdio_pin_pid,
+                                    &z475_sserver_floor_pids,
+                                ) {
                                     static Z477_DENY_LOGGED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
                                     let budget_entry =
@@ -35220,10 +35285,14 @@ pub fn run_ptrace_loop(
                                 // untouched — the bulk-cleanup semantics
                                 // stay.
                                 let z484_floor_pid =
-                                    z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
-                                if z305y_stdio_pin_pid == Some(pid)
-                                    || z475_sserver_floor_pids.contains(&z484_floor_pid)
-                                {
+                                    z541_floor_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                // 6-Z541: fail-closed (the rn525 decode).
+                                if z541_floor_gate_hit(
+                                    pid,
+                                    z484_floor_pid,
+                                    z305y_stdio_pin_pid,
+                                    &z475_sserver_floor_pids,
+                                ) {
                                     static Z484_LOGGED: std::sync::atomic::AtomicU64 =
                                         std::sync::atomic::AtomicU64::new(0);
                                     let ln = Z484_LOGGED
@@ -35530,7 +35599,14 @@ pub fn run_ptrace_loop(
                             // flows through the pre-existing rewrite arms
                             // untouched.
                             if is_tgkill && sig_arg == 6 && !z475_sserver_floor_pids.is_empty() {
-                                let z477b_tgid = z296_tgid_of(pid, &mut z306_lineage_tgid_cache);
+                                // 6-Z541: observation-only site — best-effort
+                                // tgid (None falls back to the raw pid; no
+                                // floor decision rides on it).
+                                let z477b_tgid =
+                                    match z541_floor_tgid_of(pid, &mut z306_lineage_tgid_cache) {
+                                        Some(t) => t,
+                                        None => pid,
+                                    };
                                 if z475_sserver_floor_pids.contains(&z477b_tgid)
                                     || z305y_stdio_pin_pid == Some(pid)
                                 {
@@ -64463,6 +64539,38 @@ mod z501_futex_tests {
         assert_eq!(z501_futex_op_name(4), "CMP_REQUEUE");
         assert_eq!(z501_futex_op_name(6), "LOCK_PI");
         assert_eq!(z501_futex_op_name(0x7f), "OTHER");
+    }
+}
+
+/// 6-Z541 the floor-gate pure core (the fail-closed tgid decision).
+#[cfg(test)]
+mod z541_floor_gate_tests {
+    use super::z541_floor_gate_hit;
+    use std::collections::HashSet;
+
+    /// The rn525 shape: thread 4648 of a floored process (4389) raced
+    /// its own death at close(0) — the /proc read failed, the old
+    /// fallback returned the raw TID and the gate missed, the close
+    /// freed fd 0. The fail-closed gate pins it (None -> true); the
+    /// honest resolutions keep the exact semantics.
+    #[test]
+    fn z541_floor_gate_fail_closed_on_unresolved_tgid() {
+        let mut floors: HashSet<libc::pid_t> = HashSet::new();
+        floors.insert(4389);
+        // resolved: a thread of the floored process -> floor applies.
+        assert!(z541_floor_gate_hit(4648, Some(4389), None, &floors));
+        // resolved: the pin pid itself -> applies.
+        assert!(z541_floor_gate_hit(4389, Some(4389), Some(4389), &floors));
+        // resolved: an unrelated process -> no floor.
+        assert!(!z541_floor_gate_hit(9999, Some(9999), None, &floors));
+        // UNRESOLVED (the /proc race) -> fail-closed: the floor applies.
+        assert!(z541_floor_gate_hit(4648, None, None, &floors));
+        // Unresolved even when the pid is NOT known-floored: still
+        // fail-closed (a dying unknown thread's close on a stdio slot
+        // is exactly the class the floor exists to stop).
+        assert!(z541_floor_gate_hit(7777, None, None, &floors));
+        // The pin short-circuits regardless of the resolution.
+        assert!(z541_floor_gate_hit(4389, Some(4389), Some(4389), &floors));
     }
 }
 
