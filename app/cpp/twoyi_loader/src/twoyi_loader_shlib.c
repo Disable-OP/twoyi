@@ -2347,6 +2347,11 @@ static unsigned char *bp_exchange_anc(int fd, uint32_t cmd,
                      "rlen=0x%08x ret=0x%08x exceeds cap (desync or giant parcel)\n",
                      cmd, rlen, ret);
             write_str(2, msg);
+            // 6-Z557 (rn541 decode): fd 2 is /dev/null for the fleet guest
+            // services — the dump NEVER reached any collected artifact (the
+            // rn541 run had zero "binder proxy exchange" lines while the -71
+            // abort churn ran). The guest klog IS collected (dev-__kmsg__).
+            bp_klog_write_raw(msg);
         }
         for (uint32_t i = 0; i < rnfds; i++) syscall(NR_close, rfds[i]);
         free(rfds);
@@ -3303,6 +3308,7 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
                          "out-of-range ret=%d rlen=0x%08x -> EPROTO (6-Z552)\n",
                          (int)BP_IOC_WRITE_READ, ret, rlen);
                 write_str(2, msg);
+                bp_klog_write_raw(msg); /* 6-Z557: fd2=/dev/null for services */
             }
         }
         errno = (ret <= 0 && ret >= -4095) ? -ret : EPROTO;
@@ -3324,6 +3330,7 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
                      "rlen=%u < 4 -> EPROTO (misframed stream, 6-Z552)\n",
                      (int)BP_IOC_WRITE_READ, rlen);
             write_str(2, msg);
+            bp_klog_write_raw(msg); /* 6-Z557: fd2=/dev/null for services */
         }
         free(resp);
         errno = EPROTO;
@@ -3344,6 +3351,7 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
                      "(misframed stream, 6-Z552)\n",
                      (int)BP_IOC_WRITE_READ, rlen, srv_read);
             write_str(2, msg);
+            bp_klog_write_raw(msg); /* 6-Z557: fd2=/dev/null for services */
         }
         free(resp);
         errno = EPROTO;
