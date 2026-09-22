@@ -9739,6 +9739,8 @@ fn forget_dead_pid_state(
     // 6-Z532: a dead pid's shadowed sysctl fds must never be inherited
     // by a pid-recycled successor.
     z532_shadow_set().remove(&pid);
+    // 6-Z536: the dead pid's full-syscall trace dies with it.
+    z536_pid_trace_set().remove(&pid);
     prctl_rewritten_args.remove(&pid);
     seccomp_rewritten_ops.remove(&pid);
     pending_epoll_readback.remove(&pid);
@@ -13925,6 +13927,118 @@ fn z534_kptr_fds(
 }
 
 static Z534_EVENT_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 6-Z536: the PER-PID full syscall trace set — when a pid opens
+/// /proc/sys/kernel/kptr_restrict, EVERY subsequent syscall EXIT of
+/// that pid is journaled (nr, name, ret, the first 3 args) until the
+/// 300-event cap. The rn516-518 journals proved the FILE layer
+/// coherent; the divergence lives in the syscall classes the
+/// read/write/lseek hooks don't cover (close, fcntl, ioctl, dup,
+/// mmap...). Cap 300 events/boot.
+static Z536_PID_TRACE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+    std::sync::OnceLock::new();
+
+fn z536_pid_trace_set() -> std::sync::MutexGuard<'static, std::collections::HashSet<i32>> {
+    Z536_PID_TRACE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+static Z536_EVENT_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 6-Z536 (pure): the aarch64 syscall names for the journal — the
+/// host-side compile can't use ABI_AARCH64 (cfg(target_arch)); a tiny
+/// direct table for the classes that matter at the kptr window.
+fn z536_aarch64_name(nr: i64) -> &'static str {
+    match nr {
+        48 => "openat", // asm-generic
+        56 => "openat2",
+        57 => "close",
+        58 => "close_range",
+        61 => "getdents64",
+        62 => "lseek",
+        63 => "read",
+        64 => "write",
+        65 => "readv",
+        66 => "writev",
+        67 => "pread64",
+        68 => "pwrite64",
+        71 => "sendto",
+        72 => "recvfrom",
+        73 => "recvmsg",
+        74 => "sendmsg",
+        78 => "readlinkat",
+        79 => "newfstatat",
+        80 => "fstat",
+        82 => "fsync",
+        93 => "exit",
+        94 => "exit_group",
+        96 => "set_tid_address",
+        98 => "futex",
+        113 => "clock_gettime",
+        116 => "syslog",
+        124 => "sched_yield",
+        129 => "kill",
+        131 => "tgkill",
+        132 => "sigaltstack",
+        134 => "rt_sigaction",
+        135 => "rt_sigprocmask",
+        137 => "clone",
+        138 => "clone3",
+        160 => "uname",
+        169 => "gettimeofday",
+        172 => "getpid",
+        173 => "getppid",
+        174 => "getuid",
+        175 => "geteuid",
+        176 => "getgid",
+        177 => "getegid",
+        178 => "gettid",
+        203 => "connect",
+        206 => "sendto-32",
+        207 => "recvfrom-32",
+        220 => "clone-legacy",
+        222 => "mmap",
+        226 => "mprotect",
+        233 => "madvise",
+        234 => "madvise-32",
+        236 => "epoll_wait",
+        237 => "epoll_pwait",
+        241 => "sched_setaffinity",
+        260 => "wait4",
+        261 => "prlimit64",
+        262 => "renameat",
+        263 => "unlinkat",
+        266 => "sysinfo",
+        276 => "renameat2",
+        278 => "getrandom",
+        281 => "execve",
+        282 => "execveat",
+        283 => "mmap2-32",
+        436 => "close_range2",
+        439 => "faccessat2",
+        _ => "?",
+    }
+}
+
+fn z536_trace_syscall(pid: libc::pid_t, nr: i64, ret: i64, a1: u64, a2: u64, a3: u64) {
+    let n = Z536_EVENT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 300 {
+        return;
+    }
+    crate::trace_log_line(&format!(
+        "6-Z536: kptr-pid syscall pid={} nr={} ({}) ret={:#x} args=[{:#x},{:#x},{:#x}] #{}",
+        pid,
+        nr,
+        z536_aarch64_name(nr),
+        ret,
+        a1,
+        a2,
+        a3,
+        n + 1
+    ));
+}
 
 fn z534_journal_event(pid: libc::pid_t, fd: i64, what: &str, ret: i64, buf_ptr: u64) {
     let n = Z534_EVENT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -27361,6 +27475,23 @@ pub fn run_ptrace_loop(
                         heur_is_entry
                     }
                 };
+
+                // ── 6-Z536: the kptr-pid FULL syscall journal (the EXIT
+                // half) — every syscall EXIT of a pid that opened the
+                // kptr_restrict sysctl file, uncapped by class: the
+                // closes, seeks, ioctls, dups and polls the read/write/
+                // lseek hooks don't cover are the rn516-518 mystery's
+                // remaining observable surface.
+                if !is_entry && z536_pid_trace_set().contains(&pid) {
+                    z536_trace_syscall(
+                        pid,
+                        syscall_num,
+                        get_syscall_arg(&regs, abi.reg_ret) as i64,
+                        get_syscall_arg(&regs, abi.reg_arg1),
+                        get_syscall_arg(&regs, abi.reg_arg2),
+                        get_syscall_arg(&regs, abi.reg_arg3),
+                    );
+                }
 
                 // ── 6-Z83 rolling last-16-stops ring (stop forensics) ──
                 // Every classified syscall stop lands here; event stops,
@@ -41124,6 +41255,15 @@ pub fn run_ptrace_loop(
                             {
                                 z534_kptr_fds().entry(pid).or_default().insert(ret);
                                 z534_journal_event(pid, ret, "open", ret, 0);
+                                // 6-Z536: the FULL per-pid syscall trace —
+                                // every EXIT of this pid is journaled from
+                                // now on (cap 300 events).
+                                if z536_pid_trace_set().insert(pid) {
+                                    log(&format!(
+                                        "6-Z536: kptr-pid TRACE ARMED pid={} (the full syscall journal until the 300-event cap)",
+                                        pid
+                                    ));
+                                }
                             }
                         }
                         // ── 6-Z513: the BINDER driver-fd REGISTRATION (the

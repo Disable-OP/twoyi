@@ -33062,3 +33062,27 @@ C++ streambuf (libc++) seekg/extraction interaction, which no syscall can observ
 - Sandbox: the cron tool unavailable all session (single-session mode); decode/
   rn508-rn518 mined; disk ~5G free; the credentials + the repo + the toolchain restored
   per the playbook (the reset playbook in the Session-262/263 handovers above).
+
+## Task 264 (session 264, ~00:45Z — 6-Z536 the FULL per-pid syscall journal for the kptr mystery)
+
+- **The state check**: the sandbox survived (repo 563fe8b2, cargo 1.98.1, creds) — no
+  reset. The CI: only the lint #2196 in flight; rn518 completed success (rung 3 — the
+  kptr FATAL persisted with the synthetic-tree mapping). Single-flight clear.
+- **The fresh-eyes analysis of the rn516-518 journals**: the iter-1 verify read saw the
+  written bytes ("4\n") yet the loop continued — the leading hypotheses exhausted; the
+  remaining observable surface = the syscall classes the read/write/lseek hooks don't
+  cover (close/fcntl/ioctl/dup/poll/rename — incl. the ROM's init.rc `write` commands
+  riding REUSED fds — the "3\n"/"2\n" writes could be WriteFile tmp-file writes, not
+  loop iterations!). The stale-buffer story fits iters 2/3 (libc++'s in-buffer seekg
+  without a syscall) but iter 1's match-failure stays unexplained.
+- **6-Z536 (this commit)**: the FULL per-pid syscall journal — when init opens
+  /proc/sys/kernel/kptr_restrict, EVERY subsequent syscall EXIT of that pid is journaled
+  (nr + the aarch64 name table + ret + the first 3 args), cap 300 events, the dead pid's
+  trace dies with it (the forget_dead_pid_state cleanup). This sees EVERYTHING the
+  read/write/lseek hooks missed and settles whether the "iterations" are the loop or
+  the rc commands.
+- Gates 1121/1121; fmt/clippy clean.
+- **rn519 agenda**: (1) decode the full journal — the complete choreography from the
+  first kptr open to the abort; (2) the fix follows (the shlib hook / the binary patch /
+  the rc-command discovery); (3) the rung-3 wall is the only blocker to the rung-7
+  baseline and the rung-8 push.
