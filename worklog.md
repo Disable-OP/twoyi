@@ -33311,3 +33311,18 @@ C++ streambuf (libc++) seekg/extraction interaction, which no syscall can observ
 - Gates re-verified: fmt clean, clippy zero, 1138/1138. Pushed; **rn530 dispatched (HTTP 204, boot_wait_seconds=900)** on the fix — the decode agenda unchanged (the flip line now followed by REAL arm activity: path-translation lines, the boot progressing past rung 3, the heartbeat stop-rate delta, the honest rung-8/9 timing, 6-Z542 correlations).
 - Note: 6-Z544 (the empty-read spin breaker) rides on this run — its first live data (the 128-consecutive threshold may or may not engage; the census's read storm pid will name itself if it does).
 
+
+## Task 268 update 4 (rn531 DECODED: THE FILTER VINDICATED — every milestone 17-30% faster than rn528 with zero park pollution; the spin class is intermittent; the campaign continues)
+
+- **THE HONEST MILESTONE TABLE (rn531 = 6-Z543 filter, no park, run 35760703920 vs rn528 = no filter)**:
+  - class_start early_hal: +13.4s → **+11.6s** (−13%)
+  - **starting service 'zygote': +33.2s → +23.3s (−30%)**
+  - **starting service 'surfaceflinger': +70.2s → +55.6s (−21%)**
+  - class_start core: +74.4s → **+59.5s** (−20%)
+  - **class_start main: +183.6s → +151.8s (−17%)**
+  The stop-rate profile reads ~8.5-10k/s again — but that is the guest DOING MORE per wall-second (the earlier rn530 rate collapse was park-throttling; rn531's high rate = real work). The currency is milestones and they all improved. The boot ran to +916s (the 900s window) still progressing at rung 7.
+- **The spin class is INTERMITTENT**: rn530's qemu-props fork (2874) spin-read socket fd=3 forever (16,384+ consecutive empties at park time); rn531's qemu-props (2916) EXEC'D and exited code 1 at +8.26s (its connect failed honestly — no fake-wire EOF to spin on) — zero 6-Z544 lines. Run-to-run variance in which fake arm engages the connect. The v2 instrument (streak + cmdline + EOF/EAGAIN breakdown) is armed for the next occurrence; the PROPER fix when it recurs: 6-Z546 the quiet-channel park pipe (inject a tracer-held-open pipe so the read parks IN-KERNEL at zero tracer cost — the 6-Z441 "never write, never EOF" precedent).
+- **The restart-class leak quantified**: the z417 census shows E/X pairs for UNTRACED nrs (gettid 178, munmap 215) — the ERESTARTSYS restart re-enters with TIF armed → a 0x80 stop even for untraced syscalls (bounded by ART suspension-signal frequency; ~561 gettid stops on one system_server thread over 289s — acceptable; not worth chasing).
+- **The next speed iterations (ranked)**: (1) 6-Z546 the quiet-channel park pipe (kills the qemu-props spin class properly when it recurs); (2) the entry-only resume split (PTRACE_CONT after ENTRY arms for read/write-class nrs whose exits carry no bookkeeping — halves the traced syscalls' stop count); (3) the binder log-volume trim (46k WRITE_READ INFO lines through the log chain).
+- Commits this cycle: e8a09c37 (6-Z543+6-Z542), 7c57c1d1 (E0133 fixup), 33ab9b25 (6-Z544 v1), d3727d97 (the phase-2 guard hoist), d9c4d0ad (6-Z544 v2, the park removed). Gates 1138/1138 throughout; fmt clean; clippy zero.
+
