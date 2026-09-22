@@ -3554,6 +3554,21 @@ static Z483_RET_PENDING: std::sync::LazyLock<
 static Z517_CONNECT_PENDING: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<libc::pid_t, (i64, u64)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+// 6-Z540: the per-TGID stdio SENTINEL state — the last-seen fd 0/1/2
+// targets of every floored process. Threads share the fd table, so
+// the check is keyed by TGID; the first observation records the
+// baseline verbatim and every later check logs any target CHANGE —
+// the displacement moment is named by the first verdict that runs
+// after it, regardless of which syscall vector displaced the slot.
+static Z540_SENTINEL: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<libc::pid_t, [Option<String>; 3]>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+// 6-Z540: the one-shot ring-flush guard — the Z483/Z486 rings flush
+// once per process at the first wall-park verdict (the futex/pipe
+// parks never trip the FD-shaped STALL-FD flush; the ring would die
+// with the guest unflushed, and it holds the displacement vector).
+static Z540_FLUSHED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<libc::pid_t>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 // 6-Z504: the one-in-flight (pid → class) stash for the INIT-SOCKCREATE
 // census — the ENTRY half (init's socket()/bind()) inserts; the EXIT
 // half resolves the real return into the drop-proof 6-Z504 line. The
@@ -13524,6 +13539,12 @@ fn z520a_wall_park_verdict(
             };
         }
     }
+    // 6-Z540: while the wall is live — check the stdio sentinel (the
+    // fd-0 displacement named the moment the verdict runs after it)
+    // and flush the fd-op rings once (the displacement vector lives
+    // there; the FD-shaped STALL-FD arm never fires for these parks).
+    z540_stdio_sentinel_check(pid, "wall-park");
+    z540_flush_fdop_rings(pid);
 }
 
 /// 6-Z520a (pure): the ART-Mutex shape — the LP64 art::Mutex layout
@@ -13556,6 +13577,131 @@ fn z520a_art_mutex_shape(bytes: &[u8]) -> Option<(u64, u32, u32, u32)> {
 /// wait condition variable", ...).
 fn z520a_art_mutex_name_ok(s: &str) -> bool {
     (3..=48).contains(&s.len()) && s.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+}
+
+/// 6-Z540 (pure): diff two stdio-sentinel snapshots — the (slot,
+/// before, after) triples whose target changed. None and Some(x) count
+/// as a change; None→None does not (the slot may be legitimately
+/// unreadable at both observations).
+fn z540_changed_slots(
+    prev: &[Option<String>; 3],
+    now: &[Option<String>; 3],
+) -> Vec<(usize, String, String)> {
+    let mut out = Vec::new();
+    for (i, (p, n)) in prev.iter().zip(now.iter()).enumerate() {
+        if p != n {
+            out.push((
+                i,
+                p.clone().unwrap_or_else(|| "<none>".to_string()),
+                n.clone().unwrap_or_else(|| "<none>".to_string()),
+            ));
+        }
+    }
+    out
+}
+
+/// 6-Z540 (pure): readlink one fd target — None when unreadable
+/// (honest: a dead pid, a closed slot, or a same-uid visibility gap).
+fn z540_fd_target(pid: libc::pid_t, fd: i32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// 6-Z540: the STDIO SENTINEL — the rung-8 wall's missing datum.
+/// rn522's decode: system_server's fd 0 pointed at the ART perfetto
+/// signal-pipe read end (the 6-Z527b owner-fds line: fd=5 read + fd=6
+/// write + the fd-0 third read reference, all in one self-held table)
+/// DESPITE the 6-Z475/6-Z477 floors — the +248.8s DENY lines prove the
+/// close pins and the dup-net worked, so the displacement vector
+/// bypassed every pin. The Z483 ring holds the vector, but it only
+/// flushes at the FD-shaped STALL-FD arm — the wall's futex/pipe parks
+/// never trip that arm, and the ring died with the guest unflushed.
+///
+/// This check runs at every verdict site that fires for stalled
+/// system_server-lineage pids regardless of the stall shape: the first
+/// call records the fd 0/1/2 baseline verbatim; every later call logs
+/// any target CHANGE (the displacement, named with both ends) —
+/// pure observation, zero rewrites, budget-free (3 readlinks per call
+/// at sites that already do heavier /proc reads).
+fn z540_stdio_sentinel_check(pid: libc::pid_t, site: &str) {
+    // Threads share the fd table — key the state by TGID so a thread
+    // park checks (and updates) its process's sentinel.
+    let tgid = match std::fs::read_to_string(format!("/proc/{}/status", pid))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Tgid:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<libc::pid_t>().ok())
+        }) {
+        Some(t) => t,
+        None => return,
+    };
+    let now: [Option<String>; 3] = [
+        z540_fd_target(tgid, 0),
+        z540_fd_target(tgid, 1),
+        z540_fd_target(tgid, 2),
+    ];
+    if let Ok(mut map) = Z540_SENTINEL.lock() {
+        match map.get(&tgid) {
+            None => {
+                crate::trace_log_line(&format!(
+                    "6-Z540 STDIO-SENTINEL ({}): pid={} tgid={} baseline fd0={:?} fd1={:?} fd2={:?}",
+                    site, pid, tgid, now[0], now[1], now[2]
+                ));
+            }
+            Some(prev) => {
+                for (slot, before, after) in z540_changed_slots(prev, &now) {
+                    crate::trace_log_line(&format!(
+                        "6-Z540 STDIO-SENTINEL ({}): pid={} tgid={} fd={} target changed {} -> {} (the stdio floor expects the svclog/stdio wiring — a bypass vector displaced the slot; the fd-op ring names it)",
+                        site, pid, tgid, slot, before, after
+                    ));
+                }
+            }
+        }
+        map.insert(tgid, now);
+    }
+}
+
+/// 6-Z540: flush the Z483/Z486 fd-op rings for a parked process — the
+/// wall-park verdict site's one-shot. Same shape as the 6-Z305t-14b
+/// STALL-FD flush (rare ring first — it never rotates), keyed by TGID,
+/// once per process per run.
+fn z540_flush_fdop_rings(tgid: libc::pid_t) {
+    {
+        let mut flushed = Z540_FLUSHED.lock().unwrap_or_else(|e| e.into_inner());
+        if !flushed.insert(tgid) {
+            return;
+        }
+    }
+    if let Ok(mut z483_rare_map) = Z483_RARE.lock() {
+        if let Some(ring) = z483_rare_map.remove(&tgid) {
+            if !ring.is_empty() {
+                crate::trace_log_line(&format!(
+                    "6-Z540/Z486: rare fd-op ring pid={} ({} entries, oldest->newest):",
+                    tgid,
+                    ring.len()
+                ));
+                for (seq, name, desc) in ring.iter() {
+                    crate::trace_log_line(&format!("6-Z540/Z486:   #{:06} {} {}", seq, name, desc));
+                }
+            }
+        }
+    }
+    if let Ok(mut z483_map) = Z483_FDOPS.lock() {
+        if let Some(ring) = z483_map.remove(&tgid) {
+            if !ring.is_empty() {
+                crate::trace_log_line(&format!(
+                    "6-Z540/Z483: fd-op ring pid={} ({} entries, oldest->newest):",
+                    tgid,
+                    ring.len()
+                ));
+                for (seq, name, desc) in ring.iter() {
+                    crate::trace_log_line(&format!("6-Z540/Z483:   #{:06} {} {}", seq, name, desc));
+                }
+            }
+        }
+    }
 }
 
 /// 6-Z520a: the ART-Mutex decode for a wall park — when the word's
@@ -16631,6 +16777,11 @@ fn stall_forensic_dump(pid: libc::pid_t, wchan: &str, elapsed_secs: f32) {
                     "6-Z306af-q STALL-TARGET: pid={} nr={} fd={} -> {} [{} {}]",
                     pid, nr, fd, target, flags, pos
                 ));
+                // 6-Z540: the sentinel rides the fd-shaped stall arms
+                // too — the earliest post-fork verdicts record the
+                // TRUE baseline (fd 0 = the svclog wiring) before any
+                // displacement can land.
+                z540_stdio_sentinel_check(pid, "stall-target");
                 // Pipe-peer census — only for pipe inodes.
                 let pipe_inode = target
                     .strip_prefix("pipe:[")
@@ -24355,6 +24506,11 @@ pub fn run_ptrace_loop(
                         .map(|(nr, _)| *nr)
                         .unwrap_or(-1)
                 ));
+                // 6-Z540: the stdio sentinel rides every stall verdict
+                // (any shape) — a post-baseline fd 0/1/2 target change
+                // names the displacement the moment the next verdict
+                // runs after it.
+                z540_stdio_sentinel_check(sp, "stall");
                 // 6-Z271f: forensic dump — the STALL line above carries a
                 // STALE nr (the last ENTRY the tracer happened to see;
                 // entries are missed under stop-storm load, hence the -1s
@@ -64249,5 +64405,47 @@ mod z501_futex_tests {
         assert_eq!(z501_futex_op_name(4), "CMP_REQUEUE");
         assert_eq!(z501_futex_op_name(6), "LOCK_PI");
         assert_eq!(z501_futex_op_name(0x7f), "OTHER");
+    }
+}
+
+/// 6-Z540 the stdio-sentinel pure core (the fd-0 displacement diff).
+#[cfg(test)]
+mod z540_sentinel_tests {
+    use super::z540_changed_slots;
+
+    /// The rn522 rung-8 flip shape: fd 0 displaced onto the perfetto
+    /// signal-pipe read end while fd 1/2 keep the svclog wiring; plus
+    /// the vanished-slot and no-change edges.
+    #[test]
+    fn z540_changed_slots_reports_only_real_flips() {
+        let prev: [Option<String>; 3] = [
+            Some("/dev/twoyi-svclogs/svc-4394.log".to_string()),
+            Some("/dev/twoyi-svclogs/svc-4394.log".to_string()),
+            Some("/dev/twoyi-svclogs/svc-4394.log".to_string()),
+        ];
+        let now: [Option<String>; 3] = [
+            Some("pipe:[125134]".to_string()),
+            prev[1].clone(),
+            prev[2].clone(),
+        ];
+        let out = z540_changed_slots(&prev, &now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].1, "/dev/twoyi-svclogs/svc-4394.log");
+        assert_eq!(out[0].2, "pipe:[125134]");
+
+        // A vanished slot (None) is a change; None->None is not.
+        let vanished: [Option<String>; 3] = [None, prev[1].clone(), prev[2].clone()];
+        let out = z540_changed_slots(&prev, &vanished);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0);
+        assert_eq!(out[0].1, "/dev/twoyi-svclogs/svc-4394.log");
+        assert_eq!(out[0].2, "<none>");
+
+        let same: [Option<String>; 3] = [None, prev[1].clone(), prev[2].clone()];
+        assert!(z540_changed_slots(&same, &vanished).is_empty());
+
+        // No change at all -> empty.
+        assert!(z540_changed_slots(&prev, &prev).is_empty());
     }
 }
