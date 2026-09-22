@@ -14023,12 +14023,18 @@ fn z536_aarch64_name(nr: i64) -> &'static str {
 }
 
 fn z536_trace_syscall(pid: libc::pid_t, nr: i64, ret: i64, a1: u64, a2: u64, a3: u64) {
+    // 6-Z536b: the mprotect flood (the abort handler's stack unmarking —
+    // ~30 pairs after the FATAL) burned the 300-event cap before the
+    // interesting tail; skip it (and the getpid bookkeeping) entirely.
+    if nr == 226 || nr == 172 || nr == 178 {
+        return;
+    }
     let n = Z536_EVENT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n >= 300 {
         return;
     }
     crate::trace_log_line(&format!(
-        "6-Z536: kptr-pid syscall pid={} nr={} ({}) ret={:#x} args=[{:#x},{:#x},{:#x}] #{}",
+        "6-Z536: kptr-pid syscall pid={} nr={} ({}) ret={:#x} args=[{:#x},{:#x},{:#x}] #{} (arg1-at-EXIT = the return on aarch64)",
         pid,
         nr,
         z536_aarch64_name(nr),

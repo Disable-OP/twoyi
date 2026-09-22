@@ -33086,3 +33086,36 @@ C++ streambuf (libc++) seekg/extraction interaction, which no syscall can observ
   first kptr open to the abort; (2) the fix follows (the shlib hook / the binary patch /
   the rc-command discovery); (3) the rung-3 wall is the only blocker to the rung-7
   baseline and the rung-8 push.
+
+## Task 264 second update (rn519 decoded: the FULL journal landed — the syscall layer conclusively coherent; the C++ streambuf layer declared the divergence; 6-Z536b the filter)
+
+- **rn519 (9e9e8825 → the first attempt failed on the runner's corrupted SDK-31 download
+  — the infra flake, NOT code; the rerun-failed-jobs API fixed it)**: rung 3, the kptr
+  FATAL persisted. **The 6-Z536 full journal delivered 92 events — the COMPLETE
+  choreography:**
+  ```
+  #1  openat2→17 (the ofstream) #2 fstat #3 write "4\n" ret=2 #4 close(17)
+  #5  fstat #6 lseek ret=0 (the seekg(0)) #7 read "4\n" ret=2   ← THE VERIFY SAW THE WRITTEN BYTES
+  #8  openat2→17 (iter 3) #9 fstat #10 write "3\n" #11 close
+  #12 openat2→17 (iter 2) #13 fstat #14 write "2\n" #15 close
+  #16-#17 lseeks (pos queries) #18 close(16) — inf.close(), the loop EXHAUSTED
+  #19+ the FATAL klog writev, the abort machinery, the mprotect flood, the tombstone path
+  ```
+- **The paradox is now CONCLUSIVELY BOUNDED**: the verify read returned the exact written
+  bytes and the loop continued anyway — the iters 3/2 verifies issued NO read syscalls
+  (the libc++ streambuf served stale buffer bytes without underflow) and NO lseeks
+  (seekg(0) never reached the kernel on those iterations). **The file layer is perfect;
+  the divergence is inside the child's C++ streambuf/seekg/compare layer — invisible at
+  the syscall surface. The syscall-surface campaign is COMPLETE.**
+- **6-Z536b**: the mprotect flood (the abort's stack unmarking) burned the 300-event cap
+  before the tail — now filtered (mprotect/getpid/gettid skipped), arg1-at-EXIT noted
+  as the return value (the aarch64 clobber).
+- Gates 1121/1121; fmt/clippy clean.
+- **Task 265's fix options (re-ranked by the journal evidence)**: (1) **the init binary
+  patch at import** — NOP the SetKptrRestrictAction's LOG(FATAL) branch (the boot
+  proceeds; the kptr value is irrelevant to the emu) — deterministic, no C++-layer
+  knowledge needed; (2) the ptrace single-step over the compare (the heavy instrument);
+  (3) the loader-shlib hook (the C++ layer ignores the file layer, so a file-layer hook
+  won't help — demoted).
+- The boot-ladder infra note: the runner's SDK-31 download corrupted once (the ZIP
+  error) — the rerun-failed-jobs API is the remedy.
