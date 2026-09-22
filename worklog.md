@@ -33119,3 +33119,52 @@ C++ streambuf (libc++) seekg/extraction interaction, which no syscall can observ
   won't help — demoted).
 - The boot-ladder infra note: the runner's SDK-31 download corrupted once (the ZIP
   error) — the rerun-failed-jobs API is the remedy.
+
+## Task 265 (session 265, ~03:00Z, 2026-09-22 — 6-Z537: the kptr wall FALLS by sidestep; rn520 dispatched)
+
+- **The state check**: the sandbox survived (repo 0e476f04, gates 1121/1121, creds); the
+  CI clear (rn519 = the last boot-ladder, success). Single-flight taken: rn520 dispatched
+  on the new commit (HTTP 204, full inputs).
+- **THE BREAKTHROUGH — the ROM identified and FETCHED**: the boot-ladder ROM is the repo's
+  OWN release asset `twoyi-android11-aosp-arm64-rsr1.tar.gz` (494 MB — the official
+  arm64-v8a-30_r02 AOSP-11 GSI, built into a twoyi rootfs). Downloaded and extracted
+  OFFLINE: `/init` (static first-stage, 1.8 MB — carries NONE of the FATAL needles) and
+  `/system/bin/init` (dynamic second-stage, 1,028,848 bytes — carries BOTH needles; the
+  6-Z238/6-Z102 trace in rn519's log confirms the guest execve's exactly this file,
+  1028848 bytes, at +590 ms). A-11/12/13 security.cpp are byte-identical for this code.
+- **THE DESIGN (from the real binary, hand-disassembled)**: each FATAL emit has the shape
+  [in-edge `TBNZ W0,#0, <emit>` far above] ... [emit: BL setup; ADRP/ADD "security.cpp";
+  MOV W2,#199 (line); MOV W3,#6 (FATAL); BL LogMessage-ctor; BL op<<; ADRP/ADD msg
+  (MOV W2,#43/42 = the EXACT string lengths — the xref discriminator); BL op<<(char*,len);
+  BL dtor; STR W21,[X20]; **B <common-return-tail>** (the terminator)]. The epilogue's
+  `B.NE → __stack_chk_fail` targets PAST the terminator — excluded by ending the scan
+  window AT the terminator. The REAL in-edges (full-segment scan): kptr TBNZ@0xaff80 →
+  emit@0xb0108; mmap TBNZ@0xafd0c → emit@0xafe84; BOTH sit 4 bytes before their emit's
+  return tail, so the rewrite `TBNZ → B <tail>` (0x14000001) is FALL-THROUGH-EQUIVALENT:
+  the success path (W0==0 → fall to the tail) is bit-identical; the failure path now
+  returns through the shared Result constructor instead of aborting. 6 bytes change in
+  the whole binary. The mmap-entropy FATAL (SetMmapRndBitsMin(33,24) = TEN broken verify
+  iterations on arm64) is pre-empted by the same machinery.
+- **6-Z537 (1d469ecb, gates 1129/1129)**: `src/init_patch.rs` — the ELF64 PT_LOAD
+  parser, the ADRP+ADD xref hunter (the msg-length MOV is implicit corroboration), the
+  emit-window derivation ([adrp-0x40 .. terminator]), the full-segment in-edge scanner
+  (CBZ/CBNZ/TBZ/TBNZ/B.cond/B), the strict-safety `B tail` rewrite, the B→tail evidence
+  scan for idempotency (AlreadyApplied), the staged-copy invalidation (the 6-Z102 cache
+  hit is FILE-LENGTH equality — the length-preserving patch MUST delete
+  `{data_dir}/cache/twoyi_stage/_system_bin_init_*` or the executed bytes stay stale),
+  wired as run() Step 3.1 (BEFORE the spawn; candidates [cfg.init_path,
+  /system/bin/init]; every skip = a no-op).
+- **Tests +8 = 1129**: the synthetic-ELF fixture suite (TBNZ + B.cond in-edges, mid-emit
+  targets, the stack-canary exclusion, idempotency, no-needle/non-ELF skips, the staged-
+  copy glob) + the env-gated REAL-binary validation (`Z537_REAL_INIT`) which pins
+  TBNZ@0xaff80→0x14000001, TBNZ@0xafd0c→0x14000001, exactly 6 differing bytes, and the
+  AlreadyApplied re-run — ALL GREEN against the downloaded rsr1 init. fmt clean; clippy
+  -D warnings zero.
+- **rn520 (#520) dispatched on 1d469ecb** (HTTP 204, full inputs). Expect: the
+  `6-Z537: PATCHED` line in kr64.log at boot-prep, ZERO InitFatalReboot, the boot past
+  SetKptrRestrict (and past SetMmapRndBits) → rung 7+ restored (the 6-Z530 property
+  capture + the 6-Z533 ack economy + the 6-Z528 dexopt economy are all verified working
+  and waiting upstream), the wall round 6 verdicts.
+- Infra note: the original twoyi rootfs tarball (cyanmint/twoyi "original", Android 8.1)
+  was downloaded first and DISMISSED (no needles — the wrong ROM); the release-asset
+  provenance gate in the workflow pointed at the true rsr1 asset.
