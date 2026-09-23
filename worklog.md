@@ -33514,3 +33514,17 @@ Work Log:
 
 Stage Summary:
 - rn542 decode agenda: the klog-channel dump names the -71 branch (out-of-range ret vs rlen<4 vs srv_read>rlen) → THE fleet fix; milestone variance; the init crash recurrence watch (6-Z551).
+
+---
+Task ID: 1 (update 20 — session 271 wrap: rn542 DECODED — the -71 desync SHAPES named (ret=0/rlen=0; srv_read=0x80000000) via the 6-Z557 klog channel; 6-Z558 the blocking-socket fix landed; rn543 dispatched)
+Agent: Z.ai Code (main implementation agent, session 271)
+
+Work Log:
+- rn542 (run 35797192962, cd046fa0): rung-consistent boot (class_start main completed +97.2s and +156.8s); the -71 churn active. **THE 6-Z557 KLOG CHANNEL DELIVERED: 239 "binder proxy exchange" lines in dev-__kmsg__** (rn541: zero).
+- THE SHAPES: "cmd=0xc0306201 ret=0 rlen=0 <4" ×6 (mid-frame zeros parsed as a response header) + "ret=0 rlen=100 srv_read=2147483648" ×43 (a mid-payload window parsed as the read_size) — **a CLIENT-CURSOR WIRE DESYNC**, not a proxy-frame bug (a healthy proxy resp_payload[0..4] = read_buf.len(), never 0x80000000).
+- ROOT-CAUSE THEORY + FIX (6-Z558, d2e965cb): the guest owns its binder fd and can fcntl O_NONBLOCK onto it (minijail fd sanitization — rn542's klog shows libminijail inspecting fd 5). A non-blocking socketpair short-sends a large request EAGAIN mid-frame → the client bails → the proxy is stuck mid-frame → every later exchange misframes until an abort. bp_exchange_anc now clears O_NONBLOCK (raw fcntl F_GETFL/F_SETFL) before every exchange — the real binder WR_READ is blocking by nature; libbinder never uses O_NONBLOCK.
+- rn543 DISPATCHED (run 35799975358, #543, d2e965cb, boot_wait_seconds=900, single-flight). Decode agenda: the -71 abort COUNT vs rn541's 181 (if ~0: the desync died with the fix → the fleet stabilizes → rung 8/9 open); milestone variance; the init crash watch (6-Z551 armed).
+
+Stage Summary:
+- This session: rn537 decoded (the init strlen(NULL) regression + the 6-Z556 pgoff attribution bug fixed), 6-Z551/552/553/556/557/558 landed, gates 1145/1145 throughout, one CI-caught scope bug fixed same-session, three runs dispatched (rn538→#541, #542, #543). Remote main: d2e965cb.
+- Next session: decode rn543 (the 6-Z558 verdict = the fleet fix or the next instrument), then the boot-cycle supervisor (the init-death window recovery) and the rung-8/9 push.
